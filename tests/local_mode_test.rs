@@ -2788,6 +2788,249 @@ fn check_changed_fails_on_a_new_call_to_a_route_that_does_not_exist() {
     assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
 }
 
+/// A `check --changed` stopped by SIGTERM takes its re-scan and the re-scan's
+/// type sidecar with it, even a sidecar too busy to hear a signal. Before,
+/// only the check ended: the re-scan was a process of its own that nothing
+/// told, and it ran on with its sidecar.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_signalled_check_ends_its_re_scan_and_the_re_scans_sidecar() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    // Busy as the real one is while it builds a program: its handlers never
+    // run, because its event loop never turns.
+    let sidecar_dir = root.join(".busy-sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar_dir).expect("a directory for the sidecar");
+    let pid_file = root.join(".busy-sidecar.pid");
+    std::fs::write(
+        sidecar_dir.join("index.js"),
+        format!(
+            "require('fs').writeFileSync({:?}, String(process.pid));\n\
+             process.on('SIGTERM', () => process.exit(0));\n\
+             process.stdin.on('end', () => process.exit(0));\n\
+             for (;;) {{}}\n",
+            pid_file.display().to_string()
+        ),
+    )
+    .expect("write the busy sidecar");
+
+    let mut check = Command::new(carrick())
+        .args(["check", "--changed", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_SIDECAR_DIR", root.join(".busy-sidecar"))
+        .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the check");
+
+    let alive = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) == 0 };
+    let started = Instant::now();
+    let sidecar = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+        {
+            break pid;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            let _ = check.kill();
+            panic!("the check's re-scan started no sidecar in 120s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let listed = Command::new("pgrep")
+        .args(["-P", &check.id().to_string(), "-x", "carrick"])
+        .output()
+        .expect("pgrep lists a process's children");
+    let rescan: libc::pid_t = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .find_map(|line| line.trim().parse().ok())
+        .expect("the check is waiting on its re-scan");
+
+    // SAFETY: a signal to a child this test spawned and has not reaped.
+    assert_eq!(
+        unsafe { libc::kill(check.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let ended = Instant::now();
+    let status = loop {
+        if let Some(status) = check.try_wait().expect("poll the check") {
+            break status;
+        }
+        assert!(
+            ended.elapsed() < Duration::from_secs(60),
+            "the signalled check was still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    for (pid, what) in [(rescan, "the re-scan"), (sidecar, "the busy sidecar")] {
+        let start = Instant::now();
+        while alive(pid) {
+            if start.elapsed() > Duration::from_secs(15) {
+                // SAFETY: descendants this test started, left running by the
+                // failure it is about to report.
+                unsafe {
+                    libc::kill(rescan, libc::SIGKILL);
+                    libc::kill(sidecar, libc::SIGKILL);
+                }
+                panic!("{what} was still running 15s after the check ended ({status:?})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // It ended by passing the signal on, and says which signal it was.
+    assert_eq!(status.code(), Some(143), "{status:?}");
+}
+
+/// How long the silence-watching caller below lets a command say nothing
+/// before killing it, as an agent harness does with a command it reads as
+/// hung. Longer than the check's heartbeat, shorter than the stall the stub
+/// sidecar makes.
+const SILENCE_LIMIT: Duration = Duration::from_secs(20);
+
+/// A check that works for longer than a caller will wait in silence keeps
+/// saying so on stderr, and its answer on stdout stays the answer alone.
+///
+/// The type sidecar here never becomes ready, so the re-scan and the join
+/// each wait out the readiness budget: a stretch with no output that is
+/// longer than [`SILENCE_LIMIT`], as a large repo's re-scan is. The caller is
+/// what an agent harness does: it kills the command after that long without a
+/// byte on either stream. Before the narration, the check printed nothing
+/// until its answer, and this caller killed it.
+#[test]
+#[serial]
+fn check_changed_keeps_talking_to_a_caller_that_kills_silent_commands() {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let sidecar = root.join(".stalled-sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
+    std::fs::write(
+        sidecar.join("index.js"),
+        "process.stdin.on('end', () => process.exit(0));\nprocess.stdin.resume();\n",
+    )
+    .expect("write the sidecar that never answers");
+
+    let mut child = Command::new(carrick())
+        .args(["check", "--changed", "--workspace", ".", "--json"])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_SIDECAR_DIR", root.join(".stalled-sidecar"))
+        .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "30")
+        // The stalled sidecar types nothing; the run is about the wait.
+        .env("CARRICK_ALLOW_MISSING_TYPES", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the check");
+
+    // Each stream read on its own thread; every chunk is a sign of life.
+    let (heard, hearing) = mpsc::channel::<(bool, Vec<u8>)>();
+    let readers: Vec<_> = [
+        (
+            true,
+            Box::new(child.stdout.take().expect("stdout")) as Box<dyn Read + Send>,
+        ),
+        (false, Box::new(child.stderr.take().expect("stderr"))),
+    ]
+    .into_iter()
+    .map(|(is_stdout, mut stream)| {
+        let heard = heard.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 || heard.send((is_stdout, buffer[..read].to_vec())).is_err() {
+                    break;
+                }
+            }
+        })
+    })
+    .collect();
+    drop(heard);
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let started = Instant::now();
+    let mut longest_silence = Duration::ZERO;
+    let mut last = Instant::now();
+    loop {
+        match hearing.recv_timeout(Duration::from_millis(100)) {
+            Ok((is_stdout, bytes)) => {
+                longest_silence = longest_silence.max(last.elapsed());
+                last = Instant::now();
+                if is_stdout {
+                    stdout.extend(bytes);
+                } else {
+                    stderr.extend(bytes);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last.elapsed() >= SILENCE_LIMIT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "killed as hung: {:.0}s without output, {:.0}s in; it had said:\n{}",
+                        last.elapsed().as_secs_f64(),
+                        started.elapsed().as_secs_f64(),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+            }
+        }
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let status = child.wait().expect("wait for the check");
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let stdout = String::from_utf8(stdout).expect("stdout is UTF-8");
+
+    eprintln!("what the check said while it worked:\n{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is the JSON answer alone ({e}):\n{stdout}"));
+    assert_eq!(json["schema"], "carrick.check-changed/0", "{json:#}");
+    assert!(
+        status.code().is_some(),
+        "the check ended on its own: {status:?}"
+    );
+    assert!(
+        stderr.contains("carrick check: re-reading inventory-svc..."),
+        "it named the repo it re-read:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("carrick check: still "),
+        "and said it was still working through the stall:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("carrick check: comparing routes and calls across 2 services..."),
+        "and named the join:\n{stderr}\n{stdout}"
+    );
+    assert!(
+        longest_silence < SILENCE_LIMIT,
+        "never silent for the limit: {longest_silence:?}"
+    );
+}
+
 /// The same new call through a base set at run time: it could be a service
 /// of this workspace or an outside API, so it is printed as unconfirmed and
 /// does not fail the run.
@@ -2840,7 +3083,7 @@ fn check_changed_does_not_fail_on_a_problem_the_index_already_held() {
 
     let (code, quiet) = check_changed(root, false);
     assert!(
-        quiet.contains("plus 1 unconfirmed, run with --all to list them"),
+        quiet.contains("plus 1 already in the index, run with --all to list them"),
         "counted, not listed:\n{quiet}"
     );
     assert_eq!(code, Some(0), "{quiet}");
@@ -2908,6 +3151,85 @@ fn check_changed_names_the_untouched_calls_a_deleted_route_leaves_with_no_route(
                 && line.contains("  no route  ")
                 && line.contains("the index matched this call")),
         "the consumer the deletion broke is named:\n{text}"
+    );
+    assert_eq!(code, Some(1), "{text}");
+}
+
+/// Marks the workspace's index as written by an older scanner, as an upgrade
+/// leaves it: same rows, another version.
+fn as_written_by_an_older_scanner(root: &Path) {
+    let path = root.join(".carrick/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the index"))
+            .expect("the index is JSON");
+    index["scanner_version"] = serde_json::json!("0.0.1");
+    std::fs::write(&path, index.to_string()).expect("write the index");
+}
+
+/// carrick#2911: an index an older scanner wrote holds the rows that scanner
+/// read. A row this build reads and that one did not looks new, so a check
+/// against it cannot tell a new problem from an upgrade: it does not fail,
+/// says why in one line, and exits 2.
+#[test]
+#[serial]
+fn check_changed_does_not_fail_on_a_row_an_older_scanners_index_cannot_date() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    as_written_by_an_older_scanner(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let (code, text) = check_changed(root, false);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the call is listed, not hidden:\n{text}"));
+    assert!(
+        problem.contains("[not checked: the index is from another scanner build]"),
+        "marked as not checked:\n{text}"
+    );
+    assert!(
+        text.contains("written by carrick 0.0.1")
+            && text.contains("Run `carrick refresh` on the main branch"),
+        "one line says which build wrote the index and what to run:\n{text}"
+    );
+    assert_eq!(code, Some(2), "not a pass and not a failure:\n{text}");
+
+    let (_, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(json["failing"], 0, "{json:#}");
+    assert_eq!(json["index_scanner"], "0.0.1", "{json:#}");
+    assert!(
+        json["problems"].as_array().is_some_and(|problems| problems
+            .iter()
+            .any(|p| p["other_build"] == true && p["fails"] == false)),
+        "{json:#}"
+    );
+}
+
+/// carrick#2911: what the older index did read still decides. It matched this
+/// call to a route, and the work deleted the route: that fails whichever
+/// build wrote the index.
+#[test]
+#[serial]
+fn check_changed_still_fails_a_call_an_older_scanners_index_matched() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    as_written_by_an_older_scanner(root);
+    std::fs::remove_file(root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts"))
+        .expect("delete the route");
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("inventory-svc/src/client.ts:")
+                && line.contains("  no route  ")
+                && line.contains("the index matched this call")
+                && !line.contains("not checked")),
+        "the consumer the deletion broke still fails:\n{text}"
     );
     assert_eq!(code, Some(1), "{text}");
 }
@@ -3211,5 +3533,417 @@ fn check_changed_in_a_shallow_clone_says_to_unshallow() {
     assert!(
         text.contains("this clone is shallow") && text.contains("run `git fetch --unshallow`"),
         "{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// carrick#2894: an edited file keeps the model's answer for the lines the edit
+// left alone. The producer registers its routes on a typed receiver, which no
+// deterministic reader states, so the rows below exist only as the model's
+// answer (the cassettes in the fixture), replayed from the index.
+// ---------------------------------------------------------------------------
+
+/// The fixture's cassettes: the model's answers, keyed by file stem.
+fn carry_cassettes() -> String {
+    format!(
+        "{}/",
+        repo_root()
+            .join("tests/fixtures/edited-handler-carry/cassettes")
+            .display()
+    )
+}
+
+/// The producer's route module, as the cassette's line numbers see it.
+const CARRY_ROUTES: &str = "items-api/src/routes.ts";
+
+/// The fixture's two repos, indexed with the model mocked to the fixture's
+/// cassettes, so the index holds the model's answers a check later replays.
+fn carry_workspace() -> tempfile::TempDir {
+    let workspace = workspace("edited-handler-carry", &["items-api", "items-web"]);
+    let root = workspace.path();
+    for repo in ["items-api", "items-web"] {
+        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
+    }
+    let output = Command::new(carrick())
+        .args(["index", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_MOCK_FIXTURE_DIR", carry_cassettes())
+        .output()
+        .expect("spawn carrick index");
+    assert!(
+        output.status.success(),
+        "index failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    workspace
+}
+
+/// A command with its exit code, since a failing check is the point here.
+fn carrick_code(workspace: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let output = Command::new(carrick())
+        .args(args)
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_RECHECK_BUDGET_MS", "600000")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
+/// `check --changed --json`, against a base that is the commit indexed.
+fn carry_check_changed(workspace: &Path) -> (Option<i32>, serde_json::Value) {
+    for repo in ["items-api", "items-web"] {
+        git(
+            &workspace.join(repo),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+    }
+    let (code, text) = carrick_code(
+        workspace,
+        &["check", "--changed", "--workspace", ".", "--json"],
+    );
+    let json = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("check --changed --json was not JSON: {e}\n{text}"));
+    (code, json)
+}
+
+/// The producer's route module with two lines above the plugin and the first
+/// route's field renamed: the edit every test below starts from.
+fn rename_connected(root: &Path) {
+    let file = root.join(CARRY_ROUTES);
+    edit(
+        &file,
+        "export async function itemRoutes",
+        "// A note.\n// Another.\nexport async function itemRoutes",
+    );
+    edit(
+        &file,
+        "return { id, connected: true };",
+        "return { id, isConnected: true };",
+    );
+}
+
+/// The no-model re-scan the re-check and `refresh` run for the producer, with
+/// the stored index as its previous generation, and the blob it writes.
+fn no_model_rescan(root: &Path, changed_only: bool) -> serde_json::Value {
+    let out = root.join("rescan-out");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).expect("create the scan dir");
+    let previous = root.join("rescan-previous.json");
+    std::fs::write(
+        &previous,
+        serde_json::to_vec(&vec![stored_blob(root, "items-api")]).expect("serialise"),
+    )
+    .expect("write the previous generation");
+    let output = Command::new(carrick())
+        .arg(root.join("items-api"))
+        .args(changed_only.then_some("--changed-only"))
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        // As the indexer launches a scan: a CI runner's variables would make
+        // this one read as a CI scan and ignore its previous generation.
+        .env_remove("GITHUB_REPOSITORY")
+        .env_remove("GITHUB_REF")
+        .env_remove("GITHUB_EVENT_NAME")
+        .env_remove("GITHUB_SHA")
+        .env_remove("GITHUB_RUN_ID")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_WORKSPACE")
+        .env_remove("GITHUB_EVENT_PATH")
+        .env_remove("CI")
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        .env("CARRICK_NO_MODEL", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env("CARRICK_SKIP_SIGNATURES", "1")
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_LOCAL_STORAGE_DIR", &out)
+        .env("CARRICK_LOCAL_HOSTED_PREVIOUS", &previous)
+        .output()
+        .expect("spawn the re-scan");
+    assert!(
+        output.status.success(),
+        "the re-scan failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The blob is named for the service, which differs by checkout; the
+    // scan wrote exactly one.
+    let mut written: Vec<PathBuf> = std::fs::read_dir(&out)
+        .expect("read the scan dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(written.len(), 1, "one blob expected in {written:?}");
+    let text = std::fs::read_to_string(written.remove(0)).expect("read the blob");
+    serde_json::from_str(&text).expect("the re-scan blob is JSON")
+}
+
+/// The paths of the producer's endpoint rows in a blob, as `path@line`.
+fn carried_routes(blob: &serde_json::Value) -> Vec<String> {
+    blob["endpoints"]
+        .as_array()
+        .expect("endpoints")
+        .iter()
+        .map(|row| {
+            format!(
+                "{}@{}",
+                row["key"]["path"].as_str().unwrap_or_default(),
+                row["file_path"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+fn not_carried(blob: &serde_json::Value) -> Vec<String> {
+    blob["boundary"]["model_rows_not_carried"]["reasons"]
+        .as_array()
+        .map(|reasons| {
+            reasons
+                .iter()
+                .filter_map(|r| r.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A producer registers its routes on a typed receiver, so only the model's
+/// answer states them. Editing the file used to drop all three from the one scan
+/// meant to judge the edit; now the lines the edit left alone keep their rows,
+/// and a field renamed inside a handler fails the check.
+#[test]
+#[serial]
+fn an_edited_handler_keeps_its_route_and_is_re_judged() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+
+    let before = check_json(root, CARRY_ROUTES);
+    let results: Vec<&str> = before["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["verdict"]["result"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        results,
+        vec!["compatible"; 3],
+        "the fixture starts compatible, which is the known positive:\n{before:#}"
+    );
+
+    rename_connected(root);
+
+    let (code, text) = carrick_code(
+        root,
+        &[
+            "check",
+            CARRY_ROUTES,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    let rechecked: serde_json::Value = serde_json::from_str(&text).expect("recheck is JSON");
+    let first = &rechecked["items"][0];
+    assert_eq!(
+        first["line"], 6,
+        "the route moved with the two inserted lines:\n{rechecked:#}"
+    );
+    assert_eq!(first["verdict"]["result"], "type_mismatch", "{rechecked:#}");
+    assert!(
+        first["actual_type"]
+            .as_str()
+            .is_some_and(|t| t.contains("isConnected")),
+        "with the producer's fresh type:\n{rechecked:#}"
+    );
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(1), "a fact fails the run:\n{changed:#}");
+    let problem = &changed["problems"][0];
+    assert_eq!(problem["kind"], "incompatible", "{changed:#}");
+    assert_eq!(problem["file"], CARRY_ROUTES, "{changed:#}");
+    assert_eq!(problem["line"], 6, "{changed:#}");
+    assert_eq!(problem["source"], "fact", "{changed:#}");
+    assert_eq!(problem["fails"], true, "{changed:#}");
+
+    let blob = no_model_rescan(root, false);
+    assert_eq!(
+        blob["boundary"]["model_rows_carried"], 3,
+        "{:?}",
+        blob["boundary"]
+    );
+    assert!(
+        blob["boundary"].get("model_rows_not_carried").is_none(),
+        "every row was carried and typed: {:?}",
+        blob["boundary"]
+    );
+}
+
+/// A registration whose own line the edit replaced is not carried: nothing
+/// proves it still states the route the answer named. It is counted, with the
+/// line, and its neighbours are still carried.
+#[test]
+#[serial]
+fn a_changed_registration_line_is_not_carried_and_is_counted() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "'/items/:id/status'",
+        "'/items/:id/state'",
+    );
+
+    let blob = no_model_rescan(root, false);
+    assert_eq!(
+        blob["boundary"]["model_rows_carried"], 2,
+        "{:?}",
+        blob["boundary"]
+    );
+    assert_eq!(
+        not_carried(&blob),
+        vec!["src/routes.ts:9 registration_line_changed".to_string()],
+        "{:?}",
+        blob["boundary"]
+    );
+    let routes = carried_routes(&blob);
+    assert!(
+        routes.iter().any(|r| r.starts_with("/api/v1/items/:id@"))
+            && routes.iter().any(|r| r.starts_with("/api/v1/items@")),
+        "the untouched registrations kept their routes: {routes:?}"
+    );
+}
+
+/// A handler named at the registration whose body the edit changed is not
+/// carried: its response is read where the model said, and that place moved
+/// under it. Left out rather than risk a false failure, and counted.
+#[test]
+#[serial]
+fn a_named_handler_whose_body_changed_is_not_carried() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "return [{ id: '1', connected: true }];",
+        "return [{ id: '1', isConnected: true }];",
+    );
+
+    let blob = no_model_rescan(root, false);
+    assert_eq!(
+        blob["boundary"]["model_rows_carried"], 2,
+        "{:?}",
+        blob["boundary"]
+    );
+    assert_eq!(
+        not_carried(&blob),
+        vec!["src/routes.ts:14 hint_outside_registration_changed".to_string()],
+        "{:?}",
+        blob["boundary"]
+    );
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(
+        code,
+        Some(0),
+        "no row was judged against the wrong function:\n{changed:#}"
+    );
+    assert!(
+        changed["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .all(|p| p["fails"] != true),
+        "{changed:#}"
+    );
+}
+
+/// A carried answer is joined and never stored: it is keyed by this tree's
+/// candidate ids and mapped from the previous generation's commit, so a stored
+/// copy would be mapped again from the wrong base.
+#[test]
+#[serial]
+fn an_edited_file_keeps_no_carried_answer_in_the_blob() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    assert!(
+        stored_blob(root, "items-api")["file_results"]
+            .get("src/routes.ts")
+            .is_some(),
+        "the model scan stored its answer for the file"
+    );
+    rename_connected(root);
+
+    let blob = no_model_rescan(root, false);
+    assert_eq!(
+        blob["boundary"]["model_rows_carried"], 3,
+        "{:?}",
+        blob["boundary"]
+    );
+    assert!(
+        blob["file_results"].get("src/routes.ts").is_none(),
+        "the edited file stores no answer: {:?}",
+        blob["file_results"]
+    );
+    assert!(blob["file_results"].get("src/server.ts").is_some());
+}
+
+/// Nothing changes where nothing was edited, and a model scan is not touched.
+#[test]
+#[serial]
+fn carrying_leaves_a_clean_tree_and_a_model_scan_alone() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    let indexed = stored_blob(root, "items-api");
+
+    let clean = no_model_rescan(root, false);
+    assert!(
+        clean["boundary"].get("model_rows_carried").is_none(),
+        "{:?}",
+        clean["boundary"]
+    );
+    assert!(clean["boundary"].get("model_rows_not_carried").is_none());
+    assert_eq!(clean["endpoints"], indexed["endpoints"]);
+    assert_eq!(clean["file_results"], indexed["file_results"]);
+
+    // The same edit, scanned with the model: the cassette answers again and
+    // nothing is carried. (A dirty tree stores no answer for the file it
+    // changed, with or without this change.)
+    edit(
+        &root.join(CARRY_ROUTES),
+        "return { id, connected: true };",
+        "return { id, isConnected: true };",
+    );
+    let output = Command::new(carrick())
+        .args(["index", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_MOCK_FIXTURE_DIR", carry_cassettes())
+        .output()
+        .expect("spawn carrick index");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rescanned = stored_blob(root, "items-api");
+    assert!(rescanned["boundary"].get("model_rows_carried").is_none());
+    assert!(
+        rescanned["boundary"]
+            .get("model_rows_not_carried")
+            .is_none()
+    );
+    assert_eq!(
+        carried_routes(&rescanned).len(),
+        3,
+        "the model answered for the edited file again"
     );
 }

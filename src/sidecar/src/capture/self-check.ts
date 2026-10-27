@@ -287,6 +287,18 @@ function runSelfCheck(
  * because the module that is missing is no longer imported to be reported.
  * Fail closed: the alias keeps the refusal it had before the repair.
  */
+/**
+ * Detail for a pinned external that does not resolve on an installed checkout.
+ * A subpath on the specifier means the rewrite found no entry of the package
+ * exporting a declaration from that file, so it named the file itself.
+ */
+function unresolvedExternalDetail(spec: string): string {
+  const pkg = packageNameOf(spec);
+  const subpath = spec.slice(pkg.length + 1);
+  const base = `unresolved pinned external '${spec}' on an installed checkout`;
+  return subpath ? `${base}: no entry of '${pkg}' exports a declaration from '${subpath}'` : base;
+}
+
 function repairedNameFailure(
   repaired: Map<string, RepairedFile> | undefined,
   file: string,
@@ -505,7 +517,7 @@ function checkedRecord(
         allowlisted();
       } else {
         outcome = 'decayed_internal';
-        detail = `unresolved pinned external '${blamedExternal}' on an installed checkout`;
+        detail = unresolvedExternalDetail(blamedExternal);
       }
     } else {
       // Root top type with no external explanation.
@@ -522,7 +534,7 @@ function checkedRecord(
       allowlisted();
     } else {
       outcome = 'decayed_internal';
-      detail = `unresolved pinned external '${blamedExternal}' on an installed checkout`;
+      detail = unresolvedExternalDetail(blamedExternal);
     }
   }
 

@@ -89,6 +89,10 @@ pub struct FactFiles {
     /// them apart. The orchestrator keeps these calls out of the request
     /// members it joins to callers.
     pub server_framework_calls: BTreeMap<String, BTreeSet<u32>>,
+    /// The span starts of the same calls, by file. A summary row stated at
+    /// one of these calls is a registration the store names, not a request,
+    /// and is withdrawn (`RequestSummaryIndex::withdraw_registrations`).
+    pub server_framework_starts: BTreeMap<String, BTreeSet<u32>>,
     /// The spans of the calls whose labelled export is a GraphQL client and
     /// which carry no listed end, by file (carrick#2763). A hook that hands a document to a client executes
     /// an operation; the HTTP reader is never asked about it, so a row the
@@ -190,6 +194,11 @@ impl FactFiles {
                         .entry(file.clone())
                         .or_default()
                         .insert(site.line);
+                    facts
+                        .server_framework_starts
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(site.span_start);
                 }
                 if !first.unanswered.contains(site.package()) {
                     continue;
@@ -219,6 +228,7 @@ impl FactFiles {
         self.listed.retain(|file, _| owns(file));
         self.calls.retain(|(file, _, _), _| owns(file));
         self.server_framework_calls.retain(|file, _| owns(file));
+        self.server_framework_starts.retain(|file, _| owns(file));
         self
     }
 
@@ -254,6 +264,15 @@ impl FactFiles {
             count(|why| why.lead),
             count(|why| why.unanswered_package),
         )
+    }
+
+    /// The calls the store labels a server framework, as repo-relative file
+    /// and call span start pairs.
+    pub fn server_framework_start_pairs(&self) -> Vec<(String, u32)> {
+        self.server_framework_starts
+            .iter()
+            .flat_map(|(file, starts)| starts.iter().map(|start| (file.clone(), *start)))
+            .collect()
     }
 
     /// Whether the call on `line` of `module` is made through a server
@@ -594,6 +613,19 @@ mod tests {
             &root,
         );
         assert!(facts.server_framework_call(&root.join("src/app.ts"), 5));
+        let registered = files[0].1.find("srv.get").expect("the call") as u32 + 1;
+        let sent = files[1].1.find("http.get").expect("the call") as u32 + 1;
+        assert!(
+            facts
+                .server_framework_start_pairs()
+                .contains(&("src/app.ts".to_string(), registered))
+        );
+        assert!(
+            facts
+                .server_framework_start_pairs()
+                .iter()
+                .all(|(_, start)| *start != sent)
+        );
         assert!(!facts.server_framework_call(&root.join("src/status.ts"), 4));
         assert!(!facts.server_framework_call(&root.join("src/other/app.ts"), 5));
     }

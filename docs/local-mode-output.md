@@ -176,6 +176,22 @@ is 0 on every service `refresh` scans, because `refresh` asks the model nothing.
 model answers were withheld because their working-tree bytes changed. An absent
 counter means this scan did not record it.
 
+`model_rows_carried` and `model_rows_not_carried` say what a no-model scan did
+with the rows of those files (carrick#2894). A row whose call sits on a line the
+edit left alone is carried: it moves to its new line and its types are read from
+the working tree. Every other row is counted in `model_rows_not_carried` as
+`file:line reason`, and is not checked. The reasons are
+`registration_line_changed` (the edit replaced the registration line),
+`no_matching_call` (no single call on that line matches the one the answer
+named), `hint_outside_registration_changed` (a handler named at the
+registration changed, so a type read there could come from the wrong function),
+`carried_untyped` (carried, but the send line was edited, so there is no
+response type), `old_source_unavailable` (this clone does not hold the indexed
+commit's copy of the file) and `not_carried_<field>` (GraphQL, pub/sub and
+dispatch rows are not carried yet). Both counters are absent when the tree has
+no edited file with rows to carry. Carried rows are never written to the
+stored index.
+
 ### Top level
 
 | field | type | meaning |
@@ -284,11 +300,23 @@ through a published package, are not recorded.
 
 Types first in line order, one line per operation; then functions, most callers
 first. A location in another service is prefixed with that service. A line
-names at most four locations and counts the rest. The post-edit hook prints at
-most eight of these lines, once per file per session. The Read hook
+names at most four locations and counts the rest. The Read hook
 (`carrick hook post-read`) prints them, with the other side of each route or
-call in the file, the first time a session reads a TypeScript file; the
-post-edit hook then leaves them out for that file.
+call in the file, the first time a session reads a TypeScript file. The
+post-edit hook prints none of them: it counts them in one line, once per file
+per session, and leaves that out too for a file the Read hook already covered.
+
+### What the post-edit hook prints
+
+Only what the edit needs acted on, a few lines per file
+(`renderPostToolUse` in `npm/carrick/src/render.ts`):
+
+- A file the re-check answered from the working tree: one line counting its
+  contract problems, then at most three of them, one line each.
+- A file the re-check did not answer for (it missed its budget, or none ran):
+  one line that sends the reader to `carrick check --changed`, and none of the
+  index's verdicts, which describe the file before the edit.
+- A deleted file: what the index still holds for it, and its problems.
 
 ### `items[]`
 
@@ -519,8 +547,9 @@ inventory-svc/src/client.ts:13  no route  call GET /api/v1/gadgets/:gadgetId: no
 `services`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
 `problems` (`kind` `incompatible` | `no_route`, `file`, `line`, `role`,
 `method`, `path`, `other`, `reason`, `source`, `already_indexed`,
-`unconfirmed`, `fails`), `failing`,
-`elapsed_ms`, and `not_checked` when nothing could be checked.
+`unconfirmed`, `other_build`, `fails`), `failing`,
+`elapsed_ms`, `not_checked` when nothing could be checked, and
+`index_scanner` when the index was written by another scanner build.
 
 **Exit code.** The one read a verdict moves: 1 when any problem `fails`, else
 0. An incompatible pair fails when its finding's edge source is `fact` and its
@@ -533,7 +562,19 @@ base: a parameter, a field, a config value that reads no environment variable)
 is `unconfirmed` and never fails, because the check cannot tell a service of
 this workspace from an outside API there; the exception is a call the index
 matched to a workspace route, whose loss is a fact. A problem resting on a
-model candidate, or on rows that state no source, exits 0 too. A check that
+model candidate, or on rows that state no source, exits 0 too.
+
+**An index another scanner build wrote** (carrick#2911). The index records
+the version and the stamped commit of the build that wrote it. When that is
+not the running build (after an upgrade, or a local build), the index's
+silence about a row is no evidence the row is new: that build may not have
+read it. A problem that is new only by that silence is `other_build`: it
+is listed without `--all`, marked `[not checked: the index is from another
+scanner build]`, does not fail, and the run exits 2 when nothing else fails,
+with one line naming both builds and saying to run `carrick refresh` on the
+main branch (on a branch, `refresh` would take the branch's own new problems
+in as already indexed). What the index did read still decides: a call it
+matched that now reaches no route fails whichever build wrote it. A check that
 covered none of the files it was asked about exits 2, which no verdict uses:
 no index, an index not bound to this folder, a file not in the index, a
 service that is not indexed, or the budget spent. It names each file or repo
@@ -545,12 +586,19 @@ exit codes.
 The budget is five minutes, `CARRICK_CHECK_BUDGET_MS`.
 
 **Quiet by default.** Only problems that fail the run are listed. The rest
-are counted on the summary line, `..., plus 2 unconfirmed, run with --all to
-list them`, and `--all` lists them, each marked with why: `[already in the
-index, does not fail]`, `[unconfirmed: the base is set at run time, does not
-fail]`, `[model candidate, does not fail]` or `[source not stated, does not
-fail]`. `--json` always lists every problem, with its `source`,
+are counted on the summary line by why they do not fail, `..., plus 2 already
+in the index and 1 unconfirmed, run with --all to list them`, and `--all`
+lists them, each marked with the same reason: `[already in the index, does
+not fail]`, `[unconfirmed: the base is set at run time, does not fail]`,
+`[model candidate, does not fail]` or `[source not stated, does not fail]`.
+A problem the index already held is counted as that, whatever else holds for
+it. `--json` always lists every problem, with its `source`,
 `already_indexed`, `unconfirmed` and `fails`.
+
+**Files the work did not touch.** A call in such a file is reported only when
+the index matched it and no service serves it now. It is listed when it fails,
+and with `--all` otherwise; it is never counted on the summary line, which is
+about the changed files.
 
 **Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same
 pass over the files named, in any repos of the workspace, instead of the

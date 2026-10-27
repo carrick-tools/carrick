@@ -594,7 +594,7 @@ pub struct CaptureV2Result {
 /// than what its handler returns (carrick#1516). That last one never leaves
 /// the scanner as a value: on the wire it is a `compatible` verdict with
 /// `producer_wider: true` beside it.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictBucket {
     Compatible,
@@ -607,7 +607,7 @@ pub enum VerdictBucket {
 }
 
 /// One structured verdict from `check_v2`, keyed by pair identity.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckVerdict {
     /// Deterministic FNV-1a hash of the pair (never a temp path).
     pub pair_id: String,
@@ -1208,14 +1208,14 @@ pub struct LibraryClaimsAnswer {
 }
 
 /// A service whose pairs are degraded wholesale (install failure or poison).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DegradedService {
     pub service_name: String,
     pub reason: String,
 }
 
 /// Result of a `check_v2` action (mirrors `CheckResult`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckV2Result {
     /// `false` when the check failed part way (`errors` says why); every
     /// verdict still stands, each with its own reason.
@@ -1240,7 +1240,7 @@ pub struct CheckV2Result {
 }
 
 /// How the check's compiler process ended (mirrors `CompilerEnd`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilerEnd {
     /// Its exit code, or `None` when a signal ended it.
     pub exit_code: Option<i32>,
@@ -2268,6 +2268,65 @@ fn executable_relative_path(relative: &str) -> PathBuf {
 // The sidecar process
 // ============================================================================
 
+/// Every sidecar this process started that is still owned by a
+/// [`TypeSidecar`], so a signal that ends this process ends them too.
+///
+/// A sidecar building a program runs synchronous compiler work for minutes,
+/// and Node runs a signal handler or notices its stdin close only between
+/// turns of its event loop: a SIGTERM to it, or this process going away, is
+/// not heard until that work ends. A parent that exits on a signal without
+/// killing its sidecars leaves them running, and they then need a SIGKILL
+/// from whoever finds them. The parent's SIGKILL is the one signal a busy
+/// sidecar cannot defer, so the parent sends it ([`kill_live_sidecars`]).
+/// A handle with no process behind it answers through the resident type
+/// daemon, which is not this process's to end.
+static LIVE_SIDECARS: Mutex<Vec<std::sync::Weak<Mutex<Option<Child>>>>> = Mutex::new(Vec::new());
+
+/// Hold `child` in [`LIVE_SIDECARS`] for as long as its sidecar owns it.
+/// Called again when a restart puts a fresh process behind the same handle.
+fn track(child: &Arc<Mutex<Option<Child>>>) {
+    if let Ok(mut live) = LIVE_SIDECARS.lock() {
+        live.retain(|held| held.strong_count() > 0);
+        let weak = Arc::downgrade(child);
+        if !live.iter().any(|held| held.ptr_eq(&weak)) {
+            live.push(weak);
+        }
+    }
+    // Started after the signal's sweep, by a thread that had not yet
+    // noticed it: ended here, so no sidecar outlives the run.
+    if crate::shutdown::requested().is_some()
+        && let Ok(mut held) = child.lock()
+        && let Some(child) = held.as_mut()
+    {
+        let _ = child.kill();
+    }
+}
+
+/// SIGKILL every sidecar this process still owns. For a process that a
+/// signal is ending (carrick#1124 left the drop path to do this; a
+/// `process::exit` or a thread still holding a sidecar never reaches it).
+///
+/// A process already reaped is not signalled: `Child::kill` answers for a
+/// child it has waited on without sending anything, so a pid the system has
+/// since reused is never touched. A handle another thread holds locked at
+/// this moment is skipped rather than waited for: this runs on the way out.
+pub fn kill_live_sidecars() -> usize {
+    let held: Vec<Arc<Mutex<Option<Child>>>> = match LIVE_SIDECARS.lock() {
+        Ok(live) => live.iter().filter_map(std::sync::Weak::upgrade).collect(),
+        Err(_) => return 0,
+    };
+    let mut killed = 0;
+    for child in held {
+        if let Ok(mut child) = child.try_lock()
+            && let Some(child) = child.as_mut()
+            && child.kill().is_ok()
+        {
+            killed += 1;
+        }
+    }
+    killed
+}
+
 /// One running sidecar process and the two ends of its pipe.
 struct SidecarProcess {
     child: Child,
@@ -2522,7 +2581,9 @@ pub struct TypeSidecar {
     /// Child process handle. Behind a mutex because a timeout kills it, and
     /// an operation's timeout replaces it, from a `&self` method. `None`
     /// while this answers through the resident daemon ([`Self::daemon`]).
-    child: Mutex<Option<Child>>,
+    /// Shared with [`LIVE_SIDECARS`], so a signal that ends this process can
+    /// end it too.
+    child: Arc<Mutex<Option<Child>>>,
     /// Where requests are written: the child's stdin, or the daemon's socket.
     stdin: Mutex<Box<dyn Write + Send>>,
     /// The resident type daemon's connection, while this answers through it
@@ -2845,9 +2906,11 @@ impl TypeSidecar {
         evidence: DeathEvidence,
         spawn_time: Instant,
     ) -> Self {
+        let child = Arc::new(Mutex::new(child));
+        track(&child);
         Self {
             sidecar_path: sidecar_path.to_path_buf(),
-            child: Mutex::new(child),
+            child,
             stdin: Mutex::new(stdin),
             daemon: Mutex::new(daemon),
             sent_to_daemon: Mutex::new(None),
@@ -2942,6 +3005,15 @@ impl TypeSidecar {
     /// readiness, inference, bundling, the capture, the check.
     fn note_death(&self) {
         if self.death_noted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // A signal ending this run killed it ([`kill_live_sidecars`]): that
+        // is the run stopping, not the type checker dying.
+        if let Some(signal) = crate::shutdown::requested() {
+            debug!(
+                "[type_sidecar] The sidecar process was ended by this run's {}",
+                signal.name()
+            );
             return;
         }
         let death = self.how_the_process_died();
@@ -3307,6 +3379,7 @@ impl TypeSidecar {
             Err(e) => return failed(e.to_string()),
         };
         *self.child.lock().unwrap() = Some(process.child);
+        track(&self.child);
         *self.stdin.lock().unwrap() = Box::new(process.stdin);
         *self.responses.lock().unwrap() = process.responses;
         *self.evidence.lock().unwrap() = process.evidence;
@@ -3811,6 +3884,43 @@ impl TypeSidecar {
             })?)
             .map_err(|e| SidecarError::DeserializationError(e.to_string()))?;
         Ok(result.answers)
+    }
+
+    /// Names the sidecar build this process runs: a hash of every script
+    /// file beside its entry. Part of the key a judge answer is kept under,
+    /// so another build never reuses it.
+    pub fn build_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if entry.file_name() != "node_modules" {
+                        walk(&path, out);
+                    }
+                } else if path
+                    .extension()
+                    .is_some_and(|e| matches!(e.to_str(), Some("js" | "mjs" | "cjs" | "json")))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        if let Some(dir) = self.sidecar_path.parent() {
+            walk(dir, &mut files);
+        }
+        files.sort();
+        let mut h = Sha256::new();
+        h.update(self.sidecar_path.to_string_lossy().as_bytes());
+        for file in files {
+            h.update(file.to_string_lossy().as_bytes());
+            h.update(std::fs::read(&file).unwrap_or_default());
+        }
+        format!("{:x}", h.finalize())
     }
 
     /// Run the v2 "tsc as the judge" check over assembled capture stubs.
@@ -4904,7 +5014,9 @@ impl Drop for TypeSidecar {
         // Force kill if still running, and reap it: a scan starts a sidecar
         // per service, and each one left unreaped would stay in the process
         // table until the scan ends (carrick#1066).
-        if let Ok(Some(child)) = self.child.get_mut() {
+        if let Ok(mut held) = self.child.lock()
+            && let Some(child) = held.as_mut()
+        {
             let _ = child.kill();
             let _ = child.wait();
         }

@@ -3792,7 +3792,7 @@ async fn analyze_current_repo_incremental(
                 }
             };
 
-            let cached_model_results = reusable_model_answers(
+            let mut cached_model_results = reusable_model_answers(
                 files
                     .iter()
                     .map(|f| (f.to_string_lossy().to_string(), normalize_path(f))),
@@ -3980,6 +3980,27 @@ async fn analyze_current_repo_incremental(
             // fix reach this repo without a model call — and it is why there is
             // no merge with the previous scan's rows below: this run states
             // them all, and a deleted file simply has no row.
+            // A no-model scan has nobody to ask about a file edited since the
+            // previous generation, so that file's rows would be lost in the one
+            // scan meant to judge the edit. Carry the previous answer onto the
+            // lines the edit left alone (carrick#2894); every row left behind
+            // is counted in the boundary below.
+            let carried = if crate::local_mode::no_model() {
+                crate::model_carry::carry_edited_files(
+                    repo_path,
+                    prev_commit,
+                    files
+                        .iter()
+                        .map(|f| (f.to_string_lossy().to_string(), normalize_path(f))),
+                    prev_file_results,
+                    &unchanged,
+                    &setup.detection.data_fetchers,
+                    &setup.detection.messaging_clients,
+                )
+            } else {
+                crate::model_carry::Carried::default()
+            };
+            cached_model_results.extend(carried.answers.clone());
             enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
             // The summaries are composed once the schedule started above has
             // settled; the analysis reads them only once the model has been
@@ -4036,8 +4057,12 @@ async fn analyze_current_repo_incremental(
             crate::phase_timing::mark(crate::phase_timing::Phase::Model);
 
             let merged_results = normalize_file_results_keys(&analysis.file_results, repo_path);
-            let raw_model_results =
+            let mut raw_model_results =
                 normalize_file_results_keys(&analysis.raw_model_results, repo_path);
+            // A carried answer is keyed by this tree's candidate ids and was
+            // mapped from the previous generation's commit. Stored, it would be
+            // mapped again from the wrong base, so it is joined and never kept.
+            raw_model_results.retain(|file, _| !carried.files.contains(file));
 
             // Rebuild mount graph from full merged results
             let graph_orchestrator = FileOrchestrator::new(agent_service.clone());
@@ -4389,6 +4414,10 @@ async fn analyze_current_repo_incremental(
                         .filter(|file| !unchanged.contains(*file))
                         .count(),
                 );
+                let boundary = cloud_data.boundary.as_mut().unwrap();
+                boundary.model_rows_carried = (carried.examined > 0).then_some(carried.carried);
+                boundary.model_rows_not_carried = (!carried.not_carried.is_empty())
+                    .then(|| crate::boundary::Counted::from_reasons(carried.not_carried.clone()));
             }
             // Everything between the marks above: manifest assembly, the
             // deterministic attachments, relativisation. Named so the printed
@@ -5242,11 +5271,19 @@ async fn site_rows_of(
         .iter()
         .filter(|lead| lead.reason == crate::request_summary::decided_sites::Undecided::NoOpClaim)
         .count();
+    let several_operations = decided
+        .leads
+        .iter()
+        .filter(|lead| {
+            lead.reason == crate::request_summary::decided_sites::Undecided::SeveralOperations
+        })
+        .count();
     debug!(
         discovered,
         reached_label,
         decided = decided.sites.len(),
         no_op_claim,
+        several_operations,
         rows = rows.rows.len(),
         possible_calls = rows.leads.len(),
         leads_by_reason = ?leads_by_reason,

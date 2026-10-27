@@ -29,9 +29,9 @@ use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureV2Result, CheckPairEndpoint,
-    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, MemoryDeath,
-    OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem, RetypeOutcome,
-    RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
+    CheckPairSpec, CheckStubInput, CheckV2Result, InferKind, InferRequestItem, ManifestEntry,
+    MemoryDeath, OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem,
+    RetypeOutcome, RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
 };
 
 // ===========================================================================
@@ -695,6 +695,30 @@ pub(crate) fn derive_capture_anchors(
                 alias: alias.to_string(),
                 type_text: "unknown".to_string(),
                 anchor_origin: AnchorOrigin::ManifestPlaceholder,
+                source_file: None,
+                printed_names: Vec::new(),
+                raw_text_read: false,
+                absent_body_tolerated: false,
+            });
+            continue;
+        }
+        // A line-only body request has no payload for the capture to re-read:
+        // the first expression on a registration line is the registration
+        // call, and its own result (a route chain, `void`) would be served as
+        // the reply (carrick#2727). It takes the placeholder, as a decided
+        // abstain does.
+        if matches!(
+            request.infer_kind,
+            InferKind::ResponseBody | InferKind::RequestBody
+        ) && request.span_start.is_none()
+            && request.span_end.is_none()
+            && request.expression_text.is_none()
+            && request.param_name.is_none()
+        {
+            anchors.push(CaptureAnchor::Literal {
+                alias: alias.to_string(),
+                type_text: "unknown".to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
@@ -2157,6 +2181,108 @@ pub(crate) fn materialize_stubs(
     stubs
 }
 
+/// The folder one `check --changed` keeps its finished judge answers in. The
+/// re-scan and the re-join are two processes that judge the same input; each
+/// is handed this folder, so the second takes the first's answer. Unset
+/// everywhere else, where nothing is kept.
+pub(crate) const JUDGE_ANSWERS_ENV: &str = "CARRICK_JUDGE_ANSWERS_DIR";
+
+/// Whole-input key of one judge run: the sidecar build, every stub's service
+/// name and file contents (not its temp path or its place in the list), and
+/// the pair specs. Any
+/// difference in any of them is a different key.
+fn judge_key(build_key: &str, stubs: &[CheckStubInput], specs: &[CheckPairSpec]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut h = Sha256::new();
+    let mut put = |bytes: &[u8]| {
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    put(build_key.as_bytes());
+    put(&(stubs.len() as u64).to_le_bytes());
+    // The two runs list the same stubs in different orders; the workspace
+    // names each by service, so the order is not part of the input.
+    let mut ordered: Vec<&CheckStubInput> = stubs.iter().collect();
+    ordered.sort_by(|a, b| a.service_name.cmp(&b.service_name));
+    for stub in ordered {
+        put(stub.service_name.as_bytes());
+        let root = Path::new(&stub.stub_dir);
+        let mut files = Vec::new();
+        walk(root, &mut files).ok()?;
+        files.sort();
+        put(&(files.len() as u64).to_le_bytes());
+        for file in files {
+            let rel = file.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            put(rel.as_bytes());
+            put(&std::fs::read(&file).ok()?);
+        }
+    }
+    put(serde_json::to_string(specs).ok()?.as_bytes());
+    Some(format!("{:x}", h.finalize()))
+}
+
+/// Run `judge` unless an identical input already got a finished answer in
+/// the folder [`JUDGE_ANSWERS_ENV`] names.
+fn judge_once(
+    build_key: &str,
+    stubs: &[CheckStubInput],
+    specs: &[CheckPairSpec],
+    judge: impl FnOnce() -> Result<CheckV2Result, SidecarError>,
+) -> Result<CheckV2Result, SidecarError> {
+    let dir = std::env::var_os(JUDGE_ANSWERS_ENV).map(PathBuf::from);
+    judge_once_in(dir.as_deref(), build_key, stubs, specs, judge)
+}
+
+/// [`judge_once`], over a named folder. Only a check that ran to the end is
+/// kept; a failed one is judged again. An input that cannot be keyed, or an
+/// answer that cannot be read back, is judged, never guessed.
+fn judge_once_in(
+    dir: Option<&Path>,
+    build_key: &str,
+    stubs: &[CheckStubInput],
+    specs: &[CheckPairSpec],
+    judge: impl FnOnce() -> Result<CheckV2Result, SidecarError>,
+) -> Result<CheckV2Result, SidecarError> {
+    let Some(dir) = dir else {
+        return judge();
+    };
+    let Some(key) = judge_key(build_key, stubs, specs) else {
+        return judge();
+    };
+    let kept = dir.join(format!("{key}.json"));
+    if let Some(answer) = std::fs::read(&kept)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CheckV2Result>(&bytes).ok())
+    {
+        debug!("v2 check: identical input already judged; reusing its answer");
+        return Ok(answer);
+    }
+    let result = judge()?;
+    if result.success && result.compiler_end.is_none() {
+        // Written whole and renamed in, so a process that reads while the
+        // other writes never sees half an answer.
+        let staged = dir.join(format!("{key}.{}.tmp", std::process::id()));
+        let wrote = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&staged, serde_json::to_vec(&result).unwrap_or_default()))
+            .and_then(|()| std::fs::rename(&staged, &kept));
+        if let Err(e) = wrote {
+            debug!("v2 check: could not keep the answer: {e}");
+        }
+    }
+    Ok(result)
+}
+
 /// Run the v2 check over the built pairs and produce the analyzer's pair
 /// outcomes. Pairs with a pre-set verdict (no surface / unresolved side)
 /// never reach the sidecar. A check that failed part way (an install, an
@@ -2212,7 +2338,9 @@ pub(crate) fn run_check(
                 "no capture stubs available".to_string(),
             ))
         } else {
-            sidecar.check_v2(&stubs, &specs)
+            judge_once(&sidecar.build_key(), &stubs, &specs, || {
+                sidecar.check_v2(&stubs, &specs)
+            })
         };
         let oom_kills_rose = crate::services::type_sidecar::oom_kills_rose(
             oom_kills_before,
@@ -5567,6 +5695,194 @@ mod tests {
         );
     }
 
+    /// A line names no payload (carrick#2727). A body request that carries a
+    /// line only (no span, no expression text, no parameter name) and that the
+    /// inferrer left unanswered takes the `unknown` placeholder. An infer anchor
+    /// would let the capture read the first expression on that line, which on a
+    /// registration line is the registration call's own result.
+    #[test]
+    fn derive_anchors_gives_a_line_only_body_request_the_placeholder() {
+        let line_only = |alias: &str, kind: InferKind| {
+            let mut request = response_body_infer(alias);
+            request.span_start = None;
+            request.span_end = None;
+            request.infer_kind = kind;
+            request
+        };
+        let mut with_text = line_only("Endpoint_text_Response", InferKind::ResponseBody);
+        with_text.expression_text = Some("res.json(body)".to_string());
+        let infer = vec![
+            line_only("Endpoint_line_Response", InferKind::ResponseBody),
+            line_only("Endpoint_line_Request", InferKind::RequestBody),
+            with_text,
+            line_only("Endpoint_call_Response", InferKind::CallResult),
+            line_only("Endpoint_return_Response", InferKind::FunctionReturn),
+        ];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[], &[], "/repo");
+
+        assert_eq!(anchors.len(), 5, "{anchors:?}");
+        for anchor in &anchors[..2] {
+            match anchor {
+                CaptureAnchor::Literal {
+                    type_text,
+                    anchor_origin,
+                    source_file,
+                    ..
+                } => {
+                    assert_eq!(type_text, "unknown");
+                    assert_eq!(*anchor_origin, AnchorOrigin::DeterministicInfer);
+                    assert!(source_file.is_none());
+                }
+                other => {
+                    panic!("a line-only body request must be a literal unknown, got {other:?}")
+                }
+            }
+        }
+        for anchor in &anchors[2..] {
+            assert!(
+                matches!(anchor, CaptureAnchor::Infer { .. }),
+                "a located or non-body request keeps its infer anchor, got {anchor:?}"
+            );
+        }
+    }
+
+    /// carrick#2727 through the real sidecar: line-only body requests at three
+    /// registration lines. The inferrer types the imported handler's reply; the
+    /// inline route and the middleware registration answer nothing, and the
+    /// capture must not publish the registration call's own result (a route
+    /// chain object, `void`) as their reply.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_line_only_registration_request_is_not_answered_by_the_registration_call() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("api");
+        let write = |rel: &str, text: &str| {
+            let file = repo.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{ "name": "route-chain-api", "version": "1.0.0" }"#,
+        );
+        write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "target": "ES2020", "module": "commonjs", "moduleResolution": "node", "strict": true, "esModuleInterop": true, "skipLibCheck": true }, "include": ["src/**/*"] }"#,
+        );
+        write(
+            "src/framework.ts",
+            "export interface Req { params: Record<string, string>; }\n\
+             export interface Res { sendStatus(code: number): void; write(text: string): void; }\n\
+             export type Handler = (req: Req, res: Res) => unknown;\n\
+             export interface RouteChain { get(...handlers: Handler[]): RouteChain; }\n\
+             export class Router { route(path: string): RouteChain { throw new Error(path); } }\n\
+             export const server: { use(fn: unknown): void } = { use() {} };\n",
+        );
+        write(
+            "src/items.handlers.ts",
+            "import { Req } from './framework';\n\
+             export interface ItemList { items: { id: string }[]; total: number; }\n\
+             export async function listItems(_req: Req): Promise<ItemList> {\n\
+             \x20 const body: ItemList = { items: [{ id: 'a' }], total: 1 };\n\
+             \x20 return body;\n\
+             }\n",
+        );
+        write(
+            "src/items.routes.ts",
+            "import { Router } from './framework';\n\
+             import { listItems } from './items.handlers';\n\
+             \n\
+             export const router = new Router();\n\
+             \n\
+             router.route('/items').get(listItems);\n\
+             router.route('/ping').get((_req, res) => {\n\
+             \x20 res.sendStatus(204);\n\
+             });\n",
+        );
+        write(
+            "src/use.ts",
+            "import { server } from './framework';\n\
+             \n\
+             server.use(async (_req: unknown, res: { write(text: string): void }): Promise<void> => {\n\
+             \x20 res.write('x');\n\
+             });\n",
+        );
+
+        let request = |file: &str, line: u32, alias: &str| InferRequestItem {
+            member: None,
+            file_path: repo.join(file).to_string_lossy().to_string(),
+            line_number: line,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::ResponseBody,
+            alias: Some(alias.to_string()),
+            param_name: None,
+            result: None,
+        };
+        let items = vec![
+            request("src/items.routes.ts", 6, "Route_imported_Response"),
+            request("src/items.routes.ts", 7, "Route_inline_Response"),
+            request("src/use.ts", 3, "Route_middleware_Response"),
+        ];
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&repo, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+        let resolved = sidecar
+            .resolve_all_types(&[], &items, None, None)
+            .expect("resolve_all_types");
+        let anchors = derive_capture_anchors(
+            &[],
+            &items,
+            &[],
+            &resolved.inferred_types,
+            &[],
+            repo.to_str().unwrap(),
+        );
+        let (stub_dir, _artifact) = run_capture(
+            &sidecar,
+            repo.to_str().unwrap(),
+            "route-chain-api",
+            &anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("capture");
+        let surface = std::fs::read_to_string(stub_dir.join("types/surface.d.ts")).unwrap();
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        let line_of = |alias: &str| -> String {
+            let start = surface
+                .find(&format!("type {alias} "))
+                .unwrap_or_else(|| panic!("no surface line for {alias}:\n{surface}"));
+            let rest = &surface[start..];
+            let end = rest[1..].find("\nexport ").map_or(rest.len(), |i| i + 1);
+            rest[..end].trim_end().to_string()
+        };
+        assert!(
+            line_of("Route_imported_Response").contains("total: number"),
+            "the imported handler's reply keeps its stated body:\n{surface}"
+        );
+        assert!(
+            line_of("Route_inline_Response").ends_with("= unknown;"),
+            "the inline route must not serve the registration call's result:\n{surface}"
+        );
+        assert!(
+            line_of("Route_middleware_Response").ends_with("= unknown;"),
+            "the middleware registration must not serve `void`:\n{surface}"
+        );
+    }
+
     /// carrick#2674 P3-1a: a `request_config` question asks whether an
     /// options literal writes a body key. A null answer must take the
     /// placeholder: an infer anchor at the literal would publish the options
@@ -8070,6 +8386,114 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             deterministic_route(),
         );
         assert_eq!(pre_verdict_of(&pairs), None);
+    }
+
+    // ---- judge once -----------------------------------------------------
+
+    fn kept_stub(root: &Path, name: &str, body: &str) -> CheckStubInput {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("types")).unwrap();
+        std::fs::write(dir.join("types/a.d.ts"), body).unwrap();
+        CheckStubInput {
+            service_name: name.to_string(),
+            stub_dir: dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn one_spec(key: &str) -> CheckPairSpec {
+        CheckPairSpec {
+            pair_key: key.to_string(),
+            protocol: ProbeProtocol::Http,
+            type_kind: ProbeTypeKind::Response,
+            producer: CheckPairEndpoint {
+                service_name: "p".to_string(),
+                alias: "A".to_string(),
+            },
+            consumer: CheckPairEndpoint {
+                service_name: "c".to_string(),
+                alias: "B".to_string(),
+            },
+            topic: None,
+        }
+    }
+
+    fn answer(success: bool, ts: &str) -> CheckV2Result {
+        serde_json::from_value(serde_json::json!({
+            "success": success, "isolation": "pnpm", "install_ok": true, "ts_version": ts,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn identical_input_is_judged_once_and_a_changed_input_is_judged_again() {
+        let kept = tempfile::tempdir().unwrap();
+        let dir = Some(kept.path());
+        let calls = std::cell::Cell::new(0);
+        let judge = |ts: &str| {
+            calls.set(calls.get() + 1);
+            Ok(answer(true, ts))
+        };
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        // Same content under two different temp paths: the same input.
+        let stubs_a = [kept_stub(a.path(), "svc", "export type A = number;")];
+        let stubs_b = [kept_stub(b.path(), "svc", "export type A = number;")];
+        let specs = [one_spec("k")];
+
+        let first = judge_once_in(dir, "build1", &stubs_a, &specs, || judge("5.9")).unwrap();
+        let second = judge_once_in(dir, "build1", &stubs_b, &specs, || judge("OTHER")).unwrap();
+        assert_eq!(calls.get(), 1, "the identical input must not judge twice");
+        assert_eq!(first.ts_version, second.ts_version, "same answer returned");
+
+        // The same stubs listed in another order are the same input.
+        let d = tempfile::tempdir().unwrap();
+        let two_a = [
+            kept_stub(d.path(), "one", "export type A = 1;"),
+            kept_stub(d.path(), "two", "export type A = 2;"),
+        ];
+        let two_b = [two_a[1].clone(), two_a[0].clone()];
+        judge_once_in(dir, "build1", &two_a, &specs, || judge("x")).unwrap();
+        judge_once_in(dir, "build1", &two_b, &specs, || judge("x")).unwrap();
+        assert_eq!(calls.get(), 2, "a permuted stub list must not judge again");
+
+        // Each part of the input, changed alone, judges again.
+        let c = tempfile::tempdir().unwrap();
+        let changed_stub = [kept_stub(c.path(), "svc", "export type A = string;")];
+        judge_once_in(dir, "build1", &changed_stub, &specs, || judge("x")).unwrap();
+        assert_eq!(calls.get(), 3, "a changed stub must be judged");
+        judge_once_in(dir, "build1", &stubs_a, &[one_spec("other")], || judge("x")).unwrap();
+        assert_eq!(calls.get(), 4, "a changed pair set must be judged");
+        judge_once_in(dir, "build2", &stubs_a, &specs, || judge("x")).unwrap();
+        assert_eq!(calls.get(), 5, "another sidecar build must be judged");
+    }
+
+    #[test]
+    fn a_failed_check_is_not_kept_and_no_folder_keeps_nothing() {
+        let kept = tempfile::tempdir().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let a = tempfile::tempdir().unwrap();
+        let stubs = [kept_stub(a.path(), "svc", "export type A = number;")];
+        let specs = [one_spec("k")];
+        for success in [false, false] {
+            judge_once_in(Some(kept.path()), "b", &stubs, &specs, || {
+                calls.set(calls.get() + 1);
+                Ok(answer(success, "5.9"))
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            calls.get(),
+            2,
+            "a check that did not finish is judged again"
+        );
+        for _ in 0..2 {
+            judge_once_in(None, "b", &stubs, &specs, || {
+                calls.set(calls.get() + 1);
+                Ok(answer(true, "5.9"))
+            })
+            .unwrap();
+        }
+        assert_eq!(calls.get(), 4, "with no folder every call judges");
     }
 
     // ---- end-to-end: capture_v2 -> check_v2 -> pair outcomes -> edge join --

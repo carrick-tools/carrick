@@ -81,6 +81,16 @@ pub struct ServiceBoundary {
     /// Files whose hosted model answers were withheld because their working-tree bytes changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates_withheld_changed_files: Option<usize>,
+    /// Rows of edited files that a no-model scan carried onto the lines the
+    /// edit left alone (carrick#2894). Set only when such a file had rows to
+    /// carry; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_rows_carried: Option<usize>,
+    /// Rows of edited files a no-model scan did not carry, or carried without
+    /// a response type, each as `file:line reason`. These rows are not
+    /// checked. Absent when every row was carried and typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_rows_not_carried: Option<Counted>,
     /// The commit this service's rows were read at. Already on the blob;
     /// repeated here so the whole boundary is one struct: a count means
     /// nothing without the tree it was counted on.
@@ -295,6 +305,8 @@ impl ServiceBoundary {
         let library_counts = crate::scan_health::library_packages_for(data.service_name.as_deref());
         Self {
             candidates_withheld_changed_files: None,
+            model_rows_carried: None,
+            model_rows_not_carried: None,
             commit_hash: data.commit_hash.clone(),
             files_attempted: stats.files_model_dispatched,
             files_lost: Counted::new(stats.files_analysis_failed, lost),

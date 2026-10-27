@@ -191,6 +191,8 @@ fn reason_of_undecided(reason: Undecided) -> UnreadReason {
         // A parameter of a callback this code does not call is, like a
         // parameter nothing fills, a name only the running program knows.
         Undecided::NameNeverBound | Undecided::CallbackParameter => UnreadReason::NameNeverBound,
+        // The program picks the name when it runs, by the call's arguments.
+        Undecided::SeveralOperations => UnreadReason::NameNeverBound,
         Undecided::NoOpClaim => UnreadReason::NoOpClaim,
         // A value passed in from elsewhere, and its values disagree on which
         // labelled export runs.

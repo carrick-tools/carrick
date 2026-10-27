@@ -1229,6 +1229,15 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
 /// one process is one build.
 static RUNNING_SCAN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Name the child this process is waiting on, so a signal to this process
+/// reaches it ([`forward_to_running_scan`]); `None` once it has been reaped.
+/// For the re-check's phases, which run their own subprocesses rather than
+/// through [`run_scan`].
+pub(super) fn waiting_on(child: Option<u32>) {
+    let pid = child.map_or(0, |pid| pid as i32);
+    RUNNING_SCAN.store(pid, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Send `signal` to the scan this build is waiting on, and say whether there
 /// was one (carrick#1379).
 ///
@@ -1736,6 +1745,7 @@ pub(super) fn build(
         hosted_source_key: None,
         version: READ_MODEL_VERSION,
         scanner_version: join.scanner_version.clone(),
+        scanner_build: crate::cloud_storage::ScannerBuild::current(),
         indexed_at: now,
         repos,
         // Stated by the caller, which alone knows what each repo uploaded.

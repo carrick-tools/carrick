@@ -887,7 +887,7 @@ impl StatusOutput {
             "{} — {} service(s), indexed at {} by carrick {}\n\n",
             self.workspace,
             self.services.len(),
-            self.indexed_at,
+            super::scan_state::local_time_label(&self.indexed_at),
             self.scanner_version
         ));
         for service in &self.services {

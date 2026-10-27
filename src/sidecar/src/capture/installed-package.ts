@@ -35,6 +35,11 @@ export interface InstalledPackageSpecifier {
   install: { name: string; root: string };
   /** The package the path landed in and its installed version, when published. */
   pin?: { name: string; version: string };
+  /**
+   * The name the entry exports the declaration under, set only when it differs
+   * from the name the path's declaration carries (`export { O as OmitKeys }`).
+   */
+  exportName?: string;
 }
 
 interface PackageManifest {
@@ -281,28 +286,81 @@ function entrySubpaths(manifest: PackageManifest): string[] {
   return [''];
 }
 
-const moduleExportsCache = new Map<string, Map<string, Set<string>>>();
+/**
+ * Declaration keys (`file\0declaredName`) of what `file` exports as `name`.
+ * A chunk can declare a type under its public name and export it under a
+ * short one (`export { type OmitKeyof as O }`), so the name read off the
+ * import is not the name the declaration carries.
+ */
+function declarationKeysOfExport(file: string, name: string): string[] {
+  const program = ts.createProgram([file], RESOLUTION_OPTIONS);
+  const checker = program.getTypeChecker();
+  const source = program.getSourceFile(file);
+  const moduleSymbol = source && checker.getSymbolAtLocation(source);
+  const symbol = moduleSymbol && checker.getExportsOfModule(moduleSymbol).find((s) => s.getName() === name);
+  if (!symbol) return [];
+  let target = symbol;
+  for (let hops = 0; target.flags & ts.SymbolFlags.Alias && hops < 16; hops++) {
+    const next = checker.getAliasedSymbol(target);
+    if (next === target) break;
+    target = next;
+  }
+  const keys: string[] = [];
+  for (const declaration of target.declarations ?? []) {
+    try {
+      keys.push(`${fs.realpathSync(declaration.getSourceFile().fileName)}\0${target.getName()}`);
+    } catch {
+      // declaration outside the real file system: ignore
+    }
+  }
+  return keys;
+}
 
-/** Exported names of `entryFile`, each with the real files declaring it. */
-function exportsOf(entryFile: string): Map<string, Set<string>> {
+interface EntryExports {
+  /** Exported names, each with the real files declaring it. */
+  byName: Map<string, Set<string>>;
+  /** `file\0declaredName` of each exported declaration to the name it is exported under. */
+  byDeclaration: Map<string, string>;
+}
+
+const moduleExportsCache = new Map<string, EntryExports>();
+
+/**
+ * Exports of `entryFile`: by exported name (with the real files declaring it)
+ * and by declaration identity (the file and the name the declaration carries
+ * there, whatever name the entry exports it under).
+ */
+function exportsOf(entryFile: string): EntryExports {
   const cached = moduleExportsCache.get(entryFile);
   if (cached) return cached;
-  const exported = new Map<string, Set<string>>();
+  const exported: EntryExports = { byName: new Map(), byDeclaration: new Map() };
   const program = ts.createProgram([entryFile], RESOLUTION_OPTIONS);
   const checker = program.getTypeChecker();
   const source = program.getSourceFile(entryFile);
   const moduleSymbol = source && checker.getSymbolAtLocation(source);
   for (const symbol of moduleSymbol ? checker.getExportsOfModule(moduleSymbol) : []) {
-    const target = symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+    let target = symbol;
+    // Follow the alias chain until it stops (an entry can re-export a re-export).
+    for (let hops = 0; target.flags & ts.SymbolFlags.Alias && hops < 16; hops++) {
+      const next = checker.getAliasedSymbol(target);
+      if (next === target) break;
+      target = next;
+    }
     const files = new Set<string>();
     for (const declaration of target.declarations ?? []) {
       try {
-        files.add(fs.realpathSync(declaration.getSourceFile().fileName));
+        const real = fs.realpathSync(declaration.getSourceFile().fileName);
+        files.add(real);
+        const key = `${real}\0${target.getName()}`;
+        // The first export of a declaration wins; its own name wins over a rename.
+        if (!exported.byDeclaration.has(key) || symbol.getName() === target.getName()) {
+          exported.byDeclaration.set(key, symbol.getName());
+        }
       } catch {
         // declaration outside the real file system: ignore
       }
     }
-    exported.set(symbol.getName(), files);
+    exported.byName.set(symbol.getName(), files);
   }
   moduleExportsCache.set(entryFile, exported);
   return exported;
@@ -343,8 +401,18 @@ export function installedPackageSpecifier(
     for (const entry of entrySubpaths(manifest)) {
       const entryFile = resolveAgainstInstall(publicName + entry, root, manifest.name)?.resolvedFileName;
       if (!entryFile) continue;
-      if (exportsOf(entryFile).get(importedName)?.has(file)) {
+      const entryExports = exportsOf(entryFile);
+      if (entryExports.byName.get(importedName)?.has(file)) {
         return withPin(publicName + entry);
+      }
+      // The entry may export the declaration under another name.
+      const renamed =
+        entryExports.byDeclaration.get(`${file}\0${importedName}`) ??
+        declarationKeysOfExport(file, importedName)
+          .map((key) => entryExports.byDeclaration.get(key))
+          .find((name) => name !== undefined);
+      if (renamed !== undefined) {
+        return { ...withPin(publicName + entry), exportName: renamed };
       }
     }
   }

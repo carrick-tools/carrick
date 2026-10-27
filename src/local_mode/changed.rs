@@ -19,7 +19,10 @@
 //! and is counted on the summary line, listed only with `--all`. A check that
 //! covered none of the files it was asked about, or could not run, exits
 //! [`EXIT_NOTHING_COVERED`] (carrick#2850): a pass it did not look at is not
-//! a pass.
+//! a pass. So does a run where nothing fails but a problem looks new only
+//! because the index was written by another scanner build, which may not
+//! have read that row (carrick#2911): the run names the build and says to
+//! run `carrick refresh` on the main branch.
 //!
 //! `carrick check a.ts b.ts` runs the same pass over the files named instead
 //! of the files changed ([`Selection::Named`]).
@@ -65,6 +68,10 @@ pub struct ChangedOutput {
     /// [`EXIT_NOTHING_COVERED`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_checked: Option<String>,
+    /// The scanner build that wrote the index, when it is not this one
+    /// (carrick#2911). The problems marked `other_build` rest on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_scanner: Option<String>,
 }
 
 /// One repo of the workspace, and what changed in it.
@@ -130,6 +137,16 @@ pub struct Problem {
     /// service of this workspace from an outside API. Printed, and never
     /// fails the run.
     pub unconfirmed: bool,
+    /// In a file the work did not touch: a call the index matched whose
+    /// route the work took away. Listed when it fails, and with `--all`;
+    /// never counted on the summary line, which is about the edited files.
+    #[serde(skip)]
+    pub outside_the_change: bool,
+    /// New only because the index lacks the row, and the index was written by
+    /// another scanner build, which may simply not have read it
+    /// (carrick#2911). Printed, never fails, and the run exits
+    /// [`EXIT_NOTHING_COVERED`] when nothing else fails.
+    pub other_build: bool,
     pub fails: bool,
 }
 
@@ -181,16 +198,25 @@ impl ChangedOutput {
 
     /// The process exit code: [`EXIT_NOTHING_COVERED`] when the run could not
     /// run, or asked about files and covered none; 1 when a problem is a
-    /// fact; else 0, including when some files were covered and others
-    /// skipped (the skipped ones are listed).
+    /// fact; [`EXIT_NOTHING_COVERED`] when nothing fails but a problem rests
+    /// on an index another scanner build wrote, which cannot say whether it
+    /// is new (carrick#2911); else 0, including when some files were covered
+    /// and others skipped (the skipped ones are listed).
     pub fn exit_code(&self) -> i32 {
         if self.not_checked.is_some() || (self.files == 0 && self.nothing_asked_covered()) {
             EXIT_NOTHING_COVERED
         } else if self.failing > 0 {
             1
+        } else if self.other_build() > 0 {
+            EXIT_NOTHING_COVERED
         } else {
             0
         }
+    }
+
+    /// Problems the index, written by another scanner build, cannot date.
+    fn other_build(&self) -> usize {
+        self.problems.iter().filter(|p| p.other_build).count()
     }
 }
 
@@ -225,6 +251,7 @@ fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
         failing: 0,
         elapsed_ms: 0,
         not_checked: Some(reason.into()),
+        index_scanner: None,
     }
 }
 
@@ -270,12 +297,16 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     let generation =
         std::env::temp_dir().join(format!("carrick-check-changed-{}", uuid::Uuid::new_v4()));
     let rescan: Vec<&Path> = changed.values().map(|(path, _)| path.as_path()).collect();
+    // Said on stderr while it works: on a large repo the pass runs for
+    // minutes, and a caller that reads silence as a hang kills it.
+    let narrator = super::recheck::Narrator::to_stderr(started);
     let rejoined = super::recheck::rejoin(
         &workspace,
         &rescan,
         &generation,
         started + budget(),
         super::typed::Mode::Probe,
+        Some(&narrator),
     );
     // The temporary generation goes on every path, as the single-file
     // re-check's does.
@@ -293,7 +324,18 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         .iter()
         .map(|(name, (_, files))| (name.clone(), files))
         .collect();
-    let judged = judge(&root, &index, &rejoined.index, &rejoined.join, &wanted);
+    let same_build = index.written_by_this_build();
+    if !same_build {
+        output.index_scanner = Some(index.scanner_shown());
+    }
+    let judged = judge(
+        &root,
+        &index,
+        same_build,
+        &rejoined.index,
+        &rejoined.join,
+        &wanted,
+    );
     output.routes = judged.routes;
     output.calls = judged.calls;
     output.failing = judged.problems.iter().filter(|p| p.fails).count();
@@ -465,9 +507,17 @@ struct Judged {
 
 /// The problems in the changed files, read off the rebuilt index and the join
 /// it came from.
+///
+/// `same_build` says whether `before` was written by this scanner build. When
+/// it was not, `before` lacking a row is no evidence the row is new: that
+/// build may not have read it (carrick#2911). A problem whose newness rests
+/// only on that silence is marked `other_build` and does not fail. What
+/// `before` did read still decides: a call it matched that now reaches no
+/// route fails whichever build wrote it.
 fn judge(
     root: &Path,
     before: &LocalIndex,
+    same_build: bool,
     rebuilt: &LocalIndex,
     join: &super::LocalJoin,
     changed: &BTreeMap<String, &BTreeSet<String>>,
@@ -577,7 +627,9 @@ fn judge(
                 .unwrap_or_else(|| "not_stated".to_string()),
             already_indexed: already,
             unconfirmed: false,
-            fails: fact && !already,
+            outside_the_change: false,
+            other_build: fact && !already && !same_build,
+            fails: fact && !already && same_build,
         });
     }
 
@@ -609,8 +661,10 @@ fn judge(
                 // expression: printed, never failing, new or not. Unless the
                 // index matched this call: a workspace route served it, so
                 // the base is the workspace's and losing it is a fact.
-                let unconfirmed = unmatched.injected.iter().any(|at| at == site)
-                    && !was_matched(before, repo, operation);
+                let matched = was_matched(before, repo, operation);
+                let unconfirmed = unmatched.injected.iter().any(|at| at == site) && !matched;
+                let new_fact = source == Source::Fact && !already && !unconfirmed;
+                let other_build = new_fact && !same_build && !matched;
                 judged.problems.push(Problem {
                     kind: ProblemKind::NoRoute,
                     file: shown(root, repo_path, &file),
@@ -627,7 +681,9 @@ fn judge(
                     source: source.as_str().to_string(),
                     already_indexed: already,
                     unconfirmed,
-                    fails: source == Source::Fact && !already && !unconfirmed,
+                    outside_the_change: !is_changed(repo, &file),
+                    other_build,
+                    fails: new_fact && !other_build,
                 });
             }
         }
@@ -716,9 +772,19 @@ impl ChangedOutput {
         let listed: Vec<&Problem> = self
             .problems
             .iter()
-            .filter(|problem| all || problem.fails)
+            .filter(|problem| all || problem.fails || problem.other_build)
             .collect();
-        let unconfirmed = self.problems.len() - listed.len();
+        // Each problem not listed, counted by why, in the order `--all`
+        // prints the reasons in. A file the work did not touch adds to this
+        // line only by failing, which lists it: the summary is about the
+        // edited files.
+        let mut unlisted: BTreeMap<Unlisted, usize> = BTreeMap::new();
+        for problem in &self.problems {
+            if let (false, false, Some(why)) = (all, problem.outside_the_change, problem.unlisted())
+            {
+                *unlisted.entry(why).or_default() += 1;
+            }
+        }
         let incompatible = listed
             .iter()
             .filter(|p| p.kind == ProblemKind::Incompatible)
@@ -740,9 +806,14 @@ impl ChangedOutput {
         if advisory > 0 {
             out.push_str(&format!(" ({advisory} of them do not fail the check)"));
         }
-        if unconfirmed > 0 {
+        if !unlisted.is_empty() {
+            let counts: Vec<String> = unlisted
+                .iter()
+                .map(|(why, count)| why.counted(*count))
+                .collect();
             out.push_str(&format!(
-                ", plus {unconfirmed} unconfirmed, run with --all to list them"
+                ", plus {}, run with --all to list them",
+                join_and(&counts)
             ));
         }
         out.push('\n');
@@ -760,18 +831,34 @@ impl ChangedOutput {
             } else {
                 format!(" with {}", problem.other.join(", "))
             };
-            let note = match (problem.fails, problem.source.as_str()) {
-                (true, _) => "",
-                _ if problem.already_indexed => " [already in the index, does not fail]",
-                _ if problem.unconfirmed => {
-                    " [unconfirmed: the base is set at run time, does not fail]"
-                }
-                (false, "candidate") => " [model candidate, does not fail]",
-                (false, _) => " [source not stated, does not fail]",
+            let note = if problem.other_build {
+                " [not checked: the index is from another scanner build]"
+            } else {
+                problem.unlisted().map_or("", Unlisted::note)
             };
             out.push_str(&format!(
                 "{at}  {what}  {} {} {}{with}: {}{note}\n",
                 problem.role, problem.method, problem.path, problem.reason
+            ));
+        }
+        let other_build = self.other_build();
+        if other_build > 0 {
+            // `refresh` indexes the working tree, so one run on a branch would
+            // take the branch's own new problems in as already indexed.
+            out.push_str(&format!(
+                "not checked: {} the index was written by carrick {}, and this is carrick {}, \
+                 which may read them differently. Run `carrick refresh` on the main branch, then \
+                 check again.\n",
+                plural(
+                    other_build,
+                    "problem above looks new only because",
+                    "problems above look new only because"
+                ),
+                self.index_scanner.as_deref().unwrap_or("another build"),
+                super::read_model::shown_build(
+                    env!("CARGO_PKG_VERSION"),
+                    crate::cloud_storage::ScannerBuild::current().as_ref()
+                ),
             ));
         }
         out.push_str(&self.skipped_lines());
@@ -790,6 +877,62 @@ impl ChangedOutput {
             }
         }
         out
+    }
+}
+
+/// Why a problem does not fail the run, so is listed only with `--all`: the
+/// note `--all` prints beside it and the count the summary line gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Unlisted {
+    AlreadyIndexed,
+    Unconfirmed,
+    Candidate,
+    NotStated,
+}
+
+impl Unlisted {
+    fn note(self) -> &'static str {
+        match self {
+            Unlisted::AlreadyIndexed => " [already in the index, does not fail]",
+            Unlisted::Unconfirmed => " [unconfirmed: the base is set at run time, does not fail]",
+            Unlisted::Candidate => " [model candidate, does not fail]",
+            Unlisted::NotStated => " [source not stated, does not fail]",
+        }
+    }
+
+    fn counted(self, count: usize) -> String {
+        match self {
+            Unlisted::AlreadyIndexed => format!("{count} already in the index"),
+            Unlisted::Unconfirmed => format!("{count} unconfirmed"),
+            Unlisted::Candidate => plural(count, "model candidate", "model candidates"),
+            Unlisted::NotStated => format!("{count} with no stated source"),
+        }
+    }
+}
+
+impl Problem {
+    /// Why this problem is listed only with `--all`; `None` when it fails
+    /// the run. A problem the index already held says so first, whatever
+    /// else holds for it.
+    fn unlisted(&self) -> Option<Unlisted> {
+        match (self.fails, self.source.as_str()) {
+            (true, _) => None,
+            // Listed without `--all`: it is why the run exits 2.
+            _ if self.other_build => None,
+            _ if self.already_indexed => Some(Unlisted::AlreadyIndexed),
+            _ if self.unconfirmed => Some(Unlisted::Unconfirmed),
+            (false, "candidate") => Some(Unlisted::Candidate),
+            (false, _) => Some(Unlisted::NotStated),
+        }
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_and(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -814,8 +957,100 @@ mod tests {
             source: if fails { "fact" } else { "candidate" }.to_string(),
             already_indexed: false,
             unconfirmed: false,
+            outside_the_change: false,
+            other_build: false,
             fails,
         }
+    }
+
+    /// A file the work did not touch never adds to the summary of the edited
+    /// files: its call that does not fail is listed with `--all` and counted
+    /// nowhere else. One that fails (the work took its route away) is listed.
+    #[test]
+    fn an_untouched_file_adds_nothing_to_the_summary_unless_it_fails() {
+        let mut elsewhere = problem(ProblemKind::NoRoute, false);
+        elsewhere.file = "web/src/other.ts".to_string();
+        elsewhere.reason = "the index matched this call, and no service serves it now".to_string();
+        elsewhere.outside_the_change = true;
+        let mut broken = elsewhere.clone();
+        broken.path = "/c".to_string();
+        broken.source = "fact".to_string();
+        broken.fails = true;
+        let output = |problems: Vec<Problem>, failing: usize| ChangedOutput {
+            routes: 0,
+            calls: 1,
+            files: 1,
+            services: 2,
+            problems,
+            failing,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+
+        let quiet = output(vec![elsewhere.clone()], 0).render(false);
+        assert_eq!(
+            quiet,
+            "carrick check: checked 0 routes and 1 call in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route\n"
+        );
+        let everything = output(vec![elsewhere.clone()], 0).render(true);
+        assert!(everything.contains("web/src/other.ts:4"), "{everything}");
+
+        let failing = output(vec![elsewhere, broken], 1).render(false);
+        assert!(
+            failing.starts_with(
+                "carrick check: checked 0 routes and 1 call in 1 changed file against 2 services: \
+                 0 incompatible, 1 reaches no route\n"
+            ),
+            "{failing}"
+        );
+        assert!(
+            failing.contains("web/src/other.ts:4  no route  call GET /c"),
+            "{failing}"
+        );
+    }
+
+    /// carrick#2911: a problem the index from another build cannot date is
+    /// listed without `--all`, exits 2 when nothing fails, and never hides a
+    /// failure.
+    #[test]
+    fn a_problem_another_builds_index_cannot_date_exits_two_unless_one_fails() {
+        let mut undated = problem(ProblemKind::NoRoute, false);
+        undated.source = "fact".to_string();
+        undated.other_build = true;
+        let output = ChangedOutput {
+            calls: 1,
+            files: 1,
+            problems: vec![undated],
+            not_checked: None,
+            index_scanner: Some("0.3.1".to_string()),
+            ..not_checked("/w", "")
+        };
+        assert_eq!(output.exit_code(), EXIT_NOTHING_COVERED);
+        let text = output.render(false);
+        assert!(
+            text.contains(
+                "web/src/a.ts:4  no route  call GET /a: no service in this workspace serves it \
+                 [not checked: the index is from another scanner build]"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "not checked: 1 problem above looks new only because the index was written by \
+                 carrick 0.3.1, and this is carrick "
+            ),
+            "{text}"
+        );
+        let failing = ChangedOutput {
+            problems: vec![
+                problem(ProblemKind::Incompatible, true),
+                output.problems[0].clone(),
+            ],
+            failing: 1,
+            ..output
+        };
+        assert_eq!(failing.exit_code(), 1);
     }
 
     #[test]
@@ -862,7 +1097,7 @@ mod tests {
         assert_eq!(
             quiet.lines().next().unwrap(),
             "carrick check: checked 0 routes and 2 calls in 1 changed file against 2 services: \
-             1 incompatible, 0 reach no route, plus 1 unconfirmed, run with --all to list them"
+             1 incompatible, 0 reach no route, plus 1 model candidate, run with --all to list them"
         );
         assert_eq!(quiet.lines().count(), 2, "the fact only:\n{quiet}");
         assert!(!quiet.contains("GET /b"), "{quiet}");
@@ -871,6 +1106,53 @@ mod tests {
         assert!(
             !everything.contains("unconfirmed"),
             "nothing is hidden, so nothing is counted as hidden:\n{everything}"
+        );
+    }
+
+    /// The count of problems not listed names why each is not listed, with
+    /// the reason `--all` prints beside it: a problem the index already held
+    /// is not "unconfirmed".
+    #[test]
+    fn the_hidden_count_names_why_each_problem_is_not_listed() {
+        let mut held = problem(ProblemKind::NoRoute, false);
+        held.source = "fact".to_string();
+        held.already_indexed = true;
+        let mut held_too = held.clone();
+        held_too.path = "/c".to_string();
+        let mut runtime_base = problem(ProblemKind::NoRoute, false);
+        runtime_base.source = "fact".to_string();
+        runtime_base.unconfirmed = true;
+        runtime_base.path = "/d".to_string();
+        let mut candidate = problem(ProblemKind::NoRoute, false);
+        candidate.path = "/e".to_string();
+        let mut unstated = problem(ProblemKind::NoRoute, false);
+        unstated.source = "not_stated".to_string();
+        unstated.path = "/f".to_string();
+        let only_held = ChangedOutput {
+            routes: 0,
+            calls: 2,
+            files: 1,
+            services: 2,
+            problems: vec![held.clone(), held_too.clone()],
+            failing: 0,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        assert_eq!(
+            only_held.render(false).lines().next().unwrap(),
+            "carrick check: checked 0 routes and 2 calls in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route, plus 2 already in the index, \
+             run with --all to list them"
+        );
+        let mixed = ChangedOutput {
+            problems: vec![held, held_too, runtime_base, candidate, unstated],
+            ..only_held
+        };
+        assert_eq!(
+            mixed.render(false).lines().next().unwrap(),
+            "carrick check: checked 0 routes and 2 calls in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route, plus 2 already in the index, 1 unconfirmed, \
+             1 model candidate and 1 with no stated source, run with --all to list them"
         );
     }
 

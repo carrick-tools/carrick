@@ -702,6 +702,10 @@ pub enum Undecided {
     /// The callee is a value whose values reach different labelled exports,
     /// or one of them none (carrick#2432): which one runs is the caller's.
     SeveralValues,
+    /// Walks from different branches of one function reach the same labelled
+    /// call and settle at this one, each with a different operation
+    /// (carrick#2816): which runs depends on the call's arguments.
+    SeveralOperations,
 }
 
 /// A discovered call whose name no call of this code decides.
@@ -1309,7 +1313,7 @@ fn payload_slot(down: &[Placed<'_>], slot: &ArgSlot) -> Option<SlotBinding> {
             arg,
             key: key.clone(),
         }),
-        KeyState::Unread => None,
+        KeyState::Unread | KeyState::Function => None,
     }
 }
 
@@ -1589,6 +1593,12 @@ struct Walk<'a, 'i> {
     index: Option<&'i instances::WalkIndex<'a>>,
     out: &'i mut Decided,
     seen: HashSet<(String, u32, Option<String>, String)>,
+    /// Where in `out.sites` the site of each id in `seen` was written.
+    kept: HashMap<(String, u32, Option<String>, String), usize>,
+    /// The ids two walks reached with different operations (carrick#2816):
+    /// the call picks its operation when it runs, so its site is dropped
+    /// when the walk ends ([`Walk::drop_withdrawn`]) and it is a lead.
+    withdrawn: HashSet<(String, u32, Option<String>, String)>,
     /// The label of the labelled call being walked.
     label: Option<&'i SiteLabel>,
     /// The receiver of the labelled call being walked, and how discovery
@@ -1615,7 +1625,22 @@ impl<'a> Walk<'a, '_> {
         }
         let file = relative(self.root, placed.file);
         let id = (file.clone(), placed.call.site.span_start, None, end.at());
-        if !self.seen.insert(id) {
+        let method = self
+            .label
+            .and_then(|label| label.method.as_ref())
+            .and_then(|method| method.from.as_ref())
+            .and_then(|slot| method_value(down, slot));
+        if !self.seen.insert(id.clone()) {
+            // Another walk reached this call and labelled end. The same
+            // operation (a diamond) is one site; a different one means the
+            // call chooses at run time, so it states none (carrick#2816).
+            if !self.withdrawn.contains(&id)
+                && let Some(&at) = self.kept.get(&id)
+                && (self.out.sites[at].name != name || self.out.sites[at].method != method)
+            {
+                self.withdrawn.insert(id);
+                self.lead(placed, end, Undecided::SeveralOperations);
+            }
             return;
         }
         // A call into a sibling inside a client wrapper is a site like any
@@ -1641,11 +1666,8 @@ impl<'a> Walk<'a, '_> {
         let handler = handler_slot
             .and_then(|slot| bound_at(down, slot))
             .and_then(|(at, arg, _)| handler_at(self.root, &down[at], arg));
-        let method = label
-            .and_then(|label| label.method.as_ref())
-            .and_then(|method| method.from.as_ref())
-            .and_then(|slot| method_value(down, slot));
         let instances = self.instances(down);
+        self.kept.insert(id, self.out.sites.len());
         self.out.sites.push(DecidedSite {
             file,
             line: placed.call.site.line,
@@ -1703,6 +1725,14 @@ impl<'a> Walk<'a, '_> {
         if !self.out.leads.contains(&lead) {
             self.out.leads.push(lead);
         }
+    }
+
+    /// Drops the sites two walks disagreed on ([`Walk::withdrawn`]).
+    fn drop_withdrawn(&mut self) {
+        let withdrawn = &self.withdrawn;
+        self.out.sites.retain(|site| {
+            !withdrawn.contains(&(site.file.clone(), site.span_start, None, site.end.at()))
+        });
     }
 
     /// A call on an export the store labels with no op: a lead of its own
@@ -2038,6 +2068,8 @@ fn decide(
         index: index.as_ref(),
         out: &mut out,
         seen: HashSet::new(),
+        kept: HashMap::new(),
+        withdrawn: HashSet::new(),
         label: None,
         receiver: None,
         reached: None,
@@ -2209,6 +2241,7 @@ fn decide(
             walk.up(&chain, &top, end, &mut Vec::new());
         }
     }
+    walk.drop_withdrawn();
     out.through
         .extend(callers_above(inputs, root, &calls, &out.sites));
     let mounts = match (makers, &index) {
@@ -4402,6 +4435,55 @@ pub(crate) mod tests {
         let alone = decided_sites(app, &on.repo, &sites, &labels);
         assert!(alone.sites.is_empty(), "{:?}", alone.sites);
         assert_eq!(alone.unplaced.len(), 3, "{:?}", alone.unplaced);
+    }
+
+    /// carrick#2816: a call that walks from different branches of one
+    /// function to one labelled call, each branch a different request, is a
+    /// lead (`SeveralOperations`) and no site; a call with one request still
+    /// is a site. The answer key is `tests/fixtures/discovery-dispatcher/README.md`.
+    #[test]
+    fn a_call_that_reaches_several_operations_is_a_lead_not_the_first_branch() {
+        let Some((on, sites, labels)) = sibling_sites("discovery-dispatcher") else {
+            return;
+        };
+        let [app, client] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let decided = decided_sites_with(app, &[client], &on.repo, &sites, &labels);
+        let found: Vec<(String, u32, Option<String>)> = decided
+            .sites
+            .iter()
+            .map(|site| (site.file.clone(), site.line, site.name_text()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![(
+                "services/app/src/main.ts".to_string(),
+                16,
+                Some("/items/42".to_string())
+            )],
+            "{:?}",
+            decided.sites
+        );
+        let mut leads: Vec<(String, u32, Undecided)> = decided
+            .leads
+            .iter()
+            .map(|lead| (lead.file.clone(), lead.line, lead.reason))
+            .collect();
+        leads.sort();
+        let several =
+            |file: &str, line: u32| (file.to_string(), line, Undecided::SeveralOperations);
+        assert_eq!(
+            leads,
+            vec![
+                several("services/app/src/local.ts", 16),
+                several("services/app/src/main.ts", 4),
+                several("services/app/src/main.ts", 8),
+                several("services/app/src/main.ts", 12),
+            ],
+            "{:?}",
+            decided.leads
+        );
     }
 
     /// carrick#2618: a call into a sibling inside a client wrapper is a site

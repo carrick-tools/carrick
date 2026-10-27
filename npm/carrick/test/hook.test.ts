@@ -15,11 +15,14 @@ import {
   testDir,
 } from "./helpers.ts";
 
-test("an edit gets the verdicts as additionalContext", async (t) => {
+test("an edit gets its problems as additionalContext", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
 
-  const run = await runHook("post-edit.ts", { payload: editPayload(workspace) });
+  const run = await runHook("post-edit.ts", {
+    payload: editPayload(workspace),
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+  });
   assert.equal(run.code, 0);
   const parsed = JSON.parse(run.stdout) as {
     hookSpecificOutput: { hookEventName: string; additionalContext: string };
@@ -27,7 +30,7 @@ test("an edit gets the verdicts as additionalContext", async (t) => {
   assert.equal(parsed.hookSpecificOutput.hookEventName, "PostToolUse");
   assert.match(
     parsed.hookSpecificOutput.additionalContext,
-    /^Carrick checked user-service\/src\/routes\/users\.ts against the workspace index/,
+    /^Carrick re-checked user-service\/src\/routes\/users\.ts after this edit: 1 contract problem\.\n- /,
   );
   assert.match(parsed.hookSpecificOutput.additionalContext, /type_mismatch/);
 });
@@ -47,7 +50,7 @@ test("MultiEdit payloads name their file the other way round", async (t) => {
   assert.match(run.stdout, /additionalContext/);
 });
 
-test("a file with no indexed rows prints the header and no service-wide boundary", async (t) => {
+test("a file with no indexed rows prints one line and no service-wide boundary", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
 
@@ -60,7 +63,7 @@ test("a file with no indexed rows prints the header and no service-wide boundary
     const context = (
       JSON.parse(run.stdout) as { hookSpecificOutput: { additionalContext: string } }
     ).hookSpecificOutput.additionalContext;
-    assert.match(context, /^Carrick checked .+ against the workspace index \(user-service, indexed at 6a1b2c3\)\.$/, name);
+    assert.match(context, /^Carrick re-checked \S+ after this edit: no contract problem\.$/, name);
   }
 });
 
@@ -558,14 +561,15 @@ test("a three-file patch is one binary call, and every file gets its answer", as
     .split("\n")
     .filter((line) => line.trim().length > 0);
   assert.equal(calls.length, 1, calls.join("\n"));
-  // Three headers, one per answer, in the order the patch names them.
-  const headers = contextOf(run.stdout)
-    .split("\n")
-    .filter((line) => line.startsWith("Carrick checked "));
-  assert.equal(headers.length, 3, contextOf(run.stdout));
+  // None of the three was re-checked: one line names all three, in the order
+  // the patch names them, rather than the same sentence three times.
+  assert.equal(
+    contextOf(run.stdout),
+    "Carrick noted the edits to order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts. They were not re-checked here, so run `carrick check --changed` before you finish.",
+  );
 });
 
-test("a repo whose re-check is known not to fit says so once per session and still records", async (t) => {
+test("a repo whose re-check is known not to fit gets one pointer line per edit and still records", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
@@ -591,9 +595,12 @@ test("a repo whose re-check is known not to fit says so once per session and sti
 
   const first = contextOf((await edit("sess-km")).stdout);
   const second = contextOf((await edit("sess-km")).stdout);
-  assert.ok(first.includes("carrick check --changed"), first);
-  assert.equal(second.includes("carrick check --changed"), false, second);
-  assert.ok(contextOf((await edit("sess-km2")).stdout).includes("carrick check --changed"));
+  // The index's verdicts describe the file before the edit, so none is
+  // printed: one line that sends the reader to the command that answers.
+  const pointer =
+    "Carrick noted the edit to user-service/src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish.";
+  assert.equal(first, pointer);
+  assert.equal(second, pointer);
   // The new function is recorded on every edit, the skipped re-scan or not.
   assert.deepEqual(
     sessionRecord(home, "sess-km").found.map((entry) => (entry as { name: string }).name),
@@ -708,8 +715,10 @@ function contextOf(stdout: string): string {
 
 const USES_LINE =
   "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17";
+/** The one line an edit gets about who uses the file; the Read hook lists them. */
+const EDIT_USES = "Other files use what this file declares";
 
-test("a file's uses lines are shown once per session, and the header every time", async (t) => {
+test("a file's uses line is shown once per session, and the header every time", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
@@ -722,16 +731,18 @@ test("a file's uses lines are shown once per session, and the header every time"
 
   const first = contextOf((await edit("sess-u1")).stdout);
   const second = contextOf((await edit("sess-u1")).stdout);
-  assert.ok(first.includes(USES_LINE), first);
-  assert.ok(second.startsWith("Carrick checked "), second);
-  assert.equal(second.includes(USES_LINE), false, second);
+  assert.ok(first.includes(EDIT_USES), first);
+  // The edit counts the uses; listing them is the Read hook's job.
+  assert.equal(first.includes(USES_LINE), false, first);
+  assert.ok(second.startsWith("Carrick re-checked "), second);
+  assert.equal(second.includes(EDIT_USES), false, second);
   assert.equal(second, first.split("\n")[0]);
 
   // Another session has not been shown them.
-  assert.ok(contextOf((await edit("sess-u2")).stdout).includes(USES_LINE));
+  assert.ok(contextOf((await edit("sess-u2")).stdout).includes(EDIT_USES));
   // With no session to remember them in, every edit shows them.
-  assert.ok(contextOf((await edit()).stdout).includes(USES_LINE));
-  assert.ok(contextOf((await edit()).stdout).includes(USES_LINE));
+  assert.ok(contextOf((await edit()).stdout).includes(EDIT_USES));
+  assert.ok(contextOf((await edit()).stdout).includes(EDIT_USES));
 });
 
 test("a channel that prints nothing remembers nothing as shown", async (t) => {
@@ -756,7 +767,7 @@ test("a channel that prints nothing remembers nothing as shown", async (t) => {
     payload,
     env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixture }),
   });
-  assert.ok(contextOf(hook.stdout).includes(USES_LINE));
+  assert.ok(contextOf(hook.stdout).includes(EDIT_USES));
 });
 
 // ---------------------------------------------------------------------------
@@ -923,8 +934,8 @@ test("a Read and then an Edit: the edit has its header and not the uses lines", 
     env,
   });
   const context = contextOf(edit.stdout);
-  assert.ok(context.startsWith("Carrick checked "), context);
-  assert.equal(context.includes(USES_LINE), false, context);
+  assert.ok(context.startsWith("Carrick re-checked "), context);
+  assert.equal(context.includes(EDIT_USES), false, context);
 });
 
 test("the lsp and off channels print nothing from a Read and write no session file", async (t) => {

@@ -32,13 +32,17 @@
 //! answer and says how old it is; the re-check never blocks an edit and never
 //! leaves a scan running behind one.
 
+use std::cell::RefCell;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use super::index::{build, join_command, read_blobs, repo_label, scan_command, service_id};
 use super::read_model::IndexedItem;
 use super::workspace::Workspace;
+use crate::engine::type_compat_v2::JUDGE_ANSWERS_ENV;
 
 /// How long the whole re-check may take before the caller keeps the indexed
 /// answer instead.
@@ -360,6 +364,7 @@ fn inside(
         generation,
         deadline,
         super::typed::Mode::Probe,
+        None,
     )?;
 
     let items = rejoined
@@ -414,12 +419,19 @@ pub(super) struct Rejoined {
 ///
 /// `typed` says how the re-scans and the join's type check use the resident
 /// type daemon (carrick#2884, carrick#2883).
+///
+/// `narrator` is where the pass says what it is doing while it does it: the
+/// several-file check runs for minutes on a large repo, and a caller that kills
+/// a command after some seconds of silence read the silence as a hang. The
+/// per-edit re-check passes `None`: it answers inside a hook's budget and a
+/// line on its stderr has no reader.
 pub(super) fn rejoin(
     workspace: &Workspace,
     repos: &[&Path],
     generation: &Path,
     deadline: Instant,
     typed: super::typed::Mode,
+    narrator: Option<&Narrator>,
 ) -> Result<Rejoined, String> {
     rejoin_held(
         workspace,
@@ -428,6 +440,7 @@ pub(super) fn rejoin(
         generation,
         deadline,
         typed,
+        narrator,
     )
 }
 
@@ -439,9 +452,12 @@ fn rejoin_held(
     generation: &Path,
     deadline: Instant,
     typed: super::typed::Mode,
+    narrator: Option<&Narrator>,
 ) -> Result<Rejoined, String> {
     let typed = super::typed::Session::open(&workspace.root, generation, typed);
-    let rejoined = rejoin_through(workspace, held, repos, generation, deadline, &typed);
+    let rejoined = rejoin_through(
+        workspace, held, repos, generation, deadline, &typed, narrator,
+    );
     // After the answer is read, on every path: a daemon this run found
     // missing, or that held none of the services it re-scanned, is warmed
     // for the next run in the background.
@@ -456,10 +472,14 @@ fn rejoin_through(
     generation: &Path,
     deadline: Instant,
     typed: &super::typed::Session,
+    narrator: Option<&Narrator>,
 ) -> Result<Rejoined, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
     let blobs = generation.join("repos");
+    // The re-scans and the re-join judge the same stubs and pairs; the folder
+    // is where the first answer waits for the others.
+    let judged = generation.join("judged");
     std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
     let names: std::collections::BTreeSet<String> =
         repos.iter().map(|repo| repo_label(repo)).collect();
@@ -518,7 +538,14 @@ fn rejoin_through(
         let scan_dir = generation.join(format!("scan-{position}"));
         let mut scan = rescan_command(&exe, repo, &scan_dir, &previous);
         typed.apply(&mut scan);
-        bounded(scan, "re-scan", deadline)?;
+        scan.env(JUDGE_ANSWERS_ENV, &judged);
+        if let Some(narrator) = narrator {
+            // The scan states its per-service counts on stderr only when a
+            // parent asks; the narrator is that parent here.
+            scan.env(crate::progress::PROGRESS_ENV, "1");
+            narrator.repo(Instant::now(), &name, position + 1, repos.len());
+        }
+        bounded(scan, "re-scan", deadline, narrator)?;
         let fresh = read_blobs(&scan_dir)?;
         let carried = super::index::carried_services(repo, &hosted_data, &previous_data, &fresh)?;
         for (offset, blob) in fresh.iter().chain(&carried).enumerate() {
@@ -533,10 +560,20 @@ fn rejoin_through(
     let anchor = repos.first().copied().unwrap_or(&workspace.root);
     let out = generation.join("join.json");
     let mut join = join_command(&exe, anchor, &blobs, &out);
+    join.env(JUDGE_ANSWERS_ENV, &judged);
     join.env_remove(crate::progress::PROGRESS_ENV);
     // The join's type check asks the daemon first, when this run uses one.
     typed.apply(&mut join);
-    bounded(join, "re-join", deadline)?;
+    if let Some(narrator) = narrator {
+        narrator.phase(
+            Instant::now(),
+            format!(
+                "comparing routes and calls across {}",
+                plural(services.len(), "service", "services")
+            ),
+        );
+    }
+    bounded(join, "re-join", deadline, narrator)?;
     let text = std::fs::read_to_string(&out)
         .map_err(|e| format!("the re-join wrote no result to {}: {e}", out.display()))?;
     let joined: super::LocalJoin =
@@ -668,19 +705,56 @@ const POLL: Duration = Duration::from_millis(50);
 ///
 /// The deadline is checked BEFORE the phase starts as well as while it runs: a
 /// second phase that begins with no budget left would spend the whole of the
-/// next one before anybody looked (carrick#748). Output is dropped rather than
-/// rendered — a read-only command prints its answer on stdout and nothing else,
-/// and this one runs behind an edit where a spinner has no reader.
-fn bounded(mut command: Command, what: &str, deadline: Instant) -> Result<(), String> {
+/// next one before anybody looked (carrick#748). The child's output is not
+/// rendered — a read-only command prints its answer on stdout and nothing else.
+/// With a `narrator`, the child's stderr is read for its progress updates,
+/// which the narrator turns into the few lines a waiting caller sees; without
+/// one, both streams are dropped.
+fn bounded(
+    mut command: Command,
+    what: &str,
+    deadline: Instant,
+    narrator: Option<&Narrator>,
+) -> Result<(), String> {
     if Instant::now() >= deadline {
         return Err(format!("no budget left for the {what}"));
     }
+    let stderr = if narrator.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     let mut child = command
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .map_err(|e| format!("could not start the {what}: {e}"))?;
+    let updates = child.stderr.take().map(read_updates);
+    // A signal that ends this command reaches the phase too (carrick#1379).
+    super::index::waiting_on(Some(child.id()));
+    let outcome = wait_within(&mut child, what, deadline, narrator, updates.as_ref());
+    super::index::waiting_on(None);
+    outcome
+}
+
+/// Wait for `child` until `deadline`, and stop it there, narrating its
+/// updates as they arrive when there is a narrator.
+fn wait_within(
+    child: &mut std::process::Child,
+    what: &str,
+    deadline: Instant,
+    narrator: Option<&Narrator>,
+    updates: Option<&Receiver<crate::progress::Update>>,
+) -> Result<(), String> {
     loop {
+        if let Some(narrator) = narrator {
+            if let Some(updates) = updates {
+                while let Ok(update) = updates.try_recv() {
+                    narrator.update(Instant::now(), &update);
+                }
+            }
+            narrator.quiet(Instant::now());
+        }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
@@ -690,14 +764,187 @@ fn bounded(mut command: Command, what: &str, deadline: Instant) -> Result<(), St
             Err(e) => return Err(format!("could not wait for the {what}: {e}")),
         }
         if Instant::now() >= deadline {
-            // Killing the scan closes the pipes the sidecar it spawned reads,
-            // which is what ends that process too; waiting for the child here
-            // is what keeps it from being reaped by the shell later.
-            let _ = child.kill();
-            let _ = child.wait();
+            stop(child);
             return Err(format!("the {what} ran past the budget"));
         }
         std::thread::sleep(POLL);
+    }
+}
+
+/// How long a phase stopped at its deadline has to end its own sidecars.
+const STOP_GRACE: Duration = Duration::from_secs(1);
+
+/// End a phase that ran past its deadline: SIGTERM first, so the scan ends the
+/// type sidecars it started, then SIGKILL. A SIGKILL alone left them running:
+/// a sidecar building a program does not notice its pipes close until that
+/// work ends. Waiting here is what keeps the child from being reaped by the
+/// shell later.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: a signal to a child this process spawned and has not reaped.
+        if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == 0 {
+            let asked = Instant::now();
+            while asked.elapsed() < STOP_GRACE {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The progress updates in a child's stderr, read on a thread of their own.
+///
+/// The thread reads to the end whatever happens to the receiver: a pipe nobody
+/// drains fills, and a child blocked on a full stderr is the hang this exists
+/// to rule out. Every other line is dropped, as it was when stderr was null.
+fn read_updates(stderr: std::process::ChildStderr) -> Receiver<crate::progress::Update> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Some(update) = crate::progress::parse(&line) {
+                let _ = sender.send(update);
+            }
+        }
+    });
+    receiver
+}
+
+/// The shortest gap between two lines that report counts. A phase change
+/// always prints at once; this keeps a file loop from printing per file.
+const NARRATION_GAP: Duration = Duration::from_secs(5);
+
+/// The longest a narrated pass stays silent. Under the silence limit of any
+/// caller that reads quiet as hung (an agent harness killed a check at 110
+/// seconds of it), and long enough that a fast pass prints only its phases.
+const NARRATION_HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// What `carrick check --changed` (and the several-file check) says on stderr
+/// while it works: one line per phase and per service, counts at most every
+/// [`NARRATION_GAP`], and a line saying it is still working after
+/// [`NARRATION_HEARTBEAT`] of nothing. Never stdout, which carries the answer,
+/// and never `--json`'s.
+pub(super) struct Narrator {
+    started: Instant,
+    state: RefCell<Narration>,
+    sink: RefCell<Box<dyn Write>>,
+}
+
+#[derive(Default)]
+struct Narration {
+    /// What the pass is doing, as the still-working line names it.
+    doing: String,
+    /// The repo being re-read, which names a single-service update.
+    repo: String,
+    /// The service the last count was about, and its place.
+    service: Option<(String, usize)>,
+    said_at: Option<Instant>,
+}
+
+impl Narrator {
+    /// A narrator that writes to this process's stderr.
+    pub(super) fn to_stderr(started: Instant) -> Self {
+        Self::new(started, Box::new(std::io::stderr()))
+    }
+
+    fn new(started: Instant, sink: Box<dyn Write>) -> Self {
+        Self {
+            started,
+            state: RefCell::new(Narration::default()),
+            sink: RefCell::new(sink),
+        }
+    }
+
+    fn say(&self, now: Instant, text: &str) {
+        let mut sink = self.sink.borrow_mut();
+        // A closed stderr is a caller that stopped reading, not a failure of
+        // the check.
+        let _ = writeln!(sink, "carrick check: {text}");
+        let _ = sink.flush();
+        self.state.borrow_mut().said_at = Some(now);
+    }
+
+    /// A phase starts: said at once.
+    pub(super) fn phase(&self, now: Instant, doing: String) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.doing = doing.clone();
+            state.service = None;
+        }
+        self.say(now, &format!("{doing}..."));
+    }
+
+    /// One repo's re-scan starts, `position` of `total`.
+    fn repo(&self, now: Instant, name: &str, position: usize, total: usize) {
+        self.state.borrow_mut().repo = name.to_string();
+        let doing = if total > 1 {
+            format!("re-reading {total} changed repos ({position}/{total}: {name})")
+        } else {
+            format!("re-reading {name}")
+        };
+        self.phase(now, doing);
+    }
+
+    /// A count from the re-scan: said when it is about a service not yet
+    /// named, and otherwise at most every [`NARRATION_GAP`].
+    fn update(&self, now: Instant, update: &crate::progress::Update) {
+        let unit = match update.phase {
+            crate::progress::Phase::Files => "files",
+            crate::progress::Phase::Intents => "functions",
+        };
+        let (doing, fresh, due) = {
+            let mut state = self.state.borrow_mut();
+            let doing = if update.service_total > 1 {
+                format!(
+                    "re-reading {} ({}/{})",
+                    update.service, update.service_index, update.service_total
+                )
+            } else {
+                format!("re-reading {}", state.repo)
+            };
+            let place = Some((update.service.clone(), update.service_index));
+            let fresh = state.service != place;
+            state.service = place;
+            state.doing = doing.clone();
+            let due = state
+                .said_at
+                .is_none_or(|said| now.duration_since(said) >= NARRATION_GAP);
+            (doing, fresh, due)
+        };
+        if fresh || due {
+            self.say(
+                now,
+                &format!("{doing}: {} of {} {unit}...", update.done, update.total),
+            );
+        }
+    }
+
+    /// Nothing new: after [`NARRATION_HEARTBEAT`] of silence, say the pass is
+    /// still at it and for how long.
+    fn quiet(&self, now: Instant) {
+        let (doing, due) = {
+            let state = self.state.borrow();
+            let due = state
+                .said_at
+                .is_none_or(|said| now.duration_since(said) >= NARRATION_HEARTBEAT);
+            (state.doing.clone(), due)
+        };
+        if due && !doing.is_empty() {
+            let seconds = now.duration_since(self.started).as_secs();
+            self.say(now, &format!("still {doing} ({seconds}s so far)..."));
+        }
+    }
+}
+
+fn plural(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("{count} {one}")
+    } else {
+        format!("{count} {many}")
     }
 }
 
@@ -754,7 +1001,7 @@ mod tests {
         let mut command = Command::new("sleep");
         command.arg("30");
         let started = Instant::now();
-        let error = bounded(command, "re-scan", Instant::now()).unwrap_err();
+        let error = bounded(command, "re-scan", Instant::now(), None).unwrap_err();
         assert!(error.contains("no budget left"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -768,6 +1015,7 @@ mod tests {
             command,
             "re-join",
             Instant::now() + Duration::from_millis(200),
+            None,
         )
         .unwrap_err();
         assert!(error.contains("past the budget"), "{error}");
@@ -781,15 +1029,152 @@ mod tests {
     #[test]
     fn a_phase_that_finishes_inside_the_budget_is_a_success() {
         let command = Command::new("true");
-        assert!(bounded(command, "re-scan", Instant::now() + Duration::from_secs(30)).is_ok());
+        assert!(
+            bounded(
+                command,
+                "re-scan",
+                Instant::now() + Duration::from_secs(30),
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn a_phase_that_fails_says_what_it_exited_with() {
         let command = Command::new("false");
-        let error = bounded(command, "re-scan", Instant::now() + Duration::from_secs(30))
-            .expect_err("a failing phase is not a success");
+        let error = bounded(
+            command,
+            "re-scan",
+            Instant::now() + Duration::from_secs(30),
+            None,
+        )
+        .expect_err("a failing phase is not a success");
         assert!(error.contains("exited"), "{error}");
+    }
+
+    /// What a [`Narrator`] wrote, readable after it wrote it.
+    #[derive(Clone, Default)]
+    struct Said(std::rc::Rc<RefCell<Vec<u8>>>);
+
+    impl Write for Said {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Said {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.borrow().clone())
+                .expect("UTF-8")
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn files(service: &str, index: usize, total: usize, done: usize) -> crate::progress::Update {
+        crate::progress::Update {
+            service: service.to_string(),
+            service_index: index,
+            service_total: total,
+            phase: crate::progress::Phase::Files,
+            done,
+            total: 400,
+        }
+    }
+
+    /// A phase and a new service are said at once; counts for the same
+    /// service wait out the gap, so a file loop is a few lines, not one per
+    /// file.
+    #[test]
+    fn a_narrated_pass_says_each_phase_and_service_and_throttles_counts() {
+        let said = Said::default();
+        let start = Instant::now();
+        let narrator = Narrator::new(start, Box::new(said.clone()));
+        narrator.repo(start, "api", 1, 2);
+        narrator.update(start, &files("orders", 1, 2, 10));
+        narrator.update(start + Duration::from_secs(1), &files("orders", 1, 2, 20));
+        narrator.update(start + Duration::from_secs(6), &files("orders", 1, 2, 300));
+        narrator.update(start + Duration::from_secs(7), &files("billing", 2, 2, 1));
+        narrator.phase(
+            start + Duration::from_secs(8),
+            format!(
+                "comparing routes and calls across {}",
+                plural(5, "service", "services")
+            ),
+        );
+        assert_eq!(
+            said.lines(),
+            vec![
+                "carrick check: re-reading 2 changed repos (1/2: api)...",
+                "carrick check: re-reading orders (1/2): 10 of 400 files...",
+                "carrick check: re-reading orders (1/2): 300 of 400 files...",
+                "carrick check: re-reading billing (2/2): 1 of 400 files...",
+                "carrick check: comparing routes and calls across 5 services...",
+            ]
+        );
+    }
+
+    /// A repo of one service is named by the repo, and a stretch with nothing
+    /// new says the pass is still at it once per heartbeat, never sooner.
+    #[test]
+    fn a_silent_stretch_says_the_pass_is_still_working() {
+        let said = Said::default();
+        let start = Instant::now();
+        let narrator = Narrator::new(start, Box::new(said.clone()));
+        narrator.repo(start, "api", 1, 1);
+        narrator.update(start, &files("(root)", 1, 1, 3));
+        narrator.quiet(start + Duration::from_secs(9));
+        narrator.quiet(start + Duration::from_secs(10));
+        narrator.quiet(start + Duration::from_secs(15));
+        narrator.quiet(start + Duration::from_secs(20));
+        assert_eq!(
+            said.lines(),
+            vec![
+                "carrick check: re-reading api...",
+                "carrick check: re-reading api: 3 of 400 files...",
+                "carrick check: still re-reading api (10s so far)...",
+                "carrick check: still re-reading api (20s so far)...",
+            ]
+        );
+    }
+
+    /// A child that writes progress is read as it runs, and its stderr is
+    /// drained to the end: the narrated phase still finishes.
+    #[test]
+    fn a_narrated_phase_reads_the_childs_updates_and_finishes() {
+        let said = Said::default();
+        let start = Instant::now();
+        let narrator = Narrator::new(start, Box::new(said.clone()));
+        narrator.repo(start, "api", 1, 1);
+        let update = serde_json::to_string(&files("orders", 1, 2, 7)).expect("JSON");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "i=0; while [ $i -lt 10000 ]; do echo noise line past a pipe buffer $i >&2; \
+             i=$((i+1)); done; \
+             echo '@carrick-progress {update}' >&2"
+        ));
+        bounded(
+            command,
+            "re-scan",
+            Instant::now() + Duration::from_secs(30),
+            Some(&narrator),
+        )
+        .expect("the phase finishes");
+        // The last update can land after the exit is seen; what matters is
+        // that the run finished and nothing but narration was written.
+        assert!(
+            said.lines()
+                .iter()
+                .all(|line| line.starts_with("carrick check: ")),
+            "{:?}",
+            said.lines()
+        );
     }
 
     /// A miss is remembered per repo and per index generation: another repo,

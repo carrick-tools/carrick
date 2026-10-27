@@ -815,6 +815,43 @@ fn hosted_provenance_clause(hosted: &super::hosted::HostedProvenance) -> String 
     clause
 }
 
+/// What the scan did with the model rows of the files edited since the hosted
+/// index (carrick#2894): how many it carried onto their unchanged lines, and
+/// the first row it could not, with the reason. Empty when the scan carried
+/// nothing to speak of.
+fn carried_clause(boundary: Option<&crate::boundary::ServiceBoundary>) -> String {
+    let Some(boundary) = boundary else {
+        return String::new();
+    };
+    let Some(carried) = boundary.model_rows_carried else {
+        return String::new();
+    };
+    let left = boundary.model_rows_not_carried.as_ref();
+    // Wording agreed with David, 2026-10-26.
+    let mut clause = format!(
+        " {} in edited files kept from unchanged lines",
+        crate::scan_timing::plural(carried, "check")
+    );
+    match left {
+        Some(left) if !left.is_zero() => {
+            clause.push_str(&format!("; {} skipped", left.total));
+            if let Some(first) = left.reasons.first() {
+                // Stored as `file:line code`; the code is said in words.
+                let shown = match first.rsplit_once(' ') {
+                    Some((at, code)) => {
+                        format!("{at}, {}", crate::model_carry::reason_words(code))
+                    }
+                    None => crate::model_carry::reason_words(first).to_string(),
+                };
+                clause.push_str(&format!(" (first: {shown})"));
+            }
+            clause.push('.');
+        }
+        _ => clause.push('.'),
+    }
+    clause
+}
+
 /// Hosted provenance feeds the same boundary renderer used by every local
 /// surface. Read commands never probe the network to compose this sentence.
 ///
@@ -830,13 +867,14 @@ pub fn enrichment_note(
     let remote = enrichment.remote.as_deref().unwrap_or("this repo");
     let mut note = match (&enrichment.hosted_state, &enrichment.hosted) {
         (HostedState::Enriched, Some(hosted)) => format!(
-            "candidates: from the hosted index at {} (indexed {}{}); {} file(s) changed since then hold facts only.",
+            "candidates: from the hosted index at {} (indexed {}{}); {} file(s) changed since then hold facts only.{}",
             hosted.commit.chars().take(7).collect::<String>(),
-            hosted.indexed_at,
+            super::scan_state::local_time_label(&hosted.indexed_at),
             hosted_provenance_clause(hosted),
             boundary
                 .and_then(|b| b.candidates_withheld_changed_files)
-                .unwrap_or(0)
+                .unwrap_or(0),
+            carried_clause(boundary)
         ),
         (HostedState::VersionMismatch, Some(hosted)) => format!(
             "hosted index written by carrick {} (cache {:?}), this binary is {} (cache {}); candidates not replayed.",
@@ -1150,6 +1188,72 @@ mod hosted_change_tests {
         assert_eq!(note_for(hosted_row(None, None, None)), today);
     }
 
+    /// `carrick status` is read by a person: a count agrees with its noun, a
+    /// reason is said in words, and a time is this machine's, to the minute.
+    #[test]
+    fn the_carried_clause_reads_as_plain_english() {
+        let mut hosted = hosted_row(None, None, None);
+        hosted.indexed_at = "2026-10-14T11:58:19.307127732+00:00".to_string();
+        let boundary = crate::boundary::ServiceBoundary {
+            candidates_withheld_changed_files: Some(3),
+            model_rows_carried: Some(1),
+            model_rows_not_carried: Some(crate::boundary::Counted {
+                total: 1,
+                reasons: vec![format!(
+                    "src/routes.ts:46 {}",
+                    crate::model_carry::REGISTRATION_LINE_CHANGED
+                )],
+                truncated: false,
+            }),
+            ..Default::default()
+        };
+        let note = enrichment_note(
+            &super::super::hosted::ServiceEnrichment {
+                hosted: Some(hosted.clone()),
+                hosted_state: super::super::hosted::HostedState::Enriched,
+                remote: Some("example/api".to_string()),
+                failure: None,
+                allowance_sentence: None,
+                hosted_cache_version: Some(crate::engine::CACHE_VERSION),
+                classified_here: false,
+                write_refused_as_current: false,
+            },
+            Some(&boundary),
+            "api",
+        );
+        let when = super::super::scan_state::local_time_label(&hosted.indexed_at);
+        assert_eq!(
+            note,
+            format!(
+                "candidates: from the hosted index at 4f2a1c9 (indexed {when}); 3 file(s) changed \
+                 since then hold facts only. 1 check in edited files kept from unchanged lines; \
+                 1 skipped (first: src/routes.ts:46, the edit changed the line that registers it)."
+            )
+        );
+        assert!(!note.contains("T11:58"), "{note}");
+        assert!(!note.contains("307127732"), "{note}");
+        assert!(!note.contains("registration_line_changed"), "{note}");
+    }
+
+    /// Every reason a row is not carried has words, and a code with none
+    /// (one written by a newer scanner) is printed as it stands.
+    #[test]
+    fn every_carry_reason_has_words() {
+        use crate::model_carry::*;
+        for code in [
+            REGISTRATION_LINE_CHANGED,
+            NO_MATCHING_CALL,
+            HINT_OUTSIDE_REGISTRATION_CHANGED,
+            CARRIED_UNTYPED,
+            OLD_SOURCE_UNAVAILABLE,
+            "not_carried_graphql",
+        ] {
+            let words = reason_words(code);
+            assert!(!words.contains('_'), "{code}: {words}");
+        }
+        assert_eq!(reason_words("some_new_reason"), "some_new_reason");
+    }
+
     /// A commit this clone does not have is recovered by a fetch and then a
     /// refresh, and a fetch alone leaves the sentence exactly as it was. A
     /// laptop row may be at a commit nobody pushed, so the fetch is sent only
@@ -1254,6 +1358,7 @@ mod drift_tests {
             hosted_checked_at: None,
             version: crate::local_mode::read_model::READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![IndexedRepo {
                 path: repo.to_string_lossy().into_owned(),
@@ -1300,6 +1405,7 @@ mod drift_tests {
             hosted_checked_at: None,
             version: crate::local_mode::read_model::READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![IndexedRepo {
                 path: repo.to_string_lossy().into_owned(),
@@ -1356,6 +1462,7 @@ mod drift_tests {
             hosted_checked_at: None,
             version: crate::local_mode::read_model::READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![IndexedRepo {
                 path: repo.to_string_lossy().into_owned(),
@@ -1431,6 +1538,7 @@ mod drift_tests {
             hosted_checked_at: None,
             version: crate::local_mode::read_model::READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![repo("api"), repo("web")],
             type_check: None,
@@ -1484,6 +1592,7 @@ mod drift_tests {
                 hosted_checked_at: None,
                 version: crate::local_mode::read_model::READ_MODEL_VERSION,
                 scanner_version: "test".to_string(),
+                scanner_build: None,
                 indexed_at: "2026-09-12T10:00:00Z".to_string(),
                 repos: vec![IndexedRepo {
                     path: root.canonicalize().unwrap().to_string_lossy().into_owned(),

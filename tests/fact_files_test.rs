@@ -113,6 +113,10 @@ const REGISTERS: &str = "import server from \"@fixture/server\";\n\nfunction hea
 
 const REGISTERS_CALLER: &str = "import { createServer } from \"./registers\";\n\nexport function start() {\n  return createServer();\n}\n";
 
+const REGISTERS_NAMED: &str = "import server from \"@fixture/server\";\n\nfunction health(): string {\n  return \"ok\";\n}\n\nexport function createNamedServer() {\n  const srv = server();\n  srv.get(\"/health/named\", health);\n  return srv;\n}\n";
+
+const REGISTERS_NAMED_CALLER: &str = "import { createNamedServer } from \"./registers_named\";\n\nexport function startNamed() {\n  return createNamedServer();\n}\n";
+
 const STATUS: &str = "import send from \"@fixture/http\";\n\nexport function readStatus(): Promise<unknown> {\n  return send(\"/api/v1/status\", { method: \"GET\" });\n}\n";
 
 const POLL: &str = "import { readStatus } from \"./status\";\n\nexport function poll(): void {\n  void readStatus();\n}\n";
@@ -231,6 +235,12 @@ fn repo(tmp: &Path) -> PathBuf {
     );
     fs::write(repo.join("src/registers.ts"), REGISTERS).unwrap();
     fs::write(repo.join("src/registers_caller.ts"), REGISTERS_CALLER).unwrap();
+    fs::write(repo.join("src/registers_named.ts"), REGISTERS_NAMED).unwrap();
+    fs::write(
+        repo.join("src/registers_named_caller.ts"),
+        REGISTERS_NAMED_CALLER,
+    )
+    .unwrap();
     fs::write(repo.join("src/status.ts"), STATUS).unwrap();
     fs::write(repo.join("src/poll.ts"), POLL).unwrap();
     fs::write(repo.join("src/helper.ts"), HELPER).unwrap();
@@ -733,6 +743,39 @@ fn a_callee_that_registers_a_route_states_no_call_at_its_caller() {
         !recording().log_has(&["is a server-framework call"]),
         "the off arm does not run the filter"
     );
+}
+
+/// A registration whose handler is a named function has a request's shape
+/// too (the summaries read `srv.get("/x", handler)` as `GET /x`). With the
+/// fact layer choosing, the store's role for the export withdraws the row at
+/// every caller; the off arm keeps it.
+#[test]
+fn a_callee_that_registers_a_named_handler_states_no_call_at_its_caller() {
+    let at = |scan: &Scan| -> Vec<serde_json::Value> {
+        scan.calls
+            .iter()
+            .filter(|call| {
+                call["file"]
+                    .as_str()
+                    .is_some_and(|f| f.ends_with("registers_named_caller.ts"))
+                    && call["line"].as_i64() == Some(4)
+            })
+            .cloned()
+            .collect()
+    };
+    let on = at(choosing());
+    assert!(
+        on.is_empty(),
+        "a route registration is not a request: {on:#?}"
+    );
+    assert!(
+        choosing().log_has(&["the store labels a server framework"]),
+        "the drop is logged: {}",
+        choosing().log
+    );
+    let off = at(recording());
+    assert_eq!(off.len(), 1, "the off arm is unchanged: {off:#?}");
+    assert_eq!(off[0]["path"], "/health/named", "{}", off[0]);
 }
 
 /// The fact layer lists a call into an in-module request helper that reaches
