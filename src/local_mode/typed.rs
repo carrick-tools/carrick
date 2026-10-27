@@ -342,6 +342,7 @@ pub(super) fn start(root: Option<&Path>, warm: bool) -> Result<String, String> {
         &generation,
         Instant::now() + WARM_BUDGET,
         Mode::All,
+        None,
     );
     let _ = std::fs::remove_dir_all(&generation);
     warmed?;
