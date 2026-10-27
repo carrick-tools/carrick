@@ -304,12 +304,18 @@ export function answersTheEdit(result: CheckResult): boolean {
 const MAX_NOTED_FILES = 5;
 
 /**
+ * The ask both the post-edit "not re-checked" line and the Stop hook's check
+ * line end on (carrick#2933), so the two say the same command the same way.
+ */
+export const RUN_CHECK_CHANGED = "run `carrick check --changed` before you finish.";
+
+/**
  * The one line for edited files the re-check did not answer for: the index's
  * verdicts describe them before the edit, so none is printed, and the reader
  * is sent to the command that answers.
  */
 export function notedLine(files: string[]): string {
-  const run = "run `carrick check --changed` before you finish.";
+  const run = RUN_CHECK_CHANGED;
   if (files.length === 1) {
     return `Carrick noted the edit to ${files[0]}. It was not re-checked here, so ${run}`;
   }

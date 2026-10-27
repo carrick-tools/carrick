@@ -45,7 +45,11 @@ test("edits with no check earn the check line, with the count of files", async (
   assert.ok(run.context, "expected the check line");
   // Three distinct files (one edited twice), none of them markdown.
   assert.match(run.context, /This task edited 3 files and has not run `carrick check`\./);
-  assert.match(run.context, /Run `carrick check --changed` now, before you call the work done/);
+  // Ends on the same ask as the post-edit "not re-checked" line (render.ts).
+  assert.match(
+    run.context,
+    /The per-edit re-check covers only the file each edit touched, so run `carrick check --changed` before you finish\.$/,
+  );
   // Same channel as the reuse line: never a block.
   const parsed = JSON.parse(run.stdout) as Record<string, unknown>;
   assert.equal(parsed["decision"], undefined);

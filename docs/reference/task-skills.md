@@ -218,9 +218,9 @@ Edit, Write and MultiEdit calls on a source or config file (`.ts`, `.tsx`,
 after the last Bash command that runs `carrick check` (with any arguments,
 `npx` included). When there are any, the line reads:
 
-> This task edited 3 files and has not run `carrick check`. Run `carrick check
-> --changed` now, before you call the work done: it checks every file changed on
-> this branch in one pass, which the per-edit re-check does not.
+> This task edited 3 files and has not run `carrick check`. The per-edit
+> re-check covers only the file each edit touched, so run `carrick check
+> --changed` before you finish.
 
 or, when a check ran earlier, "This task edited 2 files since its last `carrick
 check`." with the same second sentence. The edited file is read as the

@@ -17,6 +17,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { RUN_CHECK_CHANGED } from "../render.ts";
 
 /** What the scan reads as source or config: an edit to one of these can move a contract. */
 const CHECKED_EXTENSIONS = new Set([
@@ -139,5 +140,5 @@ export function checkLine(edits: UncheckedEdits): string {
   const since = edits.checkedBefore
     ? `This task edited ${count} since its last \`carrick check\`.`
     : `This task edited ${count} and has not run \`carrick check\`.`;
-  return `${since} Run \`carrick check --changed\` now, before you call the work done: it checks every file changed on this branch in one pass, which the per-edit re-check does not.`;
+  return `${since} The per-edit re-check covers only the file each edit touched, so ${RUN_CHECK_CHANGED}`;
 }
