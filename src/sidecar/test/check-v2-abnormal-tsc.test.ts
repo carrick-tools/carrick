@@ -288,6 +288,27 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     });
   }
 
+  it('an option code in a stub source file poisons that stub, not the run', async () => {
+    const plan = buildProbe(PAIRS[0], (s) => `@carrick/${s}`);
+    const probeFile = `packages/carrick-probes/probes/${plan.fileName}`;
+    const tscPath = fakeTsc(
+      'tsc-stub-ts5097',
+      [
+        "echo \"packages/orders/types/surface.d.ts(1,1): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.\"",
+        `echo "${probeFile}(${decisiveAssignmentLine(plan)},7): error TS2322: Type 'A' is not assignable to type 'B'."`,
+        'exit 1',
+      ].join('\n')
+    );
+    const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    for (const v of result.verdicts) {
+      assert.notStrictEqual(v.gate, 'tsc:abnormal-termination', JSON.stringify(v));
+    }
+    // Line 1 of the surface is pair-a's alias: the poison stays on it.
+    const a = result.verdicts.find((v) => v.pair_key === 'pair-a')!;
+    assert.strictEqual(a.gate, 'poison:producer', JSON.stringify(a));
+  });
+
   it('the native compiler out of memory is a heap death, and says why', async () => {
     const tscPath = fakeTsc(
       'tsc-go-oom',
@@ -303,17 +324,13 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     }
   });
 
-  it('a host with no native compiler installed is not checked, and says why', async () => {
-    const tscPath = fakeTsc(
-      'tsc-no-platform',
-      "echo 'Error: Unable to resolve @typescript/typescript-linux-x64. Either your platform is unsupported, or you are missing the package on disk.' >&2; exit 1"
-    );
+  it('a host with no native compiler is judged by TypeScript 6, and says so', async () => {
+    const tscPath = judgeTscPath(undefined, 'aix', 'ppc64');
     const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
-    assert.strictEqual(result.success, false);
-    for (const v of result.verdicts) {
-      assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
-      assert.match(v.diagnostic ?? '', /native type checker for this platform is not installed/);
-    }
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    assert.strictEqual(result.ts_version, '6.0.2');
+    assert.strictEqual(result.judge, 'TypeScript 6.0.2 (native compiler not installed)');
+    for (const v of result.verdicts) assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
   });
 });
 
@@ -368,20 +385,21 @@ describe('check_v2: heap-death evidence and the compiler heap cap', () => {
     });
   });
 
-  it("the judge runs the host's native executable where the walk finds it, else the launcher", () => {
+  it("the judge runs the host's native executable where the walk finds it, else TypeScript 6", () => {
     const layout = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-judge-tsc-'));
     try {
       const sidecar = path.join(layout, 'node_modules', 'carrick', 'sidecar');
       fs.mkdirSync(sidecar, { recursive: true });
-      const launcher = path.join(layout, 'node_modules', 'typescript-native', 'bin', 'tsc');
-      fs.mkdirSync(path.dirname(launcher), { recursive: true });
-      fs.writeFileSync(launcher, '');
-      assert.strictEqual(judgeTscPath(sidecar, 'linux', 'x64'), launcher);
+      const six = path.join(layout, 'node_modules', 'typescript', 'bin', 'tsc');
+      fs.mkdirSync(path.dirname(six), { recursive: true });
+      fs.writeFileSync(six, '');
+      assert.strictEqual(judgeTscPath(sidecar, 'linux', 'x64'), six);
       const native = path.join(layout, 'node_modules', '@typescript', 'typescript-linux-x64', 'lib', 'tsc');
       fs.mkdirSync(path.dirname(native), { recursive: true });
       fs.writeFileSync(native, '');
       assert.strictEqual(judgeTscPath(sidecar, 'linux', 'x64'), native);
-      assert.strictEqual(judgeTscPath(sidecar, 'darwin', 'arm64'), launcher);
+      assert.strictEqual(judgeTscPath(sidecar, 'darwin', 'arm64'), six);
+      assert.strictEqual(judgeTscPath(sidecar, 'win32', 'x64'), six);
     } finally {
       fs.rmSync(layout, { recursive: true, force: true });
     }

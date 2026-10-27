@@ -622,7 +622,12 @@ export interface CheckResult {
    * missing (soundness over availability — pinned design, Check step 2). */
   isolation: 'pnpm' | 'unavailable';
   install_ok: boolean;
+  /** The judge compiler's version. */
   ts_version: string;
+  /** Which compiler judged, in words: `TypeScript 7.0.2 (native)`, or
+   * `TypeScript 6.0.2 (native compiler not installed)` where the host's
+   * native executable is missing. */
+  judge: string;
   /** Verdicts, sorted by pair_id for byte-stable output. */
   verdicts: CheckVerdict[];
   degraded_services: DegradedService[];

@@ -127,19 +127,9 @@ jobs:
       - name: A checkout produces type verdicts
         run: node npm/carrick/scripts/verdict-probe.mjs --sidecar src/sidecar
 
-      # The judge's compiler is TypeScript 7's native executable, which ships
-      # in a platform package the compiler declares as an optional dependency.
-      # The install above omits optional dependencies on purpose, so it has no
-      # compiler, and the check would say every pair is not checked. Add this
-      # host's platform package at the install root, where the sidecar finds it.
-      - name: The judge's native compiler for this host
-        working-directory: ${{ runner.temp }}/probe
-        run: |
-          set -euo pipefail
-          VERSION=$(node -p "require('./node_modules/carrick/package.json').dependencies['typescript-native'].split('@').pop()")
-          PLATFORM=$(node -p 'process.platform + "-" + process.arch')
-          npm install --no-save --ignore-scripts --omit=optional "@typescript/typescript-${PLATFORM}@${VERSION}"
-
+      # This install omits optional dependencies, so it has no native compiler
+      # for the judge: its verdicts come from TypeScript 6's tsc, the fallback
+      # (the install matrix below runs the native one).
       - name: The installed package produces the same type verdicts
         run: |
           set -euo pipefail
@@ -412,9 +402,10 @@ jobs:
       # (carrick#833).
       # The judge's compiler is TypeScript 7's native executable, which ships
       # in a platform package the compiler declares as an optional dependency.
-      # The install above omits optional dependencies on purpose, so add this
-      # host's platform package at the install root, where the sidecar finds
-      # it. After the missing-platform step, which needs it absent.
+      # The install above omits optional dependencies on purpose (and so would
+      # judge on TypeScript 6, the fallback, which the plugin job proves), so
+      # add this host's platform package at the install root, where the
+      # sidecar finds it. After the missing-platform step, which needs it absent.
       - name: The judge's native compiler for this host
         working-directory: probe
         run: |

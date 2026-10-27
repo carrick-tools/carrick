@@ -539,12 +539,13 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
   // at once (TS2740). That pair is decided by the bytes gate, so only its
   // `codes` move.
   it('the native judge reads every pair as TypeScript 6 does', async () => {
-    assert.match(judgeTscPath(), /@typescript\/typescript-[^/]+\/lib\/tsc|typescript-native/);
+    assert.match(judgeTscPath(), /@typescript\/typescript-[^/]+\/lib\/tsc$/);
     const ts6 = resolveVendored(path.join('typescript', 'bin', 'tsc'));
     const six = await runCheck({ stubs, pairs: PAIRS, tscPath: ts6 });
     const seven = await runCheck({ stubs, pairs: PAIRS });
     assert.strictEqual(six.ts_version, '6.0.2');
     assert.strictEqual(seven.ts_version, '7.0.2');
+    assert.strictEqual(seven.judge, 'TypeScript 7.0.2 (native)');
     const sixBy = byKey(six.verdicts);
     const sevenBy = byKey(seven.verdicts);
     assert.deepStrictEqual([...sevenBy.keys()].sort(), [...sixBy.keys()].sort());

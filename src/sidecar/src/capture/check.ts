@@ -116,22 +116,17 @@ export function carriesNativeOutOfMemoryLine(output: string): boolean {
 
 /**
  * Whether a diagnostic is about the compiler's configuration rather than a
- * file it checked: one placed in a `.json` file (the tsconfig), or an option
- * code (TS5xxx), or "no inputs" (TS18003).
+ * file it checked: one placed in the tsconfig the judge wrote, or "no inputs"
+ * (TS18003). Keyed on the file, not on the TS5xxx option range: some of those
+ * codes sit in a source file (TS5097, an import ending in `.ts`) and poison
+ * only the stub that holds it.
  */
 export function isConfigDiagnostic(d: RawDiagnostic): boolean {
-  return d.file.endsWith('.json') || (d.code >= 5000 && d.code < 6000) || d.code === 18003;
+  return path.posix.basename(d.file) === 'tsconfig.json' || d.code === 18003;
 }
 
 /** Why the compiler ended abnormally, when its output names a known cause. */
 export function abnormalCause(output: string): string | undefined {
-  if (/Unable to resolve @typescript\/typescript-/.test(output)) {
-    return (
-      "the native type checker for this platform is not installed (the compiler's " +
-      'platform package is an optional dependency; an install that omits optional ' +
-      'dependencies leaves it out)'
-    );
-  }
   if (carriesNativeOutOfMemoryLine(output)) return 'the type checker ran out of memory';
   return undefined;
 }
@@ -228,21 +223,23 @@ function binPath(name: string): string {
 }
 
 /**
- * The package the judge's compiler comes from: TypeScript 7, the native
- * compiler, installed under an alias beside the TypeScript 6 that capture and
- * inference read through ts-morph. Both packages declare a `tsc` bin, so
- * `node_modules/.bin/tsc` may be either; the judge never reads it.
+ * The package that brings the judge's compiler: TypeScript 7 under an alias
+ * beside the TypeScript 6 that capture and inference read through ts-morph.
+ * Its platform package holds the native executable the judge runs. Both
+ * packages declare a `tsc` bin, so `node_modules/.bin/tsc` may be either; the
+ * judge never reads it.
  */
 export const JUDGE_COMPILER_PACKAGE = 'typescript-native';
 
 /**
- * The judge's tsc. First the host's native executable, from the platform
- * package the compiler installs as an optional dependency (`@typescript/
- * typescript-<platform>-<arch>`), found by the same walk as the bins: npm
- * hoists it beside the sidecar, and an install that omitted optional
- * dependencies can add it at its root. Otherwise the compiler package's own
- * launcher, which resolves the platform package from wherever the package
- * manager put it (pnpm's store) and says so when it is missing.
+ * The judge's tsc: the host's native executable, from the platform package
+ * the compiler installs as an optional dependency (`@typescript/
+ * typescript-<platform>-<arch>`), found by the same walk as the bins. Where it
+ * is not installed (an install that omits optional dependencies, such as the
+ * cloud runner's, or a pnpm store the walk does not reach), TypeScript 6's own
+ * tsc, which ships for ts-morph anyway. The two read every probe the same
+ * (measured on 1,018 real probes; the one wording difference moves only a
+ * verdict's `codes`), so the fallback changes no verdict, only the time.
  */
 export function judgeTscPath(
   from: string = sidecarRoot(),
@@ -253,7 +250,20 @@ export function judgeTscPath(
   const native = path.join('@typescript', `typescript-${platform}-${arch}`, 'lib', exe);
   const found = resolveVendored(native, from);
   if (fs.existsSync(found)) return found;
-  return resolveVendored(path.join(JUDGE_COMPILER_PACKAGE, 'bin', 'tsc'), from);
+  return resolveVendored(path.join('typescript', 'bin', 'tsc'), from);
+}
+
+/** Which compiler a tsc path is, in words, for the run log and the result. */
+export function judgeLabel(tscPath: string): string {
+  const version = compilerVersion(tscPath);
+  const parts = tscPath.split(/[\\/]/);
+  if (parts.some((p) => p.startsWith('typescript-') && p !== JUDGE_COMPILER_PACKAGE)) {
+    return `TypeScript ${version} (native)`;
+  }
+  if (parts.includes('typescript') && parts[parts.length - 2] === 'bin') {
+    return `TypeScript ${version} (native compiler not installed)`;
+  }
+  return `a stand-in compiler at ${tscPath}`;
 }
 
 /** The version of the compiler a tsc path belongs to, read from the package
@@ -309,6 +319,7 @@ export async function runCheck(
   const pnpmPath = opts.pnpmPath ?? binPath('pnpm');
   const tscPath = opts.tscPath ?? judgeTscPath();
   const tsVersion = compilerVersion(tscPath);
+  const judge = judgeLabel(tscPath);
 
   // Isolation is non-negotiable: without the vendored pnpm we would fall back
   // to a flat npm install that manufactures nominal false-incompatibles. Fail
@@ -325,6 +336,7 @@ export async function runCheck(
       isolation: 'unavailable',
       install_ok: false,
       ts_version: tsVersion,
+      judge,
       verdicts: sortVerdicts([
         ...unverifiableAll(
           probing,
@@ -421,6 +433,7 @@ export async function runCheck(
       isolation: 'pnpm',
       install_ok: false,
       ts_version: tsVersion,
+      judge,
       verdicts,
       degraded_services: degraded,
       errors,
@@ -428,7 +441,7 @@ export async function runCheck(
   }
 
   // ---- Judge (async, off the event loop) ----------------------------------
-  progress('checking', 'type-checking probes');
+  progress('checking', `type-checking probes (judge: ${judge})`);
   const heap = childHeap(
     process.execArgv,
     process.env.NODE_OPTIONS,
@@ -509,6 +522,7 @@ export async function runCheck(
       isolation: 'pnpm',
       install_ok: true,
       ts_version: tsVersion,
+      judge,
       verdicts,
       degraded_services: dedupeDegraded(degraded),
       errors,
@@ -574,6 +588,7 @@ export async function runCheck(
     isolation: 'pnpm',
     install_ok: true,
     ts_version: tsVersion,
+    judge,
     verdicts,
     degraded_services: dedupeDegraded(degraded),
     errors,

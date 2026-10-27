@@ -594,8 +594,9 @@ TypeScript 7.0.2's native compiler, installed under the alias
 the probe walk read through ts-morph. The sidecar runs the host's native
 executable from the compiler's platform package
 (`@typescript/typescript-<platform>-<arch>`, an optional dependency of the
-compiler, about 26-28 MB per host). It falls back to the package's own
-launcher when that executable is not where the walk looks. Parity, measured
+compiler, about 26-28 MB per host). Where that is not installed (an install
+that omits optional dependencies), the judge runs TypeScript 6's own tsc and
+says so in `judge` on the check result. Parity, measured
 before the switch: on two real 1,018-probe workspaces every probe diagnostic
 (file, line, column, code, message) matched TypeScript 6. On the golden
 suites one pair moved: an alias of `Uint8Array` assigned to `Blob` is TS2322
@@ -611,8 +612,7 @@ guards came with the switch:
   longer written.
 - The native compiler dies out of memory with the Go runtime's
   `fatal error: runtime: out of memory`. That counts as a heap death, beside
-  V8's line. A missing platform package names itself on every pair it leaves
-  unchecked.
+  V8's line.
 
 ## Future hook: wire-truth vs type-truth
 
