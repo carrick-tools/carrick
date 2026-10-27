@@ -604,8 +604,9 @@ impl Reader {
     /// lockfile counts for every service. Nothing else moves that commit, so
     /// on a busy main branch every check re-read the whole repository. The
     /// move is all or nothing, and only forward along HEAD's history: for
-    /// every local repo whose hosted commit moved, the new commit must hold
-    /// the old one and be held by HEAD. A branch behind main keeps the base
+    /// every local repo whose hosted commits moved, the newest of them
+    /// ([`newest_commit`]) must hold the newest held one and be held by HEAD.
+    /// Each service's blob keeps its own commit. A branch behind main keeps the base
     /// it has, and so does a checkout that has not fetched the new commit.
     ///
     /// Asks `resolve-repos` first and downloads only when something moved and
@@ -635,12 +636,7 @@ impl Reader {
             remotes: remotes.clone(),
             ..Default::default()
         };
-        let one = |commits: std::collections::BTreeSet<String>| -> Option<String> {
-            (commits.len() == 1)
-                .then(|| commits.into_iter().next())
-                .flatten()
-        };
-        let mut approved: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let mut approved: BTreeMap<PathBuf, std::collections::BTreeSet<String>> = BTreeMap::new();
         let mut moved: Vec<(PathBuf, String)> = Vec::new();
         for (path, name) in remotes {
             let now: std::collections::BTreeSet<String> = resolution
@@ -658,19 +654,24 @@ impl Reader {
             if now.is_empty() && held.is_empty() {
                 continue;
             }
-            let (Some(to), Some(from)) = (one(now), one(held)) else {
+            // A push scan rescans only the services the push reached, so one
+            // repo's services can sit at several commits of one line: the
+            // newest stands for the repo when it holds every other.
+            let repo = path.to_string_lossy();
+            let (Some(to), Some(from)) = (newest_commit(&repo, &now), newest_commit(&repo, &held))
+            else {
                 return (
                     Forward::Kept(format!(
-                        "{name}: the hosted index and this machine's copy are not one commit each"
+                        "{name}: the hosted index or this machine's copy spans commits that are \
+                         not one line of history"
                     )),
                     None,
                 );
             };
-            if to == from {
-                approved.insert(path.clone(), to);
+            if now == held {
+                approved.insert(path.clone(), now);
                 continue;
             }
-            let repo = path.to_string_lossy();
             let head = crate::git_state::head_commit(&repo).unwrap_or_default();
             if !crate::git_state::is_ancestor(&repo, &to, &head) {
                 return (
@@ -692,7 +693,7 @@ impl Reader {
                     None,
                 );
             }
-            approved.insert(path.clone(), to.clone());
+            approved.insert(path.clone(), now);
             moved.push((path.clone(), to));
         }
         if moved.is_empty() {
@@ -712,15 +713,17 @@ impl Reader {
         // What came down must be what was checked: main may have moved again
         // between the two requests, and a blob this build would not carry
         // (another cache format, a dirty tree) would only re-read everything.
-        for (path, to) in &approved {
+        for (path, checked) in &approved {
             let blobs = after.local_blobs(path);
             let is_moved = moved.iter().any(|(moved, _)| moved == path);
+            let came: std::collections::BTreeSet<&String> =
+                blobs.iter().map(|blob| &blob.commit_hash).collect();
             if blobs.is_empty()
+                || came != checked.iter().collect()
                 || blobs.iter().any(|blob| {
-                    &blob.commit_hash != to
-                        || (is_moved
-                            && (blob.cache_version != Some(crate::engine::CACHE_VERSION)
-                                || blob.dirty == Some(true)))
+                    is_moved
+                        && (blob.cache_version != Some(crate::engine::CACHE_VERSION)
+                            || blob.dirty == Some(true))
                 })
             {
                 return (
@@ -733,6 +736,20 @@ impl Reader {
         }
         (Forward::Moved(moved), after.snapshot)
     }
+}
+
+/// The commit of `commits` that holds every other one in its history, or
+/// `None` when there is none (the set is empty, or spans two lines). The rule
+/// the release kit's preflight reads a multi-commit hosted index by.
+fn newest_commit(repo: &str, commits: &std::collections::BTreeSet<String>) -> Option<String> {
+    commits
+        .iter()
+        .find(|candidate| {
+            commits.iter().all(|other| {
+                other == *candidate || crate::git_state::is_ancestor(repo, other, candidate)
+            })
+        })
+        .cloned()
 }
 
 /// The first seven characters of a commit id, as a sentence names it.
@@ -3123,6 +3140,87 @@ mod tests {
         )]);
         let (outcome, snapshot) = reader(url)
             .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
+        assert!(snapshot.is_none());
+        assert_eq!(requests.join().unwrap().len(), 1, "it downloaded anyway");
+    }
+
+    /// A push scan rescans only the services the push reached, so a hosted
+    /// repo's services sit at several commits. Two on one line move to the
+    /// newer one, each blob keeping its own commit; two on unrelated lines
+    /// keep the base without a download.
+    #[tokio::test]
+    async fn services_at_several_commits_of_one_line_move_and_of_two_lines_keep() {
+        use crate::git_state::tests::git_in;
+        let (dir, a, b, c) = moved_on_repo();
+        let two_at = |api: &str, worker: &str| {
+            let mut metadata = resolution();
+            metadata["repos"][0]["services"] =
+                json!([service_row("api", api), service_row("worker", worker)]);
+            metadata
+        };
+        let held = snapshot(
+            two_at(&a, &a),
+            BTreeMap::from([(
+                "p".to_string(),
+                vec![
+                    named_blob("api", "api", &a),
+                    named_blob("api", "worker", &a),
+                ],
+            )]),
+        );
+        let at = "2026-10-02T10:00:00.000Z";
+        let (url, requests) = serve_sequence(vec![
+            ("200 OK", serde_json::to_vec(&two_at(&b, &a)).unwrap()),
+            (
+                "200 OK",
+                answered(&[
+                    (named_blob("api", "api", &b), at),
+                    (named_blob("api", "worker", &a), at),
+                ]),
+            ),
+        ]);
+        let remotes = remotes_of(dir.path());
+        let (outcome, snapshot) = reader(url)
+            .forward(&credential("test"), &remotes, held.clone())
+            .await;
+        assert_eq!(
+            outcome,
+            Forward::Moved(vec![(dir.path().to_path_buf(), b.clone())])
+        );
+        assert_eq!(requests.join().unwrap().len(), 2);
+        let input = HostedInput {
+            snapshot,
+            remotes: remotes.clone(),
+            ..Default::default()
+        };
+        let mut commits: Vec<(Option<String>, String)> = input
+            .local_blobs(dir.path())
+            .into_iter()
+            .map(|blob| (blob.service_name, blob.commit_hash))
+            .collect();
+        commits.sort();
+        assert_eq!(
+            commits,
+            vec![
+                (Some("api".to_string()), b.clone()),
+                (Some("worker".to_string()), a.clone())
+            ]
+        );
+
+        // A side line from A: B and `side` share A but neither holds the other.
+        git_in(dir.path(), &["checkout", "-q", "-b", "side", &a]);
+        std::fs::write(dir.path().join("src/app.ts"), "export const value = 3;").unwrap();
+        git_in(dir.path(), &["commit", "-qam", "a line HEAD will not hold"]);
+        let side = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        git_in(dir.path(), &["checkout", "-q", &c]);
+        let (url, requests) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&two_at(&b, &side)).unwrap(),
+        )]);
+        let (outcome, snapshot) = reader(url)
+            .forward(&credential("test"), &remotes, held)
             .await;
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
         assert!(snapshot.is_none());
