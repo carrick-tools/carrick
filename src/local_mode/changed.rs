@@ -130,6 +130,11 @@ pub struct Problem {
     /// service of this workspace from an outside API. Printed, and never
     /// fails the run.
     pub unconfirmed: bool,
+    /// In a file the work did not touch: a call the index matched whose
+    /// route the work took away. Listed when it fails, and with `--all`;
+    /// never counted on the summary line, which is about the edited files.
+    #[serde(skip)]
+    pub outside_the_change: bool,
     pub fails: bool,
 }
 
@@ -571,6 +576,7 @@ fn judge(
                 .unwrap_or_else(|| "not_stated".to_string()),
             already_indexed: already,
             unconfirmed: false,
+            outside_the_change: false,
             fails: fact && !already,
         });
     }
@@ -621,6 +627,7 @@ fn judge(
                     source: source.as_str().to_string(),
                     already_indexed: already,
                     unconfirmed,
+                    outside_the_change: !is_changed(repo, &file),
                     fails: source == Source::Fact && !already && !unconfirmed,
                 });
             }
@@ -713,10 +720,13 @@ impl ChangedOutput {
             .filter(|problem| all || problem.fails)
             .collect();
         // Each problem not listed, counted by why, in the order `--all`
-        // prints the reasons in.
+        // prints the reasons in. A file the work did not touch adds to this
+        // line only by failing, which lists it: the summary is about the
+        // edited files.
         let mut unlisted: BTreeMap<Unlisted, usize> = BTreeMap::new();
         for problem in &self.problems {
-            if let (false, Some(why)) = (all, problem.unlisted()) {
+            if let (false, false, Some(why)) = (all, problem.outside_the_change, problem.unlisted())
+            {
                 *unlisted.entry(why).or_default() += 1;
             }
         }
@@ -866,8 +876,56 @@ mod tests {
             source: if fails { "fact" } else { "candidate" }.to_string(),
             already_indexed: false,
             unconfirmed: false,
+            outside_the_change: false,
             fails,
         }
+    }
+
+    /// A file the work did not touch never adds to the summary of the edited
+    /// files: its call that does not fail is listed with `--all` and counted
+    /// nowhere else. One that fails (the work took its route away) is listed.
+    #[test]
+    fn an_untouched_file_adds_nothing_to_the_summary_unless_it_fails() {
+        let mut elsewhere = problem(ProblemKind::NoRoute, false);
+        elsewhere.file = "web/src/other.ts".to_string();
+        elsewhere.reason = "the index matched this call, and no service serves it now".to_string();
+        elsewhere.outside_the_change = true;
+        let mut broken = elsewhere.clone();
+        broken.path = "/c".to_string();
+        broken.source = "fact".to_string();
+        broken.fails = true;
+        let output = |problems: Vec<Problem>, failing: usize| ChangedOutput {
+            routes: 0,
+            calls: 1,
+            files: 1,
+            services: 2,
+            problems,
+            failing,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+
+        let quiet = output(vec![elsewhere.clone()], 0).render(false);
+        assert_eq!(
+            quiet,
+            "carrick check: checked 0 routes and 1 call in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route\n"
+        );
+        let everything = output(vec![elsewhere.clone()], 0).render(true);
+        assert!(everything.contains("web/src/other.ts:4"), "{everything}");
+
+        let failing = output(vec![elsewhere, broken], 1).render(false);
+        assert!(
+            failing.starts_with(
+                "carrick check: checked 0 routes and 1 call in 1 changed file against 2 services: \
+                 0 incompatible, 1 reaches no route\n"
+            ),
+            "{failing}"
+        );
+        assert!(
+            failing.contains("web/src/other.ts:4  no route  call GET /c"),
+            "{failing}"
+        );
     }
 
     #[test]

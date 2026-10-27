@@ -566,6 +566,11 @@ A problem the index already held is counted as that, whatever else holds for
 it. `--json` always lists every problem, with its `source`,
 `already_indexed`, `unconfirmed` and `fails`.
 
+**Files the work did not touch.** A call in such a file is reported only when
+the index matched it and no service serves it now. It is listed when it fails,
+and with `--all` otherwise; it is never counted on the summary line, which is
+about the changed files.
+
 **Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same
 pass over the files named, in any repos of the workspace, instead of the
 files git says changed: always re-extracted (`--recheck` is accepted and
