@@ -2006,7 +2006,9 @@ USAGE:
                files it was asked about, or could not run, exits 2 and says
                what to run (`carrick init` or `carrick refresh`).
                --all lists the unconfirmed ones too. Five minutes at most
-               (CARRICK_CHECK_BUDGET_MS). Run it with your tests.
+               (CARRICK_CHECK_BUDGET_MS). While it works it says what it is
+               doing on stderr, at least every ten seconds; stdout carries
+               the answer only. Run it with your tests.
                Several files (`check a.ts b.ts`) are checked the same way:
                the named files, always re-extracted, each repo scanned once,
                the same summary line and exit code as --changed.

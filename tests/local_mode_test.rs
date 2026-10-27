@@ -2864,6 +2864,145 @@ fn a_signalled_check_ends_its_re_scan_and_the_re_scans_sidecar() {
     assert_eq!(status.code(), Some(143), "{status:?}");
 }
 
+/// How long the silence-watching caller below lets a command say nothing
+/// before killing it, as an agent harness does with a command it reads as
+/// hung. Longer than the check's heartbeat, shorter than the stall the stub
+/// sidecar makes.
+const SILENCE_LIMIT: Duration = Duration::from_secs(20);
+
+/// A check that works for longer than a caller will wait in silence keeps
+/// saying so on stderr, and its answer on stdout stays the answer alone.
+///
+/// The type sidecar here never becomes ready, so the re-scan and the join
+/// each wait out the readiness budget: a stretch with no output that is
+/// longer than [`SILENCE_LIMIT`], as a large repo's re-scan is. The caller is
+/// what an agent harness does: it kills the command after that long without a
+/// byte on either stream. Before the narration, the check printed nothing
+/// until its answer, and this caller killed it.
+#[test]
+#[serial]
+fn check_changed_keeps_talking_to_a_caller_that_kills_silent_commands() {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let sidecar = root.join(".stalled-sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
+    std::fs::write(
+        sidecar.join("index.js"),
+        "process.stdin.on('end', () => process.exit(0));\nprocess.stdin.resume();\n",
+    )
+    .expect("write the sidecar that never answers");
+
+    let mut child = Command::new(carrick())
+        .args(["check", "--changed", "--workspace", ".", "--json"])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_SIDECAR_DIR", root.join(".stalled-sidecar"))
+        .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "30")
+        // The stalled sidecar types nothing; the run is about the wait.
+        .env("CARRICK_ALLOW_MISSING_TYPES", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the check");
+
+    // Each stream read on its own thread; every chunk is a sign of life.
+    let (heard, hearing) = mpsc::channel::<(bool, Vec<u8>)>();
+    let readers: Vec<_> = [
+        (
+            true,
+            Box::new(child.stdout.take().expect("stdout")) as Box<dyn Read + Send>,
+        ),
+        (false, Box::new(child.stderr.take().expect("stderr"))),
+    ]
+    .into_iter()
+    .map(|(is_stdout, mut stream)| {
+        let heard = heard.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 || heard.send((is_stdout, buffer[..read].to_vec())).is_err() {
+                    break;
+                }
+            }
+        })
+    })
+    .collect();
+    drop(heard);
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let started = Instant::now();
+    let mut longest_silence = Duration::ZERO;
+    let mut last = Instant::now();
+    loop {
+        match hearing.recv_timeout(Duration::from_millis(100)) {
+            Ok((is_stdout, bytes)) => {
+                longest_silence = longest_silence.max(last.elapsed());
+                last = Instant::now();
+                if is_stdout {
+                    stdout.extend(bytes);
+                } else {
+                    stderr.extend(bytes);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last.elapsed() >= SILENCE_LIMIT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "killed as hung: {:.0}s without output, {:.0}s in; it had said:\n{}",
+                        last.elapsed().as_secs_f64(),
+                        started.elapsed().as_secs_f64(),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+            }
+        }
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let status = child.wait().expect("wait for the check");
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let stdout = String::from_utf8(stdout).expect("stdout is UTF-8");
+
+    eprintln!("what the check said while it worked:\n{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is the JSON answer alone ({e}):\n{stdout}"));
+    assert_eq!(json["schema"], "carrick.check-changed/0", "{json:#}");
+    assert!(
+        status.code().is_some(),
+        "the check ended on its own: {status:?}"
+    );
+    assert!(
+        stderr.contains("carrick check: re-reading inventory-svc..."),
+        "it named the repo it re-read:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("carrick check: still "),
+        "and said it was still working through the stall:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("carrick check: comparing routes and calls across 2 services..."),
+        "and named the join:\n{stderr}\n{stdout}"
+    );
+    assert!(
+        longest_silence < SILENCE_LIMIT,
+        "never silent for the limit: {longest_silence:?}"
+    );
+}
+
 /// The same new call through a base set at run time: it could be a service
 /// of this workspace or an outside API, so it is printed as unconfirmed and
 /// does not fail the run.

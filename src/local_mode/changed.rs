@@ -275,7 +275,16 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     let generation =
         std::env::temp_dir().join(format!("carrick-check-changed-{}", uuid::Uuid::new_v4()));
     let rescan: Vec<&Path> = changed.values().map(|(path, _)| path.as_path()).collect();
-    let rejoined = super::recheck::rejoin(&workspace, &rescan, &generation, started + budget());
+    // Said on stderr while it works: on a large repo the pass runs for
+    // minutes, and a caller that reads silence as a hang kills it.
+    let narrator = super::recheck::Narrator::to_stderr(started);
+    let rejoined = super::recheck::rejoin(
+        &workspace,
+        &rescan,
+        &generation,
+        started + budget(),
+        Some(&narrator),
+    );
     // The temporary generation goes on every path, as the single-file
     // re-check's does.
     let _ = std::fs::remove_dir_all(&generation);
