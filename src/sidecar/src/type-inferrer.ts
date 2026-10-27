@@ -66,6 +66,14 @@ import { readResponseModes, type JoinedBody, type ResponseModes } from './respon
 import { functionAtLine } from './function-line-index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
+import {
+  callsOf,
+  descendantsOf,
+  descendantsOnLine,
+  descendantsOnLines,
+  wrap,
+  type IndexedNode,
+} from './node-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import type { LabelledMembers } from './library-claims.js';
 import { StatedParams } from './stated-params.js';
@@ -8250,12 +8258,12 @@ export class TypeInferrer {
     sourceFile: SourceFile,
     line: number
   ): { registration: Node; handler: FunctionLike } | undefined {
-    for (const node of sourceFile.getDescendants()) {
+    for (const entry of descendantsOnLine(sourceFile, line)) {
       if (
-        (Node.isCallExpression(node) ||
-          Node.isObjectLiteralExpression(node)) &&
-        startLineOf(node) === line
+        entry.kind === SyntaxKind.CallExpression ||
+        entry.kind === SyntaxKind.ObjectLiteralExpression
       ) {
+        const node = wrap(sourceFile, entry);
         const handler = this.resolveRegisteredHandler(node);
         if (handler) {
           return { registration: node, handler };
@@ -11112,12 +11120,14 @@ export class TypeInferrer {
     lineNumber?: number,
     searchRadius: number = 5
   ): Node | undefined {
-    const allNodes = sourceFile.getDescendants().filter((node) => {
-      if (Node.isSourceFile(node)) return false;
-      if (node.getKind() === SyntaxKind.SyntaxList) return false;
-      return true;
-    });
-    return this.matchByText(allNodes, expressionText, lineNumber, searchRadius);
+    // Only the window's nodes are wrapped: `matchByText` keeps no other.
+    const inWindow = lineNumber
+      ? descendantsOnLines(sourceFile, lineNumber - searchRadius, lineNumber + searchRadius)
+      : descendantsOf(sourceFile);
+    const nodes = inWindow
+      .filter((entry) => entry.kind !== SyntaxKind.SyntaxList)
+      .map((entry) => wrap(sourceFile, entry));
+    return this.matchByText(nodes, expressionText, lineNumber, searchRadius);
   }
 
   /**
@@ -11129,7 +11139,13 @@ export class TypeInferrer {
     lineNumber?: number,
     searchRadius: number = 5
   ): CallExpression | undefined {
-    const callExpressions = sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression);
+    const inWindow = lineNumber
+      ? callsOf(sourceFile).filter(
+          (entry) =>
+            entry.line >= lineNumber - searchRadius && entry.line <= lineNumber + searchRadius
+        )
+      : callsOf(sourceFile);
+    const callExpressions = inWindow.map((entry) => wrap<CallExpression>(sourceFile, entry));
     return this.matchByText(callExpressions, expressionText, lineNumber, searchRadius) as
       | CallExpression
       | undefined;
@@ -11460,23 +11476,19 @@ export class TypeInferrer {
     spanStart: number,
     spanEnd: number
   ): Node | undefined {
-    const allNodes = sourceFile.getDescendants();
-    const containing = allNodes.filter((node) => {
-      if (Node.isSourceFile(node)) return false;
+    const containing = descendantsOf(sourceFile).filter(
       // Skip SyntaxList nodes as they have unreliable types
-      if (node.getKind() === SyntaxKind.SyntaxList) return false;
-      const start = node.getStart();
-      const end = node.getEnd();
-      return start <= spanStart && spanEnd <= end;
-    });
+      (entry) =>
+        entry.kind !== SyntaxKind.SyntaxList && entry.start <= spanStart && spanEnd <= entry.end
+    );
 
     if (containing.length === 0) {
       return undefined;
     }
 
-    return containing.reduce((best, current) => {
-      const bestRange = best.getEnd() - best.getStart();
-      const currentRange = current.getEnd() - current.getStart();
+    const best = containing.reduce((best, current) => {
+      const bestRange = best.end - best.start;
+      const currentRange = current.end - current.start;
 
       // Prefer exact matches, then smallest containing
       const bestDelta = Math.abs(bestRange - (spanEnd - spanStart));
@@ -11490,10 +11502,9 @@ export class TypeInferrer {
       // span published `any` as its request body. Descendants follow their
       // ancestors in `getDescendants()` order, so a tied later node inside the
       // current best is the deeper one.
-      return current.getStart() >= best.getStart() && current.getEnd() <= best.getEnd()
-        ? current
-        : best;
+      return current.start >= best.start && current.end <= best.end ? current : best;
     });
+    return wrap(sourceFile, best);
   }
 
   private findCallExpressionAtSpan(
@@ -11518,27 +11529,24 @@ export class TypeInferrer {
     // more and the slack only widens the candidate set. Removing it is
     // carrick#823, which wants its own before/after.
     const SPAN_SLACK = 2;
-    const callExpressions = sourceFile
-      .getDescendantsOfKind(SyntaxKind.CallExpression);
-    const candidates = callExpressions.filter((expr) => {
-      const start = expr.getStart();
-      const end = expr.getEnd();
-      return start - SPAN_SLACK <= spanStart && spanEnd <= end + SPAN_SLACK;
-    });
+    const candidates = callsOf(sourceFile).filter(
+      (entry) => entry.start - SPAN_SLACK <= spanStart && spanEnd <= entry.end + SPAN_SLACK
+    );
 
     if (candidates.length === 0) {
       return undefined;
     }
 
-    return candidates.reduce((best, current) => {
-      const bestRange = best.getEnd() - best.getStart();
-      const currentRange = current.getEnd() - current.getStart();
+    const best = candidates.reduce((best: IndexedNode, current) => {
+      const bestRange = best.end - best.start;
+      const currentRange = current.end - current.start;
 
       const bestDelta = Math.abs(bestRange - (spanEnd - spanStart));
       const currentDelta = Math.abs(currentRange - (spanEnd - spanStart));
 
       return currentDelta < bestDelta ? current : best;
     });
+    return wrap<CallExpression>(sourceFile, best);
   }
 
   // ===========================================================================
