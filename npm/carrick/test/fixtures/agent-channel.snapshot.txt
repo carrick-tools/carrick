@@ -13,7 +13,7 @@ Carrick: user-service/src/routes/users.ts is gone from disk and the index still 
 - user-service/src/routes/users.ts:42:3 route GET /api/users/:id [fact, file_based_route] producer_removed (no type verdict): the file is gone from disk and one consumer still calls this route. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18
 
 ### check-mismatch.json :: renderPostToolUse
-Carrick: user-service/src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish..
+Carrick: user-service/src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.
 
 ### check-new-functions.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: no contract problem.
@@ -22,7 +22,7 @@ Carrick re-checked user-service/src/routes/users.ts after this edit: no contract
 (silent)
 
 ### check-pre-rendered-boundary.json :: renderPostToolUse
-Carrick: user-service/src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish..
+Carrick: user-service/src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.
 
 ### check-silent.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: no contract problem.
