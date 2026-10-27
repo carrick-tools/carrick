@@ -165,8 +165,8 @@ export function refreshInBackground(
 // `carrick check --changed` re-reads every service a change since the hosted
 // index's commit can reach, and a manifest or lockfile reaches all of them. On
 // a busy main branch that commit falls behind within hours, so a branch's
-// one-line edit paid for every merge since. `carrick refresh --hosted-only`
-// moves this machine's copy of the hosted index to the cloud's newer one when
+// one-line edit re-read the whole repository.
+// `carrick refresh --hosted-only` moves this machine's copy of the hosted index to the cloud's newer one when
 // that commit is in HEAD's history: one metadata request, a download only when
 // it moves, no scan. Detached like the refresh above, and silent: nothing is
 // waiting on it, and the next check simply starts from the newer base.
