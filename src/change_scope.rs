@@ -546,6 +546,9 @@ pub fn plan<'a>(
     let mut changed_by_commit: HashMap<String, Result<Vec<ChangedPath>, String>> = HashMap::new();
     let mut closure_took = std::time::Duration::ZERO;
     let mut walked = 0usize;
+    // Services in one repository share files (a contracts package every
+    // service imports), so what a file reads is read once for all of them.
+    let reads = ClosureReads::default();
     let scopes: Vec<Scope> = services
         .iter()
         .map(|service| {
@@ -590,7 +593,7 @@ pub fn plan<'a>(
                     let started = Instant::now();
                     walked += 1;
                     let inputs = match &top {
-                        Some(top) => service_inputs(repo_path, top, service),
+                        Some(top) => service_inputs(repo_path, top, service, &reads),
                         // No top level, no paths to compare: nothing vouches.
                         None => ServiceInputs {
                             unresolved: vec![UnresolvedImport {
@@ -695,12 +698,84 @@ pub(crate) fn only_version_differs(stored: &str, head: &str) -> bool {
     }
 }
 
+/// What the import-closure walks of one tree read from a file, kept for every
+/// service the tree's walks run for: a file's specifiers, a path relative to
+/// the top level, a path's canonical form. Each is a property of the file on
+/// disk alone, never of the service whose walk reached it.
+pub struct ClosureReads {
+    reader: std::cell::RefCell<crate::parser::ModuleReader>,
+    specifiers: std::cell::RefCell<HashMap<PathBuf, Vec<String>>>,
+    relative: std::cell::RefCell<HashMap<(PathBuf, PathBuf), Option<String>>>,
+    canonical: std::cell::RefCell<HashMap<PathBuf, PathBuf>>,
+    /// How many files were parsed: what sharing the reads saves.
+    #[cfg(test)]
+    parsed: std::cell::Cell<usize>,
+}
+
+impl Default for ClosureReads {
+    fn default() -> Self {
+        Self {
+            // A file that does not parse is reported by the pass that reads
+            // it for analysis, not by this walk.
+            reader: std::cell::RefCell::new(crate::parser::ModuleReader::quiet()),
+            specifiers: Default::default(),
+            relative: Default::default(),
+            canonical: Default::default(),
+            #[cfg(test)]
+            parsed: Default::default(),
+        }
+    }
+}
+
+impl ClosureReads {
+    /// Keyed by the file's real path: one walk reaches a file by the path it
+    /// walked, another through a link or by the resolver's real path.
+    fn loaded_specifiers(&self, file: &Path) -> Vec<String> {
+        let key = self.canonical(file);
+        if let Some(known) = self.specifiers.borrow().get(&key) {
+            return known.clone();
+        }
+        #[cfg(test)]
+        self.parsed.set(self.parsed.get() + 1);
+        let loaded = self.reader.borrow_mut().loaded_specifiers(file);
+        self.specifiers.borrow_mut().insert(key, loaded.clone());
+        loaded
+    }
+
+    fn top_relative(&self, top: &Path, path: &Path) -> Option<String> {
+        let key = (top.to_path_buf(), path.to_path_buf());
+        if let Some(known) = self.relative.borrow().get(&key) {
+            return known.clone();
+        }
+        let relative = top_relative(top, path);
+        self.relative.borrow_mut().insert(key, relative.clone());
+        relative
+    }
+
+    fn canonical(&self, path: &Path) -> PathBuf {
+        if let Some(known) = self.canonical.borrow().get(path) {
+            return known.clone();
+        }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.canonical
+            .borrow_mut()
+            .insert(path.to_path_buf(), canonical.clone());
+        canonical
+    }
+}
+
 /// What `service` reads on the tree at `repo_path`, relative to the
-/// repository's top level `top`.
-pub fn service_inputs(repo_path: &str, top: &Path, service: &Config) -> ServiceInputs {
+/// repository's top level `top`. `reads` keeps what one file read gives, for
+/// the next service whose walk reaches the same file.
+pub fn service_inputs(
+    repo_path: &str,
+    top: &Path,
+    service: &Config,
+    reads: &ClosureReads,
+) -> ServiceInputs {
     let root = Path::new(repo_path);
     let top = top.canonicalize().unwrap_or_else(|_| top.to_path_buf());
-    let relative = |path: &Path| -> Option<String> { top_relative(&top, path) };
+    let relative = |path: &Path| -> Option<String> { reads.top_relative(&top, path) };
     let mut roots: Vec<Root> = Vec::new();
     let mut unresolved: Vec<UnresolvedImport> = Vec::new();
 
@@ -743,15 +818,14 @@ pub fn service_inputs(repo_path: &str, top: &Path, service: &Config) -> ServiceI
             .as_ref()
             .map(|(directory, config)| (directory.as_path(), config.as_path())),
     );
-    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = |path: &Path| reads.canonical(path);
     let mut seen: BTreeSet<PathBuf> = walk.files.iter().map(|file| canonical(file)).collect();
     let mut queue: Vec<PathBuf> = walk.files.clone();
-    let mut reader = crate::parser::ModuleReader::quiet();
     let mut files: BTreeSet<String> = BTreeSet::new();
     let mut lookup_dirs: BTreeSet<String> = BTreeSet::new();
     let mut dirs: BTreeSet<String> = BTreeSet::new();
     while let Some(importer) = queue.pop() {
-        for specifier in reader.loaded_specifiers(&importer) {
+        for specifier in reads.loaded_specifiers(&importer) {
             let relative_specifier = specifier.starts_with("./") || specifier.starts_with("../");
             if relative_specifier && let Some(parent) = importer.parent() {
                 // Where the lookup happens: a file appearing beside the one
@@ -945,6 +1019,8 @@ pub struct CopyJudge<'a> {
     top: Option<PathBuf>,
     /// The pull request's own changes, base to the scanned tree.
     pr_changes: std::cell::OnceCell<Result<Vec<ChangedPath>, String>>,
+    /// What the services' closure walks read, shared between the copies.
+    reads: ClosureReads,
 }
 
 impl<'a> CopyJudge<'a> {
@@ -959,6 +1035,7 @@ impl<'a> CopyJudge<'a> {
             scoped: commits.len() > 1,
             top: crate::git_state::toplevel(repo_path).ok(),
             pr_changes: std::cell::OnceCell::new(),
+            reads: ClosureReads::default(),
         }
     }
 
@@ -989,7 +1066,7 @@ impl<'a> CopyJudge<'a> {
         ) else {
             return whole_tree();
         };
-        let inputs = service_inputs(self.repo_path, top, service);
+        let inputs = service_inputs(self.repo_path, top, service, &self.reads);
         if !inputs.unresolved.is_empty() || !inputs.unfollowed_extends.is_empty() {
             return whole_tree();
         }
@@ -1692,6 +1769,39 @@ mod tests {
             })
             .collect();
         (repo, a, services)
+    }
+
+    /// Services that reach the same file share one read of it: the closure
+    /// walk of one tree parses each file once, whichever services reach it,
+    /// and each service's inputs are what a walk of its own would give.
+    #[test]
+    fn services_that_reach_one_file_parse_it_once() {
+        let (repo, _, services) = workspace();
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let top = crate::git_state::toplevel(&repo_path).unwrap();
+        let shared = ClosureReads::default();
+        let mut parsed_alone = 0;
+        for service in &services {
+            let alone = ClosureReads::default();
+            assert_eq!(
+                service_inputs(&repo_path, &top, service, &shared),
+                service_inputs(&repo_path, &top, service, &alone),
+                "{:?}",
+                service.service_name
+            );
+            parsed_alone += alone.parsed.get();
+        }
+        // `web` reaches `api`'s types file, which `api` parsed already.
+        assert!(
+            shared.parsed.get() < parsed_alone,
+            "{} parsed shared, {parsed_alone} alone",
+            shared.parsed.get()
+        );
+        let before = shared.parsed.get();
+        for service in &services {
+            service_inputs(&repo_path, &top, service, &shared);
+        }
+        assert_eq!(shared.parsed.get(), before, "a second walk parses nothing");
     }
 
     fn commit_edit(repo: &Path, path: &str, contents: &str) -> String {
