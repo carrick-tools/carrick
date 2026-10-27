@@ -260,6 +260,8 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const socket0 = recordOf(measure)!.socket;
     const w0 = await SocketClient.greeted(socket0);
     assert.strictEqual((await w0.send(initOf(measure, 'a'))).status, 'ready');
+    // Answered once, as the probe below answers it: the checker is part of what `a` holds.
+    assert.strictEqual((await w0.send(inferOf(measure, 'a'))).status, 'success');
     const measured = await statusOf(socket0);
     const heldA = measured.heap_used_mb;
     const footprintA = serviceIn(measured, measure, 'a')!.footprint_mb!;
@@ -267,8 +269,8 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const footprintB = serviceIn(await statusOf(socket0), measure, 'b')!.footprint_mb!;
     w0.conn.destroy();
     await stopDaemon(measuring, socket0);
-    // `a` fits and is under half the cap; `a` and `b` together do not fit; `b` is under half the cap.
-    const capMb = Math.max(heldA, 2 * footprintA) + Math.min(8, Math.floor(footprintB / 3));
+    // `a` fits, under half the cap, and leaves room to build (under 90% of it); `a` and `b` together do not fit; `b` is under half the cap.
+    const capMb = Math.max(Math.ceil(heldA / 0.9), 2 * footprintA) + 4;
     const fixture = `heap with a ${heldA} MB, a ${footprintA} MB, b ${footprintB} MB, cap ${capMb} MB`;
     assert.ok(heldA + footprintB > capMb + 4 && footprintB <= capMb / 2, `fixture: ${fixture}`);
 
@@ -296,7 +298,7 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     await stopDaemon(child, socket);
   });
 
-  it('without a probe, a warm build releases the least recently used service; a rebuild measures its footprint afresh', async () => {
+  it('without a probe, a warm build releases the least recently used service, whose footprint starts again from nothing', async () => {
     // The heap with `a` held, and the footprint of `big` built after it.
     const measure = withBig(6000);
     const measuring = await daemon(measure);
@@ -310,9 +312,9 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const footprintBig = serviceIn(await statusOf(socket0), measure, 'big')!.footprint_mb!;
     w0.conn.destroy();
     await stopDaemon(measuring, socket0);
-    // Each fits alone (the process base plus its footprint), under half the cap; together they do not.
+    // Each fits alone (the process base plus its footprint), under half the cap; `a` leaves room to build (under 90% of it); together they do not fit.
     const base = heldA - footprintA;
-    const capMb = Math.max(heldA, base + footprintBig, 2 * footprintA) + 8;
+    const capMb = Math.max(Math.ceil(heldA / 0.9), base + footprintBig, 2 * footprintA) + 6;
     const fixture = `heap with a ${heldA} MB, a ${footprintA} MB, big ${footprintBig} MB, cap ${capMb} MB`;
     assert.ok(heldA + footprintBig > capMb + 4 && footprintBig <= capMb / 2, `fixture: ${fixture}`);
 
@@ -326,14 +328,9 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const status = await statusOf(socket);
     assert.deepStrictEqual([serviceIn(status, ws, 'a')!.state, serviceIn(status, ws, 'big')!.state], ['released', 'built'], `${fixture}: ${JSON.stringify(status)}`);
     assert.ok(status.errors.some((e) => e.kind === 'evicted' && e.service === 'a'), JSON.stringify(status.errors));
-    // Its next warm request builds it again, answering as before, and its footprint is measured afresh.
-    assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
-    const rebuilt = await warm.send(inferOf(ws, 'a'));
-    assert.strictEqual(rebuilt.status, 'success');
-    assert.match(JSON.stringify(rebuilt.inferred_types), /id: string; n: number/);
-    const again = serviceIn(await statusOf(socket), ws, 'a')!.footprint_mb!;
-    // Measured afresh, never added to the footprint it had before its release (that would be about twice it).
-    assert.ok(again < 1.7 * firstFootprint, `footprint ${again} MB after a rebuild, ${firstFootprint} MB before`);
+    // Released: its footprint starts again from nothing (a rebuild measures it afresh).
+    assert.strictEqual(serviceIn(status, ws, 'a')!.footprint_mb, null);
+    assert.ok(firstFootprint > 0);
     warm.conn.destroy();
     await stopDaemon(child, socket);
   });
@@ -352,8 +349,8 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const large = serviceIn(await statusOf(socket0), measure, 'big')!.footprint_mb!;
     w0.conn.destroy();
     await stopDaemon(measuring, socket0);
-    // `a` is under half the cap and fits; `big` is over half of it.
-    const cap = Math.max(2 * small, heldSmall) + 10;
+    // `a` is under half the cap, fits, and leaves room to build (under 90% of it); `big` is over half of it.
+    const cap = Math.max(2 * small, Math.ceil(heldSmall / 0.9)) + 4;
     assert.ok(large > cap / 2, `fixture: big ${large} MB, small ${small} MB, cap ${cap} MB`);
 
     const ws = withBig(24000);
@@ -382,6 +379,43 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
       assert.strictEqual(await answerOrClose(client, captureOf(ws, 'a', fs.mkdtempSync(path.join(ws, 'stub-')))), 'closed', mode);
     }
     assert.strictEqual((await statusOf(socket)).counters.closed_for_cold, 2);
+    await stopDaemon(child, socket);
+  });
+
+  it('refuses a warm init as cold_only:no_room once the heap is past 90% of the cap, building nothing (carrick#2915)', async () => {
+    // The heap with `a` held, measured on a daemon of its own.
+    const measure = workspace();
+    const measuring = await daemon(measure);
+    const socket0 = recordOf(measure)!.socket;
+    const w0 = await SocketClient.greeted(socket0);
+    assert.strictEqual((await w0.send(initOf(measure, 'a'))).status, 'ready');
+    const measured = await statusOf(socket0);
+    const heldA = measured.heap_used_mb;
+    const footprintA = serviceIn(measured, measure, 'a')!.footprint_mb!;
+    w0.conn.destroy();
+    await stopDaemon(measuring, socket0);
+    // `a` fits (under the cap, under half of it) and leaves the heap past 90% of the cap.
+    const cap = Math.floor(heldA / 0.95);
+    assert.ok(heldA > 0.9 * cap + 2 && heldA < cap && footprintA <= cap / 2, `fixture: heap with a ${heldA} MB, a ${footprintA} MB, cap ${cap} MB`);
+
+    const ws = workspace();
+    const child = await daemon(ws, { CARRICK_TYPED_HEAP_CAP_MB: String(cap) });
+    const socket = recordOf(ws)!.socket;
+    const warm = await SocketClient.greeted(socket);
+    assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
+    assert.deepStrictEqual((await warm.send(initOf(ws, 'b'))).errors, ['not_held: cold_only:no_room']);
+    const status = await statusOf(socket);
+    assert.strictEqual(serviceIn(status, ws, 'a')!.state, 'built', JSON.stringify(status.services));
+    assert.strictEqual(serviceIn(status, ws, 'b'), undefined, 'b was never built');
+    assert.deepStrictEqual(
+      status.errors.map((e) => [e.kind, e.service]),
+      [['no_room', 'b']],
+      'nothing evicted, b refused'
+    );
+    const probe = await SocketClient.greeted(socket, 'probe');
+    assert.deepStrictEqual((await probe.send(initOf(ws, 'b'))).errors, ['not_held: cold_only:no_room']);
+    warm.conn.destroy();
+    probe.conn.destroy();
     await stopDaemon(child, socket);
   });
 

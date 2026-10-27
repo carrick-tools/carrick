@@ -1434,6 +1434,13 @@ function initHeld(request: SidecarRequest & { action: 'init' }, mode: Connection
       return { request_id: request.request_id, status: 'error', errors: [`not_held: ${refusal}`] };
     }
     serviceState(service, request.repo_root).probeUsed = true;
+  } else if (!(held && sessionBuilt(held)) && !roomToBuild()) {
+    // Fill, then refuse (carrick#2915): a warm-up that keeps building past a full heap evicts what it built.
+    const state = serviceState(service, request.repo_root);
+    state.coldOnly = 'no_room';
+    counters.init_refused += 1;
+    note('no_room', service, { heap_mb: Math.round(heapUsedMb()), cap_mb: heapCapMb() });
+    return { request_id: request.request_id, status: 'error', errors: ['not_held: cold_only:no_room'] };
   }
   if (held?.projectLoader?.isInitialized()) {
     session = held;
@@ -1490,13 +1497,25 @@ function buildHeld(held: Session): void {
   const loader = held.projectLoader;
   if (!loader?.isInitialized() || sessionBuilt(held)) return;
   try {
-    loader.getProject();
+    // The compiler program too, so a check's first request does not pay for it (carrick#2915).
+    void loader.getProject().getProgram().compilerObject;
   } catch (err) {
     log(`building the service at init failed: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
   held.held = heldFilesOf(held);
   held.held.sweep();
+}
+
+/** The share of the cap above which a warm `init` builds nothing (carrick#2915). */
+const BUILD_ROOM = 0.9;
+
+/** Whether the heap, collected when it reads full, leaves room under the cap to build a service. */
+function roomToBuild(): boolean {
+  const limit = heapCapMb() * BUILD_ROOM;
+  if (heapUsedMb() <= limit) return true;
+  collect();
+  return heapUsedMb() <= limit;
 }
 
 /** Whether a session's loader holds a built program: the one test for `status` and the probe refusal. */
