@@ -711,11 +711,24 @@ pub(crate) fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>
     for text in [diff, untracked] {
         changed.extend(
             text.split('\0')
-                .map(str::to_string)
-                .filter(|l| !l.is_empty()),
+                .filter(|l| !l.is_empty() && !is_surface_entry(l))
+                .map(str::to_string),
         );
     }
     Some(changed)
+}
+
+/// The basename a type capture gives the surface entry it places inside the
+/// service's `rootDir` for as long as it runs (the sidecar's
+/// `SURFACE_ENTRY_BASENAME`, `src/sidecar/src/capture/index.ts`).
+const SURFACE_ENTRY_BASENAME: &str = "__carrick_surface__";
+
+/// Whether `path` is a capture's transient surface entry: another scan's
+/// file, never the user's change (carrick#2928, carrick#2931).
+fn is_surface_entry(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(SURFACE_ENTRY_BASENAME))
 }
 
 /// Whether the file itself has been written since the index was built.
@@ -1086,6 +1099,34 @@ mod hosted_change_tests {
         );
         assert!(changed_since(repo, "--output=elsewhere").is_none());
     }
+
+    /// A capture running beside the check leaves its surface entry inside the
+    /// tree for a while: neither untracked nor tracked, it is not a change
+    /// (carrick#2928).
+    #[test]
+    fn a_captures_surface_entry_is_not_a_change() {
+        let (dir, commit) = committed_repo(&[
+            ("src/a.ts", "export const value = 1;"),
+            ("src/__carrick_surface__.7.1.ts", "export {};"),
+        ]);
+        let repo = dir.path();
+        std::fs::write(repo.join("src/a.ts"), "export const value = 2;").unwrap();
+        std::fs::write(
+            repo.join("src/__carrick_surface__.7.1.ts"),
+            "export * from './a';",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/__carrick_surface__.26576.1.ts"),
+            "export {};",
+        )
+        .unwrap();
+        assert_eq!(
+            changed_since(repo, commit.trim()).unwrap(),
+            HashSet::from(["src/a.ts".into()])
+        );
+    }
+
     fn hosted_row(
         source: Option<&str>,
         uploaded_by: Option<&str>,
