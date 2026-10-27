@@ -208,12 +208,17 @@ end, which is a block. The hook emits `hookSpecificOutput` and nothing else.
 file, before the line is written, so the next stop of the same session says
 nothing about them. A function added after a nudge is pending on its own.
 
-**It fires even when the index is older than the branch point**, and states the
-commit it compared against in the line (the ruling of 2026-09-20 on open
-question 2). The two limits are in the text the model reads, because they decide
-what an empty answer means: a function added on this branch is compared against
-the default branch as the last scan saw it, and the comparison is on what each
-function is described as doing, not on its source.
+**The line is short and says where it came from.** It reads "Carrick: this task
+added N new functions (a, b and N-2 more). Check them for existing copies with
+one find_similar call, then tell the user in one line what Carrick found." Names
+only, at most two, no paths; one and two functions read "(a)" and "(a and b)".
+Test, spec and story files are never recorded (`isCheckedSource`), and a
+function is keyed by its path relative to the nearest checkout top, so an edit
+inside a nested worktree matches the index row (carrick#2936). It fires even
+when the index is older than the branch point. The two limits on the answer (the
+index is the default branch at the commit it states; the match is on what a
+function is described as doing, not on its source) are in the `carrick-reuse`
+skill, where the answer is read.
 
 **The check line (carrick#2933).** The same Stop emission can carry a second
 line, about `carrick check --changed` rather than reuse. The post-edit hook
@@ -230,7 +235,7 @@ the hook cannot tell them from any other `.yaml` without reading the repo. These
 after the last Bash command that runs `carrick check` (with any arguments,
 `npx` included). When there are any, the line reads:
 
-> This task edited 3 files and has not run `carrick check`. The per-edit
+> Carrick: This task edited 3 files and has not run `carrick check`. The per-edit
 > re-check covers only the file each edit touched, so run `carrick check
 > --changed` before you finish (it can take a few minutes; allow up to five).
 
@@ -238,8 +243,8 @@ The same clause ends the post-edit "not re-checked here" line, the session-start
 check line and the AGENTS.md section, because a Bash call times out at 120 s by
 default. The post-edit line is said once per session.
 
-or, when a check ran earlier, "This task edited 2 files since its last `carrick
-check`." with the same second sentence. The edited file is read as the
+or, when a check ran earlier, "Carrick: This task edited 2 files since its last
+`carrick check`." with the same second sentence. The edited file is read as the
 post-edit hook reads it: `file_path`, or the first of a MultiEdit's `edits`. The count is distinct files. The
 newest such edit is stored in the session record (`checkNudged`), so one set of
 edits is named once and a later edit starts a new set. The line is not added

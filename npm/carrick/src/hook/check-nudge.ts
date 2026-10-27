@@ -162,5 +162,5 @@ export function checkLine(edits: UncheckedEdits): string {
   const since = edits.checkedBefore
     ? `This task edited ${count} since its last \`carrick check\`.`
     : `This task edited ${count} and has not run \`carrick check\`.`;
-  return `${since} The per-edit re-check covers only the file each edit touched, so ${RUN_CHECK_CHANGED}`;
+  return `Carrick: ${since} The per-edit re-check covers only the file each edit touched, so ${RUN_CHECK_CHANGED}`;
 }

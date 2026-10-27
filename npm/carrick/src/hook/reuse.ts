@@ -57,15 +57,6 @@ export type SessionRecord = {
   updated: string;
 };
 
-/**
- * How many entries one nudge names.
- *
- * `find_similar` takes twenty, so a longer list would be cut by the agent
- * making the call. Cutting it here keeps the cut in one place and keeps the
- * line readable.
- */
-export const MAX_ENTRIES = 20;
-
 /** Session files older than this are removed on the next write. */
 const KEEP_DAYS = 7;
 
@@ -356,35 +347,21 @@ export function drain(sessionId: string, home?: string): Drained | null {
 }
 
 /**
- * The one line the Stop hook hands the model.
- *
- * Three things it has to carry, and each is load-bearing:
- *
- * * the names, so the call can be made without another read;
- * * `description` entries rather than `name`, because `find_similar` resolves
- *   a `name` against the index and these are exactly the functions it does not
- *   hold — a `name` entry for one of them comes back as an error;
- * * the two limits, because they decide what an empty answer means. The
- *   comparison is against the index's commit, which is this repo's default
- *   branch as the last scan saw it, so a function written earlier on this
- *   branch is listed here too. And the index holds no body hash: the match is
- *   on what a function is described as doing, not on its source.
+ * The one line the Stop hook hands the model: how many functions, at most two
+ * names, and the ask. Short on purpose, and it starts with "Carrick:" so the
+ * user can tell where it came from. The two limits on the answer (what the
+ * index was taken at, and that the match is on what a function is described as
+ * doing) live in the `carrick-reuse` skill, where the answer is read.
  */
 export function nudge(entries: NewFunction[]): string {
-  const named = entries.slice(0, MAX_ENTRIES);
-  const commits = [...new Set(named.map((entry) => entry.indexCommit).filter(Boolean))];
-  const at =
-    commits.length === 1
-      ? `the index at ${commits[0]!.slice(0, 7)}`
-      : "the index this workspace holds";
-  const list = named
-    .map((entry) => `${entry.name} (${entry.file})`)
-    .join(", ");
-  const more =
-    entries.length > named.length ? ` ${entries.length - named.length} more are not listed.` : "";
-  return [
-    `This task added ${named.length} function${named.length === 1 ? "" : "s"} that ${at} does not hold: ${list}.${more}`,
-    `Run the carrick-reuse skill now: one find_similar call, one \`description\` entry per function (a \`name\` entry resolves against the index, and these are not in it).`,
-    `Two limits on the answer: the index was taken at ${commits.length === 1 ? commits[0]!.slice(0, 7) : "this workspace's last scan"} on the default branch, so anything added on this branch is compared against that; and the comparison is on what each function is described as doing, not on its source.`,
-  ].join(" ");
+  const total = entries.length;
+  const shown = entries.slice(0, 2).map((entry) => entry.name);
+  const rest = total - shown.length;
+  const list =
+    rest > 0
+      ? `${shown.join(", ")} and ${rest} more`
+      : shown.length === 2
+        ? `${shown[0]} and ${shown[1]}`
+        : shown[0]!;
+  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, then tell the user in one line what Carrick found.`;
 }

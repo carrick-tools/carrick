@@ -26,6 +26,17 @@ An entry is either a `name` with a `file` for a function the index holds, or a
 the other in an entry, never both. A `name` that matches more than one
 definition comes back with its candidates on that entry's `error`.
 
+Functions you added in this task are not in the index yet, so give each one a
+`description` entry: one plain sentence about what it does, written from the
+code you wrote. Do not look for the names in a file list; you wrote them.
+
+Two limits decide what an empty answer means. The index was taken at the
+commit the answer states, on the default branch, so anything added on this
+branch is compared against that. And the comparison is on what each function is
+described as doing, not on its source: the index holds no body hash.
+
+When you are done, tell the user in one line what Carrick found.
+
 The two kinds are scored on different scales, and each result states the floor
 it was ranked against. `vector_basis` says what the cosines are over. On
 `intent` the vector is the intent sentence alone, and a copy somebody renamed

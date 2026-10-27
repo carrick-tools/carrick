@@ -8,7 +8,6 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  MAX_ENTRIES,
   markNudged,
   nudge,
   pending,
@@ -121,37 +120,21 @@ test("remove deletes every record and the directory holding them", (t) => {
   assert.equal(removeSessions(dir), 0);
 });
 
-test("the nudge names the functions, the skill, and both limits on the answer", () => {
-  const line = nudge([fn("slugify"), fn("titleCase")]);
-  assert.match(line, /slugify \(src\/util\/format\.ts\)/);
-  assert.match(line, /titleCase/);
-  assert.match(line, /carrick-reuse/);
-  assert.match(line, /find_similar/);
-  // `name` entries resolve against the index and these are exactly what the
-  // index does not hold, so the call has to use `description`.
-  assert.match(line, /`description` entry/);
-  // Limit one: what it was compared against, named by commit (open question 2
-  // of carrick#1330 — it fires either way and states the commit).
-  assert.match(line, /6a1b2c3/);
-  assert.match(line, /default branch/);
-  // Limit two: no body hash, so the comparison is on the description.
-  assert.match(line, /not on its source/);
-  // Nothing about what any of it cost.
-  assert.doesNotMatch(line, /\$|cost|token|cheap|spend/i);
-});
-
-test("the nudge lists at most what one find_similar call takes, and says so", () => {
-  const many = Array.from({ length: MAX_ENTRIES + 3 }, (_, index) => fn(`helper${index}`));
-  const line = nudge(many);
-  assert.match(line, new RegExp(`added ${MAX_ENTRIES} functions`));
-  assert.match(line, /3 more are not listed/);
-  assert.equal(line.includes(`helper${MAX_ENTRIES}`), false);
-});
-
-test("a set compared against more than one index says so instead of naming a commit", () => {
-  const line = nudge([fn("slugify"), { ...fn("titleCase"), indexCommit: "ffffffffffffffff" }]);
-  assert.match(line, /the index this workspace holds/);
-  assert.doesNotMatch(line, /the index at /);
+test("the nudge is short, starts with Carrick, and names at most two functions", () => {
+  const one = nudge([fn("slugify")]);
+  assert.equal(
+    one,
+    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, then tell the user in one line what Carrick found.",
+  );
+  assert.match(
+    nudge([fn("slugify"), fn("titleCase")]),
+    /added 2 new functions \(slugify and titleCase\)\./,
+  );
+  const many = nudge(Array.from({ length: 5 }, (_, index) => fn(`helper${index}`)));
+  assert.match(many, /^Carrick: this task added 5 new functions \(helper0, helper1 and 3 more\)\./);
+  assert.equal(many.includes("helper2"), false);
+  // No paths, no commit, no limits: those live in the carrick-reuse skill.
+  assert.doesNotMatch(many, /src\/|6a1b2c3|default branch|not on its source/);
 });
 
 // The files whose uses lines a session has been shown (carrick#2067), kept in
