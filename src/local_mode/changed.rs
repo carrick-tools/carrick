@@ -698,7 +698,13 @@ fn judge(
 /// of one dispatching route are different operations, so a sibling's state
 /// says nothing about this one.
 fn same_operation(old: &IndexedItem, operation: &JoinedOperation) -> bool {
-    old.key == operation.key && old.dispatch == operation.dispatch
+    old.key == operation.key
+        && match (&old.dispatch, &operation.dispatch) {
+            // An index written before rows carried the case states none:
+            // that is no evidence of a plain route, so the key decides.
+            (None, _) => true,
+            (Some(old), operation) => operation.as_ref() == Some(old),
+        }
 }
 
 /// The rows the index, before this pass, held for one file of one repo.
@@ -1138,7 +1144,7 @@ mod tests {
     /// was already unmatched in the index; it is not this call.
     #[test]
     fn a_renamed_dispatch_case_is_not_already_indexed_because_a_sibling_was() {
-        let before = vec![call_row(280, None, false)];
+        let before = vec![call_row(280, Some(&dispatch_key("sibling")), false)];
         let problem = judged_call(before, Some("old-name"));
         assert!(!problem.already_indexed, "{problem:?}");
         assert!(problem.fails, "{problem:?}");
@@ -1165,6 +1171,13 @@ mod tests {
         assert!(same.already_indexed && !same.fails, "{same:?}");
         let plain = judged_call(vec![call_row(280, None, false)], None);
         assert!(plain.already_indexed && !plain.fails, "{plain:?}");
+        // A row from an index that predates the field states no case: it
+        // still dates the same key, so an upgrade invents no new problem.
+        let old_index = judged_call(vec![call_row(280, None, false)], Some("old-name"));
+        assert!(
+            old_index.already_indexed && !old_index.fails,
+            "{old_index:?}"
+        );
     }
 
     /// A call the index matched under one case is not matched under another.
