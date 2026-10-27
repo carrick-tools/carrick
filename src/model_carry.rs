@@ -39,6 +39,24 @@ pub const HINT_OUTSIDE_REGISTRATION_CHANGED: &str = "hint_outside_registration_c
 pub const CARRIED_UNTYPED: &str = "carried_untyped";
 /// The previous commit's copy of the file is not in this clone.
 pub const OLD_SOURCE_UNAVAILABLE: &str = "old_source_unavailable";
+/// Prefix of the reason for a kind of row that is not carried yet
+/// (`not_carried_<field>`).
+const NOT_CARRIED_PREFIX: &str = "not_carried_";
+
+/// One reason above as a person reads it, for `carrick status`. The stored
+/// boundary keeps the code; a code with no words here (one a newer scanner
+/// wrote) is returned as it stands.
+pub fn reason_words(code: &str) -> &str {
+    match code {
+        REGISTRATION_LINE_CHANGED => "the edit changed the line that registers it",
+        NO_MATCHING_CALL => "no single call on its line matches the one the index named",
+        HINT_OUTSIDE_REGISTRATION_CHANGED => "the edit changed a handler it names",
+        CARRIED_UNTYPED => "kept, but its send line was edited, so it has no response type",
+        OLD_SOURCE_UNAVAILABLE => "this clone does not hold the indexed copy of the file",
+        _ if code.starts_with(NOT_CARRIED_PREFIX) => "rows of this kind are not kept yet",
+        _ => code,
+    }
+}
 
 /// What carrying did for the files of one scan.
 #[derive(Debug, Default)]
@@ -178,7 +196,7 @@ fn other_lists_not_carried(relative: &str, answer: &FileAnalysisResult, carry: &
         for _ in 0..count {
             carry
                 .not_carried
-                .push(format!("{relative} not_carried_{field}"));
+                .push(format!("{relative} {NOT_CARRIED_PREFIX}{field}"));
         }
     }
 }

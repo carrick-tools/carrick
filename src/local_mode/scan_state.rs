@@ -282,15 +282,7 @@ impl ScanState {
     /// When the scan started, on this machine's clock: the time alone for a
     /// scan started today, the date with it otherwise.
     fn started_label(&self) -> String {
-        let Ok(started) = chrono::DateTime::parse_from_rfc3339(&self.started_at) else {
-            return self.started_at.clone();
-        };
-        let local = started.with_timezone(&chrono::Local);
-        if local.date_naive() == chrono::Local::now().date_naive() {
-            local.format("%H:%M").to_string()
-        } else {
-            local.format("%Y-%m-%d %H:%M").to_string()
-        }
+        local_time_label(&self.started_at)
     }
 
     /// A scan that failed within a minute of starting: a refusal, which a
@@ -354,6 +346,28 @@ pub fn status_lines(scans: &[ScanState], index_dir: &Path) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// An RFC 3339 time as a person reads it on this machine's clock: the time
+/// alone for today, the date with it otherwise, to the minute. Text that is
+/// not RFC 3339 (a bare date, say) is returned as it stands. Every human
+/// surface of `carrick status` prints times through this; `--json` keeps the
+/// RFC 3339 string.
+pub fn local_time_label(rfc3339: &str) -> String {
+    local_time_label_at(rfc3339, chrono::Local::now().date_naive())
+}
+
+/// [`local_time_label`] against a given "today", so a test can pin it.
+fn local_time_label_at(rfc3339: &str, today: chrono::NaiveDate) -> String {
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.to_string();
+    };
+    let local = at.with_timezone(&chrono::Local);
+    if local.date_naive() == today {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%Y-%m-%d %H:%M").to_string()
+    }
 }
 
 /// `3m12s`, `41s`, `1h04m`.
@@ -724,6 +738,26 @@ fn timestamp() -> String {
 mod tests {
     use super::*;
     use crate::progress::Phase;
+
+    /// A stored time with nanoseconds and an offset reads as this machine's
+    /// clock to the minute: the time alone today, the date with it otherwise.
+    /// Asserted on shape, so the test holds in any time zone.
+    #[test]
+    fn a_stored_time_reads_as_local_minutes() {
+        let stored = "2026-10-14T11:58:19.307127732+00:00";
+        let local = chrono::DateTime::parse_from_rfc3339(stored)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let today = local_time_label_at(stored, local.date_naive());
+        assert_eq!(today.len(), 5, "{today}");
+        assert_eq!(today.as_bytes()[2], b':', "{today}");
+        let other =
+            local_time_label_at(stored, chrono::NaiveDate::from_ymd_opt(2030, 1, 1).unwrap());
+        assert_eq!(other, local.format("%Y-%m-%d %H:%M").to_string());
+        assert!(!other.contains('T') && !other.contains("307"), "{other}");
+        // Not RFC 3339: printed as it stands.
+        assert_eq!(local_time_label("2026-09-11"), "2026-09-11");
+    }
 
     fn state(status: ScanStatus, pid: u32) -> ScanState {
         ScanState {
