@@ -545,6 +545,7 @@ fn judge(
             .find(|item| item.key == operation.key && item.line == operation.line)
     };
 
+    let strict = states_dispatch(before);
     let mut judged = Judged {
         routes: 0,
         calls: 0,
@@ -585,7 +586,7 @@ fn judge(
         // Not this work's when the index already held the same row of this
         // file with a mismatch: it was there before the change began.
         let already = indexed_rows(before, repo, &operation.file).any(|old| {
-            same_operation(old, operation)
+            same_operation(old, operation, strict)
                 && old
                     .verdict
                     .as_ref()
@@ -643,7 +644,7 @@ fn judge(
                 };
                 // A call in a file the work did not touch is reported only
                 // when the index matched it: the work took its route away.
-                if !is_changed(repo, &file) && !was_matched(before, repo, operation) {
+                if !is_changed(repo, &file) && !was_matched(before, strict, repo, operation) {
                     continue;
                 }
                 let source = Source::of(operation.resolution_source);
@@ -652,7 +653,7 @@ fn judge(
                 // have moved, so the key and the file decide.
                 let already = indexed_rows(before, repo, &file).any(|old| {
                     old.kind == super::read_model::ItemKind::Call
-                        && same_operation(old, operation)
+                        && same_operation(old, operation, strict)
                         && old.counterparts.is_empty()
                 });
                 // A base set at run time could be one of this workspace's
@@ -660,7 +661,7 @@ fn judge(
                 // expression: printed, never failing, new or not. Unless the
                 // index matched this call: a workspace route served it, so
                 // the base is the workspace's and losing it is a fact.
-                let matched = was_matched(before, repo, operation);
+                let matched = was_matched(before, strict, repo, operation);
                 let unconfirmed = unmatched.injected.iter().any(|at| at == site) && !matched;
                 let new_fact = source == Source::Fact && !already && !unconfirmed;
                 let other_build = new_fact && !same_build && !matched;
@@ -692,19 +693,28 @@ fn judge(
     judged
 }
 
+/// Whether any row of the index states a dispatch case. An index written
+/// before rows carried the case states none anywhere; one that does, states
+/// the case on every row it has one for.
+fn states_dispatch(index: &LocalIndex) -> bool {
+    index
+        .repos
+        .iter()
+        .flat_map(|repo| repo.files.values().flatten())
+        .any(|item| item.dispatch.is_some())
+}
+
 /// Whether an indexed row is the same operation as a joined one: the key
 /// (method and path, GraphQL field, socket event or topic) and the dispatch
 /// case (carrick#831), which is part of a row's identity beside it. The cases
 /// of one dispatching route are different operations, so a sibling's state
 /// says nothing about this one.
-fn same_operation(old: &IndexedItem, operation: &JoinedOperation) -> bool {
-    old.key == operation.key
-        && match (&old.dispatch, &operation.dispatch) {
-            // An index written before rows carried the case states none:
-            // that is no evidence of a plain route, so the key decides.
-            (None, _) => true,
-            (Some(old), operation) => operation.as_ref() == Some(old),
-        }
+///
+/// `strict` says the index states dispatch cases (see [`states_dispatch`]):
+/// then a row with none is a plain row. When it does not, the index predates
+/// the field, its silence is no evidence, and the key alone decides.
+fn same_operation(old: &IndexedItem, operation: &JoinedOperation, strict: bool) -> bool {
+    old.key == operation.key && (!strict || old.dispatch == operation.dispatch)
 }
 
 /// The rows the index, before this pass, held for one file of one repo.
@@ -723,7 +733,7 @@ fn indexed_rows<'a>(
 }
 
 /// Whether the index, before this pass, matched this call to a producer.
-fn was_matched(before: &LocalIndex, repo: &str, operation: &JoinedOperation) -> bool {
+fn was_matched(before: &LocalIndex, strict: bool, repo: &str, operation: &JoinedOperation) -> bool {
     before
         .repos
         .iter()
@@ -731,7 +741,7 @@ fn was_matched(before: &LocalIndex, repo: &str, operation: &JoinedOperation) -> 
         .and_then(|indexed| indexed.files.get(&operation.file))
         .is_some_and(|items| {
             items.iter().any(|item| {
-                same_operation(item, operation)
+                same_operation(item, operation, strict)
                     && item.line == operation.line
                     && !item.counterparts.is_empty()
             })
@@ -1144,7 +1154,12 @@ mod tests {
     /// was already unmatched in the index; it is not this call.
     #[test]
     fn a_renamed_dispatch_case_is_not_already_indexed_because_a_sibling_was() {
-        let before = vec![call_row(280, Some(&dispatch_key("sibling")), false)];
+        // A dispatch row elsewhere in the index: it states cases, so the
+        // dispatch-less sibling is a plain call.
+        let mut elsewhere = call_row(10, Some(&dispatch_key("other")), true);
+        elsewhere["path"] = "/other".into();
+        elsewhere["key"] = "http|POST|/other".into();
+        let before = vec![elsewhere, call_row(280, None, false)];
         let problem = judged_call(before, Some("old-name"));
         assert!(!problem.already_indexed, "{problem:?}");
         assert!(problem.fails, "{problem:?}");
@@ -1171,8 +1186,8 @@ mod tests {
         assert!(same.already_indexed && !same.fails, "{same:?}");
         let plain = judged_call(vec![call_row(280, None, false)], None);
         assert!(plain.already_indexed && !plain.fails, "{plain:?}");
-        // A row from an index that predates the field states no case: it
-        // still dates the same key, so an upgrade invents no new problem.
+        // An index with no case anywhere predates the field: it still dates
+        // the same key, so an upgrade invents no new problem.
         let old_index = judged_call(vec![call_row(280, None, false)], Some("old-name"));
         assert!(
             old_index.already_indexed && !old_index.fails,
@@ -1193,8 +1208,8 @@ mod tests {
             }))
             .unwrap()
         };
-        assert!(was_matched(&before, "web", &operation("a")));
-        assert!(!was_matched(&before, "web", &operation("b")));
+        assert!(was_matched(&before, true, "web", &operation("a")));
+        assert!(!was_matched(&before, true, "web", &operation("b")));
     }
 
     #[test]
