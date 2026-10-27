@@ -17,6 +17,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { RUN_CHECK_CHANGED } from "../render.ts";
 
 /**
@@ -144,6 +145,81 @@ export function uncheckedEdits(transcript: string): UncheckedEdits | null {
   return files.length === 0 ? null : { files, checkedBefore, lastEdit };
 }
 
+/** Each git call is bounded: the Stop hook has to stay well under a second. */
+const GIT_TIMEOUT_MS = 1500;
+
+/** Where `carrick check --changed` compares against, tried in order (`git_state.rs`). */
+const BASE_CANDIDATES = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
+
+function git(cwd: string, args: string[]): string | null {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+  for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) delete env[name];
+  const run = spawnSync("git", args, { cwd, env, encoding: "utf8", timeout: GIT_TIMEOUT_MS });
+  return run.status === 0 && typeof run.stdout === "string" ? run.stdout : null;
+}
+
+/** The nearest directory above `file` that exists, and the part below it. */
+function nearestExisting(file: string): { dir: string; rest: string } | null {
+  let dir = path.dirname(file);
+  while (!fs.existsSync(dir)) {
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  try {
+    const real = fs.realpathSync(dir);
+    return { dir: real, rest: path.relative(dir, file) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The files (repo-relative) that still differ from what `carrick check
+ * --changed` compares against: the working tree against the merge base with
+ * the default branch, which covers uncommitted and committed-not-merged edits,
+ * plus untracked files. Null when git cannot answer.
+ */
+function stillChanged(toplevel: string): Set<string> | null {
+  let base = "HEAD";
+  for (const candidate of BASE_CANDIDATES) {
+    const found = git(toplevel, ["merge-base", "HEAD", candidate]);
+    if (found !== null && found.trim() !== "") {
+      base = found.trim();
+      break;
+    }
+  }
+  const changed = git(toplevel, ["diff", "--name-only", "--no-renames", base]);
+  const untracked = git(toplevel, ["ls-files", "--others", "--exclude-standard"]);
+  if (changed === null || untracked === null) return null;
+  return new Set(`${changed}${untracked}`.split("\n").filter((name) => name !== ""));
+}
+
+/**
+ * Drop the edits whose file no longer differs: committed and merged, reverted,
+ * or in a checkout that is gone. A file git cannot answer for (no checkout
+ * above it, an error, a timeout) is kept.
+ */
+export function stillDiffering(files: string[]): string[] {
+  const toplevels = new Map<string, string | null>();
+  const changes = new Map<string, Set<string> | null>();
+  return files.filter((file) => {
+    const near = nearestExisting(file);
+    if (near === null) return true;
+    if (!toplevels.has(near.dir)) {
+      const top = git(near.dir, ["rev-parse", "--show-toplevel"]);
+      toplevels.set(near.dir, top === null ? null : top.trim());
+    }
+    const top = toplevels.get(near.dir);
+    if (top === null || top === undefined || top === "") return true;
+    if (!changes.has(top)) changes.set(top, stillChanged(top));
+    const set = changes.get(top);
+    if (set === null || set === undefined) return true;
+    const relative = path.relative(top, path.join(near.dir, near.rest)).split(path.sep).join("/");
+    return set.has(relative);
+  });
+}
+
 /** The same, read from a transcript file. Null when it cannot be read. */
 export function readUncheckedEdits(transcriptPath: unknown): UncheckedEdits | null {
   if (typeof transcriptPath !== "string" || transcriptPath === "") return null;
@@ -153,7 +229,10 @@ export function readUncheckedEdits(transcriptPath: unknown): UncheckedEdits | nu
   } catch {
     return null;
   }
-  return uncheckedEdits(text);
+  const edits = uncheckedEdits(text);
+  if (edits === null) return null;
+  const files = stillDiffering(edits.files);
+  return files.length === 0 ? null : { ...edits, files };
 }
 
 /** The line handed to the model. */

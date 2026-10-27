@@ -4,6 +4,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -172,4 +173,72 @@ test("the check line says how long the check takes", async (t) => {
     transcript_path: transcript("edit-no-check.jsonl"),
   });
   assert.ok(run.context?.includes("it can take a few minutes; allow up to five"), run.context ?? "");
+});
+
+// Edits already committed and merged, or in a checkout that is gone, are not
+// unchecked edits: `carrick check --changed` would not compare them.
+function git(cwd: string, ...args: string[]): void {
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd, stdio: "ignore" });
+}
+
+function repoWithEdit(t: { after: (fn: () => void) => void }): { repo: string; file: string } {
+  const repo = tempDir(t, "carrick-repo-");
+  git(repo, "init", "-q", "-b", "main");
+  fs.mkdirSync(path.join(repo, "src"));
+  const file = path.join(repo, "src", "order.ts");
+  fs.writeFileSync(file, "export const a = 1;\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-q", "-m", "base");
+  return { repo, file };
+}
+
+async function stopAfterEditing(t: { after: (fn: () => void) => void }, session: string, file: string) {
+  const home = tempDir(t, "carrick-home-");
+  const dir = tempDir(t, "carrick-transcript-");
+  const transcriptFile = path.join(dir, "session.jsonl");
+  fs.writeFileSync(
+    transcriptFile,
+    `${JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "toolu_1", name: "Edit", input: { file_path: file } }],
+      },
+    })}\n`,
+  );
+  return stop(home, { session_id: session, transcript_path: transcriptFile });
+}
+
+test("an edit committed and merged into the default branch earns no line", async (t) => {
+  const { repo, file } = repoWithEdit(t);
+  fs.writeFileSync(file, "export const a = 2;\n");
+  git(repo, "commit", "-q", "-am", "edit");
+  const run = await stopAfterEditing(t, "chk-merged", file);
+  assert.equal(run.stdout, "");
+});
+
+test("an uncommitted edit earns the line", async (t) => {
+  const { file } = repoWithEdit(t);
+  fs.writeFileSync(file, "export const a = 2;\n");
+  const run = await stopAfterEditing(t, "chk-dirty", file);
+  assert.match(run.context ?? "", /This task edited 1 file/);
+});
+
+test("an edit committed on a branch not yet merged earns the line", async (t) => {
+  const { repo, file } = repoWithEdit(t);
+  git(repo, "checkout", "-q", "-b", "feature");
+  fs.writeFileSync(file, "export const a = 2;\n");
+  git(repo, "commit", "-q", "-am", "edit");
+  const run = await stopAfterEditing(t, "chk-branch", file);
+  assert.match(run.context ?? "", /This task edited 1 file/);
+});
+
+test("an edit in a worktree that has been removed earns no line", async (t) => {
+  const { repo } = repoWithEdit(t);
+  const worktree = path.join(repo, ".claude", "worktrees", "gone");
+  git(repo, "worktree", "add", "-q", worktree, "-b", "gone");
+  const file = path.join(worktree, "src", "order.ts");
+  git(repo, "worktree", "remove", "--force", worktree);
+  const run = await stopAfterEditing(t, "chk-gone", file);
+  assert.equal(run.stdout, "");
 });
