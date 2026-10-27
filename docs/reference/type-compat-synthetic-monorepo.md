@@ -608,8 +608,10 @@ guards came with the switch:
 - TypeScript 7 refuses removed options with a positioned diagnostic in the
   tsconfig and checks nothing. A configuration diagnostic (one in a `.json`
   file, TS5xxx or TS18003) now ends the run as abnormal, so every probed pair
-  is unverifiable rather than compatible. `esModuleInterop: false` is no
-  longer written.
+  is unverifiable rather than compatible. The check tsconfig now
+  writes `esModuleInterop: true` (TypeScript 7 removed `false`). It states the
+  option rather than leaving it unset, because the TypeScript 5 option fill
+  that the in-memory probe walk applies would otherwise read `false`.
 - The native compiler dies out of memory with the Go runtime's
   `fatal error: runtime: out of memory`. That counts as a heap death, beside
   V8's line.

@@ -24,6 +24,8 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { sidecarCompilerOptions } from '../src/capture/compiler-options.js';
 import { CHECKER_TSCONFIG } from '../src/capture/check-workspace.js';
+import { judgeTscPath } from '../src/capture/check.js';
+import { spawnSync } from 'node:child_process';
 import type { CaptureStubResult } from '../src/capture/api.js';
 import { SidecarClient } from './helpers.js';
 
@@ -218,6 +220,28 @@ describe('carrick#2019: TypeScript 5 values for the options a project leaves uns
     // No probe files exist here (TS18003); any other error is the config's.
     assert.deepStrictEqual(parsed.errors.filter((d) => d.code !== 18003), []);
     assert.deepStrictEqual(sidecarCompilerOptions(parsed.options), parsed.options);
+  });
+
+  // The fill reaches only the TypeScript 6 program the probe walk opens, in
+  // memory; the native judge reads the file. So the file states every option
+  // the fill would otherwise supply (above), and states none TypeScript 7
+  // removed: the native tsc accepts it and checks a probe under it.
+  it('writes a check tsconfig the native judge accepts', () => {
+    const tscPath = judgeTscPath();
+    assert.match(tscPath, /@typescript\/typescript-[^/]+\/lib\/tsc(\.exe)?$/, 'the native compiler is installed here');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-native-tsconfig-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'tsconfig.json'), CHECKER_TSCONFIG);
+      fs.mkdirSync(path.join(dir, 'probes'));
+      fs.writeFileSync(path.join(dir, 'probes', 'p.ts'), 'const n: number = 1;\nexport const s: string = n;\n');
+      const out = spawnSync(tscPath, ['--noEmit', '--pretty', 'false', '-p', 'tsconfig.json'], { cwd: dir, encoding: 'utf8' });
+      const text = out.stdout + out.stderr;
+      assert.doesNotMatch(text, /tsconfig\.json/, text);
+      assert.doesNotMatch(text, /error TS5\d{3}/, text);
+      assert.match(text, /probes\/p\.ts\(2,14\): error TS2322/, text);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
