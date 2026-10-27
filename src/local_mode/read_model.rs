@@ -115,6 +115,11 @@ pub struct IndexedItem {
     pub service: String,
     /// `OperationKey::canonical()`.
     pub key: String,
+    /// The dispatch case, as `Dispatch::key` states it: with `key`, the row's
+    /// whole identity. Absent on a plain row and on an index written before
+    /// the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<String>,
     pub method: String,
     pub path: String,
     pub line: Option<u32>,

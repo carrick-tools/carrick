@@ -52,6 +52,11 @@ pub struct JoinedOperation {
     pub line: Option<u32>,
     pub resolution_source: Option<ResolutionSource>,
     pub handler: Option<String>,
+    /// The dispatch case this row is, as [`crate::dispatch::Dispatch::key`]
+    /// states it (carrick#831): part of the operation's identity beside
+    /// `key`. `None` is a plain route or call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<String>,
 }
 
 /// One producer/consumer edge, with whatever the type check concluded about
@@ -436,6 +441,7 @@ fn project(op: &ApiEndpointDetails, role: Role) -> JoinedOperation {
         line,
         resolution_source: op.resolution_source,
         handler: op.handler_name.clone(),
+        dispatch: crate::dispatch::Dispatch::key_of(op.dispatch.as_ref()),
     }
 }
 

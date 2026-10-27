@@ -1686,6 +1686,7 @@ pub(super) fn build(
             },
             service: operation.service.clone(),
             key: operation.key.clone(),
+            dispatch: operation.dispatch.clone(),
             method: operation.method.clone(),
             path: operation.path.clone(),
             line: operation.line,
