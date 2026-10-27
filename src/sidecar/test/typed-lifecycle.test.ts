@@ -406,7 +406,9 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     assert.deepStrictEqual((await warm.send(initOf(ws, 'b'))).errors, ['not_held: cold_only:no_room']);
     const status = await statusOf(socket);
     assert.strictEqual(serviceIn(status, ws, 'a')!.state, 'built', JSON.stringify(status.services));
-    assert.strictEqual(serviceIn(status, ws, 'b'), undefined, 'b was never built');
+    // Listed though never built, so the CLI reads it as cold_only, not as a service the daemon has not seen (carrick#2928).
+    const refused = serviceIn(status, ws, 'b');
+    assert.deepStrictEqual(refused && [refused.state, refused.built, refused.footprint_mb], ['cold_only:no_room', false, null], JSON.stringify(status.services));
     assert.deepStrictEqual(
       status.errors.map((e) => [e.kind, e.service]),
       [['no_room', 'b']],

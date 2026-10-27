@@ -1557,6 +1557,20 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
         items: { held: held.items?.size ?? 0, ...held.answers },
         evictions: held.evictions,
       })),
+      // Every service the daemon has seen, built or not: a refused one reads as cold_only, never as unseen (carrick#2928).
+      ...[...services.entries()]
+        .filter(([key]) => ![...heldSessions.values()].some((held) => held.service === key))
+        .map(([key, state]) => ({
+          repo_root: state.repo_root,
+          scan_root: (JSON.parse(key) as Array<string | null>)[2] ?? null,
+          built: false,
+          state: state.coldOnly ? (`cold_only:${state.coldOnly}` as const) : ('released' as const),
+          footprint_mb: null,
+          last_used_s: state.lastUsed != null ? Math.round((now - state.lastUsed) / 1000) : null,
+          freshness: { refreshes: 0, drops: 0 },
+          items: { held: 0, replayed: 0, recomputed: 0 },
+          evictions: 0,
+        })),
     ],
     heap_cap_mb: heapCapMb(),
     heap_limit_mb: Math.round(v8.getHeapStatistics().heap_size_limit / 1048576),
