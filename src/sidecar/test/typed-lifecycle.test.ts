@@ -296,14 +296,13 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     await stopDaemon(child, socket);
   });
 
-  it('without a probe, a warm build releases the least recently used service, its capture with it; a rebuild measures its footprint afresh', async () => {
-    // The heap with `a` and its capture held, and the footprint of `big` built after it.
-    const measure = withBig(40000);
+  it('without a probe, a warm build releases the least recently used service; a rebuild measures its footprint afresh', async () => {
+    // The heap with `a` held, and the footprint of `big` built after it.
+    const measure = withBig(6000);
     const measuring = await daemon(measure);
     const socket0 = recordOf(measure)!.socket;
     const w0 = await SocketClient.greeted(socket0);
     assert.strictEqual((await w0.send(initOf(measure, 'a'))).status, 'ready');
-    assert.strictEqual((await w0.send(captureOf(measure, 'a', fs.mkdtempSync(path.join(measure, 'stub-'))))).status, 'success');
     const measured = await statusOf(socket0);
     const heldA = measured.heap_used_mb;
     const footprintA = serviceIn(measured, measure, 'a')!.footprint_mb!;
@@ -311,32 +310,30 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const footprintBig = serviceIn(await statusOf(socket0), measure, 'big')!.footprint_mb!;
     w0.conn.destroy();
     await stopDaemon(measuring, socket0);
-    const capMb = Math.max(heldA, 2 * footprintA) + 8;
+    // Each fits alone (the process base plus its footprint), under half the cap; together they do not.
+    const base = heldA - footprintA;
+    const capMb = Math.max(heldA, base + footprintBig, 2 * footprintA) + 8;
     const fixture = `heap with a ${heldA} MB, a ${footprintA} MB, big ${footprintBig} MB, cap ${capMb} MB`;
     assert.ok(heldA + footprintBig > capMb + 4 && footprintBig <= capMb / 2, `fixture: ${fixture}`);
 
-    const ws = withBig(40000);
+    const ws = withBig(6000);
     const child = await daemon(ws, { CARRICK_TYPED_HEAP_CAP_MB: String(capMb) });
     const socket = recordOf(ws)!.socket;
     const warm = await SocketClient.greeted(socket);
     assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
-    assert.strictEqual((await warm.send(captureOf(ws, 'a', fs.mkdtempSync(path.join(ws, 'stub-'))))).status, 'success');
     const firstFootprint = serviceIn(await statusOf(socket), ws, 'a')!.footprint_mb!;
     assert.strictEqual((await warm.send(initOf(ws, 'big'))).status, 'ready');
     const status = await statusOf(socket);
     assert.deepStrictEqual([serviceIn(status, ws, 'a')!.state, serviceIn(status, ws, 'big')!.state], ['released', 'built'], `${fixture}: ${JSON.stringify(status)}`);
     assert.ok(status.errors.some((e) => e.kind === 'evicted' && e.service === 'a'), JSON.stringify(status.errors));
-    // Its capture went with it: a probe capture is not built in the daemon.
-    const probe = await SocketClient.greeted(socket, 'probe');
-    assert.strictEqual(await answerOrClose(probe, captureOf(ws, 'a', fs.mkdtempSync(path.join(ws, 'stub-')))), 'closed');
     // Its next warm request builds it again, answering as before, and its footprint is measured afresh.
     assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
     const rebuilt = await warm.send(inferOf(ws, 'a'));
     assert.strictEqual(rebuilt.status, 'success');
     assert.match(JSON.stringify(rebuilt.inferred_types), /id: string; n: number/);
     const again = serviceIn(await statusOf(socket), ws, 'a')!.footprint_mb!;
-    // Measured afresh, never added to the footprint it had before its release.
-    assert.ok(again <= firstFootprint, `footprint ${again} MB after a rebuild, ${firstFootprint} MB before`);
+    // Measured afresh, never added to the footprint it had before its release (that would be about twice it).
+    assert.ok(again < 1.7 * firstFootprint, `footprint ${again} MB after a rebuild, ${firstFootprint} MB before`);
     warm.conn.destroy();
     await stopDaemon(child, socket);
   });
@@ -373,6 +370,18 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     );
     assert.ok(status.errors.some((e) => e.kind === 'too_big' && e.service === 'big'), JSON.stringify(status.errors));
     warm.conn.destroy();
+    await stopDaemon(child, socket);
+  });
+
+  it('closes a capture_v2 on any connection with no frame: the client captures in a process of its own', async () => {
+    const ws = workspace();
+    const child = await daemon(ws);
+    const socket = recordOf(ws)!.socket;
+    for (const mode of ['warm', 'probe'] as const) {
+      const client = await SocketClient.greeted(socket, mode);
+      assert.strictEqual(await answerOrClose(client, captureOf(ws, 'a', fs.mkdtempSync(path.join(ws, 'stub-')))), 'closed', mode);
+    }
+    assert.strictEqual((await statusOf(socket)).counters.closed_for_cold, 2);
     await stopDaemon(child, socket);
   });
 

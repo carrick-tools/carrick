@@ -9,8 +9,9 @@
  * `node_modules`, and one function per operation kind (HTTP route, GraphQL
  * resolver, socket handler, pub/sub subscriber and publisher, RPC procedure).
  * After each edit the daemon is asked `infer` (all items, and a strict subset
- * of them), `capture_v2`, `resolve_definitions` and, on some steps,
- * `check_v2` over a pair of each protocol:
+ * of them) and, on some steps, `resolve_definitions` and `check_v2` over a
+ * pair of each protocol, on stubs captured by a process of their own (a daemon
+ * runs no capture, carrick#2914):
  * - verify off: every answer equals a fresh stdio process's byte for byte
  *   (timing taken out), and `status` carries no verify counts;
  * - verify on (`CARRICK_TYPED_VERIFY=1`): every request is answered both ways
@@ -280,7 +281,7 @@ interface Step {
    * of its items again and keep the others.
    */
   subset?: 'partial';
-  /** Also capture, resolve definitions, and judge a pair of each protocol. */
+  /** Also capture (cold), resolve definitions, and judge a pair of each protocol. */
   judge: boolean;
 }
 
@@ -352,7 +353,10 @@ async function drive(verify: boolean): Promise<void> {
     step.change();
     const requests: Array<Record<string, unknown>> = step.batches.map((b) => inferOf(root, b));
     if (step.judge) {
-      requests.push(captureOf(root, 'producer', dirs.a), captureOf(root, 'consumer', dirs.b));
+      // Captured as the CLI captures: by a process of its own.
+      for (const answer of await coldAnswers(root, [captureOf(root, 'producer', dirs.a), captureOf(root, 'consumer', dirs.b)])) {
+        assert.ok(answer.includes('"status":"success"'), `${step.name}: ${answer.slice(0, 300)}`);
+      }
     }
     const warm: string[] = [];
     for (const request of requests) {

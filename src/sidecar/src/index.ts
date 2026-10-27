@@ -28,14 +28,12 @@ import { TypeBundler } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { DefinitionResolver } from './definition-resolver.js';
 import {
-  CaptureHold,
   captureStub,
   findDisqualifyingTopTypes,
   jsonWireDeclarations,
   KeptJudge,
   runCheck,
   removeOrphanedJudgeWorkspaces,
-  type EmitReach,
 } from './capture/index.js';
 import * as os from 'node:os';
 import * as v8 from 'node:v8';
@@ -451,8 +449,7 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
         stage = phase;
         writeProgress(request.request_id, phase, message);
       },
-      },
-      captureHoldFor(request)
+      }
     );
     return {
       request_id: request.request_id,
@@ -1405,69 +1402,6 @@ function processLine(line: string): void {
 /** Sessions a daemon holds, by what their `init` named. */
 const heldSessions = new Map<string, Session>();
 
-/**
- * Server mode: what each service's last capture kept (carrick#2882), by the
- * fields that scope a capture. Null over stdio, where every capture is cold.
- */
-let captureHolds: Map<string, HeldCaptureEntry> | null = null;
-
-interface HeldCaptureEntry {
-  hold: CaptureHold;
-  repo_root: string;
-  service_name: string;
-  evictions: number;
-  /** The service it belongs to (`serviceKeyOf`): released with it, and counted in its footprint. */
-  service: string;
-}
-
-/** Whether a capture hold has anything built. */
-function captureBuilt(held: HeldCaptureEntry): boolean {
-  return !!(held.hold.emit || held.hold.selfCheck);
-}
-
-/** The hold for `request`'s service, made on its first capture; undefined over stdio. */
-function captureKeyOf(request: SidecarRequest & { action: 'capture_v2' }): string {
-  return JSON.stringify([path.resolve(request.repo_root), request.tsconfig_path ?? null, request.scan_root ?? null, request.service_name]);
-}
-
-function captureHoldFor(request: SidecarRequest & { action: 'capture_v2' }): CaptureHold | undefined {
-  if (!captureHolds) return undefined;
-  const key = captureKeyOf(request);
-  let held = captureHolds.get(key);
-  if (!held) {
-    held = {
-      hold: new CaptureHold(emitReach()),
-      repo_root: path.resolve(request.repo_root),
-      service_name: request.service_name,
-      evictions: 0,
-      service: serviceKeyOf(request),
-    };
-    captureHolds.set(key, held);
-  }
-  held.hold.lastUsed = performance.now();
-  return held.hold;
-}
-
-/**
- * carrick#2882: the files whose declarations an edit can change, read from
- * the import graph of the emit program the kept output came from, and the
- * graph carried to the next one (as `graphFor` carries a held project's).
- */
-function emitReach(): EmitReach {
-  let carried: { graph: ImportGraph; program: unknown } | undefined;
-  return (before, after, changes) => {
-    const graph = carried?.program === before ? carried.graph : importGraphOf(before as never);
-    const reached = affectedFiles(graph, changes);
-    if (reached === 'all' || reached.exportsMoved) {
-      carried = undefined;
-      return reached === 'all' ? 'all' : reached.files;
-    }
-    readAgain(graph, after as never, changes.map((change) => change.file));
-    carried = { graph, program: after };
-    return reached.files;
-  };
-}
-
 /** The key of the service an `init` names: every field that scopes its project. */
 function sessionKey(request: SidecarRequest & { action: 'init' }): string {
   return JSON.stringify([
@@ -1518,7 +1452,7 @@ function initHeld(request: SidecarRequest & { action: 'init' }, mode: Connection
   return response;
 }
 
-/** The service a request names: the fields that scope its programs and its capture. */
+/** The service a request names: the fields that scope its programs. */
 function serviceKeyOf(request: { repo_root: string; tsconfig_path?: string | null; scan_root?: string | null }): string {
   return JSON.stringify([path.resolve(request.repo_root), request.tsconfig_path ?? null, request.scan_root ?? null]);
 }
@@ -1570,23 +1504,17 @@ function sessionBuilt(held: Session): boolean {
   return (held.projectLoader?.builtProjects().length ?? 0) > 0;
 }
 
-/** Whether anything of `service` (a built program or a capture) is held. */
+/** Whether `service` holds a built program. */
 function serviceBuilt(service: string): boolean {
   for (const held of heldSessions.values()) if (held.service === service && sessionBuilt(held)) return true;
-  for (const held of captureHolds?.values() ?? []) if (held.service === service && captureBuilt(held)) return true;
   return false;
 }
 
-/** Release everything `service` holds: its programs and its capture. Its `init` stays; a warm request builds it again. */
+/** Release `service`'s programs. Its `init` stays; a warm request builds it again. */
 function releaseService(service: string): void {
   const state = services.get(service);
   if (state) state.footprintMb = null;
   for (const held of heldSessions.values()) if (held.service === service && held.projectLoader !== null) releaseSession(held);
-  for (const held of captureHolds?.values() ?? []) {
-    if (held.service !== service || !captureBuilt(held)) continue;
-    held.hold = new CaptureHold(emitReach());
-    held.evictions += 1;
-  }
 }
 
 function statusOf(server: TypedServer, buildId: string, cliVersion: string | null): StatusResponse['daemon'] {
@@ -1611,12 +1539,6 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
         evictions: held.evictions,
       })),
     ],
-    captures: [...(captureHolds?.values() ?? [])].map((held) => ({
-      repo_root: held.repo_root,
-      service_name: held.service_name,
-      ...held.hold.report(),
-      evictions: held.evictions,
-    })),
     heap_cap_mb: heapCapMb(),
     heap_limit_mb: Math.round(v8.getHeapStatistics().heap_size_limit / 1048576),
     judge: {
@@ -1637,8 +1559,7 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
 
 /**
  * A held session's budget fields for `status`. `built` is the probe refusal's
- * test (a built program); a held capture is reported under `captures`. The
- * footprint counts the service's programs and its capture.
+ * test (a built program).
  */
 function serviceReport(
   held: Session,
@@ -1785,20 +1706,18 @@ async function serveLine(
 async function serveRequest(conn: Connection, line: string, request: SidecarRequest): Promise<void> {
   const mode = conn.mode ?? 'probe';
   const held = conn.slot as Session | undefined;
-  const service = held?.service ?? (request.action === 'capture_v2' ? serviceKeyOf(request) : null);
+  const service = held?.service ?? null;
   const budget = underBudget(service, mode);
   let stopListening = (): void => {};
   try {
     // The daemon never changes a held program at a client's request.
     if (request.action === 'add_program_files') throw new CloseForCold('add_program_files');
+    // A capture builds three programs of its own: the client's process runs it beside its other captures (carrick#2914).
+    if (request.action === 'capture_v2') throw new CloseForCold('capture_v2');
     if (mode === 'probe') {
       // A probe never builds: an evicted or cold_only service answers through a process of the client's own.
       if (held && (held.projectLoader === null || (held.service && services.get(held.service)?.coldOnly))) {
         throw new CloseForCold('the service is not held');
-      }
-      const capture = request.action === 'capture_v2' ? captureHolds?.get(captureKeyOf(request)) : undefined;
-      if (request.action === 'capture_v2' && (!capture || !captureBuilt(capture) || services.get(serviceKeyOf(request))?.coldOnly)) {
-        throw new CloseForCold('no capture is held for the service');
       }
     }
     if (request.action === 'check_v2' && keptJudge?.inUse) throw new CloseForCold('the kept judge is in use');
@@ -1912,8 +1831,8 @@ function collect(): void {
 
 /**
  * Keep the heap under its cap around a request (L2). Collect, then while over
- * the cap release the least recently used held service (its programs and its
- * capture), never `current` (the request's own). A warm request (the warm-up)
+ * the cap release the least recently used held service, never `current`
+ * (the request's own). A warm request (the warm-up)
  * may release only services no probe has used. After the request: a service
  * whose own footprint is over half the cap is released and marked
  * `cold_only:too_big`; a warm request that is still over the cap releases the
@@ -2140,7 +2059,6 @@ function answerFresh(request: SidecarRequest, mode: ConnectionMode): SidecarResp
 /** `--serve <workspace> [--cli-version <v>]`: run as the workspace's daemon. */
 async function serve(workspace: string, cliVersion: string | null): Promise<void> {
   const buildId = buildIdOf(DIST_SRC);
-  captureHolds = new Map();
   const idle = Number(process.env.CARRICK_TYPED_IDLE_MS);
   const server: TypedServer = new TypedServer({
     workspace: path.resolve(workspace),

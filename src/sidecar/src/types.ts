@@ -1074,27 +1074,6 @@ export interface HeldService {
   evictions: number;
 }
 
-/**
- * One service whose capture a daemon holds (carrick#2882), with what its
- * captures reused, counted over the hold's life.
- */
-export interface HeldCapture {
-  repo_root: string;
-  service_name: string;
-  captures: number;
-  /** Source files whose declarations were written again, and kept. */
-  emitted: number;
-  emit_kept: number;
-  /** Stub files checked again, and whose diagnostics were kept. */
-  checked: number;
-  check_kept: number;
-  /** Source files parsed again, and handed back unparsed. */
-  parsed: number;
-  parse_kept: number;
-  /** How often it was released to keep the heap under its cap. */
-  evictions: number;
-}
-
 /** Response for status. */
 export interface StatusResponse extends BaseResponse {
   status: 'success';
@@ -1107,7 +1086,6 @@ export interface StatusResponse extends BaseResponse {
     uptime_ms: number;
     idle_ms: number;
     services: HeldService[];
-    captures: HeldCapture[];
     heap_used_mb: number;
     rss_mb: number;
     /** The heap held services are kept under (`CARRICK_TYPED_HEAP_CAP_MB`, default min(3072, RAM/8)). */
