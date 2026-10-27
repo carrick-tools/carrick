@@ -420,14 +420,58 @@ fn ignored_in(top: &Path) -> Option<Arc<HashSet<PathBuf>>> {
 /// The checkout `path` sits in, and `path` relative to its top: the nearest
 /// directory above `path` that holds `.git`. Absolute, and not canonical, as
 /// [`is_separate_checkout`] reads it.
+///
+/// Every walk asks this for every entry it meets ([`boundary_at`]), so the
+/// top is looked up per parent directory through [`CheckoutTops`], not
+/// probed again for each sibling.
 fn in_checkout(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    static TOPS: OnceLock<CheckoutTops> = OnceLock::new();
+    in_checkout_with(TOPS.get_or_init(Default::default), path)
+}
+
+fn in_checkout_with(tops: &CheckoutTops, path: &Path) -> Option<(PathBuf, PathBuf)> {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let top = path
-        .ancestors()
-        .skip(1)
-        .find(|above| is_git_checkout(above))?;
-    let relative = path.strip_prefix(top).ok()?.to_path_buf();
-    Some((top.to_path_buf(), relative))
+    let top = tops.at_or_above(path.parent()?)?;
+    let relative = path.strip_prefix(&top).ok()?.to_path_buf();
+    Some((top, relative))
+}
+
+/// The nearest directory at or above a directory that holds `.git`
+/// ([`is_git_checkout`]), remembered per directory for the process, as
+/// [`tracked_in`] and [`ignored_in`] remember what git answers for a
+/// checkout. A directory's answer is its own `.git` or its parent's answer,
+/// so one lookup fills every directory above it too.
+#[derive(Default)]
+struct CheckoutTops {
+    tops: std::sync::RwLock<HashMap<PathBuf, Option<PathBuf>>>,
+    /// How many directories were probed for `.git`: what the memo saves.
+    #[cfg(test)]
+    probes: std::sync::atomic::AtomicUsize,
+}
+
+impl CheckoutTops {
+    fn at_or_above(&self, dir: &Path) -> Option<PathBuf> {
+        if let Some(known) = self
+            .tops
+            .read()
+            .ok()
+            .and_then(|tops| tops.get(dir).cloned())
+        {
+            return known;
+        }
+        #[cfg(test)]
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let top = if is_git_checkout(dir) {
+            Some(dir.to_path_buf())
+        } else {
+            dir.parent().and_then(|parent| self.at_or_above(parent))
+        };
+        if let Ok(mut tops) = self.tops.write() {
+            tops.insert(dir.to_path_buf(), top.clone());
+        }
+        top
+    }
 }
 
 /// Whether `dir` is a dot folder git tracks nothing under (carrick#1607): a
@@ -1286,6 +1330,55 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use tempfile::tempdir;
+
+    /// Every walk asks which checkout each entry sits in. The answer is the
+    /// one the ancestors give, and each directory is probed for `.git` once
+    /// however many entries sit below it, not once per entry per level.
+    #[test]
+    fn the_checkout_an_entry_sits_in_is_probed_once_per_directory() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path().join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let mut dir = root.clone();
+        let mut entries = Vec::new();
+        let mut dirs = 1;
+        for level in ["a", "b", "c", "d"] {
+            dir = dir.join(level);
+            fs::create_dir_all(&dir).unwrap();
+            dirs += 1;
+            for file in ["one.ts", "two.ts", "three.ts"] {
+                fs::write(dir.join(file), "").unwrap();
+                entries.push(dir.join(file));
+            }
+            entries.push(dir.clone());
+        }
+
+        let tops = CheckoutTops::default();
+        for entry in &entries {
+            let probed = entry
+                .ancestors()
+                .skip(1)
+                .find(|above| is_git_checkout(above))
+                .map(|top| {
+                    (
+                        top.to_path_buf(),
+                        entry.strip_prefix(top).unwrap().to_path_buf(),
+                    )
+                });
+            assert_eq!(
+                in_checkout_with(&tops, entry),
+                probed,
+                "{}",
+                entry.display()
+            );
+        }
+        let probes = tops.probes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            probes <= dirs,
+            "{probes} probes for {} entries in {dirs} directories",
+            entries.len()
+        );
+    }
 
     /// Node's module spellings are source, and a test or story file is left
     /// out whichever spelling it uses (carrick#904).
