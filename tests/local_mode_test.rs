@@ -2777,6 +2777,63 @@ fn check_changed_fails_when_a_shared_type_drops_a_field_a_consumer_reads() {
     assert_eq!(json["problems"][0]["fails"], true, "{json:#}");
 }
 
+/// Sets every stored verdict of the index to "could not be judged".
+fn as_unjudged(root: &Path) {
+    fn walk(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(verdict) = map.get_mut("verdict").filter(|v| v.is_object()) {
+                    *verdict = serde_json::json!({
+                        "state": "unresolved", "result": null, "detail": "not judged"
+                    });
+                }
+                map.values_mut().for_each(walk);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    let path = root.join(".carrick/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the index"))
+            .expect("the index is JSON");
+    walk(&mut index);
+    std::fs::write(&path, index.to_string()).expect("write the index");
+}
+
+/// The same shared-type edit, but the index never judged the route: a mismatch
+/// there may be old, so outside the changed files it is not this work's.
+#[test]
+#[serial]
+fn check_changed_does_not_report_an_outside_row_the_index_never_judged() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let producer = root.join("catalog-web");
+    let route = producer.join("app/routes/api.v1.widgets.$widgetId.ts");
+    let types =
+        "export type Widget = {\n  id: string;\n  name: string;\n  activeCount: number;\n};\n";
+    edit(&route, types, "import type { Widget } from \"../types\";\n");
+    std::fs::write(producer.join("app/types.ts"), types).expect("write the types file");
+    commit_all(&producer, "move the widget type into its own file");
+    index(root);
+    as_unjudged(root);
+
+    git(&producer, &["checkout", "-qb", "feature"]);
+    edit(
+        &producer.join("app/types.ts"),
+        "  activeCount: number;\n",
+        "",
+    );
+    commit_all(&producer, "drop activeCount from the shared type");
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        !text.contains("  incompatible  "),
+        "an outside row the index never judged is not reported:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
 /// A new call, uncommitted, to a route no service in the workspace serves.
 /// Its path is bare, so it goes to the origin the client already talks to.
 #[test]

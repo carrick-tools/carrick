@@ -581,10 +581,10 @@ it. `--json` always lists every problem, with its `source`,
 
 **Files the work did not touch.** A row in such a file is reported in two
 cases only. A call the index matched, and no service serves now. Or a route or
-call whose verdict is a type or method mismatch now and was not one in the
-index for the same row: the work changed something the row reads, such as a
-shared type in a contracts file. A mismatch the index already held is never
-reported. Either is judged by the same `fact` rule as a changed file's
+call whose verdict is a type or method mismatch now and was `compatible` in
+the index for the same row: the work changed something the row reads, such as
+a shared type in a contracts file. A row the index held a mismatch for, could
+not judge or held no verdict for is never reported. Either is judged by the same `fact` rule as a changed file's
 problem, so it fails the run when it is a fact. It is listed when it fails,
 and with `--all` otherwise; it is never counted on the summary line, which is
 about the changed files. `--json` marks none of this; the list shows the row's

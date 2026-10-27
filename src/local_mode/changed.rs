@@ -597,7 +597,20 @@ fn judge(
                     .and_then(|verdict| verdict.result.as_deref())
                     .is_some_and(|result| matches!(result, "type_mismatch" | "method_mismatch"))
         });
-        if !in_the_change && already {
+        // Outside the change only a verdict that MOVED is this work's: the
+        // index held a judged `compatible` for the row and it is a mismatch
+        // now. A row the index could not judge, or held no verdict for, may
+        // carry an old mismatch the work did not cause.
+        if !in_the_change
+            && !indexed_rows(before, repo, &operation.file).any(|old| {
+                old.key == operation.key
+                    && old
+                        .verdict
+                        .as_ref()
+                        .and_then(|verdict| verdict.result.as_deref())
+                        == Some("compatible")
+            })
+        {
             continue;
         }
         let named: Vec<&String> = finding
