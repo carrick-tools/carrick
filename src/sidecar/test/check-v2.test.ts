@@ -14,6 +14,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { runCheck } from '../src/capture/index.js';
+import { judgeTscPath, resolveVendored } from '../src/capture/check.js';
 import type { CheckPairSpec, CheckStubInput, CheckVerdict } from '../src/capture/api.js';
 
 let root: string;
@@ -529,5 +530,33 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
       JSON.stringify(b.verdicts),
       'verdict payloads must be byte-identical'
     );
+  });
+
+  // The judge is TypeScript 7's native compiler; capture and inference stay on
+  // TypeScript 6. Every pair here reads the same under both, but for the one
+  // place TypeScript 7 words an assignment differently: it names the alias
+  // (TS2322, then the missing members) where TypeScript 6 names the members
+  // at once (TS2740). That pair is decided by the bytes gate, so only its
+  // `codes` move.
+  it('the native judge reads every pair as TypeScript 6 does', async () => {
+    assert.match(judgeTscPath(), /@typescript\/typescript-[^/]+\/lib\/tsc|typescript-native/);
+    const ts6 = resolveVendored(path.join('typescript', 'bin', 'tsc'));
+    const six = await runCheck({ stubs, pairs: PAIRS, tscPath: ts6 });
+    const seven = await runCheck({ stubs, pairs: PAIRS });
+    assert.strictEqual(six.ts_version, '6.0.2');
+    assert.strictEqual(seven.ts_version, '7.0.2');
+    const sixBy = byKey(six.verdicts);
+    const sevenBy = byKey(seven.verdicts);
+    assert.deepStrictEqual([...sevenBy.keys()].sort(), [...sixBy.keys()].sort());
+    for (const [key, v6] of sixBy) {
+      const v7 = sevenBy.get(key)!;
+      if (key === 'bytesblob') {
+        assert.deepStrictEqual(v6.codes, [2344, 2740]);
+        assert.deepStrictEqual(v7.codes, [2322, 2344]);
+        assert.deepStrictEqual({ ...v7, codes: [] }, { ...v6, codes: [] }, key);
+        continue;
+      }
+      assert.deepStrictEqual(v7, v6, key);
+    }
   });
 });

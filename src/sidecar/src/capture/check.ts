@@ -104,6 +104,38 @@ export function carriesHeapLimitLine(stderr: string): boolean {
     );
 }
 
+/**
+ * Whether the native compiler (TypeScript 7, a Go program) died out of
+ * memory. The Go runtime prints `fatal error: runtime: out of memory` and
+ * exits 2; V8's line above never appears, and a heap cap passed through
+ * `NODE_OPTIONS` reaches only the launcher, not the compiler.
+ */
+export function carriesNativeOutOfMemoryLine(output: string): boolean {
+  return output.split('\n').some((line) => line.includes('fatal error: runtime: out of memory'));
+}
+
+/**
+ * Whether a diagnostic is about the compiler's configuration rather than a
+ * file it checked: one placed in a `.json` file (the tsconfig), or an option
+ * code (TS5xxx), or "no inputs" (TS18003).
+ */
+export function isConfigDiagnostic(d: RawDiagnostic): boolean {
+  return d.file.endsWith('.json') || (d.code >= 5000 && d.code < 6000) || d.code === 18003;
+}
+
+/** Why the compiler ended abnormally, when its output names a known cause. */
+export function abnormalCause(output: string): string | undefined {
+  if (/Unable to resolve @typescript\/typescript-/.test(output)) {
+    return (
+      "the native type checker for this platform is not installed (the compiler's " +
+      'platform package is an optional dependency; an install that omits optional ' +
+      'dependencies leaves it out)'
+    );
+  }
+  if (carriesNativeOutOfMemoryLine(output)) return 'the type checker ran out of memory';
+  return undefined;
+}
+
 /** V8's default old-space ceiling on a 64-bit host, in MB. */
 const V8_DEFAULT_HEAP_CEILING_MB = 4096;
 
@@ -175,9 +207,17 @@ function sidecarRoot(): string {
  * which is the caller's "not found" signal and the most useful thing to name.
  */
 export function resolveVendoredBin(name: string, from: string = sidecarRoot()): string {
-  const local = path.join(from, 'node_modules', '.bin', name);
+  return resolveVendored(path.join('.bin', name), from);
+}
+
+/**
+ * The first `node_modules/<rel>` at or above `from`, the same walk as
+ * {@link resolveVendoredBin}; the sidecar-local path when none exists.
+ */
+export function resolveVendored(rel: string, from: string = sidecarRoot()): string {
+  const local = path.join(from, 'node_modules', rel);
   for (let dir = from; ; dir = path.dirname(dir)) {
-    const candidate = path.join(dir, 'node_modules', '.bin', name);
+    const candidate = path.join(dir, 'node_modules', rel);
     if (fs.existsSync(candidate)) return candidate;
     if (path.dirname(dir) === dir) return local;
   }
@@ -185,6 +225,51 @@ export function resolveVendoredBin(name: string, from: string = sidecarRoot()): 
 
 function binPath(name: string): string {
   return resolveVendoredBin(name);
+}
+
+/**
+ * The package the judge's compiler comes from: TypeScript 7, the native
+ * compiler, installed under an alias beside the TypeScript 6 that capture and
+ * inference read through ts-morph. Both packages declare a `tsc` bin, so
+ * `node_modules/.bin/tsc` may be either; the judge never reads it.
+ */
+export const JUDGE_COMPILER_PACKAGE = 'typescript-native';
+
+/**
+ * The judge's tsc. First the host's native executable, from the platform
+ * package the compiler installs as an optional dependency (`@typescript/
+ * typescript-<platform>-<arch>`), found by the same walk as the bins: npm
+ * hoists it beside the sidecar, and an install that omitted optional
+ * dependencies can add it at its root. Otherwise the compiler package's own
+ * launcher, which resolves the platform package from wherever the package
+ * manager put it (pnpm's store) and says so when it is missing.
+ */
+export function judgeTscPath(
+  from: string = sidecarRoot(),
+  platform: string = process.platform,
+  arch: string = process.arch
+): string {
+  const exe = platform === 'win32' ? 'tsc.exe' : 'tsc';
+  const native = path.join('@typescript', `typescript-${platform}-${arch}`, 'lib', exe);
+  const found = resolveVendored(native, from);
+  if (fs.existsSync(found)) return found;
+  return resolveVendored(path.join(JUDGE_COMPILER_PACKAGE, 'bin', 'tsc'), from);
+}
+
+/** The version of the compiler a tsc path belongs to, read from the package
+ * that holds it; the compiler-API version for a stand-in with no package. */
+function compilerVersion(tscPath: string): string {
+  try {
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(path.dirname(tscPath), '..', 'package.json'), 'utf8')
+    ) as { name?: string; version?: string };
+    const compiler =
+      manifest.name === 'typescript' || manifest.name?.startsWith('@typescript/typescript-');
+    if (compiler && manifest.version) return manifest.version;
+  } catch {
+    // A stand-in compiler (tests) sits in no package.
+  }
+  return ts.version;
 }
 
 function unverifiableAll(
@@ -222,8 +307,8 @@ export async function runCheck(
   const progress: CheckProgress = onProgress ?? (() => {});
   const cleanup = opts.cleanup !== false;
   const pnpmPath = opts.pnpmPath ?? binPath('pnpm');
-  const tscPath = opts.tscPath ?? binPath('tsc');
-  const tsVersion = ts.version;
+  const tscPath = opts.tscPath ?? judgeTscPath();
+  const tsVersion = compilerVersion(tscPath);
 
   // Isolation is non-negotiable: without the vendored pnpm we would fall back
   // to a flat npm install that manufactures nominal false-incompatibles. Fail
@@ -366,11 +451,26 @@ export async function runCheck(
   // `code === 0` guard.
   // A compiler a signal ended never finished, so a pair with no diagnostic
   // was never cleared, whatever it printed first (carrick#2209).
-  if (tsc.signal !== null || (tsc.code !== 0 && diagnostics.length === 0)) {
+  //
+  // A diagnostic about the configuration (a tsconfig the compiler refuses,
+  // an option it does not know) is printed WITH a position, in the tsconfig,
+  // and belongs to no pair: TypeScript 7 refuses an option and checks
+  // nothing, so without this every pair read compatible. Such a run checked
+  // no pair, whatever else it printed.
+  const configError = diagnostics.find(isConfigDiagnostic);
+  if (
+    tsc.signal !== null ||
+    (tsc.code !== 0 && diagnostics.length === 0) ||
+    configError !== undefined
+  ) {
     const excerpt = scrubPaths(
-      (tsc.stderr || tsc.stdout).trim().slice(0, 2000),
+      (configError
+        ? `${configError.file}(${configError.line},${configError.col}): error TS${configError.code}: ${configError.message}`
+        : (tsc.stderr || tsc.stdout).trim()
+      ).slice(0, 2000),
       scrubCtx
     );
+    const cause = abnormalCause(tsc.stderr + '\n' + tsc.stdout);
     errors.push(
       `tsc terminated abnormally (exit code ${tsc.code ?? 'null'}) ` +
         `with no parseable diagnostics${excerpt ? `: ${excerpt}` : ''}`
@@ -385,8 +485,9 @@ export async function runCheck(
       ...unverifiableAll(
         probing,
         'tsc:abnormal-termination',
-        `the type checker terminated abnormally (exit code ${tsc.code ?? 'null'}); ` +
-          'compatibility cannot be verified.' +
+        `the type checker terminated abnormally (exit code ${tsc.code ?? 'null'})` +
+          (cause ? ` because ${cause}` : '') +
+          '; compatibility cannot be verified.' +
           (excerpt ? ` Compiler output: ${excerpt}` : '')
       ),
       ...preGated,
@@ -398,7 +499,7 @@ export async function runCheck(
     const compilerEnd: CompilerEnd = {
       exit_code: tsc.code,
       signal: tsc.signal,
-      heap_limit: carriesHeapLimitLine(tsc.stderr),
+      heap_limit: carriesHeapLimitLine(tsc.stderr) || carriesNativeOutOfMemoryLine(tsc.stderr + '\n' + tsc.stdout),
       heap_cap_mb: heap.heapCapMb,
     };
     if (cleanup) safeRm(ws);

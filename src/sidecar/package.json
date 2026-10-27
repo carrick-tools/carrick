@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "node node_modules/typescript/bin/tsc",
     "start": "node dist/index.js",
     "test": "node --test dist/test/**/*.test.js",
     "clean": "rm -rf dist",
@@ -14,6 +14,7 @@
   "dependencies": {
     "ts-morph": "28.0.0",
     "typescript": "6.0.2",
+    "typescript-native": "npm:typescript@7.0.2",
     "zod": "^3.23.0"
   },
   "devDependencies": {

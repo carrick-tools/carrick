@@ -588,6 +588,32 @@ retired: typescript-go issue #972 (declaration emit failing under type errors,
 which would have broken the `--noCheck` capture emit) was fixed in May 2025
 and is not a blocker.
 
+**The judge runs on TypeScript 7 (2026-10-27).** The check phase's `tsc` is
+TypeScript 7.0.2's native compiler, installed under the alias
+`typescript-native` beside the TypeScript 6.0.2 that capture, inference and
+the probe walk read through ts-morph. The sidecar runs the host's native
+executable from the compiler's platform package
+(`@typescript/typescript-<platform>-<arch>`, an optional dependency of the
+compiler, about 26-28 MB per host). It falls back to the package's own
+launcher when that executable is not where the walk looks. Parity, measured
+before the switch: on two real 1,018-probe workspaces every probe diagnostic
+(file, line, column, code, message) matched TypeScript 6. On the golden
+suites one pair moved: an alias of `Uint8Array` assigned to `Blob` is TS2322
+with an elaboration under 7 and TS2740 under 6. Both are assignment codes, so
+no bucket changes. The judge's tsc took 1.8-2.3 s and about 1.8 GB on a
+1,018-probe workspace, against 9.3-9.6 s and 2.6 GB on TypeScript 6. Two
+guards came with the switch:
+
+- TypeScript 7 refuses removed options with a positioned diagnostic in the
+  tsconfig and checks nothing. A configuration diagnostic (one in a `.json`
+  file, TS5xxx or TS18003) now ends the run as abnormal, so every probed pair
+  is unverifiable rather than compatible. `esModuleInterop: false` is no
+  longer written.
+- The native compiler dies out of memory with the Go runtime's
+  `fatal error: runtime: out of memory`. That counts as a heap death, beside
+  V8's line. A missing platform package names itself on every pair it leaves
+  unchecked.
+
 ## Future hook: wire-truth vs type-truth
 
 TS assignability is a proxy for what Carrick actually claims: **wire
