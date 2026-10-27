@@ -737,7 +737,10 @@ impl ClosureReads {
         }
         #[cfg(test)]
         self.parsed.set(self.parsed.get() + 1);
-        let loaded = self.reader.borrow_mut().loaded_specifiers(file);
+        // A type named through `import('./x').T` or a `/// <reference>` is a
+        // read for reach, though `loaded_specifiers` does not load it.
+        let mut loaded = self.reader.borrow_mut().loaded_specifiers(file);
+        loaded.extend(self.reader.borrow_mut().type_reads(file));
         self.specifiers.borrow_mut().insert(key, loaded.clone());
         loaded
     }
@@ -1769,6 +1772,42 @@ mod tests {
             })
             .collect();
         (repo, a, services)
+    }
+
+    /// A type named only through `import('./x').T` or a triple-slash
+    /// reference is still read by the service, so a change to that file
+    /// reaches it.
+    #[test]
+    fn a_type_position_import_is_an_edge_of_the_closure() {
+        let (repo, _) = committed_repo(&[
+            ("package.json", r#"{ "name": "mono", "private": true }"#),
+            ("apps/api/package.json", r#"{ "name": "api" }"#),
+            ("apps/api/src/server.ts", "export const server = 1;\n"),
+            (
+                "apps/api/src/types.ts",
+                "export interface Order { id: string }\n",
+            ),
+            (
+                "apps/api/src/globals.d.ts",
+                "interface Extra { n: number }\n",
+            ),
+            ("apps/web/package.json", r#"{ "name": "web" }"#),
+            (
+                "apps/web/src/checkout.ts",
+                "/// <reference path=\"../../api/src/globals.d.ts\" />\nexport type T = import('../../api/src/types').Order;\n",
+            ),
+        ]);
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let top = crate::git_state::toplevel(&repo_path).unwrap();
+        let web: Config = serde_json::from_value(serde_json::json!({
+            "name": "web",
+            "directory": "apps/web",
+        }))
+        .unwrap();
+        let inputs = service_inputs(&repo_path, &top, &web, &ClosureReads::default());
+        for file in ["apps/api/src/types.ts", "apps/api/src/globals.d.ts"] {
+            assert!(inputs.files.contains(file), "{file} in {:?}", inputs.files);
+        }
     }
 
     /// Services that reach the same file share one read of it: the closure

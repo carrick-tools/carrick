@@ -108,6 +108,19 @@ impl ModuleReader {
         module_loads(&module)
     }
 
+    /// What `file` reads in type position that [`Self::loaded_specifiers`]
+    /// does not: see [`type_reads`] and [`reference_directives`].
+    pub fn type_reads(&mut self, file: &Path) -> Vec<String> {
+        let Some(module) = parse_file(file, &self.source_map, &self.handler) else {
+            return Vec::new();
+        };
+        let mut found = type_reads(&module);
+        if let Some(source) = read_source(file) {
+            found.extend(reference_directives(&source));
+        }
+        found
+    }
+
     /// Every module specifier `file` imports from, in source order.
     ///
     /// Type-only imports are included: a package imported for its types alone
@@ -159,6 +172,68 @@ pub fn module_loads(module: &Module) -> Vec<String> {
     let mut loads = Loads(Vec::new());
     module.visit_with(&mut loads);
     found.extend(loads.0);
+    found
+}
+
+/// The specifiers of every `import('./x').T` and `typeof import('./x')` type
+/// in `module`. [`module_loads`] does not read them: it feeds passes that ask
+/// what a file loads at run time. Only the change-scope reach walk asks what a
+/// file reads for its types (a type-position import is an edge for reach).
+pub fn type_reads(module: &Module) -> Vec<String> {
+    use swc_ecma_ast::TsImportType;
+    use swc_ecma_visit::{Visit, VisitWith};
+    struct Reads(Vec<String>);
+    impl Visit for Reads {
+        fn visit_ts_import_type(&mut self, import: &TsImportType) {
+            self.0.push(import.arg.value.to_string_lossy().into_owned());
+            import.visit_children_with(self);
+        }
+    }
+    let mut reads = Reads(Vec::new());
+    module.visit_with(&mut reads);
+    reads.0
+}
+
+/// The targets of `/// <reference path="..." />` and `/// <reference
+/// types="..." />` lines in `source`. A path is returned as a relative
+/// specifier, a types name as the package it names. Comments are not in the
+/// AST, so the leading `///` lines are read from the text.
+pub fn reference_directives(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in source.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("///") else {
+            // Directives are only honoured before the first statement.
+            if line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') {
+                continue;
+            }
+            break;
+        };
+        let Some(tag) = rest.trim().strip_prefix("<reference") else {
+            continue;
+        };
+        for (attribute, relative) in [("path", true), ("types", false)] {
+            let Some(at) = tag.find(&format!("{attribute}=")) else {
+                continue;
+            };
+            let value = &tag[at + attribute.len() + 1..];
+            let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+                continue;
+            };
+            let Some(end) = value[1..].find(quote) else {
+                continue;
+            };
+            let target = &value[1..1 + end];
+            if relative && !target.starts_with('.') {
+                found.push(format!("./{target}"));
+            } else {
+                found.push(target.to_string());
+            }
+        }
+    }
     found
 }
 
@@ -272,6 +347,15 @@ pub fn parse_source(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reference_directives_name_paths_and_packages_before_the_first_statement() {
+        let source = "// header\n/// <reference path=\"g.d.ts\" />\n/// <reference types='node' />\nimport x from './x';\n/// <reference path=\"late.d.ts\" />\n";
+        assert_eq!(
+            super::reference_directives(source),
+            vec!["./g.d.ts", "node"]
+        );
+    }
+
     use super::parse_file;
     use swc_common::{
         SourceMap,
