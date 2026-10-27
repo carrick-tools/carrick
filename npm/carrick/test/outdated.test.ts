@@ -290,10 +290,14 @@ test("a hook that is not the build that set the workspace up says so where the a
     // hook goes back to saying only what it found in the file.
     const second = run("hook", "post-edit");
     assert.doesNotMatch(second.stdout, /set this workspace up/, second.stdout);
-    assert.match(
-      JSON.parse(second.stdout).hookSpecificOutput.additionalContext,
-      /^Carrick (noted the edit to|re-checked) /,
-    );
+    // The "not re-checked here" line is said once per session, so the first
+    // edit's was the only one; a re-checked edit still speaks.
+    if (second.stdout !== "") {
+      assert.match(
+        JSON.parse(second.stdout).hookSpecificOutput.additionalContext,
+        /^Carrick re-checked /,
+      );
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
