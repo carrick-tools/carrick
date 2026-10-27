@@ -29,9 +29,9 @@ use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureV2Result, CheckPairEndpoint,
-    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, MemoryDeath,
-    OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem, RetypeOutcome,
-    RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
+    CheckPairSpec, CheckStubInput, CheckV2Result, InferKind, InferRequestItem, ManifestEntry,
+    MemoryDeath, OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem,
+    RetypeOutcome, RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
 };
 
 // ===========================================================================
@@ -2181,6 +2181,108 @@ pub(crate) fn materialize_stubs(
     stubs
 }
 
+/// The folder one `check --changed` keeps its finished judge answers in. The
+/// re-scan and the re-join are two processes that judge the same input; each
+/// is handed this folder, so the second takes the first's answer. Unset
+/// everywhere else, where nothing is kept.
+pub(crate) const JUDGE_ANSWERS_ENV: &str = "CARRICK_JUDGE_ANSWERS_DIR";
+
+/// Whole-input key of one judge run: the sidecar build, every stub's service
+/// name and file contents (not its temp path or its place in the list), and
+/// the pair specs. Any
+/// difference in any of them is a different key.
+fn judge_key(build_key: &str, stubs: &[CheckStubInput], specs: &[CheckPairSpec]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut h = Sha256::new();
+    let mut put = |bytes: &[u8]| {
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    put(build_key.as_bytes());
+    put(&(stubs.len() as u64).to_le_bytes());
+    // The two runs list the same stubs in different orders; the workspace
+    // names each by service, so the order is not part of the input.
+    let mut ordered: Vec<&CheckStubInput> = stubs.iter().collect();
+    ordered.sort_by(|a, b| a.service_name.cmp(&b.service_name));
+    for stub in ordered {
+        put(stub.service_name.as_bytes());
+        let root = Path::new(&stub.stub_dir);
+        let mut files = Vec::new();
+        walk(root, &mut files).ok()?;
+        files.sort();
+        put(&(files.len() as u64).to_le_bytes());
+        for file in files {
+            let rel = file.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            put(rel.as_bytes());
+            put(&std::fs::read(&file).ok()?);
+        }
+    }
+    put(serde_json::to_string(specs).ok()?.as_bytes());
+    Some(format!("{:x}", h.finalize()))
+}
+
+/// Run `judge` unless an identical input already got a finished answer in
+/// the folder [`JUDGE_ANSWERS_ENV`] names.
+fn judge_once(
+    build_key: &str,
+    stubs: &[CheckStubInput],
+    specs: &[CheckPairSpec],
+    judge: impl FnOnce() -> Result<CheckV2Result, SidecarError>,
+) -> Result<CheckV2Result, SidecarError> {
+    let dir = std::env::var_os(JUDGE_ANSWERS_ENV).map(PathBuf::from);
+    judge_once_in(dir.as_deref(), build_key, stubs, specs, judge)
+}
+
+/// [`judge_once`], over a named folder. Only a check that ran to the end is
+/// kept; a failed one is judged again. An input that cannot be keyed, or an
+/// answer that cannot be read back, is judged, never guessed.
+fn judge_once_in(
+    dir: Option<&Path>,
+    build_key: &str,
+    stubs: &[CheckStubInput],
+    specs: &[CheckPairSpec],
+    judge: impl FnOnce() -> Result<CheckV2Result, SidecarError>,
+) -> Result<CheckV2Result, SidecarError> {
+    let Some(dir) = dir else {
+        return judge();
+    };
+    let Some(key) = judge_key(build_key, stubs, specs) else {
+        return judge();
+    };
+    let kept = dir.join(format!("{key}.json"));
+    if let Some(answer) = std::fs::read(&kept)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CheckV2Result>(&bytes).ok())
+    {
+        debug!("v2 check: identical input already judged; reusing its answer");
+        return Ok(answer);
+    }
+    let result = judge()?;
+    if result.success && result.compiler_end.is_none() {
+        // Written whole and renamed in, so a process that reads while the
+        // other writes never sees half an answer.
+        let staged = dir.join(format!("{key}.{}.tmp", std::process::id()));
+        let wrote = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&staged, serde_json::to_vec(&result).unwrap_or_default()))
+            .and_then(|()| std::fs::rename(&staged, &kept));
+        if let Err(e) = wrote {
+            debug!("v2 check: could not keep the answer: {e}");
+        }
+    }
+    Ok(result)
+}
+
 /// Run the v2 check over the built pairs and produce the analyzer's pair
 /// outcomes. Pairs with a pre-set verdict (no surface / unresolved side)
 /// never reach the sidecar. A check that failed part way (an install, an
@@ -2236,7 +2338,9 @@ pub(crate) fn run_check(
                 "no capture stubs available".to_string(),
             ))
         } else {
-            sidecar.check_v2(&stubs, &specs)
+            judge_once(&sidecar.build_key(), &stubs, &specs, || {
+                sidecar.check_v2(&stubs, &specs)
+            })
         };
         let oom_kills_rose = crate::services::type_sidecar::oom_kills_rose(
             oom_kills_before,
@@ -8200,6 +8304,114 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             deterministic_route(),
         );
         assert_eq!(pre_verdict_of(&pairs), None);
+    }
+
+    // ---- judge once -----------------------------------------------------
+
+    fn kept_stub(root: &Path, name: &str, body: &str) -> CheckStubInput {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("types")).unwrap();
+        std::fs::write(dir.join("types/a.d.ts"), body).unwrap();
+        CheckStubInput {
+            service_name: name.to_string(),
+            stub_dir: dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn one_spec(key: &str) -> CheckPairSpec {
+        CheckPairSpec {
+            pair_key: key.to_string(),
+            protocol: ProbeProtocol::Http,
+            type_kind: ProbeTypeKind::Response,
+            producer: CheckPairEndpoint {
+                service_name: "p".to_string(),
+                alias: "A".to_string(),
+            },
+            consumer: CheckPairEndpoint {
+                service_name: "c".to_string(),
+                alias: "B".to_string(),
+            },
+            topic: None,
+        }
+    }
+
+    fn answer(success: bool, ts: &str) -> CheckV2Result {
+        serde_json::from_value(serde_json::json!({
+            "success": success, "isolation": "pnpm", "install_ok": true, "ts_version": ts,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn identical_input_is_judged_once_and_a_changed_input_is_judged_again() {
+        let kept = tempfile::tempdir().unwrap();
+        let dir = Some(kept.path());
+        let calls = std::cell::Cell::new(0);
+        let judge = |ts: &str| {
+            calls.set(calls.get() + 1);
+            Ok(answer(true, ts))
+        };
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        // Same content under two different temp paths: the same input.
+        let stubs_a = [kept_stub(a.path(), "svc", "export type A = number;")];
+        let stubs_b = [kept_stub(b.path(), "svc", "export type A = number;")];
+        let specs = [one_spec("k")];
+
+        let first = judge_once_in(dir, "build1", &stubs_a, &specs, || judge("5.9")).unwrap();
+        let second = judge_once_in(dir, "build1", &stubs_b, &specs, || judge("OTHER")).unwrap();
+        assert_eq!(calls.get(), 1, "the identical input must not judge twice");
+        assert_eq!(first.ts_version, second.ts_version, "same answer returned");
+
+        // The same stubs listed in another order are the same input.
+        let d = tempfile::tempdir().unwrap();
+        let two_a = [
+            kept_stub(d.path(), "one", "export type A = 1;"),
+            kept_stub(d.path(), "two", "export type A = 2;"),
+        ];
+        let two_b = [two_a[1].clone(), two_a[0].clone()];
+        judge_once_in(dir, "build1", &two_a, &specs, || judge("x")).unwrap();
+        judge_once_in(dir, "build1", &two_b, &specs, || judge("x")).unwrap();
+        assert_eq!(calls.get(), 2, "a permuted stub list must not judge again");
+
+        // Each part of the input, changed alone, judges again.
+        let c = tempfile::tempdir().unwrap();
+        let changed_stub = [kept_stub(c.path(), "svc", "export type A = string;")];
+        judge_once_in(dir, "build1", &changed_stub, &specs, || judge("x")).unwrap();
+        assert_eq!(calls.get(), 3, "a changed stub must be judged");
+        judge_once_in(dir, "build1", &stubs_a, &[one_spec("other")], || judge("x")).unwrap();
+        assert_eq!(calls.get(), 4, "a changed pair set must be judged");
+        judge_once_in(dir, "build2", &stubs_a, &specs, || judge("x")).unwrap();
+        assert_eq!(calls.get(), 5, "another sidecar build must be judged");
+    }
+
+    #[test]
+    fn a_failed_check_is_not_kept_and_no_folder_keeps_nothing() {
+        let kept = tempfile::tempdir().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let a = tempfile::tempdir().unwrap();
+        let stubs = [kept_stub(a.path(), "svc", "export type A = number;")];
+        let specs = [one_spec("k")];
+        for success in [false, false] {
+            judge_once_in(Some(kept.path()), "b", &stubs, &specs, || {
+                calls.set(calls.get() + 1);
+                Ok(answer(success, "5.9"))
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            calls.get(),
+            2,
+            "a check that did not finish is judged again"
+        );
+        for _ in 0..2 {
+            judge_once_in(None, "b", &stubs, &specs, || {
+                calls.set(calls.get() + 1);
+                Ok(answer(true, "5.9"))
+            })
+            .unwrap();
+        }
+        assert_eq!(calls.get(), 4, "with no folder every call judges");
     }
 
     // ---- end-to-end: capture_v2 -> check_v2 -> pair outcomes -> edge join --

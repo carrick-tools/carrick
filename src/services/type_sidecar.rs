@@ -594,7 +594,7 @@ pub struct CaptureV2Result {
 /// than what its handler returns (carrick#1516). That last one never leaves
 /// the scanner as a value: on the wire it is a `compatible` verdict with
 /// `producer_wider: true` beside it.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictBucket {
     Compatible,
@@ -607,7 +607,7 @@ pub enum VerdictBucket {
 }
 
 /// One structured verdict from `check_v2`, keyed by pair identity.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckVerdict {
     /// Deterministic FNV-1a hash of the pair (never a temp path).
     pub pair_id: String,
@@ -1208,14 +1208,14 @@ pub struct LibraryClaimsAnswer {
 }
 
 /// A service whose pairs are degraded wholesale (install failure or poison).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DegradedService {
     pub service_name: String,
     pub reason: String,
 }
 
 /// Result of a `check_v2` action (mirrors `CheckResult`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckV2Result {
     /// `false` when the check failed part way (`errors` says why); every
     /// verdict still stands, each with its own reason.
@@ -1240,7 +1240,7 @@ pub struct CheckV2Result {
 }
 
 /// How the check's compiler process ended (mirrors `CompilerEnd`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilerEnd {
     /// Its exit code, or `None` when a signal ended it.
     pub exit_code: Option<i32>,
@@ -3497,6 +3497,43 @@ impl TypeSidecar {
             })?)
             .map_err(|e| SidecarError::DeserializationError(e.to_string()))?;
         Ok(result.answers)
+    }
+
+    /// Names the sidecar build this process runs: a hash of every script
+    /// file beside its entry. Part of the key a judge answer is kept under,
+    /// so another build never reuses it.
+    pub fn build_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if entry.file_name() != "node_modules" {
+                        walk(&path, out);
+                    }
+                } else if path
+                    .extension()
+                    .is_some_and(|e| matches!(e.to_str(), Some("js" | "mjs" | "cjs" | "json")))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        if let Some(dir) = self.sidecar_path.parent() {
+            walk(dir, &mut files);
+        }
+        files.sort();
+        let mut h = Sha256::new();
+        h.update(self.sidecar_path.to_string_lossy().as_bytes());
+        for file in files {
+            h.update(file.to_string_lossy().as_bytes());
+            h.update(std::fs::read(&file).unwrap_or_default());
+        }
+        format!("{:x}", h.finalize())
     }
 
     /// Run the v2 "tsc as the judge" check over assembled capture stubs.

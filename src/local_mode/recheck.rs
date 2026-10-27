@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use super::index::{build, join_command, read_blobs, repo_label, scan_command, service_id};
 use super::read_model::IndexedItem;
 use super::workspace::Workspace;
+use crate::engine::type_compat_v2::JUDGE_ANSWERS_ENV;
 
 /// How long the whole re-check may take before the caller keeps the indexed
 /// answer instead.
@@ -430,6 +431,9 @@ fn rejoin_held(
     let exe =
         std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
     let blobs = generation.join("repos");
+    // The re-scans and the re-join judge the same stubs and pairs; the folder
+    // is where the first answer waits for the others.
+    let judged = generation.join("judged");
     std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
     let names: std::collections::BTreeSet<String> =
         repos.iter().map(|repo| repo_label(repo)).collect();
@@ -486,7 +490,8 @@ fn rejoin_held(
         )
         .map_err(|e| e.to_string())?;
         let scan_dir = generation.join(format!("scan-{position}"));
-        let scan = rescan_command(&exe, repo, &scan_dir, &previous);
+        let mut scan = rescan_command(&exe, repo, &scan_dir, &previous);
+        scan.env(JUDGE_ANSWERS_ENV, &judged);
         bounded(scan, "re-scan", deadline)?;
         let fresh = read_blobs(&scan_dir)?;
         let carried = super::index::carried_services(repo, &hosted_data, &previous_data, &fresh)?;
@@ -502,6 +507,7 @@ fn rejoin_held(
     let anchor = repos.first().copied().unwrap_or(&workspace.root);
     let out = generation.join("join.json");
     let mut join = join_command(&exe, anchor, &blobs, &out);
+    join.env(JUDGE_ANSWERS_ENV, &judged);
     join.env_remove(crate::progress::PROGRESS_ENV);
     bounded(join, "re-join", deadline)?;
     let text = std::fs::read_to_string(&out)
