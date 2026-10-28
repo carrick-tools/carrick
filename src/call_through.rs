@@ -141,6 +141,10 @@ pub struct CallThroughSites {
     /// that analyses the service, so never stored: a carried service's blob
     /// already holds the rows they stated.
     pub leaves: Vec<LeafCall>,
+    /// The type the compiler states at each leaf call's result, captured in
+    /// the service's own type pass ([`leaf_candidates`]), by the leaf's file
+    /// and span. Like the leaves, never stored.
+    pub leaf_types: HashMap<(String, (u32, u32)), crate::cloud_storage::TypeManifestEntry>,
 }
 
 impl CallThroughSites {
@@ -187,6 +191,8 @@ pub struct LeafCall {
     pub client: String,
     /// The function the call reaches.
     pub callee: LeafCallee,
+    /// The call's span start and end, in the units a row's span carries.
+    pub span: (u32, u32),
 }
 
 /// The function a [`LeafCall`] reaches.
@@ -269,6 +275,7 @@ impl StoredCallThrough {
     pub fn sites(&self) -> CallThroughSites {
         CallThroughSites {
             leaves: Vec::new(),
+            leaf_types: HashMap::new(),
             rows: self.rows.clone(),
             return_shapes: self
                 .return_shapes
@@ -333,11 +340,12 @@ pub fn read_sites(
     inputs: &RequestSummaryInputs,
     repo_path: &str,
     definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
+    leaves: Vec<LeafCall>,
+    leaf_types: HashMap<(String, (u32, u32)), crate::cloud_storage::TypeManifestEntry>,
 ) -> CallThroughSites {
     let root = repo_path.trim_end_matches('/');
     let (side_calls, return_shapes) = read_function_facts(file_results, inputs, root, definitions);
     let lines = definition_lines(definitions, root);
-    let leaves = read_leaves(inputs, root, &lines);
     let mut keys: Vec<&String> = file_results
         .iter()
         .filter(|(_, result)| result.data_calls.iter().any(is_model_row))
@@ -350,6 +358,7 @@ pub fn read_sites(
             return_shapes,
             side_calls,
             leaves,
+            leaf_types,
         };
     }
 
@@ -447,6 +456,7 @@ pub fn read_sites(
         return_shapes,
         side_calls,
         leaves,
+        leaf_types,
     }
 }
 
@@ -483,11 +493,15 @@ fn definition_lines<'d>(
 /// declares, by file and name. A callee of the service whose file and name
 /// more than one definition share names no one definition, and its calls are
 /// left out.
-fn read_leaves(
+///
+/// Read before the service's type pass, so the type at a leaf call can be
+/// asked there ([`leaf_candidates`], carrick#2377).
+pub(crate) fn read_leaves(
     inputs: &RequestSummaryInputs,
     root: &str,
-    lines: &DefinitionLines<'_>,
+    definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
 ) -> Vec<LeafCall> {
+    let lines = definition_lines(definitions, root);
     let mut by_file: BTreeMap<PathBuf, Vec<crate::request_summary::CallIntoFile>> = BTreeMap::new();
     for call in inputs.calls_into_other_files() {
         by_file.entry(call.file.clone()).or_default().push(call);
@@ -552,12 +566,110 @@ fn read_leaves(
                 enclosing_lines,
                 client: name.rsplit('.').next().unwrap_or(name).to_string(),
                 callee,
+                span: (call.span_start, call.span_end),
             });
         }
     }
     leaves.sort();
     leaves.dedup();
     leaves
+}
+
+/// The path prefix of the key a leaf call's result type is asked under in the
+/// service's own type pass. The key joins nothing; it only gives each call an
+/// alias of its own. [`lift_leaf_types`] takes every entry under it out of the
+/// manifest before anything reads the manifest as the index.
+const PENDING_PATH: &str = "/__call_through__/";
+
+/// The key a leaf call at `span` is asked under.
+pub(crate) fn pending_key(span: (u32, u32)) -> OperationKey {
+    OperationKey::http("GET", format!("{PENDING_PATH}{}-{}", span.0, span.1))
+}
+
+/// The span a pending key names, or none for any other key.
+fn pending_span(key: &OperationKey) -> Option<(u32, u32)> {
+    let (_, path) = key.as_http()?;
+    let (start, end) = path.strip_prefix(PENDING_PATH)?.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+/// The leaf calls whose result type is asked in the service's type pass
+/// (carrick#2377): every call straight into a function another service
+/// declares, and every call into a function of the service's own that itself
+/// holds such a call. [`settle`] states a row at a call of either kind, and at
+/// a corrected row's callback or spread, so it can adopt what is asked here.
+/// The type pass runs before [`settle`], when no row exists to anchor a type
+/// at, so the call is asked for its own.
+///
+/// A call into a function no service of the run owns (`owned_elsewhere`
+/// says no, for a repository-relative file) is no candidate: [`settle`]
+/// states nothing there, and a question asked there would leave an alias no
+/// row adopts in the service's bundle and stub.
+pub(crate) fn leaf_candidates<'a>(
+    leaves: &'a [LeafCall],
+    definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
+    root: &str,
+    owned_elsewhere: &dyn Fn(&str) -> bool,
+) -> Vec<&'a LeafCall> {
+    let sibling_asked = |leaf: &LeafCall| match &leaf.callee {
+        LeafCallee::Sibling { file, .. } => owned_elsewhere(file),
+        LeafCallee::Own(_) => false,
+    };
+    let boundary: Vec<(&str, u32)> = leaves
+        .iter()
+        .filter(|leaf| sibling_asked(leaf))
+        .map(|leaf| (leaf.file.as_str(), leaf.line))
+        .collect();
+    let ends: HashMap<DefinitionSite, u32> = definitions
+        .values()
+        .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
+        .map(|definition| {
+            (
+                DefinitionSite {
+                    file: crate::engine::repo_relative(
+                        &definition.file_path.to_string_lossy(),
+                        root,
+                    ),
+                    line: definition.line_number,
+                },
+                definition.end_line.max(definition.line_number),
+            )
+        })
+        .collect();
+    leaves
+        .iter()
+        .filter(|leaf| match &leaf.callee {
+            LeafCallee::Sibling { .. } => sibling_asked(leaf),
+            LeafCallee::Own(callee) => ends.get(callee).is_some_and(|end| {
+                boundary
+                    .iter()
+                    .any(|(file, line)| *file == callee.file && callee.line <= *line && line <= end)
+            }),
+        })
+        .collect()
+}
+
+/// Take the pending entries ([`pending_key`]) out of a service's manifest,
+/// by the file and span of the leaf call each was asked at. What is left is
+/// the manifest the index serves, so no pending key or alias reaches a blob.
+pub(crate) fn lift_leaf_types(
+    manifest: &mut Option<Vec<crate::cloud_storage::TypeManifestEntry>>,
+) -> HashMap<(String, (u32, u32)), crate::cloud_storage::TypeManifestEntry> {
+    let Some(entries) = manifest.take() else {
+        return HashMap::new();
+    };
+    let mut lifted = HashMap::new();
+    let mut kept = Vec::new();
+    for entry in entries {
+        match pending_span(&entry.key) {
+            Some(span) => {
+                lifted.insert((entry.file_path.clone(), span), entry);
+            }
+            None => kept.push(entry),
+        }
+    }
+    *manifest = (!kept.is_empty()).then_some(kept);
+    lifted
 }
 
 /// Every resolved call of the service whose value is not handed back by the
@@ -1314,6 +1426,26 @@ pub struct Settled {
     /// Rows withdrawn at a client wrapper's call once a leaf row states the
     /// request at its caller ([`withdraw_wrapped`]).
     pub wrapper_rows_withdrawn: usize,
+    /// What became of the type asked at each leaf call a row was stated or
+    /// corrected through ([`LeafTypes`], carrick#2377).
+    pub leaf_types: LeafTypes,
+}
+
+/// What [`settle`] did with the result type the service's type pass asked at
+/// a leaf call ([`leaf_candidates`]), each time a row was stated or corrected
+/// through that call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LeafTypes {
+    /// Adopted: the row took the type the call's result has.
+    pub carried: usize,
+    /// Left out: the chain from the call's callee does not hand back the
+    /// request's body, read exactly one step off the transport's value.
+    pub unproven: usize,
+    /// Left out: the chain hands back the body but the type is a bare top
+    /// type, or the pass could not state one.
+    pub unknown: usize,
+    /// Left out: the type pass asked nothing at the call.
+    pub uncaptured: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -1337,6 +1469,13 @@ pub struct Settled {
 /// builds a value around the body, reads it twice, or passes it through
 /// another function) the anchor names a function's own result, and the
 /// entries are dropped and counted.
+///
+/// A row stated at a leaf call, or corrected through one at its spread or
+/// callback step, takes instead the type the service's type pass asked at
+/// that call's result ([`leaf_candidates`], [`CallThroughSites::leaf_types`]),
+/// by the same body test applied from the leaf's callee. A corrected row
+/// whose call is the one that reaches the request keeps the type it holds of
+/// its own where that type says something.
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     let mut graph = ReachGraph::of(services.iter().map(|service| &*service.data));
     let sites: Vec<&CallThroughSites> = services.iter().map(|service| service.sites).collect();
@@ -1380,40 +1519,65 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     left("reaches a request only the model states");
                     settled.reaches_unstated += 1;
                 }
-                Reach::One { request, step } => match apply(
-                    service.data,
-                    row,
-                    request,
-                    // What the row's call returns is the request's body only
-                    // where its own callee decided and every definition that
-                    // callee goes through hands back that body, read one way
-                    // (carrick#2377).
-                    step == 0
-                        && row.steps.first().is_some_and(|callee| {
-                            let operation = operation_of(request);
-                            !callee.is_empty()
-                                && callee
-                                    .iter()
-                                    .all(|definition| graph.hands_back_body(definition, &operation))
-                        }),
-                ) {
-                    Some(Change::Relabelled) => settled.relabelled += 1,
-                    Some(Change::Corrected {
-                        types_dropped,
-                        types_unknown,
-                        request_dropped,
-                    }) => {
-                        corrected += 1;
-                        settled.types_not_carried += usize::from(types_dropped);
-                        settled.types_unknown += usize::from(types_unknown);
-                        settled.requests_not_carried += usize::from(request_dropped);
+                Reach::One { request, step } => {
+                    // The type the service's type pass asked at the one leaf
+                    // call the row's chain goes through, when that chain
+                    // hands back the request's body (carrick#2377).
+                    let mut left_out = LeafTypes::default();
+                    let leaf_entry = row_leaf_entry(
+                        service.sites,
+                        &siblings,
+                        &graph,
+                        row,
+                        step,
+                        request,
+                        &mut left_out,
+                    );
+                    match apply(
+                        service.data,
+                        row,
+                        request,
+                        // What the row's call returns is the request's body
+                        // only where its own callee decided and every
+                        // definition that callee goes through hands back that
+                        // body, read one way (carrick#2377).
+                        step == 0
+                            && row.steps.first().is_some_and(|callee| {
+                                let operation = operation_of(request);
+                                !callee.is_empty()
+                                    && callee.iter().all(|definition| {
+                                        graph.hands_back_body(definition, &operation)
+                                    })
+                            }),
+                        leaf_entry,
+                    ) {
+                        Some(Change::Relabelled) => settled.relabelled += 1,
+                        Some(Change::Corrected {
+                            types_dropped,
+                            types_unknown,
+                            request_dropped,
+                            leaf_type,
+                        }) => {
+                            corrected += 1;
+                            settled.types_not_carried += usize::from(types_dropped);
+                            settled.types_unknown += usize::from(types_unknown);
+                            settled.requests_not_carried += usize::from(request_dropped);
+                            settled.leaf_types.carried += usize::from(leaf_type);
+                            settled.leaf_types.unproven += left_out.unproven;
+                            settled.leaf_types.unknown += left_out.unknown;
+                            settled.leaf_types.uncaptured += left_out.uncaptured;
+                        }
+                        None => {}
                     }
-                    None => {}
-                },
+                }
             }
         }
         settled.corrected += corrected;
         let stated = state_leaves(service, index, &owners, &siblings, &graph, &mut decider);
+        settled.leaf_types.carried += stated.types.carried;
+        settled.leaf_types.unproven += stated.types.unproven;
+        settled.leaf_types.unknown += stated.types.unknown;
+        settled.leaf_types.uncaptured += stated.types.uncaptured;
         settled.leaf_rows += stated.own + stated.boundary;
         settled.boundary_rows += stated.boundary;
         settled.boundary_in_wrapper += stated.in_wrapper;
@@ -1445,6 +1609,13 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.boundary_in_wrapper,
         settled.boundary_third_service,
         settled.boundary_unresolved
+    );
+    debug!(
+        "Call-through leaf types (carrick#2377): {} adopted from the call's own result, {} left out because the chain does not hand back the request's body, {} left out because the type is unknown, {} left out because the type pass asked nothing at the call",
+        settled.leaf_types.carried,
+        settled.leaf_types.unproven,
+        settled.leaf_types.unknown,
+        settled.leaf_types.uncaptured
     );
     debug!(
         "Call-through wrapper rows withdrawn: {} at a client wrapper's call into another service, whose caller's leaf row now states the request (carrick#2618)",
@@ -1537,6 +1708,8 @@ struct LeafOutcome {
     unresolved: usize,
     /// Fact rows withdrawn at a client wrapper's call ([`withdraw_wrapped`]).
     withdrawn: usize,
+    /// What became of the types asked at the leaf calls a row was stated at.
+    types: LeafTypes,
 }
 
 /// State a row at each of `service`'s leaf calls ([`LeafCall`]) that holds no
@@ -1652,7 +1825,14 @@ fn state_leaves<'g>(
         if !written.insert((format!("{}:{}", leaf.file, leaf.line), operation)) {
             continue;
         }
-        if state_leaf(service.data, leaf, request) {
+        let mut left_out = LeafTypes::default();
+        let entry = leaf_entry(service.sites, graph, leaf, callee, request, &mut left_out);
+        let has_entry = entry.is_some();
+        if state_leaf(service.data, leaf, request, entry) {
+            outcome.types.carried += usize::from(has_entry);
+            outcome.types.unproven += left_out.unproven;
+            outcome.types.unknown += left_out.unknown;
+            outcome.types.uncaptured += left_out.uncaptured;
             outcome.own += 1;
             through.push((
                 callee.clone(),
@@ -1741,7 +1921,14 @@ fn state_leaves<'g>(
         if !written.insert((at, operation)) {
             continue;
         }
-        if state_leaf(service.data, leaf, request) {
+        let mut left_out = LeafTypes::default();
+        let entry = leaf_entry(service.sites, graph, leaf, &callee, request, &mut left_out);
+        let has_entry = entry.is_some();
+        if state_leaf(service.data, leaf, request, entry) {
+            outcome.types.carried += usize::from(has_entry);
+            outcome.types.unproven += left_out.unproven;
+            outcome.types.unknown += left_out.unknown;
+            outcome.types.uncaptured += left_out.uncaptured;
             outcome.boundary += 1;
         }
     }
@@ -1917,8 +2104,84 @@ fn serves_own_route(graph: &crate::mount_graph::MountGraph, reached: &Reached) -
         })
 }
 
-/// Write the row `leaf` states for `reached` into the graph and the calls.
-fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> bool {
+/// The definition a leaf call reaches, for a boundary call by the one
+/// definition its file and name name in any service.
+fn leaf_callee(leaf: &LeafCall, siblings: &SiblingLines) -> Option<DefinitionSite> {
+    match &leaf.callee {
+        LeafCallee::Own(callee) => Some(callee.clone()),
+        LeafCallee::Sibling { file, name } => siblings.resolve(file, name),
+    }
+}
+
+/// The type the service's type pass asked at `leaf`'s result (carrick#2377),
+/// rekeyed to the operation `request` states, when the row stated at the call
+/// can take it: the chain from the call's callee hands back the request's
+/// body, and the type says something. What it leaves out is counted in
+/// `left_out`.
+fn leaf_entry(
+    sites: &CallThroughSites,
+    graph: &ReachGraph,
+    leaf: &LeafCall,
+    callee: &DefinitionSite,
+    request: &Reached,
+    left_out: &mut LeafTypes,
+) -> Option<crate::cloud_storage::TypeManifestEntry> {
+    let Some(asked) = sites.leaf_types.get(&(leaf.file.clone(), leaf.span)) else {
+        left_out.uncaptured += 1;
+        return None;
+    };
+    if !graph.hands_back_body(callee, &operation_of(request)) {
+        left_out.unproven += 1;
+        return None;
+    }
+    if is_bare_top_type(asked) {
+        left_out.unknown += 1;
+        return None;
+    }
+    let mut entry = asked.clone();
+    entry.key = OperationKey::http(
+        &normalize_manifest_method(&request.method),
+        request.canonical_path.clone(),
+    );
+    Some(entry)
+}
+
+/// The type asked at the one leaf call of the row's service that the row's
+/// chain goes through at `step`: on the row's own line, or inside the call
+/// the row sits on, and reaching a definition that step names. None where no
+/// leaf, or more than one, is that call.
+fn row_leaf_entry(
+    sites: &CallThroughSites,
+    siblings: &SiblingLines,
+    graph: &ReachGraph,
+    row: &SiteRow,
+    step: usize,
+    request: &Reached,
+    left_out: &mut LeafTypes,
+) -> Option<crate::cloud_storage::TypeManifestEntry> {
+    let reached = row.steps.get(step)?;
+    let mut matching = sites.leaves.iter().filter_map(|leaf| {
+        let callee = leaf_callee(leaf, siblings)?;
+        let on_the_row = leaf.file == row.file
+            && (leaf.line == row.line || (step > 0 && leaf.enclosing_lines.contains(&row.line)));
+        (on_the_row && reached.contains(&callee)).then_some((leaf, callee))
+    });
+    let (leaf, callee) = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    leaf_entry(sites, graph, leaf, &callee, request, left_out)
+}
+
+/// Write the row `leaf` states for `reached` into the graph and the calls,
+/// with the type entry the call's result carries (`entry`) when the chain
+/// hands the request's body back through it.
+fn state_leaf(
+    data: &mut CloudRepoData,
+    leaf: &LeafCall,
+    reached: &Reached,
+    entry: Option<crate::cloud_storage::TypeManifestEntry>,
+) -> bool {
     let Some(graph) = data.mount_graph.as_mut() else {
         return false;
     };
@@ -1949,6 +2212,9 @@ fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> b
     );
     data.calls.push(crate::cloud_storage::call_details(&call));
     graph.data_calls.push(call);
+    if let Some(entry) = entry {
+        data.type_manifest.get_or_insert_with(Vec::new).push(entry);
+    }
     true
 }
 
@@ -2688,13 +2954,19 @@ enum Change {
         /// The row kept its response entry and its request entry was
         /// dropped: a call's arguments are not a request body.
         request_dropped: bool,
+        /// The row took the type the type pass asked at the leaf call its
+        /// chain goes through, in place of every entry it held.
+        leaf_type: bool,
     },
 }
 
 /// Change the one row of `data` that `row` names to what `reached` states.
 /// `carries_response`: the chain from the row's call hands back the request's
 /// body ([`ReachGraph::hands_back_body`]), so the response type anchored there
-/// is the request's. `None`
+/// is the request's. `leaf_entry` is the type the type pass asked at the one
+/// leaf call the row's chain goes through, when that chain hands back the
+/// request's body (carrick#2377): a corrected row takes it in place of every
+/// entry it held. `None`
 /// when the blob holds no such row: the graph build keeps fewer rows than the
 /// analysis stated.
 fn apply(
@@ -2702,6 +2974,7 @@ fn apply(
     row: &SiteRow,
     reached: &Reached,
     carries_response: bool,
+    leaf_entry: Option<crate::cloud_storage::TypeManifestEntry>,
 ) -> Option<Change> {
     let location = format!("{}:{}", row.file, row.line);
     let graph = data.mount_graph.as_mut()?;
@@ -2762,15 +3035,28 @@ fn apply(
     // A chain that hands back the body but whose type the compiler could not
     // say (the helper's `T` is never given) is a bare top type: judged, it
     // makes its pair unverifiable, so the entry goes (carrick#2377).
-    let types_unknown = carries_response && !twin && {
+    let (held_responses, held_says_something) = {
         let responses: Vec<&crate::cloud_storage::TypeManifestEntry> = data
             .type_manifest
             .iter()
             .flatten()
             .filter(|entry| at_the_row(entry) && entry.type_kind == ManifestTypeKind::Response)
             .collect();
-        !responses.is_empty() && responses.iter().all(|entry| is_bare_top_type(entry))
+        (
+            responses.len(),
+            responses.iter().any(|entry| !is_bare_top_type(entry)),
+        )
     };
+    // The row's own response type is what the model anchored at the call, a
+    // symbol the caller names. Where the call is the one that reaches the
+    // request and that type says something, it stays as the call's type;
+    // the type asked at the call stands in only where the row holds none.
+    let adopted = leaf_entry.filter(|_| !twin && !(carries_response && held_says_something));
+    let types_unknown = adopted.is_none()
+        && carries_response
+        && !twin
+        && held_responses > 0
+        && !held_says_something;
     let carries_response = carries_response && !types_unknown;
     if twin {
         graph.data_calls.remove(index);
@@ -2803,7 +3089,7 @@ fn apply(
             operation.key = OperationKey::http(&reached.method, reached.canonical_path.clone());
             operation.dispatch = reached.dispatch.clone();
             operation.resolution_source = Some(ResolutionSource::RequestSummary);
-            if !carries_response {
+            if !carries_response || adopted.is_some() {
                 operation.request_type = None;
                 operation.response_type = None;
             }
@@ -2821,7 +3107,20 @@ fn apply(
     // they go.
     let mut types_dropped = false;
     let mut request_dropped = false;
-    if let Some(manifest) = data.type_manifest.as_mut() {
+    let leaf_type = adopted.is_some();
+    if let Some(mut entry) = adopted {
+        // The type the call's result has, asked in the type pass, replaces
+        // what the row held: the model's annotation names what the caller
+        // reads, not what the callee hands back. It sits at the row's line,
+        // which is the leaf call's own or the line of the call around it.
+        entry.line_number = row.line;
+        let manifest = data.type_manifest.get_or_insert_with(Vec::new);
+        request_dropped = manifest
+            .iter()
+            .any(|held| at_the_row(held) && held.type_kind == ManifestTypeKind::Request);
+        manifest.retain(|held| !at_the_row(held));
+        manifest.push(entry);
+    } else if let Some(manifest) = data.type_manifest.as_mut() {
         if carries_response && !twin {
             let carried = OperationKey::http(
                 &normalize_manifest_method(&reached.method),
@@ -2848,7 +3147,9 @@ fn apply(
     }
     debug!(
         "  - {location}: consumer types {}",
-        if types_unknown {
+        if leaf_type {
+            "the type of the call's own result, the chain hands back the request's body"
+        } else if types_unknown {
             "dropped, the chain hands back the body but the type is unknown"
         } else if carries_response && !twin {
             "kept, the chain hands back the request's body"
@@ -2862,6 +3163,7 @@ fn apply(
         types_dropped,
         types_unknown,
         request_dropped,
+        leaf_type,
     })
 }
 
@@ -2972,6 +3274,7 @@ mod tests {
                 return_shapes: order.iter().map(|&i| shapes[i].clone()).collect(),
                 side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
                 leaves: Vec::new(),
+                leaf_types: HashMap::new(),
             }
         };
         let sites = facts(&[0, 1]);
@@ -3375,6 +3678,7 @@ mod tests {
                 file: file.to_string(),
                 name: name.to_string(),
             },
+            span: (30, 40),
         }
     }
 
@@ -3460,6 +3764,215 @@ mod tests {
             (settled.boundary_rows, settled.boundary_unresolved, rows),
             (0, 1, 0),
             "{settled:?}"
+        );
+    }
+
+    /// Settle `settle_boundary`'s services where `send` returns a `kind` of
+    /// its request, and the type pass asked `asked` at the boundary call
+    /// (carrick#2377). Returns what was settled and the manifest `web` holds.
+    fn settle_leaf_type(
+        kind: ShapeKind,
+        asked: Option<crate::cloud_storage::TypeManifestEntry>,
+    ) -> (Settled, Vec<crate::cloud_storage::TypeManifestEntry>) {
+        let mut web = blob("web");
+        put(&mut web, function("run", "web/a.ts", 1, 5, None));
+        let mut lib = blob("lib");
+        put(
+            &mut lib,
+            function("load", "lib/q.ts", 1, 3, Some(("lib/r.ts", 1, 2))),
+        );
+        put(&mut lib, function("send", "lib/r.ts", 1, 3, None));
+        lib.mount_graph
+            .as_mut()
+            .unwrap()
+            .data_calls
+            .push(request_at("lib/r.ts", 2));
+        let web_sites = CallThroughSites {
+            leaves: vec![boundary_leaf("lib/q.ts", "load")],
+            leaf_types: asked
+                .into_iter()
+                .map(|entry| (("web/a.ts".to_string(), (30, 40)), entry))
+                .collect(),
+            ..Default::default()
+        };
+        let lib_sites = CallThroughSites {
+            return_shapes: HashMap::from([
+                shaped(("lib/q.ts", 1), ShapeKind::Value, 2, 2),
+                shaped(("lib/r.ts", 1), kind, 2, 2),
+            ]),
+            ..Default::default()
+        };
+        let settled = settle(&mut [
+            ServiceRows {
+                data: &mut web,
+                sites: &web_sites,
+                writable: true,
+            },
+            ServiceRows {
+                data: &mut lib,
+                sites: &lib_sites,
+                writable: true,
+            },
+        ]);
+        (settled, web.type_manifest.unwrap_or_default())
+    }
+
+    /// carrick#2377: a row stated at a call whose chain hands back the
+    /// request's body takes the type the type pass asked at that call, keyed
+    /// to the operation the row states and sitting at the row's line.
+    #[test]
+    fn a_leaf_row_adopts_the_type_asked_at_its_call_where_the_chain_hands_back_the_body() {
+        let (settled, manifest) = settle_leaf_type(
+            ShapeKind::Parsed,
+            Some(entry_typed("implicit", Some("Run"))),
+        );
+        assert_eq!(settled.boundary_rows, 1, "{settled:?}");
+        assert_eq!(
+            settled.leaf_types,
+            LeafTypes {
+                carried: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(manifest.len(), 1, "{manifest:#?}");
+        assert_eq!(manifest[0].resolved_definition.as_deref(), Some("Run"));
+        assert_eq!(
+            manifest[0].key,
+            OperationKey::http("GET", "/things".to_string())
+        );
+        assert_eq!(manifest[0].line_number, 3);
+    }
+
+    /// A member read of a library client's result is never the body (slice 1's
+    /// rule), so the row is stated and takes no type.
+    #[test]
+    fn a_leaf_row_takes_no_type_where_the_chain_reads_a_member() {
+        let (settled, manifest) = settle_leaf_type(
+            ShapeKind::Member,
+            Some(entry_typed("implicit", Some("Run"))),
+        );
+        assert_eq!(settled.boundary_rows, 1, "{settled:?}");
+        assert_eq!(
+            settled.leaf_types,
+            LeafTypes {
+                unproven: 1,
+                ..Default::default()
+            }
+        );
+        assert!(manifest.is_empty(), "{manifest:#?}");
+    }
+
+    #[test]
+    fn a_leaf_row_takes_no_type_that_is_a_bare_top_type_or_was_never_asked() {
+        let (settled, manifest) = settle_leaf_type(
+            ShapeKind::Parsed,
+            Some(entry_typed("implicit", Some("any"))),
+        );
+        assert_eq!(
+            settled.leaf_types,
+            LeafTypes {
+                unknown: 1,
+                ..Default::default()
+            }
+        );
+        assert!(manifest.is_empty(), "{manifest:#?}");
+        let (settled, manifest) = settle_leaf_type(ShapeKind::Parsed, None);
+        assert_eq!(
+            settled.leaf_types,
+            LeafTypes {
+                uncaptured: 1,
+                ..Default::default()
+            }
+        );
+        assert!(manifest.is_empty(), "{manifest:#?}");
+    }
+
+    fn own_leaf(line: u32, callee: DefinitionSite) -> LeafCall {
+        LeafCall {
+            file: "web/a.ts".to_string(),
+            line,
+            last_line: line,
+            enclosing_lines: Vec::new(),
+            client: "call".to_string(),
+            callee: LeafCallee::Own(callee),
+            span: (line * 10, line * 10 + 5),
+        }
+    }
+
+    /// The type pass asks at a call into another service's function, and at a
+    /// call into a function of the service's own that holds such a call.
+    /// Anywhere else `settle` states no row, so nothing is asked.
+    #[test]
+    fn the_type_pass_asks_only_at_calls_a_row_may_be_stated_at() {
+        let mut definitions = HashMap::new();
+        for definition in [
+            function("wrapper", "/repo/web/b.ts", 1, 9, None),
+            function("plain", "/repo/web/b.ts", 11, 15, None),
+        ] {
+            put_in(&mut definitions, definition);
+        }
+        let leaves = vec![
+            // Inside `wrapper`: the boundary call.
+            LeafCall {
+                file: "web/b.ts".to_string(),
+                ..boundary_leaf("lib/q.ts", "load")
+            },
+            own_leaf(5, definition("web/b.ts", 1)),
+            own_leaf(6, definition("web/b.ts", 11)),
+        ];
+        let asked = leaf_candidates(&leaves, &definitions, "/repo", &|file| file == "lib/q.ts");
+        assert_eq!(
+            asked.iter().map(|leaf| leaf.line).collect::<Vec<_>>(),
+            [3, 5],
+            "the boundary call and the call of the function that holds it"
+        );
+        // No service of the run owns the function called: nothing is asked,
+        // at the call or at the calls of the function that holds it.
+        let asked = leaf_candidates(&leaves, &definitions, "/repo", &|_| false);
+        assert!(asked.is_empty(), "{asked:?}");
+    }
+
+    fn put_in(
+        definitions: &mut HashMap<String, crate::visitor::FunctionDefinition>,
+        definition: crate::visitor::FunctionDefinition,
+    ) {
+        let key = format!(
+            "{}:{}",
+            definition.file_path.display(),
+            definition.line_number
+        );
+        definitions.insert(key, definition);
+    }
+
+    /// No pending key or alias is left in the manifest after the lift: the
+    /// entries are keyed by the file and span of the call they were asked at.
+    #[test]
+    fn lifting_the_pending_entries_leaves_the_manifest_the_index_serves() {
+        let mut pending = entry_typed("implicit", Some("Run"));
+        pending.key = pending_key((30, 40));
+        let mut served = entry_typed("implicit", Some("Run"));
+        served.type_alias = "Served".to_string();
+        let mut manifest = Some(vec![served.clone(), pending]);
+        let lifted = lift_leaf_types(&mut manifest);
+        assert_eq!(
+            manifest
+                .iter()
+                .flatten()
+                .map(|entry| entry.type_alias.as_str())
+                .collect::<Vec<_>>(),
+            ["Served"]
+        );
+        assert_eq!(
+            lifted.keys().collect::<Vec<_>>(),
+            [&("a.ts".to_string(), (30, 40))]
+        );
+        let mut only_pending = entry_typed("unknown", None);
+        only_pending.key = pending_key((1, 2));
+        let mut manifest = Some(vec![only_pending]);
+        lift_leaf_types(&mut manifest);
+        assert!(
+            manifest.is_none(),
+            "an emptied manifest is none, as a scan with no entries"
         );
     }
 
@@ -3840,6 +4353,7 @@ mod tests {
             enclosing_lines: Vec::new(),
             client: client.to_string(),
             callee: LeafCallee::Own(definition("services/app/src/api.ts", callee)),
+            span: (line * 10, line * 10 + 5),
         };
         let app_sites = CallThroughSites {
             leaves: vec![leaf(6, 5, "api.get"), leaf(11, 9, "api.status")],

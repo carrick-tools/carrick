@@ -54,3 +54,17 @@ export async function existsTyped(id: string) {
   const exists = await runExists(id);
   return exists;
 }
+
+/** No row from the model. The client member returns a function's parsed `fetch`, and says so. */
+export async function readStated(id: string) {
+  const client = createTypedClient();
+  const run = await client.read(id);
+  return run;
+}
+
+/** No row from the model. The client member reads a member of a spec's result. */
+export async function getStated(id: string) {
+  const client = createTypedClient();
+  const run = await client.getRun(id);
+  return run;
+}

@@ -4343,6 +4343,28 @@ async fn analyze_current_repo_incremental(
                 cloud_data.type_manifest.as_deref().unwrap_or_default(),
                 repo_path,
             );
+            // The result type of each call `call_through::settle` may state a
+            // row at, asked here because no row exists to anchor it at yet
+            // (carrick#2377). After the site payloads, which never see it.
+            let leaves = crate::call_through::read_leaves(
+                &request_inputs,
+                repo_path,
+                &cloud_data.function_definitions,
+            );
+            protocol_infer.extend(append_leaf_capture(
+                &mut cloud_data.type_manifest,
+                &crate::call_through::leaf_candidates(
+                    &leaves,
+                    &cloud_data.function_definitions,
+                    repo_path,
+                    &|file| {
+                        neighbours.is_some_and(|run| {
+                            run.owned_elsewhere(&Path::new(repo_path).join(file))
+                        })
+                    },
+                ),
+                repo_path,
+            ));
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -4388,6 +4410,9 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 &served_paths::PathScrub::for_scan(repo_path),
             );
+            // The types asked at the leaf calls leave the manifest here: what
+            // follows reads it as the index. `settle` adopts them.
+            let leaf_types = crate::call_through::lift_leaf_types(&mut cloud_data.type_manifest);
             let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
             debug!("Handler spans placed on endpoint rows: {placed}");
 
@@ -4425,6 +4450,8 @@ async fn analyze_current_repo_incremental(
                 &request_inputs,
                 repo_path,
                 &cloud_data.function_definitions,
+                leaves,
+                leaf_types,
             );
             return Ok(ServiceAnalysis {
                 data: cloud_data,
@@ -4481,6 +4508,7 @@ async fn analyze_current_repo_incremental(
         run_intents,
         graphql_schemas,
         &siblings,
+        neighbours,
     )
     .await?;
 
@@ -7628,34 +7656,39 @@ fn apply_site_fold_to_manifest(
     }
 }
 
-/// The type requests for the site rows the fold stated (carrick#2472 C3),
-/// each at its record's anchor by span: a send's payload expression, an
-/// HTTP request's result at its call, and a handler's first parameter. A
-/// row whose record has no such anchor asks nothing for that type; an HTTP
-/// route's handler is not asked (its request and response are read off the
-/// route, not the parameter).
-fn site_infer_requests(
-    fold: &crate::site_rows::SiteFold,
-    repo_path: &str,
-) -> Vec<crate::services::type_sidecar::InferRequestItem> {
-    use crate::services::type_sidecar::InferRequestItem;
-    use crate::site_rows::RowSide;
-    let root = Path::new(repo_path);
-    // The anchors' spans are SWC's (bytes from `SWC_SPAN_BASE`); the sidecar
-    // locates in TypeScript positions (UTF-16 units from 0), as
-    // `collect_type_requests` converts them (carrick#806, carrick#2604). One
-    // offset table per file; an unreadable file is read as ASCII, as the
-    // base subtraction alone.
-    let tables: std::cell::RefCell<HashMap<String, Option<crate::utils::Utf16Offsets>>> =
-        std::cell::RefCell::new(HashMap::new());
-    let at = |anchor: &crate::request_summary::site_record::AnchorAt,
-              infer_kind: InferKind,
-              alias: String,
-              param_name: Option<String>| {
-        let path = root.join(&anchor.file);
-        let mut tables = tables.borrow_mut();
+/// Builds infer requests located by an SWC span. The spans are SWC's (bytes
+/// from `SWC_SPAN_BASE`); the sidecar locates in TypeScript positions (UTF-16
+/// units from 0), as `collect_type_requests` converts them (carrick#806,
+/// carrick#2604). One offset table per file; an unreadable file is read as
+/// ASCII, as the base subtraction alone.
+struct SpanLocator<'a> {
+    root: &'a Path,
+    tables: std::cell::RefCell<HashMap<String, Option<crate::utils::Utf16Offsets>>>,
+}
+
+impl<'a> SpanLocator<'a> {
+    fn new(repo_path: &'a str) -> Self {
+        Self {
+            root: Path::new(repo_path),
+            tables: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The request for the expression `span` names in `file` (relative to
+    /// the repository), asked under `alias`.
+    fn item(
+        &self,
+        file: &str,
+        line: u32,
+        span: (u32, u32),
+        infer_kind: InferKind,
+        alias: String,
+        param_name: Option<String>,
+    ) -> crate::services::type_sidecar::InferRequestItem {
+        let path = self.root.join(file);
+        let mut tables = self.tables.borrow_mut();
         let table = tables
-            .entry(anchor.file.clone())
+            .entry(file.to_string())
             .or_insert_with(|| {
                 std::fs::read_to_string(&path)
                     .ok()
@@ -7666,19 +7699,91 @@ fn site_infer_requests(
             Some(table) => table.position(span),
             None => span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE),
         };
-        InferRequestItem {
+        crate::services::type_sidecar::InferRequestItem {
             member: None,
             result: None,
             file_path: path.to_string_lossy().into_owned(),
-            line_number: anchor.line,
-            span_start: Some(position(anchor.span_start)),
-            span_end: Some(position(anchor.span_end)),
+            line_number: line,
+            span_start: Some(position(span.0)),
+            span_end: Some(position(span.1)),
             expression_text: None,
             expression_line: None,
             infer_kind,
             alias: Some(alias),
             param_name,
         }
+    }
+}
+
+/// Ask the result type of each leaf call [`crate::call_through::settle`] may
+/// state a row at or correct one through (carrick#2377), under a pending key
+/// of its own. The type pass runs before `settle`, when no row exists to
+/// anchor a type at; the entries it fills are lifted off the manifest after
+/// the pass ([`crate::call_through::lift_leaf_types`]), so none is served.
+/// Returns the infer requests that locate each call.
+fn append_leaf_capture(
+    manifest: &mut Option<Vec<TypeManifestEntry>>,
+    candidates: &[&crate::call_through::LeafCall],
+    repo_path: &str,
+) -> Vec<crate::services::type_sidecar::InferRequestItem> {
+    let locator = SpanLocator::new(repo_path);
+    let mut requests = Vec::new();
+    for leaf in candidates {
+        let key = crate::call_through::pending_key(leaf.span);
+        let file = Path::new(repo_path)
+            .join(&leaf.file)
+            .to_string_lossy()
+            .into_owned();
+        let site_id = build_site_id(&file, leaf.line, &key, repo_path);
+        let mut pair = Vec::new();
+        add_manifest_pair(
+            &mut pair,
+            key.clone(),
+            ManifestRole::Consumer,
+            &file,
+            leaf.line,
+            Some(&site_id),
+        );
+        pair.retain(|entry| entry.type_kind == ManifestTypeKind::Response);
+        for entry in &pair {
+            requests.push(locator.item(
+                &leaf.file,
+                leaf.line,
+                leaf.span,
+                InferKind::CallResult,
+                entry.type_alias.clone(),
+                None,
+            ));
+        }
+        manifest.get_or_insert_with(Vec::new).extend(pair);
+    }
+    requests
+}
+
+/// The type requests for the site rows the fold stated (carrick#2472 C3),
+/// each at its record's anchor by span: a send's payload expression, an
+/// HTTP request's result at its call, and a handler's first parameter. A
+/// row whose record has no such anchor asks nothing for that type; an HTTP
+/// route's handler is not asked (its request and response are read off the
+/// route, not the parameter).
+fn site_infer_requests(
+    fold: &crate::site_rows::SiteFold,
+    repo_path: &str,
+) -> Vec<crate::services::type_sidecar::InferRequestItem> {
+    use crate::site_rows::RowSide;
+    let locator = SpanLocator::new(repo_path);
+    let at = |anchor: &crate::request_summary::site_record::AnchorAt,
+              infer_kind: InferKind,
+              alias: String,
+              param_name: Option<String>| {
+        locator.item(
+            &anchor.file,
+            anchor.line,
+            (anchor.span_start, anchor.span_end),
+            infer_kind,
+            alias,
+            param_name,
+        )
     };
     let mut requests = Vec::new();
     for row in &fold.stated {
@@ -11078,6 +11183,7 @@ async fn analyze_current_repo(
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
     siblings: &siblings::Siblings,
+    neighbours: Option<siblings::Neighbours<'_>>,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     debug!("Running multi-agent analysis on: {}", repo_path);
 
@@ -11454,6 +11560,26 @@ async fn analyze_current_repo(
         cloud_data.type_manifest.as_deref().unwrap_or_default(),
         repo_path,
     );
+    // The result type of each call `call_through::settle` may state a row at,
+    // asked here because no row exists to anchor it at yet (carrick#2377).
+    // After the site payloads, which never see it.
+    let leaves = crate::call_through::read_leaves(
+        &request_inputs,
+        repo_path,
+        &cloud_data.function_definitions,
+    );
+    protocol_infer.extend(append_leaf_capture(
+        &mut cloud_data.type_manifest,
+        &crate::call_through::leaf_candidates(
+            &leaves,
+            &cloud_data.function_definitions,
+            repo_path,
+            &|file| {
+                neighbours.is_some_and(|run| run.owned_elsewhere(&Path::new(repo_path).join(file)))
+            },
+        ),
+        repo_path,
+    ));
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -11528,6 +11654,9 @@ async fn analyze_current_repo(
         repo_path,
         &served_paths::PathScrub::for_scan(repo_path),
     );
+    // The types asked at the leaf calls leave the manifest here: what follows
+    // reads it as the index. `settle` adopts them.
+    let leaf_types = crate::call_through::lift_leaf_types(&mut cloud_data.type_manifest);
     // Each route's handler function, placed once paths are relative so a row's
     // file and a definition's file compare (cloud#948).
     let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
@@ -11551,6 +11680,8 @@ async fn analyze_current_repo(
         &request_inputs,
         repo_path,
         &cloud_data.function_definitions,
+        leaves,
+        leaf_types,
     );
     Ok(ServiceAnalysis {
         data: cloud_data,

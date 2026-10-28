@@ -23,6 +23,7 @@ const COMMANDS: &str = "packages/cli/src/commands.ts";
 const TYPED_COMMANDS: &str = "packages/cli/src/typed-commands.ts";
 const TYPED: &str = "packages/client/src/typed.ts";
 const HOOKS: &str = "apps/web/src/hooks.ts";
+const TYPED_HOOKS: &str = "apps/web/src/typed-hooks.ts";
 const REQUESTS: &str = "packages/client/src/requests.ts";
 const TOOLS: &str = "packages/cli/src/tools.ts";
 const MAIN: &str = "packages/cli/src/main.ts";
@@ -150,8 +151,13 @@ fn settled_line() -> &'static str {
     &scan().1
 }
 
-fn scan() -> &'static (Blobs, String) {
-    static SCAN: OnceLock<(Blobs, String)> = OnceLock::new();
+/// The line the pass logs about the types it took from leaf calls.
+fn leaf_types_line() -> &'static str {
+    &scan().2
+}
+
+fn scan() -> &'static (Blobs, String, String) {
+    static SCAN: OnceLock<(Blobs, String, String)> = OnceLock::new();
     SCAN.get_or_init(|| {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = committed_copy(tmp.path());
@@ -164,17 +170,21 @@ fn scan() -> &'static (Blobs, String) {
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
             .env("HOME", &home);
         run(cmd);
-        let settled = std::fs::read_dir(home.join(".carrick/logs/runs"))
-            .expect("the scan keeps a run log")
-            .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
-            .flat_map(|log| {
-                log.lines()
-                    .filter(|line| line.contains("Call-through rows settled"))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .next()
-            .expect("the pass logs what it settled");
+        let logged = |what: &str| {
+            std::fs::read_dir(home.join(".carrick/logs/runs"))
+                .expect("the scan keeps a run log")
+                .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+                .flat_map(|log| {
+                    log.lines()
+                        .filter(|line| line.contains(what))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .next()
+                .unwrap_or_else(|| panic!("the pass logs {what}"))
+        };
+        let settled = logged("Call-through rows settled");
+        let leaf_types = logged("Call-through leaf types");
         let blobs: Blobs = read_blobs(&storage)
             .into_iter()
             .map(|(service, (_, blob))| (service, blob))
@@ -184,15 +194,20 @@ fn scan() -> &'static (Blobs, String) {
             SERVICES,
             "every service uploads one blob"
         );
-        (blobs, settled)
+        (blobs, settled, leaf_types)
     })
 }
 
 /// The response verdicts stored for the call at `file:line`, each with the
 /// producer operation it was judged against.
 fn response_verdicts_at(file: &str, line: u32) -> Vec<(String, String)> {
+    response_verdicts_in(blobs(), file, line)
+}
+
+/// The same, read off `blobs`.
+fn response_verdicts_in(blobs: &Blobs, file: &str, line: u32) -> Vec<(String, String)> {
     let site = format!("{file}:{line}");
-    blobs()
+    blobs
         .values()
         .flat_map(|blob| {
             blob["compat_verdicts"]
@@ -274,6 +289,29 @@ fn corrected(method: &str, path: &str, request_line: u32) -> Row {
         role: Some("wrapper_call".to_string()),
         reaches: Some(format!("{REQUESTS}:{request_line}")),
     }
+}
+
+/// The row at `file:line` of `service` took `GET /api/v1/runs/:id` from the
+/// request written at `request`.
+fn assert_takes_the_run_request(service: &str, file: &str, line: u32, request: &str) {
+    let row = row_at(service, file, line);
+    assert_eq!(
+        (
+            row.method.as_str(),
+            row.path.as_str(),
+            row.source.as_str(),
+            row.role.as_deref(),
+            row.reaches.as_deref()
+        ),
+        (
+            "GET",
+            "/api/v1/runs/:id",
+            "request_summary",
+            Some("wrapper_call"),
+            Some(request)
+        ),
+        "{file}:{line}"
+    );
 }
 
 /// A row left exactly as the model stated it.
@@ -610,6 +648,124 @@ fn a_client_method_with_a_helper_that_is_never_given_its_type_carries_nothing() 
     }
 }
 
+/// carrick#2377 slice 2: a call the model stated no row at, whose function
+/// (or the function it calls) parses a `fetch`, takes the type the compiler
+/// states at the call's own result. A member of a client class returns the
+/// parsed body and says so (`Promise<Run>`), so the caller needs to say
+/// nothing: the row states the request, holds that type, and is judged
+/// against the API.
+#[test]
+fn a_leaf_row_through_a_typed_client_carries_the_leafs_type_and_is_judged() {
+    assert_takes_the_run_request("cli", TYPED_COMMANDS, 61, &format!("{REQUESTS}:45"));
+    let entries = consumer_entries_at("cli", TYPED_COMMANDS, 61);
+    assert_eq!(entries.len(), 1, "one entry, a response: {entries:#?}");
+    assert_eq!(entries[0]["type_kind"], "response");
+    assert_eq!(entries[0]["path"], "/api/v1/runs/:id");
+    assert!(
+        entries[0]["resolved_definition"]
+            .as_str()
+            .is_some_and(|text| text.contains("id: string") && text.contains("state: string")),
+        "the type the client declares: {entries:#?}"
+    );
+    assert_eq!(
+        response_verdicts_at(TYPED_COMMANDS, 61),
+        [(
+            "http|GET|/api/v1/runs/:id".to_string(),
+            "compatible".to_string()
+        )]
+    );
+}
+
+/// A call straight into another service's function, whose parsed `fetch` it
+/// returns with a declared type, states the row with that type. A function
+/// that reads a member of a library client's result (slice 1's rule), hands
+/// the result back whole, or reads a member of a `fetch` has no proven body:
+/// its row is stated and holds no type.
+#[test]
+fn a_boundary_row_carries_a_type_only_where_one_body_step_is_proven() {
+    assert_takes_the_run_request("web", TYPED_HOOKS, 6, &format!("{TYPED}:30"));
+    let entries = consumer_entries_at("web", TYPED_HOOKS, 6);
+    assert_eq!(entries.len(), 1, "{entries:#?}");
+    assert!(
+        entries[0]["resolved_definition"]
+            .as_str()
+            .is_some_and(|text| text.contains("id: string")),
+        "the type the client package declares: {entries:#?}"
+    );
+    assert_eq!(
+        response_verdicts_at(TYPED_HOOKS, 6),
+        [(
+            "http|GET|/api/v1/runs/:id".to_string(),
+            "compatible".to_string()
+        )]
+    );
+    // A member of a spec's result, and the spec's result whole.
+    for line in [17, 23] {
+        assert!(
+            row_at("web", TYPED_HOOKS, line).reaches.is_some(),
+            "{TYPED_HOOKS}:{line} states the request it reaches"
+        );
+        let entries = consumer_entries_at("web", TYPED_HOOKS, line);
+        assert!(
+            entries.is_empty(),
+            "no type at {TYPED_HOOKS}:{line}: {entries:#?}"
+        );
+        assert_eq!(response_verdicts_at(TYPED_HOOKS, line), []);
+    }
+    // A client member that reads a member of a spec's result (slice 1's
+    // rule), and the existing leaf row of the same shape.
+    for line in [36, 68] {
+        assert!(row_at("cli", TYPED_COMMANDS, line).reaches.is_some());
+        assert!(consumer_entries_at("cli", TYPED_COMMANDS, line).is_empty());
+    }
+}
+
+/// The model's row sits at the hook call, and the callback inside it calls
+/// the function that parses the `fetch`: the row takes the request, and the
+/// type of that inner call's result, not the hook's.
+#[test]
+fn a_callback_decided_row_takes_the_type_of_the_call_inside_the_callback() {
+    assert_takes_the_run_request("web", TYPED_HOOKS, 12, &format!("{TYPED}:30"));
+    let entries = consumer_entries_at("web", TYPED_HOOKS, 12);
+    assert_eq!(entries.len(), 1, "{entries:#?}");
+    assert_eq!(entries[0]["path"], "/api/v1/runs/:id");
+    assert!(
+        entries[0]["resolved_definition"]
+            .as_str()
+            .is_some_and(|text| text.contains("id: string")),
+        "{entries:#?}"
+    );
+    assert_eq!(
+        response_verdicts_at(TYPED_HOOKS, 12),
+        [(
+            "http|GET|/api/v1/runs/:id".to_string(),
+            "compatible".to_string()
+        )]
+    );
+}
+
+/// The type pass asks at the leaf calls under a key of its own, and lifts it
+/// off before anything is stored: no blob holds the key, and the count of
+/// what became of each question is logged.
+#[test]
+fn no_pending_alias_or_key_reaches_a_blob() {
+    for (service, blob) in blobs() {
+        let text = serde_json::to_string(blob).unwrap();
+        assert!(
+            !text.contains("__call_through__"),
+            "{service}'s blob holds a pending key"
+        );
+    }
+    let line = leaf_types_line();
+    // The three rows above adopt; the member reads and the whole result
+    // (`readRunReply`, `getRun`, `readRunResult`) are unproven; the others
+    // keep the type the model anchored.
+    assert!(
+        line.contains("3 adopted from the call's own result"),
+        "{line}"
+    );
+}
+
 /// Every method of the client makes a request of its own before the one it
 /// hands back, and drops its value: a probe. The request the call reaches is
 /// the one whose value the method returns, whether the probe is a request a
@@ -913,7 +1069,7 @@ fn every_request_row_is_unchanged() {
                 "GET /api/v1/runs/:id".to_string(),
                 "env_base_path".to_string()
             ),
-            // `typed.ts`: two specs and a `fetch` on the declared base.
+            // `typed.ts`: two specs and two `fetch`es on the declared base.
             (
                 format!("{TYPED}:13"),
                 "GET /api/v1/runs/:id".to_string(),
@@ -926,6 +1082,11 @@ fn every_request_row_is_unchanged() {
             ),
             (
                 format!("{TYPED}:24"),
+                "GET /api/v1/runs/:id".to_string(),
+                "env_base_path".to_string()
+            ),
+            (
+                format!("{TYPED}:30"),
                 "GET /api/v1/runs/:id".to_string(),
                 "env_base_path".to_string()
             ),
@@ -1057,6 +1218,48 @@ fn unanswered() -> &'static Blobs {
             .map(|(service, (_, blob))| (service, blob))
             .collect()
     })
+}
+
+/// carrick#2377 slice 2: with no model row at the calls, the boundary call
+/// that parses a `fetch` states the row, and the type is the compiler's at the
+/// call's own result: the type the caller declared for it. The current copy
+/// is compatible; the stale one (a field the API no longer sends) is found.
+#[test]
+fn a_boundary_row_with_no_model_row_is_judged_on_the_type_the_compiler_states_at_the_call() {
+    let blobs = unanswered();
+    for (line, verdict) in [(145, "compatible"), (157, "incompatible")] {
+        let entries: Vec<serde_json::Value> = blobs["cli"]["type_manifest"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| {
+                entry["role"] == "consumer"
+                    && entry["file_path"] == COMMANDS
+                    && entry["line_number"] == line
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "{COMMANDS}:{line}: {entries:#?}");
+        assert_eq!(entries[0]["path"], "/api/v1/runs/:id");
+        assert_eq!(
+            response_verdicts_in(blobs, COMMANDS, line),
+            [("http|GET|/api/v1/runs/:id".to_string(), verdict.to_string())],
+            "{COMMANDS}:{line}"
+        );
+    }
+    // The envelope and the transport's result whole (151, 176) are not the
+    // request's body: stated, and no type.
+    for line in [151, 176] {
+        assert!(
+            blobs["cli"]["type_manifest"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .all(|entry| entry["file_path"] != COMMANDS || entry["line_number"] != line),
+            "no type at {COMMANDS}:{line}"
+        );
+    }
 }
 
 #[test]

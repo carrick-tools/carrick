@@ -65,6 +65,29 @@ The calls in `typed-commands.ts` from line 36 have no model row. The requests
 they reach are in `packages/client/src/typed.ts`: two specs (lines 13 and 19)
 and a `fetch` on the declared base (line 24).
 
+## Types at the calls a row is stated through
+
+The service's own type pass asks the result type of each leaf call a row may
+be stated at (every call straight into another service's function, and every
+call into a function of the service's own that holds one), under a key of its
+own that no blob keeps. `settle` takes that type when it states a row at the
+call, or corrects a row whose chain goes through it, and only where the chain
+from the callee hands back the request's body by the one step carrick#2377
+accepts (`Response.json()`). A corrected row that holds a type of its own at
+its own call keeps it (the type the model anchored at the call). The type is
+the compiler's at the call's result: the callee's declared return type, or the
+type the caller declared for the binding the call is assigned to.
+
+| Site | Outcome |
+|---|---|
+| `typed-commands.ts:61` (`readStated`) | leaf row, `Run`, compatible: the member returns a function's parsed `fetch` |
+| `typed-hooks.ts:6` (`loadRunTyped`) | boundary row, `RunReply`, compatible |
+| `typed-hooks.ts:12` | the model's row at the hook, decided by the callback; takes the type of the call inside it: `RunReply`, compatible |
+| `typed-hooks.ts:17`, `:23` | rows, no type: a member of a spec's result, the spec's result whole |
+| `typed-commands.ts:36`, `:68` | rows, no type: the client member reads a member of a spec's result |
+| `commands.ts:145`, `:157` with the model's answers emptied | boundary rows over `readRun`: `Run` compatible, and the stale `SavedRun` found |
+| `commands.ts:151`, `:176` with the model's answers emptied | stated, no type: an envelope, the transport's result whole |
+
 Where a call reaches more than one request, the request is the one whose value
 the functions hand back. A request awaited and dropped, or whose value only
 goes into the arguments of another request, is a side request
