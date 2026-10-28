@@ -256,6 +256,7 @@ mod tests {
             span_start: span.0,
             span_end: span.1,
             new: false,
+            scope: None,
         }
     }
 
