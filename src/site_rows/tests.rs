@@ -167,6 +167,7 @@ fn labels() -> Vec<SiteLabel> {
         runs: None,
         method: None,
         request: None,
+        request_dropped: false,
     };
     vec![
         label("Server", Some("server")),

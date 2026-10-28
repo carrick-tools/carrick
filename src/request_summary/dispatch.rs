@@ -286,6 +286,11 @@ impl Reader<'_, '_> {
                 && label.export == end.export
                 && label.member == end.member
         }) {
+            // The verifier kept the route and dropped its request: nothing
+            // is read through it (carrick#2979).
+            if label.request_dropped {
+                return Err("label_request_dropped".to_string());
+            }
             let read = (&label.handler, &label.request);
             if !agreed.contains(&read) {
                 agreed.push(read);
@@ -546,6 +551,73 @@ mod tests {
                     .all(|id| typed.asked.iter().any(|asked| asked.to_string() == *id)),
                 "{}",
                 typed.subject.at
+            );
+        }
+    }
+
+    /// carrick#2979, every protocol whose `receive` ops carry a request (a
+    /// server entry point and a procedure router in the fixture): a route
+    /// the verifier kept but whose request it dropped is read through
+    /// nothing, so no comparison attaches to its handler, and the reason is
+    /// counted.
+    #[test]
+    fn a_dropped_request_reads_no_path_from_its_handler() {
+        let Some(on) = the_fixture() else {
+            return;
+        };
+        let exports = claims(|_| {});
+        let count = |records: &serde_json::Value, key: &str| -> u64 {
+            records["counts"][key].as_u64().unwrap_or(0)
+        };
+        let baseline = records_of(&on, &exports, HoleReach::Nested);
+        for package in ["node:http", "fixture-router"] {
+            // The verifier's verdicts for the ask the trace sends: every
+            // `receive` op that states a request verified with it dropped.
+            let ask = crate::request_summary::discovery::declaration_ask(&on.inputs, &exports);
+            let verdicts: Vec<_> = ask
+                .checks
+                .iter()
+                .zip(&ask.requests)
+                .map(
+                    |(check, request)| crate::services::type_sidecar::SemanticsResult {
+                        claim_id: check.claim_id.clone(),
+                        receiver: check.receiver.clone(),
+                        verdict: crate::services::type_sidecar::SemanticsVerdict::Verified,
+                        reason: None,
+                        declarations: Vec::new(),
+                        request_dropped: request
+                            .as_ref()
+                            .filter(|request| request.package == package)
+                            .map(|_| "request_member_missing".to_string()),
+                    },
+                )
+                .collect();
+            let declarations =
+                crate::request_summary::discovery::MemberDeclarations::of(&ask, &verdicts);
+            let mut labels = SiteLabel::from_exports(&exports);
+            declarations.mark_dropped_requests(&mut labels);
+            let dropped: Vec<&str> = labels
+                .iter()
+                .filter(|label| label.request_dropped)
+                .map(|label| label.package.as_str())
+                .collect();
+            assert_eq!(dropped, [package], "only the dropped op's label is marked");
+            let records = serde_json::to_value(handler_records(
+                &on.inputs,
+                &discovered(&on, &exports),
+                &labels,
+                &on.repo,
+                HoleReach::Nested,
+            ))
+            .unwrap();
+            assert!(
+                count(&records, "comparisons") < count(&baseline, "comparisons"),
+                "{package}: no comparison attaches to its handler"
+            );
+            assert!(
+                records["not_attached"]["label_request_dropped"].as_u64() > Some(0),
+                "{:#}",
+                records["not_attached"]
             );
         }
     }

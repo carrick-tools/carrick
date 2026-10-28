@@ -106,7 +106,7 @@ const INJECTED_CALLEE: &str = "injected_callee";
 const MAX_VALUES: usize = 16;
 
 /// The hop a walk records where it enters a function through a value.
-use super::decided_sites::VALUE_HOP;
+use super::decided_sites::{SiteLabel, VALUE_HOP};
 
 /// One discovered site, or one walk that entered code and stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,12 +537,25 @@ pub struct DeclaredOp {
 /// `call` row names is asked too (carrick#2474 R2b, carrick#1678), on the
 /// same receivers, after every op check (the verifier judges in request
 /// order under a time limit, so near it a scope goes unchecked, never an
-/// op): `scopes` lines up with `checks` the same way.
+/// op): `scopes` lines up with `checks` the same way. Each `receive` op that
+/// states a `request` is asked whether or not a call row names its member
+/// (carrick#2979): `requests` lines up with `checks` too, the op whose
+/// verdict may drop its request.
 #[derive(Debug, Default, Clone)]
 pub struct DeclarationAsk {
     pub checks: Vec<LibraryCheck>,
     pub ops: Vec<Option<DeclaredOp>>,
     pub scopes: Vec<Option<AskedScope>>,
+    pub requests: Vec<Option<RequestOp>>,
+}
+
+/// A `receive` op that states a `request`, by the keys its label carries
+/// ([`SiteLabel`]): the package as the store keys it, the export, the member.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequestOp {
+    pub package: String,
+    pub export: String,
+    pub member: Option<String>,
 }
 
 /// One scope claim the trace asks, by its claim id, on one receiver id
@@ -608,15 +621,18 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
         let claims = export.claims_with_scopes_by_id();
         let wanted: Vec<&(String, &LibraryClaim)> = claims
             .iter()
-            .filter(|(_, claim)| match claim {
-                LibraryClaim::Op {
-                    member: Some(member),
-                    ..
-                }
-                | LibraryClaim::Scope { member, .. } => {
-                    called.contains(&(export.package.clone(), member.clone()))
-                }
-                _ => false,
+            .filter(|(_, claim)| {
+                let named = match claim {
+                    LibraryClaim::Op {
+                        member: Some(member),
+                        ..
+                    }
+                    | LibraryClaim::Scope { member, .. } => {
+                        called.contains(&(export.package.clone(), member.clone()))
+                    }
+                    _ => false,
+                };
+                named || states_request(claim)
             })
             .collect();
         if wanted.is_empty() {
@@ -635,27 +651,39 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
                 ask.checks.push(check(id, "export", claim));
                 ask.ops.push(None);
                 ask.scopes.push(None);
+                ask.requests.push(None);
             }
         }
         let on_receivers = |on: Option<ClaimOn>, of: Option<&str>| claim_receivers(&claims, on, of);
         for (id, claim) in wanted {
             match claim {
                 LibraryClaim::Op {
-                    op,
-                    member: Some(member),
-                    on,
-                    of,
-                    ..
+                    op, member, on, of, ..
                 } => {
-                    for receiver in on_receivers(*on, of.as_deref()) {
-                        ask.checks.push(check(id, &receiver, claim));
-                        ask.ops.push(Some(DeclaredOp {
+                    // The op stands for its declarations only when a call
+                    // row names its member; a `receive` op stating a request
+                    // is asked either way, for its request.
+                    let declared = member
+                        .as_ref()
+                        .filter(|member| {
+                            called.contains(&(export.package.clone(), (*member).clone()))
+                        })
+                        .map(|member| DeclaredOp {
                             package: export.package.clone(),
                             export: export.export.clone(),
                             member: member.clone(),
                             op: *op,
-                        }));
+                        });
+                    let request = states_request(claim).then(|| RequestOp {
+                        package: export.package.clone(),
+                        export: export.export.clone(),
+                        member: member.clone(),
+                    });
+                    for receiver in on_receivers(*on, of.as_deref()) {
+                        ask.checks.push(check(id, &receiver, claim));
+                        ask.ops.push(declared.clone());
                         ask.scopes.push(None);
+                        ask.requests.push(request.clone());
                     }
                 }
                 LibraryClaim::Scope { on, of, .. } => {
@@ -679,8 +707,22 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
         ask.checks.push(check);
         ask.ops.push(None);
         ask.scopes.push(Some(scope));
+        ask.requests.push(None);
     }
     ask
+}
+
+/// Whether a claim is a `receive` op that states where its handler's request
+/// holds its path and method.
+fn states_request(claim: &LibraryClaim) -> bool {
+    matches!(
+        claim,
+        LibraryClaim::Op {
+            op: LibraryOp::Receive,
+            request: Some(_),
+            ..
+        }
+    )
 }
 
 /// Each member declaration a verified op claim resolves to, with the ops it
@@ -698,9 +740,24 @@ pub struct MemberDeclarations {
     pub checks: usize,
     /// Of those, the ones the verifier did not reach in its time limit.
     pub not_reached: usize,
+    /// The `receive` ops whose verified verdict dropped their `request`
+    /// (carrick#2979): the route stands, its request did not resolve.
+    request_dropped: HashSet<RequestOp>,
 }
 
 impl MemberDeclarations {
+    /// Mark every label of an op whose verdict dropped its request, so the
+    /// dispatch read takes no path from it (`label_request_dropped`).
+    pub fn mark_dropped_requests(&self, labels: &mut [SiteLabel]) {
+        for label in labels.iter_mut().filter(|label| label.request.is_some()) {
+            label.request_dropped = self.request_dropped.contains(&RequestOp {
+                package: label.package.clone(),
+                export: label.export.clone(),
+                member: label.member.clone(),
+            });
+        }
+    }
+
     /// The declarations the verdicts for `ask` name. A verdict counts only
     /// for the check at its own position that it names.
     pub fn of(ask: &DeclarationAsk, verdicts: &[SemanticsResult]) -> Self {
@@ -712,11 +769,12 @@ impl MemberDeclarations {
         if verdicts.len() != ask.checks.len() {
             return out;
         }
-        for (((check, op), scope), verdict) in ask
+        for ((((check, op), scope), request), verdict) in ask
             .checks
             .iter()
             .zip(&ask.ops)
             .zip(&ask.scopes)
+            .zip(&ask.requests)
             .zip(verdicts)
         {
             if verdict.verdict != SemanticsVerdict::Verified
@@ -724,6 +782,9 @@ impl MemberDeclarations {
                 || verdict.receiver != check.receiver
             {
                 continue;
+            }
+            if let (Some(request), Some(_)) = (request, &verdict.request_dropped) {
+                out.request_dropped.insert(request.clone());
             }
             if let Some(scope) = scope {
                 let mut declarations: Vec<(String, u32)> = verdict

@@ -1359,6 +1359,7 @@ mod tests {
             verdict,
             reason: None,
             declarations: Vec::new(),
+            request_dropped: None,
         };
         let results = vec![
             verdict(
@@ -1437,6 +1438,7 @@ mod tests {
             verdict: SemanticsVerdict::Verified,
             reason: None,
             declarations: Vec::new(),
+            request_dropped: None,
         };
         let exact: Vec<SemanticsResult> = checks.iter().map(verified).collect();
         assert!(!surface_from(&derived, &checks, &exact).is_empty());
