@@ -1384,6 +1384,10 @@ pub struct FileOrchestrator {
     /// The files the fact layer would send the reader, logged beside the
     /// ones the signals select (carrick#2613). Record-only.
     fact_files: FactFileSource,
+    /// The results the library store labelled and the sidecar verified, by
+    /// the labelled call (carrick#2819). Empty unless the engine hands one
+    /// over.
+    result_index: crate::result_shapes::ResultIndex,
 }
 
 /// The fact layer's file set for one analysis (carrick#2613): not recorded,
@@ -1725,6 +1729,7 @@ impl FileOrchestrator {
             model_deferred: false,
             request_summaries: RequestSummaryIndex::default().into(),
             fact_files: FactFileSource::None,
+            result_index: crate::result_shapes::ResultIndex::default(),
         }
     }
 
@@ -1732,6 +1737,13 @@ impl FileOrchestrator {
     /// from the engine ([`FactFileSource::later`]).
     pub fn with_fact_files(mut self, fact_files: FactFileSource) -> Self {
         self.fact_files = fact_files;
+        self
+    }
+
+    /// The results verified for this service's labelled calls, carried onto
+    /// the consumer response requests built for them (carrick#2819).
+    pub fn with_result_index(mut self, result_index: crate::result_shapes::ResultIndex) -> Self {
+        self.result_index = result_index;
         self
     }
 
@@ -4786,11 +4798,20 @@ impl FileOrchestrator {
             Line,
         }
 
+        // The verified result of the consumer call whose response requests
+        // are being pushed (carrick#2819): set before them, cleared after, and
+        // carried by `CallResult` items only.
+        let call_result: std::cell::RefCell<Option<crate::services::type_sidecar::ResultShape>> =
+            std::cell::RefCell::new(None);
         let mut push_infer = |file_path: &str,
                               line_number: u32,
                               infer_kind: InferKind,
                               alias: String,
                               locator: InferLocator<'_>| {
+            let result = match infer_kind {
+                InferKind::CallResult => call_result.borrow().clone(),
+                _ => None,
+            };
             match locator {
                 InferLocator::Span {
                     span_start,
@@ -4835,7 +4856,7 @@ impl FileOrchestrator {
                     };
                     infer_requests.push(InferRequestItem {
                         member: None,
-                        result: None,
+                        result,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -4860,7 +4881,7 @@ impl FileOrchestrator {
                     }
                     infer_requests.push(InferRequestItem {
                         member: None,
-                        result: None,
+                        result,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -4877,7 +4898,7 @@ impl FileOrchestrator {
                 InferLocator::Line => {
                     infer_requests.push(InferRequestItem {
                         member: None,
-                        result: None,
+                        result,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -5420,6 +5441,16 @@ impl FileOrchestrator {
                         );
                     }
 
+                    *call_result.borrow_mut() = self
+                        .result_index
+                        .at(
+                            file_path,
+                            data_call
+                                .call_expression_span_start
+                                .zip(data_call.call_expression_span_end),
+                            line_number,
+                        )
+                        .cloned();
                     let call_inferred = push_infer(
                         &file_path_absolute,
                         line_number,
@@ -5439,6 +5470,7 @@ impl FileOrchestrator {
                             span_end: data_call.call_expression_span_end,
                         },
                     );
+                    *call_result.borrow_mut() = None;
                     if !call_inferred && let Some(symbol) = data_call.primary_type_symbol.as_ref() {
                         inline_aliases.push((response_alias.clone(), symbol.clone()));
                     }
@@ -15309,6 +15341,88 @@ export * from "./aFetch.js";"#,
         assert!(aliases[0].contains("_Call"));
         assert!(aliases[1].contains("_Call"));
         assert_ne!(aliases[0], aliases[1]);
+    }
+
+    /// carrick#2819: the consumer response request of a call whose labelled
+    /// end has a verified result carries it; every other request, and every
+    /// request when no result is verified, is as it was.
+    #[test]
+    fn a_verified_result_reaches_the_consumer_response_request() {
+        let repo = repo_with_source("src/service.ts", 700);
+        let answer = serde_json::json!({
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": [
+                {
+                    "candidate_id": "span:470-520",
+                    "line_number": 10,
+                    "target": "https://api.example.com/orders",
+                    "method": "GET",
+                    "pattern_matched": "get(",
+                    "call_expression_span_start": 470,
+                    "call_expression_span_end": 520,
+                },
+                {
+                    "candidate_id": "span:530-580",
+                    "line_number": 20,
+                    "target": "https://api.example.com/orders",
+                    "method": "GET",
+                    "pattern_matched": "get(",
+                    "call_expression_span_start": 530,
+                    "call_expression_span_end": 580,
+                },
+            ],
+        });
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            serde_json::from_value::<FileAnalysisResult>(answer).expect("a file answer"),
+        );
+        let requests = |index: crate::result_shapes::ResultIndex| {
+            let orchestrator = FileOrchestrator::new(AgentService::new()).with_result_index(index);
+            let graph = orchestrator.build_mount_graph(
+                &file_results,
+                &UrlNormalizer::default_permissive(),
+                Path::new(""),
+                Path::new(""),
+            );
+            let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+                &file_results,
+                &repo.path().to_string_lossy(),
+                &graph,
+                &Config::default(),
+                &repo_modules(repo.path()),
+            );
+            infer
+        };
+        let bare = requests(crate::result_shapes::ResultIndex::default());
+        let member = crate::services::type_sidecar::ResultShape::Member(["data".to_string()]);
+        let labelled = requests(crate::result_shapes::ResultIndex::labelled(
+            "src/service.ts",
+            (470, 520),
+            member.clone(),
+        ));
+        assert_eq!(bare.len(), 2);
+        assert!(bare.iter().all(|item| item.result.is_none()));
+        assert_eq!(labelled.len(), 2);
+        let results: Vec<_> = labelled.iter().map(|item| item.result.clone()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
+        let carrying = labelled.iter().find(|item| item.result.is_some()).unwrap();
+        assert_eq!(carrying.result, Some(member));
+        assert_eq!(carrying.line_number, 10);
+        assert_eq!(carrying.infer_kind, InferKind::CallResult);
+        // Everything but the label is the same request.
+        let strip = |items: &[InferRequestItem]| {
+            items
+                .iter()
+                .map(|item| InferRequestItem {
+                    result: None,
+                    ..item.clone()
+                })
+                .map(|item| serde_json::to_string(&item).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&bare), strip(&labelled));
     }
 
     /// carrick#1876: the type requests go out in one order on every scan.

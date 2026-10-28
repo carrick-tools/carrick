@@ -114,6 +114,7 @@ fn job(labels: &[(&str, KeyLabel)]) -> LibraryClaim {
             namespace: None,
         }),
         picker: Some("model/q1".into()),
+        result: None,
     }
 }
 
@@ -158,6 +159,7 @@ fn send(member: &str, path: &[&str], place: Place, name: OpName, payload: u32) -
         runs: None,
         yields: None,
         request: None,
+        result: None,
     }
 }
 
@@ -290,6 +292,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
                 runs: None,
                 yields: None,
                 request: None,
+                result: None,
             },
         ),
     ];

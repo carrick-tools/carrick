@@ -357,6 +357,8 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             hops(path, member.as_deref()),
             selector(on, of)
         )),
+        // Asked only beside the claim it sits on, under that claim's id.
+        LibraryClaim::Result { .. } => None,
         LibraryClaim::Reserved {
             member,
             name,
@@ -513,7 +515,7 @@ pub fn checks(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryChec
                         .filter(|receiver| applies(*on, of.as_deref(), receiver))
                         .collect()
                 }
-                LibraryClaim::Scope { .. } => Vec::new(),
+                LibraryClaim::Scope { .. } | LibraryClaim::Result { .. } => Vec::new(),
             };
             for receiver in on {
                 checks.push(LibraryCheck {
@@ -522,7 +524,7 @@ pub fn checks(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryChec
                     export: export.export.clone(),
                     role: export.role,
                     receiver: receiver.to_string(),
-                    claim: claim.clone(),
+                    claim: claim.without_result(),
                 });
             }
         }
@@ -570,7 +572,7 @@ pub fn server_checks(exports: &[ExportClaims]) -> Vec<LibraryCheck> {
                     export: export.export.clone(),
                     role: export.role,
                     receiver,
-                    claim: claim.clone(),
+                    claim: claim.without_result(),
                 });
             }
         }

@@ -4124,6 +4124,21 @@ async fn analyze_current_repo_incremental(
                 sidecar,
                 &semantics_root,
             );
+            let results = result_index_of(
+                crate::site_questions::enabled(),
+                &request_inputs,
+                Path::new(repo_path),
+                &claims,
+                SiteContext {
+                    prior: first_discovery.as_ref(),
+                    declarations: declarations.as_ref(),
+                    siblings: &sibling_inputs,
+                    ..SiteContext::default()
+                },
+                sidecar,
+                &semantics_root,
+            );
+            let file_orchestrator = file_orchestrator.with_result_index(results);
             protocol_extractions.site = site_rows_of(
                 crate::site_questions::enabled(),
                 &request_inputs,
@@ -5417,6 +5432,89 @@ fn discovered_sites(
         .collect()
 }
 
+/// The calls of `inputs` that reach a labelled export: the walk made on the
+/// store's first answer when `context` holds it and the settled answer is the
+/// same, else a walk made now and left in `walked`.
+fn discovery_of<'a>(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+    claims: &[crate::library_claims::ExportClaims],
+    context: SiteContext<'a>,
+    walked: &'a mut Option<crate::request_summary::discovery::Discovery>,
+) -> &'a crate::request_summary::discovery::Discovery {
+    // A walk made without the trace is not the walk the trace asks for.
+    let prior = context
+        .prior
+        .filter(|prior| prior.exports == claims && context.declarations.is_none());
+    match prior {
+        Some(prior) => &prior.discovery,
+        None => {
+            let labels = match context.declarations {
+                Some(declarations) => {
+                    crate::request_summary::discovery::Labels::traced(claims, declarations)
+                }
+                None => crate::request_summary::discovery::Labels::of(claims),
+            };
+            walked.insert(crate::request_summary::discovery::discover_with(
+                inputs,
+                context.siblings,
+                &labels,
+                root,
+            ))
+        }
+    }
+}
+
+/// The results the store labels and the sidecar verifies (carrick#2819): one
+/// `result` check for each labelled claim whose end discovery finds, beside
+/// the member declarations' request and under the library checks' time limit.
+/// Empty unless `enabled`, the service has rows and some claim carries a
+/// result, so a scan whose store labels none walks and asks nothing more. No
+/// sidecar, or a failed request, indexes nothing.
+fn result_index_of(
+    enabled: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+    claims: &[crate::library_claims::ExportClaims],
+    context: SiteContext<'_>,
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &Path,
+) -> crate::result_shapes::ResultIndex {
+    use crate::result_shapes::{ResultIndex, result_checks};
+    let labelled = claims.iter().any(|export| {
+        export
+            .claims
+            .iter()
+            .any(|claim| claim.result_check().is_some())
+    });
+    if !enabled || !labelled || inputs.positions.is_none() {
+        return ResultIndex::default();
+    }
+    let mut walked = None;
+    let discovery = discovery_of(inputs, root, claims, context, &mut walked);
+    let ask = result_checks(claims, discovery);
+    let verdicts = match sidecar {
+        Some(sidecar) if !ask.checks.is_empty() => {
+            match sidecar.verify_library_claims(from_dir, &ask.checks) {
+                Ok(answer) => answer.verdicts,
+                Err(error) => {
+                    warn!(%error, "result shapes: the result ask failed; none indexed");
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    let index = ResultIndex::of(&ask, &verdicts, discovery);
+    debug!(
+        checks = index.checks,
+        not_reached = index.not_reached,
+        results = index.len(),
+        "result shapes: verified results"
+    );
+    index
+}
+
 /// The site labels the settled `claims` give, of every role the store was
 /// asked for (carrick#2436), every call discovery finds that reaches one,
 /// where each one's name is decided, and each decided site's record. Files
@@ -5427,29 +5525,8 @@ fn site_records_of(
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> SiteRecordsOf {
-    let walked;
-    // A walk made without the trace is not the walk the trace asks for.
-    let prior = context
-        .prior
-        .filter(|prior| prior.exports == claims && context.declarations.is_none());
-    let discovery = match prior {
-        Some(prior) => &prior.discovery,
-        None => {
-            let labels = match context.declarations {
-                Some(declarations) => {
-                    crate::request_summary::discovery::Labels::traced(claims, declarations)
-                }
-                None => crate::request_summary::discovery::Labels::of(claims),
-            };
-            walked = crate::request_summary::discovery::discover_with(
-                inputs,
-                context.siblings,
-                &labels,
-                root,
-            );
-            &walked
-        }
-    };
+    let mut walked = None;
+    let discovery = discovery_of(inputs, root, claims, context, &mut walked);
     let reached_label = discovery
         .sites
         .iter()
@@ -11274,6 +11351,20 @@ async fn analyze_current_repo(
         sidecar,
         &service_root,
     );
+    let results = result_index_of(
+        crate::site_questions::enabled(),
+        &request_inputs,
+        Path::new(repo_path),
+        &claims,
+        SiteContext {
+            prior: first_discovery.as_ref(),
+            declarations: declarations.as_ref(),
+            siblings: &sibling_inputs,
+            ..SiteContext::default()
+        },
+        sidecar,
+        &service_root,
+    );
     protocol_extractions.site = site_rows_of(
         crate::site_questions::enabled(),
         &request_inputs,
@@ -11403,7 +11494,7 @@ async fn analyze_current_repo(
 
     // 6. Resolve types using sidecar if available
     let agent_service = AgentService::new();
-    let file_orchestrator = FileOrchestrator::new(agent_service.clone());
+    let file_orchestrator = FileOrchestrator::new(agent_service.clone()).with_result_index(results);
 
     let extraction_config = setup.extraction_config.clone();
 

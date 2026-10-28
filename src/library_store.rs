@@ -1125,6 +1125,16 @@ fn parse_export(
         for mut element in elements(list) {
             let tagged = element.as_object_mut().map(|fields| {
                 fields.insert("kind".to_string(), Value::String(kind.to_string()));
+                // A result this build cannot read says nothing (carrick#2819):
+                // the claim it sits on is still read, as it was before results.
+                if fields.get("result").is_some_and(|result| {
+                    !serde_json::from_value::<crate::services::type_sidecar::ResultShape>(
+                        result.clone(),
+                    )
+                    .is_ok_and(|shape| shape.readable())
+                }) {
+                    fields.remove("result");
+                }
             });
             let parsed = tagged
                 .and_then(|()| serde_json::from_value::<LibraryClaim>(element).ok())

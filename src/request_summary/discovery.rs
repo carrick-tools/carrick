@@ -562,6 +562,26 @@ fn make_receiver(form: MakeForm, member: Option<&str>) -> String {
     super::library_sites::maker_receiver_id(form == MakeForm::New, member)
 }
 
+/// Every receiver a claim's `on` or `of` applies to among the export itself
+/// and the instances `claims`' makers build, sorted.
+pub(crate) fn claim_receivers(
+    claims: &[(String, &LibraryClaim)],
+    on: Option<ClaimOn>,
+    of: Option<&str>,
+) -> Vec<String> {
+    let mut all = vec!["export".to_string()];
+    for (_, claim) in claims {
+        if let LibraryClaim::Make { form, member, .. } = claim {
+            all.push(make_receiver(*form, member.as_deref()));
+        }
+    }
+    all.extend(of.map(str::to_string));
+    all.sort();
+    all.dedup();
+    all.retain(|receiver| applies(on, of, receiver));
+    all
+}
+
 /// The ask for the service `inputs` reads, under the store's answer
 /// `exports`. Nothing without rows, or with no member any op names.
 pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) -> DeclarationAsk {
@@ -608,26 +628,16 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
             export: export.export.clone(),
             role: export.role,
             receiver: receiver.to_string(),
-            claim: claim.clone(),
+            claim: claim.without_result(),
         };
-        let mut receivers = vec!["export".to_string()];
         for (id, claim) in &claims {
-            if let LibraryClaim::Make { form, member, .. } = claim {
-                receivers.push(make_receiver(*form, member.as_deref()));
+            if matches!(claim, LibraryClaim::Make { .. }) {
                 ask.checks.push(check(id, "export", claim));
                 ask.ops.push(None);
                 ask.scopes.push(None);
             }
         }
-        // Every receiver a claim's `on` or `of` applies to.
-        let on_receivers = |on: Option<ClaimOn>, of: Option<&str>| -> Vec<String> {
-            let mut all = receivers.clone();
-            all.extend(of.map(str::to_string));
-            all.sort();
-            all.dedup();
-            all.retain(|receiver| applies(on, of, receiver));
-            all
-        };
+        let on_receivers = |on: Option<ClaimOn>, of: Option<&str>| claim_receivers(&claims, on, of);
         for (id, claim) in wanted {
             match claim {
                 LibraryClaim::Op {

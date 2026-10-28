@@ -1,0 +1,8 @@
+{
+  "name": "result-shape-client",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-reply-client": "^1.0.0"
+  }
+}

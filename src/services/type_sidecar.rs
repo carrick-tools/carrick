@@ -177,6 +177,27 @@ pub enum ResultShape {
     Parse(String),
 }
 
+impl ResultShape {
+    /// Whether the sidecar's schema accepts the shape: `whole` is `true`, and a
+    /// member or method name is not empty. One refused element fails a whole
+    /// verify request, so a result that is not readable is dropped on the way
+    /// in (carrick#2819).
+    pub fn readable(&self) -> bool {
+        match self {
+            ResultShape::Whole(whole) => *whole,
+            ResultShape::Member([name]) | ResultShape::Parse(name) => !name.is_empty(),
+        }
+    }
+}
+
+/// What a `result` check's claim sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultForm {
+    Make,
+    Op,
+}
+
 /// Request for type inference at a specific location
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferRequestItem {
@@ -1057,6 +1078,11 @@ pub enum LibraryClaim {
         name_scope: Option<NameScope>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         picker: Option<String>,
+        /// Which member of what a hook returns holds the value the function
+        /// it runs resolves to (carrick#2819). Never sent with a make check:
+        /// a `result` check carries it ([`LibraryClaim::Result`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ResultShape>,
     },
     /// `member(name)` (after `path`) returns a receiver bound to that name.
     /// A procedure router's member (`collects`, #2474 R6a) has no name: a
@@ -1150,6 +1176,27 @@ pub enum LibraryClaim {
         /// request holds its path and method.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request: Option<Box<RequestAt>>,
+        /// Which part of what the call returns holds the response body
+        /// (carrick#2819). Never sent with an op check: a `result` check
+        /// carries it ([`LibraryClaim::Result`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ResultShape>,
+    },
+    /// The result a labelled make or op claims, checked on its own so a
+    /// refused result never fails the claim it sits on (carrick#2819). Built
+    /// only from a make or op claim's `result` ([`LibraryClaim::result_check`]).
+    Result {
+        form: ResultForm,
+        member: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on: Option<ClaimOn>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        of: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picker: Option<String>,
+        result: ResultShape,
     },
     /// A name the library emits itself, spelled in one of `member`'s
     /// parameters.
@@ -1165,6 +1212,60 @@ pub enum LibraryClaim {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         picker: Option<String>,
     },
+}
+
+impl LibraryClaim {
+    /// The claim as an op or maker check sends it: without its `result`, so
+    /// the verdict on the claim is the one it had before results existed
+    /// (carrick#2819). Every other claim is returned as it is.
+    pub fn without_result(&self) -> LibraryClaim {
+        let mut claim = self.clone();
+        match &mut claim {
+            LibraryClaim::Make { result, .. } | LibraryClaim::Op { result, .. } => *result = None,
+            _ => {}
+        }
+        claim
+    }
+
+    /// The `result` check for a make or op claim that carries a result: the
+    /// same member, path, and receivers, asked on its own. `None` for a claim
+    /// with no result and for any other kind.
+    pub fn result_check(&self) -> Option<LibraryClaim> {
+        match self {
+            LibraryClaim::Make {
+                member,
+                picker,
+                result: Some(result),
+                ..
+            } => Some(LibraryClaim::Result {
+                form: ResultForm::Make,
+                member: member.clone(),
+                path: Vec::new(),
+                on: None,
+                of: None,
+                picker: picker.clone(),
+                result: result.clone(),
+            }),
+            LibraryClaim::Op {
+                member,
+                path,
+                on,
+                of,
+                picker,
+                result: Some(result),
+                ..
+            } => Some(LibraryClaim::Result {
+                form: ResultForm::Op,
+                member: member.clone(),
+                path: path.clone(),
+                on: *on,
+                of: of.clone(),
+                picker: picker.clone(),
+                result: result.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// The server-framework claims an `infer` request reads route handlers'
@@ -5326,6 +5427,7 @@ mod tests {
                             runs: None,
                             yields: None,
                             request: None,
+                            result: None,
                         },
                     }],
                     type_packages: BTreeMap::from([(
@@ -5465,6 +5567,7 @@ mod tests {
                         key_labels: key_labels(),
                         name_scope: Some(name_scope()),
                         picker: Some("model/q1".into()),
+                        result: None,
                     }),
                     library(LibraryClaim::Scope {
                         member: "channel".into(),
@@ -5527,6 +5630,7 @@ mod tests {
                         runs: None,
                         yields: None,
                         request: None,
+                        result: None,
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Send,
@@ -5563,6 +5667,7 @@ mod tests {
                             method: Some(vec!["method".into()]),
                             body: None,
                         })),
+                        result: None,
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Receive,
@@ -5587,6 +5692,7 @@ mod tests {
                         runs: None,
                         yields: None,
                         request: None,
+                        result: None,
                     }),
                     library(LibraryClaim::Reserved {
                         member: "on".into(),
@@ -6115,6 +6221,7 @@ mod tests {
                             namespace: Some("task".into()),
                         }),
                         picker: Some("model/q1".into()),
+                        result: None,
                     },
                 ),
                 check(
@@ -6144,6 +6251,7 @@ mod tests {
                         runs: None,
                         yields: None,
                         request: None,
+                        result: None,
                     },
                 ),
                 check(
@@ -6174,6 +6282,7 @@ mod tests {
                         runs: None,
                         yields: None,
                         request: None,
+                        result: None,
                     },
                 ),
                 check(
@@ -6223,6 +6332,7 @@ mod tests {
                         key_labels: BTreeMap::new(),
                         name_scope: None,
                         picker: None,
+                        result: None,
                     },
                 ),
                 check(
@@ -6250,6 +6360,7 @@ mod tests {
                         runs: None,
                         yields: None,
                         request: None,
+                        result: None,
                     },
                 ),
             ],
@@ -6356,6 +6467,7 @@ mod tests {
                 key_labels: BTreeMap::new(),
                 name_scope: None,
                 picker: None,
+                result: None,
             },
         };
         let checks = [check("a", "export"), check("b", "export")];
