@@ -497,9 +497,9 @@ impl Attacher<'_, '_> {
         if let Some(handoff) = &facts.handoff {
             return match self.reader.labelled(chain, handoff) {
                 Ok(reached) => {
-                    let label = reached.label.clone().expect("the label arm");
+                    let end = self.reader.end_of(handoff).expect("the label arm");
                     Ok(Attached {
-                        to: vec![(handoff.handed, self.label_handler(label))],
+                        to: vec![(handoff.handed, self.label_handler(end))],
                         arm: Arm::Proven(reached, facts.clone()),
                         below: false,
                     })
@@ -513,7 +513,7 @@ impl Attacher<'_, '_> {
                     &handoff.path,
                 ) {
                     Some(end) => Ok(Attached {
-                        to: vec![(handoff.handed, self.label_handler(subject_label(end)))],
+                        to: vec![(handoff.handed, self.label_handler(end))],
                         arm: Arm::Unread(facts.clone()),
                         below: false,
                     }),
@@ -582,7 +582,7 @@ impl Attacher<'_, '_> {
             return self
                 .reader
                 .receive_at(handoff.caller, &handoff.site, handoff.arg, &handoff.path)
-                .map(|end| vec![(handoff.handed, self.label_handler(subject_label(end)))])
+                .map(|end| vec![(handoff.handed, self.label_handler(end))])
                 .unwrap_or_default();
         }
         self.attach(node, chain, facts)
@@ -600,7 +600,7 @@ impl Attacher<'_, '_> {
             }
             for (caller, site, arg, path) in self.chains.handed_calls(current) {
                 if let Some(end) = self.reader.receive_at(caller, &site, arg, &path) {
-                    return Some((current, self.label_handler(subject_label(end))));
+                    return Some((current, self.label_handler(end)));
                 }
             }
             at = self.chains.nodes[current].parent;
@@ -611,15 +611,9 @@ impl Attacher<'_, '_> {
     /// The handler of a labelled `receive` call: with a path slot when any
     /// `receive` label of that member names one (the call takes the path
     /// the handler is registered under).
-    fn label_handler(&self, label: SubjectLabel) -> Handler {
-        let path_slot = self.reader.labels.iter().any(|known| {
-            known.op.as_deref() == Some("receive")
-                && known.package == label.package
-                && known.export == label.export
-                && known.member == label.member
-                && known.name.is_some()
-        });
-        Handler::Label(label, path_slot)
+    fn label_handler(&self, end: &LabelledEnd) -> Handler {
+        let path_slot = super::names_path(self.reader.labels, end);
+        Handler::Label(subject_label(end), path_slot)
     }
 
     /// Whether a function from `stopped` up to `handler` (not the handler

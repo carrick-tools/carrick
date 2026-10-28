@@ -42,7 +42,6 @@ use super::guards::{
     Handoff, Step, key_steps, read_steps,
 };
 use crate::services::type_sidecar::RequestAt;
-use crate::site_questions::SubjectLabel;
 
 mod records;
 pub use records::{ComparisonPlace, HandlerRecords, HoleReach, LineRange, handler_records};
@@ -67,8 +66,6 @@ enum Anchor {
 #[derive(Clone)]
 struct Reached {
     anchor: Anchor,
-    /// The labelled `receive` call's label (label arm only).
-    label: Option<SubjectLabel>,
     request: RequestRead,
     /// The label's method member path, as steps (label arm only).
     method_steps: Option<Vec<Step>>,
@@ -160,7 +157,6 @@ impl Reader<'_, '_> {
         match (&chain.end, &facts.entry) {
             (ChainEnd::EntryPoint { .. }, Some(entry)) => Ok(Reached {
                 anchor: Anchor::Entry(entry.node, entry.param),
-                label: None,
                 request: RequestRead {
                     param: entry.param,
                     steps: entry.steps.iter().map(Step::render).collect(),
@@ -175,6 +171,12 @@ impl Reader<'_, '_> {
     /// The labelled end discovery found at the handoff call.
     fn end_at(&self, file: &str, handoff: &Handoff) -> Option<&LabelledEnd> {
         self.end_at_site(file, &handoff.site)
+    }
+
+    /// The labelled end at the handoff call, its file read off the caller.
+    fn end_of(&self, handoff: &Handoff) -> Option<&LabelledEnd> {
+        let file = self.chains.rel(self.chains.nodes[handoff.caller].file);
+        self.end_at(&file, handoff)
     }
 
     /// The labelled end discovery found at the call `site` in `file`.
@@ -204,25 +206,13 @@ impl Reader<'_, '_> {
         if end.op.as_deref() != Some("receive") {
             return None;
         }
-        self.labels
-            .iter()
-            .any(|label| {
-                label.op.as_deref() == Some("receive")
-                    && label.package == end.package
-                    && label.export == end.export
-                    && label.member == end.member
-                    && label
-                        .handler
-                        .as_ref()
-                        .is_some_and(|slot| slot_is(slot, arg, path))
-            })
-            .then_some(end)
+        handler_at(self.labels, end, arg, path).then_some(end)
     }
 
     /// The label arm: the handoff call is a labelled `receive` whose label
     /// names the handler slot, the request parameter and the path read.
     fn labelled(&self, chain: &GuardChain, handoff: &Handoff) -> Result<Reached, String> {
-        let (end, request) = self.request_of(chain, handoff)?;
+        let (_, request) = self.request_of(chain, handoff)?;
         if !reads_path(&handoff.steps, request) {
             return Err("steps_not_path".to_string());
         }
@@ -233,11 +223,6 @@ impl Reader<'_, '_> {
                 handoff.site.span_end,
                 handoff.param,
             ),
-            label: Some(SubjectLabel {
-                package: end.package.clone(),
-                export: end.export.clone(),
-                member: end.member.clone(),
-            }),
             request: RequestRead {
                 param: handoff.param,
                 steps: handoff.steps.iter().map(Step::render).collect(),
@@ -279,24 +264,7 @@ impl Reader<'_, '_> {
         if end.op.as_deref() != Some("receive") {
             return Err("handoff_not_receive".to_string());
         }
-        let mut agreed: Vec<(&Option<ArgSlot>, &Option<RequestAt>)> = Vec::new();
-        for label in self.labels.iter().filter(|label| {
-            label.op.as_deref() == Some("receive")
-                && label.package == end.package
-                && label.export == end.export
-                && label.member == end.member
-        }) {
-            let read = (&label.handler, &label.request);
-            if !agreed.contains(&read) {
-                agreed.push(read);
-            }
-        }
-        if agreed.len() > 1 {
-            return Err("label_ambiguous".to_string());
-        }
-        let Some((handler, Some(request))) = agreed.first().copied() else {
-            return Err("label_without_request".to_string());
-        };
+        let (handler, request) = request_read(self.labels, end)?;
         if !handler
             .as_ref()
             .is_some_and(|slot| slot_is(slot, handoff.arg, &handoff.path))
@@ -308,6 +276,52 @@ impl Reader<'_, '_> {
         }
         Ok((end, request))
     }
+}
+
+/// Whether a `receive` label claimed on `end`'s receiver names the handler
+/// slot `arg` and `path`.
+fn handler_at(labels: &[SiteLabel], end: &LabelledEnd, arg: usize, path: &[String]) -> bool {
+    labels.iter().any(|label| {
+        label.op.as_deref() == Some("receive")
+            && label.is_on(end)
+            && label
+                .handler
+                .as_ref()
+                .is_some_and(|slot| slot_is(slot, arg, path))
+    })
+}
+
+/// The one (handler slot, request) pair the `receive` labels claimed on
+/// `end`'s receiver agree on, or why they name none.
+fn request_read<'l>(
+    labels: &'l [SiteLabel],
+    end: &LabelledEnd,
+) -> Result<(&'l Option<ArgSlot>, &'l RequestAt), String> {
+    let mut agreed: Vec<(&Option<ArgSlot>, &Option<RequestAt>)> = Vec::new();
+    for label in labels
+        .iter()
+        .filter(|label| label.op.as_deref() == Some("receive") && label.is_on(end))
+    {
+        let read = (&label.handler, &label.request);
+        if !agreed.contains(&read) {
+            agreed.push(read);
+        }
+    }
+    if agreed.len() > 1 {
+        return Err("label_ambiguous".to_string());
+    }
+    match agreed.first().copied() {
+        Some((handler, Some(request))) => Ok((handler, request)),
+        _ => Err("label_without_request".to_string()),
+    }
+}
+
+/// Whether a `receive` label claimed on `end`'s receiver names a path slot
+/// (the call takes the path the handler is registered under).
+pub(super) fn names_path(labels: &[SiteLabel], end: &LabelledEnd) -> bool {
+    labels.iter().any(|label| {
+        label.op.as_deref() == Some("receive") && label.is_on(end) && label.name.is_some()
+    })
 }
 
 /// Whether an entry point's chain reads its request's `method`: the member
@@ -467,6 +481,93 @@ mod tests {
             .iter()
             .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
             .collect()
+    }
+
+    /// carrick#1678: a router's `get` (handler arg 1, a path) and the `get`
+    /// of what its `at` returns (handler arg 0) are two labels; each call
+    /// reads its own, whichever order the store lists them in.
+    fn scoped_pair() -> (SiteLabel, SiteLabel, LabelledEnd, LabelledEnd) {
+        let label = |scope: Option<&str>, handler: usize, name: bool, param: u32| SiteLabel {
+            package: "fixture-router".into(),
+            export: "Router".into(),
+            member: Some("get".into()),
+            role: "server_framework".into(),
+            op: Some("receive".into()),
+            side: None,
+            name: name.then_some(ArgSlot { arg: 0, key: None }),
+            payload: None,
+            handler: Some(ArgSlot {
+                arg: handler,
+                key: None,
+            }),
+            method: None,
+            reserved: vec![],
+            runs: None,
+            request: Some(RequestAt {
+                param,
+                path: Some(vec!["path".into()]),
+                url: None,
+                method: None,
+                body: None,
+            }),
+            scope: scope.map(|step| super::super::decided_sites::LabelScope {
+                base: "instance:()".into(),
+                step: step.into(),
+                names: false,
+            }),
+        };
+        let end = |scope: Option<&str>| LabelledEnd {
+            package: "fixture-router".into(),
+            export: "Router".into(),
+            member: Some("get".into()),
+            role: "server_framework".into(),
+            op: Some("receive".into()),
+            file: "a.ts".into(),
+            line: 1,
+            span_start: 0,
+            span_end: 1,
+            new: false,
+            scope: scope.map(str::to_string),
+        };
+        (
+            label(None, 1, true, 0),
+            label(Some("at"), 0, false, 1),
+            end(None),
+            end(Some("at")),
+        )
+    }
+
+    #[test]
+    fn a_router_get_and_a_scoped_get_read_their_own_labels() {
+        let (router, scoped, router_end, scoped_end) = scoped_pair();
+        let path = Vec::<String>::new();
+        for labels in [
+            vec![router.clone(), scoped.clone()],
+            vec![scoped.clone(), router.clone()],
+        ] {
+            // request_of's read: the one request each call's label names.
+            let (handler, request) = request_read(&labels, &router_end).unwrap();
+            assert_eq!((handler.as_ref().unwrap().arg, request.param), (1, 0));
+            let (handler, request) = request_read(&labels, &scoped_end).unwrap();
+            assert_eq!((handler.as_ref().unwrap().arg, request.param), (0, 1));
+            // receive_at's handler slot.
+            assert!(handler_at(&labels, &router_end, 1, &path));
+            assert!(!handler_at(&labels, &router_end, 0, &path));
+            assert!(handler_at(&labels, &scoped_end, 0, &path));
+            assert!(!handler_at(&labels, &scoped_end, 1, &path));
+            // label_handler's path slot: only the router's get names one.
+            assert!(names_path(&labels, &router_end));
+            assert!(!names_path(&labels, &scoped_end));
+        }
+    }
+
+    #[test]
+    fn without_a_scoped_label_the_router_label_is_read_as_before() {
+        let (router, _, router_end, _) = scoped_pair();
+        let labels = vec![router];
+        assert!(request_read(&labels, &router_end).is_ok());
+        assert!(handler_at(&labels, &router_end, 1, &[]));
+        assert!(names_path(&labels, &router_end));
     }
 
     fn the_fixture() -> Option<Walked> {

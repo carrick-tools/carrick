@@ -415,13 +415,20 @@ impl SiteLabel {
     /// `at` returns) is two labels, told apart by the end's scope step
     /// (carrick#1678). A maker's label (no op) is [`Self::runner`]'s.
     pub fn find<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Option<&'l SiteLabel> {
-        labels.iter().find(|label| {
-            label.op.is_some()
-                && label.package == end.package
-                && label.export == end.export
-                && label.member == end.member
-                && label.scope.as_ref().map(|scope| &scope.step) == end.scope.as_ref()
-        })
+        labels
+            .iter()
+            .find(|label| label.op.is_some() && label.is_on(end))
+    }
+
+    /// Whether the label is claimed on the receiver `end` is made on: the
+    /// same package, export and member, and the same scope step (none for a
+    /// member claimed on the export itself). The one match every lookup of a
+    /// label by its end shares (carrick#1678).
+    pub fn is_on(&self, end: &LabelledEnd) -> bool {
+        self.package == end.package
+            && self.export == end.export
+            && self.member == end.member
+            && self.scope.as_ref().map(|scope| &scope.step) == end.scope.as_ref()
     }
 
     /// Whether the op has a name to read: a slot of its own call, or the
