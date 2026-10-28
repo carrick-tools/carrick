@@ -1206,6 +1206,13 @@ export interface SurfaceMember {
    * their own: 500 members per parameter, top-level first (carrick#2966).
    */
   handlers?: SurfaceHandler[];
+  /**
+   * The object this member returns when called with a path, listed as a
+   * receiver (id `R>scope:m`) when routes are registered on it (carrick#2774).
+   * Instance receivers only, one level, under a cap of its own, and left out
+   * of the hash.
+   */
+  scope_receiver?: SurfaceReceiver;
   signatures: SurfaceSignature[];
 }
 

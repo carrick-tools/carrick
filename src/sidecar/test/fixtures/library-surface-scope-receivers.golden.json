@@ -1,0 +1,76 @@
+{
+  "surface_sha256": "184792da4f324db115bf61a674a92ae754d4483715a6db7617fc45b50888065f",
+  "tiny": {
+    "max_entries": 12,
+    "surfaces": [
+      {
+        "package": "fixture-chain-router",
+        "truncated": 16,
+        "exports": [
+          {
+            "export": "app",
+            "receivers": [
+              {
+                "receiver": "export",
+                "members": [],
+                "call": []
+              },
+              {
+                "receiver": "instance:()",
+                "members": [
+                  {
+                    "name": "at",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "at2",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "basePath",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "count",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "either",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "ext",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "fn",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "get",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "label",
+                    "own": true,
+                    "signatures": []
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "installed_version": "1.0.0"
+      }
+    ],
+    "surface_sha256": "286017bc8f15d28f8964c7782afa467562a65cbeb22bd27733cba14fbe582321"
+  }
+}

@@ -947,6 +947,11 @@ export class LibraryClaimsVerifier {
    * (`receiverExpression` on the export's `importLine`, read through
    * `DeclarationReader.returnOf`) and lists from it.
    *
+   * A member of an `instance:` receiver whose call returns another object
+   * that routes are registered on lists that object as its `scope_receiver`
+   * (carrick#2774), built as the verifier builds a scope step, under a cap of
+   * its own and left out of the hash.
+   *
    * Each member's handler-parameter members (carrick#2674 S3) are listed
    * only when `options.handlers` is set, and each signature's result
    * candidates (carrick#2817) only when `options.resultCandidates` is
@@ -992,10 +997,12 @@ export class LibraryClaimsVerifier {
     const buildLines: string[] = [];
     const builtIndex = new Map<string, number>();
     packages.forEach((pkg, i) => {
-      for (const { export: name, receivers } of makers[i]) {
+      for (const { export: name, receivers, scopes } of makers[i]) {
         const local = `__carrick_e${importLines.length}`;
         importLines.push(probeLine(pkg, name, local));
-        for (const receiver of receivers) {
+        // The scope receivers a maker's members may return (carrick#2774) are
+        // built beside the makers, so `listPackage` reads them as it reads those.
+        for (const receiver of [...receivers, ...scopes]) {
           const expression = receiverExpression(local, receiver);
           if (expression === undefined) continue;
           builtIndex.set(builtKey({ package: pkg, export: name }, receiver), buildLines.length);
@@ -1055,6 +1062,15 @@ interface ListedExport {
   type: ts.Type;
 }
 
+/** An instance receiver the surface lists, with what the scope pass reads its members on (carrick#2774). */
+interface ScopeSource {
+  export: string;
+  target: ts.Symbol;
+  type: ts.Type;
+  home: ReadonlySet<string>;
+  receiver: SurfaceReceiver;
+}
+
 /** A way an export makes a receiver, by receiver id, with the library signatures that make it. */
 interface Maker {
   receiver: string;
@@ -1086,8 +1102,8 @@ export interface ListedSurface {
  * array of `[package, exports]` for every surface that listed at least one
  * export, sorted by `package` (code unit order). A specifier that lists
  * nothing (unresolved, local, no value exports) is left out, so asking for a
- * subpath a version does not have changes nothing. Handler members are not
- * hashed. Type text already names
+ * subpath a version does not have changes nothing. Handler members, result
+ * candidates and scope receivers are not hashed. Type text already names
  * the request's directory as `<root>`.
  */
 export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
@@ -1095,11 +1111,12 @@ export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
     .filter(surface => surface.reason === undefined && surface.exports.length > 0)
     .map(surface => [surface.package, surface.exports] as const)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  // A member's `handlers` (carrick#2674) and a signature's `result_candidates`
-  // (carrick#2817) are out of the hash at every depth, so a package's key does
-  // not change when the lister learns to list them.
+  // A member's `handlers` (carrick#2674), a signature's `result_candidates`
+  // (carrick#2817) and a member's `scope_receiver` (carrick#2774) are out of
+  // the hash at every depth, so a package's key does not change when the
+  // lister learns to list them.
   const text = JSON.stringify(listed, (key, value) =>
-    key === 'handlers' || key === 'result_candidates' ? undefined : value
+    key === 'handlers' || key === 'result_candidates' || key === 'scope_receiver' ? undefined : value
   );
   return crypto.createHash('sha256').update(text).digest('hex');
 }
@@ -1273,6 +1290,18 @@ function receiverExpression(local: string, receiver: string): string | undefined
   return text;
 }
 
+/**
+ * The id of the receiver `member` of the receiver `receiver` returns when
+ * called with a path (carrick#2774): `receiver>scope:member`. Undefined for a
+ * receiver that is not an instance, or a member name the verifier's grammar
+ * does not read back as one scope step.
+ */
+function scopeReceiverId(receiver: string, member: string): string | undefined {
+  if (!receiver.startsWith('instance:') || receiver.includes('>') || /[>.\s]/.test(member)) return undefined;
+  const id = `${receiver}>scope:${member}`;
+  return parseReceiver(id)?.scope === member ? id : undefined;
+}
+
 /** The symbols that say who declared a type: its own, its alias's, its parts'. */
 function typeSymbols(type: ts.Type): (ts.Symbol | undefined)[] {
   const symbols: (ts.Symbol | undefined)[] = [type.getSymbol(), type.aliasSymbol];
@@ -1374,6 +1403,9 @@ class DeclarationReader {
   private readonly declared = new Map<ts.Type, ts.Symbol[]>();
   /** A handler parameter's listed members per type, for the package being listed (`handlerMembersOf`). */
   private readonly handlerMembers = new Map<ts.Type, { members: SurfaceHandlerMember[]; dropped: number }>();
+  /** `takesString` per signature, and `scopeMembers` per type and home: the same types recur across receivers. */
+  private readonly takesStringRead = new Map<ts.Signature, boolean>();
+  private readonly scopeMembersRead = new Map<ts.Type, Map<string, readonly string[]>>();
   /** Handler-parameter members `HANDLER_MEMBER_CAP` dropped in the package being listed. */
   private handlersDropped = 0;
   /** Whether the package being listed lists each signature's `result_candidates`. */
@@ -3457,6 +3489,8 @@ class DeclarationReader {
     // What the package's default export names: a maker also exported by name
     // under this declaration is imported the same way, so it is read the same.
     const defaultTarget = exported.find(each => each.name === 'default')?.target;
+    // The instance receivers listed, for the scope pass (carrick#2774).
+    const instances: ScopeSource[] = [];
     for (const { name, target, type } of exported) {
       if (!take()) continue;
       const entry: SurfaceExport = { export: name, receivers: [] };
@@ -3465,7 +3499,11 @@ class DeclarationReader {
       const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
         if (!take()) return;
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
-        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, handlers, fills));
+        const receiver = this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, handlers, fills);
+        entry.receivers.push(receiver);
+        if (receiverName.startsWith('instance:')) {
+          instances.push({ export: name, target, type: receiverType, home, receiver });
+        }
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
@@ -3486,26 +3524,214 @@ class DeclarationReader {
     for (const run of names) run();
     if (withHandlers) for (const run of handlers) run();
     for (const fill of fills) fill();
+    this.listScopeReceivers(pkg, instances, maxEntries, withHandlers, built);
     surface.truncated = dropped;
     if (withHandlers) surface.handlers_truncated = this.handlersDropped;
     return surface;
   }
 
   /**
+   * The fifth pass (carrick#2774): each own member of an instance receiver
+   * whose call returns the object routes are registered on lists it as
+   * `scope_receiver`, outlined as any receiver is. Everything it lists draws
+   * on one budget of its own, spent after every other pass, so the listing
+   * without it, `truncated` and the hash are the ones the lister gave before.
+   * One level: a scope receiver lists no scope receiver of its own.
+   */
+  private listScopeReceivers(
+    pkg: string,
+    sources: readonly ScopeSource[],
+    maxEntries: number,
+    withHandlers: boolean,
+    built: (exportName: string, receiver: string) => ts.Signature | undefined
+  ): void {
+    let budget = maxEntries;
+    const take = (): boolean => budget > 0 && (budget--, true);
+    const names: Array<() => void> = [];
+    const handlers: Array<() => void> = [];
+    const fills: Array<() => void> = [];
+    for (const source of sources) {
+      const holder = this.surfaceHolder(pkg, source.type, source.home);
+      for (const member of source.receiver.members) {
+        const id = member.own ? scopeReceiverId(source.receiver.receiver, member.name) : undefined;
+        if (id === undefined) continue;
+        const callee = this.ownCallee(holder, [], member.name, 'call');
+        if (!('signatures' in callee)) continue;
+        if (!callee.signatures.some(signature => this.takesString(signature))) continue;
+        const type = this.scopeTypeOf(callee.signatures, built(source.export, id), source.type, source.home);
+        if (type === undefined || !take()) continue;
+        const home = this.homeOf(pkg, [source.target, ...typeSymbols(type)]);
+        member.scope_receiver = this.outlineReceiver(pkg, id, type, home, take, names, handlers, fills);
+      }
+    }
+    for (const run of names) run();
+    if (withHandlers) for (const run of handlers) run();
+    for (const fill of fills) fill();
+  }
+
+  /**
    * The receivers each export of a specifier can make, by receiver id, for
    * the probe statements that build them (see `LibraryClaimsVerifier.listSurface`).
    */
-  makersOf(pkg: string, probe: SurfaceProbe, only: readonly string[] | undefined): { export: string; receivers: string[] }[] {
+  makersOf(
+    pkg: string,
+    probe: SurfaceProbe,
+    only: readonly string[] | undefined
+  ): { export: string; receivers: string[]; scopes: string[] }[] {
     this.setPackage(pkg);
     const moduleRead = 'namespace' in probe ? this.readModule(pkg, probe.namespace, true) : undefined;
     if (moduleRead?.reason) return [];
     return (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
       .filter(({ type }) => !this.isOpenTop(type))
-      .map(({ name, target, type }) => ({
-        export: name,
-        receivers: this.makers(pkg, target, type).map(maker => maker.receiver),
-      }))
+      .map(({ name, target, type }) => {
+        const makers = this.makers(pkg, target, type);
+        return {
+          export: name,
+          receivers: makers.map(maker => maker.receiver),
+          scopes: this.scopeCandidates(pkg, target, makers),
+        };
+      })
       .filter(({ receivers }) => receivers.length > 0);
+  }
+
+  /**
+   * The `R>scope:m` receivers an export's `instance:` makers may have
+   * (carrick#2774): for each object type a maker's overloads declare as their
+   * return, each own member that `scopeTypeOf` lists at its declared return.
+   * A superset of the listing, which reads each at the type the probe's build
+   * resolves; the second program builds these so `listPackage` can.
+   */
+  private scopeCandidates(pkg: string, target: ts.Symbol, makers: readonly Maker[]): string[] {
+    const found = new Set<string>();
+    for (const maker of makers) {
+      if (!maker.receiver.startsWith('instance:')) continue;
+      const types = new Set(maker.signatures.map(sig => this.checker.getReturnTypeOfSignature(sig)));
+      for (const type of types) {
+        if (this.returnSaysNothing(type) || !this.isObjectType(type)) continue;
+        const home = this.homeOf(pkg, [target, ...typeSymbols(type)]);
+        for (const name of this.scopeMembers(pkg, type, home)) {
+          const id = scopeReceiverId(maker.receiver, name);
+          if (id !== undefined) found.add(id);
+        }
+      }
+    }
+    return [...found];
+  }
+
+  /** The members of `type` that list a scope receiver at their declared return, read once per type and home. */
+  private scopeMembers(pkg: string, type: ts.Type, home: ReadonlySet<string>): readonly string[] {
+    const key = [...home].sort().join('\u0000');
+    let byHome = this.scopeMembersRead.get(type);
+    if (byHome === undefined) this.scopeMembersRead.set(type, (byHome = new Map()));
+    const read = byHome.get(key);
+    if (read !== undefined) return read;
+    const names: string[] = [];
+    const holder = this.surfaceHolder(pkg, type, home);
+    for (const property of sortedByName(this.namedProperties(type))) {
+      if (!this.mayScope(property)) continue;
+      const callee = this.ownCallee(holder, [], property.getName(), 'call');
+      if ('signatures' in callee && this.scopeTypeOf(callee.signatures, undefined, type, home) !== undefined) {
+        names.push(property.getName());
+      }
+    }
+    byHome.set(key, names);
+    return names;
+  }
+
+  /** Some library signature of the member takes a string: the cheap superset of what `scopeTypeOf` asks first. */
+  private mayScope(property: ts.Symbol): boolean {
+    return this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call').some(signature =>
+      this.takesString(signature)
+    );
+  }
+
+  /**
+   * The object a scope member returns, as the verifier reads a scope step
+   * (carrick#2774): what a route is registered on when the member is called
+   * with a path. Undefined unless:
+   * - some own signature takes a string, positionally or at a key of an
+   *   object parameter;
+   * - the returns (at `built`'s defaults, less those that say nothing) are
+   *   all object types, none thenable, sharing one declared symbol that is
+   *   declared in the receiver's home and has a callable member of its own;
+   * - that symbol and the receiver's share no declaration in the home
+   *   (`family`): the receiver itself (`basePath(): this`), a sibling or a
+   *   wrapper of one base is a builder's next link, not an object routes
+   *   are registered on.
+   * The type is the return of the overload `built` resolves, when that is
+   * one of the signatures that take a string, else the first of them.
+   */
+  private scopeTypeOf(
+    signatures: readonly ts.Signature[],
+    built: ts.Signature | undefined,
+    receiver: ts.Type,
+    home: ReadonlySet<string>
+  ): ts.Type | undefined {
+    const takers = signatures.filter(signature => this.takesString(signature));
+    const returns = takers
+      .map(signature => ({ signature, type: this.returnOf(signature, built) }))
+      .filter(({ type }) => !this.returnSaysNothing(type));
+    if (returns.length === 0) return undefined;
+    const symbolOf = (type: ts.Type): ts.Symbol | undefined => type.getSymbol() ?? type.aliasSymbol;
+    const symbol = symbolOf(returns[0].type);
+    if (symbol === undefined) return undefined;
+    // The receiver itself, a sibling of it, or a wrapper built from the same
+    // base (a fluent builder's `.default(x)`) is the same kind of thing, not
+    // an object routes are registered on: abstain.
+    const mine = this.family(receiver, home);
+    if ([...this.family(returns[0].type, home)].some(each => mine.has(each))) return undefined;
+    for (const { type } of returns) {
+      if (!this.isObjectType(type) || symbolOf(type) !== symbol || this.isThenable(type)) return undefined;
+    }
+    if (!(symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), home))) return undefined;
+    const chosen = returns.find(({ signature }) => built !== undefined && this.instantiates(built, signature)) ?? returns[0];
+    const callable = this.namedProperties(chosen.type).some(
+      member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0
+    );
+    return callable ? chosen.type : undefined;
+  }
+
+  /** The type's own declaration and every base it extends or implements that its home declares. */
+  private family(type: ts.Type, home: ReadonlySet<string>): Set<ts.Symbol> {
+    const found = new Set<ts.Symbol>();
+    const visit = (each: ts.Type, depth: number): void => {
+      const target = ((each as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference ? (each as ts.TypeReference).target : each;
+      const symbol = target.getSymbol();
+      if (symbol === undefined || found.has(symbol) || depth > 12) return;
+      if (!(symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), home))) return;
+      found.add(symbol);
+      if (((target as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.ClassOrInterface) {
+        for (const base of this.checker.getBaseTypes(target as ts.InterfaceType)) visit(base, depth + 1);
+      }
+    };
+    visit(type, 0);
+    return found;
+  }
+
+  /** A parameter of the signature accepts a string, positionally or at a key of its object. */
+  private takesString(signature: ts.Signature): boolean {
+    let read = this.takesStringRead.get(signature);
+    if (read === undefined) this.takesStringRead.set(signature, (read = this.readTakesString(signature)));
+    return read;
+  }
+
+  private readTakesString(signature: ts.Signature): boolean {
+    const count = signature.getParameters().length;
+    for (let index = 0; index < count; index++) {
+      const slot = this.keyParameterAt(signature, index);
+      if (slot === undefined || slot === VARIADIC) continue;
+      if (this.acceptsString(this.throughConditional(slot))) return true;
+      if (this.isObjectType(slot) && this.handlerFailure(slot) !== undefined) {
+        if (this.listKeys(slot, () => true).some(key => key.accepts_string)) return true;
+      }
+    }
+    return false;
+  }
+
+  /** The type has a callable `then`: awaiting it gives something else. */
+  private isThenable(type: ts.Type): boolean {
+    const then = this.checker.getPropertyOfType(type, 'then');
+    return then !== undefined && this.checker.getNonNullableType(this.checker.getTypeOfSymbol(then)).getCallSignatures().length > 0;
   }
 
   /**

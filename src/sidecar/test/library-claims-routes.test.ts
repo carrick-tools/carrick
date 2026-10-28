@@ -108,6 +108,22 @@ export default factory;
 export declare function helper(): void;
 `;
 
+// A server package whose app hands back a route object: `at(path)` returns
+// a `Route` that the verbs are registered on (carrick#2774). The verbs take
+// handlers only, so the path is the one `at` was called with.
+const CHAIN_ROUTER = `export type Handler = (request: { body: unknown }, reply: { send(body: unknown): void }) => void;
+export interface Route {
+  get(...handlers: Handler[]): this;
+  post(...handlers: Handler[]): this;
+  delete(...handlers: Handler[]): this;
+}
+export interface App {
+  get(path: string, ...handlers: Handler[]): this;
+  at(path: string): Route;
+}
+export declare function app(): App;
+`;
+
 function writeTree(root: string, files: Record<string, string>): void {
   for (const [rel, text] of Object.entries(files)) {
     const file = path.join(root, rel);
@@ -191,6 +207,12 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
       'src/index.ts': 'export const service = 1;\n',
       'node_modules/fixture-server/package.json': JSON.stringify({ name: P, version: '1.0.0', types: 'index.d.ts' }),
       'node_modules/fixture-server/index.d.ts': SERVER,
+      'node_modules/fixture-chain-router/package.json': JSON.stringify({
+        name: 'fixture-chain-router',
+        version: '1.0.0',
+        types: 'index.d.ts',
+      }),
+      'node_modules/fixture-chain-router/index.d.ts': CHAIN_ROUTER,
       'node_modules/fixture-plugin-server/package.json': JSON.stringify({
         name: 'fixture-plugin-server',
         version: '1.0.0',
@@ -440,6 +462,52 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
       ]),
       ['unchecked claim_invalid', 'unchecked claim_invalid', 'unchecked claim_invalid']
     );
+  });
+
+  it('a route object a scope returns is the receiver its verbs are registered on (carrick#2774)', async () => {
+    const chain = (receiver: string, claim: Claim): Check => ({
+      claim_id: `c${sequence++}`,
+      package: 'fixture-chain-router',
+      export: 'app',
+      role: 'server_framework',
+      receiver,
+      claim,
+    });
+    const make = chain('export', { kind: 'make', form: 'call', member: null });
+    const at = chain('instance:()', { kind: 'scope', member: 'at', name: { arg: 0 }, of: 'instance:()' });
+    const SCOPE = 'instance:()>scope:at';
+    const verb = (member: string, name: Record<string, unknown> = { bound: 'scope' }) =>
+      chain(SCOPE, {
+        kind: 'op',
+        op: 'receive',
+        member,
+        name,
+        handler: { arg: 0 },
+        method: member.toUpperCase(),
+        of: SCOPE,
+      });
+    const ask = (checks: Check[]) =>
+      client.send<{ status: string; errors?: string[]; verdicts?: Array<{ verdict: string; reason?: string; declarations?: unknown }> }>(
+        { request_id: `routes-${requestId++}`, action: 'verify_library_claims', from_dir: root, checks },
+        60_000
+      );
+    // The scope claim and the verbs: all verified, each verb at `Route`'s member.
+    const held = await ask([make, at, verb('get'), verb('post'), verb('delete')]);
+    assert.deepStrictEqual(verdicts(held), ['verified', 'verified', 'verified', 'verified', 'verified']);
+    const file = 'node_modules/fixture-chain-router/index.d.ts';
+    const lineOf = (needle: string): number => CHAIN_ROUTER.split('\n').findIndex(line => line.includes(needle)) + 1;
+    assert.deepStrictEqual(
+      held.verdicts!.slice(2).map(each => each.declarations),
+      ['get(...', 'post(...', 'delete(...'].map(needle => [{ decl_file: file, decl_line: lineOf(needle) }])
+    );
+    // The verbs without the scope claim that builds their receiver are not read.
+    assert.deepStrictEqual(verdicts(await ask([make, verb('get')])), ['verified', 'unchecked scope_unverified']);
+    // A verb that names its path from its own first argument is refused: that argument is its handler.
+    assert.deepStrictEqual(verdicts(await ask([make, at, verb('get', { arg: 0 })])), [
+      'verified',
+      'verified',
+      'failed slots_overlap',
+    ]);
   });
 
   it('refuses a request whose route field is outside the shape', async () => {
