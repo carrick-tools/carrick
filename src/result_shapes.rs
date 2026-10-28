@@ -289,6 +289,7 @@ mod tests {
                 verdict: SemanticsVerdict::Verified,
                 reason: None,
                 declarations: Vec::new(),
+                request_dropped: None,
             })
             .collect()
     }

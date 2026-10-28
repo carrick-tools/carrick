@@ -201,6 +201,10 @@ pub struct SiteLabel {
     /// site's state carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<crate::services::type_sidecar::RequestAt>,
+    /// The verifier verified this `receive` op but dropped its `request`
+    /// (carrick#2979): the dispatch read takes no path or method from it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub request_dropped: bool,
 }
 
 /// A maker that runs the function its call supplies at `slot`
@@ -271,6 +275,7 @@ impl SiteLabel {
                         reserved: Vec::new(),
                         runs: None,
                         request: op.request,
+                        request_dropped: false,
                     });
                 }
             }
@@ -324,6 +329,7 @@ impl SiteLabel {
                             new: *form == MakeForm::New,
                         }),
                         request: None,
+                        request_dropped: false,
                     });
                     continue;
                 }
@@ -368,6 +374,7 @@ impl SiteLabel {
                     reserved: reserved_on(&export.claims, member.as_deref(), path, (*on, of)),
                     runs: None,
                     request: request.as_deref().cloned(),
+                    request_dropped: false,
                 });
             }
         }
@@ -2718,6 +2725,7 @@ pub(crate) mod tests {
                     reserved: Vec::new(),
                     runs: None,
                     request: None,
+                    request_dropped: false,
                     method: Some(MethodLabel {
                         from: None,
                         default: None,
@@ -2737,6 +2745,7 @@ pub(crate) mod tests {
                     reserved: Vec::new(),
                     runs: None,
                     request: None,
+                    request_dropped: false,
                     method: Some(MethodLabel {
                         from: Some(ArgSlot {
                             arg: 1,
@@ -3531,6 +3540,7 @@ pub(crate) mod tests {
             reserved: Vec::new(),
             runs: None,
             request: None,
+            request_dropped: false,
             method: None,
         }
     }
@@ -3550,6 +3560,7 @@ pub(crate) mod tests {
             reserved: Vec::new(),
             runs: None,
             request: None,
+            request_dropped: false,
             method: Some(MethodLabel {
                 from: Some(ArgSlot {
                     arg: 1,
@@ -3577,6 +3588,7 @@ pub(crate) mod tests {
             reserved: Vec::new(),
             runs: None,
             request: None,
+            request_dropped: false,
             method: None,
         }
     }
@@ -4254,6 +4266,7 @@ pub(crate) mod tests {
             reserved: Vec::new(),
             runs: None,
             request: None,
+            request_dropped: false,
             method: Some(MethodLabel {
                 from: None,
                 default: None,

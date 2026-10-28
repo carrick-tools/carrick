@@ -842,6 +842,12 @@ pub struct SemanticsResult {
     /// A verified op's member as declared on its receiver. Nothing reads it yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declarations: Vec<SemanticsDeclaration>,
+    /// A verified `receive` op whose `request` names a member the
+    /// declarations lack (carrick#2968): the route stands, its request does
+    /// not. The reason, `request_member_missing`. Read by the dispatch routes
+    /// (carrick#2979).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_dropped: Option<String>,
 }
 
 /// Where a member is declared, spelled as a position row's `decl_file` and
@@ -6127,7 +6133,9 @@ mod tests {
                 { "claim_id": "v", "receiver": "instance:create", "verdict": "failed",
                   "reason": "member_missing" },
                 { "claim_id": "r", "receiver": "export", "verdict": "unchecked",
-                  "reason": "budget" }
+                  "reason": "budget" },
+                { "claim_id": "q", "receiver": "export", "verdict": "verified",
+                  "request_dropped": "request_member_missing" }
             ],
             "semantics_modules": [
                 { "package": "@fixture/http", "resolved_file": "/svc/node_modules/x/index.d.ts",
@@ -6145,12 +6153,19 @@ mod tests {
                 verdict: SemanticsVerdict::Verified,
                 reason: None,
                 declarations: Vec::new(),
+                request_dropped: None,
             }
         );
         assert_eq!(semantics[1].verdict, SemanticsVerdict::Failed);
         assert_eq!(semantics[1].reason.as_deref(), Some("member_missing"));
         assert_eq!(semantics[2].verdict, SemanticsVerdict::Unchecked);
         assert_eq!(semantics[2].reason.as_deref(), Some("budget"));
+        // carrick#2979: a verified verdict may carry a dropped request.
+        assert_eq!(
+            semantics[3].request_dropped.as_deref(),
+            Some("request_member_missing")
+        );
+        assert_eq!(semantics[0].request_dropped, None);
         // carrick#2021: the one the time limit did not reach is counted, and
         // the reason counted is the one the verifier writes.
         assert_eq!(not_reached_in_time(&semantics), 1);

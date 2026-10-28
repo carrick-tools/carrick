@@ -5533,7 +5533,12 @@ fn site_records_of(
         .filter(|site| site.end.is_some())
         .count();
     let discovered = discovered_sites(discovery);
-    let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
+    let mut labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
+    // A route the verifier kept but whose request it dropped (carrick#2979)
+    // is read by no dispatch path.
+    if let Some(declarations) = context.declarations {
+        declarations.mark_dropped_requests(&mut labels);
+    }
     // With the receiver trace on, each request handler's path and method
     // comparisons, as the records the handler questions ask (carrick#2474
     // R4b).
@@ -20405,6 +20410,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 },
                 reason: None,
                 declarations: Vec::new(),
+                request_dropped: None,
                 claim_id: check.claim_id,
                 receiver: check.receiver,
             })
