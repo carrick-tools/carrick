@@ -480,6 +480,13 @@ export interface ModuleGraph {
 
 const NO_MODULE_GRAPH: ModuleGraph = { packageDirectoryOf: () => undefined, resolveModule: () => undefined };
 
+/**
+ * Test instrumentation, never on the wire: how many times the lister built a
+ * handler parameter's members and printed a type, since the caller last
+ * reset them (carrick#2977).
+ */
+export const surfaceReadCounts = { handlerMemberBuilds: 0, typePrints: 0 };
+
 export class LibraryClaimsVerifier {
   constructor(
     private readonly project: Project,
@@ -1401,7 +1408,12 @@ class DeclarationReader {
   private currentPackage = '';
   /** `declaredProperties` per type, for `currentPackage` (its augmentations decide them). */
   private readonly declared = new Map<ts.Type, ts.Symbol[]>();
-  /** A handler parameter's listed members per type, for the package being listed (`handlerMembersOf`). */
+  /**
+   * A handler parameter's listed members per type (`handlerMembersOf`), kept
+   * across every specifier of one package and cleared with `declared` when
+   * the package changes: a member's listing reads that package's
+   * augmentations (carrick#2977).
+   */
   private readonly handlerMembers = new Map<ts.Type, { members: SurfaceHandlerMember[]; dropped: number }>();
   /** `takesString` per signature, and `scopeMembers` per type and home: the same types recur across receivers. */
   private readonly takesStringRead = new Map<ts.Signature, boolean>();
@@ -1412,6 +1424,8 @@ class DeclarationReader {
   private listResultCandidates = false;
   /** The service root as given and as a realpath, longest first: what a listing prints as `<root>`. */
   private readonly printedRoots: readonly string[];
+  /** `printed` per type: its text reads nothing but the type and `printedRoots` (carrick#2977). */
+  private readonly printedTexts = new Map<ts.Type, string>();
 
   constructor(
     private readonly program: ts.Program,
@@ -3475,7 +3489,6 @@ class DeclarationReader {
     // so the listing, `truncated` and the hash are the ones the lister gave
     // before handlers were listed; each parameter has a cap of its own
     // (`HANDLER_MEMBER_CAP`, carrick#2966).
-    this.handlerMembers.clear();
     this.handlersDropped = 0;
     this.listResultCandidates = options.resultCandidates === true;
     const withHandlers = options.handlers === true;
@@ -3982,12 +3995,13 @@ class DeclarationReader {
    * The cap keeps every top-level member before any nested one, so a wide
    * parameter loses its deepest members, never a top-level one a later member
    * name sorts after. Kept members come back parents before children, each
-   * level sorted by name. Read once per type in a package: a type many
-   * handlers share is listed once.
+   * level sorted by name. Read once per type in a package, across its
+   * specifiers: a type many handlers share is listed once.
    */
   private handlerMembersOf(type: ts.Type): { members: SurfaceHandlerMember[]; dropped: number } {
     const known = this.handlerMembers.get(type);
     if (known) return known;
+    surfaceReadCounts.handlerMemberBuilds += 1;
     interface Node { member: SurfaceHandlerMember; children: Node[] }
     const roots: Node[] = [];
     let kept = 0;
@@ -4119,9 +4133,14 @@ class DeclarationReader {
    * so where the cut falls does not depend on where the package is installed.
    */
   private printed(type: ts.Type): string {
+    const known = this.printedTexts.get(type);
+    if (known !== undefined) return known;
+    surfaceReadCounts.typePrints += 1;
     const node = this.checker.typeToTypeNode(type, undefined, PRINT_FLAGS);
     const text = node === undefined ? this.checker.typeToString(type) : printTypeNode(this.orderUnions(node));
-    return truncate(this.scrubbed(text));
+    const listed = truncate(this.scrubbed(text));
+    this.printedTexts.set(type, listed);
+    return listed;
   }
 
   /** `text` with the service root written as `<root>`. */
@@ -4304,7 +4323,10 @@ class DeclarationReader {
   /** Judge the next check as a claim about `pkg`. */
   setPackage(pkg: string): void {
     const named = packageNameOf(pkg);
-    if (named !== this.currentPackage) this.declared.clear();
+    if (named !== this.currentPackage) {
+      this.declared.clear();
+      this.handlerMembers.clear();
+    }
     this.currentPackage = named;
   }
 
