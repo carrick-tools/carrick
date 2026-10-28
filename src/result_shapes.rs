@@ -209,6 +209,23 @@ impl ResultIndex {
         }
     }
 
+    /// The verified result of the call a site record anchors at `anchor`
+    /// (carrick#2910): by its SWC span, under the file reduced to the
+    /// repo-relative form the index is keyed by, whatever form the anchor's
+    /// file takes (carrick#2974).
+    pub fn at_anchor(
+        &self,
+        anchor: &crate::request_summary::site_record::AnchorAt,
+        repo_path: &str,
+    ) -> Option<ResultShape> {
+        self.at(
+            crate::utils::repo_relative_source_path(&anchor.file, repo_path),
+            Some((anchor.span_start, anchor.span_end)),
+            anchor.line,
+        )
+        .cloned()
+    }
+
     /// An index holding `result` for the call at `file` with SWC span
     /// `span`, as a test of what reads it needs one.
     #[cfg(test)]

@@ -110,6 +110,7 @@ impl SitePayloads {
         &self,
         entries: &[TypeManifestEntry],
         repo_path: &str,
+        results: &crate::result_shapes::ResultIndex,
     ) -> Vec<InferRequestItem> {
         let root = Path::new(repo_path);
         let mut sources: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -169,6 +170,13 @@ impl SitePayloads {
                     (InferKind::RequestConfig, None, Some(key.clone()))
                 }
             };
+            // A call's result takes the store's label for the call it reads
+            // (carrick#2910): the request replaces the reader's and the site
+            // row's, which carry it.
+            let result = match slot {
+                PayloadAt::Result(at) => results.at_anchor(at, repo_path),
+                _ => None,
+            };
             requests.push(InferRequestItem {
                 file_path: root.join(&at.file).to_string_lossy().into_owned(),
                 line_number: at.line,
@@ -180,7 +188,7 @@ impl SitePayloads {
                 alias: Some(entry.type_alias.clone()),
                 param_name,
                 member,
-                result: None,
+                result,
             });
         }
         requests

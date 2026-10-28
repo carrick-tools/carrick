@@ -1,0 +1,90 @@
+{
+  "library_claims": [
+    {
+      "package": "fixture-reply-client",
+      "version": "1.0.0",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "fixture-reply-client",
+          "export": "api",
+          "role": "http_client",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "get",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "method": "GET",
+              "result": {
+                "member": [
+                  "data"
+                ]
+              },
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "send",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "method": "POST",
+              "result": {
+                "whole": true
+              },
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "ping",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "method": "GET",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "fixture-reply-client",
+          "export": "useLoad",
+          "role": "http_client",
+          "side": "client",
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "runs": {
+                "arg": 0,
+                "key": "load"
+              },
+              "result": {
+                "member": [
+                  "data"
+                ]
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

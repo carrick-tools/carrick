@@ -4138,7 +4138,7 @@ async fn analyze_current_repo_incremental(
                 sidecar,
                 &semantics_root,
             );
-            let file_orchestrator = file_orchestrator.with_result_index(results);
+            let file_orchestrator = file_orchestrator.with_result_index(results.clone());
             protocol_extractions.site = site_rows_of(
                 crate::site_questions::enabled(),
                 &request_inputs,
@@ -4353,10 +4353,11 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
-            protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
+            protocol_infer.extend(site_infer_requests(&site_fold, repo_path, &results));
             let payload_infer = site_payloads.requests(
                 cloud_data.type_manifest.as_deref().unwrap_or_default(),
                 repo_path,
+                &results,
             );
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
@@ -7714,6 +7715,7 @@ fn apply_site_fold_to_manifest(
 fn site_infer_requests(
     fold: &crate::site_rows::SiteFold,
     repo_path: &str,
+    results: &crate::result_shapes::ResultIndex,
 ) -> Vec<crate::services::type_sidecar::InferRequestItem> {
     use crate::services::type_sidecar::InferRequestItem;
     use crate::site_rows::RowSide;
@@ -7775,12 +7777,15 @@ fn site_infer_requests(
                         None,
                     ));
                 }
-                requests.push(at(
+                let mut call_result = at(
                     &anchors.call,
                     InferKind::CallResult,
                     alias(ManifestTypeKind::Response),
                     None,
-                ));
+                );
+                // The store's label for the call's result (carrick#2910).
+                call_result.result = results.at_anchor(&anchors.call, repo_path);
+                requests.push(call_result);
             }
             (OperationKey::Http { .. }, _) => {}
             (_, RowSide::Call) => {
@@ -11494,7 +11499,8 @@ async fn analyze_current_repo(
 
     // 6. Resolve types using sidecar if available
     let agent_service = AgentService::new();
-    let file_orchestrator = FileOrchestrator::new(agent_service.clone()).with_result_index(results);
+    let file_orchestrator =
+        FileOrchestrator::new(agent_service.clone()).with_result_index(results.clone());
 
     let extraction_config = setup.extraction_config.clone();
 
@@ -11540,10 +11546,11 @@ async fn analyze_current_repo(
     protocol_infer.extend(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
-    protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
+    protocol_infer.extend(site_infer_requests(&site_fold, repo_path, &results));
     let payload_infer = site_payloads.requests(
         cloud_data.type_manifest.as_deref().unwrap_or_default(),
         repo_path,
+        &results,
     );
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
@@ -24179,7 +24186,11 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             );
         }
 
-        let requests = site_infer_requests(&fold, "/repo");
+        let requests = site_infer_requests(
+            &fold,
+            "/repo",
+            &crate::result_shapes::ResultIndex::default(),
+        );
         let aliases: HashSet<&str> = entries
             .iter()
             .map(|entry| entry.type_alias.as_str())
@@ -24226,6 +24237,90 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ),
                 ("/repo/src/client.ts", InferKind::CallResult, Some(99), None),
             ]
+        );
+    }
+
+    /// carrick#2910: an HTTP request's result item takes the store's label for
+    /// the call at its span, under the repo-relative file; a request whose call
+    /// span is not labelled, a payload item and a non-HTTP row carry none, and
+    /// an index with no labels leaves every request as it was.
+    #[test]
+    fn a_site_rows_call_result_item_takes_the_label_at_its_call() {
+        use crate::result_shapes::ResultIndex;
+        use crate::services::type_sidecar::ResultShape;
+        use crate::site_rows::RowSide;
+        let member = ResultShape::Member(["data".to_string()]);
+        let fold_of = |rows: Vec<crate::site_rows::SiteRow>| crate::site_rows::SiteFold {
+            stated: rows,
+            withdrawn: Vec::new(),
+            leads: Vec::new(),
+            route_kept_reader: 0,
+            lead_on_row_line: 0,
+            through_folded: Vec::new(),
+        };
+        // The anchor's file is the one discovery names, absolute here, and the
+        // index is keyed by the repo-relative file.
+        let labelled = site_row(
+            "/repo/src/client.ts",
+            OperationKey::http("POST", "/v1/orders"),
+            RowSide::Call,
+            true,
+        );
+        let other_call = site_row(
+            "/repo/src/other.ts",
+            OperationKey::http("GET", "/v1/other"),
+            RowSide::Call,
+            true,
+        );
+        let publish = site_row(
+            "/repo/src/client.ts",
+            OperationKey::pubsub("orders.settled"),
+            RowSide::Call,
+            true,
+        );
+        let fold = fold_of(vec![labelled, other_call, publish]);
+        let index = ResultIndex::labelled("src/client.ts", (100, 130), member.clone());
+        let requests = site_infer_requests(&fold, "/repo", &index);
+        let carrying: Vec<(&str, InferKind)> = requests
+            .iter()
+            .filter(|request| request.result.is_some())
+            .map(|request| (request.file_path.as_str(), request.infer_kind.clone()))
+            .collect();
+        assert_eq!(
+            carrying,
+            vec![("/repo/src/client.ts", InferKind::CallResult)],
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request.result.is_some())
+                .all(|request| request.result.as_ref() == Some(&member))
+        );
+        // The same span in another file names another call.
+        let elsewhere = ResultIndex::labelled("src/else.ts", (100, 130), member);
+        assert!(
+            site_infer_requests(&fold, "/repo", &elsewhere)
+                .iter()
+                .all(|request| request.result.is_none())
+        );
+        // No labels: byte-identical to the requests with the label stripped.
+        let bare = site_infer_requests(&fold, "/repo", &ResultIndex::default());
+        let strip = |items: &[crate::services::type_sidecar::InferRequestItem]| {
+            items
+                .iter()
+                .map(|item| {
+                    let mut item = item.clone();
+                    item.result = None;
+                    serde_json::to_string(&item).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&bare), strip(&requests));
+        assert!(
+            bare.iter()
+                .map(|item| serde_json::to_string(item).unwrap())
+                .all(|json| !json.contains("\"result\""))
         );
     }
 
