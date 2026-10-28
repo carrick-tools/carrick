@@ -938,6 +938,35 @@ fn a_fact_keeps_the_base_and_host_of_its_call() {
     assert_eq!(graph[0].base, None);
 }
 
+/// The graph row of a fact keeps the reader's client and dispatch, as it
+/// keeps the host and base: they describe the call as written.
+#[test]
+fn a_fact_keeps_the_client_and_dispatch_of_its_call() {
+    let file = "src/forced-http.ts";
+    let mut reader = graph_call("GET", "/v1/item", file, ResolutionSource::Model);
+    reader.client = "axios".to_string();
+    let dispatch = crate::dispatch::Dispatch {
+        location: crate::dispatch::DispatchLocation::Body,
+        field: "action".to_string(),
+        value: "create".to_string(),
+    };
+    reader.dispatch = Some(dispatch.clone());
+    let mut data = blob_with_graph(
+        vec![blob_row(
+            OperationKey::http("GET", "/v1/item"),
+            file,
+            LINE,
+            Some(ResolutionSource::Model),
+        )],
+        vec![reader],
+    );
+    fold_into(&mut data, &rows());
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 1, "{graph:?}");
+    assert_eq!(graph[0].client, "axios");
+    assert_eq!(graph[0].dispatch, Some(dispatch));
+}
+
 /// A candidate replacement (an answer in the band) leaves the graph as it
 /// was: the reader's row stays, and nothing is added.
 #[test]

@@ -832,7 +832,8 @@ pub fn fold(
             // URL names (the external-call inventory classifies on it), and
             // the base a configured one resolves through (the unlisted
             // variable suggestions read it). A fact keyed by an absolute URL
-            // names its own host and has no base.
+            // names its own host and has no base. The client and the dispatch
+            // are read off the call too, so they come from the same row.
             let read = removed.iter().find(|call| {
                 call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
                     relative(root, f) == row.file && l.parse::<u32>().ok() == Some(row.line)
@@ -848,7 +849,7 @@ pub fn fold(
                 method: method.to_string(),
                 target_url: path.to_string(),
                 canonical_path: path.to_string(),
-                client: String::new(),
+                client: read.map(|call| call.client.clone()).unwrap_or_default(),
                 file_location: format!("{}:{}", row.file, row.line),
                 call_kind: None,
                 repo_name: None,
@@ -858,7 +859,7 @@ pub fn fold(
                 base,
                 consumers_not_resolved: None,
                 resolution_source: Some(row.source),
-                dispatch: None,
+                dispatch: read.and_then(|call| call.dispatch.clone()),
                 role: row.through.then_some(ConsumerRole::WrapperCall),
                 reaches_request: None,
                 library_semantics: Vec::new(),
