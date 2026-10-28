@@ -46,6 +46,7 @@ import { findAugmentationFiles } from './augmentations.js';
 import { installedVersions, lockfileVersions } from './lockfile.js';
 import { installedResolutionEdges, RESOLUTION_FILE } from './resolution-edges.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
+import { substituteMachinePathImports } from './machine-paths.js';
 import { installedPackageSpecifier, typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
@@ -474,6 +475,22 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     entryDir,
   });
   const specifierRewrites = denoRewrites + placed.rewrites + rewritten.rewrites;
+  // What the rewrite could not map still names a machine path (carrick#2943).
+  const machinePaths = substituteMachinePathImports({
+    files: emittedFiles.map((rel) => path.join(typesDir, rel)),
+    surfaceAbsPath,
+    tree: stubGuard.narrow(typesDir),
+    labelRoot: opts.scanRoot ?? repoRoot,
+  });
+  if (machinePaths.size > 0) {
+    resolved = resolved.map((anchor) => {
+      const found = machinePaths.get(anchor.request.alias);
+      if (!found) return anchor;
+      const paths = [...new Set([...(anchor.unresolved?.paths ?? []), ...found.paths])];
+      const specifiers = [...new Set([...found.modules, ...(anchor.unresolved?.specifiers ?? [])])];
+      return { ...anchor, unresolved: { paths, specifiers } };
+    });
+  }
 
   // ---- Pin external deps: installed node_modules first, lockfile fallback ----
   // Externals are collected AFTER the rewrite pass: a rewritten paths

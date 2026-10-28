@@ -270,7 +270,7 @@ export function substituteUndeclaredNames(
 }
 
 /** The deep walk's path for `child` inside `parent`, extending `path`. */
-function childPath(parent: ts.Node, child: ts.Node, path: string): string {
+export function childPath(parent: ts.Node, child: ts.Node, path: string): string {
   if (ts.isPropertySignature(parent) && parent.type === child) {
     const name = ts.isIdentifier(parent.name) || ts.isStringLiteral(parent.name)
       ? parent.name.text
