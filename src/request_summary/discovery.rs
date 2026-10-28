@@ -1215,7 +1215,7 @@ impl<'a> Walker<'a> {
                         of,
                         ..
                     } if claimed.as_deref() == member
-                        && !of.as_deref().is_some_and(|of| scope_step(of).is_some()) =>
+                        && of.as_deref().is_none_or(|of| scope_step(of).is_none()) =>
                     {
                         Some(*op)
                     }
