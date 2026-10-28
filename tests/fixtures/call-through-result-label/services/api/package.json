@@ -1,0 +1,8 @@
+{
+  "name": "@fixture/result-api",
+  "version": "1.0.0",
+  "main": "src/routes.ts",
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

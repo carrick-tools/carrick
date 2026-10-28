@@ -1314,6 +1314,9 @@ pub struct Settled {
     /// Rows withdrawn at a client wrapper's call once a leaf row states the
     /// request at its caller ([`withdraw_wrapped`]).
     pub wrapper_rows_withdrawn: usize,
+    /// Rows skipped because a fact site row replaced the model's row at the
+    /// call, and the graph no longer holds it (carrick#2795).
+    pub replaced_by_site_row: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -1367,6 +1370,14 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     row.file, row.line, row.method, row.target
                 );
             };
+            if replaced_by_site_row(service.data, row) {
+                debug!(
+                    "  - {}:{} {} {}: the model's row was replaced by a fact site row",
+                    row.file, row.line, row.method, row.target
+                );
+                settled.replaced_by_site_row += 1;
+                continue;
+            }
             match decider.decide(row) {
                 Reach::None => {
                     left("reaches no request row");
@@ -1428,7 +1439,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         }
     }
     debug!(
-        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} lost an unknown type the chain hands back, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146)",
+        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} lost an unknown type the chain hands back, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146); {} skipped because a fact site row replaced the model's row (carrick#2795)",
         settled.relabelled,
         settled.corrected,
         settled.types_not_carried,
@@ -1436,7 +1447,8 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.requests_not_carried,
         settled.reaches_none,
         settled.reaches_several,
-        settled.reaches_unstated
+        settled.reaches_unstated,
+        settled.replaced_by_site_row
     );
     debug!(
         "Call-through leaf rows stated: {} at calls into a function of the caller's own service that calls into another service and reaches exactly one request there (carrick#1146), and {} at calls straight into a function another service declares (carrick#2773); boundary calls left alone: {} inside a function whose callers state the row, {} whose function reaches a request a third service writes, {} whose function no one definition names",
@@ -1451,6 +1463,32 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.wrapper_rows_withdrawn
     );
     settled
+}
+
+/// Whether the model's row `row` names is gone from the graph because a fact
+/// site row now stands at its call (carrick#2795): the site fold replaced it,
+/// so there is no row to settle. A row absent for any other reason is not
+/// this, and [`apply`] leaves it as before.
+fn replaced_by_site_row(data: &CloudRepoData, row: &SiteRow) -> bool {
+    let Some(graph) = data.mount_graph.as_ref() else {
+        return false;
+    };
+    let location = format!("{}:{}", row.file, row.line);
+    let model_row = graph.data_calls.iter().any(|call| {
+        call.file_location == location
+            && call.method == row.method
+            && call.target_url == row.target
+            && call.resolution_source == Some(ResolutionSource::Model)
+            && call.reaches_request.is_none()
+    });
+    !model_row
+        && graph.data_calls.iter().any(|call| {
+            call.file_location == location
+                && call.reaches_request.is_none()
+                && call
+                    .resolution_source
+                    .is_some_and(|source| source != ResolutionSource::Model)
+        })
 }
 
 /// Each file a service's definitions or rows name, with the index of the
@@ -1798,6 +1836,7 @@ fn withdraw_wrapped(
     };
     let mut withdrawn = 0;
     let mut index = 0;
+    let mut gone: Vec<(String, OperationKey)> = Vec::new();
     data.calls.retain(|call| {
         let keep = index >= held || !wrapped(call);
         index += 1;
@@ -1808,9 +1847,28 @@ fn withdraw_wrapped(
                 call.key
             );
             withdrawn += 1;
+            gone.push((
+                call.file_path.to_string_lossy().into_owned(),
+                call.key.clone(),
+            ));
         }
         keep
     });
+    // The graph holds a twin of each fact row the site fold stated
+    // (carrick#2795): it goes with the row, or the graph keeps a request the
+    // blob's calls no longer state.
+    if let Some(graph) = data.mount_graph.as_mut() {
+        graph.data_calls.retain(|call| {
+            !(call.resolution_source == Some(ResolutionSource::RequestSummary)
+                && call.reaches_request.is_none()
+                && gone.iter().any(|(place, key)| {
+                    *place == call.file_location
+                        && key.as_http().is_some_and(|(method, path)| {
+                            call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
+                        })
+                }))
+        });
+    }
     withdrawn
 }
 
@@ -1904,15 +1962,20 @@ impl Occupied {
     }
 }
 
-/// Whether the service serves the route `reached` requests itself.
-fn serves_own_route(graph: &crate::mount_graph::MountGraph, reached: &Reached) -> bool {
+/// Whether the service serves the route a call to `canonical_path` with
+/// `method` requests itself: the one rule for a row's `own_route`, whichever
+/// pass writes the row (carrick#1926).
+pub(crate) fn serves_own_route(
+    graph: &crate::mount_graph::MountGraph,
+    method: &str,
+    canonical_path: &str,
+) -> bool {
     graph
-        .find_matching_endpoints(&reached.canonical_path, &reached.method)
+        .find_matching_endpoints(canonical_path, method)
         .iter()
         .any(|endpoint| {
             endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
-                && carrick_match::match_agreement(&endpoint.full_path, &reached.canonical_path)
-                    .unwrap_or(0)
+                && carrick_match::match_agreement(&endpoint.full_path, canonical_path).unwrap_or(0)
                     > 0
         })
 }
@@ -1922,7 +1985,7 @@ fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> b
     let Some(graph) = data.mount_graph.as_mut() else {
         return false;
     };
-    let own_route = serves_own_route(graph, reached);
+    let own_route = serves_own_route(graph, &reached.method, &reached.canonical_path);
     let call = DataFetchingCall {
         method: reached.method.clone(),
         target_url: reached.target_url.clone(),
@@ -2743,7 +2806,7 @@ fn apply(
             && call.canonical_path == reached.canonical_path
             && call.dispatch == reached.dispatch
     });
-    let own_route = serves_own_route(graph, reached);
+    let own_route = serves_own_route(graph, &reached.method, &reached.canonical_path);
     // The entries anchored at the site were captured under the operation the
     // model stated.
     let at_the_row = |entry: &crate::cloud_storage::TypeManifestEntry| {
@@ -3772,6 +3835,16 @@ mod tests {
     /// fact in its graph, `getStatus` is only the model's. Settled, with
     /// the client's request for `getItem` stated as `stated_items`.
     fn settle_wrappers(stated_items: &str) -> (Vec<(String, String)>, Settled) {
+        let (facts, _, settled) = settle_wrappers_in_full(stated_items);
+        (facts, settled)
+    }
+
+    /// [`settle_wrappers`], and the places of the app's graph rows after it:
+    /// the site fold put a twin of each wrapper's row in the graph, as a call
+    /// through (carrick#2795).
+    fn settle_wrappers_in_full(
+        stated_items: &str,
+    ) -> (Vec<(String, String)>, Vec<String>, Settled) {
         let app_definitions: serde_json::Map<String, serde_json::Value> = [
             definition_json(
                 "ItemsApi.get",
@@ -3797,7 +3870,10 @@ mod tests {
                 summary_call("GET", "/api/items/${id}", "services/app/src/api.ts:6"),
                 summary_call("GET", "/api/status", "services/app/src/api.ts:10"),
             ]),
-            serde_json::json!([]),
+            serde_json::json!([
+                wrapper_twin("/api/items/${id}", "services/app/src/api.ts:6"),
+                wrapper_twin("/api/status", "services/app/src/api.ts:10"),
+            ]),
         );
         let client_definitions: serde_json::Map<String, serde_json::Value> = [
             definition_json(
@@ -3865,7 +3941,117 @@ mod tests {
             .map(|call| (call.file_path.display().to_string(), call.key.canonical()))
             .collect();
         facts.sort();
-        (facts, settled)
+        let mut graph: Vec<String> = app
+            .mount_graph
+            .iter()
+            .flat_map(|graph| graph.data_calls.iter())
+            .map(|call| call.file_location.clone())
+            .collect();
+        graph.sort();
+        (facts, graph, settled)
+    }
+
+    /// The graph twin of a wrapper's fact row: a call through, as the site
+    /// fold writes it.
+    fn wrapper_twin(path: &str, at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "method": "GET", "target_url": path, "canonical_path": path,
+            "client": "", "file_location": at,
+            "line": at.rsplit_once(':').and_then(|(_, line)| line.parse::<u32>().ok()),
+            "resolution_source": "request_summary", "role": "wrapper_call"
+        })
+    }
+
+    /// carrick#2795: the graph twin of a wrapper's row goes with the row.
+    #[test]
+    fn a_wrapper_s_graph_twin_goes_with_its_row() {
+        let (_, graph, settled) = settle_wrappers_in_full("request_summary");
+        assert_eq!(settled.wrapper_rows_withdrawn, 1, "{graph:?}");
+        assert_eq!(
+            graph,
+            [
+                "services/app/src/api.ts:10".to_string(),
+                "services/app/src/commands.ts:6".to_string(),
+            ],
+            "the withdrawn wrapper's twin is gone, the kept wrapper's stays"
+        );
+        let (_, graph, settled) = settle_wrappers_in_full("model");
+        assert_eq!(settled.wrapper_rows_withdrawn, 0, "{graph:?}");
+        assert_eq!(
+            graph,
+            [
+                "services/app/src/api.ts:10".to_string(),
+                "services/app/src/api.ts:6".to_string(),
+            ],
+            "no row withdrawn, no twin removed"
+        );
+    }
+
+    /// carrick#2795: a fact that is a call through (`wrapper_call`) is no
+    /// request of its own and no row the model left unstated, so the walk
+    /// from a caller never takes the caller's own fact for the request.
+    #[test]
+    fn a_mirrored_call_through_fact_is_neither_a_request_nor_unstated() {
+        let mut call = request_at("a.ts", 3);
+        assert!(is_request_row(&call));
+        call.role = Some(ConsumerRole::WrapperCall);
+        assert!(!is_request_row(&call));
+        assert!(!is_unstated_row(&call));
+    }
+
+    fn site_row_at(line: u32) -> SiteRow {
+        SiteRow {
+            file: "a.ts".to_string(),
+            line,
+            method: "GET".to_string(),
+            target: "/stated".to_string(),
+            steps: vec![Vec::new(), Vec::new(), Vec::new()],
+            receiver: Vec::new(),
+            callbacks: Vec::new(),
+        }
+    }
+
+    fn settled_with_graph(data_calls: serde_json::Value) -> Settled {
+        let mut data = wrapper_blob(
+            "app",
+            serde_json::json!({}),
+            serde_json::json!([]),
+            data_calls,
+        );
+        let sites = CallThroughSites {
+            rows: vec![site_row_at(5)],
+            ..Default::default()
+        };
+        settle(&mut [ServiceRows {
+            data: &mut data,
+            sites: &sites,
+            writable: true,
+        }])
+    }
+
+    /// carrick#2795: a row whose model row the site fold replaced with a fact
+    /// is skipped and counted; the same row with nothing at its call, or with
+    /// the model's row still in the graph, is read as before.
+    #[test]
+    fn a_row_a_fact_site_row_replaced_is_skipped_and_counted() {
+        let stated = |source: &str| {
+            serde_json::json!({
+                "method": "GET", "target_url": "/stated", "canonical_path": "/stated",
+                "client": "", "file_location": "a.ts:5", "line": 5,
+                "resolution_source": source
+            })
+        };
+        let replaced = settled_with_graph(serde_json::json!([stated("request_summary")]));
+        assert_eq!(replaced.replaced_by_site_row, 1);
+        assert_eq!(replaced.reaches_none, 0);
+
+        let nothing_there = settled_with_graph(serde_json::json!([]));
+        assert_eq!(nothing_there.replaced_by_site_row, 0);
+        assert_eq!(nothing_there.reaches_none, 1);
+
+        let model_row = settled_with_graph(serde_json::json!([stated("model")]));
+        assert_eq!(model_row.replaced_by_site_row, 0);
+        assert_eq!(model_row.reaches_none, 1);
     }
 
     /// carrick#2618, the stated side: once call-through states the leaf row

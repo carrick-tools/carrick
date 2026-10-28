@@ -169,6 +169,7 @@ fn row(
         },
         lead: lead(place, UnreadReason::BelowBand),
         needs_reader: false,
+        through: false,
         within: place.within.clone(),
     }
 }

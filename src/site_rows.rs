@@ -67,6 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::agents::file_analyzer_agent::ResolutionSource;
 use crate::analyzer::ApiEndpointDetails;
 use crate::cloud_storage::CloudRepoData;
+use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::{OperationKey, SocketDirection};
 use crate::possible_calls::{PossibleCall, UnreadReason};
 use crate::request_summary::decided_sites::{Decided, DecidedSite, SiteLabel, Through};
@@ -151,6 +152,10 @@ pub struct SiteRow {
     /// does not state its name (carrick#2520): it stands only where a reader
     /// row at its line agrees on the key.
     pub needs_reader: bool,
+    /// Whether the decided call is not the labelled call itself: it reaches
+    /// the library call through a function (carrick#2795). The mirrored graph
+    /// row of such a fact is a `wrapper_call`, never a request of its own.
+    pub through: bool,
     /// A dispatch row's handler (carrick#2474 R4b, [`dispatch`]): the
     /// functions in which a reader endpoint row agreeing on its key is the
     /// same route read again, at another line. Empty for a site's row.
@@ -605,6 +610,14 @@ fn site_of<'d>(decided: &'d Decided, anchors: &TypeAnchors) -> Option<&'d Decide
     })
 }
 
+/// Whether the call a site decides is not its labelled end: the labelled call
+/// is written inside a function the decided call enters (carrick#2795).
+fn is_through(site: &DecidedSite) -> bool {
+    site.file != site.end.file
+        || site.span_start != site.end.span_start
+        || site.span_end != site.end.span_end
+}
+
 /// The rows and possible calls a service's records come to, read with the
 /// labels the store answered and the cloud's answers. The lead-bucket
 /// records and the undecided calls are [`crate::possible_calls::from_sites`]'s.
@@ -719,6 +732,7 @@ pub fn of(
             anchors: record.anchors.clone(),
             lead: lead(UnreadReason::BelowBand),
             needs_reader: needs_reader(record),
+            through: is_through(site),
             within: Vec::new(),
         });
     }
@@ -747,6 +761,11 @@ pub struct SiteFold {
     /// site holds (carrick#2614), as `(file, line, key)`. Each is in
     /// `withdrawn` as well.
     pub through_folded: Vec<(String, u32, OperationKey)>,
+    /// Of `withdrawn`, the call-side reader rows a FACT site row replaced,
+    /// as `(file, line, key)`: the mount graph's copy of each goes too
+    /// (carrick#2795). A row an in-band candidate replaced is not here: the
+    /// graph keeps the reader's row beside the candidate.
+    pub replaced_by_fact: Vec<(String, u32, OperationKey)>,
 }
 
 /// `file` relative to `root`, `/`-separated, whichever form it is held in
@@ -775,17 +794,56 @@ pub fn fold(
     // pass reads them (`call_through::settle`), and would read the folded
     // row as a call of its own (carrick#2704).
     if let Some(graph) = data.mount_graph.as_mut() {
-        graph.data_calls.retain(|call| {
-            !fold.through_folded.iter().any(|(file, line, key)| {
+        // A fact site row replaces the reader's row in the graph as it does
+        // in the calls, and the facts join the graph beside the rows the
+        // reader stated (carrick#2795): the cross-service pass and the cloud
+        // read the graph's HTTP rows, and a fact held only in `calls` is
+        // invisible to them while the reader's stale row there stands.
+        let is_model_row_of =
+            |call: &DataFetchingCall, file: &str, line: u32, key: &OperationKey| {
                 call.resolution_source == Some(ResolutionSource::Model)
                     && call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
-                        relative(root, f) == *file && l.parse::<u32>().ok() == Some(*line)
+                        relative(root, f) == file && l.parse::<u32>().ok() == Some(line)
                     })
                     && key.as_http().is_some_and(|(method, path)| {
                         call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
                     })
-            })
+            };
+        graph.data_calls.retain(|call| {
+            !fold
+                .through_folded
+                .iter()
+                .chain(fold.replaced_by_fact.iter())
+                .any(|(file, line, key)| is_model_row_of(call, file, *line, key))
         });
+        for row in fold.stated.iter().filter(|row| {
+            row.side == RowSide::Call && row.fact() && matches!(row.key, OperationKey::Http { .. })
+        }) {
+            let Some((method, path)) = row.key.as_http() else {
+                continue;
+            };
+            let own_route = crate::call_through::serves_own_route(graph, method, path);
+            graph.data_calls.push(DataFetchingCall {
+                method: method.to_string(),
+                target_url: path.to_string(),
+                canonical_path: path.to_string(),
+                client: String::new(),
+                file_location: format!("{}:{}", row.file, row.line),
+                call_kind: None,
+                repo_name: None,
+                service_name: None,
+                host: None,
+                line: Some(row.line),
+                base: None,
+                consumers_not_resolved: None,
+                resolution_source: Some(row.source),
+                dispatch: None,
+                role: row.through.then_some(ConsumerRole::WrapperCall),
+                reaches_request: None,
+                library_semantics: Vec::new(),
+                own_route,
+            });
+        }
     }
     fold
 }
@@ -894,6 +952,10 @@ pub fn fold_rows(
         withdrawn.sort_unstable();
         for index in withdrawn.into_iter().rev() {
             let gone = rows.remove(index);
+            if row.fact() && row.side == RowSide::Call {
+                out.replaced_by_fact
+                    .push((row.file.clone(), row.line, gone.key.clone()));
+            }
             out.withdrawn
                 .push((row.file.clone(), row.line, gone.key, row.side));
         }

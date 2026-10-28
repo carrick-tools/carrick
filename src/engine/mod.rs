@@ -23125,6 +23125,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 trace_depth: 0,
             },
             needs_reader: false,
+            through: false,
             within: Vec::new(),
         }
     }
@@ -24132,6 +24133,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_kept_reader: 0,
             lead_on_row_line: 0,
             through_folded: Vec::new(),
+            replaced_by_fact: Vec::new(),
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
