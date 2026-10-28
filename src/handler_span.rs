@@ -130,7 +130,13 @@ fn place(
         if named.next().is_some() {
             return None;
         }
-        return span_of(def);
+        // A route is never registered from inside its own handler, so a named
+        // definition that opens above the registration line and contains it is
+        // the function the route is registered FROM (a plugin), not the
+        // handler: read the row as inline (carrick#2824).
+        if !(def.line_number < line && line <= def.end_line) {
+            return span_of(def);
+        }
     }
 
     let derived = crate::visitor::derive_handler_name(&method.to_lowercase(), Some(path));
@@ -339,6 +345,51 @@ mod tests {
 
         attach_handler_spans(&mut data);
         assert_eq!(spans(&data), vec![span(40, 52), None, None]);
+    }
+
+    /// The plugin function the routes are registered from names every row, but
+    /// its definition encloses each registration: the row is placed as inline.
+    #[test]
+    fn a_named_handler_that_encloses_its_registration_is_read_as_inline() {
+        let get_a = crate::visitor::derive_handler_name("get", Some("/trend/a"));
+        let get_c = crate::visitor::derive_handler_name("get", Some("/trend/c/:id"));
+        let mut data = payload(
+            vec![
+                def("reportRoutes", "src/routes/report.ts", 11, 43),
+                def(&get_a, "src/routes/report.ts", 12, 15),
+                def(&get_c, "src/routes/report.ts", 22, 25),
+            ],
+            vec![
+                row("GET", "/trend/a", "reportRoutes", "src/routes/report.ts:12"),
+                row(
+                    "GET",
+                    "/trend/c/:id",
+                    "reportRoutes",
+                    "src/routes/report.ts:22",
+                ),
+            ],
+        );
+
+        attach_handler_spans(&mut data);
+        assert_eq!(spans(&data), vec![span(12, 15), span(22, 25)]);
+    }
+
+    /// An enclosing named handler with no inline definition indexed places
+    /// nothing, rather than the plugin's whole span.
+    #[test]
+    fn an_enclosing_named_handler_with_no_inline_definition_places_nothing() {
+        let mut data = payload(
+            vec![def("reportRoutes", "src/routes/report.ts", 11, 43)],
+            vec![row(
+                "GET",
+                "/trend/a",
+                "reportRoutes",
+                "src/routes/report.ts:12",
+            )],
+        );
+
+        attach_handler_spans(&mut data);
+        assert_eq!(spans(&data), vec![None]);
     }
 
     /// A route call that passes an inline middleware before its inline handler
