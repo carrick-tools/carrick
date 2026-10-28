@@ -475,9 +475,9 @@ pub(crate) fn receiver_object(callee: &Expr) -> Option<(u32, u32, ObjectForm)> {
     Some((span.lo.0, span.hi.0, form))
 }
 
-/// The switch for the receiver trace (carrick#2474 R1): `1` only. Off, and
-/// never set by the cloud runner, so with it off every scan is byte-identical
-/// to one without it.
+/// The switch for the receiver trace (carrick#2474 R1): `1` only. The cloud
+/// runner and every laptop scan set it ([`crate::fact_layer`]); `0` turns it
+/// off for a comparison.
 pub const RECEIVER_TRACE_SWITCH: &str = "CARRICK_RECEIVER_TRACE";
 
 /// Whether the receiver trace is on in this process.
