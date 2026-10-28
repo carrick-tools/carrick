@@ -57,7 +57,9 @@ use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::OperationKey;
 use crate::parser::{parse_file, parse_source};
 use crate::request_summary::{CallReach, RequestSummaryInputs};
+use crate::result_shapes::ResultIndex;
 use crate::return_flow::ShapeKind;
+use crate::services::type_sidecar::ResultShape;
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::normalize_manifest_method;
 use crate::wrapper_request_shape::{RequestShapeSignal, call_request_verb};
@@ -141,12 +143,53 @@ pub struct CallThroughSites {
     /// that analyses the service, so never stored: a carried service's blob
     /// already holds the rows they stated.
     pub leaves: Vec<LeafCall>,
+    /// The result label the library store gives each library call of the
+    /// service that is verified at that call (carrick#2820), sorted. A
+    /// request row is labelled by the one call on its line.
+    pub request_results: Vec<RequestResult>,
 }
 
 impl CallThroughSites {
     /// Whether there is nothing to store. The leaf calls are never stored.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.return_shapes.is_empty() && self.side_calls.is_empty()
+        self.rows.is_empty()
+            && self.return_shapes.is_empty()
+            && self.side_calls.is_empty()
+            && self.request_results.is_empty()
+    }
+}
+
+/// A library call the store labels with which part of its result holds the
+/// response body, and the sidecar verified at that call
+/// ([`crate::result_shapes::ResultIndex`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestResult {
+    /// Repository-relative file and the line the call is written on.
+    pub file: String,
+    pub line: u32,
+    /// The call's SWC span: the span of a returned call that is this one.
+    pub span: (u32, u32),
+    pub result: ResultShape,
+}
+
+impl RequestResult {
+    /// The labelled calls of `index`, in order.
+    fn of(index: &ResultIndex, root: &str) -> Vec<Self> {
+        let mut results: Vec<Self> = index
+            .labelled_calls()
+            .map(|(file, line, span, result)| Self {
+                file: crate::engine::repo_relative(file, root),
+                line,
+                span,
+                result: result.clone(),
+            })
+            .collect();
+        results.sort_by(RequestResult::order);
+        results
+    }
+
+    fn order(a: &Self, b: &Self) -> std::cmp::Ordering {
+        (&a.file, a.line, a.span).cmp(&(&b.file, b.line, b.span))
     }
 }
 
@@ -154,11 +197,23 @@ impl CallThroughSites {
 /// ([`crate::return_flow::return_shapes`]), and the lines that call is written
 /// on. A call edge counts as the one whose value is returned only when it is
 /// written on those lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyShape {
     pub kind: ShapeKind,
     pub first_line: u32,
     pub last_line: u32,
+    /// For [`ShapeKind::Member`], the member read, when the source names one
+    /// (carrick#2820).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// The SWC span of the call whose value is read. A blob stored before
+    /// this field holds none, and a result label proves nothing for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<(u32, u32)>,
+    /// The call's value goes through `.then`, `.catch` or `.finally` before
+    /// it is returned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub derived: bool,
 }
 
 /// A call in one file of a service whose callee, as the compiler resolves it
@@ -213,6 +268,8 @@ pub struct StoredCallThrough {
     pub return_shapes: Vec<StoredReturnShape>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_calls: Vec<StoredSideCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_results: Vec<RequestResult>,
 }
 
 /// One entry of [`CallThroughSites::return_shapes`].
@@ -242,7 +299,7 @@ impl StoredCallThrough {
             .iter()
             .map(|(definition, shape)| StoredReturnShape {
                 definition: definition.clone(),
-                shape: *shape,
+                shape: shape.clone(),
             })
             .collect();
         return_shapes.sort_by(|a, b| a.definition.cmp(&b.definition));
@@ -263,6 +320,11 @@ impl StoredCallThrough {
             rows: sites.rows.clone(),
             return_shapes,
             side_calls,
+            request_results: {
+                let mut results = sites.request_results.clone();
+                results.sort_by(RequestResult::order);
+                results
+            },
         })
     }
 
@@ -273,7 +335,7 @@ impl StoredCallThrough {
             return_shapes: self
                 .return_shapes
                 .iter()
-                .map(|entry| (entry.definition.clone(), entry.shape))
+                .map(|entry| (entry.definition.clone(), entry.shape.clone()))
                 .collect(),
             side_calls: self
                 .side_calls
@@ -285,6 +347,7 @@ impl StoredCallThrough {
                     )
                 })
                 .collect(),
+            request_results: self.request_results.clone(),
         }
     }
 }
@@ -327,14 +390,17 @@ pub enum Outer {
 ///
 /// `file_results` is the service's joined rows, keyed absolute or relative to
 /// `repo_path`. `definitions` are the service's own: what each returns is read
-/// off its file ([`BodyShape`]).
+/// off its file ([`BodyShape`]). `results` are the verified result labels of
+/// the service's library calls ([`RequestResult`]).
 pub fn read_sites(
     file_results: &HashMap<String, FileAnalysisResult>,
     inputs: &RequestSummaryInputs,
     repo_path: &str,
     definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
+    results: &ResultIndex,
 ) -> CallThroughSites {
     let root = repo_path.trim_end_matches('/');
+    let request_results = RequestResult::of(results, root);
     let (side_calls, return_shapes) = read_function_facts(file_results, inputs, root, definitions);
     let lines = definition_lines(definitions, root);
     let leaves = read_leaves(inputs, root, &lines);
@@ -350,6 +416,7 @@ pub fn read_sites(
             return_shapes,
             side_calls,
             leaves,
+            request_results,
         };
     }
 
@@ -447,6 +514,7 @@ pub fn read_sites(
         return_shapes,
         side_calls,
         leaves,
+        request_results,
     }
 }
 
@@ -658,6 +726,9 @@ fn read_function_facts(
                     kind: shape.kind,
                     first_line: base.line,
                     last_line: base.last_line,
+                    member: shape.member,
+                    base: Some(base.span()),
+                    derived: shape.derived,
                 },
             );
         }
@@ -1348,8 +1419,9 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     graph.shapes = sites
         .iter()
         .flat_map(|sites| sites.return_shapes.iter())
-        .map(|(definition, shape)| (definition.clone(), *shape))
+        .map(|(definition, shape)| (definition.clone(), shape.clone()))
         .collect();
+    graph.label_requests(sites.iter().flat_map(|sites| sites.request_results.iter()));
     let owners = file_owners(services.iter().map(|service| &*service.data));
     let siblings = SiblingLines::of(services.iter().map(|service| &*service.data));
     let mut decider = Decider::new(&graph, &sites);
@@ -1965,6 +2037,9 @@ struct Reached {
     site: String,
     /// The line the row is written on.
     line: u32,
+    /// The result label verified at the one library call on its line
+    /// (carrick#2820), and that call's SWC span.
+    result: Option<(ResultShape, (u32, u32))>,
 }
 
 enum Reach<'g> {
@@ -1979,6 +2054,21 @@ enum Reach<'g> {
         /// the arguments, [`RECEIVER_STEP`] the call the callee is read off.
         step: usize,
     },
+}
+
+/// What [`ReachGraph::returned_steps`] read off the way from a function to a
+/// request.
+#[derive(Debug, Default)]
+struct ReturnedChain {
+    /// The parses and member reads, in the order the walk met them.
+    steps: Vec<ShapeKind>,
+    /// The member each member read names, when the source names one.
+    members: Vec<Option<String>>,
+    /// For each request reached: its verified result label, when the call
+    /// the function returns is the labelled call.
+    labels: Vec<Option<ResultShape>>,
+    /// A value on the way goes through `.then`, `.catch` or `.finally`.
+    derived: bool,
 }
 
 /// An operation as [`ReachGraph::decide`] tells two requests apart.
@@ -2178,6 +2268,7 @@ impl ReachGraph {
                             dispatch: call.dispatch.clone(),
                             site: call.file_location.clone(),
                             line,
+                            result: None,
                         });
                     } else {
                         graph
@@ -2194,6 +2285,26 @@ impl ReachGraph {
             }
         }
         graph
+    }
+
+    /// Give each request row the result label verified at the one library
+    /// call on its line. A line with more than one labelled call names none.
+    fn label_requests<'r>(&mut self, results: impl Iterator<Item = &'r RequestResult>) {
+        let mut by_line: HashMap<(&str, u32), Vec<&RequestResult>> = HashMap::new();
+        for result in results {
+            by_line
+                .entry((result.file.as_str(), result.line))
+                .or_default()
+                .push(result);
+        }
+        for request in self.requests.values_mut().flatten() {
+            let Some((file, _)) = request.site.rsplit_once(':') else {
+                continue;
+            };
+            if let Some([only]) = by_line.get(&(file, request.line)).map(Vec::as_slice) {
+                request.result = Some((only.result.clone(), only.span));
+            }
+        }
     }
 
     /// Collect the requests written in `start` and in the definitions it
@@ -2300,15 +2411,45 @@ impl ReachGraph {
     /// whose value goes into another function that makes no request is
     /// unproven, since the value passes through that function.
     ///
-    /// Proven means the request is reached, nothing is unproven, the steps
-    /// total one, and that step is the Fetch standard's `Response.json()`. A
-    /// member read (`.data`, `.status`) is never taken as the body: which
-    /// member of a library client's result holds it is the library store's to
-    /// state (carrick-cloud#2639), so such a chain abstains and the row keeps
-    /// no type.
+    /// Proven means the request is reached, nothing is unproven, and either
+    /// the steps total one and that step is the Fetch standard's
+    /// `Response.json()`, or the library store's label for the request says
+    /// where the body is (carrick#2820, carrick-cloud#2639): one member read
+    /// whose name is the label's member, or no step at all with a label that
+    /// says the whole value is the body. A member read with any other name
+    /// (`.status`), or over a request no verified label names, is never taken
+    /// as the body, so such a chain abstains and the row keeps no type.
+    ///
+    /// A label counts only where the call a function returns (or reads the
+    /// member of) is the labelled call itself, and its value reaches the
+    /// return as that call gave it: not through `.then`, `.catch` or
+    /// `.finally`, and not as an argument of another call
+    /// (`toModel(await get(url))`), which is the base of the return instead.
     fn hands_back_body(&self, start: &DefinitionSite, operation: &Operation) -> bool {
-        self.returned_steps(start, operation)
-            .is_some_and(|steps| steps == [ShapeKind::Parsed])
+        let Some(chain) = self.returned_steps(start, operation) else {
+            return false;
+        };
+        if chain.steps == [ShapeKind::Parsed] {
+            return true;
+        }
+        if chain.derived || chain.labels.is_empty() {
+            return false;
+        }
+        let Some(labels) = chain.labels.iter().cloned().collect::<Option<Vec<_>>>() else {
+            return false;
+        };
+        match chain.steps.as_slice() {
+            [] => labels
+                .iter()
+                .all(|label| *label == ResultShape::Whole(true)),
+            [ShapeKind::Member] => match chain.members.as_slice() {
+                [Some(member)] => labels
+                    .iter()
+                    .all(|label| *label == ResultShape::Member([member.clone()])),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// Whether `start` returns the value of a request of `operation`, whole,
@@ -2326,28 +2467,41 @@ impl ReachGraph {
         &self,
         start: &DefinitionSite,
         operation: &Operation,
-    ) -> Option<Vec<ShapeKind>> {
+    ) -> Option<ReturnedChain> {
         let (start, _) = self.calls.get_key_value(start)?;
         let mut seen: HashSet<&DefinitionSite> = HashSet::from([start]);
         let mut queue: VecDeque<(&DefinitionSite, usize)> = VecDeque::from([(start, 0)]);
-        let mut steps: Vec<ShapeKind> = Vec::new();
+        let mut chain = ReturnedChain::default();
         let mut reached = false;
         while let Some((definition, depth)) = queue.pop_front() {
             let shape = self.shapes.get(definition)?;
             if shape.kind != ShapeKind::Value {
-                steps.push(shape.kind);
+                chain.steps.push(shape.kind);
             }
+            if shape.kind == ShapeKind::Member {
+                chain.members.push(shape.member.clone());
+            }
+            chain.derived |= shape.derived;
             let written_in_base = |line: u32| shape.first_line <= line && line <= shape.last_line;
-            let holds = self
+            let holding: Vec<&Reached> = self
                 .requests
                 .get(definition)
                 .into_iter()
                 .flatten()
-                .any(|request| {
+                .filter(|request| {
                     written_in_base(request.line) && operation_of(request) == *operation
-                });
-            if holds {
+                })
+                .collect();
+            if !holding.is_empty() {
                 reached = true;
+                // A label stands for the request only where the call this
+                // function returns is that very call.
+                chain
+                    .labels
+                    .extend(holding.iter().map(|request| match &request.result {
+                        Some((result, span)) if shape.base == Some(*span) => Some(result.clone()),
+                        _ => None,
+                    }));
                 continue;
             }
             if depth == MAX_EDGE_DEPTH {
@@ -2377,7 +2531,7 @@ impl ReachGraph {
                 }
             }
         }
-        reached.then_some(steps)
+        reached.then_some(chain)
     }
 
     /// Whether `start`, or a definition it reaches within [`MAX_EDGE_DEPTH`]
@@ -2939,6 +3093,9 @@ mod tests {
                         kind: ShapeKind::Member,
                         first_line: 10,
                         last_line: 12,
+                        member: None,
+                        base: None,
+                        derived: false,
                     },
                 ),
                 (
@@ -2947,6 +3104,9 @@ mod tests {
                         kind: ShapeKind::Value,
                         first_line: 2,
                         last_line: 2,
+                        member: None,
+                        base: None,
+                        derived: false,
                     },
                 ),
             ];
@@ -2972,6 +3132,7 @@ mod tests {
                 return_shapes: order.iter().map(|&i| shapes[i].clone()).collect(),
                 side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
                 leaves: Vec::new(),
+                request_results: Vec::new(),
             }
         };
         let sites = facts(&[0, 1]);
@@ -3498,6 +3659,9 @@ mod tests {
                 kind,
                 first_line,
                 last_line,
+                member: None,
+                base: None,
+                derived: false,
             },
         )
     }
@@ -3590,6 +3754,366 @@ mod tests {
     #[test]
     fn a_member_read_by_a_helper_over_a_library_request_abstains() {
         assert!(!value_member_spec(ShapeKind::Member));
+    }
+
+    /// The span of the labelled call every result-label test uses.
+    const LABELLED: (u32, u32) = (40, 70);
+
+    fn labelled(result: ResultShape) -> RequestResult {
+        RequestResult {
+            file: "c.ts".to_string(),
+            line: 3,
+            span: LABELLED,
+            result,
+        }
+    }
+
+    fn data() -> ResultShape {
+        ResultShape::Member(["data".to_string()])
+    }
+
+    /// A function that returns one call's value, `kind` and `member` read
+    /// off it, over a request of the library at `c.ts:3` that `results`
+    /// label. `base` is the span of the call it returns.
+    fn returns_labelled(
+        kind: ShapeKind,
+        member: Option<&str>,
+        base: Option<(u32, u32)>,
+        derived: bool,
+        results: &[RequestResult],
+    ) -> bool {
+        let mut graph = chain(
+            vec![
+                calling("method", "a.ts", 1, 5, &[("c.ts", 1, 2)]),
+                function("reader", "c.ts", 1, 4, None),
+            ],
+            vec![
+                shaped(("a.ts", 1), ShapeKind::Value, 2, 2),
+                (
+                    definition("c.ts", 1),
+                    BodyShape {
+                        kind,
+                        first_line: 3,
+                        last_line: 3,
+                        member: member.map(str::to_string),
+                        base,
+                        derived,
+                    },
+                ),
+            ],
+            &[("c.ts", 3, true)],
+        );
+        graph.label_requests(results.iter());
+        graph.hands_back_body(&definition("a.ts", 1), &things())
+    }
+
+    /// carrick#2820: the store's label says where the body is. One member
+    /// read whose name is the label's member proves the chain.
+    #[test]
+    fn a_member_read_proves_the_body_where_the_label_names_that_member() {
+        let one = [labelled(data())];
+        let member = |name: Option<&str>| {
+            returns_labelled(ShapeKind::Member, name, Some(LABELLED), false, &one)
+        };
+        assert!(member(Some("data")));
+        // Another member of the same result is not the body.
+        assert!(!member(Some("status")));
+        // A read that names no member (a rest element) is not either.
+        assert!(!member(None));
+        // A label that says the whole value is the body does not prove a member.
+        assert!(!returns_labelled(
+            ShapeKind::Member,
+            Some("data"),
+            Some(LABELLED),
+            false,
+            &[labelled(ResultShape::Whole(true))]
+        ));
+        // A request no verified label names proves nothing: as before.
+        assert!(!returns_labelled(
+            ShapeKind::Member,
+            Some("data"),
+            Some(LABELLED),
+            false,
+            &[]
+        ));
+    }
+
+    /// carrick#2820: no step at all proves the body where the label says the
+    /// whole value is the body, and only there.
+    #[test]
+    fn a_value_returned_whole_proves_the_body_where_the_label_says_whole() {
+        let value = |results: &[RequestResult]| {
+            returns_labelled(ShapeKind::Value, None, Some(LABELLED), false, results)
+        };
+        assert!(value(&[labelled(ResultShape::Whole(true))]));
+        assert!(!value(&[labelled(data())]));
+        assert!(!value(&[labelled(ResultShape::Parse("json".to_string()))]));
+        assert!(!value(&[]));
+    }
+
+    /// carrick#2820: a label stands for the request only where the call the
+    /// function returns is the labelled call itself, and its value was not
+    /// run through a callback (`toModel(await get(url))`, `.then(f)`,
+    /// `.catch(f)`), or read from a blob that stored no span.
+    #[test]
+    fn a_label_does_not_stand_for_a_call_the_labelled_call_is_only_inside() {
+        let whole = [labelled(ResultShape::Whole(true))];
+        let one = [labelled(data())];
+        // The returned call is another call that holds the labelled one.
+        assert!(!returns_labelled(
+            ShapeKind::Value,
+            None,
+            Some((30, 90)),
+            false,
+            &whole
+        ));
+        assert!(!returns_labelled(
+            ShapeKind::Member,
+            Some("data"),
+            Some((30, 90)),
+            false,
+            &one
+        ));
+        // Run through `.then`, `.catch` or `.finally`.
+        assert!(!returns_labelled(
+            ShapeKind::Value,
+            None,
+            Some(LABELLED),
+            true,
+            &whole
+        ));
+        assert!(!returns_labelled(
+            ShapeKind::Member,
+            Some("data"),
+            Some(LABELLED),
+            true,
+            &one
+        ));
+        // A blob stored before the span was.
+        assert!(!returns_labelled(
+            ShapeKind::Value,
+            None,
+            None,
+            false,
+            &whole
+        ));
+    }
+
+    /// carrick#2820: every request a function reaches must be labelled, and
+    /// the labels must agree: one unlabelled request among them abstains.
+    #[test]
+    fn every_request_the_function_reaches_must_carry_the_label() {
+        let mut graph = chain(
+            vec![
+                calling("method", "a.ts", 1, 5, &[("c.ts", 1, 2)]),
+                function("reader", "c.ts", 1, 4, None),
+            ],
+            vec![
+                shaped(("a.ts", 1), ShapeKind::Value, 2, 2),
+                shaped(("c.ts", 1), ShapeKind::Value, 3, 4),
+            ],
+            &[("c.ts", 3, true), ("c.ts", 4, true)],
+        );
+        let at = |line: u32, result: ResultShape| RequestResult {
+            line,
+            ..labelled(result)
+        };
+        graph.shapes.get_mut(&definition("c.ts", 1)).unwrap().base = Some(LABELLED);
+        graph.label_requests([at(3, ResultShape::Whole(true))].iter());
+        // The request on line 4 is unlabelled.
+        assert!(!graph.hands_back_body(&definition("a.ts", 1), &things()));
+        graph.label_requests(
+            [
+                at(3, ResultShape::Whole(true)),
+                at(4, ResultShape::Whole(true)),
+            ]
+            .iter(),
+        );
+        assert!(graph.hands_back_body(&definition("a.ts", 1), &things()));
+    }
+
+    /// carrick#2820: a line that holds two labelled calls names neither
+    /// request, and a label of another file names none.
+    #[test]
+    fn a_line_with_two_labelled_calls_labels_no_request() {
+        let whole = ResultShape::Whole(true);
+        let two = [
+            labelled(whole.clone()),
+            RequestResult {
+                span: (80, 99),
+                ..labelled(whole.clone())
+            },
+        ];
+        assert!(!returns_labelled(
+            ShapeKind::Value,
+            None,
+            Some(LABELLED),
+            false,
+            &two
+        ));
+        let elsewhere = [RequestResult {
+            file: "d.ts".to_string(),
+            ..labelled(whole)
+        }];
+        assert!(!returns_labelled(
+            ShapeKind::Value,
+            None,
+            Some(LABELLED),
+            false,
+            &elsewhere
+        ));
+    }
+
+    /// carrick#2820: a blob stored before the result fields loads, and its
+    /// chains abstain where a label is wanted; one that holds them reads
+    /// back as stored.
+    #[test]
+    fn a_blob_without_the_result_fields_loads_and_its_chains_abstain() {
+        let old: StoredCallThrough = serde_json::from_value(serde_json::json!({
+            "return_shapes": [{
+                "definition": { "file": "c.ts", "line": 1 },
+                "shape": { "kind": "member", "first_line": 3, "last_line": 3 }
+            }]
+        }))
+        .expect("an old blob loads");
+        assert!(old.request_results.is_empty());
+        let shape = old.return_shapes[0].shape.clone();
+        assert_eq!(
+            (shape.member, shape.base, shape.derived),
+            (None, None, false)
+        );
+        let sites = old.sites();
+        assert!(sites.request_results.is_empty());
+        // Stored again, a service with nothing new stores nothing new.
+        let again = StoredCallThrough::of(&sites).unwrap();
+        let text = serde_json::to_string(&again).unwrap();
+        assert!(!text.contains("request_results"), "{text}");
+        assert!(!text.contains("\"member\":"), "{text}");
+
+        let held = CallThroughSites {
+            request_results: vec![
+                labelled(data()),
+                RequestResult {
+                    file: "b.ts".to_string(),
+                    ..labelled(ResultShape::Whole(true))
+                },
+            ],
+            ..CallThroughSites::default()
+        };
+        assert!(!held.is_empty(), "labels alone are worth storing");
+        let stored = StoredCallThrough::of(&held).unwrap();
+        assert_eq!(stored.request_results[0].file, "b.ts", "stored sorted");
+        let text = serde_json::to_string(&stored).unwrap();
+        let back: StoredCallThrough = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, stored);
+        assert_eq!(back.sites().request_results, stored.request_results);
+    }
+
+    /// Whether the type captured at a model row's call (`app/a.ts:3`, calling
+    /// `load` of `app/q.ts`) is kept when `load` returns `shape` over the
+    /// request at `app/q.ts:3`, which `results` label. Settled whole.
+    fn keeps_the_type(shape: BodyShape, results: Vec<RequestResult>) -> bool {
+        let mut app = blob("app");
+        put(&mut app, function("show", "app/a.ts", 1, 5, None));
+        put(&mut app, function("load", "app/q.ts", 1, 4, None));
+        let graph = app.mount_graph.as_mut().unwrap();
+        graph.data_calls.push(request_at("app/q.ts", 3));
+        let mut row = request_at("app/a.ts", 3);
+        row.target_url = "/load".to_string();
+        row.canonical_path = "/load".to_string();
+        row.resolution_source = Some(ResolutionSource::Model);
+        graph.data_calls.push(row);
+        let mut entry = entry_typed("explicit", Some("User"));
+        entry.file_path = "app/a.ts".to_string();
+        entry.key = OperationKey::http("GET", "/load".to_string());
+        app.type_manifest = Some(vec![entry]);
+        let sites = CallThroughSites {
+            rows: vec![SiteRow {
+                file: "app/a.ts".to_string(),
+                line: 3,
+                method: "GET".to_string(),
+                target: "/load".to_string(),
+                steps: vec![vec![definition("app/q.ts", 1)]],
+                receiver: Vec::new(),
+                callbacks: Vec::new(),
+            }],
+            return_shapes: [(definition("app/q.ts", 1), shape)].into_iter().collect(),
+            request_results: results,
+            ..CallThroughSites::default()
+        };
+        let settled = settle(&mut [ServiceRows {
+            data: &mut app,
+            sites: &sites,
+            writable: true,
+        }]);
+        assert_eq!(settled.corrected, 1, "{settled:?}");
+        app.type_manifest
+            .iter()
+            .flatten()
+            .any(|entry| entry.key == OperationKey::http("GET", "/things".to_string()))
+    }
+
+    fn body_at_q(kind: ShapeKind, member: Option<&str>, base: (u32, u32)) -> BodyShape {
+        BodyShape {
+            kind,
+            first_line: 3,
+            last_line: 3,
+            member: member.map(str::to_string),
+            base: Some(base),
+            derived: false,
+        }
+    }
+
+    /// carrick#2820, end to end through [`settle`]: a wrapper whose leaf is a
+    /// call the store labels hands back the body, so the type captured at the
+    /// caller is kept under the request's operation. The same wrapper over a
+    /// member the label does not name, over no label, or through a call that
+    /// only holds the labelled one, keeps nothing.
+    #[test]
+    fn the_type_at_a_call_through_a_labelled_leaf_is_kept_only_when_the_label_proves_the_body() {
+        let at_q = |result| RequestResult {
+            file: "app/q.ts".to_string(),
+            line: 3,
+            span: LABELLED,
+            result,
+        };
+        let member = |name: &str| ResultShape::Member([name.to_string()]);
+        let kept = |shape, results| keeps_the_type(shape, results);
+        // `reply.data`, the labelled member.
+        assert!(kept(
+            body_at_q(ShapeKind::Member, Some("data"), LABELLED),
+            vec![at_q(member("data"))]
+        ));
+        // `reply.status`, another member of the same result.
+        assert!(!kept(
+            body_at_q(ShapeKind::Member, Some("status"), LABELLED),
+            vec![at_q(member("data"))]
+        ));
+        // The same read over a call no label names: as before.
+        assert!(!kept(
+            body_at_q(ShapeKind::Member, Some("data"), LABELLED),
+            Vec::new()
+        ));
+        // The call returned whole, over a whole label.
+        assert!(kept(
+            body_at_q(ShapeKind::Value, None, LABELLED),
+            vec![at_q(ResultShape::Whole(true))]
+        ));
+        // Returned whole over a member label.
+        assert!(!kept(
+            body_at_q(ShapeKind::Value, None, LABELLED),
+            vec![at_q(member("data"))]
+        ));
+        // The returned call holds the labelled one (`toModel(await get())`).
+        assert!(!kept(
+            body_at_q(ShapeKind::Value, None, (30, 90)),
+            vec![at_q(ResultShape::Whole(true))]
+        ));
+        // The Fetch standard's parse is unchanged, labelled or not.
+        assert!(kept(
+            body_at_q(ShapeKind::Parsed, None, LABELLED),
+            Vec::new()
+        ));
     }
 
     #[test]

@@ -4138,7 +4138,7 @@ async fn analyze_current_repo_incremental(
                 sidecar,
                 &semantics_root,
             );
-            let file_orchestrator = file_orchestrator.with_result_index(results);
+            let file_orchestrator = file_orchestrator.with_result_index(results.clone());
             protocol_extractions.site = site_rows_of(
                 crate::site_questions::enabled(),
                 &request_inputs,
@@ -4440,6 +4440,7 @@ async fn analyze_current_repo_incremental(
                 &request_inputs,
                 repo_path,
                 &cloud_data.function_definitions,
+                &results,
             );
             return Ok(ServiceAnalysis {
                 data: cloud_data,
@@ -11494,7 +11495,8 @@ async fn analyze_current_repo(
 
     // 6. Resolve types using sidecar if available
     let agent_service = AgentService::new();
-    let file_orchestrator = FileOrchestrator::new(agent_service.clone()).with_result_index(results);
+    let file_orchestrator =
+        FileOrchestrator::new(agent_service.clone()).with_result_index(results.clone());
 
     let extraction_config = setup.extraction_config.clone();
 
@@ -11642,6 +11644,7 @@ async fn analyze_current_repo(
         &request_inputs,
         repo_path,
         &cloud_data.function_definitions,
+        &results,
     );
     Ok(ServiceAnalysis {
         data: cloud_data,

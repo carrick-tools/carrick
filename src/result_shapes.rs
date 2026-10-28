@@ -125,8 +125,9 @@ pub fn result_checks(exports: &[ExportClaims], discovery: &Discovery) -> ResultA
 /// The verified results of a service, by the labelled call they belong to.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ResultIndex {
-    /// Keyed by file and the labelled call's SWC span.
-    by_span: BTreeMap<(String, u32, u32), ResultShape>,
+    /// Keyed by file and the labelled call's SWC span, with the line it is
+    /// written on.
+    by_span: BTreeMap<(String, u32, u32), (u32, ResultShape)>,
     /// Keyed by file and line, only where the line holds exactly one
     /// discovered end.
     by_line: BTreeMap<(String, u32), ResultShape>,
@@ -188,7 +189,7 @@ impl ResultIndex {
             };
             index.by_span.insert(
                 (end.file.clone(), end.span_start, end.span_end),
-                result.clone(),
+                (end.line, result.clone()),
             );
             if on_line[&(end.file.as_str(), end.line)].len() == 1 {
                 index
@@ -204,7 +205,10 @@ impl ResultIndex {
     /// a different call, so the line is not tried.
     pub fn at(&self, file: &str, span: Option<(u32, u32)>, line: u32) -> Option<&ResultShape> {
         match span {
-            Some((start, end)) => self.by_span.get(&(file.to_string(), start, end)),
+            Some((start, end)) => self
+                .by_span
+                .get(&(file.to_string(), start, end))
+                .map(|(_, result)| result),
             None => self.by_line.get(&(file.to_string(), line)),
         }
     }
@@ -216,8 +220,18 @@ impl ResultIndex {
         let mut index = ResultIndex::default();
         index
             .by_span
-            .insert((file.to_string(), span.0, span.1), result);
+            .insert((file.to_string(), span.0, span.1), (0, result));
         index
+    }
+
+    /// Every labelled call the index holds: its file, line, SWC span and
+    /// result, in key order.
+    pub fn labelled_calls(&self) -> impl Iterator<Item = (&str, u32, (u32, u32), &ResultShape)> {
+        self.by_span
+            .iter()
+            .map(|((file, start, end), (line, result))| {
+                (file.as_str(), *line, (*start, *end), result)
+            })
     }
 
     pub fn len(&self) -> usize {

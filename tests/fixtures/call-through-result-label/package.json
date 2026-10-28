@@ -1,0 +1,8 @@
+{
+  "name": "call-through-result-label",
+  "private": true,
+  "workspaces": ["packages/*", "services/*"],
+  "dependencies": {
+    "fixture-reply-client": "^1.0.0"
+  }
+}
