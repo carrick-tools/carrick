@@ -253,6 +253,11 @@ type Outcome =
        */
       members?: readonly ts.Declaration[];
       bodyMembers?: readonly ts.Declaration[];
+      /**
+       * Stamped: why a receive op's `request` was dropped while the op
+       * itself verified (carrick#2968). Only `request_member_missing`.
+       */
+      requestDropped?: string;
     }
   | { verdict: 'failed' | 'unchecked'; reason: string };
 
@@ -503,6 +508,7 @@ export class LibraryClaimsVerifier {
             receiver: check.receiver,
             verdict: 'verified',
             ...(outcome.declarations?.length ? { declarations: outcome.declarations } : {}),
+            ...(outcome.requestDropped === undefined ? {} : { request_dropped: outcome.requestDropped }),
           }
         : {
             claim_id: check.claim_id,
@@ -834,6 +840,8 @@ export class LibraryClaimsVerifier {
         const declarations: DeclaredAt[] = [];
         const members: ts.Declaration[] = [];
         const bodyMembers: ts.Declaration[] = [];
+        // A request one receiver does not hold is dropped for the op (carrick#2968).
+        let requestDropped: string | undefined;
         for (const receiver of receivers.value) {
           const result = reader.judgeMessage(receiver, check.claim, rules, builtAtDefaults, collectionsOf);
           if (result.outcome.verdict !== 'verified') return result;
@@ -841,11 +849,13 @@ export class LibraryClaimsVerifier {
           declarations.push(...(result.outcome.declarations ?? []));
           members.push(...(result.outcome.members ?? []));
           bodyMembers.push(...(result.outcome.bodyMembers ?? []));
+          requestDropped ??= result.outcome.requestDropped;
         }
         const verified: Outcome =
           declarations.length > 0 ? { verdict: 'verified', declarations: sortedDeclarations(declarations) } : { ...VERIFIED };
         if (verified.verdict === 'verified' && members.length > 0) verified.members = members;
-        if (verified.verdict === 'verified' && bodyMembers.length > 0) verified.bodyMembers = bodyMembers;
+        if (verified.verdict === 'verified' && requestDropped !== undefined) verified.requestDropped = requestDropped;
+        else if (verified.verdict === 'verified' && bodyMembers.length > 0) verified.bodyMembers = bodyMembers;
         return { outcome: verified, holding };
       };
 
@@ -901,7 +911,12 @@ export class LibraryClaimsVerifier {
     const outcomes: Record<string, number> = {};
     const observe = (check: LibraryCheck, outcome: Outcome): void => {
       if (check.claim.kind !== 'op') return;
-      const read = outcome.verdict === 'verified' ? 'verified' : `${outcome.verdict} ${outcome.reason}`;
+      const read =
+        outcome.verdict !== 'verified'
+          ? `${outcome.verdict} ${outcome.reason}`
+          : outcome.requestDropped === undefined
+            ? 'verified'
+            : `verified request_dropped ${outcome.requestDropped}`;
       outcomes[read] = (outcomes[read] ?? 0) + 1;
       if (outcome.verdict !== 'verified') return;
       if (check.claim.op === 'send' && check.claim.payload !== undefined) {
@@ -2412,6 +2427,10 @@ class DeclarationReader {
     const labels = claim.key_labels ?? {};
     let best: RankedFailure | undefined;
     let held = false;
+    // An overload that holds but for a request member the declarations lack
+    // (carrick#2968): the op stands without its request, unless another
+    // overload holds the request too. Every other request fault fails the op.
+    let requestDropped: string | undefined;
     const bodyMembers: ts.Declaration[] = [];
     for (const signature of callee.signatures) {
       let result = this.messageSignatureOutcome(signature, layout.value, labels);
@@ -2421,16 +2440,24 @@ class DeclarationReader {
       }
       if (result.rank === Infinity && claim.request !== undefined) {
         const read = this.requestOutcome(signature, claim.handler!, claim.request, bodyMembers);
+        if (read?.verdict === 'failed' && read.reason === 'request_member_missing') {
+          requestDropped = read.reason;
+          continue;
+        }
         if (read) result = { rank: 5, outcome: read };
       }
       if (result.rank === Infinity) {
         held = true;
+        requestDropped = undefined;
         break;
       }
       best = furthest(best, result.rank, result.outcome);
     }
-    if (!held) return best!.outcome;
-    if (boundRuns) return this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
+    if (!held && requestDropped === undefined) return best!.outcome;
+    if (boundRuns) {
+      const ran = this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
+      return ran.verdict === 'verified' && requestDropped !== undefined ? { ...ran, requestDropped } : ran;
+    }
     const declarations = this.declarationsOf(callee);
     const members = callee.named
       ? (callee.named.property.declarations ?? [])
@@ -2440,6 +2467,7 @@ class DeclarationReader {
       ...(declarations.length > 0 ? { declarations } : {}),
       ...(members.length > 0 ? { members } : {}),
       ...(bodyMembers.length > 0 ? { bodyMembers } : {}),
+      ...(requestDropped === undefined ? {} : { requestDropped }),
     };
   }
 

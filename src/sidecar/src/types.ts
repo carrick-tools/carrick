@@ -1109,6 +1109,12 @@ export interface SemanticsResult {
   reason?: string;
   /** Verified op verdicts only: the declarations its member resolves to on the receiver. */
   declarations?: SemanticsDeclaration[];
+  /**
+   * Verified receive op verdicts only: the op verified but its `request`
+   * names a member the declarations lack, so the request is dropped and the
+   * route kept (carrick#2968). The reason, `request_member_missing`.
+   */
+  request_dropped?: string;
 }
 
 /** How one package of the request resolved, for logs. */

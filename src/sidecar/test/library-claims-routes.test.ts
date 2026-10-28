@@ -127,7 +127,7 @@ interface Check {
 }
 interface Response {
   status: string;
-  verdicts?: Array<{ verdict: string; reason?: string }>;
+  verdicts?: Array<{ verdict: string; reason?: string; request_dropped?: string }>;
   errors?: string[];
 }
 
@@ -160,7 +160,13 @@ const route = (member: string, parts: Record<string, unknown>): Claim => ({
 
 function verdicts(response: Response): string[] {
   assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
-  return response.verdicts!.map(r => (r.verdict === 'verified' ? 'verified' : `${r.verdict} ${r.reason}`));
+  return response.verdicts!.map(r =>
+    r.verdict !== 'verified'
+      ? `${r.verdict} ${r.reason}`
+      : r.request_dropped === undefined
+        ? 'verified'
+        : `verified request_dropped ${r.request_dropped}`
+  );
 }
 
 describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
@@ -347,7 +353,56 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
         // Invalid: the handler's parameter there is the reply.
         onApp(route('get', { request: { param: 1, path: ['path'] } })),
       ]),
-      ['verified', 'verified', 'failed request_member_missing', 'failed request_member_missing', 'failed request_member_missing']
+      [
+        'verified',
+        'verified',
+        // A request member the declarations lack drops the request, never
+        // the route (carrick#2968).
+        'verified request_dropped request_member_missing',
+        'verified request_dropped request_member_missing',
+        'verified request_dropped request_member_missing',
+      ]
+    );
+  });
+
+  it('a wrong request member fails only the request: the route op stands, its own faults still fail it (carrick#2968)', async () => {
+    const wrong = { param: 0, path: ['pathname'] };
+    assert.deepStrictEqual(
+      await send([
+        // The route is right and its request wrong: the op verifies, the request is dropped.
+        onApp(route('get', { request: wrong })),
+        onRouter(route('post', { request: { param: 0, url: ['raw', 'href'] } })),
+        // The same route with no request: unchanged.
+        onApp(route('get', {})),
+        // The member is wrong as well: the op fails as it does without a request.
+        onApp(route('put', { request: wrong })),
+        onApp(route('put', {})),
+        // The name slot is wrong as well.
+        onApp(route('get', { name: { arg: 2 }, request: wrong })),
+        onApp(route('get', { name: { arg: 2 } })),
+        // The method is wrong as well.
+        onApp(route('get', { method: 'POST', request: wrong })),
+        onApp(route('get', { method: 'POST' })),
+        // The handler slot is past the overload as well.
+        onApp(route('get', { handler: { arg: 2 }, request: wrong })),
+        onApp(route('get', { handler: { arg: 2 } })),
+        // The handler takes no parameter there: not a member fault, so the op still fails.
+        onApp(route('get', { request: { param: 5, path: ['path'] } })),
+      ]),
+      [
+        'verified request_dropped request_member_missing',
+        'verified request_dropped request_member_missing',
+        'verified',
+        'failed member_missing',
+        'failed member_missing',
+        'failed param_missing',
+        'failed param_missing',
+        'failed method_not_member_verb',
+        'failed method_not_member_verb',
+        'failed param_missing',
+        'failed param_missing',
+        'failed param_missing',
+      ]
     );
   });
 
@@ -368,8 +423,8 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
       [
         'verified',
         'verified',
-        'failed request_member_missing',
-        'failed request_member_missing',
+        'verified request_dropped request_member_missing',
+        'verified request_dropped request_member_missing',
         'unchecked claim_invalid',
         'verified',
       ]

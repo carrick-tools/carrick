@@ -24,6 +24,37 @@ export function handler(rep: Rep<{ id: string }>): void {
 }
 void reply;
 `;
+// A route package (carrick#2968): a receive op whose request names a body
+// member the request type lacks verifies with its request dropped, so that
+// body is never read.
+const ROUTES = 'route-kit';
+const ROUTE_KIT = `export interface Req {
+  path: string;
+  body: { id: string };
+}
+export interface Routes {
+  post(path: string, handler: (req: Req) => void): this;
+  put(path: string, handler: (req: Req) => void): this;
+}
+export declare const routes: Routes;
+`;
+const routeOp = (claim_id: string, member: string, body: string[]) => ({
+  claim_id,
+  package: ROUTES,
+  export: 'routes',
+  role: 'server_framework',
+  receiver: 'export',
+  claim: {
+    kind: 'op',
+    op: 'receive',
+    member,
+    on: 'export',
+    name: { arg: 0 },
+    handler: { arg: 1 },
+    method: member.toUpperCase(),
+    request: { param: 0, path: ['path'], body },
+  },
+});
 const CLAIMS = {
   from_dir: '.',
   checks: [
@@ -55,6 +86,12 @@ describe('carrick#2674: server labels for an infer request', () => {
       JSON.stringify({ name: PKG, version: '1.0.0', types: 'index.d.ts' })
     );
     fs.writeFileSync(path.join(root, 'node_modules', PKG, 'index.d.ts'), KIT);
+    fs.mkdirSync(path.join(root, 'node_modules', ROUTES), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'node_modules', ROUTES, 'package.json'),
+      JSON.stringify({ name: ROUTES, version: '1.0.0', types: 'index.d.ts' })
+    );
+    fs.writeFileSync(path.join(root, 'node_modules', ROUTES, 'index.d.ts'), ROUTE_KIT);
     fs.mkdirSync(path.join(root, 'src'));
     fs.writeFileSync(path.join(root, 'src', 'app.ts'), APP);
     loader = new ProjectLoader({ repoRoot: root });
@@ -108,5 +145,22 @@ describe('carrick#2674: server labels for an infer request', () => {
     );
     assert.strictEqual(labels.sends.size, 1);
     assert.ok(logged.some((line) => line.startsWith('Dropped 1 server claim')));
+  });
+
+  it('a request member the declarations lack drops that request, never the route, and is counted (carrick#2968)', () => {
+    const logged: string[] = [];
+    const labels = readServerLabels(
+      source,
+      '',
+      { from_dir: '.', checks: [routeOp('kept', 'post', ['body']), routeOp('dropped', 'put', ['payload'])] },
+      60_000,
+      (message) => logged.push(message)
+    );
+    assert.strictEqual(labels.bodies.size, 1, 'only the request that resolves names a body');
+    assert.deepStrictEqual(labels.outcomes, {
+      verified: 1,
+      'verified request_dropped request_member_missing': 1,
+    });
+    assert.ok(logged.some((line) => line.includes('request_dropped request_member_missing')));
   });
 });
