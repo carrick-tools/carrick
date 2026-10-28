@@ -1125,6 +1125,59 @@ mod tests {
         read(sites, exports, verifier(&asked, verified)).rows
     }
 
+    /// carrick#2819: a result label rides the claim it sits on, and no
+    /// check sends it: a labelled claim and the same claim unlabelled give
+    /// the same check payload, from `checks` and from `server_checks`.
+    #[test]
+    fn checks_send_claims_without_their_result() {
+        let labelled = |mut claim: serde_json::Value| {
+            claim["result"] = json!({ "whole": true });
+            claim
+        };
+        let bus_claims = vec![
+            json!({ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                "name": { "arg": 0 }, "payload": { "arg": 1 } }),
+            json!({ "kind": "make", "form": "call", "member": null }),
+        ];
+        let with = |claims: Vec<serde_json::Value>, role: &str, package: &str| {
+            export(json!({
+                "package": package, "version": "1.4.0", "specifier": package,
+                "export": "bus", "role": role, "claims": claims
+            }))
+        };
+        let payload = |checks: Vec<LibraryCheck>| serde_json::to_string(&checks).unwrap();
+
+        let sites = sites_of(&[("src/orders.ts", BUS_SERVICE)]);
+        let plain = with(bus_claims.clone(), "broker", "@fixture/bus");
+        let marked = with(
+            bus_claims.iter().cloned().map(labelled).collect(),
+            "broker",
+            "@fixture/bus",
+        );
+        assert!(marked.claims.iter().all(|c| c.result_check().is_some()));
+        let sent = checks(&sites, &[marked]);
+        assert!(!sent.is_empty());
+        assert!(!payload(sent.clone()).contains("\"result\""));
+        assert_eq!(payload(sent), payload(checks(&sites, &[plain])));
+
+        let server_claims = vec![
+            json!({ "kind": "make", "form": "call", "member": null }),
+            json!({ "kind": "op", "op": "send", "member": "json", "on": "export",
+                "payload": { "arg": 0 } }),
+        ];
+        let plain = with(server_claims.clone(), "server_framework", "fixture-server");
+        let marked = with(
+            server_claims.into_iter().map(labelled).collect(),
+            "server_framework",
+            "fixture-server",
+        );
+        assert!(marked.claims.iter().all(|c| c.result_check().is_some()));
+        let sent = server_checks(&[marked]);
+        assert!(!sent.is_empty());
+        assert!(!payload(sent.clone()).contains("\"result\""));
+        assert_eq!(payload(sent), payload(server_checks(&[plain])));
+    }
+
     /// carrick#2674: the checks an `infer` request reads a route handler's
     /// parameters through: a server export's makers and scopes, its send ops
     /// that carry a payload slot, and its receive ops that say where the

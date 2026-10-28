@@ -200,10 +200,13 @@ impl ResultIndex {
     }
 
     /// The verified result of the labelled call at `file` with SWC span
-    /// `span`; with no span, or none that matches, of the one end on `line`.
+    /// `span`; with no span, of the one end on `line`. A span that matches no end names
+    /// a different call, so the line is not tried.
     pub fn at(&self, file: &str, span: Option<(u32, u32)>, line: u32) -> Option<&ResultShape> {
-        span.and_then(|(start, end)| self.by_span.get(&(file.to_string(), start, end)))
-            .or_else(|| self.by_line.get(&(file.to_string(), line)))
+        match span {
+            Some((start, end)) => self.by_span.get(&(file.to_string(), start, end)),
+            None => self.by_line.get(&(file.to_string(), line)),
+        }
     }
 
     /// An index holding `result` for the call at `file` with SWC span
@@ -356,11 +359,13 @@ mod tests {
         let whole = ResultShape::Whole(true);
         assert_eq!(index.at("src/client.ts", Some((10, 30)), 4), Some(&data));
         assert_eq!(index.at("src/client.ts", Some((40, 60)), 4), Some(&whole));
-        // No span that matches: the line holds two ends, so it names none.
+        // No span that matches names none; with no span the line holds two ends.
         assert_eq!(index.at("src/client.ts", Some((1, 2)), 4), None);
         assert_eq!(index.at("src/client.ts", None, 4), None);
-        // The one end on its line is found by line when its span is not.
-        assert_eq!(index.at("src/client.ts", Some((1, 2)), 9), Some(&data));
+        // A span that matches none is a different call: no line fallback.
+        assert_eq!(index.at("src/client.ts", Some((1, 2)), 9), None);
+        // With no span, the one end on its line is found by line.
+        assert_eq!(index.at("src/client.ts", None, 9), Some(&data));
         assert_eq!(index.at("other.ts", Some((10, 30)), 4), None);
     }
 

@@ -5444,7 +5444,7 @@ impl FileOrchestrator {
                     *call_result.borrow_mut() = self
                         .result_index
                         .at(
-                            file_path,
+                            crate::utils::repo_relative_source_path(file_path, repo_path),
                             data_call
                                 .call_expression_span_start
                                 .zip(data_call.call_expression_span_end),
@@ -15373,56 +15373,67 @@ export * from "./aFetch.js";"#,
                 },
             ],
         });
-        let mut file_results = HashMap::new();
-        file_results.insert(
+        let root = repo.path().to_string_lossy().to_string();
+        // The full scan keys its results by the raw path, the incremental
+        // scan by the repo-relative one; the label is found under each.
+        for key in [
             "src/service.ts".to_string(),
-            serde_json::from_value::<FileAnalysisResult>(answer).expect("a file answer"),
-        );
-        let requests = |index: crate::result_shapes::ResultIndex| {
-            let orchestrator = FileOrchestrator::new(AgentService::new()).with_result_index(index);
-            let graph = orchestrator.build_mount_graph(
-                &file_results,
-                &UrlNormalizer::default_permissive(),
-                Path::new(""),
-                Path::new(""),
+            "./src/service.ts".to_string(),
+            format!("{root}/src/service.ts"),
+        ] {
+            let mut file_results = HashMap::new();
+            file_results.insert(
+                key,
+                serde_json::from_value::<FileAnalysisResult>(answer.clone())
+                    .expect("a file answer"),
             );
-            let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
-                &file_results,
-                &repo.path().to_string_lossy(),
-                &graph,
-                &Config::default(),
-                &repo_modules(repo.path()),
-            );
-            infer
-        };
-        let bare = requests(crate::result_shapes::ResultIndex::default());
-        let member = crate::services::type_sidecar::ResultShape::Member(["data".to_string()]);
-        let labelled = requests(crate::result_shapes::ResultIndex::labelled(
-            "src/service.ts",
-            (470, 520),
-            member.clone(),
-        ));
-        assert_eq!(bare.len(), 2);
-        assert!(bare.iter().all(|item| item.result.is_none()));
-        assert_eq!(labelled.len(), 2);
-        let results: Vec<_> = labelled.iter().map(|item| item.result.clone()).collect();
-        assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
-        let carrying = labelled.iter().find(|item| item.result.is_some()).unwrap();
-        assert_eq!(carrying.result, Some(member));
-        assert_eq!(carrying.line_number, 10);
-        assert_eq!(carrying.infer_kind, InferKind::CallResult);
-        // Everything but the label is the same request.
-        let strip = |items: &[InferRequestItem]| {
-            items
-                .iter()
-                .map(|item| InferRequestItem {
-                    result: None,
-                    ..item.clone()
-                })
-                .map(|item| serde_json::to_string(&item).unwrap())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(strip(&bare), strip(&labelled));
+            let requests = |index: crate::result_shapes::ResultIndex| {
+                let orchestrator =
+                    FileOrchestrator::new(AgentService::new()).with_result_index(index);
+                let graph = orchestrator.build_mount_graph(
+                    &file_results,
+                    &UrlNormalizer::default_permissive(),
+                    Path::new(""),
+                    Path::new(""),
+                );
+                let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+                    &file_results,
+                    &repo.path().to_string_lossy(),
+                    &graph,
+                    &Config::default(),
+                    &repo_modules(repo.path()),
+                );
+                infer
+            };
+            let bare = requests(crate::result_shapes::ResultIndex::default());
+            let member = crate::services::type_sidecar::ResultShape::Member(["data".to_string()]);
+            let labelled = requests(crate::result_shapes::ResultIndex::labelled(
+                "src/service.ts",
+                (470, 520),
+                member.clone(),
+            ));
+            assert_eq!(bare.len(), 2);
+            assert!(bare.iter().all(|item| item.result.is_none()));
+            assert_eq!(labelled.len(), 2);
+            let results: Vec<_> = labelled.iter().map(|item| item.result.clone()).collect();
+            assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
+            let carrying = labelled.iter().find(|item| item.result.is_some()).unwrap();
+            assert_eq!(carrying.result, Some(member));
+            assert_eq!(carrying.line_number, 10);
+            assert_eq!(carrying.infer_kind, InferKind::CallResult);
+            // Everything but the label is the same request.
+            let strip = |items: &[InferRequestItem]| {
+                items
+                    .iter()
+                    .map(|item| InferRequestItem {
+                        result: None,
+                        ..item.clone()
+                    })
+                    .map(|item| serde_json::to_string(&item).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(strip(&bare), strip(&labelled));
+        }
     }
 
     /// carrick#1876: the type requests go out in one order on every scan.
