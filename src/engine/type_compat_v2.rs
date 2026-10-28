@@ -2265,11 +2265,17 @@ fn judge_once_in(
         .ok()
         .and_then(|bytes| serde_json::from_slice::<CheckV2Result>(&bytes).ok())
     {
-        debug!("v2 check: identical input already judged; reusing its answer");
+        debug!("v2 check: identical input already judged (key {key}); reusing its answer");
         return Ok(answer);
     }
+    debug!("v2 check: no kept answer for key {key}; judging");
     let result = judge()?;
-    if result.success && result.compiler_end.is_none() {
+    if !result.success || result.compiler_end.is_some() {
+        debug!(
+            "v2 check: answer for key {key} not kept (success {}, compiler end {:?})",
+            result.success, result.compiler_end
+        );
+    } else {
         // Written whole and renamed in, so a process that reads while the
         // other writes never sees half an answer.
         let staged = dir.join(format!("{key}.{}.tmp", std::process::id()));
