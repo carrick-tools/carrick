@@ -655,6 +655,8 @@ export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({
   packages: z.array(z.string().min(1)),
   max_entries: z.number().int().positive().optional(),
   exports: z.record(z.string(), z.array(z.string().min(1))).optional(),
+  handlers: z.boolean().optional(),
+  result_candidates: z.boolean().optional(),
 });
 
 // ============================================================================

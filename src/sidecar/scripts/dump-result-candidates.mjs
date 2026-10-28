@@ -59,6 +59,7 @@ try {
   if (ready.status !== 'ready') throw new Error(`init: ${JSON.stringify(ready)}`);
   const listed = await ask({ request_id: 'list', action: 'list_library_surface', from_dir: root,
     packages,
+    result_candidates: true,
     ...(maxEntries === undefined ? {} : { max_entries: maxEntries }),
   });
   if (listed.status !== 'success') throw new Error(`list_library_surface: ${JSON.stringify(listed)}`);

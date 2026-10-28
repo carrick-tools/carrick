@@ -759,6 +759,10 @@ export interface ListLibrarySurfaceRequest extends BaseRequest {
   max_entries?: number;
   /** Per package, the only exports to list (the ones the service imports); absent lists every value export. */
   exports?: Record<string, string[]>;
+  /** List each member's handler-parameter members (`handlers`, carrick#2674 S3); default false (carrick#2966). */
+  handlers?: boolean;
+  /** List each signature's `result_candidates` (carrick#2817); default false (carrick#2966). */
+  result_candidates?: boolean;
 }
 
 /**
@@ -1161,8 +1165,9 @@ export interface SurfaceSignature {
   returns: string;
   /**
    * Which parts of the awaited return could hold the response body
-   * (carrick#2817). Left out of the surface hash. Absent when the signature
-   * returns nothing.
+   * (carrick#2817). Left out of the surface hash. Listed only on a
+   * `result_candidates: true` request (carrick#2966); absent when the
+   * signature returns nothing.
    */
   result_candidates?: SurfaceResultCandidates;
 }
@@ -1191,7 +1196,8 @@ export interface SurfaceMember {
   /**
    * The members the parameters of a function this member takes declare
    * (carrick#2674): what a receive op's `request` field names its member
-   * paths in. Under a cap of their own, apart from the main one.
+   * paths in. Listed only on a `handlers: true` request, under a cap of
+   * their own: 500 members per parameter, top-level first (carrick#2966).
    */
   handlers?: SurfaceHandler[];
   signatures: SurfaceSignature[];
@@ -1248,6 +1254,11 @@ export interface LibrarySurface {
   reason?: string;
   /** Entries dropped by `max_entries`. */
   truncated: number;
+  /**
+   * With `handlers: true`, the handler-parameter members dropped by the cap of
+   * 500 per parameter (carrick#2966), summed over every listed parameter.
+   */
+  handlers_truncated?: number;
   exports: SurfaceExport[];
 }
 

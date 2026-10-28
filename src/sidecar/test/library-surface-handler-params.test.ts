@@ -1,7 +1,7 @@
 /**
- * carrick#2674 S3: `list_library_surface` lists the members a route handler's
- * own parameters declare, so a picker can name `request.body` on a receive
- * op's `request` field. They have a cap of their own, so the main listing, its
+ * carrick#2674 S3: `list_library_surface` with `handlers: true` (carrick#2966)
+ * lists the members a route handler's own parameters declare, so a picker can
+ * name `request.body` on a receive op's `request` field. They have a cap of their own, so the main listing, its
  * `truncated` count and the hash are the ones the lister gave without them.
  *
  * Every package below is invented and its declarations are hand-written.
@@ -106,6 +106,7 @@ interface Member {
 interface Surface {
   package: string;
   truncated: number;
+  handlers_truncated?: number;
   exports: Array<{ export: string; receivers: Array<{ receiver: string; members: Member[] }> }>;
 }
 
@@ -116,7 +117,7 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
 
   async function surface(packages: string[], extra: Record<string, unknown> = {}): Promise<Surface[]> {
     const response = await client.send<{ status: string; surfaces: Surface[]; errors?: string[] }>(
-      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, packages, ...extra },
+      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, packages, handlers: true, ...extra },
       60_000
     );
     assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
@@ -192,27 +193,24 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
     assert.strictEqual(byName.get('on')!.handlers, undefined);
   });
 
-  it('lists the members under a cap of their own, so a small cap still lists them', async () => {
+  it('lists every handler member under a main cap that cuts the signatures', async () => {
     const [full] = await surface(['fixture-big']);
     const fullMembers = membersOf(full);
     assert.deepStrictEqual(fullMembers.map(m => m.name), [...VERBS].sort());
     assert.strictEqual(full.truncated, 0);
+    assert.strictEqual(full.handlers_truncated, 0);
     const entries = (listed: Surface): number =>
       membersOf(listed).reduce(
         (n, m) => n + (m.handlers ?? []).reduce((k, h) => k + h.params.reduce((j, p) => j + 1 + p.members.length, 0), 0),
         0
       );
     const handlerEntries = entries(full);
-    // Under a cap that cuts the signatures, the handler members still take a
-    // cap of their own: all of it, not what the main listing left.
+    // Handler members take nothing from `max_entries` and are not cut by it
+    // (their cap is per parameter, carrick#2966).
     const [capped] = await surface(['fixture-big'], { max_entries: 20 });
     assert.ok(capped.truncated > 0, 'nothing was cut');
     assert.ok(handlerEntries > 20, 'the fixture is too small to reach the cap');
-    assert.strictEqual(entries(capped), 20);
-    // One entry fewer than the cap holds loses the last handler member only.
-    const [short] = await surface(['fixture-big'], { max_entries: handlerEntries - 1 });
-    assert.deepStrictEqual(membersOf(short).map(m => m.name), [...VERBS].sort());
-    assert.strictEqual(entries(short), handlerEntries - 1);
+    assert.strictEqual(entries(capped), handlerEntries);
   });
 
   it('hashes a package over the cap as the lister did before it listed handlers', async () => {
@@ -220,7 +218,7 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
     // below: handler members take nothing from the main cap, so the truncated
     // count and the hash are the ones it gave.
     const response = await client.send<{ status: string; surfaces: Surface[]; surface_sha256: string }>(
-      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, packages: ['fixture-big'], max_entries: 20 },
+      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, handlers: true, packages: ['fixture-big'], max_entries: 20 },
       60_000
     );
     assert.strictEqual(response.surfaces[0].truncated, 6);
@@ -229,7 +227,7 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
 
   it('keeps handlers out of the full-surface hash, at every depth', async () => {
     const response = await client.send<{ status: string; surfaces: Surface[]; surface_sha256: string }>(
-      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, packages: ['fixture-routes'] },
+      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, handlers: true, packages: ['fixture-routes'] },
       60_000
     );
     const [routes] = response.surfaces;
@@ -249,7 +247,7 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
 
   it('hashes a package with no handlers as the lister did before it listed them', async () => {
     const response = await client.send<{ status: string; surfaces: Surface[]; surface_sha256: string }>(
-      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, packages: ['fixture-plain'] },
+      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, handlers: true, packages: ['fixture-plain'] },
       60_000
     );
     assert.ok(membersOf(response.surfaces[0]).every(m => m.handlers === undefined));

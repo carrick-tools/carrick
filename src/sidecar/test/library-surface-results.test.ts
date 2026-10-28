@@ -1,5 +1,6 @@
 /**
- * carrick#2817: `list_library_surface` lists, per signature, which parts of a
+ * carrick#2817: `list_library_surface` with `result_candidates: true`
+ * (carrick#2966) lists, per signature, which parts of a
  * call's return could hold the response body (`result_candidates`), and
  * leaves the listing out of the full-surface hash. The package is invented
  * (`results-fixture.ts`).
@@ -53,7 +54,7 @@ describe('list_library_surface: result candidates (carrick#2817)', () => {
     const ready = await client.send<{ status: string }>({ request_id: 'init', action: 'init', repo_root: root });
     assert.strictEqual(ready.status, 'ready');
     listed = await client.send<SurfaceResponse>(
-      { request_id: 'list', action: 'list_library_surface', from_dir: root, packages: ['fixture-results'] },
+      { request_id: 'list', action: 'list_library_surface', from_dir: root, packages: ['fixture-results'], result_candidates: true },
       60_000
     );
     assert.strictEqual(listed.status, 'success', JSON.stringify(listed.errors));
@@ -129,5 +130,15 @@ describe('list_library_surface: result candidates (carrick#2817)', () => {
 
   it('leaves the candidates out of the surface hash', () => {
     assert.strictEqual(listed.surface_sha256, PINNED_SHA256);
+  });
+
+  it('lists no candidates when the request does not ask for them, with the same hash (carrick#2966)', async () => {
+    const plain = await client.send<SurfaceResponse>(
+      { request_id: 'list-plain', action: 'list_library_surface', from_dir: root, packages: ['fixture-results'] },
+      60_000
+    );
+    assert.strictEqual(plain.status, 'success', JSON.stringify(plain.errors));
+    assert.ok(!JSON.stringify(plain.surfaces).includes('"result_candidates"'), 'a signature carries result_candidates');
+    assert.strictEqual(plain.surface_sha256, PINNED_SHA256);
   });
 });

@@ -932,13 +932,20 @@ export class LibraryClaimsVerifier {
    * (`receiverExpression` on the export's `importLine`, read through
    * `DeclarationReader.returnOf`) and lists from it.
    *
+   * Each member's handler-parameter members (carrick#2674 S3) are listed
+   * only when `options.handlers` is set, and each signature's result
+   * candidates (carrick#2817) only when `options.resultCandidates` is
+   * (carrick#2966): on a large package either costs more than the rest of the
+   * listing.
+   *
    * `surface_sha256` is the full-surface hash (see `fullSurfaceSha256`).
    */
   listSurface(
     fromDir: string,
     packages: string[],
     maxEntries: number,
-    only: Readonly<Record<string, string[]>> = {}
+    only: Readonly<Record<string, string[]>> = {},
+    options: SurfaceOptions = {}
   ): ListedSurface {
     if (packages.length === 0) return { surfaces: [], surface_sha256: fullSurfaceSha256([]) };
     // Each specifier twice: as a namespace, which holds its named exports, and
@@ -985,7 +992,7 @@ export class LibraryClaimsVerifier {
 
     const surfaces = this.readProbe(fromDir, [...imports, ...importLines, ...buildLines], (checker, reader, file) =>
       packages.map((pkg, i) =>
-        reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], (name, receiver) => {
+        reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], options, (name, receiver) => {
           const index = builtIndex.get(builtKey({ package: pkg, export: name }, receiver));
           return index === undefined ? undefined : resolvedBuild(checker, file.statements[firstBuild + index]);
         })
@@ -1350,6 +1357,12 @@ class DeclarationReader {
   private currentPackage = '';
   /** `declaredProperties` per type, for `currentPackage` (its augmentations decide them). */
   private readonly declared = new Map<ts.Type, ts.Symbol[]>();
+  /** A handler parameter's listed members per type, for the package being listed (`handlerMembersOf`). */
+  private readonly handlerMembers = new Map<ts.Type, { members: SurfaceHandlerMember[]; dropped: number }>();
+  /** Handler-parameter members `HANDLER_MEMBER_CAP` dropped in the package being listed. */
+  private handlersDropped = 0;
+  /** Whether the package being listed lists each signature's `result_candidates`. */
+  private listResultCandidates = false;
   /** The service root as given and as a realpath, longest first: what a listing prints as `<root>`. */
   private readonly printedRoots: readonly string[];
 
@@ -3373,6 +3386,7 @@ class DeclarationReader {
     probe: SurfaceProbe,
     maxEntries: number,
     only: readonly string[] | undefined,
+    options: SurfaceOptions,
     built: (exportName: string, receiver: string) => ts.Signature | undefined
   ): LibrarySurface {
     this.setPackage(pkg);
@@ -3397,17 +3411,17 @@ class DeclarationReader {
       dropped += 1;
       return false;
     };
-    // Handler-parameter members (carrick#2674) have a cap of their own, so they
-    // take nothing from the main one: the listing, `truncated` and the hash are
-    // the ones the lister gave before handlers were listed.
-    let handlerBudget = maxEntries;
-    const takeHandler = (): boolean => {
-      if (handlerBudget <= 0) return false;
-      handlerBudget -= 1;
-      return true;
-    };
+    // Handler-parameter members (carrick#2674) take nothing from the main cap,
+    // so the listing, `truncated` and the hash are the ones the lister gave
+    // before handlers were listed; each parameter has a cap of its own
+    // (`HANDLER_MEMBER_CAP`, carrick#2966).
+    this.handlerMembers.clear();
+    this.handlersDropped = 0;
+    this.listResultCandidates = options.resultCandidates === true;
+    const withHandlers = options.handlers === true;
     // Four passes: every export and receiver, then every member name, then the
-    // members of each handler's parameters (carrick#2674), then signatures.
+    // members of each handler's parameters (carrick#2674; only when asked,
+    // carrick#2966), then signatures.
     const names: Array<() => void> = [];
     const handlers: Array<() => void> = [];
     const fills: Array<() => void> = [];
@@ -3423,7 +3437,7 @@ class DeclarationReader {
       const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
         if (!take()) return;
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
-        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, takeHandler, names, handlers, fills));
+        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, handlers, fills));
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
@@ -3442,9 +3456,10 @@ class DeclarationReader {
       }
     }
     for (const run of names) run();
-    for (const run of handlers) run();
+    if (withHandlers) for (const run of handlers) run();
     for (const fill of fills) fill();
     surface.truncated = dropped;
+    if (withHandlers) surface.handlers_truncated = this.handlersDropped;
     return surface;
   }
 
@@ -3610,7 +3625,6 @@ class DeclarationReader {
     type: ts.Type,
     home: ReadonlySet<string>,
     take: () => boolean,
-    takeHandler: () => boolean,
     names: Array<() => void>,
     handlers: Array<() => void>,
     fills: Array<() => void>
@@ -3639,7 +3653,7 @@ class DeclarationReader {
         const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
         handlers.push(() => {
-          const listed = this.listHandlers(own ? callee.signatures : library, takeHandler);
+          const listed = this.listHandlers(own ? callee.signatures : library);
           if (listed.length > 0) member.handlers = listed;
         });
         fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, holder.type, take)));
@@ -3655,13 +3669,13 @@ class DeclarationReader {
    * A parameter that declares no member lists nothing, and so does a handler
    * none of whose parameters do.
    */
-  private listHandlers(signatures: readonly ts.Signature[], take: () => boolean): SurfaceHandler[] {
+  private listHandlers(signatures: readonly ts.Signature[]): SurfaceHandler[] {
     const listed: SurfaceHandler[] = [];
     const seen = new Set<string>();
     const add = (arg: number, key: string | undefined, slot: ts.Type): void => {
       const place = JSON.stringify([arg, key ?? null]);
       if (seen.has(place)) return;
-      const params = this.listHandlerParams(slot, take);
+      const params = this.listHandlerParams(slot);
       if (params.length === 0) return;
       seen.add(place);
       listed.push(key === undefined ? { arg, params } : { arg, key, params });
@@ -3689,8 +3703,8 @@ class DeclarationReader {
     return listed;
   }
 
-  /** The parameters of a function type's first signature that declare members, each member counting against the cap. */
-  private listHandlerParams(handler: ts.Type, take: () => boolean): SurfaceHandlerParam[] {
+  /** The parameters of a function type's first signature that declare members, each with its members (`handlerMembersOf`). */
+  private listHandlerParams(handler: ts.Type): SurfaceHandlerParam[] {
     const slot = this.throughConditional(this.throughConstraint(handler));
     if (slot === VARIADIC) return [];
     const signature = this.parts(slot)
@@ -3700,31 +3714,72 @@ class DeclarationReader {
     const listed: SurfaceHandlerParam[] = [];
     signature.getParameters().forEach((parameter, index) => {
       const type = this.checker.getTypeOfSymbol(parameter);
-      if (this.namedProperties(type).length === 0 || !take()) return;
-      const members: SurfaceHandlerMember[] = [];
-      this.listMembers(type, [], members, take);
+      if (this.namedProperties(type).length === 0) return;
+      const { members, dropped } = this.handlerMembersOf(type);
+      this.handlersDropped += dropped;
       listed.push({ param: index, name: parameter.getName(), type: this.printed(type), members });
     });
     return listed;
   }
 
-  /** A type's declared members by path, parents before children, each level sorted by name, down to `HANDLER_MEMBER_DEPTH`. */
-  private listMembers(type: ts.Type, prefix: string[], into: SurfaceHandlerMember[], take: () => boolean): void {
-    for (const property of sortedByName(this.namedProperties(type))) {
-      if (!take()) continue;
-      const memberType = this.checker.getTypeOfSymbol(property);
-      const path = [...prefix, property.getName()];
-      const callable = this.librarySignatures(memberType, 'call').length > 0;
-      into.push({
-        path,
-        type: this.printed(memberType),
-        optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
-        function: callable,
-      });
-      if (!callable && path.length < HANDLER_MEMBER_DEPTH && this.isObjectType(memberType)) {
-        this.listMembers(memberType, path, into, take);
+  /**
+   * A handler parameter's declared members by path, down to
+   * `HANDLER_MEMBER_DEPTH`, at most `HANDLER_MEMBER_CAP` of them (carrick#2966).
+   * The cap keeps every top-level member before any nested one, so a wide
+   * parameter loses its deepest members, never a top-level one a later member
+   * name sorts after. Kept members come back parents before children, each
+   * level sorted by name. Read once per type in a package: a type many
+   * handlers share is listed once.
+   */
+  private handlerMembersOf(type: ts.Type): { members: SurfaceHandlerMember[]; dropped: number } {
+    const known = this.handlerMembers.get(type);
+    if (known) return known;
+    interface Node { member: SurfaceHandlerMember; children: Node[] }
+    const roots: Node[] = [];
+    let kept = 0;
+    let dropped = 0;
+    // Breadth first: a level is kept whole, in name order, before the next.
+    let level: Array<{ type: ts.Type; prefix: string[]; into: Node[] }> = [{ type, prefix: [], into: roots }];
+    while (level.length > 0) {
+      const next: typeof level = [];
+      for (const { type: holder, prefix, into } of level) {
+        for (const property of sortedByName(this.namedProperties(holder))) {
+          if (kept >= HANDLER_MEMBER_CAP) {
+            dropped += 1;
+            continue;
+          }
+          kept += 1;
+          const memberType = this.checker.getTypeOfSymbol(property);
+          const path = [...prefix, property.getName()];
+          const callable = this.librarySignatures(memberType, 'call').length > 0;
+          const node: Node = {
+            member: {
+              path,
+              type: this.printed(memberType),
+              optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
+              function: callable,
+            },
+            children: [],
+          };
+          into.push(node);
+          if (!callable && path.length < HANDLER_MEMBER_DEPTH && this.isObjectType(memberType)) {
+            next.push({ type: memberType, prefix: path, into: node.children });
+          }
+        }
       }
+      level = next;
     }
+    const members: SurfaceHandlerMember[] = [];
+    const emit = (nodes: Node[]): void => {
+      for (const node of nodes) {
+        members.push(node.member);
+        emit(node.children);
+      }
+    };
+    emit(roots);
+    const listed = { members, dropped };
+    this.handlerMembers.set(type, listed);
+    return listed;
   }
 
   private listSignatures(signatures: readonly ts.Signature[], holder: ts.Type, take: () => boolean): SurfaceSignature[] {
@@ -3759,7 +3814,7 @@ class DeclarationReader {
         params.push(param);
       }
       const entry: SurfaceSignature = { params, returns: this.printed(this.checker.getReturnTypeOfSignature(signature)) };
-      const candidates = resultCandidatesOf(this.checker, signature);
+      const candidates = this.listResultCandidates ? resultCandidatesOf(this.checker, signature) : undefined;
       if (candidates !== undefined) entry.result_candidates = candidates;
       listed.push(entry);
     }
@@ -4315,6 +4370,20 @@ class DeclarationReader {
  */
 /** The longest member path a handler parameter's members are listed to (`['raw', 'url']`). */
 const HANDLER_MEMBER_DEPTH = 2;
+/**
+ * The most members one handler parameter lists (carrick#2966), top-level
+ * first. The store's server question shows at most 300 of them in the same
+ * order, so this must stay at least that.
+ */
+const HANDLER_MEMBER_CAP = 500;
+
+/** What a surface listing adds beyond the hashed surface, each only when asked (carrick#2966). */
+export interface SurfaceOptions {
+  /** Each member's `handlers` (carrick#2674 S3). */
+  handlers?: boolean;
+  /** Each signature's `result_candidates` (carrick#2817). */
+  resultCandidates?: boolean;
+}
 
 const PRINT_FLAGS =
   ts.NodeBuilderFlags.AllowUniqueESSymbolType |

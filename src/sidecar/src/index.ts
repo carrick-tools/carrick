@@ -791,7 +791,8 @@ function handleListLibrarySurface(
       fromDir,
       request.packages,
       request.max_entries ?? SURFACE_MAX_ENTRIES,
-      request.exports ?? {}
+      request.exports ?? {},
+      { handlers: request.handlers, resultCandidates: request.result_candidates }
     );
     return { request_id: request.request_id, status: 'success', surfaces, surface_sha256 };
   } catch (err) {
