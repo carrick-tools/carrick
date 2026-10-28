@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use super::row_calls::Reach;
 use super::values::ValueAt;
 use super::*;
-use crate::library_claims::{ExportClaims, applies, runtime_packages_of};
+use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_step};
 use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
@@ -155,6 +155,12 @@ pub struct SiteEnd {
     /// The call constructs its callee (`new m(…)`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new: bool,
+    /// The scope member whose result the labelled call is made on, when its
+    /// op is claimed on that result (`instance:()>scope:at` is `at`;
+    /// carrick#1678). Only a call a verified op resolves to by its
+    /// declaration states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// One function a walk entered.
@@ -527,6 +533,10 @@ pub struct DeclaredOp {
     pub export: String,
     pub member: String,
     pub op: LibraryOp,
+    /// The scope member the receiver the op was asked on is the result of
+    /// (carrick#1678): the same member declared on another type is another
+    /// op.
+    pub scope: Option<String>,
 }
 
 /// The verify request the receiver trace sends: each labelled op claim whose
@@ -654,6 +664,7 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
                             export: export.export.clone(),
                             member: member.clone(),
                             op: *op,
+                            scope: scope_step(&receiver).map(|(_, step)| step.to_string()),
                         }));
                         ask.scopes.push(None);
                     }
@@ -1054,6 +1065,59 @@ fn row_at<'a>(inputs: &'a RequestSummaryInputs, file: &Path, call: &CallIr) -> O
         .ok()
 }
 
+/// The binding `call`, written in `file`, is made on (carrick#2474 R1): the
+/// row at the object its member is read on, `ident` for a name, `member` for
+/// a member access, `call` for a call's value, and what holds it. A name is
+/// a parameter when a function of its declaring file binds that name at the
+/// line the row names. `None` for a call with no receiver. The decided
+/// sites read the receiver of a scope call the same way (carrick#1678).
+pub(super) fn receiver_at(
+    inputs: &RequestSummaryInputs,
+    file: &Path,
+    call: &CallIr,
+) -> Option<ReceiverAt> {
+    let (lo, hi, form) = call.receiver_object?;
+    let (kind, row_kind) = match form {
+        ObjectForm::Name => (ReceiverKind::Binding, Some(Kind::Ident)),
+        ObjectForm::Member => (ReceiverKind::Field, Some(Kind::Member)),
+        ObjectForm::Call => (ReceiverKind::CallResult, Some(Kind::Call)),
+        ObjectForm::Other => (ReceiverKind::Other, None),
+    };
+    let row = row_kind.and_then(|row_kind| {
+        let positions = inputs.positions.as_ref()?;
+        let ir = inputs.files.get(file)?;
+        positions
+            .lookup(file, ir.swc_start(lo), ir.swc_start(hi), row_kind)
+            .ok()
+    });
+    let parameter = form == ObjectForm::Name
+        && row.is_some_and(|row| {
+            if in_repo(row)
+                && let (Some(symbol), Some(decl_file), Some(line)) =
+                    (row.symbol(), row.decl_file(), row.decl_line())
+                && let Some(positions) = inputs.positions.as_ref()
+                && let Some(declared) = inputs.files.get(&positions.path_of(decl_file))
+            {
+                declared
+                    .declaration_lines
+                    .params
+                    .contains(&(line, symbol.to_string()))
+            } else {
+                false
+            }
+        });
+    Some(ReceiverAt {
+        symbol: row.and_then(|row| row.symbol()).map(str::to_string),
+        decl_file: row.and_then(|row| row.decl_file()).map(str::to_string),
+        decl_line: row.and_then(|row| row.decl_line()),
+        kind: if parameter {
+            ReceiverKind::Parameter
+        } else {
+            kind
+        },
+    })
+}
+
 struct Walker<'a> {
     inputs: &'a RequestSummaryInputs,
     /// The run's other services, in declared order (carrick#2618): the walk
@@ -1142,11 +1206,19 @@ impl<'a> Walker<'a> {
         let op = (!invoke.construction)
             .then(|| {
                 claims.claims.iter().find_map(|claim| match claim {
+                    // An op claimed on what a scope member returns is read
+                    // only where a verified declaration says so
+                    // (carrick#1678), never by the member's name.
                     LibraryClaim::Op {
                         op,
                         member: claimed,
+                        of,
                         ..
-                    } if claimed.as_deref() == member => Some(*op),
+                    } if claimed.as_deref() == member
+                        && !of.as_deref().is_some_and(|of| scope_step(of).is_some()) =>
+                    {
+                        Some(*op)
+                    }
                     _ => None,
                 })
             })
@@ -1162,6 +1234,7 @@ impl<'a> Walker<'a> {
             span_start: invoke.call.site.span_start,
             span_end: invoke.call.site.span_end,
             new: invoke.construction,
+            scope: None,
         }
     }
 
@@ -1170,52 +1243,9 @@ impl<'a> Walker<'a> {
         row_at(self.inputs_for(file), file, call)
     }
 
-    /// The binding `call` is made on (carrick#2474 R1): the row at the
-    /// object its member is read on, `ident` for a name, `member` for a
-    /// member access, `call` for a call's value, and what holds it. A name
-    /// is a parameter when a function of its declaring file binds that name
-    /// at the line the row names. `None` for a call with no receiver.
+    /// The binding `call` is made on ([`receiver_at`]).
     fn receiver_of(&self, file: &Path, call: &CallIr) -> Option<ReceiverAt> {
-        let (lo, hi, form) = call.receiver_object?;
-        let (kind, row_kind) = match form {
-            ObjectForm::Name => (ReceiverKind::Binding, Some(Kind::Ident)),
-            ObjectForm::Member => (ReceiverKind::Field, Some(Kind::Member)),
-            ObjectForm::Call => (ReceiverKind::CallResult, Some(Kind::Call)),
-            ObjectForm::Other => (ReceiverKind::Other, None),
-        };
-        let row = row_kind.and_then(|row_kind| {
-            let positions = self.inputs.positions.as_ref()?;
-            let ir = self.inputs.files.get(file)?;
-            positions
-                .lookup(file, ir.swc_start(lo), ir.swc_start(hi), row_kind)
-                .ok()
-        });
-        let parameter = form == ObjectForm::Name
-            && row.is_some_and(|row| {
-                if in_repo(row)
-                    && let (Some(symbol), Some(decl_file), Some(line)) =
-                        (row.symbol(), row.decl_file(), row.decl_line())
-                    && let Some(positions) = self.inputs.positions.as_ref()
-                    && let Some(declared) = self.inputs.files.get(&positions.path_of(decl_file))
-                {
-                    declared
-                        .declaration_lines
-                        .params
-                        .contains(&(line, symbol.to_string()))
-                } else {
-                    false
-                }
-            });
-        Some(ReceiverAt {
-            symbol: row.and_then(|row| row.symbol()).map(str::to_string),
-            decl_file: row.and_then(|row| row.decl_file()).map(str::to_string),
-            decl_line: row.and_then(|row| row.decl_line()),
-            kind: if parameter {
-                ReceiverKind::Parameter
-            } else {
-                kind
-            },
-        })
+        receiver_at(self.inputs, file, call)
     }
 
     /// The labelled export `call` is made on, when it is one, and how it
@@ -1383,6 +1413,7 @@ impl<'a> Walker<'a> {
                 Some((
                     SiteEnd {
                         op: Some(one.op),
+                        scope: one.scope.clone(),
                         ..end(&one.package, &one.export, Some(&one.member), claims)
                     },
                     ReachedBy::Declaration,
@@ -4159,6 +4190,117 @@ export function listen(): void {
                 ("hole_entry_point".to_string(), 3),
                 ("mount_unverified".to_string(), 1),
             ])
+        );
+    }
+
+    /// carrick#1678: a verb called on the object a scope member returns
+    /// (`items.at("/items").get(list)`) is a route whose path is the scope
+    /// call's argument and whose instance is the scope call's receiver: the
+    /// scope's path is the route's own path, never also a prefix. The verb is
+    /// the scoped op's (`get` of `Route`), not the router's `get` of the same
+    /// name, which would read the handler as the path.
+    #[test]
+    fn a_route_on_the_object_a_scope_member_returns_is_composed_under_its_router() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-scopes-chain")
+        else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = composed_lines(&decided, false);
+        // The scope's path is the route's own path, served under the
+        // router's mount. A path the code cannot read composes none.
+        let want = texts(&[
+            // Across lines: the site is the call, at the chain's first line.
+            "src/items.ts:27 <- /api/multi",
+            "src/items.ts:25 <- /api/items",
+            // A module-scope constant bound to the scope call.
+            "src/items.ts:32 <- /api/one",
+            // A helper's path parameter: each caller states one.
+            "src/items.ts:37 <- /api/p1",
+            "src/items.ts:38 <- /api/p2",
+            // The first verb of a chain of two; the second waits on slice B.
+            "src/items.ts:40 <- /api/items/:id",
+            "src/items.ts:56 <- ?",
+        ]);
+        let mut want = want;
+        want.sort();
+        assert_eq!(got, want, "{got:#?}");
+        // A constant local to a function, a `let` written twice and a result
+        // handed to a helper state no scope call: leads, never sites.
+        let leads: Vec<String> = decided
+            .leads
+            .iter()
+            .map(|lead| format!("{}:{} {:?}", lead.file, lead.line, lead.reason))
+            .collect();
+        assert_eq!(
+            leads,
+            texts(&[
+                "src/items.ts:40 NameNeverBound",
+                "src/items.ts:44 NameNeverBound",
+                "src/items.ts:49 NameNeverBound",
+                "src/items.ts:52 NameNeverBound",
+            ])
+        );
+        // The rows the trace writes: the verb is the scoped op's, the owner
+        // is the scope call's receiver (`items`, or `r` inside the helper),
+        // never the scope member (`at`), and the name is the scope call's
+        // argument, forced by the code with no call argument to ask for.
+        let labels = SiteLabel::from_exports(&exports);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        let routes = crate::site_rows::traced(&decided, &records);
+        let mut served: Vec<String> = routes
+            .routes
+            .iter()
+            .map(|route| {
+                format!(
+                    "{}:{} {} {} <- {} owner {}",
+                    route.file,
+                    route.line,
+                    route.method,
+                    route.path,
+                    route.full_paths.join(" "),
+                    route.owner.as_deref().unwrap_or("-"),
+                )
+            })
+            .collect();
+        served.sort();
+        assert_eq!(
+            served,
+            texts(&[
+                "src/items.ts:25 GET /items <- /api/items owner items",
+                "src/items.ts:27 POST /multi <- /api/multi owner items",
+                "src/items.ts:32 GET /one <- /api/one owner items",
+                "src/items.ts:37 GET /p1 <- /api/p1 owner r",
+                "src/items.ts:38 GET /p2 <- /api/p2 owner r",
+                "src/items.ts:40 GET /items/:id <- /api/items/:id owner items",
+            ]),
+            "{served:#?}"
+        );
+        let first = records
+            .iter()
+            .find(|record| record.state.point.at == "src/items.ts:25")
+            .expect("a record at the first chain");
+        assert_eq!(
+            first.state.forced.get(&crate::site_questions::Slot::Name),
+            Some(&"/items".to_string())
+        );
+        assert_eq!(
+            first.basis.get(&crate::site_questions::Slot::Name),
+            Some(&super::super::site_record::Basis::Code)
+        );
+        assert!(
+            !first
+                .state
+                .forced
+                .contains_key(&crate::site_questions::Slot::NameArgument)
+                && !first
+                    .state
+                    .asked
+                    .contains(&crate::site_questions::Slot::NameArgument),
+            "no argument of the verb holds the name"
         );
     }
 

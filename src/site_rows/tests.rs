@@ -62,6 +62,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
             line: LINE,
             span_start: 100,
             new: false,
+            scope: None,
             span_end: 130,
         },
         name: Vec::new(),
@@ -167,6 +168,7 @@ fn labels() -> Vec<SiteLabel> {
         runs: None,
         method: None,
         request: None,
+        scope: None,
     };
     vec![
         label("Server", Some("server")),

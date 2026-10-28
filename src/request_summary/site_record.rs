@@ -1420,12 +1420,12 @@ fn record(
         .iter()
         .filter_map(|index| parts.arg_exprs.get(*index))
         .collect();
-    let whole_names: Option<BTreeSet<String>> = match (&site.key, &label.name) {
+    let whole_names: Option<BTreeSet<String>> = match (&site.key, label.reads_name()) {
         (Some(key), _) => {
             stated.value(key, place(PlaceFrom::ObjectKey, &at));
             Some(BTreeSet::from([key.clone()]))
         }
-        (None, Some(_)) => {
+        (None, true) => {
             if let Some(text) = literal_text(&site.name) {
                 stated.value(&text, place(PlaceFrom::StringLiteral, &at));
             } else if let Some(text) = env_based_text(&site.name) {
@@ -1440,7 +1440,7 @@ fn record(
                 Some(BTreeSet::from([text]))
             })
         }
-        (None, None) => None,
+        (None, false) => None,
     };
     for written in &parts.in_args {
         for text in &written.strings {
@@ -1527,15 +1527,15 @@ fn record(
     // when it states several; a lead when it states none whole. A label
     // that names no name slot forces neither the name nor the argument it
     // is read from: both are asked.
-    let name_unstated = match (&label.name, &whole_names) {
-        (None, _) => {
+    let name_unstated = match (label.reads_name(), &whole_names) {
+        (false, _) => {
             decide(Slot::Name, Vec::new(), true, Basis::Code);
             if site.key.is_none() {
                 decide(Slot::NameArgument, Vec::new(), true, Basis::Label);
             }
             false
         }
-        (Some(_), Some(values)) if !values.is_empty() => {
+        (true, Some(values)) if !values.is_empty() => {
             decide(
                 Slot::Name,
                 values.iter().cloned().collect(),
@@ -1544,7 +1544,7 @@ fn record(
             );
             false
         }
-        (Some(_), _) => true,
+        (true, _) => true,
     };
     if site.key.is_none() {
         if label.name.is_some() {

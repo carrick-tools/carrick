@@ -175,8 +175,10 @@ impl ExportClaims {
     /// `<specifier>@<major>:<export>:<kind>:…`, the convention HTTP claim
     /// ids follow (`<package>@<major>:<export>:factory:<member>`). A claim id
     /// stated twice, differently, names nothing one can verify, so both are
-    /// dropped. Scope claims are left out: no reader reads the receivers a
-    /// scope returns yet (carrick#1678).
+    /// dropped. Scope claims are left out: the library check reads no
+    /// receiver a scope returns. The receiver trace does (carrick#1678): an
+    /// op claimed on `<base>>scope:<member>` is read at the call made on what
+    /// the scope member returned ([`scope_step`]).
     pub fn claims_by_id(&self) -> Vec<(String, &LibraryClaim)> {
         self.by_id(false)
     }
@@ -465,6 +467,13 @@ pub(crate) fn applies(on: Option<ClaimOn>, of: Option<&str>, receiver: &str) -> 
         (Some(ClaimOn::Both), None) => receiver == "export" || instance,
         _ => false,
     }
+}
+
+/// The base receiver and the scope member of a receiver id that names what a
+/// scope member returns (`instance:()>scope:at` is `instance:()` and `at`);
+/// `None` for any other id (carrick#1678).
+pub(crate) fn scope_step(receiver: &str) -> Option<(&str, &str)> {
+    receiver.split_once(">scope:")
 }
 
 /// The site API's selector for a claim's own `on`, `of`, `path` and

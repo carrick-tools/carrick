@@ -478,6 +478,7 @@ mod tests {
             line: 3,
             span_start: 10,
             new: false,
+            scope: None,
             span_end: 20,
         };
         let lead = |end: LabelledEnd| DecidedLead {

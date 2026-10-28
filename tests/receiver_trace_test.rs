@@ -450,6 +450,49 @@ fn traced_routes_take_their_composed_paths() {
     );
 }
 
+/// carrick#1678 slice A: a verb called on the object a scope member returns
+/// (`items.at("/items").get(list)`, the made-up package's `at`) is a route
+/// whose path is the scope call's argument, served under the router's
+/// mount. With the switch on, the mount graph and the flat endpoints hold
+/// each at its line, `library_claim`, owned by the scope call's receiver
+/// (`items`, `r` inside the helper), never the scope member (`at`). The
+/// chain's later verb, a function-local constant, a `let` written twice and
+/// a result handed to a helper add no row. With the switch off, or with the
+/// fact layer off, nothing moves.
+#[test]
+fn routes_on_a_returned_scope_take_their_paths() {
+    let off = scan_fixture("receiver-scopes-chain", true, None);
+    let (off_graph, _) = endpoint_rows(&off);
+    assert_eq!(off_graph, Vec::<String>::new());
+
+    let on = scan_fixture("receiver-scopes-chain", true, Some("1"));
+    let (graph, flat) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            "src/items.ts:25 GET /api/items library_claim items",
+            "src/items.ts:27 POST /api/multi library_claim items",
+            "src/items.ts:32 GET /api/one library_claim items",
+            "src/items.ts:37 GET /api/p1 library_claim r",
+            "src/items.ts:38 GET /api/p2 library_claim r",
+            "src/items.ts:40 GET /api/items/:id library_claim items",
+        ]
+    );
+    let flat_of_graph: Vec<String> = {
+        let mut rows: Vec<String> = graph
+            .iter()
+            .map(|row| row.rsplit_once(' ').unwrap().0.to_string())
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(flat, flat_of_graph);
+    assert_eq!(
+        scan_fixture("receiver-scopes-chain", false, Some("1")),
+        scan_fixture("receiver-scopes-chain", false, None)
+    );
+}
+
 /// Why each possible call's path is unread, as `file:line` to reason. A call
 /// whose path is read and whose owner is not is `owner_unknown`.
 fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {

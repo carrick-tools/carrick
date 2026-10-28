@@ -92,6 +92,11 @@ pub struct LabelledEnd {
     /// The call constructs its callee (`new m(…)`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new: bool,
+    /// The scope member whose result the call is made on, when its op is
+    /// claimed on that result (carrick#1678): the label of the same member
+    /// on the scope's receiver, never the base receiver's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 impl LabelledEnd {
@@ -201,6 +206,21 @@ pub struct SiteLabel {
     /// site's state carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<crate::services::type_sidecar::RequestAt>,
+    /// Set on an op claimed on what a scope member returns (carrick#1678).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<LabelScope>,
+}
+
+/// The scope member an op is claimed on the result of (carrick#1678):
+/// `instance:()>scope:at` is `step` `at` on `base` `instance:()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelScope {
+    pub base: String,
+    pub step: String,
+    /// The scope call's `name` slot is the op's name (`name: { bound:
+    /// "scope" }`): the site reads the name at the scope call, not at its
+    /// own call.
+    pub names: bool,
 }
 
 /// A maker that runs the function its call supplies at `slot`
@@ -271,6 +291,7 @@ impl SiteLabel {
                         reserved: Vec::new(),
                         runs: None,
                         request: op.request,
+                        scope: None,
                     });
                 }
             }
@@ -285,7 +306,7 @@ impl SiteLabel {
     /// carries `runs`; a scope labels nothing. A reserved name rides on the
     /// labels of the op it applies to.
     pub fn from_exports(exports: &[crate::library_claims::ExportClaims]) -> Vec<SiteLabel> {
-        use crate::services::type_sidecar::{LibraryClaim, MakeForm, OpName};
+        use crate::services::type_sidecar::{BoundName, LibraryClaim, MakeForm, OpName};
         let word = |value: serde_json::Result<serde_json::Value>| -> Option<String> {
             value.ok()?.as_str().map(str::to_string)
         };
@@ -324,6 +345,7 @@ impl SiteLabel {
                             new: *form == MakeForm::New,
                         }),
                         request: None,
+                        scope: None,
                     });
                     continue;
                 }
@@ -368,6 +390,19 @@ impl SiteLabel {
                     reserved: reserved_on(&export.claims, member.as_deref(), path, (*on, of)),
                     runs: None,
                     request: request.as_deref().cloned(),
+                    scope: of
+                        .as_deref()
+                        .and_then(crate::library_claims::scope_step)
+                        .map(|(base, step)| LabelScope {
+                            base: base.to_string(),
+                            step: step.to_string(),
+                            names: matches!(
+                                name,
+                                Some(OpName::Bound {
+                                    bound: BoundName::Scope
+                                })
+                            ),
+                        }),
                 });
             }
         }
@@ -375,14 +410,24 @@ impl SiteLabel {
     }
 
     /// The op label for `end` among `labels`: the same package, export and
-    /// member. A maker's label (no op) is [`Self::runner`]'s.
+    /// member, claimed on the same receiver: a member also claimed on what a
+    /// scope member returns (`get` of a router and `get` of the object its
+    /// `at` returns) is two labels, told apart by the end's scope step
+    /// (carrick#1678). A maker's label (no op) is [`Self::runner`]'s.
     pub fn find<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Option<&'l SiteLabel> {
         labels.iter().find(|label| {
             label.op.is_some()
                 && label.package == end.package
                 && label.export == end.export
                 && label.member == end.member
+                && label.scope.as_ref().map(|scope| &scope.step) == end.scope.as_ref()
         })
+    }
+
+    /// Whether the op has a name to read: a slot of its own call, or the
+    /// argument of the scope call it is made on the result of (carrick#1678).
+    pub fn reads_name(&self) -> bool {
+        self.name.is_some() || self.scope.as_ref().is_some_and(|scope| scope.names)
     }
 
     /// The slot the call `end` names is handed a function in, when the store
@@ -1605,6 +1650,10 @@ struct Walk<'a, 'i> {
     /// reached it.
     receiver: Option<super::discovery::ReceiverAt>,
     reached: Option<super::discovery::ReachedBy>,
+    /// The scope call the labelled call being walked is made on the result
+    /// of, when its op's name is that call's argument (carrick#1678): its
+    /// instances are the scope call's receiver's.
+    scope_call: Option<Placed<'a>>,
 }
 
 impl<'a> Walk<'a, '_> {
@@ -1691,19 +1740,104 @@ impl<'a> Walk<'a, '_> {
         });
     }
 
+    /// The scope call the labelled call `last` is made on the result of, and
+    /// the slot of it that holds the name: the call of the member `scope`
+    /// names, which a label verified on the scope's base receiver says
+    /// returns that object (carrick#1678). Two shapes are read: the scope
+    /// call is the receiver itself (`items.at(p).get(h)`), or the receiver
+    /// is a name a module-scope constant binds to it (`one.get(h)`). A
+    /// constant local to a function, a binding written twice and a result
+    /// handed on read as no scope call.
+    fn scope_call_of(
+        &self,
+        last: &Placed<'a>,
+        end: &LabelledEnd,
+        scope: &LabelScope,
+    ) -> Option<(Placed<'a>, ArgSlot)> {
+        use super::discovery::ObjectForm;
+        let ir = self.inputs.files.get(last.file)?;
+        let instance = &last.call.instance;
+        let at = match last.call.receiver_object? {
+            (lo, hi, ObjectForm::Call) => (ir.swc_start(lo), ir.swc_start(hi)),
+            (_, _, ObjectForm::Name) => match instance.receiver_held.as_ref()? {
+                super::HeldInstance::Returned(lo, hi) => (ir.swc_start(*lo), ir.swc_start(*hi)),
+                super::HeldInstance::Client(client) => match &client.instance {
+                    Some(made) if matches!(made.made_by, super::MadeBy::Call(_)) => {
+                        (made.site.span_start, made.site.span_end)
+                    }
+                    _ => return None,
+                },
+                super::HeldInstance::Imported(..) => return None,
+            },
+            _ => return None,
+        };
+        let call = self.calls.at_span(last.file, at.0, at.1)?;
+        // A name stands for the scope call only where it is bound once for
+        // the whole module.
+        if matches!(last.call.receiver_object, Some((_, _, ObjectForm::Name)))
+            && (call.key.is_some() || call.depth != 0)
+        {
+            return None;
+        }
+        if call.call.callee != scope.step
+            || !instances::library_call(self.inputs, call.file, call.call)
+        {
+            return None;
+        }
+        let label = self.scopes.iter().find(|label| {
+            label.member == scope.step && label.returns_on(&end.package, &end.export, &scope.base)
+        })?;
+        Some((
+            call,
+            ArgSlot {
+                arg: label.name.0,
+                key: label.name.1.clone(),
+            },
+        ))
+    }
+
+    /// The site of the labelled call `last`, an op whose name the scope call
+    /// it is made on the result of binds (carrick#1678): the name is the
+    /// scope call's own argument, settled as a slotted name is (at the call,
+    /// else at the callers of its function), so the scope's path is the
+    /// route's own path and never also a prefix. The site is the labelled
+    /// call; its instances and receiver are the scope call's receiver's.
+    /// No scope call found (a constant local to a function, one assigned
+    /// twice, the result handed to a helper) is a lead.
+    fn scoped(&mut self, last: &Placed<'a>, end: &LabelledEnd, scope: &LabelScope) {
+        let Some((call, slot)) = self.scope_call_of(last, end, scope) else {
+            self.lead(last, end, Undecided::NameNeverBound);
+            return;
+        };
+        let pieces = slot_value(call.call, &slot);
+        self.receiver = super::discovery::receiver_at(self.inputs, call.file, call.call);
+        self.scope_call = Some(call);
+        if self.settles(last, &pieces, end) {
+            self.site(&[*last], end, pieces, BTreeSet::new());
+        } else {
+            self.up(&[*last], &pieces, end, &mut Vec::new());
+        }
+        self.scope_call = None;
+    }
+
     /// With the receiver trace on, the instance ends of the site whose
     /// calls are `down` ([`instances`]); none with it off.
     fn instances(&self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
         match (self.makers, self.index) {
-            (Some(makers), Some(index)) => instances::InstanceWalk::new(
-                self.calls,
-                self.inputs,
-                self.root,
-                makers,
-                self.scopes,
-                index,
-            )
-            .of(down),
+            (Some(makers), Some(index)) => {
+                let walk = instances::InstanceWalk::new(
+                    self.calls,
+                    self.inputs,
+                    self.root,
+                    makers,
+                    self.scopes,
+                    index,
+                );
+                match &self.scope_call {
+                    Some(scope) => walk.of_scoped(down, scope),
+                    None => walk.of(down),
+                }
+            }
             _ => Vec::new(),
         }
     }
@@ -2073,6 +2207,7 @@ fn decide(
         label: None,
         receiver: None,
         reached: None,
+        scope_call: None,
     };
     for site in discovered {
         let Some(end) = &site.end else {
@@ -2080,6 +2215,7 @@ fn decide(
         };
         walk.receiver = site.receiver.clone();
         walk.reached = site.reached;
+        walk.scope_call = None;
         // An end discovery keeps with a stop is one of the labelled exports
         // a callee's disagreeing values reach (carrick#2432): the call is a
         // lead, named by none of them.
@@ -2129,6 +2265,16 @@ fn decide(
         // file is never the site. The request is stated at the call of this
         // service's files that enters the sibling.
         let last_is_own = calls.is_own(last.file);
+        // An op whose name the scope member it is called on the result of
+        // binds (carrick#1678): the name is read at the scope call, and the
+        // site stays the labelled call. A sibling's call is stated in the
+        // sibling's own scan.
+        if let Some(scope) = label.scope.as_ref().filter(|scope| scope.names) {
+            if last_is_own {
+                walk.scoped(&last, end, scope);
+            }
+            continue;
+        }
         let Some(slot) = &label.name else {
             // The label names no slot: the labelled call is the site, or for
             // a sibling's call the call of this service that enters it.
@@ -2718,6 +2864,7 @@ pub(crate) mod tests {
                     reserved: Vec::new(),
                     runs: None,
                     request: None,
+                    scope: None,
                     method: Some(MethodLabel {
                         from: None,
                         default: None,
@@ -2737,6 +2884,7 @@ pub(crate) mod tests {
                     reserved: Vec::new(),
                     runs: None,
                     request: None,
+                    scope: None,
                     method: Some(MethodLabel {
                         from: Some(ArgSlot {
                             arg: 1,
@@ -2834,6 +2982,7 @@ pub(crate) mod tests {
             line,
             span_start: line * 100,
             new: false,
+            scope: None,
             span_end: line * 100 + 20,
         };
         let sites = [
@@ -2891,6 +3040,7 @@ pub(crate) mod tests {
             span_start,
             span_end,
             new: false,
+            scope: None,
         }
     }
 
@@ -3391,6 +3541,7 @@ pub(crate) mod tests {
             line: 7,
             span_start: start,
             new: false,
+            scope: None,
             span_end: start + call.len() as u32,
         };
         let bottom = DiscoverySite {
@@ -3531,6 +3682,7 @@ pub(crate) mod tests {
             reserved: Vec::new(),
             runs: None,
             request: None,
+            scope: None,
             method: None,
         }
     }
@@ -3550,6 +3702,7 @@ pub(crate) mod tests {
             reserved: Vec::new(),
             runs: None,
             request: None,
+            scope: None,
             method: Some(MethodLabel {
                 from: Some(ArgSlot {
                     arg: 1,
@@ -3577,6 +3730,7 @@ pub(crate) mod tests {
             reserved: Vec::new(),
             runs: None,
             request: None,
+            scope: None,
             method: None,
         }
     }
@@ -3594,6 +3748,7 @@ pub(crate) mod tests {
             line: line_of(text, call),
             span_start,
             new: false,
+            scope: None,
             span_end,
         }
     }
@@ -4120,6 +4275,40 @@ pub(crate) mod tests {
         (decided, text, inputs)
     }
 
+    /// carrick#1678: a member claimed on a router and again on the object
+    /// one of its scope members returns (`get` of both) is two labels, told
+    /// apart by the scope step the end carries, in either order. Matching by
+    /// package, export and member alone hands the router's label to the
+    /// scoped call, which reads its handler as the path.
+    #[test]
+    fn a_member_claimed_on_a_scope_result_is_a_label_of_its_own() {
+        let router = http_get_label();
+        let scoped = SiteLabel {
+            name: None,
+            handler: Some(ArgSlot { arg: 0, key: None }),
+            scope: Some(LabelScope {
+                base: "instance:()".into(),
+                step: "at".into(),
+                names: true,
+            }),
+            ..http_get_label()
+        };
+        assert!(scoped.reads_name() && router.reads_name());
+        let plain = end_for(&router, "x.ts", "x.get(h)", "x.get(h)");
+        let on_scope = LabelledEnd {
+            scope: Some("at".into()),
+            ..plain.clone()
+        };
+        let labels = [router.clone(), scoped.clone()];
+        assert_eq!(SiteLabel::find(&labels, &plain), Some(&labels[0]));
+        assert_eq!(SiteLabel::find(&labels, &on_scope), Some(&labels[1]));
+        let reversed = [scoped, router.clone()];
+        assert_eq!(SiteLabel::find(&reversed, &plain), Some(&reversed[1]));
+        assert_eq!(SiteLabel::find(&reversed, &on_scope), Some(&reversed[0]));
+        // A call on a scope's result no label states is no router call.
+        assert_eq!(SiteLabel::find(&[router], &on_scope), None);
+    }
+
     fn names_at(decided: &Decided, file: &str) -> Vec<(u32, Option<String>)> {
         decided
             .sites
@@ -4254,6 +4443,7 @@ pub(crate) mod tests {
             reserved: Vec::new(),
             runs: None,
             request: None,
+            scope: None,
             method: Some(MethodLabel {
                 from: None,
                 default: None,

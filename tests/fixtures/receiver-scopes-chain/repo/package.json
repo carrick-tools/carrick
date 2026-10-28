@@ -1,0 +1,8 @@
+{
+  "name": "receiver-scopes-chain-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-chain-router": "^1.0.0"
+  }
+}

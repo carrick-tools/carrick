@@ -206,6 +206,14 @@ impl ScopeLabel {
             .map(|(receiver, _)| receiver.as_str())
     }
 
+    /// Whether the member returns the scoped instance and was verified on
+    /// the receiver `receiver` of `package`'s `export`: a call of it on an
+    /// instance read through `receiver` returns the object an op claimed on
+    /// `<receiver>>scope:<member>` is called on (carrick#1678).
+    pub(super) fn returns_on(&self, package: &str, export: &str, receiver: &str) -> bool {
+        self.binds == ScopeBinds::Returns && self.applies(package, export, receiver)
+    }
+
     /// Whether the claim applies to the instance `end` ends at.
     pub(super) fn applies_to(&self, end: &InstanceEnd) -> bool {
         match &end.end {
@@ -581,6 +589,19 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     pub(super) fn of(self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
         let last = down[down.len() - 1];
         let instance = &last.call.instance;
+        self.of_value(
+            down,
+            instance.receiver_value.as_ref(),
+            instance.receiver_held.as_ref(),
+        )
+    }
+
+    /// The instance ends of the site whose calls are `down`, when its
+    /// labelled call is made on the result of the scope call `scope`
+    /// (carrick#1678): the instance is the scope call's receiver's, which
+    /// `scope` reads in the body of the labelled call's function.
+    pub(super) fn of_scoped(self, down: &[Placed<'a>], scope: &Placed<'a>) -> Vec<InstanceEnd> {
+        let instance = &scope.call.instance;
         self.of_value(
             down,
             instance.receiver_value.as_ref(),
@@ -1229,7 +1250,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
 
 /// Whether `call`, written in `file`, is a library call: its callee is
 /// declared outside the repository, as the compiler names it.
-fn library_call(inputs: &RequestSummaryInputs, file: &Path, call: &CallIr) -> bool {
+pub(super) fn library_call(inputs: &RequestSummaryInputs, file: &Path, call: &CallIr) -> bool {
     let (Some(positions), Some(ir)) = (inputs.positions.as_ref(), inputs.files.get(file)) else {
         return false;
     };
