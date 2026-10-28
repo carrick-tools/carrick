@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.135](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.134...carrick-v0.3.135) (2026-10-28)
+
+
+### Features
+
+* **discovery:** list a walk that passed a package the store has not answered ([#2813](https://github.com/carrick-tools/carrick/issues/2813) S1) ([#2967](https://github.com/carrick-tools/carrick/issues/2967)) ([a65fe41](https://github.com/carrick-tools/carrick/commit/a65fe4120c1f2b4ea890833c588f173482fef83c))
+* **receiver-trace:** routes registered on the object a scope member returns ([#1678](https://github.com/carrick-tools/carrick/issues/1678) slice A) ([#2976](https://github.com/carrick-tools/carrick/issues/2976)) ([cac3c5b](https://github.com/carrick-tools/carrick/commit/cac3c5b751b2623110548b258a5157bf023d6dd7))
+* **scanner:** result labels reach the scan and the consumer response request ([#2819](https://github.com/carrick-tools/carrick/issues/2819)) ([#2974](https://github.com/carrick-tools/carrick/issues/2974)) ([b21db36](https://github.com/carrick-tools/carrick/commit/b21db36665bcb8d105bc09967cb665ec0db9770e))
+* **sidecar:** list the object a scope member returns as scope_receiver ([#2774](https://github.com/carrick-tools/carrick/issues/2774) T1) ([#2978](https://github.com/carrick-tools/carrick/issues/2978)) ([cbe0048](https://github.com/carrick-tools/carrick/commit/cbe00483f24abfe96cdfc7ec590d88231ddb1199))
+
+
+### Bug Fixes
+
+* **handler_span:** a named handler that encloses its registration is read as inline ([#2973](https://github.com/carrick-tools/carrick/issues/2973)) ([2a821cf](https://github.com/carrick-tools/carrick/commit/2a821cf425aedcd60e7926cb2bd315522775c9bd)), closes [#2824](https://github.com/carrick-tools/carrick/issues/2824)
+* **sidecar:** a stub never names a module by a machine path ([#2969](https://github.com/carrick-tools/carrick/issues/2969)) ([c8338e0](https://github.com/carrick-tools/carrick/commit/c8338e02a7f8210c077b352a204e29ad39ee6c80)), closes [#2943](https://github.com/carrick-tools/carrick/issues/2943)
+* **sidecar:** a wrong request member drops only the request, not the route op ([#2981](https://github.com/carrick-tools/carrick/issues/2981)) ([23fd503](https://github.com/carrick-tools/carrick/commit/23fd50329858b4304b849c53f0bf44c4f4ff6da8)), closes [#2968](https://github.com/carrick-tools/carrick/issues/2968)
+* **sidecar:** list handler members and result candidates only on request ([#2971](https://github.com/carrick-tools/carrick/issues/2971)) ([9824798](https://github.com/carrick-tools/carrick/commit/9824798cd3ed0685a6076e02876d935d98031549)), closes [#2966](https://github.com/carrick-tools/carrick/issues/2966)
+
+
+### Performance
+
+* **sidecar:** print each type once and keep handler members across a package's specifiers ([#2977](https://github.com/carrick-tools/carrick/issues/2977)) ([#2986](https://github.com/carrick-tools/carrick/issues/2986)) ([08bb865](https://github.com/carrick-tools/carrick/commit/08bb86573fa8f985141482b2191fceafb0dc1c0b))
+
 ## [0.3.134](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.133...carrick-v0.3.134) (2026-10-27)
 
 
