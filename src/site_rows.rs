@@ -809,13 +809,17 @@ pub fn fold(
                         call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
                     })
             };
-        graph.data_calls.retain(|call| {
-            !fold
-                .through_folded
-                .iter()
-                .chain(fold.replaced_by_fact.iter())
-                .any(|(file, line, key)| is_model_row_of(call, file, *line, key))
-        });
+        let (removed, kept): (Vec<DataFetchingCall>, Vec<DataFetchingCall>) =
+            std::mem::take(&mut graph.data_calls)
+                .into_iter()
+                .partition(|call| {
+                    fold.through_folded
+                        .iter()
+                        .chain(fold.replaced_by_fact.iter())
+                        .any(|(file, line, key)| is_model_row_of(call, file, *line, key))
+                });
+        graph.data_calls = kept;
+        let normalizer = crate::url_normalizer::UrlNormalizer::default();
         for row in fold.stated.iter().filter(|row| {
             row.side == RowSide::Call && row.fact() && matches!(row.key, OperationKey::Http { .. })
         }) {
@@ -823,6 +827,23 @@ pub fn fold(
                 continue;
             };
             let own_route = crate::call_through::serves_own_route(graph, method, path);
+            // Where the call goes is read off the call as written, which the
+            // reader's row at the same call held: the host a literal absolute
+            // URL names (the external-call inventory classifies on it), and
+            // the base a configured one resolves through (the unlisted
+            // variable suggestions read it). A fact keyed by an absolute URL
+            // names its own host and has no base.
+            let read = removed.iter().find(|call| {
+                call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
+                    relative(root, f) == row.file && l.parse::<u32>().ok() == Some(row.line)
+                })
+            });
+            let host = normalizer.absolute_host(path);
+            let base = match host {
+                Some(_) => None,
+                None => read.and_then(|call| call.base.clone()),
+            };
+            let host = host.or_else(|| read.and_then(|call| call.host.clone()));
             graph.data_calls.push(DataFetchingCall {
                 method: method.to_string(),
                 target_url: path.to_string(),
@@ -832,9 +853,9 @@ pub fn fold(
                 call_kind: None,
                 repo_name: None,
                 service_name: None,
-                host: None,
+                host,
                 line: Some(row.line),
-                base: None,
+                base,
                 consumers_not_resolved: None,
                 resolution_source: Some(row.source),
                 dispatch: None,

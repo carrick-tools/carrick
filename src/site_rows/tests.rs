@@ -882,6 +882,62 @@ fn a_fact_at_a_call_through_a_function_joins_as_a_wrapper_call() {
     );
 }
 
+/// The graph row of a fact keeps what the reader's row at the same call read
+/// about where it goes: the base a relative key resolves through, and the host
+/// of an absolute key, read off the key itself.
+#[test]
+fn a_fact_keeps_the_base_and_host_of_its_call() {
+    let file = "src/forced-http.ts";
+    let mut reader = graph_call("GET", "${API_URL}/v1/item", file, ResolutionSource::Model);
+    reader.base = Some(crate::call_base::CallBaseResolution {
+        written: "${process.env.API_URL}".to_string(),
+        kind: crate::call_base::CallBaseKind::Env,
+        env_var: Some("API_URL".to_string()),
+        fallback: None,
+        fallback_is_loopback: false,
+        declared_optional: None,
+    });
+    let reader_call = |path: &str| {
+        blob_row(
+            OperationKey::http("GET", path),
+            file,
+            LINE,
+            Some(ResolutionSource::Model),
+        )
+    };
+    let relative = {
+        let mut data = blob_with_graph(
+            vec![reader_call("${API_URL}/v1/item")],
+            vec![reader.clone()],
+        );
+        fold_into(&mut data, &rows());
+        data.mount_graph.unwrap().data_calls
+    };
+    assert_eq!(relative.len(), 1, "{relative:?}");
+    assert_eq!(
+        relative[0]
+            .base
+            .as_ref()
+            .and_then(|base| base.env_var.as_deref()),
+        Some("API_URL")
+    );
+    assert_eq!(relative[0].host, None);
+
+    // The same call keyed by an absolute URL names its host and no base.
+    let mut absolute_rows = rows();
+    for site_row in &mut absolute_rows.rows {
+        if site_row.file == file {
+            site_row.key = OperationKey::http("POST", "https://api.vendor.test/v1/items");
+        }
+    }
+    let mut data = blob_with_graph(vec![reader_call("${API_URL}/v1/item")], vec![reader]);
+    fold_into(&mut data, &absolute_rows);
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 1, "{graph:?}");
+    assert_eq!(graph[0].host.as_deref(), Some("api.vendor.test"));
+    assert_eq!(graph[0].base, None);
+}
+
 /// A candidate replacement (an answer in the band) leaves the graph as it
 /// was: the reader's row stays, and nothing is added.
 #[test]
