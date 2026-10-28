@@ -2266,8 +2266,12 @@ impl ReachGraph {
     ///
     /// A request's own call (the one edge written on a request row's line)
     /// leads into how the request is made, a transport and the primitive it
-    /// calls: a row no fact states past it is that request's, not another.
-    /// Every other path counts the rows it reaches. A definition two paths
+    /// calls: a row past it is that request's, not another. A fact there is
+    /// the transport's side call (a token refresh made before the request is
+    /// sent), and a row no fact states there is the primitive the transport
+    /// calls (carrick#2795). Every other path counts the rows it reaches,
+    /// so a request reached past one request's own call and on another path
+    /// counts. A definition two paths
     /// reach is walked once on each, and a request reached both through a
     /// side call and not is not a side request.
     fn walk<'g>(
@@ -2284,13 +2288,13 @@ impl ReachGraph {
         seen.insert((start, false, false));
         queue.push_back((start, 0, false, false));
         while let Some((definition, depth, within_request, side)) = queue.pop_front() {
-            for request in self.requests.get(definition).into_iter().flatten() {
-                let entry = reached
-                    .entry(request.site.as_str())
-                    .or_insert((request, side));
-                entry.1 &= side;
-            }
             if !within_request {
+                for request in self.requests.get(definition).into_iter().flatten() {
+                    let entry = reached
+                        .entry(request.site.as_str())
+                        .or_insert((request, side));
+                    entry.1 &= side;
+                }
                 for row in self.unstated.get(definition).into_iter().flatten() {
                     let entry = unstated
                         .entry(row.site.as_str())
@@ -4052,6 +4056,102 @@ mod tests {
         let model_row = settled_with_graph(serde_json::json!([stated("model")]));
         assert_eq!(model_row.replaced_by_site_row, 0);
         assert_eq!(model_row.reaches_none, 1);
+    }
+
+    /// An invented client whose transport refreshes a token before it sends:
+    /// `refreshToken` (lines 1-5) writes `POST /auth/refresh` at line 3,
+    /// stated as `refresh_source`; `send` (7-12) calls it at line 9;
+    /// `getUser` (14) writes the request `GET /users/:id` at its call of
+    /// `send`; `refreshAndLoad` (16-19) calls `refreshToken` itself, then
+    /// `getUser`. The operation a caller whose own callee is the definition
+    /// at `callee` reaches, or why it reaches none.
+    fn reached_through_refreshing_transport(refresh_source: &str, callee: u32) -> String {
+        const API: &str = "packages/client/src/api.ts";
+        let call = |name: &str, line: u32, at: u32| serde_json::json!({"name": name, "file_path": API, "line_number": line, "call_site_line": at});
+        let definitions: serde_json::Map<String, serde_json::Value> = [
+            definition_json("refreshToken", API, 1, 5, serde_json::json!([])),
+            definition_json(
+                "send",
+                API,
+                7,
+                12,
+                serde_json::json!([call("refreshToken", 1, 9)]),
+            ),
+            definition_json(
+                "getUser",
+                API,
+                14,
+                14,
+                serde_json::json!([call("send", 7, 14)]),
+            ),
+            definition_json(
+                "refreshAndLoad",
+                API,
+                16,
+                19,
+                serde_json::json!([call("refreshToken", 1, 17), call("getUser", 14, 18)]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let row = |method: &str, path: &str, line: u32, source: &str| {
+            serde_json::json!({
+                "method": method, "target_url": path, "canonical_path": path,
+                "client": "fetch", "file_location": format!("{API}:{line}"),
+                "line": line, "resolution_source": source
+            })
+        };
+        let client = wrapper_blob(
+            "client",
+            serde_json::Value::Object(definitions),
+            serde_json::json!([]),
+            serde_json::json!([
+                row("POST", "/auth/refresh", 3, refresh_source),
+                row("GET", "/users/:id", 14, "request_summary"),
+            ]),
+        );
+        let graph = ReachGraph::of(std::iter::once(&client));
+        let sites = CallThroughSites::default();
+        let mut decider = Decider::new(&graph, &[&sites]);
+        let mut caller = site_row_at(5);
+        caller.file = "packages/app/src/page.ts".to_string();
+        caller.steps[0] = vec![definition(API, callee)];
+        match decider.decide(&caller) {
+            Reach::One { request, .. } => format!("{} {}", request.method, request.canonical_path),
+            Reach::None => "none".to_string(),
+            Reach::Several => "several".to_string(),
+            Reach::Unstated => "unstated".to_string(),
+        }
+    }
+
+    /// carrick#2795: a fact request reached only past a request's own call
+    /// (the transport's token refresh behind `getUser`'s `send`) is that
+    /// transport's side call, not a second operation the caller reaches:
+    /// the caller reaches `GET /users/:id` whether the refresh is a fact or
+    /// the model's row. A caller that calls the refresh itself still reaches
+    /// two operations, and a caller of the transport reaches the refresh.
+    #[test]
+    fn a_fact_past_a_requests_own_call_is_the_transports_side_call() {
+        assert_eq!(
+            reached_through_refreshing_transport("request_summary", 14),
+            "GET /users/:id",
+            "the refresh stated by a fact"
+        );
+        assert_eq!(
+            reached_through_refreshing_transport("model", 14),
+            "GET /users/:id",
+            "the refresh stated by the model"
+        );
+        assert_eq!(
+            reached_through_refreshing_transport("request_summary", 16),
+            "several",
+            "a caller that refreshes and then loads reaches both"
+        );
+        assert_eq!(
+            reached_through_refreshing_transport("request_summary", 7),
+            "POST /auth/refresh",
+            "a caller of the transport itself reaches the refresh"
+        );
     }
 
     /// carrick#2618, the stated side: once call-through states the leaf row
