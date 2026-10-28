@@ -168,6 +168,20 @@ impl FactFiles {
         for (file, start, end) in &discovery.finished {
             facts.record(file, (*start, *end), Followed::Finished);
         }
+        // A walk that passed a call into a package the first answer has not
+        // finished (pending or failed) is not final: listed for the reader as
+        // a direct call into one is (carrick#2813). Only records with no end
+        // carry keys, and a finished walk never does.
+        for ((file, start, end), keys) in &discovery.unanswered_at {
+            if keys.iter().any(|key| first.unanswered.contains(key)) {
+                facts.select(file, (*start, *end), true);
+                facts
+                    .files
+                    .entry(file.clone())
+                    .or_default()
+                    .unanswered_package = true;
+            }
+        }
         for lead in &decided.leads {
             let listed = serde_json::from_value::<LibraryRole>(lead.end.role.clone().into())
                 .is_ok_and(listed_role);
@@ -525,6 +539,59 @@ mod tests {
                 Some(&Followed::Finished),
                 "{span:?}"
             );
+        }
+    }
+
+    /// carrick#2813 S1: a stopped site or a `missed_inside` walk that passed
+    /// a call into a package the first answer left unanswered is listed for
+    /// the reader and selects its file, as a direct call into one is. The
+    /// same record is not listed once the answer holds the package, and a
+    /// finished walk is never listed.
+    #[test]
+    fn a_walk_that_passed_an_unanswered_package_is_listed() {
+        let pending = |key: &str| FirstAnswer {
+            unanswered: BTreeSet::from([key.to_string()]),
+            ..FirstAnswer::default()
+        };
+        let discovery = Discovery {
+            sites: vec![site("a.ts", (1, 4), None, Some("several_values"))],
+            missed_inside: vec![("b.ts".to_string(), 2, 6)],
+            finished: vec![("c.ts".to_string(), 3, 8)],
+            unanswered_at: BTreeMap::from([
+                (
+                    ("a.ts".to_string(), 1, 4),
+                    BTreeSet::from(["pkg".to_string()]),
+                ),
+                (
+                    ("b.ts".to_string(), 2, 6),
+                    BTreeSet::from(["pkg".to_string()]),
+                ),
+            ]),
+            ..Discovery::default()
+        };
+        let facts = FactFiles::of(
+            &discovery,
+            &Decided::default(),
+            None,
+            &pending("pkg"),
+            Path::new("/repo"),
+        );
+        assert_eq!(facts.listed_in("a.ts"), BTreeSet::from([(1, 4)]));
+        assert_eq!(facts.listed_in("b.ts"), BTreeSet::from([(2, 6)]));
+        assert!(facts.listed_in("c.ts").is_empty());
+        assert_eq!(facts.counts(), (0, 0, 2));
+        // The package answered (or another one pending): nothing is listed.
+        for first in [FirstAnswer::default(), pending("other")] {
+            let facts = FactFiles::of(
+                &discovery,
+                &Decided::default(),
+                None,
+                &first,
+                Path::new("/repo"),
+            );
+            assert!(facts.listed_in("a.ts").is_empty());
+            assert!(facts.listed_in("b.ts").is_empty());
+            assert_eq!(facts.counts(), (0, 0, 0));
         }
     }
 

@@ -182,6 +182,12 @@ pub struct Discovery {
     /// follow on the way (`no_site` all the same): not followed to the end.
     pub missed_inside: Vec<(String, u32, u32)>,
     pub counts: BTreeMap<String, usize>,
+    /// For each call recorded with no end (a stopped site or `missed_inside`),
+    /// by file and SWC span: the store keys of the packages the walk passed a
+    /// call into that the answer holds nothing for. A walk that passed one is
+    /// not final until the store answers it (carrick#2813): the fact layer
+    /// lists the call for the reader when the key is still pending.
+    pub unanswered_at: BTreeMap<(String, u32, u32), BTreeSet<String>>,
 }
 
 /// The labelled exports of the store's answer, by the store's package key
@@ -853,6 +859,10 @@ struct Outcome<'a> {
     /// (one of [`Discovery::unfollowed`]'s reasons): a walk that found no
     /// site has not read everything the call runs (carrick#2613).
     missed: bool,
+    /// The store keys of every package the walk passed a call into that the
+    /// answer holds nothing for (`unanswered_package`), when that call's own
+    /// walk found nothing (carrick#2813).
+    unanswered: BTreeSet<String>,
     /// Each callee whose value a caller of the body decides (carrick#2432).
     open: Vec<Open<'a>>,
 }
@@ -949,6 +959,7 @@ impl<'a> Outcome<'a> {
             self.stop = other.stop;
         }
         self.missed |= other.missed;
+        self.unanswered.extend(other.unanswered);
         self.cycle_at = match (self.cycle_at, other.cycle_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1660,12 +1671,30 @@ impl<'a> Walker<'a> {
             if self.misses(file, body, call, construction, &inner) {
                 inner.missed = true;
             }
+            if inner.ends.is_empty()
+                && inner.stop.is_none()
+                && self.unfollowed(file, call, construction) == Some(UNANSWERED_PACKAGE)
+            {
+                inner.unanswered.extend(self.unanswered_keys(file, call));
+            }
             out.absorb(inner);
         }
         if !out.ends.is_empty() {
             out.stop = None;
         }
         out
+    }
+
+    /// The store keys of `call`'s declaration that the answer holds nothing
+    /// for.
+    fn unanswered_keys(&self, file: &Path, call: &CallIr) -> Vec<String> {
+        let Some(row) = self.row(file, call) else {
+            return Vec::new();
+        };
+        store_keys(row, self.labels.exports)
+            .into_iter()
+            .filter(|key| self.labels.package_reason(key) == Some(UNANSWERED_PACKAGE))
+            .collect()
     }
 
     /// Whether `call`, whose walk gave `outcome` and found no site, passed
@@ -1732,8 +1761,24 @@ impl<'a> Walker<'a> {
                     reached: None,
                 };
             if outcome.ends.is_empty() {
+                if !outcome.unanswered.is_empty() {
+                    discovery.unanswered_at.insert(
+                        (self.rel(file), call.site.span_start, call.site.span_end),
+                        outcome.unanswered.clone(),
+                    );
+                }
+                // A walk that entered code (a value's functions included)
+                // and missed something inside is `missed_inside`, whatever
+                // the call's own row reads (carrick#2813): the row's hole
+                // would hide that the walk passed code it did not finish.
+                let entered_missed = outcome.missed && outcome.stop.is_none();
                 let Some((chain, stop)) = outcome.stop else {
-                    match self.unfollowed(file, call, construction) {
+                    let own = if entered_missed {
+                        None
+                    } else {
+                        self.unfollowed(file, call, construction)
+                    };
+                    match own {
                         Some(reason) => {
                             *discovery
                                 .counts
@@ -2757,6 +2802,94 @@ mod tests {
                 .all(|site| site.end.is_none()),
             "a captured parameter inside a bound object is read one function out: {:?}",
             discovery.sites
+        );
+    }
+
+    /// carrick#2813 S1: a walk that passed a call into a package the store has
+    /// not answered records the package, whether it ends at a wrapper chain
+    /// or at a value callee a parameter's fallback decides, and a walk that
+    /// read code and missed inside is `missed_inside` even when the call's
+    /// own row reads `value_callee`. A walk over answered packages, and a
+    /// site, record none. The answer key is
+    /// `tests/fixtures/discovery-pending-package/README.md`.
+    #[test]
+    fn a_walk_that_passed_a_package_the_store_has_not_answered_records_it() {
+        let Some(on) = walked(
+            "discovery-pending-package",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-pending-package");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let span = |file: &str, needle: &str| -> (String, u32, u32) {
+            let text =
+                std::fs::read_to_string(fixture.join("repo/services/web/src").join(file)).unwrap();
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (
+                format!("services/web/src/{file}"),
+                lo,
+                lo + needle.len() as u32,
+            )
+        };
+        let keys = |file: &str, needle: &str| -> Vec<String> {
+            discovery
+                .unanswered_at
+                .get(&span(file, needle))
+                .map(|keys| keys.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        let pending = vec!["fixture-pending".to_string()];
+        // A wrapper chain: `postEvent` -> `send` -> a call into the package.
+        assert_eq!(keys("events.ts", "send(\"/events\", body)"), pending);
+        // A value callee: `deps.send ?? sendViaClient`.
+        assert_eq!(keys("inject.ts", "doSend(\"/notify\", body)"), pending);
+        // Both are walks that read code and missed inside, never `finished`
+        // and never recorded as the call's own row.
+        for (file, needle) in [
+            ("events.ts", "send(\"/events\", body)"),
+            ("inject.ts", "doSend(\"/notify\", body)"),
+        ] {
+            assert!(
+                discovery.missed_inside.contains(&span(file, needle)),
+                "{file}: missed_inside {:?} unfollowed {:?} sites {:?}",
+                discovery.missed_inside,
+                discovery.unfollowed,
+                discovery.sites
+            );
+        }
+        // The controls: a walk over an answered package with no export, and
+        // a site, pass no unanswered package.
+        assert!(keys("answered.ts", "render(body)").is_empty());
+        assert!(
+            discovery
+                .finished
+                .contains(&span("answered.ts", "render(body)")),
+            "{:?}",
+            discovery.finished
+        );
+        assert!(keys("global.ts", "request(\"/items\")").is_empty());
+        assert!(
+            discovery
+                .sites
+                .iter()
+                .any(|site| site.file == "services/web/src/global.ts" && site.end.is_some())
+        );
+        // A call inside the package's wrapper that goes straight to it is
+        // the direct call Rule 4 lists: it keeps its own record.
+        assert!(
+            !discovery
+                .unanswered_at
+                .contains_key(&span("client.ts", "transmit(path, body)")),
+            "a direct call records no passed package"
         );
     }
 
