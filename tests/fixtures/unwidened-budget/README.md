@@ -13,5 +13,5 @@ packages.
 - `__llm__/` holds the mocked model answers for a `CARRICK_MOCK_ALL` scan.
 
 Used by `tests/unwidened_budget_test.rs`, which scans it with the sidecar's
-budget for the reading forced to 0 (`CARRICK_UNWIDENED_BUDGET_MS`) and with the
+cap on readings forced to 0 (`CARRICK_UNWIDENED_READINGS_CAP`) and with the
 default one.

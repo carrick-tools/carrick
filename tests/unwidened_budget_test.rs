@@ -5,8 +5,8 @@
 //! to `status: string`; `web` expects `status: "ready"`. The sidecar's
 //! unwidened reading recovers the literal, and the pair is compatible.
 //!
-//! When that reading runs out of its time budget (a loaded machine; forced
-//! here with `CARRICK_UNWIDENED_BUDGET_MS=0`), the pair must read
+//! When that reading is not made (past the sidecar's work cap, carrick#2629;
+//! forced here with `CARRICK_UNWIDENED_READINGS_CAP=0`), the pair must read
 //! unverifiable, never incompatible from the widened type, and the scan must
 //! count the reading it did not make on the producer's health.
 
@@ -43,7 +43,7 @@ fn scan(root: &Path, env: &[(&str, &str)]) -> Scan {
             format!("{}/", root.join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env_remove("CARRICK_UNWIDENED_BUDGET_MS");
+        .env_remove("CARRICK_UNWIDENED_READINGS_CAP");
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -113,7 +113,7 @@ fn a_reading_that_ran_out_of_budget_leaves_the_pair_unverifiable() {
         eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
         return;
     }
-    let spent = scan(&fixture_dir(), &[("CARRICK_UNWIDENED_BUDGET_MS", "0")]);
+    let spent = scan(&fixture_dir(), &[("CARRICK_UNWIDENED_READINGS_CAP", "0")]);
     let response = job_response_verdict(&spent);
     assert_eq!(
         response["verdict"], "unverifiable",

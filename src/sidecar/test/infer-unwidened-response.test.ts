@@ -33,7 +33,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { Project } from 'ts-morph';
 import { SidecarClient } from './helpers.js';
-import { TypeInferrer } from '../src/type-inferrer.js';
+import { TypeInferrer, type UnwidenedLimits } from '../src/type-inferrer.js';
 
 const DECORATORS = `export function Get(path: string): MethodDecorator {
   return () => {
@@ -304,38 +304,105 @@ describe('carrick#1516: the unwidened reading of a response inference', () => {
     });
   }
 
-  it('reads nothing once its budget is spent, and still answers', () => {
-    const request = {
+  describe('carrick#2629: bounded by work, not by the clock', () => {
+    const route = (name: string) => ({
       file_path: controllerPath,
-      line_number: lineOf(CONTROLLER, "@Get('holidays')"),
+      line_number: lineOf(CONTROLLER, `@Get('${name}')`),
       infer_kind: 'response_body' as const,
-      alias: 'holidays',
+      alias: name,
+    });
+    /** A clock that moves `stepMs` every time it is read: a very slow machine. */
+    const slowClock = (stepMs: number) => {
+      let t = 0;
+      return () => (t += stepMs);
     };
-    const read = (unwidenedBudgetMs?: number) => {
+    const read = (
+      names: string[],
+      options: { unwidenedLimits?: Partial<UnwidenedLimits>; now?: () => number } = {}
+    ) => {
       const project = new Project({ tsConfigFilePath: path.join(repoDir, 'tsconfig.json') });
-      const inferrer = new TypeInferrer({ project, repoRoot: repoDir, unwidenedBudgetMs });
-      return inferrer.infer([request]).inferred_types?.[0];
+      const inferrer = new TypeInferrer({ project, repoRoot: repoDir, ...options });
+      let steps = 0;
+      const res = inferrer.infer(names.map(route), undefined, undefined, undefined, undefined, () => {
+        steps += 1;
+      });
+      return {
+        steps,
+        byAlias: new Map((res.inferred_types ?? []).map((t) => [t.alias, t])),
+      };
     };
-    const spent = read(0);
-    assert.ok(spent, 'the inference itself is not the reading and must answer');
-    assert.match(collapse(spent.type_string)!, /scope: string/);
-    assert.strictEqual(spent.unwidened_type_string, undefined);
-    // carrick#2100: the answer says the budget, not the handler, is why it
-    // carries no reading, so the check does not judge the widened type.
-    assert.strictEqual(spent.unwidened_out_of_budget, true);
-    // Control: the same inference with the default budget reads, and says
-    // nothing ran out.
-    const full = read();
-    assert.ok(full?.unwidened_type_string);
-    assert.strictEqual(full?.unwidened_out_of_budget, undefined);
+
+    it('makes every reading however slow the machine is', () => {
+      // Each read of the clock is 100 s later: the reading takes far longer
+      // than the 120 s a batch once had, and starts well past 600 s.
+      const { steps, byAlias } = read(['holidays', 'totals', 'declared'], { now: slowClock(100_000) });
+      for (const alias of ['holidays', 'totals', 'declared']) {
+        const t = byAlias.get(alias);
+        assert.ok(t?.unwidened_type_string, `${alias} must be read: ${JSON.stringify(t)}`);
+        assert.strictEqual(t?.unwidened_out_of_budget, undefined, alias);
+      }
+      // Two files checked before and after the rewrite, three re-reads: each
+      // is a sign of life the scanner hears while the reading runs.
+      assert.strictEqual(steps, 7);
+    });
+
+    it('marks exactly the readings past its cap on readings', () => {
+      const { byAlias } = read(['holidays', 'totals', 'declared'], { unwidenedLimits: { readings: 2 } });
+      for (const alias of ['holidays', 'totals']) {
+        assert.ok(byAlias.get(alias)?.unwidened_type_string, alias);
+        assert.strictEqual(byAlias.get(alias)?.unwidened_out_of_budget, undefined, alias);
+      }
+      const capped = byAlias.get('declared');
+      assert.ok(capped, 'the inference itself is not the reading and must answer');
+      assert.match(collapse(capped.type_string)!, /source: string/);
+      assert.strictEqual(capped.unwidened_type_string, undefined);
+      assert.strictEqual(capped.unwidened_out_of_budget, true);
+    });
+
+    it('marks the first reading that would pass its cap on files, and every one after it', () => {
+      // `totals` reads the controller alone; `holidays` adds the service.
+      const { byAlias } = read(['totals', 'holidays', 'declared'], { unwidenedLimits: { files: 1 } });
+      assert.ok(byAlias.get('totals')?.unwidened_type_string);
+      assert.strictEqual(byAlias.get('totals')?.unwidened_out_of_budget, undefined);
+      for (const alias of ['holidays', 'declared']) {
+        assert.strictEqual(byAlias.get(alias)?.unwidened_type_string, undefined, alias);
+        assert.strictEqual(byAlias.get(alias)?.unwidened_out_of_budget, true, alias);
+      }
+    });
+
+    it('reads nothing with a cap of 0, and still answers', () => {
+      const { byAlias } = read(['holidays'], { unwidenedLimits: { readings: 0 } });
+      const spent = byAlias.get('holidays');
+      assert.ok(spent, 'the inference itself is not the reading and must answer');
+      assert.match(collapse(spent.type_string)!, /scope: string/);
+      assert.strictEqual(spent.unwidened_type_string, undefined);
+      // carrick#2100: the answer says the cap, not the handler, is why it
+      // carries no reading, so the check does not judge the widened type.
+      assert.strictEqual(spent.unwidened_out_of_budget, true);
+      // Control: the default caps read, and say nothing ran out.
+      const full = read(['holidays']).byAlias.get('holidays');
+      assert.ok(full?.unwidened_type_string);
+      assert.strictEqual(full?.unwidened_out_of_budget, undefined);
+    });
+
+    it('stops at its last-resort time limit and marks what it did not read', () => {
+      const { byAlias } = read(['holidays', 'totals'], {
+        now: slowClock(100_000),
+        unwidenedLimits: { backstopMs: 50_000 },
+      });
+      for (const alias of ['holidays', 'totals']) {
+        assert.strictEqual(byAlias.get(alias)?.unwidened_type_string, undefined, alias);
+        assert.strictEqual(byAlias.get(alias)?.unwidened_out_of_budget, true, alias);
+      }
+    });
   });
 
   // carrick#2100: the wire spelling the scanner reads (`InferredType` in
   // `src/services/type_sidecar.rs` pins the same key), and the switch the
-  // scanner's own tests force the budget with.
-  it('says on the wire when the budget, set from the environment, ran out', async () => {
+  // scanner's own tests force the cap with (carrick#2629).
+  it('says on the wire when the cap, set from the environment, ran out', async () => {
     const spent = new SidecarClient();
-    await spent.start({ CARRICK_UNWIDENED_BUDGET_MS: '0' });
+    await spent.start({ CARRICK_UNWIDENED_READINGS_CAP: '0' });
     try {
       await spent.send({ action: 'init', request_id: 'init', repo_root: repoDir });
       const res = await spent.send<{ status: string; inferred_types?: Array<Record<string, unknown>> }>({
@@ -357,7 +424,7 @@ describe('carrick#1516: the unwidened reading of a response inference', () => {
     } finally {
       await spent.stop();
     }
-    // The scan's own process, on the default budget, read it and says nothing.
+    // The scan's own process, on the default caps, read it and says nothing.
     assert.ok(inferred.get('holidays')?.unwidened_type_string);
     assert.strictEqual(
       (inferred.get('holidays') as Record<string, unknown> | undefined)?.['unwidened_out_of_budget'],

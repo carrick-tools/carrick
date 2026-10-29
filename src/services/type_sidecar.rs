@@ -1617,8 +1617,9 @@ pub struct InferredType {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwidened_type_string: Option<String>,
     /// carrick#2100, response inferences only: the inference was owed an
-    /// unwidened reading and the sidecar's time budget for it ran out first,
-    /// so `unwidened_type_string` is absent for want of time, not because the
+    /// unwidened reading and the sidecar's work cap for it (or its last-resort
+    /// time limit, carrick#2629) ran out first, so `unwidened_type_string` is
+    /// absent for want of work allowance, not because the
     /// handler sends what `type_string` says. The definitions pass carries it
     /// onto the producer's manifest entry, and the check does not publish a
     /// mismatch judged on the widened type. The key is pinned on both sides

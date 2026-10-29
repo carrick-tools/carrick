@@ -23,7 +23,7 @@
 //! | Retype | the scan's one retype ceiling, `RETYPE_SCAN_CEILING` in `engine/type_compat_v2.rs`, and a request's `RETYPE_BUDGET_MS` in the sidecar's `index.ts` | an abstain saying "the retype check ran out of its N ms budget" (the ceiling's adds "for the whole scan"), on the pair's unresolved reason | [`from_check_outcomes`] |
 //! | Library checks | `SEMANTICS_BUDGET_MS` in the sidecar's `index.ts` | a verdict `unchecked` with reason `budget` | the two places a service's library checks are answered |
 //! | Sidecar deadline | `OPERATION_TIMEOUT` in `services/type_sidecar.rs` | the operation fails with a timeout and the process is replaced | the sidecar client while a service is analysed; [`from_check_outcomes`] in the cross-service check |
-//! | Unwidened reading | `UNWIDENED_BUDGET_MS` in the sidecar's `type-inferrer.ts` | the inference is marked `unwidened_out_of_budget`, and a pair judged incompatible on its widened type is `unverifiable` (carrick#2100) | the definitions pass, per producer response marked |
+//! | Unwidened reading | a work cap, `UNWIDENED_MAX_READINGS` and `UNWIDENED_MAX_FILES`, with the wall-clock backstop `UNWIDENED_BACKSTOP_MS`, in the sidecar's `type-inferrer.ts` (carrick#2629) | the inference is marked `unwidened_out_of_budget`, and a pair judged incompatible on its widened type is `unverifiable` (carrick#2100) | the definitions pass, per producer response marked |
 
 use std::collections::BTreeMap;
 

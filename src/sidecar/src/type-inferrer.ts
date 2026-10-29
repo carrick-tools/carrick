@@ -630,34 +630,61 @@ export interface TypeInferrerOptions {
    */
   repoRoot: string;
   /**
-   * How long the unwidened reading of one `infer` batch may take
-   * (carrick#1516). Defaults to `UNWIDENED_BUDGET_MS`.
+   * How much work the unwidened reading of one `infer` batch may do
+   * (carrick#2629). Each field defaults to its `UNWIDENED_*` constant.
    */
-  unwidenedBudgetMs?: number;
+  unwidenedLimits?: Partial<UnwidenedLimits>;
+  /**
+   * The clock the unwidened reading's last-resort time limit reads, in
+   * milliseconds. Defaults to `performance.now`; a test passes a slow one.
+   */
+  now?: () => number;
 }
 
 /**
- * How long the unwidened reading of one batch may take by default. The
- * reading adds a field and never an answer, so running out costs only the
- * readings not yet made; the rewrite is always undone. It reports no
- * progress, so this is also the longest a batch goes silent after its last
- * request: well inside the 900s the scanner allows between two signs of life.
+ * The bounds on one batch's unwidened reading (carrick#2629). The first two
+ * count work, so a batch reads the same on a quiet machine and a loaded one;
+ * the third is a wall-clock backstop for a reading that runs away.
  */
-const UNWIDENED_BUDGET_MS = 120_000;
+export interface UnwidenedLimits {
+  /** Readings (requests re-read in the rewrite) one batch may make. */
+  readings: number;
+  /** Files one batch may type-check before and after its rewrite. */
+  files: number;
+  /** The longest the reading may run, from its start, before it stops. */
+  backstopMs: number;
+}
+
 /**
- * No reading starts or continues past this long after the batch began. The
- * number dates from when the scanner allowed a whole request 900s; it now
- * allows that long between progress reports (carrick#1914), so a batch can
- * run past this and still be read. A batch that does publishes no unwidened
- * reading, as before.
+ * How many readings one batch may make (carrick#2629). A count, not a time,
+ * so whether a reading is made never depends on the machine's load: a reading
+ * a batch cannot make marks its response `unwidened_out_of_budget`, and the
+ * check then abstains on every mismatch against it (carrick#2100). Sized well
+ * above the largest batch measured; see the PR that set it.
  */
-const UNWIDENED_LATEST_MS = 600_000;
+const UNWIDENED_MAX_READINGS = 5_000;
+/** How many files one batch's reading may type-check (carrick#2629). */
+const UNWIDENED_MAX_FILES = 5_000;
+/**
+ * The last resort: a reading still running this long after it started stops
+ * and says so in the log. The reading reports progress after every file it
+ * checks and every request it re-reads, so the scanner's limit on silence
+ * never needs it; it is here for a reading that runs away.
+ */
+const UNWIDENED_BACKSTOP_MS = 30 * 60_000;
 
 /**
  * Called each time an `infer` batch is done with one of its requests,
  * whatever that request answered: skipped, refused, failed or inferred.
  */
 export type InferRequestDone = () => void;
+
+/**
+ * Called each time the unwidened reading finishes a unit of its work: a file
+ * type-checked or a request re-read (carrick#2629). The reading runs after
+ * every request is done, so this is what keeps a long one from going silent.
+ */
+export type UnwidenedStepDone = () => void;
 
 /**
  * Result of unwrapping a type
@@ -743,7 +770,8 @@ export class TypeInferrer {
    * unwidened reading re-reads from here (carrick#1516).
    */
   private readonly readNodes = new WeakMap<SourceLocation, Node>();
-  private readonly unwidenedBudgetMs: number;
+  private readonly unwidenedLimits: UnwidenedLimits;
+  private readonly now: () => number;
   /**
    * The files a request has named to this inferrer, as the requests named
    * them (carrick#1985). It lives as long as the project does, so the first
@@ -755,7 +783,12 @@ export class TypeInferrer {
     this.project = options.project;
     this.packageOf = options.packageOf;
     this.repoRoot = options.repoRoot;
-    this.unwidenedBudgetMs = options.unwidenedBudgetMs ?? UNWIDENED_BUDGET_MS;
+    this.unwidenedLimits = {
+      readings: options.unwidenedLimits?.readings ?? UNWIDENED_MAX_READINGS,
+      files: options.unwidenedLimits?.files ?? UNWIDENED_MAX_FILES,
+      backstopMs: options.unwidenedLimits?.backstopMs ?? UNWIDENED_BACKSTOP_MS,
+    };
+    this.now = options.now ?? (() => performance.now());
   }
 
   /**
@@ -778,6 +811,7 @@ export class TypeInferrer {
    * @param requests - Array of inference requests
    * @param extractionConfig - Agent-generated extraction config for payload unwrapping
    * @param onRequestDone - Called once per request, as the batch is done with it
+   * @param onUnwidenedStep - Called once per unit of the unwidened reading's work
    * @returns InferResult with inferred types or errors
    */
   infer(
@@ -785,9 +819,9 @@ export class TypeInferrer {
     extractionConfig?: ExtractionConfig,
     onRequestDone?: InferRequestDone,
     modelSymbols?: ModelSymbol[],
-    labels?: LabelledMembers
+    labels?: LabelledMembers,
+    onUnwidenedStep?: UnwidenedStepDone
   ): InferResult {
-    const started = performance.now();
     this.modelSymbols = new Map((modelSymbols ?? []).map((symbol) => [symbol.alias, symbol]));
     this.statedParams = this.statedParamsFor(labels ?? { sends: new Map(), bodies: new Set() });
     const inferredTypes: InferredType[] = [];
@@ -868,10 +902,14 @@ export class TypeInferrer {
     }
 
     try {
-      const deadline = Math.min(
-        performance.now() + this.unwidenedBudgetMs,
-        started + UNWIDENED_LATEST_MS
-      );
+      // One allowance for the batch: the responses draw on it first, the
+      // bodies on what they leave.
+      const work: UnwidenedWork = {
+        readings: this.unwidenedLimits.readings,
+        files: this.unwidenedLimits.files,
+        backstopAt: this.now() + this.unwidenedLimits.backstopMs,
+        step: onUnwidenedStep ?? (() => {}),
+      };
       // The responses' rewrite forgets every node of the files it touches, so
       // each body's read node is kept as its span, taken now and found again
       // in the restored file.
@@ -888,7 +926,7 @@ export class TypeInferrer {
         };
       });
       try {
-        this.addUnwidenedReadings(responses, extractionConfig, deadline, 'response');
+        this.addUnwidenedReadings(responses, extractionConfig, work, 'response');
       } catch (err) {
         // The reading only ever adds a field; it never costs an answer.
         this.logError(
@@ -896,16 +934,16 @@ export class TypeInferrer {
         );
       }
       try {
-        // Second, and in a rewrite of its own: the bodies' files never delay a
-        // response's reading, whose budget a spent deadline turns into an
-        // abstention (carrick#2100).
-        this.addUnwidenedReadings(bodySpans, extractionConfig, deadline, 'request_body');
+        // Second, and in a rewrite of its own: the bodies never take a
+        // response's share of the work, whose cap a spent allowance turns into
+        // an abstention (carrick#2100).
+        this.addUnwidenedReadings(bodySpans, extractionConfig, work, 'request_body');
       } catch (err) {
         this.logError(
           `Unwidened reading of request bodies failed: ${err instanceof Error ? err.message : String(err)}`
         );
         // carrick#2011: a body whose reading was not made is judged on its
-        // widened type alone, so it is marked the way a spent budget marks it
+        // widened type alone, so it is marked the way a spent work cap marks it
         // and its pair abstains on a mismatch rather than report one.
         for (const body of bodies) {
           if (body.result.unwidened_type_string === undefined) {
@@ -1040,23 +1078,28 @@ export class TypeInferrer {
    * and every file restored before returning, so the project other requests
    * read is the project the scan loaded.
    *
-   * Nothing is read past `deadline`: a batch that runs out keeps the readings
-   * it made and publishes none for the rest, and marks each of the rest
-   * `unwidened_out_of_budget` (carrick#2100). A request that never needed a
-   * reading (a declared return, nothing to mark) or lost it for a reason of
-   * its own (a marking that added a diagnostic) is never marked.
+   * The reading is bounded by work, not time (carrick#2629): a batch makes at
+   * most `UnwidenedLimits.readings` readings over at most `.files` files,
+   * taken in request order, the responses first. The first request past
+   * either cap and every request after it are marked
+   * `unwidened_out_of_budget` (carrick#2100) and publish no reading, on any
+   * machine. A reading still running at the wall-clock backstop stops the
+   * same way and says so in the log. A request that never needed a reading
+   * (a declared return, nothing to mark) or lost it for a reason of its own
+   * (a marking that added a diagnostic) is never marked.
    */
   private addUnwidenedReadings(
     responses: Array<{ request: InferRequestItem; result: InferredType; readSpan?: SavedSpan }>,
     extractionConfig: ExtractionConfig | undefined,
-    deadline: number,
+    work: UnwidenedWork,
     read: 'response' | 'request_body'
   ): void {
+    const started = this.now();
     const outOfTime = (stage: string, unread: ReadonlyArray<{ result: InferredType }>): boolean => {
-      if (performance.now() <= deadline) return false;
+      if (this.now() <= work.backstopAt) return false;
       this.log(
-        `Unwidened reading stopped ${stage}: it ran out of its budget, ` +
-          `${unread.length} reading(s) not made`
+        `Unwidened reading stopped ${stage}: it ran past its last-resort time limit ` +
+          `(${this.unwidenedLimits.backstopMs} ms), ${unread.length} reading(s) not made`
       );
       for (const plan of unread) plan.result.unwidened_out_of_budget = true;
       return true;
@@ -1066,12 +1109,12 @@ export class TypeInferrer {
       result: InferredType;
       read: { file: SourceFile; start: number; end: number };
       path: PathFunction[];
+      /** The markings on this request's path, by file. */
+      insertions: Array<[SourceFile, Insertion[]]>;
       /** Original span of the node an expression-text locator names. */
       locatedByText?: { start: number; end: number };
     }
-    const plans: Plan[] = [];
-    const insertionsByFile = new Map<SourceFile, Insertion[]>();
-    const checkedFiles = new Set<SourceFile>();
+    const planned: Plan[] = [];
 
     // Every position is read before the first rewrite: a rewrite forgets
     // every node of its file.
@@ -1083,22 +1126,19 @@ export class TypeInferrer {
         : this.readNodes.get(result.source_location);
       if (!readNode) continue;
       const functions = pathOf(readNode);
-      let marked = 0;
+      const planInsertions: Plan['insertions'] = [];
       for (const fn of functions) {
         const insertions = literalInsertions(fn, read === 'request_body' ? readNode : undefined);
-        marked += insertions.length;
         if (insertions.length === 0) continue;
-        const file = fn.getSourceFile();
-        insertionsByFile.set(file, [...(insertionsByFile.get(file) ?? []), ...insertions]);
+        planInsertions.push([fn.getSourceFile(), insertions]);
       }
       // Nothing on the path to mark: the reading would equal the published type.
-      if (marked === 0) continue;
+      if (planInsertions.length === 0) continue;
       const path = functions.map((fn) => ({
         file: fn.getSourceFile(),
         start: fn.getStart(),
         end: fn.getEnd(),
       }));
-      for (const fn of path) checkedFiles.add(fn.file);
       let locatedByText: Plan['locatedByText'];
       if (request.expression_text && request.span_start === undefined) {
         const sourceFile = this.getSourceFile(request.file_path);
@@ -1107,22 +1147,63 @@ export class TypeInferrer {
           : undefined;
         if (located) locatedByText = { start: located.getStart(), end: located.getEnd() };
       }
-      plans.push({
+      planned.push({
         request,
         result,
         read: { file: readNode.getSourceFile(), start: readNode.getStart(), end: readNode.getEnd() },
         path,
+        insertions: planInsertions,
         locatedByText,
       });
     }
-    if (plans.length === 0) return;
+    if (planned.length === 0) return;
 
+    // The work cap: requests are taken in order while both allowances last.
+    const checkedFiles = new Set<SourceFile>();
+    let taken = 0;
+    for (const plan of planned) {
+      const added = new Set(plan.path.map((fn) => fn.file).filter((f) => !checkedFiles.has(f)));
+      if (work.readings < 1 || added.size > work.files) break;
+      work.readings -= 1;
+      work.files -= added.size;
+      for (const file of added) checkedFiles.add(file);
+      taken += 1;
+    }
+    const plans = planned.slice(0, taken);
+    const capped = planned.slice(taken);
+    if (capped.length > 0) {
+      this.log(
+        `Unwidened reading stopped at its work cap (${this.unwidenedLimits.readings} readings, ` +
+          `${this.unwidenedLimits.files} files per batch): ${capped.length} reading(s) not made`
+      );
+      for (const plan of capped) plan.result.unwidened_out_of_budget = true;
+    }
+    /** Readings that came back narrower than the published type, and so were published. */
+    let narrower = 0;
+    const report = () =>
+      this.log(
+        `Unwidened reading of ${read === 'response' ? 'responses' : 'request bodies'}: ` +
+          `${planned.length} planned, ${plans.length} taken over ${checkedFiles.size} file(s), ` +
+          `${narrower} narrower than published, ${Math.round(this.now() - started)} ms`
+      );
+    if (plans.length === 0) {
+      report();
+      return;
+    }
+
+    const insertionsByFile = new Map<SourceFile, Insertion[]>();
+    for (const plan of plans) {
+      for (const [file, list] of plan.insertions) {
+        insertionsByFile.set(file, [...(insertionsByFile.get(file) ?? []), ...list]);
+      }
+    }
     const insertions = new Map<SourceFile, Insertion[]>();
     for (const [file, list] of insertionsByFile) insertions.set(file, normalise(list));
     const before = new Map<SourceFile, ReturnType<typeof fileDiagnostics>>();
     for (const file of checkedFiles) {
-      if (outOfTime('before the rewrite', plans)) return;
+      if (outOfTime('before the rewrite', plans)) return report();
       before.set(file, fileDiagnostics(file));
+      work.step();
     }
     const originals = new Map<SourceFile, string>();
     for (const file of insertions.keys()) originals.set(file, file.getFullText());
@@ -1137,9 +1218,11 @@ export class TypeInferrer {
       // holds it loses its reading.
       const tainted = new Set<Plan>();
       for (const file of checkedFiles) {
-        if (outOfTime('while checking the rewrite', plans)) return;
+        if (outOfTime('while checking the rewrite', plans)) return report();
         const list = insertions.get(file) ?? [];
-        for (const at of addedDiagnostics(before.get(file)!, fileDiagnostics(file), list)) {
+        const after = fileDiagnostics(file);
+        work.step();
+        for (const at of addedDiagnostics(before.get(file)!, after, list)) {
           const holders = plans.flatMap((plan) => plan.path).filter(
             (fn) => fn.file === file && fn.start <= at && at < fn.end
           );
@@ -1154,7 +1237,7 @@ export class TypeInferrer {
 
       for (const [at, plan] of plans.entries()) {
         if (outOfTime('while re-reading', plans.slice(at).filter((rest) => !tainted.has(rest)))) {
-          return;
+          return report();
         }
         if (tainted.has(plan)) {
           this.log(
@@ -1170,6 +1253,7 @@ export class TypeInferrer {
         } catch {
           again = null;
         }
+        work.step();
         if (!again || again.type_string === plan.result.type_string) continue;
         // An invariant, not a case: `mappedRequest` is what keeps the re-read
         // on the node the inference read, so no fixture reaches this. It is
@@ -1190,7 +1274,9 @@ export class TypeInferrer {
           continue;
         }
         plan.result.unwidened_type_string = again.type_string;
+        narrower += 1;
       }
+      report();
     } finally {
       for (const [file, text] of originals) file.replaceWithText(text);
     }
@@ -11736,6 +11822,18 @@ export class TypeInferrer {
   private logError(message: string): void {
     console.error(`[sidecar:type-inferrer:error] ${message}`);
   }
+}
+
+/**
+ * What is left of one batch's unwidened reading allowance (carrick#2629),
+ * shared by the responses' rewrite and the bodies' after it.
+ */
+interface UnwidenedWork {
+  readings: number;
+  files: number;
+  /** The `now()` past which the reading stops: the wall-clock backstop. */
+  backstopAt: number;
+  step: UnwidenedStepDone;
 }
 
 /** A node kept by its place, for a reading made after its file was rewritten. */

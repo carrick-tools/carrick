@@ -127,15 +127,15 @@ function initializedLoader(): ProjectLoader {
 }
 
 /**
- * carrick#2100: the unwidened reading's budget in milliseconds, when
- * `CARRICK_UNWIDENED_BUDGET_MS` sets one. A switch for tests that drive the
- * scanner's binary: it forces the budget to run out on any machine. Unset or
- * not a whole number of milliseconds, the inferrer's default stands.
+ * carrick#2629: the most readings one batch's unwidened reading may make,
+ * when `CARRICK_UNWIDENED_READINGS_CAP` sets it. A switch for tests that
+ * drive the scanner's binary: 0 forces every reading past the cap, on any
+ * machine. Unset or not a whole number, the inferrer's default stands.
  */
-function unwidenedBudgetFromEnv(): number | undefined {
-  const value = process.env.CARRICK_UNWIDENED_BUDGET_MS;
+function unwidenedLimitsFromEnv(): { readings: number } | undefined {
+  const value = process.env.CARRICK_UNWIDENED_READINGS_CAP;
   if (value === undefined || !/^\d+$/.test(value.trim())) return undefined;
-  return Number(value.trim());
+  return { readings: Number(value.trim()) };
 }
 
 /**
@@ -160,7 +160,7 @@ function projectComponents(key = ''): ProjectComponents {
       project,
       repoRoot,
       packageOf: (filePath) => loader.packageOf(filePath),
-      unwidenedBudgetMs: unwidenedBudgetFromEnv(),
+      unwidenedLimits: unwidenedLimitsFromEnv(),
     });
     built = {
       typeBundler: new TypeBundler({ project, repoRoot }),
@@ -449,8 +449,15 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
 
     // One count for the request, whichever programs its items span.
     let done = 0;
+    let readingSteps = 0;
     const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
-      writeProgress(request.request_id, 'infer', `${done} of ${request.requests.length}`)
+      writeProgress(
+        request.request_id,
+        'infer',
+        readingSteps === 0
+          ? `${done} of ${request.requests.length}`
+          : `${done} of ${request.requests.length}, unwidened reading step ${readingSteps}`
+      )
     );
     const results = [...groups].map(
       ([key, items]) => {
@@ -463,7 +470,11 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
             report();
           },
           request.model_symbols,
-          labelledMembersFor(built, key, items, request.server_claims)
+          labelledMembersFor(built, key, items, request.server_claims),
+          () => {
+            readingSteps += 1;
+            report();
+          }
         );
       }
     );
