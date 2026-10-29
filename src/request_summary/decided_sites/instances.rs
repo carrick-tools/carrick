@@ -827,14 +827,20 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         }
         self.passing.push(here);
         for caller in callers {
-            let value = filled(&own, caller.call);
-            if holds_parameter(&value) {
-                self.up(*caller, value);
-            } else {
-                self.handed(caller, &own, &value);
-            }
+            self.filled_by(*caller, &own);
         }
         self.passing.pop();
+    }
+
+    /// What `caller` hands in at the parameter `own` reads: walked up when
+    /// it is the caller's own parameter, else the instance it holds.
+    fn filled_by(&mut self, caller: Placed<'a>, own: &[Piece]) {
+        let value = filled(own, caller.call);
+        if holds_parameter(&value) {
+            self.up(caller, value);
+        } else {
+            self.handed(&caller, own, &value);
+        }
     }
 
     /// The receiver is a parameter of the function `placed` is written in,
@@ -1253,13 +1259,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     construction.call.site.span_end,
                 )
                 .unwrap_or(*construction);
-            let construction = &construction;
-            let value = filled(&own, construction.call);
-            if holds_parameter(&value) {
-                self.up(*construction, value);
-            } else {
-                self.handed(construction, &own, &value);
-            }
+            self.filled_by(construction, &own);
         }
         self.fielding.pop();
         true
