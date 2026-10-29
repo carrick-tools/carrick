@@ -2577,9 +2577,8 @@ export class TypeInferrer {
     const returnedBranches = this.responseReturnedExpressions(func).flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
     );
-    const serialisers = this.calleesProvenSerialiser(returnedBranches);
     const isSend = (candidate: Node): boolean =>
-      this.isResponseSend(candidate, extractionConfig, serialisers);
+      this.isResponseSend(candidate, extractionConfig);
     // carrick#2427: a handler that sends through a parameter returns nothing,
     // its sends are statements, and the located one can be an error send.
     // Statement sends find and drop that branch. A call whose result is
@@ -2749,18 +2748,14 @@ export class TypeInferrer {
   /**
    * True when `candidate` is a response send: a call or `new` whose result is
    * transport machinery (by the extraction config's verified rule or the
-   * structural check), or whose callee this handler's own returns prove is a
-   * serialiser (`calleesProvenSerialiser`, which holds on a bare checkout).
+   * structural check).
    */
   private isResponseSend(
     candidate: Node,
-    extractionConfig: ExtractionConfig | undefined,
-    serialisers: Set<string>
+    extractionConfig: ExtractionConfig | undefined
   ): boolean {
     const call = this.peelTransparentExpression(candidate);
     if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) return false;
-    const identity = this.calleeIdentity(call);
-    if (identity !== undefined && serialisers.has(identity)) return true;
     const result = this.unwrapPromiseType(call.getType());
     if (result.isAny() || result.isUnknown()) return false;
     return (
@@ -6760,11 +6755,8 @@ export class TypeInferrer {
       this.expandResponseBranches(expression, 0)
     );
     // `alsoSerialisers` are callees a caller has its own evidence for
-    // (`calleeIdentity` keys), beside the ones these expressions prove.
-    const serialisers = this.calleesProvenSerialiser(returned);
-    for (const identity of alsoSerialisers ?? []) {
-      serialisers.add(identity);
-    }
+    // (`calleeIdentity` keys).
+    const serialisers = new Set<string>(alsoSerialisers ?? []);
 
     for (const expression of returned) {
       const payloadNode = this.responseHelperPayloadNode(
@@ -7542,56 +7534,6 @@ export class TypeInferrer {
     return flattened;
   }
 
-  // FROZEN (old path, 2026-10-21): this method only. Deletions and safety fixes
-  // only. Fixes for wrong or missing types go in labelled sends (carrick#2472
-  // C4). Delete when a delete-and-replay on the four repos moves no row
-  // wrongly, after carrick-cloud#2379 and carrick#2445 (carrick#2472, C6).
-  /**
-   * The callees these returned expressions PROVE are response serialisers.
-   *
-   * A return type of `any` says the callee could not be resolved, not that it
-   * was a serialiser — the reason the unresolvable-callee case is otherwise
-   * restricted to arguments the source annotates. But a handler that writes
-   *
-   *     return f(problem, { status: 401 });
-   *     return f(payload);
-   *
-   * has stated what `f` is in its own source: a call that takes a body and,
-   * beside it, an HTTP status is a response serialiser, and nothing else is
-   * written that way. That is evidence the compiler does not need to resolve
-   * anything to see, so it survives the bare checkout CI scans, and it makes
-   * the second call's unannotated argument a payload rather than a guess.
-   *
-   * Three deliberate limits, each a negative test:
-   *  - only RETURNED expressions count. A handler may well call a logger with
-   *    `{ status: 500 }`; what it returns is what it serialises.
-   *  - the status-stating argument must sit at index >= 1. A status in FIRST
-   *    position is a field of the body (`{ status: 503, note }`), and reading
-   *    it as evidence would promote every callee that takes a status field.
-   *  - the evidence is per HANDLER, never cached across files. It says what
-   *    this handler does, and that is all it is used for.
-   *
-   * Callees are keyed by resolved symbol where one exists — an import alias
-   * resolves locally even when its module does not — and by callee text
-   * otherwise.
-   */
-  private calleesProvenSerialiser(returned: Node[]): Set<string> {
-    const proven = new Set<string>();
-    for (const expression of returned) {
-      const call = this.peelTransparentExpression(expression);
-      if (!Node.isCallExpression(call)) continue;
-      const args = call.getArguments().map((a) => this.peelTransparentExpression(a));
-      if (args.length < 2) continue;
-      const statesStatus = args
-        .slice(1)
-        .some((arg) => Array.isArray(this.statedStatusCodes(arg)));
-      if (!statesStatus) continue;
-      const key = this.calleeIdentity(call);
-      if (key) proven.add(key);
-    }
-    return proven;
-  }
-
   /**
    * Stable identity for a call's callee within one file: its resolved symbol
    * when the compiler has one, else the callee's source text.
@@ -7621,9 +7563,7 @@ export class TypeInferrer {
    *
    * `statedOnly` narrows what counts as a payload to an argument the source
    * annotates; see `recoverPayloadFromReturnStatements`. It is lifted for a
-   * callee the handler's own returned calls PROVE is a serialiser
-   * (`calleesProvenSerialiser`): there the source has stated what the callee
-   * is, so its argument is the payload even unannotated.
+   * callee a caller has its own evidence for (`serialisers`).
    */
   private responseHelperPayloadNode(
     expression: Node,

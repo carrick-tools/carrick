@@ -13,14 +13,11 @@
  *
  *  (A) `return serialise(payload)` where `serialise` has no installed
  *      declaration. The return is `any`, which says the callee was
- *      unresolvable, not that it was a serialiser — so the recovery stays
- *      restricted to a stated annotation and the unannotated payload is left
- *      behind. But the handler itself states what the callee is: a SIBLING
- *      returned call hands the same callee a body plus an argument carrying an
- *      HTTP status. A body-plus-status call is the structural signature of a
- *      response serialiser, written in the handler's own source, so it is
- *      evidence available on a bare checkout and it promotes the unannotated
- *      argument to a payload.
+ *      unresolvable, not that it was a serialiser, so the unannotated payload
+ *      is left behind. A sibling body-plus-status call used to promote it;
+ *      carrick#2472 C6d deleted that rule (the compiler resolving the callee,
+ *      or a labelled send, replaces it), and the two sibling fixtures below
+ *      now pin the honest `any`.
  *
  *  (B) The success payload sits inside a callback the handler hands to the
  *      returned call (`return settle(...).match(ok => serialise(body), err =>
@@ -225,20 +222,22 @@ describe('carrick#707 payload-argument walk', () => {
     return (res.inferred_types ?? []).find((t) => t.alias === alias);
   }
 
-  it('reads the unannotated payload when a returned sibling states a status', async () => {
+  it('does not promote an unresolvable callee from a returned sibling that states a status', async () => {
     const inferred = await inferReturn('Sibling_Response', LINES.statusSibling);
-    assert.ok(inferred, 'must resolve a response contract, not `any`');
+    assert.ok(inferred, 'the honest `any` is still reported');
     assert.strictEqual(
       collapse(inferred.type_string),
-      '{ sub: string; pub: boolean; }'
+      'any',
+      'a body-plus-status sibling is no longer evidence (carrick#2472 C6d): the compiler resolves the callee or the row abstains'
     );
-    assert.strictEqual(inferred.is_explicit, false);
+    assert.strictEqual((inferred.any_provenance ?? [])[0]?.reason, 'no_payload_evidence');
   });
 
-  it('accepts a bare status code as the same evidence', async () => {
+  it('does not accept a bare status code as that evidence either', async () => {
     const inferred = await inferReturn('BareSibling_Response', LINES.bareStatusSibling);
-    assert.ok(inferred, 'must resolve a response contract, not `any`');
-    assert.strictEqual(collapse(inferred.type_string), '{ id: string; label: string; }');
+    assert.ok(inferred, 'the honest `any` is still reported');
+    assert.strictEqual(collapse(inferred.type_string), 'any');
+    assert.strictEqual((inferred.any_provenance ?? [])[0]?.reason, 'no_payload_evidence');
   });
 
   it('leaves an unresolvable callee with no evidence at `any`, and says why', async () => {
