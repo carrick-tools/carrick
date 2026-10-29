@@ -242,16 +242,17 @@ fn a_caller_that_writes_no_body_through_a_wrapper_is_decided_no_body() {
 /// publish, so each call stands as a site row (as in `site_row_span_test`).
 /// The reader's cassette names, for `src/orders.ts:4`, a symbol the file does
 /// not import (`OrderCreated`, from `src/types.ts`, an unrelated shape) and an
-/// envelope copy of the call as the payload locator, which the envelope guard
-/// treats as no locator and so does not demote the symbol to inference.
+/// envelope copy of the call as the payload locator. No guard drops that
+/// locator (carrick#2472 C6a), so with no slot the failing symbol is demoted
+/// to inference of the envelope copy.
 /// `src/relay.ts` is the same shape through a function the store does not
 /// label: no site, no slot.
 ///
 /// | alias | switch off | `CARRICK_SITE_PAYLOADS=1` |
 /// |---|---|---|
-/// | `orders.created` (slotted, borrowed symbol) | `OrderCreated` | the envelope's own shape |
-/// | `orders.paid` (slotted, no symbol) | the envelope's own shape | the same |
-/// | `orders.shipped` (no slot, borrowed symbol) | `OrderShipped` | `OrderShipped` |
+/// | `orders.created` (slotted, borrowed symbol) | the envelope copy's shape | the slot's shape (same text) |
+/// | `orders.paid` (slotted, no symbol) | the slot's shape | the same |
+/// | `orders.shipped` (no slot, borrowed symbol) | the envelope copy's shape | the same |
 #[test]
 fn a_borrowed_pubsub_symbol_gives_way_to_the_slot_that_types_the_alias() {
     let repo =
@@ -269,13 +270,15 @@ fn a_borrowed_pubsub_symbol_gives_way_to_the_slot_that_types_the_alias() {
         captured_block(blob, &alias)
     };
 
-    let created_off = type_at(&off, "src/orders.ts", 4);
-    assert!(created_off.contains("OrderCreated"), "off: {created_off}");
-    let created_on = type_at(&on, "src/orders.ts", 4);
-    assert!(
-        created_on.contains("quantity: number") && !created_on.contains("OrderCreated"),
-        "on: {created_on}"
-    );
+    // The borrowed symbol is read neither way: the slot types it on, and
+    // demotion to the locator's inference does off.
+    for blob in [&off, &on] {
+        let created = type_at(blob, "src/orders.ts", 4);
+        assert!(
+            created.contains("quantity: number") && !created.contains("OrderCreated"),
+            "created: {created}"
+        );
+    }
 
     // A slotted alias with no symbol is typed at the slot either way.
     for blob in [&off, &on] {
@@ -283,9 +286,12 @@ fn a_borrowed_pubsub_symbol_gives_way_to_the_slot_that_types_the_alias() {
         assert!(paid.contains("sku: string"), "paid: {paid}");
     }
 
-    // No slot: the guard decides, as before.
+    // No slot: the failing symbol is demoted to the locator's own shape.
     for blob in [&off, &on] {
         let shipped = type_at(blob, "src/relay.ts", 9);
-        assert!(shipped.contains("OrderShipped"), "shipped: {shipped}");
+        assert!(
+            shipped.contains("topic: string") && !shipped.contains("OrderShipped"),
+            "shipped: {shipped}"
+        );
     }
 }
