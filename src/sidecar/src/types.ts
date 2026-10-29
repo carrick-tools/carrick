@@ -1229,13 +1229,41 @@ export interface SurfaceHandler {
   params: SurfaceHandlerParam[];
 }
 
-/** One parameter of a handler, with the members its type declares (none: not listed). */
+/**
+ * One parameter of a handler whose type declares members (none: not
+ * listed), by the id of its entry in the surface's `handler_types`
+ * (carrick#2977).
+ */
 export interface SurfaceHandlerParam {
   param: number;
   name: string;
+  type_id: number;
+}
+
+/**
+ * One handler-parameter type of a surface (carrick#2977): every parameter
+ * whose printed type, members and export name are equal refers to one entry.
+ */
+export interface SurfaceHandlerType {
+  /** From 1, in first-reference order within the surface. */
+  id: number;
   /** The parameter's type as the declarations print it, truncated. */
   type: string;
   members: SurfaceHandlerMember[];
+  /** Members the cap of 500 per type dropped (carrick#2966). */
+  dropped: number;
+  /**
+   * The specifier's type-only export that is this type (the same symbol),
+   * declared in the home of the receiver that hands it, every type
+   * parameter defaulted: what a `yields` names, and what `types` lists.
+   */
+  export?: string;
+}
+
+/** A type export some `handler_types` entry names, listed as the one receiver `type` (carrick#2977). */
+export interface SurfaceTypeExport {
+  export: string;
+  receivers: SurfaceReceiver[];
 }
 
 /** A member of a handler's parameter, by path from the parameter, to two levels. */
@@ -1269,13 +1297,17 @@ export interface LibrarySurface {
   reason?: string;
   /** Entries dropped by `max_entries`. */
   truncated: number;
-  /**
-   * With `handlers: true`, the handler-parameter members dropped by the cap of
-   * 500 per parameter (carrick#2966) and the parameters the listing's budget
-   * left out (`max_handler_members`, carrick#3016), summed over every parameter.
-   */
-  handlers_truncated?: number;
   exports: SurfaceExport[];
+  /** With `handlers: true`: the handler-parameter types its handlers' parameters refer to (carrick#2977). */
+  handler_types?: SurfaceHandlerType[];
+  /** With `handlers: true`: each type export a `handler_types` entry names, as receiver `type` (carrick#2977). */
+  types?: SurfaceTypeExport[];
+  /**
+   * With `handlers: true`: the handler parameters the listing's budget of
+   * handler members (`max_handler_members`, carrick#3016) left out, because
+   * their type's new entry would pass it.
+   */
+  handler_params_left_out?: number;
 }
 
 export interface ListLibrarySurfaceResponse extends BaseResponse {

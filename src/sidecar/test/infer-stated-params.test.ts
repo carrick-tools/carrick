@@ -249,6 +249,16 @@ const LABELS = [
   send('response', 'sendCode'),
 ];
 
+/**
+ * The same labels with the reply's sends placed on the type export `Rep`
+ * itself (`of: "type"`, carrick#2977 B), not on the value `reply` the kit
+ * declares to work around the gap; and with no reply send at all.
+ */
+const typeSend = (member: string) =>
+  check('Rep', 'type', { kind: 'op', op: 'send', member, of: 'type', payload: { arg: 0 } });
+const NO_REPLY_SENDS = LABELS.filter((each) => each.export !== 'reply');
+const TYPE_LABELS = [...NO_REPLY_SENDS, typeSend('send'), typeSend('sendFile')];
+
 interface Inferred {
   alias: string;
   type_string: string;
@@ -350,6 +360,21 @@ describe('carrick#2674: bodies a route handler’s parameters state', () => {
     assert.match(reply.type_string, /total: number/);
     assert.doesNotMatch(reply.type_string, /error: string/);
     assert.match((await infer('E', 'request_body'))?.type_string ?? '', /lines: string\[\]/);
+  });
+
+  it('D and E: a send labelled on the reply`s type export reads as the one on a value export does (carrick#2977 B)', async () => {
+    for (const [label, kind] of [
+      ['D', 'response_body'],
+      ['E', 'response_body'],
+      ['E', 'request_body'],
+    ] as const) {
+      const byValue = unaliased(await infer(label, kind));
+      const byType = unaliased(await infer(label, kind, true, { [PKG]: [CORE_PKG] }, TYPE_LABELS));
+      assert.deepStrictEqual(byType, byValue, `${label} ${kind}`);
+    }
+    // Without a reply send in either set, D's reply is not read from its send.
+    const unsent = await infer('D', 'response_body', true, { [PKG]: [CORE_PKG] }, NO_REPLY_SENDS);
+    assert.doesNotMatch(unsent?.type_string ?? '', /id: string/);
   });
 
   it('E: a reply member a type-only package declares is read only where the store lists that package', async () => {

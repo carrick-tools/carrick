@@ -325,3 +325,32 @@ export function asVersion1Rows(text: string): string {
 export function asVersion2Rows(text: string): string {
   return asVersionRows(text, 2, VERSION_2_KINDS, 0);
 }
+
+/**
+ * A `list_library_surface` surface with every handler parameter's `type_id`
+ * resolved back to the `type` and `members` of its `handler_types` entry
+ * (carrick#2977), the shape the lister wrote inline before the table, and
+ * `handler_types`, `types` and `handler_params_left_out` dropped. `dropped`
+ * sums each referring parameter's entry `dropped`: what the inline lister
+ * counted as `handlers_truncated` when its budget left nothing out.
+ */
+export function inlineHandlerParams(surface: Record<string, unknown>): {
+  surface: Record<string, unknown>;
+  dropped: number;
+} {
+  type Entry = { id: number; type: string; members: unknown[]; dropped: number };
+  const byId = new Map(((surface.handler_types as Entry[] | undefined) ?? []).map(entry => [entry.id, entry]));
+  let dropped = 0;
+  const { handler_types: _t, types: _y, handler_params_left_out: _l, ...rest } = surface;
+  const inline = JSON.parse(JSON.stringify(rest), (key, value) => {
+    if (key !== 'params' || !Array.isArray(value)) return value;
+    return value.map((param: { param: number; name: string; type_id?: number }) => {
+      if (param.type_id === undefined) return param;
+      const entry = byId.get(param.type_id);
+      if (!entry) throw new Error(`type_id ${param.type_id} has no entry`);
+      dropped += entry.dropped;
+      return { param: param.param, name: param.name, type: entry.type, members: entry.members };
+    });
+  }) as Record<string, unknown>;
+  return { surface: inline, dropped };
+}
