@@ -63,7 +63,7 @@ const RESOLUTION_OPTIONS: ts.CompilerOptions = sidecarCompilerOptions({
 });
 
 /** DefinitelyTyped packages are imported by the runtime name (TS6137). */
-function publicNameOf(name: string): string {
+export function publicNameOf(name: string): string {
   if (!name.startsWith('@types/')) return name;
   const bare = name.slice('@types/'.length);
   const scoped = /^([^_]+)__(.+)$/.exec(bare);
