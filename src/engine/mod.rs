@@ -9454,6 +9454,7 @@ fn discover_with_positions(
             repo_root,
             &files,
             &workspace,
+            &service_tsconfig,
             &service_ignore_patterns(service),
         );
         debug!(
