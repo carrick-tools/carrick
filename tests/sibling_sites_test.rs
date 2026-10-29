@@ -247,6 +247,126 @@ fn a_changed_only_scan_reads_a_carried_sibling_for_the_same_rows() {
     assert_app_rows(&scoped);
 }
 
+/// The client's kept rows file in `store`, and its record of what it was
+/// walked from.
+fn kept_client_rows(store: &Path) -> PathBuf {
+    fs::read_dir(store.join("positions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with("__client.jsonl.gz"))
+        .expect("the full scan kept the client's rows")
+}
+
+/// A file's identity and write time: changed by every walk, which removes the
+/// rows file and renames a new one in.
+fn identity(path: &Path) -> (u64, std::time::SystemTime) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).unwrap();
+    (meta.ino(), meta.modified().unwrap())
+}
+
+fn unzipped(path: &Path) -> String {
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(fs::File::open(path).unwrap())
+        .read_to_string(&mut text)
+        .unwrap();
+    text
+}
+
+fn zip_to(path: &Path, text: &str) {
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(text.as_bytes()).unwrap();
+    fs::write(path, gz.finish().unwrap()).unwrap();
+}
+
+/// A change to the app alone, committed after every line the rows sit on.
+fn change_the_app(repo: &Path) {
+    let main = repo.join("services/app/src/main.ts");
+    let mut text = fs::read_to_string(&main).unwrap();
+    text.push_str("\nexport function more(): number {\n  return 1;\n}\n");
+    fs::write(&main, text).unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-q", "-m", "app only"]);
+}
+
+/// carrick#3027: a pass that carries the client uses the rows the last pass
+/// kept for it, instead of walking it again, and states the same rows.
+#[test]
+fn a_carried_service_s_kept_rows_are_used_not_walked() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    scan(&repo, store.path(), &[], false);
+    let kept = kept_client_rows(store.path());
+    let before = identity(&kept);
+    change_the_app(&repo);
+    let scoped = scan(&repo, store.path(), &["--changed-only"], false);
+    assert_eq!(
+        identity(&kept),
+        before,
+        "the client's rows file was not walked again"
+    );
+    assert_app_rows(&scoped);
+}
+
+/// carrick#3027: kept rows whose file no longer hashes as they say are
+/// walked again, though change_scope still carries the service.
+#[test]
+fn a_kept_rows_file_that_does_not_bind_is_walked_again() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    scan(&repo, store.path(), &[], false);
+    let kept = kept_client_rows(store.path());
+    let honest = unzipped(&kept);
+    zip_to(&kept, &honest.replace("\"h\":\"", "\"h\":\"0"));
+    let before = identity(&kept);
+    change_the_app(&repo);
+    let scoped = scan(&repo, store.path(), &["--changed-only"], false);
+    assert_ne!(identity(&kept), before, "the client was walked again");
+    assert_eq!(unzipped(&kept), honest, "and its rows are the honest ones");
+    assert_app_rows(&scoped);
+}
+
+/// carrick#3027: rows used again are the rows a walk writes, and the scan
+/// states the same call rows either way.
+#[test]
+fn kept_rows_are_byte_identical_to_a_walk_of_the_same_service() {
+    if !sidecar_built() {
+        return;
+    }
+    let arm = |forget: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = committed_copy(tmp.path());
+        let store = tempfile::tempdir().unwrap();
+        scan(&repo, store.path(), &[], false);
+        let kept = kept_client_rows(store.path());
+        if forget {
+            fs::remove_file(&kept).unwrap();
+        }
+        let before = (!forget).then(|| identity(&kept));
+        change_the_app(&repo);
+        let scoped = scan(&repo, store.path(), &["--changed-only"], false);
+        if let Some(before) = before {
+            assert_eq!(identity(&kept), before, "used, not walked");
+        }
+        (
+            unzipped(&kept),
+            sourced_call_rows(blob_of(&scoped, "app")),
+            sourced_call_rows(blob_of(&scoped, "client")),
+        )
+    };
+    assert_eq!(arm(false), arm(true));
+}
+
 /// Each call row of a blob as `file:line METHOD path source`.
 fn sourced_call_rows(blob: &serde_json::Value) -> Vec<String> {
     let mut rows: Vec<String> = blob["calls"]

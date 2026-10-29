@@ -30,6 +30,11 @@ use super::{service_scan_root, walk_lane};
 use crate::config::Config;
 use crate::request_summary::RequestSummaryInputs;
 
+/// A service's name in the run log.
+fn label_of(service: &Config) -> &str {
+    service.service_name.as_deref().unwrap_or("(root)")
+}
+
 /// One service of the run, read for another's walk.
 pub(super) struct Sibling {
     /// Where its install lives: its packages are asked from here.
@@ -119,6 +124,10 @@ pub(super) struct SiblingRegistry {
     /// that an analysed service's calls enter, by declared position
     /// ([`walk_carried`]).
     carried: Vec<Option<walk_lane::Walked>>,
+    /// The commit each carried service is carried at (`None` for an analysed
+    /// one): the commit whose inputs its rows must be a walk of to be used
+    /// again instead of walked ([`walk_lane::reuse`], carrick#3027).
+    carried_commit: Vec<Option<String>>,
 }
 
 impl SiblingRegistry {
@@ -126,6 +135,7 @@ impl SiblingRegistry {
         repo_path: &str,
         services: &[Config],
         analysed_at: Vec<Option<usize>>,
+        carried_commit: Vec<Option<String>>,
     ) -> Self {
         Self {
             repo_path: canonical_repo_path(repo_path),
@@ -134,6 +144,7 @@ impl SiblingRegistry {
             owners: OnceLock::new(),
             slots: services.iter().map(|_| OnceLock::new()).collect(),
             carried: services.iter().map(|_| None).collect(),
+            carried_commit,
         }
     }
 
@@ -183,17 +194,68 @@ impl SiblingRegistry {
             if next.is_empty() {
                 return;
             }
-            let configs: Vec<Config> = next
+            // Rows an earlier pass kept stand in for a walk when they are
+            // exactly what the walk would write (carrick#3027).
+            let mut kept: Vec<(usize, walk_lane::Walked)> = Vec::new();
+            let mut to_walk: Vec<usize> = Vec::new();
+            for index in next {
+                let reused = match &self.carried_commit[index] {
+                    Some(commit) => {
+                        walk_lane::reuse(&self.repo_path, &self.services[index], commit)
+                    }
+                    None => Err(crate::position_rows::Miss::NotKept),
+                };
+                match reused {
+                    Ok(walked) => {
+                        debug!(
+                            "Position rows for service {} reused from the last pass",
+                            label_of(&self.services[index])
+                        );
+                        kept.push((index, walked));
+                    }
+                    Err(miss) => {
+                        debug!(
+                            "Position rows for service {} not reused: {miss:?}",
+                            label_of(&self.services[index])
+                        );
+                        to_walk.push(index);
+                    }
+                }
+            }
+            let configs: Vec<Config> = to_walk
                 .iter()
                 .map(|index| self.services[*index].clone())
                 .collect();
-            debug!(
-                "Walking {} carried service(s) the analysed services call into",
-                configs.len()
-            );
-            let done =
-                walk_lane::walk_all(recipe.clone(), &self.repo_path, &configs, width, Vec::new())
-                    .await;
+            if !configs.is_empty() {
+                debug!(
+                    "Walking {} carried service(s) the analysed services call into",
+                    configs.len()
+                );
+            }
+            // Walked from the inputs of the commit the service is carried at.
+            let at = to_walk
+                .iter()
+                .map(|index| self.carried_commit[*index].clone())
+                .collect();
+            let done = walk_lane::walk_all(
+                recipe.clone(),
+                &self.repo_path,
+                &configs,
+                width,
+                Vec::new(),
+                at,
+            )
+            .await;
+            let next: Vec<usize> = kept
+                .iter()
+                .map(|(index, _)| *index)
+                .chain(to_walk)
+                .collect();
+            let done: Vec<walk_lane::Walked> = kept
+                .into_iter()
+                .map(|(_, walked)| walked)
+                .chain(done)
+                .collect();
             for (index, walked) in next.into_iter().zip(done) {
                 wanted.extend(self.declared_in(&walked.index()));
                 self.carried[index] = Some(walked);

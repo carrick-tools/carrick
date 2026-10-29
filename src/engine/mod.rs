@@ -1081,6 +1081,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // Every analysed service's compiler walk, when the run walks, in a lane
     // of its own that ends before the loop starts (carrick#2413 slice G1).
     let walking = walk_lane::requested();
+    let clean_commit =
+        (!git_state.dirty && !git_state.commit.is_empty()).then(|| git_state.commit.clone());
     let (walk_ends, walked) = if walking {
         walk_lane::signals(analysed.len())
     } else {
@@ -1092,6 +1094,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         if walking { &analysed } else { &[] },
         width.count,
         walk_ends,
+        // Recorded beside each service's rows: a clean tree's commit, whose
+        // inputs they are a walk of (carrick#3027).
+        vec![clean_commit.clone(); analysed.len()],
     );
     // Every service's detection and guidance, asked for from here on beside
     // the loop below instead of one service at a time inside it
@@ -1115,8 +1120,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // The services the run carries that an analysed one calls into are
     // walked in a lane round of their own, so a scan of a change to the
     // consumer alone reads the same chains as a full scan (carrick#2618).
-    let mut sibling_registry =
-        siblings::SiblingRegistry::new(repo_path, &services, scan_index.clone());
+    let mut sibling_registry = siblings::SiblingRegistry::new(
+        repo_path,
+        &services,
+        scan_index.clone(),
+        scopes
+            .iter()
+            .map(|scope| match scope {
+                crate::change_scope::Scope::Carried { commit } => Some(commit.clone()),
+                crate::change_scope::Scope::Analysed { .. } => None,
+            })
+            .chain(std::iter::repeat(None))
+            .take(services.len())
+            .collect(),
+    );
     if walking {
         sibling_registry
             .walk_carried(&walks, recipe.clone(), width.count)
