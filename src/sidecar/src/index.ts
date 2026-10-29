@@ -803,7 +803,7 @@ function handleListLibrarySurface(
       request.packages,
       request.max_entries ?? SURFACE_MAX_ENTRIES,
       request.exports ?? {},
-      { handlers: request.handlers, resultCandidates: request.result_candidates }
+      { handlers: request.handlers, resultCandidates: request.result_candidates, maxHandlerMembers: request.max_handler_members }
     );
     return { request_id: request.request_id, status: 'success', surfaces, surface_sha256 };
   } catch (err) {

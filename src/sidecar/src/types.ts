@@ -761,6 +761,8 @@ export interface ListLibrarySurfaceRequest extends BaseRequest {
   exports?: Record<string, string[]>;
   /** List each member's handler-parameter members (`handlers`, carrick#2674 S3); default false (carrick#2966). */
   handlers?: boolean;
+  /** The most handler-parameter members the whole listing lists; default 500000 (carrick#3016). */
+  max_handler_members?: number;
   /** List each signature's `result_candidates` (carrick#2817); default false (carrick#2966). */
   result_candidates?: boolean;
 }
@@ -1269,7 +1271,8 @@ export interface LibrarySurface {
   truncated: number;
   /**
    * With `handlers: true`, the handler-parameter members dropped by the cap of
-   * 500 per parameter (carrick#2966), summed over every listed parameter.
+   * 500 per parameter (carrick#2966) and the parameters the listing's budget
+   * left out (`max_handler_members`, carrick#3016), summed over every parameter.
    */
   handlers_truncated?: number;
   exports: SurfaceExport[];

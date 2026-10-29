@@ -1019,14 +1019,16 @@ export class LibraryClaimsVerifier {
     });
     const firstBuild = imports.length + importLines.length;
 
-    const surfaces = this.readProbe(fromDir, [...imports, ...importLines, ...buildLines], (checker, reader, file) =>
-      packages.map((pkg, i) =>
+    const surfaces = this.readProbe(fromDir, [...imports, ...importLines, ...buildLines], (checker, reader, file) => {
+      // One budget for the whole call, spent across its specifiers: the answer is one line.
+      reader.startListing(options.maxHandlerMembers ?? HANDLER_LISTING_BUDGET);
+      return packages.map((pkg, i) =>
         reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], options, (name, receiver) => {
           const index = builtIndex.get(builtKey({ package: pkg, export: name }, receiver));
           return index === undefined ? undefined : resolvedBuild(checker, file.statements[firstBuild + index]);
         })
-      )
-    );
+      );
+    });
     return { surfaces, surface_sha256: fullSurfaceSha256(surfaces) };
   }
 
@@ -1418,8 +1420,15 @@ class DeclarationReader {
   /** `takesString` per signature, and `scopeMembers` per type and home: the same types recur across receivers. */
   private readonly takesStringRead = new Map<ts.Signature, boolean>();
   private readonly scopeMembersRead = new Map<ts.Type, Map<string, readonly string[]>>();
-  /** Handler-parameter members `HANDLER_MEMBER_CAP` dropped in the package being listed. */
+  /** Handler-parameter members `HANDLER_MEMBER_CAP` and the listing's budget dropped in the package being listed. */
   private handlersDropped = 0;
+  /** Handler-parameter members the rest of this `listSurface` call may still list (carrick#3016). */
+  private handlerBudget = HANDLER_LISTING_BUDGET;
+
+  /** Begin one `listSurface` call: its specifiers share `handlerBudget` handler-parameter members. */
+  startListing(handlerBudget: number): void {
+    this.handlerBudget = handlerBudget;
+  }
   /** Whether the package being listed lists each signature's `result_candidates`. */
   private listResultCandidates = false;
   /** The service root as given and as a realpath, longest first: what a listing prints as `<root>`. */
@@ -3984,6 +3993,12 @@ class DeclarationReader {
       if (this.namedProperties(type).length === 0) return;
       const { members, dropped } = this.handlerMembersOf(type);
       this.handlersDropped += dropped;
+      // Past the listing's budget a parameter is left out whole and counted (carrick#3016).
+      if (members.length > this.handlerBudget) {
+        this.handlersDropped += members.length;
+        return;
+      }
+      this.handlerBudget -= members.length;
       listed.push({ param: index, name: parameter.getName(), type: this.printed(type), members });
     });
     return listed;
@@ -4653,12 +4668,24 @@ const HANDLER_MEMBER_DEPTH = 2;
  */
 const HANDLER_MEMBER_CAP = 500;
 
+/**
+ * The most handler-parameter members one `listSurface` call lists, across all
+ * its specifiers (carrick#3016). The answer is one JSON line and a string
+ * passes V8's limit at about 512 MiB; a member costs about 150 bytes, so this
+ * keeps the handlers near 75 MB beside an export listing of tens of MB. A
+ * server framework handing 50 distinct request types to thousands of members
+ * listed 8.99 million of them (1.3 GB) before it.
+ */
+const HANDLER_LISTING_BUDGET = 500_000;
+
 /** What a surface listing adds beyond the hashed surface, each only when asked (carrick#2966). */
 export interface SurfaceOptions {
   /** Each member's `handlers` (carrick#2674 S3). */
   handlers?: boolean;
   /** Each signature's `result_candidates` (carrick#2817). */
   resultCandidates?: boolean;
+  /** Handler-parameter members the whole call may list (default `HANDLER_LISTING_BUDGET`, carrick#3016). */
+  maxHandlerMembers?: number;
 }
 
 const PRINT_FLAGS =

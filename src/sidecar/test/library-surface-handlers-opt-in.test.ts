@@ -52,6 +52,18 @@ export declare class Bus {
 }
 `;
 
+// Four route methods handing one ten-member request type: a listing that
+// inlines the type per method is four times the type's size.
+const REQ = Array.from({ length: 10 }, (_, i) => `  r${i}: string;`).join('\n');
+const ROUTES = `export interface Req {\n${REQ}\n}
+export declare class Router {
+  del(path: string, handler: (req: Req) => void): this;
+  get(path: string, handler: (req: Req) => void): this;
+  post(path: string, handler: (req: Req) => void): this;
+  put(path: string, handler: (req: Req) => void): this;
+}
+`;
+
 interface Member {
   name: string;
   handlers?: Array<{ arg: number; params: Array<{ name: string; members: Array<{ path: string[] }> }> }>;
@@ -90,6 +102,8 @@ describe('list_library_surface: handler members only on request (carrick#2966)',
       'node_modules/fixture-bus/index.d.ts': BUS,
       'node_modules/fixture-server/package.json': JSON.stringify({ name: 'fixture-server', version: '1.0.0', types: 'index.d.ts' }),
       'node_modules/fixture-server/index.d.ts': SERVER,
+      'node_modules/fixture-routes/package.json': JSON.stringify({ name: 'fixture-routes', version: '1.0.0', types: 'index.d.ts' }),
+      'node_modules/fixture-routes/index.d.ts': ROUTES,
     };
     for (const [rel, text] of Object.entries(files)) {
       const file = path.join(root, rel);
@@ -147,5 +161,26 @@ describe('list_library_surface: handler members only on request (carrick#2966)',
     const without = await list({}, 'fixture-server');
     assert.strictEqual(without.surfaces[0].handlers_truncated, undefined);
     assert.strictEqual(without.surface_sha256, listed.surface_sha256);
+  });
+
+  // carrick#3016: the response is one JSON line, and a string passes V8's
+  // limit near 512 MB. A server framework handed one request type by thousands
+  // of members listed over a gigabyte of members, 50 distinct types inlined
+  // per member. A listing spends one budget of handler members across the
+  // whole call; a parameter that would pass it is left out and counted.
+  it('spends one budget of handler members per listing, counts what it leaves out and keeps the hash', async () => {
+    const free = await list({ handlers: true }, 'fixture-routes');
+    const all = membersOf(free).filter(m => m.handlers !== undefined).map(m => m.name);
+    assert.deepStrictEqual(all, ['del', 'get', 'post', 'put']);
+    assert.strictEqual(free.surfaces[0].handlers_truncated, 0);
+
+    // 25 members: two parameters of ten fit, the third would pass it.
+    const bounded = await list({ handlers: true, max_handler_members: 25 }, 'fixture-routes');
+    const kept = membersOf(bounded).filter(m => m.handlers !== undefined).map(m => m.name);
+    assert.deepStrictEqual(kept, ['del', 'get']);
+    assert.strictEqual(bounded.surfaces[0].handlers_truncated, 20);
+    assert.strictEqual(bounded.surface_sha256, free.surface_sha256);
+    const without = await list({}, 'fixture-routes');
+    assert.strictEqual(without.surface_sha256, bounded.surface_sha256);
   });
 });
