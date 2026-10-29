@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::contract::{
-    Caller, CheckOutput, Counterpart, FunctionUse, Item, MAX_STALE_FILES, ReadError, ReadFailure,
-    Recheck, SCHEMA, STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService, TypeOperation,
-    TypeUse, Uses, Verdict,
+    Caller, CheckOutput, CheckSummary, Counterpart, FunctionUse, Item, MAX_STALE_FILES, ReadError,
+    ReadFailure, Recheck, SCHEMA, STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService,
+    TypeOperation, TypeUse, Uses, Verdict,
 };
 use super::read_model::{FileUses, IndexedItem, IndexedRepo, LocalIndex};
 
@@ -179,7 +179,53 @@ pub fn answer(
         .map(|uses| uses.lines(&service))
         .unwrap_or_default();
 
+    let items: Vec<Item> = items
+        .iter()
+        .map(|item| {
+            project(
+                item,
+                mode,
+                rows_are_indexed,
+                deleted,
+                repo,
+                &repo_of_service,
+            )
+        })
+        .collect();
+    let mut pairs_compared = 0;
+    let mut pairs_uncompared = 0;
+    for item in &items {
+        let reached = item
+            .verdict
+            .as_ref()
+            .is_some_and(|verdict| CheckSummary::reached_verdict(verdict.result.as_deref()));
+        if reached {
+            pairs_compared += item.counterparts.len();
+        } else {
+            pairs_uncompared += item.counterparts.len();
+        }
+    }
+    let summary = (mode == Mode::Check).then(|| CheckSummary {
+        files: 1,
+        services: 1,
+        calls: items.iter().filter(|item| item.kind == "call").count(),
+        routes: items.iter().filter(|item| item.kind == "route").count(),
+        pairs_compared,
+        pairs_uncompared,
+        breaks: items
+            .iter()
+            .filter(|item| {
+                item.verdict.as_ref().is_some_and(|verdict| {
+                    matches!(
+                        verdict.result.as_deref(),
+                        Some("type_mismatch" | "method_mismatch")
+                    )
+                })
+            })
+            .count(),
+    });
     Ok(CheckOutput {
+        summary,
         hosted: enrichment.hosted,
         hosted_state: enrichment.hosted_state,
         hosted_checked_at: index.hosted_checked_at.clone(),
@@ -193,19 +239,7 @@ pub fn answer(
         changed_since_index: scanned_changes(&repo_root, changed.iter()),
         stale,
         deleted,
-        items: items
-            .iter()
-            .map(|item| {
-                project(
-                    item,
-                    mode,
-                    rows_are_indexed,
-                    deleted,
-                    repo,
-                    &repo_of_service,
-                )
-            })
-            .collect(),
+        items,
         recheck,
         boundary,
         boundary_note,

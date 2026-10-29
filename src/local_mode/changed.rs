@@ -60,6 +60,14 @@ pub struct ChangedOutput {
     /// already held.
     pub services: usize,
     pub repos: Vec<ChangedRepo>,
+    /// The same counts as the summary line: files, the services they belong
+    /// to, calls, routes, and the pairs compared. Absent when the run did not
+    /// finish (`not_checked` is set): there is nothing to count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<super::contract::CheckSummary>,
+    /// The files are the ones git lists as changed, not ones the caller named.
+    #[serde(skip)]
+    pub changed: bool,
     pub problems: Vec<Problem>,
     /// How many of `problems` fail the run.
     pub failing: usize,
@@ -247,6 +255,8 @@ fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
         calls: 0,
         services: 0,
         repos: Vec::new(),
+        summary: None,
+        changed: false,
         problems: Vec::new(),
         failing: 0,
         elapsed_ms: 0,
@@ -285,6 +295,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     let mut output = ChangedOutput {
         repos,
         files,
+        changed: matches!(selection, Selection::Changed),
         ..not_checked(&shown, "")
     };
     output.not_checked = None;
@@ -339,6 +350,15 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     output.calls = judged.calls;
     output.failing = judged.problems.iter().filter(|p| p.fails).count();
     output.problems = judged.problems;
+    output.summary = Some(super::contract::CheckSummary {
+        files: output.files,
+        services: services_of(&index, &changed),
+        calls: output.calls,
+        routes: output.routes,
+        pairs_compared: judged.pairs_compared,
+        pairs_uncompared: judged.pairs_uncompared,
+        breaks: output.failing,
+    });
     output
 }
 
@@ -498,9 +518,34 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
     (repos, changed)
 }
 
+/// How many services the checked files belong to: those whose directory
+/// covers one of them. A repo the index holds no service rows for counts as
+/// one.
+fn services_of(index: &LocalIndex, changed: &Changed) -> usize {
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for (name, (_, files)) in changed {
+        let Some(repo) = index.repos.iter().find(|repo| &repo.name == name) else {
+            continue;
+        };
+        if repo.services.is_empty() {
+            seen.insert((name.as_str(), ""));
+        }
+        for service in &repo.services {
+            if files.iter().any(|file| service.covers(file)) {
+                seen.insert((name.as_str(), service.name.as_str()));
+            }
+        }
+    }
+    seen.len()
+}
+
 struct Judged {
     routes: usize,
     calls: usize,
+    /// Pairs of a checked call or route with its counterpart, counted once
+    /// each, split by whether the type layer gave a verdict.
+    pairs_compared: usize,
+    pairs_uncompared: usize,
     problems: Vec<Problem>,
 }
 
@@ -549,8 +594,12 @@ fn judge(
     let mut judged = Judged {
         routes: 0,
         calls: 0,
+        pairs_compared: 0,
+        pairs_uncompared: 0,
         problems: Vec::new(),
     };
+    type Site = (String, String, Option<u32>);
+    let mut pairs: BTreeSet<(Site, Site)> = BTreeSet::new();
     for operation in &join.operations {
         let Some(&(repo, repo_path)) = repo_of.get(operation.service.as_str()) else {
             continue;
@@ -565,6 +614,34 @@ fn judge(
         let Some(item) = item_of(repo, operation) else {
             continue;
         };
+        // A pair seen from both of its ends, both in the changed files, counts
+        // once: keyed consumer first.
+        let reached = item.verdict.as_ref().is_some_and(|verdict| {
+            super::contract::CheckSummary::reached_verdict(verdict.result.as_deref())
+        });
+        for counterpart in &item.counterparts {
+            let here = (
+                operation.service.clone(),
+                operation.file.clone(),
+                operation.line,
+            );
+            let there = (
+                counterpart.service.clone(),
+                counterpart.file.clone(),
+                counterpart.line,
+            );
+            let pair = match operation.role {
+                Role::Consumer => (here, there),
+                Role::Producer => (there, here),
+            };
+            if pairs.insert(pair) {
+                if reached {
+                    judged.pairs_compared += 1;
+                } else {
+                    judged.pairs_uncompared += 1;
+                }
+            }
+        }
         let Some(verdict) = item.verdict.as_ref() else {
             continue;
         };
@@ -841,6 +918,10 @@ impl ChangedOutput {
             ));
         }
         out.push('\n');
+        if let Some(summary) = &self.summary {
+            out.push_str(&summary.line(self.changed));
+            out.push('\n');
+        }
         for problem in listed {
             let at = match problem.line {
                 Some(line) => format!("{}:{line}", problem.file),
@@ -1247,6 +1328,7 @@ mod tests {
             calls: 2,
             files: 1,
             services: 2,
+            summary: Some(Default::default()),
             problems: vec![problem(ProblemKind::Incompatible, true), candidate],
             failing: 1,
             not_checked: None,
@@ -1258,7 +1340,11 @@ mod tests {
             "carrick check: checked 0 routes and 2 calls in 1 changed file against 2 services: \
              1 incompatible, 0 reach no route, plus 1 model candidate, run with --all to list them"
         );
-        assert_eq!(quiet.lines().count(), 2, "the fact only:\n{quiet}");
+        assert_eq!(
+            quiet.lines().count(),
+            3,
+            "the summary, the count line and the fact only:\n{quiet}"
+        );
         assert!(!quiet.contains("GET /b"), "{quiet}");
         let everything = output.render(true);
         assert!(everything.contains("GET /b"), "{everything}");
@@ -1403,5 +1489,89 @@ mod tests {
     fn a_compiler_message_is_one_line_and_cut() {
         assert_eq!(one_line("a\n  b\tc"), "a b c");
         assert!(one_line(&"x ".repeat(400)).chars().count() <= MAX_REASON_CHARS);
+    }
+
+    fn counted(breaks: usize, problems: Vec<Problem>) -> ChangedOutput {
+        ChangedOutput {
+            routes: 2,
+            calls: 12,
+            files: 3,
+            services: 38,
+            summary: Some(super::super::contract::CheckSummary {
+                files: 3,
+                services: 2,
+                calls: 12,
+                routes: 2,
+                pairs_compared: 9,
+                pairs_uncompared: 3,
+                breaks,
+            }),
+            changed: true,
+            problems,
+            failing: breaks,
+            not_checked: None,
+            ..not_checked("/w", "")
+        }
+    }
+
+    #[test]
+    fn a_clean_run_says_what_it_checked() {
+        let text = counted(0, Vec::new()).render(false);
+        assert_eq!(
+            text.lines().nth(1).unwrap(),
+            "Checked 3 changed files in 2 services: 12 calls and 2 routes, 9 pairs compared with \
+             other services (3 could not be compared). No breaks."
+        );
+    }
+
+    #[test]
+    fn a_run_with_a_break_counts_it_before_the_list() {
+        let text = counted(1, vec![problem(ProblemKind::Incompatible, true)]).render(false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1],
+            "Checked 3 changed files in 2 services: 12 calls and 2 routes, 9 pairs compared with \
+             other services (3 could not be compared). 1 break (listed below)."
+        );
+        assert!(lines[2].contains("web/src/a.ts:4"), "{text}");
+    }
+
+    #[test]
+    fn named_files_are_not_called_changed_and_the_json_carries_the_counts() {
+        let mut output = counted(0, Vec::new());
+        output.changed = false;
+        assert!(
+            output
+                .render(false)
+                .contains("Checked 3 files in 2 services")
+        );
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["summary"]["files"], 3);
+        assert_eq!(json["summary"]["services"], 2);
+        assert_eq!(json["summary"]["calls"], 12);
+        assert_eq!(json["summary"]["routes"], 2);
+        assert_eq!(json["summary"]["pairs_compared"], 9);
+        assert_eq!(json["summary"]["pairs_uncompared"], 3);
+        assert_eq!(json["summary"]["breaks"], 0);
+    }
+
+    #[test]
+    fn a_run_that_compared_nothing_says_so_and_does_not_claim_a_clean_pass() {
+        let mut output = counted(0, Vec::new());
+        output.summary.as_mut().unwrap().pairs_compared = 0;
+        assert_eq!(
+            output.render(false).lines().nth(1).unwrap(),
+            "Checked 3 changed files in 2 services: 12 calls and 2 routes, nothing compared \
+             with other services (3 pairs could not be compared). No breaks, but nothing was \
+             compared."
+        );
+    }
+
+    #[test]
+    fn a_run_that_did_not_finish_carries_no_summary() {
+        let output = not_checked("/w", "the check did not finish: out of time");
+        let json = serde_json::to_value(&output).unwrap();
+        assert!(json.get("summary").is_none(), "{json}");
+        assert!(!output.render(false).contains("Checked "), "no count line");
     }
 }
