@@ -41,7 +41,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
 import { holdsResult, resultCandidatesOf } from './result-candidates.js';
-import { publicNameOf } from './capture/installed-package.js';
 import { RUNTIME_EMITTER_EVENTS, RUNTIME_TYPE_PACKAGES, isRuntimeEmitterMember } from './runtime-emitter.js';
 import { PathNames, declaringFileName, type PackageDirectoryOf } from './position-rows.js';
 import type {
@@ -3935,7 +3934,7 @@ class DeclarationReader {
     }
     const owner = this.packageOf(first.getSourceFile());
     if (owner === undefined || RUNTIME_TYPE_PACKAGES.has(owner)) return undefined;
-    let module = publicNameOf(owner);
+    let module = importedNameOf(owner);
     let names = containers.filter(each => ts.isIdentifier(each.name)).map(each => (each.name as ts.Identifier).text);
     const ambient = containers.findIndex(each => ts.isStringLiteral(each.name));
     if (ambient >= 0) {
@@ -5273,6 +5272,14 @@ function truncate(text: string): string {
 function isNamedPackage(specifier: string, packageName: string | undefined): boolean {
   const named = packageNameOf(specifier);
   return packageName === named || packageName === typesPackageOf(named);
+}
+
+/** The name a service imports a package by: `@types/scope__name` is `@scope/name`, `@types/name` is `name`. */
+function importedNameOf(installed: string): string {
+  if (!installed.startsWith('@types/')) return installed;
+  const bare = installed.slice('@types/'.length);
+  const scoped = /^([^_]+)__(.+)$/.exec(bare);
+  return scoped ? `@${scoped[1]}/${scoped[2]}` : bare;
 }
 
 /** The `@types` package of a package name (`@types/scope__name` for a scoped one). */
