@@ -1317,8 +1317,8 @@ const BASE_DEPTH = 8;
  * A type's key (carrick#3046): the class, interface and alias symbols the
  * type stands on. They are the type's own, those of its union and
  * intersection parts, of its awaited type, of its reference target, and of
- * its base types, to a bounded depth. A type parameter (`this` inside a
- * subclass included) is read through its constraint.
+ * its base types, to a bounded depth.  A `this` type is the symbol of its class or
+ * interface, which the checker already hands over instantiated.
  */
 function declaredSymbols(checker: ts.TypeChecker, type: ts.Type, bases = true): Set<ts.Symbol> {
   const out = new Set<ts.Symbol>();
@@ -1327,11 +1327,6 @@ function declaredSymbols(checker: ts.TypeChecker, type: ts.Type, bases = true): 
   const visit = (t: ts.Type, depth: number): void => {
     if (seen.has(t) || depth > BASE_DEPTH) return;
     seen.add(t);
-    if (t.flags & ts.TypeFlags.TypeParameter) {
-      const constraint = checker.getBaseConstraintOfType(t);
-      if (constraint && constraint !== t) visit(constraint, depth);
-      return;
-    }
     const awaited = checker.getAwaitedType(t) ?? t;
     if (awaited !== t) return visit(awaited, depth);
     if (t.isUnionOrIntersection()) {

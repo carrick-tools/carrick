@@ -74,6 +74,7 @@ export * from 'fixture-core';
 export interface AppRouter extends Router {
   prefix: string;
   publishAll(payload: unknown): void;
+  again(name: string): this;
 }
 export declare function server(name?: string): Router;
 export declare function appServer(name?: string): AppRouter;
@@ -202,6 +203,15 @@ describe('verify_library_claims: type receiver paths (carrick#3046)', () => {
     const bound = send('fixture-server', 'server', 'type:fixture-core#Router', { name: { bound: 'maker' } });
     assert.deepStrictEqual(verdicts([maker('server'), bound]), ['verified', 'verified']);
     assert.deepStrictEqual(verdicts([bound]), ['failed name_unbound']);
+  });
+
+  it('a scope that returns `this` binds a name by type', () => {
+    // `again` returns `this` inside `AppRouter`, which extends `Router`: a scope returning `this` is the subclass, which stands on `Router` through its bases.
+    const made = maker('appServer');
+    const scope = check('fixture-server', 'appServer', 'instance:()', { kind: 'scope', form: 'call', member: 'again', of: 'instance:()', name: { arg: 0 } });
+    const bound = send('fixture-server', 'appServer', 'type:fixture-core#Router', { name: { bound: 'scope' } });
+    assert.deepStrictEqual(verdicts([made, scope, bound]), ['verified', 'verified', 'verified']);
+    assert.deepStrictEqual(verdicts([made, bound]), ['verified', 'failed name_unbound']);
   });
 
   it('6. `yields.package` matches the handed type in that package`s home', () => {
