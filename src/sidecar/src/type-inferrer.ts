@@ -2621,14 +2621,7 @@ export class TypeInferrer {
         ...returnedBranches,
         ...statementSends
           // A labelled send is a body wherever it sits (carrick#2472 C2).
-          // FROZEN (old path, 2026-10-21): the `statementEndsFunctionPath` test
-          // here; see that method.
-          .filter(
-            (s) =>
-              s.send === locatedBranch ||
-              isLabelledSend(s.send) ||
-              this.statementEndsFunctionPath(s.statement, func)
-          )
+          .filter((s) => s.send === locatedBranch || isLabelledSend(s.send))
           .map((s) => s.send),
       ];
     } else {
@@ -2712,50 +2705,6 @@ export class TypeInferrer {
       if (isSend(expression)) sends.push({ statement, send: expression });
     }
     return sends;
-  }
-
-  // FROZEN (old path, 2026-10-21): this method and its one use. Deletions and
-  // safety fixes only. Fixes for wrong or missing types go in send versus
-  // setter, read from the framework label (carrick#2472 C4). Delete when C4 is
-  // released (carrick#2472, C6).
-  /**
-   * True when nothing in `func` runs after `statement`: a bare `return;`
-   * follows it, or it is the last statement of its block and the statement
-   * that block belongs to (an `if` branch, a `try` or `catch` block) is itself
-   * last, up to `func`'s body. A statement inside a loop, a `switch` case or
-   * any other construct does not end the path; a send there is not read as a
-   * success body.
-   */
-  private statementEndsFunctionPath(statement: Node, func: FunctionLike): boolean {
-    const body = func.getBody();
-    const next = statement.getNextSibling();
-    if (next && Node.isReturnStatement(next) && !next.getExpression()) return true;
-    let current: Node = statement;
-    for (;;) {
-      const parent = current.getParent();
-      if (!parent) return false;
-      if (Node.isIfStatement(parent)) {
-        current = parent;
-        continue;
-      }
-      if (!Node.isBlock(parent)) return false;
-      const statements = parent.getStatements();
-      if (statements[statements.length - 1] !== current) return false;
-      if (parent === body) return true;
-      const owner = parent.getParent();
-      if (!owner) return false;
-      if (Node.isIfStatement(owner) || Node.isTryStatement(owner) || Node.isBlock(owner)) {
-        current = Node.isBlock(owner) ? parent : owner;
-        continue;
-      }
-      if (Node.isCatchClause(owner)) {
-        const tryStatement = owner.getParent();
-        if (!tryStatement || !Node.isTryStatement(tryStatement)) return false;
-        current = tryStatement;
-        continue;
-      }
-      return false;
-    }
   }
 
   // FROZEN (old path, 2026-10-21): this method's structural test (the whole
