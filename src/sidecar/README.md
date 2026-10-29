@@ -315,6 +315,7 @@ Response (`result` is a `CaptureStubResult`, abbreviated here):
       }
     ],
     "bare_checkout": false,
+    "unresolved_dependencies": [],
     "ts_version": "5.8.3",
     "errors": []
   }

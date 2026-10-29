@@ -127,6 +127,7 @@ function fail(stubDir: string, packageName: string, errors: string[]): CaptureSt
     augmentation_files: [],
     specifier_rewrites: 0,
     bare_checkout: false,
+    unresolved_dependencies: [],
     ts_version: ts.version,
     errors,
   };
@@ -551,7 +552,16 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   );
 
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
-  const bareCheckout = !deno && !fs.existsSync(path.join(dependencyRoot, 'node_modules'));
+  const nodeModulesPresent = fs.existsSync(path.join(dependencyRoot, 'node_modules'));
+  const unresolvedDependencies =
+    deno || !nodeModulesPresent ? [] : unresolvedDeclaredDependencies(dependencyRoot);
+  const bareCheckout = !deno && (!nodeModulesPresent || unresolvedDependencies.length > 0);
+  if (unresolvedDependencies.length > 0) {
+    console.error(
+      `[sidecar] capture ${packageName}: bare checkout, declared dependencies do not resolve: ` +
+        unresolvedDependencies.join(', ')
+    );
+  }
 
   stubGuard.writeFile(
     path.join(stubDir, 'package.json'),
@@ -633,12 +643,59 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     augmentation_files: augmentationFiles.sort(),
     specifier_rewrites: specifierRewrites,
     bare_checkout: bareCheckout,
+    unresolved_dependencies: unresolvedDependencies,
     ts_version: ts.version,
     errors,
   };
 }
 
-/** What one declaration emit wrote, as text: nothing here is a compiler object. */
+/** How many unresolved packages a capture result names. */
+const UNRESOLVED_DEPENDENCIES_NAMED = 5;
+
+/**
+ * The first few packages `root/package.json` declares (dependencies and
+ * devDependencies) that do not resolve from `root`: no `node_modules/<name>`
+ * in `root` or any parent directory. `existsSync` follows links, so a pnpm
+ * link into a missing store reads as unresolved (carrick#2999). Declared names
+ * only, one stat per ancestor: no module walk.
+ */
+function unresolvedDeclaredDependencies(root: string): string[] {
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  } catch {
+    return [];
+  }
+  if (manifest === null || typeof manifest !== 'object') return [];
+  const declared = new Set<string>();
+  for (const field of ['dependencies', 'devDependencies'] as const) {
+    const group = (manifest as Record<string, unknown>)[field];
+    if (group !== null && typeof group === 'object') {
+      for (const name of Object.keys(group)) declared.add(name);
+    }
+  }
+  const unresolved: string[] = [];
+  for (const name of [...declared].sort()) {
+    let dir = path.resolve(root);
+    let found = false;
+    for (;;) {
+      if (fs.existsSync(path.join(dir, 'node_modules', name))) {
+        found = true;
+        break;
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    if (!found) {
+      unresolved.push(name);
+      if (unresolved.length === UNRESOLVED_DEPENDENCIES_NAMED) break;
+    }
+  }
+  return unresolved;
+}
+
+/** What one, as text: nothing here is a compiler object. */
 interface DeclarationEmit {
   /** Staging-absolute emitted file -> its text. */
   emitted: Map<string, string>;

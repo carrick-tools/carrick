@@ -424,8 +424,12 @@ export interface CaptureStubResult {
   /** Number of emitted specifiers rewritten by the post-emit pass
    * (tsconfig-paths mappings and absolute internal import types). */
   specifier_rewrites: number;
-  /** True when the source repo had no node_modules at capture time. */
+  /** True when the source repo had no node_modules at capture time, or a
+   * dependency its package.json declares does not resolve from the service
+   * root (carrick#2999). */
   bare_checkout: boolean;
+  /** The first few declared dependencies that did not resolve, sorted. */
+  unresolved_dependencies: string[];
   ts_version: string;
   errors: string[];
 }
