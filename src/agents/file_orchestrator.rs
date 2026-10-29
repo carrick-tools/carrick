@@ -8080,6 +8080,9 @@ impl FileOrchestrator {
                 // (carrick#1782).
                 let row = DataCallResult {
                     call_body: member.body.clone(),
+                    // A member whose helper is handed its origin states a bare
+                    // path; `stamp_call_bases` leaves a row that has a base.
+                    base: member.base_unread.then(crate::call_base::unread_base),
                     ..Self::deterministic_call(
                         candidate,
                         line,
@@ -20331,6 +20334,7 @@ export { routes };
             target: target.to_string(),
             request_line: 0,
             body: None,
+            base_unread: false,
         }
     }
 
@@ -21184,6 +21188,47 @@ export { routes };
         assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
         assert_eq!(result.data_calls[0].call_expression_span_end, Some(140));
         assert_eq!(result.data_calls[0].line_number, 12);
+    }
+
+    /// A member whose helper is handed its origin states a bare path, but the
+    /// origin is a run-time value: the row is base `injected`, and the pass
+    /// that stamps bases leaves it so. A bare path next to a `relative` base
+    /// is a route of this workspace, which this is not.
+    #[test]
+    fn an_imported_member_handed_its_origin_is_stamped_injected() {
+        use crate::call_base::CallBaseKind;
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        for (unread, kind) in [
+            (true, CallBaseKind::Injected),
+            (false, CallBaseKind::Relative),
+        ] {
+            let mut resolved = resolved_member(100, "POST", "/api/v2/things");
+            resolved.get_mut(&100).unwrap().member.base_unread = unread;
+            let (mut result, _) = emit_and_join_with(
+                FileAnalysisResult::default(),
+                &candidate_map,
+                &resolved,
+                &[],
+                &EnvAliasMap::new(),
+                &WholeUrlFallbackMap::new(),
+                &[],
+                "src/consumer.ts",
+                false,
+            );
+            FileOrchestrator::stamp_call_bases(
+                &mut result,
+                &EnvAliasMap::new(),
+                &Default::default(),
+                &Default::default(),
+            );
+            let base = result.data_calls[0]
+                .base
+                .as_ref()
+                .expect("a base is stated");
+            assert_eq!(base.kind, kind);
+            assert_eq!(base.written, "");
+        }
     }
 
     /// A site extraction DID answer keeps the analyzer's row (which
