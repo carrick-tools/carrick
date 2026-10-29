@@ -12,7 +12,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { runCheck } from '../src/capture/index.js';
-import { installFailure } from '../src/capture/check.js';
+import { installFailure, installTotalLimitMs, DEFAULT_INSTALL_TIMEOUT_MS } from '../src/capture/check.js';
 import type { CheckPairSpec, CheckStubInput } from '../src/capture/api.js';
 
 let root: string;
@@ -75,6 +75,39 @@ describe('check_v2: the install is bounded and says why it stopped', () => {
     assert.match(result.errors.join('\n'), /did not finish within 2s/);
   });
 
+  it('a silent install is killed at the idle limit, well before the total cap', async () => {
+    const pnpmPath = fakePnpm('pnpm-silent', 'echo started; sleep 600 & wait');
+    const started = Date.now();
+    const result = await runCheck({
+      stubs,
+      pairs: PAIRS,
+      pnpmPath,
+      installIdleTimeoutMs: 1500,
+      installTimeoutMs: 600_000,
+    });
+    assert.ok(Date.now() - started < 20_000, 'returned long after the idle limit');
+    for (const v of result.verdicts) {
+      assert.strictEqual(v.gate, 'install:timeout');
+      assert.match(v.diagnostic ?? '', /printed nothing for 2s/);
+    }
+  });
+
+  it('a slow install that keeps printing is not killed by the idle limit', async () => {
+    const pnpmPath = fakePnpm(
+      'pnpm-slow-chatty',
+      'for i in 1 2 3 4 5 6; do echo progress $i; sleep 0.5; done; exit 1'
+    );
+    const result = await runCheck({ stubs, pairs: PAIRS, pnpmPath, installIdleTimeoutMs: 1200 });
+    for (const v of result.verdicts) assert.strictEqual(v.gate, 'install:failed');
+  });
+
+  it('the total cap comes from the option, then the environment, then the default', () => {
+    assert.strictEqual(installTotalLimitMs(5, { CARRICK_CHECK_INSTALL_TIMEOUT_MS: '9' }), 5);
+    assert.strictEqual(installTotalLimitMs(undefined, { CARRICK_CHECK_INSTALL_TIMEOUT_MS: '9000' }), 9000);
+    assert.strictEqual(installTotalLimitMs(undefined, { CARRICK_CHECK_INSTALL_TIMEOUT_MS: 'abc' }), DEFAULT_INSTALL_TIMEOUT_MS);
+    assert.strictEqual(installTotalLimitMs(undefined, {}), DEFAULT_INSTALL_TIMEOUT_MS);
+  });
+
   it('an install that cannot reach the registry names that, not a bare failure', async () => {
     const pnpmPath = fakePnpm(
       'pnpm-offline',
@@ -91,7 +124,7 @@ describe('check_v2: the install is bounded and says why it stopped', () => {
 
   it('any other install failure keeps the plain gate', () => {
     assert.strictEqual(
-      installFailure({ timedOut: false, stderr: 'ERR_PNPM_PEER_DEP_ISSUES', stdout: '' }, 1000).gate,
+      installFailure({ timedOut: false, stderr: 'ERR_PNPM_PEER_DEP_ISSUES', stdout: '' }, { idleMs: 1000, totalMs: 1000 }).gate,
       'install:failed'
     );
   });

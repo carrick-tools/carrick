@@ -57,8 +57,14 @@ interface SpawnResult {
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
-  /** True when the process outlived its time limit and was killed for it. */
-  timedOut: boolean;
+  /** Which time limit killed the process, when one did. */
+  timedOut: false | 'total' | 'idle';
+}
+
+/** Time limits for one child: a total cap, and a limit on silence. */
+interface ProcessLimits {
+  totalMs?: number;
+  idleMs?: number;
 }
 
 function runProcess(
@@ -66,46 +72,78 @@ function runProcess(
   args: string[],
   cwd: string,
   env?: NodeJS.ProcessEnv,
-  timeoutMs?: number
+  limits?: ProcessLimits
 ): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
+    const limited = limits?.totalMs !== undefined || limits?.idleMs !== undefined;
     // With a limit the child leads its own process group, so the kill takes
     // the package manager's workers with it and `close` can fire.
     const child = spawn(command, args, {
       cwd,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      detached: timeoutMs !== undefined,
+      detached: limited,
     });
     let stdout = '';
     let stderr = '';
-    let timedOut = false;
-    const timer =
-      timeoutMs === undefined
-        ? undefined
-        : setTimeout(() => {
-            timedOut = true;
-            try {
-              process.kill(-(child.pid as number), 'SIGKILL');
-            } catch {
-              child.kill('SIGKILL');
-            }
-          }, timeoutMs);
-    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+    let timedOut: SpawnResult['timedOut'] = false;
+    const kill = (kind: 'total' | 'idle') => {
+      timedOut = kind;
+      try {
+        process.kill(-(child.pid as number), 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    };
+    const totalTimer =
+      limits?.totalMs === undefined ? undefined : setTimeout(() => kill('total'), limits.totalMs);
+    let idleTimer: NodeJS.Timeout | undefined;
+    const armIdle = () => {
+      if (limits?.idleMs === undefined) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => kill('idle'), limits.idleMs);
+    };
+    const clearTimers = () => {
+      if (totalTimer) clearTimeout(totalTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+    };
+    armIdle();
+    child.stdout.on('data', (d: Buffer) => {
+      stdout += d.toString();
+      armIdle();
+    });
+    child.stderr.on('data', (d: Buffer) => {
+      stderr += d.toString();
+      armIdle();
+    });
     child.on('error', (e) => {
-      if (timer) clearTimeout(timer);
+      clearTimers();
       reject(e);
     });
     child.on('close', (code, signal) => {
-      if (timer) clearTimeout(timer);
+      clearTimers();
       resolve({ code, signal, stdout, stderr, timedOut });
     });
   });
 }
 
-/** The check install's own time limit, in ms (carrick#3021). */
-export const DEFAULT_INSTALL_TIMEOUT_MS = 300_000;
+/**
+ * The check install's limits (carrick#3021). A healthy install prints
+ * progress about once a second (longest gap measured: 1 s), so silence is the
+ * sign of a hang: the install is killed after `DEFAULT_INSTALL_IDLE_MS` with
+ * no output, and a total cap bounds one that keeps printing. Both are far
+ * above the slowest healthy run measured (54 s, install plus judge).
+ * `CARRICK_CHECK_INSTALL_TIMEOUT_MS` replaces the total cap.
+ */
+export const DEFAULT_INSTALL_IDLE_MS = 120_000;
+export const DEFAULT_INSTALL_TIMEOUT_MS = 1_800_000;
+
+/** The total cap: the option, else the environment, else the default. */
+export function installTotalLimitMs(opt: number | undefined, env: NodeJS.ProcessEnv = process.env): number {
+  if (opt !== undefined) return opt;
+  const fromEnv = Number(env.CARRICK_CHECK_INSTALL_TIMEOUT_MS);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : DEFAULT_INSTALL_TIMEOUT_MS;
+}
 
 /** What the package manager prints when it cannot reach the registry. */
 const REGISTRY_UNREACHABLE =
@@ -117,12 +155,15 @@ const REGISTRY_UNREACHABLE =
  */
 export function installFailure(
   install: Pick<SpawnResult, 'timedOut' | 'stderr' | 'stdout'>,
-  limitMs: number
+  limits: { idleMs: number; totalMs: number }
 ): { gate: string; reason: string } {
   if (install.timedOut) {
+    const idle = install.timedOut === 'idle';
     return {
       gate: 'install:timeout',
-      reason: `workspace dependency install did not finish within ${Math.round(limitMs / 1000)}s (registry unreachable or too slow)`,
+      reason: idle
+        ? `workspace dependency install printed nothing for ${Math.round(limits.idleMs / 1000)}s and was stopped (registry unreachable or stuck)`
+        : `workspace dependency install did not finish within ${Math.round(limits.totalMs / 1000)}s (registry unreachable or too slow)`,
     };
   }
   if (REGISTRY_UNREACHABLE.test(`${install.stderr}\n${install.stdout}`)) {
@@ -460,16 +501,19 @@ export async function runCheck(
 
   // ---- Install (async, off the event loop) --------------------------------
   progress('installing', 'installing pinned dependencies');
-  const installLimitMs = opts.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS;
+  const installLimits = {
+    idleMs: opts.installIdleTimeoutMs ?? DEFAULT_INSTALL_IDLE_MS,
+    totalMs: installTotalLimitMs(opts.installTimeoutMs),
+  };
   const install = await runProcess(
     pnpmPath,
     ['install'],
     ws.workspaceDir,
     undefined,
-    installLimitMs
+    installLimits
   );
   if (install.code !== 0 || install.timedOut) {
-    const failure = installFailure(install, installLimitMs);
+    const failure = installFailure(install, installLimits);
     const installError = scrubPaths(
       (install.stderr || install.stdout).trim().slice(0, 2000),
       scrubCtx
