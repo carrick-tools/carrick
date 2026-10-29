@@ -761,6 +761,8 @@ export interface ListLibrarySurfaceRequest extends BaseRequest {
   exports?: Record<string, string[]>;
   /** List each member's handler-parameter members (`handlers`, carrick#2674 S3); default false (carrick#2966). */
   handlers?: boolean;
+  /** List `types[]` widened, with `settable` (carrick#3050); default false. */
+  types?: boolean;
   /** The most handler-parameter members the whole listing lists; default 500000 (carrick#3016). */
   max_handler_members?: number;
   /** List each signature's `result_candidates` (carrick#2817); default false (carrick#2966). */
@@ -1315,6 +1317,11 @@ export interface LibrarySurface {
    * their type's new entry would pass it.
    */
   handler_params_left_out?: number;
+  /**
+   * With `types: true`: entries of `types` the listing's budget left out
+   * (carrick#3050). `truncated` does not count them.
+   */
+  types_left_out?: number;
 }
 
 export interface ListLibrarySurfaceResponse extends BaseResponse {

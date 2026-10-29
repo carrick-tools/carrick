@@ -1036,8 +1036,8 @@ export class LibraryClaimsVerifier {
     // reads a `type` receiver. Only with handlers: the table names them.
     const typeImports = new Map<string, number>();
     packages.forEach((pkg, i) => {
-      if (options.handlers !== true) return;
-      for (const name of read[i].types) {
+      if (options.handlers !== true && options.types !== true) return;
+      for (const name of typeNamesOf(read[i], options)) {
         const local = `__carrick_e${importLines.length}`;
         const key = builtKey({ package: pkg, export: name }, TYPE_RECEIVER);
         typeImports.set(key, importLines.length);
@@ -1067,8 +1067,8 @@ export class LibraryClaimsVerifier {
       reader.startListing(options.maxHandlerMembers ?? HANDLER_LISTING_BUDGET);
       return packages.map((pkg, i) => {
         const typeExports: BuiltType[] = [];
-        if (options.handlers === true) {
-          for (const name of read[i].types) {
+        if (options.handlers === true || options.types === true) {
+          for (const name of typeNamesOf(read[i], options)) {
             const key = builtKey({ package: pkg, export: name }, TYPE_RECEIVER);
             const built = builtType(
               checker,
@@ -1161,6 +1161,20 @@ const TYPE_RECEIVER = 'type';
 /** A type export read as receiver `type`: the symbol the import names and the type built at its defaults. */
 interface BuiltType {
   name: string;
+  symbol: ts.Symbol;
+  type: ts.Type;
+}
+
+/** What `idOfSymbol` says a type is: its receiver id, and the export it sits on when the id says (module-declared types sit on the export that reaches them). */
+interface TypeId {
+  id: string;
+  export?: string;
+}
+
+/** A type `types[]` may list (carrick#3050). */
+interface TypeCandidate {
+  id: string;
+  export: string;
   symbol: ts.Symbol;
   type: ts.Type;
 }
@@ -1540,6 +1554,22 @@ class DeclarationReader {
   private typeExportNames = new Map<ts.Symbol, string>();
   /** Handler-parameter members the rest of this `listSurface` call may still list (carrick#3016). */
   private handlerBudget = HANDLER_LISTING_BUDGET;
+  /** The surface being listed lists `types[]` widened (`types: true`, carrick#3050). */
+  private listTypes = false;
+  /** The receivers being outlined are the surface's own: the types they return are candidates for `types[]`. */
+  private collectTypes = false;
+  /** The types `types[]` may list, by declaring symbol, in discovery order. */
+  private readonly typeCandidates = new Map<ts.Symbol, TypeCandidate>();
+  /** `idOfSymbol` per symbol, for the surface being listed. */
+  private readonly typeIds = new Map<ts.Symbol, TypeId | null>();
+  /** The surface's listed value exports, by target symbol: what a namespace-declared type's export is. */
+  private exportTargets = new Map<ts.Symbol, string>();
+  /** The packages the specifier names (itself and its types package): a type declared there is the specifier's own. */
+  private specifierHome: ReadonlySet<string> = new Set();
+  /** The export whose receivers are being outlined: the export a module-declared type is listed under. */
+  private typeContext = '';
+  /** `types[]` entries the budget left out of the surface being listed. */
+  private typesLeftOut = 0;
 
   /** Begin one `listSurface` call: its specifiers share `handlerBudget` handler-parameter members. */
   startListing(handlerBudget: number): void {
@@ -3626,7 +3656,15 @@ class DeclarationReader {
     // `handler_types` (carrick#2977).
     this.listResultCandidates = options.resultCandidates === true;
     const withHandlers = options.handlers === true;
-    if (withHandlers) {
+    this.listTypes = options.types === true;
+    this.collectTypes = this.listTypes;
+    this.typeCandidates.clear();
+    this.typeIds.clear();
+    this.typesLeftOut = 0;
+    this.typeContext = '';
+    this.specifierHome = this.homeOf(pkg, []);
+    this.exportTargets = new Map(exported.map(each => [each.target, each.name] as const).reverse());
+    if (withHandlers || this.listTypes) {
       this.handlerTypes = [];
       this.handlerTypeIds.clear();
       this.handlerTypeByContent.clear();
@@ -3656,6 +3694,8 @@ class DeclarationReader {
       const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
         if (!take()) return;
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
+        this.typeContext = name;
+        if (receiverName.startsWith('instance:')) this.noteType(receiverType);
         const receiver = this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, handlers, fills);
         entry.receivers.push(receiver);
         if (receiverName.startsWith('instance:')) {
@@ -3683,11 +3723,11 @@ class DeclarationReader {
     for (const fill of fills) fill();
     this.listScopeReceivers(pkg, instances, maxEntries, withHandlers, built);
     surface.truncated = dropped;
-    if (withHandlers) {
-      surface.handler_types = this.handlerTypes;
-      surface.types = this.listTypeReceivers(pkg, typeExports, maxEntries);
-      surface.handler_params_left_out = this.handlerParamsLeftOut;
-    }
+    this.collectTypes = false;
+    if (withHandlers) surface.handler_types = this.handlerTypes;
+    if (withHandlers || this.listTypes) surface.types = this.listTypeReceivers(pkg, typeExports, maxEntries);
+    if (withHandlers) surface.handler_params_left_out = this.handlerParamsLeftOut;
+    if (this.listTypes) surface.types_left_out = this.typesLeftOut;
     return surface;
   }
 
@@ -3699,6 +3739,7 @@ class DeclarationReader {
    * on one budget of its own, so `truncated` and the hash are unchanged.
    */
   private listTypeReceivers(pkg: string, typeExports: readonly BuiltType[], maxEntries: number): SurfaceTypeExport[] {
+    if (this.listTypes) return this.listWidenedTypes(pkg, typeExports, maxEntries);
     const named = [...new Set(this.handlerTypes.flatMap(entry => (entry.export === undefined ? [] : [entry.export])))].sort(
       byName
     );
@@ -3719,6 +3760,155 @@ class DeclarationReader {
     for (const run of names) run();
     for (const fill of fills) fill();
     return listed;
+  }
+
+  /**
+   * `types[]` under `types: true` (carrick#3050): every exported class, and
+   * every type the surface's makers, members and handlers reach that has a
+   * receiver id (`idOfSymbol`), sorted by id, each outlined as any receiver
+   * is. A `type` id reads the type
+   * the probe built at its defaults; any other, the type as reached when
+   * that is its defaults (`atDefaults`). One budget of its own: an entry it
+   * leaves out is counted in `types_left_out`.
+   */
+  private listWidenedTypes(pkg: string, typeExports: readonly BuiltType[], maxEntries: number): SurfaceTypeExport[] {
+    const builtBySymbol = new Map(typeExports.map(each => [each.symbol, each] as const).reverse());
+    const entries = new Map<ts.Symbol, TypeCandidate>();
+    for (const built of typeExports) {
+      if ((built.symbol.flags & ts.SymbolFlags.Class) === 0 || entries.has(built.symbol)) continue;
+      entries.set(built.symbol, { id: TYPE_RECEIVER, export: built.name, symbol: built.symbol, type: built.type });
+    }
+    for (const candidate of this.typeCandidates.values()) {
+      if (entries.has(candidate.symbol)) continue;
+      if (candidate.id !== TYPE_RECEIVER) {
+        entries.set(candidate.symbol, candidate);
+        continue;
+      }
+      const built = builtBySymbol.get(candidate.symbol);
+      if (built !== undefined) entries.set(candidate.symbol, { ...candidate, type: built.type });
+    }
+    const ordered = [...entries.values()].sort((a, b) => byName(a.id, b.id) || byName(a.export, b.export));
+    let budget = maxEntries;
+    const take = (): boolean => budget > 0 && (budget--, true);
+    const names: Array<() => void> = [];
+    const fills: Array<() => void> = [];
+    const listed: SurfaceTypeExport[] = [];
+    for (const entry of ordered) {
+      if (!take()) {
+        this.typesLeftOut += 1;
+        continue;
+      }
+      const home = this.homeOf(pkg, [entry.symbol, ...typeSymbols(entry.type)]);
+      const receiver = this.outlineReceiver(pkg, entry.id, entry.type, home, take, names, [], fills);
+      listed.push({ export: entry.export, receivers: [receiver] });
+    }
+    for (const run of names) run();
+    for (const fill of fills) fill();
+    return listed;
+  }
+
+  /**
+   * Note a type for `types[]` when it has a receiver id (carrick#3050), under
+   * the export being read. A type seen at other than its type-parameter
+   * defaults is not noted, unless its id says the probe builds it (`type`).
+   */
+  private noteType(type: ts.Type): void {
+    if (!this.listTypes || type.isUnion() || (type.flags & ts.TypeFlags.TypeParameter) !== 0) return;
+    const symbol = type.aliasSymbol ?? type.getSymbol();
+    if (symbol === undefined || this.typeCandidates.has(symbol)) return;
+    const id = this.idOfSymbol(symbol);
+    if (id === undefined || (id.id !== TYPE_RECEIVER && !this.atDefaults(type, symbol))) return;
+    this.typeCandidates.set(symbol, { id: id.id, export: id.export ?? this.typeContext, symbol, type });
+  }
+
+  /** A type a signature returns, awaited and without null, noted for `types[]`. */
+  private noteReturn(signature: ts.Signature): void {
+    const returned = this.checker.getNonNullableType(this.checker.getReturnTypeOfSignature(signature));
+    this.noteType(this.checker.getNonNullableType(this.checker.getAwaitedType(returned) ?? returned));
+  }
+
+  /** `type` is `symbol` read at its declared type-parameter defaults: it has none, or its arguments are exactly the defaults. */
+  private atDefaults(type: ts.Type, symbol: ts.Symbol): boolean {
+    const declaration = (symbol.declarations ?? []).find(
+      (each): each is ts.InterfaceDeclaration | ts.TypeAliasDeclaration | ts.ClassDeclaration =>
+        (ts.isInterfaceDeclaration(each) || ts.isTypeAliasDeclaration(each) || ts.isClassDeclaration(each)) &&
+        (each.typeParameters?.length ?? 0) > 0
+    );
+    if (declaration === undefined) return true;
+    const args = type.aliasSymbol === symbol
+      ? type.aliasTypeArguments ?? []
+      : ((type as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference
+        ? this.checker.getTypeArguments(type as ts.TypeReference)
+        : [];
+    return declaration.typeParameters!.every((node, index) => {
+      const parameter = this.checker.getTypeAtLocation(node);
+      const fallback = this.checker.getDefaultFromTypeParameter(parameter);
+      return fallback !== undefined && fallback === args[index];
+    });
+  }
+
+  /**
+   * The receiver id of a class, interface or alias (amendment 7), or
+   * undefined when it has none. Declared in the specifier's own packages:
+   * `type` when the specifier exports it (the export), `type:<Path>` when an
+   * export's namespace declares it (that export). Declared in another
+   * installed package: `type:<module>#<Path>`, the module as a service
+   * imports it (`@types/x` is `x`; an ambient `declare module 'm'` is `m`),
+   * whichever specifier re-exports it. Anonymous types, the default
+   * library's and the runtime's types have none.
+   */
+  private idOfSymbol(symbol: ts.Symbol): TypeId | undefined {
+    const known = this.typeIds.get(symbol);
+    if (known !== undefined) return known ?? undefined;
+    const found = this.readIdOfSymbol(symbol);
+    this.typeIds.set(symbol, found ?? null);
+    return found;
+  }
+
+  private readIdOfSymbol(symbol: ts.Symbol): TypeId | undefined {
+    if ((symbol.flags & (ts.SymbolFlags.Class | ts.SymbolFlags.Interface | ts.SymbolFlags.TypeAlias)) === 0) return undefined;
+    const declarations = symbol.declarations ?? [];
+    if (declarations.length === 0 || !IDENTIFIER.test(symbol.getName())) return undefined;
+    if (declarations.some(declaration => this.program.isSourceFileDefaultLibrary(declaration.getSourceFile()))) return undefined;
+    const first = declarations[0];
+    // The namespaces around the declaration, outermost first.
+    const containers: ts.ModuleDeclaration[] = [];
+    for (let node: ts.Node | undefined = first.parent; node !== undefined; node = node.parent) {
+      if (ts.isModuleDeclaration(node)) containers.unshift(node);
+    }
+    if (declarations.some(declaration => this.isOwnFile(declaration.getSourceFile(), this.specifierHome))) {
+      const exported = this.typeExportNames.get(symbol);
+      if (exported !== undefined) return { id: TYPE_RECEIVER, export: exported };
+      const outer = containers[0] === undefined ? undefined : this.checker.getSymbolAtLocation(containers[0].name);
+      const owner = outer === undefined ? undefined : this.exportTargets.get(outer);
+      if (owner === undefined || !containers.every(each => ts.isIdentifier(each.name))) return undefined;
+      const names = [...containers.slice(1).map(each => (each.name as ts.Identifier).text), symbol.getName()];
+      return { id: `type:${names.join('.')}`, export: owner };
+    }
+    const owner = this.packageOf(first.getSourceFile());
+    if (owner === undefined || RUNTIME_TYPE_PACKAGES.has(owner)) return undefined;
+    let module = owner.startsWith('@types/') ? owner.slice('@types/'.length).replace(/^([^_]+)__/, '@$1/') : owner;
+    let names = containers.filter(each => ts.isIdentifier(each.name)).map(each => (each.name as ts.Identifier).text);
+    const ambient = containers.findIndex(each => ts.isStringLiteral(each.name));
+    if (ambient >= 0) {
+      module = (containers[ambient].name as ts.StringLiteral).text;
+      names = containers.slice(ambient + 1).map(each => (each.name as ts.Identifier).text);
+    } else if (names.length > 0 && this.isExportEqualsTarget(first.getSourceFile(), names[0])) {
+      // The namespace a module exports whole is the module itself.
+      names = names.slice(1);
+    }
+    return { id: `type:${module}#${[...names, symbol.getName()].join('.')}` };
+  }
+
+  /** The file says `export = name`. */
+  private isExportEqualsTarget(file: ts.SourceFile, name: string): boolean {
+    return file.statements.some(
+      statement =>
+        ts.isExportAssignment(statement) &&
+        statement.isExportEquals === true &&
+        ts.isIdentifier(statement.expression) &&
+        statement.expression.text === name
+    );
   }
 
   /**
@@ -3752,6 +3942,8 @@ class DeclarationReader {
         const type = this.scopeTypeOf(callee.signatures, built(source.export, id), source.type, source.home);
         if (type === undefined || !take()) continue;
         const home = this.homeOf(pkg, [source.target, ...typeSymbols(type)]);
+        this.typeContext = source.export;
+        this.noteType(type);
         member.scope_receiver = this.outlineReceiver(pkg, id, type, home, take, names, handlers, fills);
       }
     }
@@ -3768,11 +3960,13 @@ class DeclarationReader {
     pkg: string,
     probe: SurfaceProbe,
     only: readonly string[] | undefined
-  ): { makers: { export: string; receivers: string[]; scopes: string[] }[]; types: string[] } {
+  ): { makers: { export: string; receivers: string[]; scopes: string[] }[]; types: string[]; classes: string[] } {
     this.setPackage(pkg);
     const moduleRead = 'namespace' in probe ? this.readModule(pkg, probe.namespace, true) : undefined;
-    if (moduleRead?.reason) return { makers: [], types: [] };
-    const types = 'namespace' in probe && !moduleRead?.globalFile ? this.typeExportCandidates(probe.namespace) : [];
+    if (moduleRead?.reason) return { makers: [], types: [], classes: [] };
+    const readable = 'namespace' in probe && !moduleRead?.globalFile;
+    const types = readable ? this.typeExportCandidates(probe.namespace, false) : [];
+    const classes = readable ? this.typeExportCandidates(probe.namespace, true) : [];
     const makers = (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
       .filter(({ type }) => !this.isOpenTop(type))
       .map(({ name, target, type }) => {
@@ -3784,7 +3978,7 @@ class DeclarationReader {
         };
       })
       .filter(({ receivers }) => receivers.length > 0);
-    return { makers, types };
+    return { makers, types, classes };
   }
 
   /**
@@ -3796,19 +3990,17 @@ class DeclarationReader {
    * superset: the listing names one only when a parameter is that
    * declaration and it is declared in the handing receiver's home.
    */
-  private typeExportCandidates(namespace: ts.ImportDeclaration): string[] {
+  private typeExportCandidates(namespace: ts.ImportDeclaration, classes: boolean): string[] {
     const moduleSymbol = this.checker.getSymbolAtLocation(namespace.moduleSpecifier);
     if (!moduleSymbol) return [];
     const names: string[] = [];
     for (const symbol of this.checker.getExportsOfModule(moduleSymbol)) {
       const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
-      if (
-        IDENTIFIER.test(symbol.getName()) &&
-        !this.checker.isUnknownSymbol(target) &&
-        (target.flags & ts.SymbolFlags.Value) === 0 &&
-        (target.flags & (ts.SymbolFlags.Interface | ts.SymbolFlags.TypeAlias)) !== 0 &&
-        typeParametersDefaulted(target)
-      ) {
+      const wanted = classes
+        ? (target.flags & ts.SymbolFlags.Class) !== 0 && symbol.getName() !== 'default'
+        : (target.flags & ts.SymbolFlags.Value) === 0 &&
+          (target.flags & (ts.SymbolFlags.Interface | ts.SymbolFlags.TypeAlias)) !== 0;
+      if (IDENTIFIER.test(symbol.getName()) && !this.checker.isUnknownSymbol(target) && wanted && typeParametersDefaulted(target)) {
         names.push(symbol.getName());
       }
     }
@@ -4106,6 +4298,7 @@ class DeclarationReader {
   ): SurfaceReceiver {
     const receiver: SurfaceReceiver = { receiver: receiverName, members: [] };
     const holder = this.surfaceHolder(pkg, type, home);
+    const context = this.typeContext;
     // The receiver's own call and construct signatures, as a claim with a
     // null member reads them.
     const call = this.ownCallee(holder, [], null, 'call');
@@ -4127,7 +4320,12 @@ class DeclarationReader {
         const own = 'signatures' in callee;
         const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
+        if (this.collectTypes) {
+          this.typeContext = context;
+          for (const signature of own ? callee.signatures : library) this.noteReturn(signature);
+        }
         handlers.push(() => {
+          this.typeContext = context;
           const listed = this.listHandlers(own ? callee.signatures : library, home);
           if (listed.length > 0) member.handlers = listed;
         });
@@ -4223,7 +4421,16 @@ class DeclarationReader {
    * entry spends the budget: its members are written once.
    */
   private handlerTypeId(type: ts.Type, home: ReadonlySet<string>): number {
-    const exportName = this.nameableExport(type, home);
+    let exportName = this.nameableExport(type, home);
+    if (this.listTypes) {
+      // A handed type declared in another package carries its receiver id as
+      // its `export` (carrick#3050); the ones declared in the home are as
+      // they were.
+      this.noteType(type);
+      const symbol = type.aliasSymbol ?? type.getSymbol();
+      const id = symbol === undefined || type.isUnion() ? undefined : this.idOfSymbol(symbol);
+      if (id !== undefined && id.id.includes('#')) exportName = id.id;
+    }
     let byExport = this.handlerTypeIds.get(type);
     if (byExport === undefined) this.handlerTypeIds.set(type, (byExport = new Map()));
     const known = byExport.get(exportName);
@@ -4946,6 +5153,8 @@ const HANDLER_LISTING_BUDGET = 500_000;
 export interface SurfaceOptions {
   /** Each member's `handlers` (carrick#2674 S3). */
   handlers?: boolean;
+  /** `types[]` widened, `settable`, `types_left_out` (carrick#3050). */
+  types?: boolean;
   /** Each signature's `result_candidates` (carrick#2817). */
   resultCandidates?: boolean;
   /** Handler-parameter members the whole call may list (default `HANDLER_LISTING_BUDGET`, carrick#3016). */
@@ -4969,12 +5178,17 @@ function printTypeNode(node: ts.Node): string {
   return TYPE_PRINTER.printNode(ts.EmitHint.Unspecified, node, undefined as unknown as ts.SourceFile);
 }
 
+/** The type exports a listing builds with the probe: the type-only ones, and with `types: true` the exported classes (carrick#3050). */
+function typeNamesOf(read: { types: readonly string[]; classes: readonly string[] }, options: SurfaceOptions): string[] {
+  return options.types === true ? [...read.types, ...read.classes].sort(byName) : [...read.types];
+}
+
 /** Code-unit order on names. */
-/** Every type parameter of an interface or type alias has a default, in some declaration of it (carrick#2977). */
+/** Every type parameter of an interface, type alias or class has a default, in some declaration of it (carrick#2977). */
 function typeParametersDefaulted(symbol: ts.Symbol): boolean {
   const declarations = (symbol.declarations ?? []).filter(
-    (declaration): declaration is ts.InterfaceDeclaration | ts.TypeAliasDeclaration =>
-      ts.isInterfaceDeclaration(declaration) || ts.isTypeAliasDeclaration(declaration)
+    (declaration): declaration is ts.InterfaceDeclaration | ts.TypeAliasDeclaration | ts.ClassDeclaration =>
+      ts.isInterfaceDeclaration(declaration) || ts.isTypeAliasDeclaration(declaration) || ts.isClassDeclaration(declaration)
   );
   if (declarations.length === 0) return false;
   const count = Math.max(...declarations.map(declaration => declaration.typeParameters?.length ?? 0));
