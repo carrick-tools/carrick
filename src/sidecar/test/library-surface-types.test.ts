@@ -92,6 +92,7 @@ interface Surface {
   handler_types?: Array<{ id: number; export?: string }>;
   types?: Array<{ export: string; receivers: TypeReceiver[] }>;
   types_left_out?: number;
+  receiver_types?: Record<string, Record<string, string[]>>;
 }
 
 describe('list_library_surface: types (carrick#3050)', () => {
@@ -196,6 +197,40 @@ describe('list_library_surface: types (carrick#3050)', () => {
       assert.strictEqual(withTypes.surfaces[0].truncated, without.surfaces[0].truncated);
       assert.deepStrictEqual(withTypes.surfaces[0].exports, without.surfaces[0].exports);
     }
+  });
+
+  it('maps each receiver to the type ids its built type and its bases are declared by (carrick#3051)', async () => {
+    const [listed] = await surface(['fixture-server'], { types: true });
+    assert.deepStrictEqual(listed.receiver_types, {
+      // Constructing the class makes an instance of its own export read as a type.
+      Server: { 'instance:new': ['type'] },
+      server: {
+        'instance:()': ['type:fixture-core#Base', 'type:fixture-core#Router'],
+        'instance:()>scope:route': ['type:fixture-core#Route'],
+      },
+    });
+  });
+
+  it('leaves out an export that is a function or a class constructor, and any receiver whose type has no listed id', async () => {
+    const [listed] = await surface(['fixture-server'], { types: true });
+    const map = listed.receiver_types!;
+    assert.strictEqual(map.server.export, undefined);
+    assert.strictEqual(map.Server.export, undefined);
+    // Without `types`, no map.
+    const [plain] = await surface(['fixture-server']);
+    assert.strictEqual(plain.receiver_types, undefined);
+  });
+
+  it('keeps the hash and truncated as they were with the map', async () => {
+    const hash = async (extra: Record<string, unknown>) =>
+      client.send<{ surface_sha256: string; surfaces: Surface[] }>(
+        { request_id: `m-${requestId++}`, action: 'list_library_surface', from_dir: root, packages: ['fixture-server'], ...extra },
+        60_000
+      );
+    const without = await hash({});
+    const withTypes = await hash({ types: true });
+    assert.strictEqual(withTypes.surface_sha256, without.surface_sha256);
+    assert.strictEqual(withTypes.surfaces[0].truncated, without.surfaces[0].truncated);
   });
 
   it('spends a budget of its own and counts the entries it leaves out', async () => {
