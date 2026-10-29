@@ -184,6 +184,11 @@ pub struct SiteLabel {
     pub op: Option<String>,
     #[serde(default)]
     pub side: Option<String>,
+    /// The store marks the export `by_origin`: it has no side of its own, and
+    /// `side` is always `None` here (docs/reference/client-semantics.md,
+    /// "Message roles").
+    #[serde(default)]
+    pub by_origin: bool,
     #[serde(default)]
     pub name: Option<ArgSlot>,
     #[serde(default)]
@@ -260,6 +265,8 @@ impl SiteLabel {
             #[serde(default)]
             side: Option<String>,
             #[serde(default)]
+            side_rule: Option<String>,
+            #[serde(default)]
             ops: Vec<Op>,
         }
         #[derive(Deserialize)]
@@ -276,6 +283,7 @@ impl SiteLabel {
         let mut labels = Vec::new();
         for package in packages {
             for export in package.exports {
+                let by_origin = export.side_rule.as_deref() == Some("by_origin");
                 for op in export.ops {
                     labels.push(SiteLabel {
                         package: package.package.clone(),
@@ -283,7 +291,8 @@ impl SiteLabel {
                         member: op.member,
                         role: export.role.clone(),
                         op: Some(op.op),
-                        side: export.side.clone(),
+                        side: export.side.clone().filter(|_| !by_origin),
+                        by_origin,
                         name: op.name,
                         payload: op.payload,
                         handler: op.handler,
@@ -317,8 +326,10 @@ impl SiteLabel {
         let mut labels = Vec::new();
         for export in exports {
             let role = word(serde_json::to_value(export.role)).unwrap_or_default();
+            let by_origin = export.side_rule == Some(crate::library_claims::SideRule::ByOrigin);
             let side = export
                 .side
+                .filter(|_| !by_origin)
                 .and_then(|side| word(serde_json::to_value(side)));
             for claim in &export.claims {
                 if let LibraryClaim::Make {
@@ -335,6 +346,7 @@ impl SiteLabel {
                         role: role.clone(),
                         op: None,
                         side: side.clone(),
+                        by_origin,
                         name: None,
                         payload: None,
                         handler: None,
@@ -380,6 +392,7 @@ impl SiteLabel {
                     role: role.clone(),
                     op: word(serde_json::to_value(op)),
                     side: side.clone(),
+                    by_origin,
                     name: match name {
                         Some(OpName::Slot(name)) => Some(slot(name)),
                         _ => None,
@@ -2859,6 +2872,7 @@ pub(crate) mod tests {
             labels,
             vec![
                 SiteLabel {
+                    by_origin: false,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("post".into()),
@@ -2879,6 +2893,7 @@ pub(crate) mod tests {
                     }),
                 },
                 SiteLabel {
+                    by_origin: false,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("send".into()),
@@ -2903,6 +2918,38 @@ pub(crate) mod tests {
                 },
             ]
         );
+    }
+
+    /// An export the store marks `by_origin` has no side of its own: both
+    /// label sources give `by_origin: true` and no side (carrick#3011).
+    #[test]
+    fn a_by_origin_export_labels_carry_no_side() {
+        let export = serde_json::json!({
+            "package": "@fixture/wire", "version": "1.0.0", "specifier": "@fixture/wire",
+            "export": "Socket", "role": "socket", "side": "client", "side_rule": "by_origin",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "emit",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 } }
+            ]
+        });
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([export])).unwrap();
+        let from_exports = SiteLabel::from_exports(&exports);
+        let answer = serde_json::json!({ "library_claims": [{
+            "package": "@fixture/wire",
+            "exports": [{
+                "export": "Socket", "role": "socket", "side": "client",
+                "side_rule": "by_origin",
+                "ops": [{ "op": "send", "member": "emit",
+                          "name": { "arg": 0 }, "payload": { "arg": 1 } }]
+            }]
+        }]});
+        let from_answer = SiteLabel::from_store_answer(&answer);
+        for labels in [&from_exports, &from_answer] {
+            assert_eq!(labels.len(), 1, "{labels:#?}");
+            assert!(labels[0].by_origin);
+            assert_eq!(labels[0].side, None);
+        }
     }
 
     /// carrick#2674: a receive op's `request.body` member path is read from
@@ -3677,6 +3724,7 @@ pub(crate) mod tests {
         handler: Option<usize>,
     ) -> SiteLabel {
         SiteLabel {
+            by_origin: false,
             package: "@fixture/wire".into(),
             export: "connect".into(),
             member: Some(member.into()),
@@ -3697,6 +3745,7 @@ pub(crate) mod tests {
     /// The language's own `fetch`, with label v2's method fields.
     pub(crate) fn fetch_label() -> SiteLabel {
         SiteLabel {
+            by_origin: false,
             package: "lib:lib.dom.d.ts".into(),
             export: "fetch".into(),
             member: None,
@@ -3725,6 +3774,7 @@ pub(crate) mod tests {
     /// name.
     pub(crate) fn child_send_label() -> SiteLabel {
         SiteLabel {
+            by_origin: false,
             package: "node:child_process".into(),
             export: "ChildProcess".into(),
             member: Some("send".into()),
@@ -4291,6 +4341,7 @@ pub(crate) mod tests {
     fn a_member_claimed_on_a_scope_result_is_a_label_of_its_own() {
         let router = http_get_label();
         let scoped = SiteLabel {
+            by_origin: false,
             name: None,
             handler: Some(ArgSlot { arg: 0, key: None }),
             scope: Some(LabelScope {
@@ -4438,6 +4489,7 @@ pub(crate) mod tests {
     /// The label of the fixture's `@fixture/http` instance member `get`.
     fn http_get_label() -> SiteLabel {
         SiteLabel {
+            by_origin: false,
             package: "@fixture/http".into(),
             export: "default".into(),
             member: Some("get".into()),

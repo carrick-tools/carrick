@@ -155,6 +155,7 @@ const ASKED: &[Slot] = &[Slot::Kind, Slot::Role, Slot::Name];
 /// The labels: the server's socket and the client's.
 fn labels() -> Vec<SiteLabel> {
     let label = |export: &str, side: Option<&str>| SiteLabel {
+        by_origin: false,
         package: "@fixture/wire".to_string(),
         export: export.to_string(),
         member: Some("emit".to_string()),
@@ -359,6 +360,48 @@ fn an_in_process_site_stays_in_its_service_whatever_its_kind() {
         scoped("worker", None),
         scoped("worker", row.name_scope.as_ref())
     ));
+}
+
+/// A site whose label comes from an export the store marks `by_origin` has no
+/// side to read, so its socket event is keyed `UNKNOWN` (carrick#3011).
+#[test]
+fn a_by_origin_label_keys_its_socket_event_unknown() {
+    let exports: Vec<crate::library_claims::ExportClaims> =
+        serde_json::from_value(serde_json::json!([{
+            "package": "@fixture/wire", "version": "1.0.0", "specifier": "@fixture/wire",
+            "export": "Socket", "role": "socket", "side": "client", "side_rule": "by_origin",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "emit", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 } }
+            ]
+        }]))
+        .unwrap();
+    let labels = SiteLabel::from_exports(&exports);
+    assert!(
+        labels
+            .iter()
+            .all(|label| label.by_origin && label.side.is_none())
+    );
+    let (decided, records) = cases();
+    let decided = Decided {
+        sites: decided
+            .sites
+            .into_iter()
+            .map(|mut site| {
+                if site.file == "src/server-socket.ts" {
+                    site.end.export = "Socket".to_string();
+                    site.end.op = Some("send".to_string());
+                }
+                site
+            })
+            .collect(),
+        ..Decided::default()
+    };
+    let rows = of(&decided, &records, &labels, &cassette());
+    assert_eq!(
+        row(&rows, "src/server-socket.ts").map(|row| row.key.clone()),
+        Some(OperationKey::socket("chat", SocketDirection::Unknown))
+    );
 }
 
 /// A send on a server's socket goes server to client, a send on a

@@ -313,7 +313,9 @@ an HTTP row.
     with a name and a handler) a subscriber row.
   - `socket`: the export's `side` and the op give the direction, and a
     `receive` is the listener. An export that serves both sides, or says
-    nothing, states nothing.
+    nothing, states nothing. An export the store marks `by_origin` has no
+    side of its own: it states no library row, and a decided site's label
+    carries no side, so the site's direction is `UNKNOWN`.
   - Every other role, HTTP included, states nothing here.
 
   Each row is a `library_claim` fact with `library_semantics` (its claim
