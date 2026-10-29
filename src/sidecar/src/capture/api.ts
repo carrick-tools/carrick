@@ -675,6 +675,13 @@ export interface CheckOptions {
    * 7's native tsc (`judgeTscPath`). Tests inject a stand-in to pin the
    * abnormal-termination path. */
   tscPath?: string;
+  /** Total time cap for the workspace install, in ms (default 1800000, or
+   * `CARRICK_CHECK_INSTALL_TIMEOUT_MS`). Past it the install is killed and
+   * every pair reads unverifiable with gate `install:timeout` (carrick#3021). */
+  installTimeoutMs?: number;
+  /** Silence limit for the workspace install, in ms (default 120000): an
+   * install that prints nothing for this long is killed the same way. */
+  installIdleTimeoutMs?: number;
   /** Delete the scratch workspace before returning (default true). Tests that
    * inspect the assembled tree pass false. */
   cleanup?: boolean;
