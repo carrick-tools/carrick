@@ -3540,7 +3540,18 @@ fn carry_workspace_with(prepare: impl FnOnce(&Path)) -> tempfile::TempDir {
     let workspace = workspace("edited-handler-carry", &["items-api", "items-web"]);
     let root = workspace.path();
     prepare(root);
+    // Commit only what `prepare` changed: an empty commit on top would leave a
+    // later `commit --amend` with nothing to amend.
     for repo in ["items-api", "items-web"] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root.join(repo))
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        if status.stdout.is_empty() {
+            continue;
+        }
         git(&root.join(repo), &["add", "-A"]);
         git(
             &root.join(repo),
@@ -3552,7 +3563,6 @@ fn carry_workspace_with(prepare: impl FnOnce(&Path)) -> tempfile::TempDir {
                 "commit",
                 "-qm",
                 "prepared",
-                "--allow-empty",
             ],
         );
     }
