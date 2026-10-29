@@ -7706,8 +7706,9 @@ fn apply_site_fold_to_manifest(
 }
 
 /// The type requests for the site rows the fold stated (carrick#2472 C3),
-/// each at its record's anchor by span: a send's payload expression, an
-/// HTTP request's result at its call, and a handler's first parameter. A
+/// each at its record's anchor by span: a send's payload expression (an
+/// HTTP request's as its request body), an HTTP request's result at its
+/// call, and a handler's first parameter. A
 /// row whose record has no such anchor asks nothing for that type; an HTTP
 /// route's handler is not asked (its request and response are read off the
 /// route, not the parameter).
@@ -7767,10 +7768,14 @@ fn site_infer_requests(
         let anchors = &row.anchors;
         match (&row.key, row.side) {
             (OperationKey::Http { path, .. }, RowSide::Call) if path.starts_with('/') => {
+                // Asked as a request body, as the payload slot asks it
+                // (`site_payloads`): the sidecar reads `JSON.stringify(x)` as
+                // `x`, where an expression reads the serialised `string`
+                // (carrick#3009).
                 if let Some(payload) = &anchors.payload_at {
                     requests.push(at(
                         payload,
-                        InferKind::Expression,
+                        InferKind::RequestBody,
                         alias(ManifestTypeKind::Request),
                         None,
                     ));
@@ -24204,7 +24209,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             })
             .collect();
         // The files are not on disk, so each span is read as ASCII: the SWC
-        // span less its base (carrick#2604).
+        // span less its base (carrick#2604). An HTTP send's payload is asked
+        // as a request body, which the sidecar reads through
+        // `JSON.stringify(x)` to `x`, as the payload slot asks it; asked as
+        // an expression it reads the serialised `string` (carrick#3009).
         assert_eq!(
             asked,
             vec![
@@ -24222,7 +24230,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ),
                 (
                     "/repo/src/client.ts",
-                    InferKind::Expression,
+                    InferKind::RequestBody,
                     Some(111),
                     None
                 ),
