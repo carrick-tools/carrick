@@ -179,6 +179,15 @@ pub struct RequestMember {
     /// is the body there. Outside `PartialEq` too: it says how to type a site,
     /// not which request the member makes.
     pub body: Option<CallBody>,
+    /// The request's origin is handed in at run time and was not read: the
+    /// target is a bare path, and either an argument before it is rooted at
+    /// one of the member's own parameters or at `this`
+    /// (`fetchJson(conn, site.url, "/x", bag)`), or the path came out of a
+    /// `new URL(path, base)` whose base is opaque by design. A row from such
+    /// a member must not read as a same-origin route, so it is stamped base
+    /// `injected`. Outside `PartialEq` too: it is how the base is read, not
+    /// which request the member makes.
+    pub base_unread: bool,
 }
 
 /// Two members state the SAME request when their method and their URL agree.
@@ -624,13 +633,28 @@ impl MemberCollector<'_> {
             None => verb?,
         };
 
+        let base_unread = target.starts_with('/')
+            && (self.path_came_from_new_url(call, target_at)
+                || call.args[..target_at]
+                    .iter()
+                    .any(|arg| rooted_at_handed_in_value(&arg.expr, &params.names)));
+
         Some(RequestMember {
             method,
             target,
+            base_unread,
             request_line: u32::try_from(self.source_map.lookup_char_pos(call.span().lo).line)
                 .unwrap_or(0),
             body: sent_body(call, options, verb_call, target_at, params),
         })
+    }
+
+    /// Whether the URL argument at `at` is a path read out of a `new URL`
+    /// rather than a route-shaped string written on the call.
+    fn path_came_from_new_url(&self, call: &CallExpr, at: usize) -> bool {
+        let expr = &call.args[at].expr;
+        argument_text(expr, self.source_map).is_none_or(|text| !is_route_shaped(&text))
+            && self.urls.stated_path(expr).is_some()
     }
 
     /// The call's single URL argument, with its position: a route-shaped
@@ -655,6 +679,28 @@ impl MemberCollector<'_> {
             found = Some((position, text));
         }
         found
+    }
+}
+
+/// Whether `expr` is a value the member's caller handed in: rooted at one of
+/// the member's parameters or at `this`, through member access, optional
+/// chains, non-null and type assertions, or a call on such a value.
+fn rooted_at_handed_in_value(expr: &Expr, params: &[String]) -> bool {
+    match unwrap_parens(expr) {
+        Expr::This(_) => true,
+        Expr::Ident(ident) => params.iter().any(|name| name == ident.sym.as_ref()),
+        Expr::Member(member) => rooted_at_handed_in_value(&member.obj, params),
+        Expr::OptChain(chain) => match &*chain.base {
+            OptChainBase::Member(member) => rooted_at_handed_in_value(&member.obj, params),
+            OptChainBase::Call(call) => rooted_at_handed_in_value(&call.callee, params),
+        },
+        Expr::TsNonNull(inner) => rooted_at_handed_in_value(&inner.expr, params),
+        Expr::TsAs(inner) => rooted_at_handed_in_value(&inner.expr, params),
+        Expr::Call(call) => match &call.callee {
+            Callee::Expr(callee) => rooted_at_handed_in_value(callee, params),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1093,7 +1139,58 @@ mod tests {
             target: target.to_string(),
             request_line: 0,
             body: None,
+            base_unread: false,
         }
+    }
+
+    fn unread(source: &str, name: &str) -> bool {
+        index(source)
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is a member"))
+            .base_unread
+    }
+
+    #[test]
+    fn a_helper_handed_its_origin_leaves_the_base_unread() {
+        assert!(unread(
+            r#"class C { go() { return helper(this.base, "/api/x", { method: "GET" }); } }"#,
+            "go"
+        ));
+        assert!(unread(
+            r#"function go(conn: C, site: Site) { return helper(conn, site.url, "/api/x", { method: "GET" }); }"#,
+            "go"
+        ));
+        assert!(unread(
+            r#"class C { go() { return fetch(new URL("/api/x", this.base), { method: "GET" }); } }"#,
+            "go"
+        ));
+    }
+
+    #[test]
+    fn a_request_that_hands_in_nothing_keeps_its_base_read() {
+        assert!(!unread(
+            r#"function go() { return fetch("/api/x", { method: "GET" }); }"#,
+            "go"
+        ));
+        assert!(
+            !unread(
+                r#"function go() { return helper(conn, "/api/x", { method: "GET" }); }"#,
+                "go"
+            ),
+            "a module-level value is not handed in"
+        );
+        assert!(!unread(
+            r#"class C { go() { return this.http.get("/api/x"); } }"#,
+            "go"
+        ));
+        assert!(!unread(
+            r#"class C { go() { return send(Schema, `${this.baseUrl}/api/x`, { method: "GET" }); } }"#,
+            "go"
+        ));
+        assert!(!unread(
+            r#"import { Schema } from "./s"; class C { go() { return send(Schema, "/api/x", { method: "GET" }); } }"#,
+            "go"
+        ));
     }
 
     #[test]

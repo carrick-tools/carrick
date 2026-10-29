@@ -155,6 +155,20 @@ fn slotless_base(trimmed: &str) -> Option<CallBaseResolution> {
     })
 }
 
+/// The base of a request whose origin the code hands in at run time and the
+/// scanner did not read: nothing is written, and the kind is `injected`, so a
+/// bare path next to it is not taken for a route of this workspace.
+pub fn unread_base() -> CallBaseResolution {
+    CallBaseResolution {
+        written: String::new(),
+        kind: CallBaseKind::Injected,
+        env_var: None,
+        fallback: None,
+        fallback_is_loopback: false,
+        declared_optional: None,
+    }
+}
+
 /// A base slot that reads no environment variable, reported as written.
 fn injected_base(slot: &str) -> CallBaseResolution {
     CallBaseResolution {
