@@ -406,7 +406,7 @@ impl SiteLabel {
                     op: word(serde_json::to_value(op)),
                     side: side.clone(),
                     by_origin,
-                    name: match name {
+                    name: match name.as_deref() {
                         Some(OpName::Slot(name)) => Some(slot(name)),
                         _ => None,
                     },
@@ -424,7 +424,7 @@ impl SiteLabel {
                             base: base.to_string(),
                             step: step.to_string(),
                             names: matches!(
-                                name,
+                                name.as_deref(),
                                 Some(OpName::Bound {
                                     bound: BoundName::Scope,
                                     ..

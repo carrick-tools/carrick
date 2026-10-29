@@ -906,7 +906,7 @@ pub struct ClaimSlot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub at: Option<Vec<String>>,
+    pub at: Option<Box<[String]>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub each: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1044,7 +1044,7 @@ pub enum OpName {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         param: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        at: Option<Vec<String>>,
+        at: Option<Box<[String]>>,
     },
     /// Two or three slots joined (amendment 7).
     Parts {
@@ -1278,7 +1278,7 @@ pub enum LibraryClaim {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         of: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<OpName>,
+        name: Option<Box<OpName>>,
         /// Amendment 7: how the service writes the op; absent is `call`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         form: Option<OpForm>,
@@ -5794,7 +5794,7 @@ mod tests {
                         path: vec!["procedure".into()],
                         on: Some(ClaimOn::Instance),
                         of: None,
-                        name: Some(OpName::bound(BoundName::Key)),
+                        name: Some(Box::new(OpName::bound(BoundName::Key))),
                         payload: None,
                         handler: Some(slot()),
                         ack: None,
@@ -5821,7 +5821,7 @@ mod tests {
                         path: vec!["tasks".into()],
                         on: Some(ClaimOn::Instance),
                         of: Some("instance:task".into()),
-                        name: Some(OpName::Slot(slot())),
+                        name: Some(Box::new(OpName::Slot(slot()))),
                         payload: Some(slot()),
                         handler: Some(slot()),
                         ack: Some(slot()),
@@ -5863,7 +5863,7 @@ mod tests {
                         path: vec!["tasks".into()],
                         on: Some(ClaimOn::Export),
                         of: Some("instance:task".into()),
-                        name: Some(OpName::bound(BoundName::Maker)),
+                        name: Some(Box::new(OpName::bound(BoundName::Maker))),
                         payload: Some(slot()),
                         handler: Some(slot()),
                         ack: Some(slot()),
@@ -6425,7 +6425,7 @@ mod tests {
                         path: vec![],
                         on: None,
                         of: Some("instance:task".into()),
-                        name: Some(OpName::bound(BoundName::Maker)),
+                        name: Some(Box::new(OpName::bound(BoundName::Maker))),
                         payload: Some(slot(0, None)),
                         handler: None,
                         ack: None,
@@ -6457,7 +6457,7 @@ mod tests {
                         path: vec!["tasks".into()],
                         on: Some(ClaimOn::Export),
                         of: None,
-                        name: Some(OpName::Slot(slot(0, None))),
+                        name: Some(Box::new(OpName::Slot(slot(0, None)))),
                         payload: Some(slot(1, None)),
                         handler: None,
                         ack: None,
@@ -6543,7 +6543,7 @@ mod tests {
                         path: vec![],
                         on: None,
                         of: None,
-                        name: Some(OpName::Slot(slot(0, Some("url")))),
+                        name: Some(Box::new(OpName::Slot(slot(0, Some("url"))))),
                         payload: None,
                         handler: None,
                         ack: None,

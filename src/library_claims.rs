@@ -1020,7 +1020,7 @@ impl Reading<'_> {
             if !supplied {
                 return None;
             }
-            let (text, scope) = match name.as_ref()? {
+            let (text, scope) = match name.as_deref()? {
                 OpName::Slot(slot) => (
                     self.site.literal(slot_arg(slot), slot_key(slot))?,
                     name_scope.clone(),
