@@ -1301,13 +1301,13 @@ mod hosted_change_tests {
     #[test]
     fn a_lost_replay_reads_as_plain_english() {
         let lost = crate::boundary::ModelAnswersUnavailable {
-            commit: "ed47a926aa00000000000000000000000000beef".to_string(),
+            commit: "abc1234aa00000000000000000000000000beef".to_string(),
             reason: "bad object".to_string(),
             rows: 595,
         };
         assert_eq!(
             answers_unavailable_sentence(&lost),
-            "the index was written at ed47a92, which this clone does not have and could not \
+            "the index was written at abc1234, which this clone does not have and could not \
              fetch from origin, so 595 routes and calls are missing. Run `git fetch origin`, \
              then check again."
         );
