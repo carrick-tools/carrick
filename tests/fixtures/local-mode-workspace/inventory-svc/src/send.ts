@@ -10,3 +10,14 @@ export async function send<T>(url: string, options: RequestOptions): Promise<T> 
   const response = await fetch(url, options);
   return (await response.json()) as T;
 }
+
+// A helper that is handed its origin: the caller states the path, the base is
+// a run-time value passed in as the first argument.
+export async function sendTo<T>(
+  base: string,
+  path: string,
+  options: RequestOptions
+): Promise<T> {
+  const response = await fetch(`${base}${path}`, options);
+  return (await response.json()) as T;
+}
