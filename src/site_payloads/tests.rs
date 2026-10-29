@@ -7,6 +7,7 @@ use serde_json::json;
 
 use super::*;
 use crate::request_summary::site_record::{AnchorAt, Bucket, HandlerAnchor, TypeAnchors};
+use crate::result_shapes::ResultIndex;
 use crate::site_questions::SiteState;
 
 const FILE: &str = "src/api.ts";
@@ -150,7 +151,11 @@ fn an_http_calls_entries_read_its_body_and_its_result() {
         entry(http(), "consumer", "request", "Req", 2),
         entry(http(), "consumer", "response", "Res", 2),
     ];
-    let requests = payloads.requests(&entries, &dir.path().to_string_lossy());
+    let requests = payloads.requests(
+        &entries,
+        &dir.path().to_string_lossy(),
+        &ResultIndex::default(),
+    );
     // The body argument: `order` before the call's closing parenthesis.
     let body = {
         let (start, end) = sidecar_span("order)");
@@ -187,6 +192,52 @@ fn an_http_calls_entries_read_its_body_and_its_result() {
     );
 }
 
+/// carrick#2910: the response entry's request carries the store's label for
+/// the call it reads, found by the call's span under the repo-relative file;
+/// the request entry and an index with no label at the call carry none, and
+/// the labelled request is the unlabelled one with the label.
+#[test]
+fn a_calls_result_request_takes_the_label_at_its_call() {
+    use crate::services::type_sidecar::ResultShape;
+    let dir = repo();
+    let root = dir.path().to_string_lossy().into_owned();
+    let payloads = SitePayloads::of(&[record("http_client", false, call_slots())]);
+    let entries = [
+        entry(http(), "consumer", "request", "Req", 2),
+        entry(http(), "consumer", "response", "Res", 2),
+    ];
+    let member = ResultShape::Member(["data".to_string()]);
+    let (start, end) = span_of("http.post(\"/orders\", order)");
+    let index = ResultIndex::labelled(FILE, (start, end), member.clone());
+    let labelled = payloads.requests(&entries, &root, &index);
+    let bare = payloads.requests(&entries, &root, &ResultIndex::default());
+    assert_eq!(labelled.len(), 2, "{labelled:?}");
+    let by_alias = |requests: &[InferRequestItem], alias: &str| {
+        requests
+            .iter()
+            .find(|request| request.alias.as_deref() == Some(alias))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(by_alias(&labelled, "Res").result, Some(member));
+    assert_eq!(by_alias(&labelled, "Req").result, None);
+    assert!(bare.iter().all(|request| request.result.is_none()));
+    let mut unlabelled = by_alias(&labelled, "Res");
+    unlabelled.result = None;
+    assert_eq!(
+        serde_json::to_value(&unlabelled).unwrap(),
+        serde_json::to_value(by_alias(&bare, "Res")).unwrap()
+    );
+    // The same span in another file names another call.
+    let elsewhere = ResultIndex::labelled("src/other.ts", (start, end), ResultShape::Whole(true));
+    assert!(
+        payloads
+            .requests(&entries, &root, &elsewhere)
+            .iter()
+            .all(|request| request.result.is_none())
+    );
+}
+
 /// An entry joins only a site on its line, of its protocol and on its side;
 /// two sites that could both answer leave it to the reader.
 #[test]
@@ -197,18 +248,30 @@ fn an_entry_joins_one_site_of_its_line_protocol_and_side() {
     // Another line.
     assert!(
         http_call
-            .requests(&[entry(http(), "consumer", "response", "Res", 3)], &root)
+            .requests(
+                &[entry(http(), "consumer", "response", "Res", 3)],
+                &root,
+                &ResultIndex::default()
+            )
             .is_empty()
     );
     // Another protocol.
     let socket =
         json!({ "protocol": "socket", "event": "orders", "direction": "client_to_server" });
     let socket_entry = entry(socket, "consumer", "response", "Sock", 2);
-    assert!(http_call.requests(&[socket_entry], &root).is_empty());
+    assert!(
+        http_call
+            .requests(&[socket_entry], &root, &ResultIndex::default())
+            .is_empty()
+    );
     // Another side: a route at the line of a client's call.
     assert!(
         http_call
-            .requests(&[entry(http(), "producer", "request", "Route", 2)], &root)
+            .requests(
+                &[entry(http(), "producer", "request", "Route", 2)],
+                &root,
+                &ResultIndex::default()
+            )
             .is_empty()
     );
     // Two calls on the line.
@@ -217,8 +280,12 @@ fn an_entry_joins_one_site_of_its_line_protocol_and_side() {
         record("http_client", false, call_slots()),
     ]);
     assert!(
-        two.requests(&[entry(http(), "consumer", "response", "Res", 2)], &root)
-            .is_empty()
+        two.requests(
+            &[entry(http(), "consumer", "response", "Res", 2)],
+            &root,
+            &ResultIndex::default()
+        )
+        .is_empty()
     );
 }
 
@@ -241,6 +308,7 @@ fn a_handlers_payload_is_its_parameter_and_an_empty_slot_asks_nothing() {
     let requests = handler.requests(
         &[entry(socket.clone(), "producer", "response", "Sub", 2)],
         &root,
+        &ResultIndex::default(),
     );
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(requests[0].infer_kind, InferKind::FunctionParam);
@@ -249,7 +317,11 @@ fn a_handlers_payload_is_its_parameter_and_an_empty_slot_asks_nothing() {
     let empty = SitePayloads::of(&[record("http_client", false, PayloadSlots::default())]);
     assert!(
         empty
-            .requests(&[entry(http(), "consumer", "request", "Req", 2)], &root)
+            .requests(
+                &[entry(http(), "consumer", "request", "Req", 2)],
+                &root,
+                &ResultIndex::default()
+            )
             .is_empty()
     );
 }
@@ -348,8 +420,11 @@ fn an_unwritten_slot_asks_the_request_config_question_with_its_key() {
         }),
         response: None,
     };
-    let requests = SitePayloads::of(&[record("http_client", false, literal)])
-        .requests(&[entry(http(), "consumer", "request", "Req", 2)], &root);
+    let requests = SitePayloads::of(&[record("http_client", false, literal)]).requests(
+        &[entry(http(), "consumer", "request", "Req", 2)],
+        &root,
+        &ResultIndex::default(),
+    );
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(requests[0].infer_kind, InferKind::RequestConfig);
     assert_eq!(requests[0].member.as_deref(), Some("body"));
@@ -358,8 +433,11 @@ fn an_unwritten_slot_asks_the_request_config_question_with_its_key() {
     assert_eq!(wire["infer_kind"], "request_config");
     assert_eq!(wire["member"], "body");
 
-    let value = SitePayloads::of(&[record("http_client", false, call_slots())])
-        .requests(&[entry(http(), "consumer", "request", "Req", 2)], &root);
+    let value = SitePayloads::of(&[record("http_client", false, call_slots())]).requests(
+        &[entry(http(), "consumer", "request", "Req", 2)],
+        &root,
+        &ResultIndex::default(),
+    );
     assert_eq!(value[0].infer_kind, InferKind::RequestBody);
     assert_eq!(value[0].member, None);
     assert!(
@@ -385,7 +463,10 @@ fn an_unwritten_slot_is_not_asked_of_another_protocol() {
     };
     let socket =
         json!({ "protocol": "socket", "event": "orders", "direction": "client_to_server" });
-    let requests = SitePayloads::of(&[record("socket", false, literal)])
-        .requests(&[entry(socket, "producer", "response", "Sub", 2)], &root);
+    let requests = SitePayloads::of(&[record("socket", false, literal)]).requests(
+        &[entry(socket, "producer", "response", "Sub", 2)],
+        &root,
+        &ResultIndex::default(),
+    );
     assert!(requests.is_empty(), "{requests:?}");
 }
