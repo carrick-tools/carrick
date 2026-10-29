@@ -1446,7 +1446,9 @@ impl CallWalker<'_, '_, '_> {
             spread_args: Vec::new(),
             receiver_spans: super::discovery::receiver_spans(&new.callee),
             receiver_object: super::discovery::receiver_object(&new.callee),
-            instance: super::InstanceIr::default(),
+            // The instance each argument holds, for a constructor parameter a
+            // field is set from (carrick#1670 T3).
+            instance: self.reader.instance_ir(None, args, self.scope),
         };
         self.ir.constructions.push(construction);
     }

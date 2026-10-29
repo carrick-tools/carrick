@@ -4156,7 +4156,9 @@ export function listen(): void {
     /// The holes: a function nothing calls (`entry_point`), a callback
     /// this code runs (`callback_parameter`), a function a library call
     /// runs, by name or written in place (`runs_by_library`), an app a
-    /// package declares (`outside_service`), and a field (`unread`).
+    /// package declares (`outside_service`). A field set from one
+    /// constructor parameter is that parameter (carrick#1670 T3): the
+    /// instance the `new` hands in.
     #[test]
     fn each_deciding_caller_gives_its_own_instance_end() {
         let Some((on, exports, declarations)) = traced_fixture() else {
@@ -4181,7 +4183,7 @@ export function listen(): void {
             "src/helpers.ts:42 <- src/helpers.ts:59 root src/helpers.ts:51",
             "src/helpers.ts:47 <- src/helpers.ts:47 runs_by_library",
             "src/helpers.ts:61 <- src/helpers.ts:61 runs_by_library",
-            "src/routes.ts:11 <- src/routes.ts:11 unread",
+            "src/routes.ts:11 <- src/app.ts:22 root src/app.ts:12",
             "src/users.ts:8 <- src/app.ts:16 root src/app.ts:12",
         ]);
         assert_eq!(got, want, "{got:#?}");
