@@ -487,11 +487,13 @@ async fn a_pending_package_is_asked_again_and_its_answer_read() {
     assert_eq!(message_rows(&data, &repo), rows_with_claims());
 }
 
-/// A run with no model asks the cloud nothing, and neither does a scan with
-/// no sidecar to verify an answer with.
+/// A scan with no sidecar to verify an answer with asks the store nothing. A
+/// run with no model asks it once, read-only (carrick#2907): a package the
+/// store has not built, or is building, is never waited on, and what the
+/// store has answered is read.
 #[tokio::test]
 #[serial]
-async fn no_model_or_no_sidecar_asks_the_store_nothing() {
+async fn no_sidecar_asks_nothing_and_no_model_reads_the_store_once() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, cassette) = fixture_copy(tmp.path());
     mock_env(&cassette);
@@ -506,17 +508,48 @@ async fn no_model_or_no_sidecar_asks_the_store_nothing() {
             .all(|row| row.2 != FACT)
     );
     let sidecar = real_sidecar(&repo);
+    // Matched only by the read-only body: an ask in the form that can start
+    // a build would get the fixture's answered claims instead.
+    carrick::agent_service::inject_mock_answer(
+        ROUTE,
+        r#"{"read_only":{"#,
+        1,
+        r#"{"library_claims":[
+            {"package":"@fixture/live","version":"1.2.0","status":"pending","reason":"in_flight"},
+            {"package":"@fixture/queue","version":"2.4.1","status":"pending","reason":"not_built"}
+        ]}"#,
+    );
     // SAFETY: every test in this binary is `#[serial]`.
     unsafe { std::env::set_var("CARRICK_NO_MODEL", "1") };
-    let local = scan(&repo, Some(&sidecar)).await;
+    let unbuilt = scan(&repo, Some(&sidecar)).await;
+    let asked = store_requests();
+    let read = scan(&repo, Some(&sidecar)).await;
     unsafe { std::env::remove_var("CARRICK_NO_MODEL") };
-    assert_eq!(store_requests() - before, 0, "no model");
+    assert_eq!(
+        asked - before,
+        1,
+        "one read-only ask, a build in flight never polled"
+    );
     assert!(
-        message_rows(&local, &repo)
+        message_rows(&unbuilt, &repo)
             .0
             .iter()
-            .chain(&message_rows(&local, &repo).1)
-            .all(|row| row.2 != FACT)
+            .chain(&message_rows(&unbuilt, &repo).1)
+            .all(|row| row.2 != FACT),
+        "a package with no label stays unknown"
+    );
+    assert_eq!(store_requests() - asked, 1);
+    // The library rows are the ones a model-asking scan states. The socket
+    // pass's own row for the package the store skipped needs the detection a
+    // no-model pass does not ask for, so it is compared on neither side.
+    let library = |(endpoints, calls): (Vec<Row>, Vec<Row>)| {
+        let keep =
+            |rows: Vec<Row>| -> Vec<Row> { rows.into_iter().filter(|row| row.2 == FACT).collect() };
+        (keep(endpoints), keep(calls))
+    };
+    assert_eq!(
+        library(message_rows(&read, &repo)),
+        library(rows_with_claims())
     );
 }
 

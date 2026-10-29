@@ -957,6 +957,29 @@ fn deno_lock_name(key: &str) -> &str {
         .map_or(key, |at| &key[..at + 1])
 }
 
+/// The body one ask sends: the request itself, or, for a pass that may not
+/// start work (carrick#2907), the request under `read_only` and nothing
+/// beside it. The store answers a read from its rows as they stand and starts
+/// no build; a store that predates the mode finds no top-level `roles` and
+/// refuses the body before it reads a package.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum AskBody<'a> {
+    Build(&'a LibraryClaimsRequest),
+    ReadOnly { read_only: &'a LibraryClaimsRequest },
+}
+
+impl<'a> AskBody<'a> {
+    /// The body for `request`, read-only when `read_only`.
+    pub fn of(request: &'a LibraryClaimsRequest, read_only: bool) -> Self {
+        if read_only {
+            Self::ReadOnly { read_only: request }
+        } else {
+            Self::Build(request)
+        }
+    }
+}
+
 /// The name and version a `deno.lock` package key names: `name@1.2.3`, or
 /// with the peer dependencies it resolved against after an `_`
 /// (`name@1.2.3_peer@2.0.0`). A version holds no `_`; a name may.
@@ -1289,8 +1312,45 @@ where
     S: Fn(LibraryClaimsRequest) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
+    settle_within(asked, gate, send, early, WAIT_CAP).await
+}
+
+/// The store's answer for `asked` from one read-only ask (carrick#2907): the
+/// rows as they stand, waiting on nothing. `send` sends the read-only body
+/// ([`AskBody`]). A package pending for any reason ends the pass without
+/// claims, and a refusal (a store that predates the mode) ends it with none:
+/// a read is never asked again in the form that can start a build.
+pub async fn read_settled<G, GateFut, S, Fut>(
+    asked: &Asked,
+    gate: G,
+    send: S,
+    early: Option<tokio::sync::oneshot::Sender<FirstAnswer>>,
+) -> Settled
+where
+    G: Fn(&LibraryClaimsRequest) -> GateFut,
+    GateFut: Future,
+    S: Fn(LibraryClaimsRequest) -> Fut,
+    Fut: Future<Output = Result<String, AgentCallError>>,
+{
+    settle_within(asked, gate, send, early, Duration::ZERO).await
+}
+
+/// [`ask_until_settled`], waiting at most `wait` from the first ask.
+async fn settle_within<G, GateFut, S, Fut>(
+    asked: &Asked,
+    gate: G,
+    send: S,
+    early: Option<tokio::sync::oneshot::Sender<FirstAnswer>>,
+    wait: Duration,
+) -> Settled
+where
+    G: Fn(&LibraryClaimsRequest) -> GateFut,
+    GateFut: Future,
+    S: Fn(LibraryClaimsRequest) -> Fut,
+    Fut: Future<Output = Result<String, AgentCallError>>,
+{
     let started = tokio::time::Instant::now();
-    let deadline = started + WAIT_CAP;
+    let deadline = started + wait;
     let Some(first) = try_ask(asked.request.clone(), &gate, &send, ASK_TIMEOUT).await else {
         if let Some(early) = early {
             let _ = early.send(FirstAnswer {
@@ -2718,6 +2778,20 @@ mod tests {
             .await
         }
 
+        async fn read(self: &std::sync::Arc<Self>, asked: &Asked) -> Settled {
+            let store = self.clone();
+            read_settled(
+                asked,
+                |_| async {},
+                move |request| {
+                    let store = store.clone();
+                    async move { store.send(request).await }
+                },
+                None,
+            )
+            .await
+        }
+
         fn asks(&self) -> usize {
             self.seen.lock().unwrap().len()
         }
@@ -2945,5 +3019,59 @@ mod tests {
         );
         assert_eq!(answer.pending, specifiers(&["a", "b", "c", "d"]));
         assert_eq!(answer.building, specifiers(&["a", "b"]));
+    }
+
+    /// A read-only ask (carrick#2907) is the request under `read_only`, alone:
+    /// with no top-level `roles`, a store that predates the mode refuses it
+    /// before it reads a package or starts a build.
+    #[test]
+    fn a_read_only_body_is_the_request_under_read_only_alone() {
+        let request = LibraryClaimsRequest {
+            roles: ROLES.to_vec(),
+            packages: vec![RegistryPackage {
+                package: "lib".to_string(),
+                version: "1.0.0".to_string(),
+                specifiers: vec!["lib".to_string()],
+                exports: Vec::new(),
+            }],
+        };
+        let plain = serde_json::to_value(AskBody::of(&request, false)).unwrap();
+        assert_eq!(plain, serde_json::to_value(&request).unwrap());
+        let read = serde_json::to_value(AskBody::of(&request, true)).unwrap();
+        let read = read.as_object().unwrap();
+        assert_eq!(read.keys().collect::<Vec<_>>(), vec!["read_only"]);
+        assert!(read.get("roles").is_none() && read.get("packages").is_none());
+        assert_eq!(read["read_only"], plain);
+    }
+
+    /// A read-only ask is sent once and never waited on: a package another
+    /// scan is building, or one nobody built, ends the pass unanswered.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_only_ask_is_sent_once_and_waits_on_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        for body in [pending_for("in_flight"), pending_for("not_built")] {
+            let store = FakeStore::new(vec![body, STORE_ANSWERED.to_string()]);
+            let settled = store.read(&asked).await;
+            assert_eq!(store.asks(), 1);
+            assert_eq!(settled.pending, specifiers(&["lib"]));
+            assert!(settled.exports.is_empty());
+        }
+        let store = FakeStore::new(vec![STORE_ANSWERED.to_string()]);
+        assert_eq!(store.read(&asked).await.exports.len(), 1);
+    }
+
+    /// A store that refuses the read (one that predates the mode answers
+    /// 400) gives the pass nothing, after one ask: it is never asked again in
+    /// the form that can start a build.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_read_is_one_ask_and_no_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![String::new(), STORE_ANSWERED.to_string()]);
+        let settled = store.read(&asked).await;
+        assert_eq!(store.asks(), 1);
+        assert!(settled.exports.is_empty());
+        assert!(settled.asked);
     }
 }

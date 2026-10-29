@@ -95,6 +95,19 @@ pub fn enabled() -> bool {
     enabled_from(std::env::var(SWITCH).ok().as_deref())
 }
 
+/// Whether this process sends its site and handler questions: the switch is
+/// on and the run may ask the model. A no-model pass (`check`, `refresh`,
+/// `init`'s read-in, the after-edit hook) builds its records and asks
+/// nothing, so a slot only an answer fills stays unfilled (carrick#2907).
+pub fn asks() -> bool {
+    asks_with(enabled(), crate::local_mode::no_model())
+}
+
+/// [`asks`], given the switch and whether the run asks no model.
+fn asks_with(enabled: bool, no_model: bool) -> bool {
+    enabled && !no_model
+}
+
 /// Whether a value of [`SWITCH`] turns site questions on: `1` only.
 pub fn enabled_from(value: Option<&str>) -> bool {
     value == Some("1")
@@ -793,11 +806,26 @@ async fn ask_service_seeded<Q: Question>(
     sites: Vec<Q>,
     seed: &str,
 ) -> Answers<Q::Answer> {
-    if !enabled() || sites.is_empty() {
+    if !asks() || sites.is_empty() {
         return Answers::default();
     }
     ask(repo, service, sites, |request| async move {
         agent.post_to_lambda(ROUTE, &request, seed).await
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A no-model pass sends no site or handler question whatever the switch
+    /// says: the questions are model calls (carrick#2907).
+    #[test]
+    fn a_no_model_pass_asks_no_site_question() {
+        assert!(asks_with(true, false));
+        assert!(!asks_with(true, true));
+        assert!(!asks_with(false, false));
+        assert!(!asks_with(false, true));
+    }
 }

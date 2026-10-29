@@ -3798,7 +3798,7 @@ async fn analyze_current_repo_incremental(
     // enter them (carrick#2618), only where the store is asked
     // (`LibraryAsk::start`).
     let siblings = neighbours
-        .filter(|_| sidecar.is_some() && !crate::local_mode::no_model())
+        .filter(|_| sidecar.is_some())
         .map(|neighbours| neighbours.reached(&request_inputs))
         .unwrap_or_default();
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
@@ -5002,16 +5002,21 @@ fn scan_protocol_extractions(
 struct LibraryAsk {
     sites: crate::request_summary::LibrarySites,
     asked: crate::library_store::Asked,
+    /// A pass that asks no model reads the store and starts no build
+    /// (carrick#2907): one read-only ask, no wait, nothing recorded as
+    /// pending.
+    read_only: bool,
     /// The run's turns: two services asking the store the same thing take
     /// them (carrick#1066).
     turns: setup_ahead::AskTurns,
 }
 
 impl LibraryAsk {
-    /// What the service asks, or `None` when it asks nothing: a run with no
-    /// model asks the cloud nothing, a scan with no sidecar could verify no
-    /// answer, and a service whose library calls go through no public
-    /// registry package has nothing to ask about.
+    /// What the service asks, or `None` when it asks nothing: a scan with no
+    /// sidecar could verify no answer, and a service whose library calls go
+    /// through no public registry package has nothing to ask about. A run
+    /// with no model reads the store's settled answers and starts no build
+    /// (carrick#2907): a package with no label stays unknown.
     fn start(
         inputs: &crate::request_summary::RequestSummaryInputs,
         siblings: &siblings::Siblings,
@@ -5020,9 +5025,7 @@ impl LibraryAsk {
         repo_root: &Path,
         turns: setup_ahead::AskTurns,
     ) -> Option<Self> {
-        if crate::local_mode::no_model() || sidecar.is_none() {
-            return None;
-        }
+        sidecar?;
         let site_questions = crate::site_questions::enabled();
         Self::of_with(
             inputs,
@@ -5032,6 +5035,10 @@ impl LibraryAsk {
             turns,
             site_questions,
         )
+        .map(|ask| Self {
+            read_only: crate::local_mode::no_model(),
+            ..ask
+        })
     }
 
     /// What the service asks: the roles [`crate::library_store::roles_for`]
@@ -5084,6 +5091,7 @@ impl LibraryAsk {
         Some(Self {
             sites,
             asked: asked?,
+            read_only: false,
             turns,
         })
     }
@@ -5141,10 +5149,24 @@ impl LibraryAsk {
 async fn send_to_library_store(
     request: crate::library_store::LibraryClaimsRequest,
 ) -> Result<String, crate::agent_service::AgentCallError> {
+    send_library_body(crate::library_store::AskBody::of(&request, false)).await
+}
+
+/// Send one read-only ask to the library store (carrick#2907): the store
+/// answers from its rows and starts no build.
+async fn read_from_library_store(
+    request: crate::library_store::LibraryClaimsRequest,
+) -> Result<String, crate::agent_service::AgentCallError> {
+    send_library_body(crate::library_store::AskBody::of(&request, true)).await
+}
+
+async fn send_library_body(
+    body: crate::library_store::AskBody<'_>,
+) -> Result<String, crate::agent_service::AgentCallError> {
     reask_agent()
         .post_to_lambda(
             crate::library_store::ROUTE,
-            &request,
+            &body,
             crate::library_store::MOCK_SEED,
         )
         .await
@@ -5177,6 +5199,15 @@ async fn settled_library_answer(
     early: tokio::sync::oneshot::Sender<crate::library_store::FirstAnswer>,
 ) -> crate::library_store::Settled {
     match ask {
+        Some(ask) if ask.read_only => {
+            crate::library_store::read_settled(
+                &ask.asked,
+                |request| library_turn(&ask.turns)(request),
+                read_from_library_store,
+                Some(early),
+            )
+            .await
+        }
         Some(ask) => {
             crate::library_store::ask_until_settled(
                 &ask.asked,
@@ -5285,10 +5316,15 @@ fn library_rows(
     let Some(ask) = ask else {
         return Default::default();
     };
-    crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
-        pending: settled.pending,
-        failed: settled.build_failed,
-    });
+    // A read-only pass (carrick#2907) started no build, so a package it ends
+    // without is unknown, as it was before the pass asked: nothing is
+    // pending on its account.
+    if !ask.read_only {
+        crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
+            pending: settled.pending,
+            failed: settled.build_failed,
+        });
+    }
     (
         read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
         settled.exports,
@@ -12000,6 +12036,7 @@ mod tests {
         let ask = super::LibraryAsk {
             sites: Default::default(),
             asked,
+            read_only: false,
             turns: Default::default(),
         };
         let service = Some("hand-off-service".to_string());
