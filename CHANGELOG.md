@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.136](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.135...carrick-v0.3.136) (2026-10-29)
+
+
+### Features
+
+* **discovery:** a function written as a parameter's default is read as the value ([#2813](https://github.com/carrick-tools/carrick/issues/2813) S2) ([#2869](https://github.com/carrick-tools/carrick/issues/2869)) ([6bec8a2](https://github.com/carrick-tools/carrick/commit/6bec8a24dfbefeaefe2207d7e7455c5f2307f33f))
+
+
+### Bug Fixes
+
+* a capture reads a tree as bare when a declared dependency does not resolve ([#3015](https://github.com/carrick-tools/carrick/issues/3015)) ([9f5ad1d](https://github.com/carrick-tools/carrick/commit/9f5ad1d8f8bdddcfae04bf9d7f27ecb7bb37298f))
+* a site row's HTTP send payload is asked as a request body ([#3009](https://github.com/carrick-tools/carrick/issues/3009)) ([#3010](https://github.com/carrick-tools/carrick/issues/3010)) ([50b4e1e](https://github.com/carrick-tools/carrick/commit/50b4e1e3f49765e10bc3d9acd60fcf5b468afa82))
+* bound the handler members one surface listing lists ([#3016](https://github.com/carrick-tools/carrick/issues/3016)) ([#3018](https://github.com/carrick-tools/carrick/issues/3018)) ([e8136c0](https://github.com/carrick-tools/carrick/commit/e8136c0eb4fd0713ca7ab74c01d667ab64f2cca6))
+* check --changed names pairs it could not type-check ([#3012](https://github.com/carrick-tools/carrick/issues/3012)) ([#3017](https://github.com/carrick-tools/carrick/issues/3017)) ([8331750](https://github.com/carrick-tools/carrick/commit/83317506e006b3bf363a45e0850919e0552600a1))
+* **check:** a lost model replay exits 2, and the indexed commit is fetched by hash ([#3000](https://github.com/carrick-tools/carrick/issues/3000) F1, F2) ([#3002](https://github.com/carrick-tools/carrick/issues/3002)) ([98fa1ab](https://github.com/carrick-tools/carrick/commit/98fa1abbb8e053d11a5ed4be80e1a58f3fba65c7))
+* **sidecar:** a chain callback's return is never a consumer's body ([#3004](https://github.com/carrick-tools/carrick/issues/3004)) ([#3005](https://github.com/carrick-tools/carrick/issues/3005)) ([4dc9830](https://github.com/carrick-tools/carrick/commit/4dc9830e9ef65eda16bdfc6593074804c950b025))
+* **sidecar:** bound the unwidened reading by work, not wall-clock time ([#2629](https://github.com/carrick-tools/carrick/issues/2629)) ([#3008](https://github.com/carrick-tools/carrick/issues/3008)) ([e8a358b](https://github.com/carrick-tools/carrick/commit/e8a358b412088b9a3e8f400a8016f315668f39c7))
+* the site fold writes its call-side facts into the mount graph ([#2795](https://github.com/carrick-tools/carrick/issues/2795)) ([#2987](https://github.com/carrick-tools/carrick/issues/2987)) ([41a7be3](https://github.com/carrick-tools/carrick/commit/41a7be3df5cc83f09291a45ff24ba6c49cd89c3a))
+
+
+### Refactoring
+
+* **scanner:** delete Signal 2 and Signal 4, the detection-list and await gates ([#2440](https://github.com/carrick-tools/carrick/issues/2440) C4, C2) ([#2995](https://github.com/carrick-tools/carrick/issues/2995)) ([3fa1486](https://github.com/carrick-tools/carrick/commit/3fa1486fd30a7ccd51c3a0fb00d1d5c962ec0a74))
+
 ## [0.3.135](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.134...carrick-v0.3.135) (2026-10-28)
 
 
