@@ -506,7 +506,7 @@ pub struct TypeProvenance {
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
     /// `no_success_payload`, `no_request_body`, `projected_value_only`,
     /// `serialised_body_unread`, `body_built_by_callee`, `result_member_missing`,
-    /// `not_recorded`.
+    /// `reshaped_by_callback`, `not_recorded`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]

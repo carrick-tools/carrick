@@ -291,6 +291,7 @@ const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set([
   'projected_value_only',
   'serialised_body_unread',
   'body_built_by_callee',
+  'reshaped_by_callback',
 ]);
 
 /** One response branch's payload, before branches are joined. */
@@ -608,6 +609,14 @@ interface CallResultUse {
   projectionOnly: boolean;
   /** The member reads themselves, so a caller can ask what they resolve to. */
   projections: Node[];
+  /**
+   * The call starts a chain, a callback in it is handed the body unread, and
+   * nothing in the chain states the body (carrick#3004). The terminal is the
+   * call itself: what the chain ends in is the value a callback built from
+   * the body, never the body, and where the call's own value is untyped the
+   * site states no response contract.
+   */
+  handedUnreadBody?: boolean;
 }
 
 /**
@@ -2837,7 +2846,11 @@ export class TypeInferrer {
       isExplicit = unwrapResult.isExplicit;
     }
 
-    const explicitType = this.extractExplicitTypeFromAncestor(terminalNode);
+    // carrick#3004: around a call whose body a chain callback reshapes, an
+    // annotation or a cast further out states the reshaped value.
+    const explicitType = use.handedUnreadBody
+      ? null
+      : this.extractExplicitTypeFromAncestor(terminalNode);
     if (explicitType) {
       typeString = explicitType;
       isExplicit = true;
@@ -2847,7 +2860,8 @@ export class TypeInferrer {
     // source narrows the value later (`return json as { data: Item[] }`).
     // The narrowed statement is the body, and it is reported as stated, so a
     // model symbol naming an element inside it is not kept as the body.
-    const narrowed = func ? this.narrowedBodyStatement(terminalNode, func) : undefined;
+    const narrowed =
+      func && !use.handedUnreadBody ? this.narrowedBodyStatement(terminalNode, func) : undefined;
     if (narrowed) {
       typeString = narrowed.text;
       isExplicit = true;
@@ -3051,6 +3065,32 @@ export class TypeInferrer {
     // typed parameter. A function that converts the value into something new
     // states nothing about it, and neither does a use on a failure path.
     const untypedAnswer = typeString.trim() === 'any' || typeString.trim() === 'unknown';
+    // carrick#3004: the call's own value is untyped and a callback in its
+    // chain is handed it unread and builds a new value from it. The function
+    // around the call states that new value, not the body, so nothing here
+    // is a response contract. The decision rides the row: a plain answer is
+    // re-read by the capture's own locator, which publishes the chain end.
+    // A carrier's payload or a rule's that is itself a carrier of an untyped
+    // value (a transport response around `unknown`) is no read either.
+    const callPayload =
+      carrierPayload ??
+      (unwrapResult.wasUnwrapped && !untypedAnswer ? unwrapResult.payloadType : undefined) ??
+      returnType;
+    if (use.handedUnreadBody && (untypedAnswer || this.holdsTopTypeArgument(callPayload))) {
+      this.log(
+        `Call result at ${where} is untyped and handed unread to a callback that builds a ` +
+          'new value from it; this site states no response contract'
+      );
+      return this.decidedAbstain(request, this.getNodeLocation(callExpr), {
+        path: '',
+        kind: 'unknown',
+        reason: 'reshaped_by_callback',
+        detail:
+          "this call's result is handed unread to a callback in its chain that builds a new " +
+          'value from it, and nothing in the chain states the body, so the value the chain ' +
+          'ends in is not the response this call receives',
+      });
+    }
     if (untypedAnswer && func && !explicitType && !unwrapResult.wasUnwrapped && !carrierPayload) {
       const stated = this.statedInFunction(callExpr, func, {
         returned: true,
@@ -4002,9 +4042,14 @@ export class TypeInferrer {
     // the body unread and casts it. That cast is the body read, and it comes
     // before the return-statement answer below, which for a chain is the
     // value the caller computed from the body, not the body.
-    const chainRead = this.bodyReadInCallbackChain(callExpr);
-    if (chainRead) {
-      return { terminal: chainRead, projectionOnly: false, projections: [] };
+    const chain = this.bodyReadInCallbackChain(callExpr);
+    if (chain.read) {
+      return { terminal: chain.read, projectionOnly: false, projections: [] };
+    }
+    // carrick#3004: a callback is handed the body unread and nothing states
+    // it. The return below would answer the value that callback built.
+    if (chain.handedUnread) {
+      return { terminal: callExpr, projectionOnly: false, projections: [], handedUnreadBody: true };
     }
 
     // A return statement answers only for a call of the function it returns
@@ -5417,14 +5462,24 @@ export class TypeInferrer {
    * the chain ends in is what the caller computed from it, and publishing
    * that as the body is the false mismatch this rule exists for.
    *
-   * Exactly one such cast across the whole chain answers. None, or more than
+   * A call that narrows that parameter (a schema validates it, or a function
+   * returns it unchanged) states it the same way (carrick#3004).
+   *
+   * Exactly one such read across the whole chain answers. None, or more than
    * one (a callback on the failure side can be handed an `unknown` too), and
-   * the walk carries on as before. A parameter typed `any` is not read: an
-   * unresolved library types every callback that way, success and failure
-   * alike, so it says nothing about which one is the body.
+   * `handedUnread` says a callback was handed the body all the same: what it
+   * returns is a value built from the body (`.mapOk`, `.then`, `.andThen`,
+   * whatever the name), so the value the chain ends in is never the body
+   * (carrick#3004). A parameter typed `any` is not read: an unresolved
+   * library types every callback that way, success and failure alike, so it
+   * says nothing about which one is the body.
    */
-  private bodyReadInCallbackChain(callExpr: CallExpression): Node | undefined {
+  private bodyReadInCallbackChain(callExpr: CallExpression): {
+    read?: Node;
+    handedUnread: boolean;
+  } {
     const reads: Node[] = [];
+    let handedUnread = false;
     let receiver: Node = callExpr;
     for (let link = 0; link < 64; link++) {
       const access = receiver.getParent();
@@ -5441,35 +5496,62 @@ export class TypeInferrer {
       }
       for (const arg of call.getArguments()) {
         if (Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)) {
-          reads.push(...this.castsOfUnreadParameter(arg));
+          const statements = this.statementsOfUnreadParameter(arg);
+          if (statements) {
+            handedUnread = true;
+            reads.push(...statements);
+          }
         }
       }
       receiver = call;
     }
-    return reads.length === 1 ? reads[0] : undefined;
+    return reads.length === 1 ? { read: reads[0], handedUnread } : { handedUnread };
   }
 
   /**
-   * The casts of a callback's first parameter, when the compiler types that
-   * parameter `unknown`: `response as T` and `<T>response`, the operand being
-   * the parameter itself. A cast that leaves a position open states nothing
-   * about the body and is skipped.
+   * `type`, or a type argument it is instantiated with at any depth, is
+   * `any` or `unknown`: `Chain<unknown>`, `Task<Outcome<unknown, E>>`. The
+   * value such a carrier hands its callbacks is untyped (carrick#3004).
    */
-  private castsOfUnreadParameter(callback: ArrowFunction | FunctionExpression): Node[] {
+  private holdsTopTypeArgument(type: Type, depth = 0): boolean {
+    if (type.isAny() || type.isUnknown()) return true;
+    if (depth >= 6) return false;
+    const args = [...type.getTypeArguments(), ...type.getAliasTypeArguments()];
+    return args.some((arg) => this.holdsTopTypeArgument(arg, depth + 1));
+  }
+
+  /**
+   * What a callback states about its first parameter, when the compiler types
+   * that parameter `unknown`, or `undefined` when it is not handed one. A
+   * statement is a cast whose operand is the parameter itself (`response as
+   * T`, `<T>response`), or a call that narrows it (`callStatesItsArgument`:
+   * a schema validates it, or a function returns it unchanged). A cast that
+   * leaves a position open states nothing about the body and is skipped.
+   */
+  private statementsOfUnreadParameter(
+    callback: ArrowFunction | FunctionExpression
+  ): Node[] | undefined {
     const param = callback.getParameters()[0];
     const name = param?.getNameNode();
     if (!param || !name || !Node.isIdentifier(name) || !param.getType().isUnknown()) {
-      return [];
+      return undefined;
     }
     const symbol = name.getSymbol();
     if (!symbol) return [];
-    return callback.getDescendants().filter((node) => {
-      if (!Node.isAsExpression(node) && !Node.isTypeAssertion(node)) return false;
-      let operand: Node = node.getExpression();
+    const isParameter = (node: Node): boolean => {
+      let operand: Node = node;
       while (Node.isParenthesizedExpression(operand)) {
         operand = operand.getExpression();
       }
-      if (!Node.isIdentifier(operand) || operand.getSymbol() !== symbol) return false;
+      return Node.isIdentifier(operand) && operand.getSymbol() === symbol;
+    };
+    return callback.getDescendants().filter((node) => {
+      if (Node.isCallExpression(node)) {
+        const index = node.getArguments().findIndex(isParameter);
+        return index >= 0 && this.callStatesItsArgument(node, index);
+      }
+      if (!Node.isAsExpression(node) && !Node.isTypeAssertion(node)) return false;
+      if (!isParameter(node.getExpression())) return false;
       const stated = node.getType();
       const statedNode = node.getTypeNode();
       return (

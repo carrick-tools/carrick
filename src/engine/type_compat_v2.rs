@@ -434,7 +434,10 @@ fn path_names_a_member(path: &str) -> bool {
 /// body it builds cannot be typed, so the argument is not the body
 /// (carrick#2628). `result_member_missing`: the library store labels which
 /// part of a call's result holds the body, and the type at the call has no such
-/// part, so the site states no contract (carrick#2818).
+/// part, so the site states no contract (carrick#2818). `reshaped_by_callback`:
+/// a call's untyped result is handed unread to a callback in its chain that
+/// builds a new value from it, and nothing states the body, so the value the
+/// chain ends in is not the response (carrick#3004).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
@@ -442,6 +445,7 @@ const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "serialised_body_unread",
     "body_built_by_callee",
     "result_member_missing",
+    "reshaped_by_callback",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -5971,6 +5975,25 @@ mod tests {
             }
             other => panic!("an unread serialised body must stay a literal unknown, got {other:?}"),
         }
+    }
+
+    /// carrick#3004: a call result handed unread to a chain callback that
+    /// reshapes it is answered `unknown` with `reshaped_by_callback`. That is
+    /// a decision: the capture's raw locator re-run would publish the value
+    /// the chain ends in, which the callback built.
+    #[test]
+    fn a_body_reshaped_by_a_chain_callback_is_a_decided_abstain() {
+        let mut decided = inferred("Endpoint_items_Response", "unknown", None, None);
+        decided.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "reshaped_by_callback".to_string(),
+            detail: None,
+        }];
+        assert!(
+            inference_decided_no_contract(&decided),
+            "a body a chain callback reshapes is a decided abstain"
+        );
     }
 
     /// carrick#2628: a request locator on an argument of a call into a

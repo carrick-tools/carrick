@@ -91,10 +91,14 @@ declare class Chain<T> {
   mapOk<R>(transform: (value: T) => R): Chain<R>;
   mapFailure(transform: (failure: unknown) => Error): Chain<T>;
   peek(observe: (value: any) => void): Chain<T>;
+  andThen<R>(next: (value: T) => Chain<R>): Chain<R>;
 }
 
 declare function request(url: string): Chain<unknown>;
+declare function requestTyped(url: string): Chain<SearchResponse>;
+declare function requestAsync(url: string): Promise<unknown>;
 declare function hasBody(value: unknown): boolean;
+declare function wrap<T>(value: T): Chain<T>;
 
 type Opaque = unknown;
 
@@ -132,6 +136,39 @@ export const searchTwoCasts = (query: string): Chain<number> => {
     .mapOk((response) => (response as SearchResponse).results.length);
 };
 
+export const searchReshaped = (query: string): Chain<Suggestions> => {
+  return request(\`/v1/search-reshaped?q=\${query}\`)
+    .check(hasBody)
+    .mapOk((response) => {
+      const raw = response as { results: Array<Record<string, unknown>> };
+      return {
+        suggestions: raw.results.map((hit) => ({
+          value: hit.code as string,
+          label: hit.title as string,
+        })),
+      };
+    });
+};
+
+export const searchThen = (query: string): Promise<number> =>
+  requestAsync(\`/v1/search-then?q=\${query}\`).then((body) => {
+    const raw = body as { results: Record<string, unknown>[] };
+    return raw.results.length;
+  });
+
+export const searchAndThen = (query: string): Chain<string[]> =>
+  request(\`/v1/search-and-then?q=\${query}\`).andThen((value) => wrap(String(value).split(",")));
+
+function asSearchResponse(value: unknown): SearchResponse {
+  return value as SearchResponse;
+}
+
+export const searchNarrowed = (query: string): Chain<number> =>
+  request(\`/v1/search-narrowed?q=\${query}\`).mapOk((response) => asSearchResponse(response).results.length);
+
+export const searchTyped = (query: string): Chain<SearchResponse> =>
+  requestTyped(\`/v1/search-typed?q=\${query}\`).mapFailure((failure) => new Error(String(failure)));
+
 export const searchAny = (query: string): Chain<unknown> => {
   return request(\`/v1/search-any?q=\${query}\`).peek((value) => {
     const seen = value as SearchResponse;
@@ -153,6 +190,7 @@ interface InferShape {
     type_string: string;
     is_explicit: boolean;
     primary_type_symbol?: string;
+    any_provenance?: Array<{ path: string; reason: string }>;
     stated_body?: {
       root?: string;
       root_source?: string;
@@ -163,6 +201,14 @@ interface InferShape {
 }
 
 const collapse = (text: string): string => text.replace(/\s+/g, ' ').trim();
+
+/** The answer as `type (root reason)`, so a decided abstain reads as one. */
+const decided = (inferred: { type_string: string; any_provenance?: Array<{ path: string; reason: string }> }) => {
+  const root = (inferred.any_provenance ?? []).find((p) => p.path === '');
+  return root ? `${inferred.type_string} (${root.reason})` : inferred.type_string;
+};
+
+const RESHAPED = 'unknown (reshaped_by_callback)';
 
 const SEARCH_RESPONSE_TEXT =
   '{ results: { registrationNumber: string; name: string; city?: string; }[]; messageKey?: string; }';
@@ -310,6 +356,7 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
       );
       assert.strictEqual(inferred.stated_body, undefined);
       assert.strictEqual(inferred.is_explicit, false, 'no cast was read as the body');
+      assert.strictEqual(decided(inferred), RESHAPED, 'the mapped return is not the body either');
     });
 
     it('states nothing when two callbacks cast an unread value', async () => {
@@ -319,6 +366,41 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
       assert.ok(
         !/registrationNumber/.test(inferred.type_string),
         `two candidate reads must not pick one, got: ${inferred.type_string}`
+      );
+      assert.strictEqual(decided(inferred), RESHAPED, 'nor is the value the chain ends in');
+    });
+
+    it('carrick#3004: an open cast and a mapped return state no body', async () => {
+      // The cast leaves its elements open and the callback builds a new
+      // value from them field by field; the chain end is that value.
+      const inferred = await infer('SearchReshaped_Response', 'request(`/v1/search-reshaped?q=${query}`)');
+      assert.ok(
+        !/suggestions/.test(inferred.type_string),
+        `the mapped return is what the caller computed, not the body, got: ${inferred.type_string}`
+      );
+      assert.strictEqual(decided(inferred), RESHAPED);
+    });
+
+    it('carrick#3004: a then callback handed the unread body states no body by its return', async () => {
+      const inferred = await infer('SearchThen_Response', 'requestAsync(`/v1/search-then?q=${query}`)');
+      assert.strictEqual(decided(inferred), RESHAPED);
+    });
+
+    it('carrick#3004: an andThen callback handed the unread body states no body by its return', async () => {
+      const inferred = await infer('SearchAndThen_Response', 'request(`/v1/search-and-then?q=${query}`)');
+      assert.strictEqual(decided(inferred), RESHAPED);
+    });
+
+    it('carrick#3004: a function that narrows the unread body states it', async () => {
+      const inferred = await infer('SearchNarrowed_Response', 'request(`/v1/search-narrowed?q=${query}`)');
+      assert.match(collapse(inferred.type_string), /^\{ results: /);
+    });
+
+    it('carrick#3004: a typed call keeps its own type when a failure callback is handed an unknown', async () => {
+      const inferred = await infer('SearchTyped_Response', 'requestTyped(`/v1/search-typed?q=${query}`)');
+      assert.ok(
+        /SearchResponse|registrationNumber/.test(inferred.type_string),
+        `the call states its body, got: ${decided(inferred)}`
       );
     });
 
