@@ -35,8 +35,21 @@ const isTypeParameter = (type: ts.Type): type is ts.TypeParameter => (type.flags
 const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 export function resultCandidatesOf(checker: ts.TypeChecker, signature: ts.Signature): SurfaceResultCandidates | undefined {
-  const reader = new ResultReader(checker);
-  return reader.candidates(signature);
+  return resultCandidatesOfReturn(checker, checker.getReturnTypeOfSignature(signature), signature.getTypeParameters() ?? []);
+}
+
+/**
+ * Rule R over a return type read against `parameters`: the type parameters
+ * that stand for the caller's value. A handler a route takes returns a type
+ * the route's own parameters decide (carrick#3047), so those are the ones
+ * its return is read against.
+ */
+export function resultCandidatesOfReturn(
+  checker: ts.TypeChecker,
+  returned: ts.Type,
+  parameters: readonly ts.Type[]
+): SurfaceResultCandidates | undefined {
+  return new ResultReader(checker).candidates(returned, parameters);
 }
 
 /** Whether `shape` names one of `candidates`. `whole` is always one; a decided whole is the only one. */
@@ -56,10 +69,9 @@ interface Leaf {
 class ResultReader {
   constructor(private readonly checker: ts.TypeChecker) {}
 
-  candidates(signature: ts.Signature): SurfaceResultCandidates | undefined {
-    const raw = this.checker.getReturnTypeOfSignature(signature);
+  candidates(raw: ts.Type, parameters: readonly ts.Type[]): SurfaceResultCandidates | undefined {
     if (raw.flags & NOTHING) return undefined;
-    const params = new Set<ts.Type>(signature.getTypeParameters() ?? []);
+    const params = new Set<ts.Type>(parameters);
 
     let awaited = this.awaited(raw);
     for (let hop = 0; hop < MAX_DEPTH && isTypeParameter(awaited) && params.has(awaited); hop++) {

@@ -103,6 +103,9 @@ const ELEMENTS: Record<string, LibraryCheck> = {
   'make slot at': check('export', { kind: 'make', form: 'call', member: null, name: { arg: 0, at: ['id'] } }),
 };
 
+/** The elements above whose part a judge reads now. */
+const BUILT = new Set(['form new', 'form decorate', 'returns empty', 'returns result', 'scope form decorate']);
+
 describe('verify_library_claims: amendment 7 grammar (carrick#3045)', () => {
   let root: string;
   let verifier: LibraryClaimsVerifier;
@@ -140,6 +143,8 @@ describe('verify_library_claims: amendment 7 grammar (carrick#3045)', () => {
       assert.deepStrictEqual(settled.checks[0].claim, element.claim);
     });
 
+    // Judged since carrick#3047 (library-claims-forms.test.ts).
+    if (BUILT.has(name)) continue;
     it(`answers unchecked part_unbuilt for ${name}`, () => {
       assert.strictEqual(verdict(element), 'unchecked part_unbuilt');
     });

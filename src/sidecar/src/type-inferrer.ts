@@ -832,7 +832,7 @@ export class TypeInferrer {
     onUnwidenedStep?: UnwidenedStepDone
   ): InferResult {
     this.modelSymbols = new Map((modelSymbols ?? []).map((symbol) => [symbol.alias, symbol]));
-    this.statedParams = this.statedParamsFor(labels ?? { sends: new Map(), bodies: new Set() });
+    this.statedParams = this.statedParamsFor(labels ?? { sends: new Map(), sets: new Map(), bodies: new Set() });
     const inferredTypes: InferredType[] = [];
     const errors: string[] = [];
     /** Response inferences the unwidened reading re-reads (carrick#1516). */
@@ -981,7 +981,7 @@ export class TypeInferrer {
    * members the batch's verified server-framework labels name. Empty when
    * the batch carries no labels, and then it reads nothing.
    */
-  private statedParams = this.statedParamsFor({ sends: new Map(), bodies: new Set() });
+  private statedParams = this.statedParamsFor({ sends: new Map(), sets: new Map(), bodies: new Set() });
 
   /**
    * carrick#2111: where the model named a type for the response this request
