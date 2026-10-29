@@ -1,0 +1,35 @@
+{
+  "question_set": "qs-c3",
+  "answers": [
+    {
+      "site_id": "src/orders.ts:127-200",
+      "ok": true,
+      "kind": {
+        "value": "topic",
+        "confidence": 0.95,
+        "orders_agree": true
+      },
+      "role": null,
+      "name": null,
+      "method": null,
+      "namespace": null,
+      "name_argument": null,
+      "payload_argument": null
+    },
+    {
+      "site_id": "src/orders.ts:210-267",
+      "ok": true,
+      "kind": {
+        "value": "topic",
+        "confidence": 0.95,
+        "orders_agree": true
+      },
+      "role": null,
+      "name": null,
+      "method": null,
+      "namespace": null,
+      "name_argument": null,
+      "payload_argument": null
+    }
+  ]
+}

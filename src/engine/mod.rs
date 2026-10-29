@@ -4412,10 +4412,19 @@ async fn analyze_current_repo_incremental(
             // bundle through the same path (#corpus-2 resolution dim). A row
             // withdrawn as in-process has no operation to type (carrick#1513).
             let pubsub_results = in_process_pubsub.pubsub_rows_kept(&merged_results);
+            // Where the fact layer places a payload, the type capture reads it
+            // there (`CARRICK_SITE_PAYLOADS=1`; empty otherwise), so a
+            // pub/sub symbol and locator the reader stated for that alias are
+            // not the ones asked (carrick#2472 C3).
+            let payload_infer = site_payloads.requests(
+                cloud_data.type_manifest.as_deref().unwrap_or_default(),
+                repo_path,
+            );
             protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
                 &pubsub_results,
                 repo_path,
                 &service_modules,
+                &crate::site_payloads::slotted_aliases(&payload_infer),
             ));
 
             // GraphQL producers take the infer path, not the bundle path: their
@@ -4441,10 +4450,6 @@ async fn analyze_current_repo_incremental(
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
             protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
-            let payload_infer = site_payloads.requests(
-                cloud_data.type_manifest.as_deref().unwrap_or_default(),
-                repo_path,
-            );
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -11592,10 +11597,18 @@ async fn analyze_current_repo(
     // through the same path (#corpus-2 resolution dim). A row withdrawn as
     // in-process has no operation to type (carrick#1513).
     let pubsub_results = in_process_pubsub.pubsub_rows_kept(&analysis_result.file_results);
+    // A payload the fact layer places is read there, so the pub/sub symbol and
+    // locator the reader stated for that alias are not the ones asked
+    // (carrick#2472 C3).
+    let payload_infer = site_payloads.requests(
+        cloud_data.type_manifest.as_deref().unwrap_or_default(),
+        repo_path,
+    );
     protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
         &pubsub_results,
         repo_path,
         &service_modules,
+        &crate::site_payloads::slotted_aliases(&payload_infer),
     ));
 
     // GraphQL producers take the infer path, not the bundle path: their response
@@ -11617,10 +11630,6 @@ async fn analyze_current_repo(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
     protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
-    let payload_infer = site_payloads.requests(
-        cloud_data.type_manifest.as_deref().unwrap_or_default(),
-        repo_path,
-    );
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -26953,6 +26962,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &file_results,
             ".",
             &modules_without_config(),
+            &BTreeSet::new(),
         );
         let request = requests
             .iter()
@@ -27045,6 +27055,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &file_results,
             ".",
             &modules_without_config(),
+            &BTreeSet::new(),
         );
         let request_aliases: HashSet<String> =
             requests.iter().filter_map(|r| r.alias.clone()).collect();
