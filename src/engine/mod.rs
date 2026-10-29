@@ -3791,6 +3791,7 @@ async fn analyze_current_repo_incremental(
         positions,
         crate::request_summary::ROWS_JOIN_BUDGET,
         crate::request_summary::discovery::receiver_trace_enabled(),
+        &workspace.test_only,
         Read::Own,
     )?;
     // The services this one's calls are declared in, read for the walks that
@@ -9179,6 +9180,7 @@ fn discover_files_and_symbols(
         None,
         crate::request_summary::ROWS_JOIN_BUDGET,
         false,
+        &Default::default(),
         Read::Own,
     )
 }
@@ -9198,6 +9200,7 @@ enum Read {
 /// against the bytes every span is counted in. Binding the rows may take
 /// `rows_budget` (carrick#2564). With `receiver_trace`, it also reads the
 /// files only tests import (carrick#2775).
+#[allow(clippy::too_many_arguments)]
 fn discover_with_positions(
     repo_path: &str,
     service: &Config,
@@ -9205,6 +9208,7 @@ fn discover_with_positions(
     mut positions: Option<crate::position_rows::PositionIndex>,
     rows_budget: std::time::Duration,
     receiver_trace: bool,
+    test_only_cache: &crate::test_only_files::Cache,
     read: Read,
 ) -> FileDiscoveryResult {
     let own = read == Read::Own;
@@ -9444,9 +9448,11 @@ fn discover_with_positions(
     let test_only = if receiver_trace {
         let started = Instant::now();
         let test_only = crate::test_only_files::of(
+            test_only_cache,
             repo_root,
             &files,
             &workspace,
+            &service_tsconfig,
             &service_ignore_patterns(service),
         );
         debug!(
@@ -9569,6 +9575,7 @@ pub(crate) fn discover_service_inputs_within(
         positions,
         budget,
         true,
+        &Default::default(),
         Read::Own,
     )
     .expect("discovery reads the service")

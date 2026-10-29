@@ -15,8 +15,79 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::workspace_resolver::WorkspaceIndex;
+
+/// The aliases that govern a service's module resolution
+/// ([`crate::config::Config::alias_tsconfig`]): the one input of
+/// [`of`] that varies between the services of a repo.
+pub type AliasKey = Option<(PathBuf, PathBuf)>;
+
+type SetKey = (PathBuf, AliasKey, Vec<String>);
+
+/// One key's slot: filled by the first caller, awaited by the rest.
+type SetSlot = Arc<OnceLock<Arc<HashSet<PathBuf>>>>;
+
+/// What one scan has read, owned by the scan and dropped with it, so a tree
+/// that changes between two scans of one process is read again (carrick#2786).
+/// Per file, the specifiers it loads; per `(repo_root, alias, ignore
+/// patterns)`, the finished set. Every service of a repo walks the same
+/// files, and a parse is the cost.
+#[derive(Debug, Default)]
+pub struct Cache {
+    read: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
+    sets: Mutex<HashMap<SetKey, SetSlot>>,
+}
+
+impl Cache {
+    fn held(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Arc<Vec<String>>>> {
+        self.read.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn loaded_specifiers(
+        &self,
+        reader: &mut crate::parser::ModuleReader,
+        file: &Path,
+    ) -> Arc<Vec<String>> {
+        if let Some(known) = self.held().get(file).cloned() {
+            return known;
+        }
+        #[cfg(test)]
+        parse_count::bump(file);
+        let read = Arc::new(reader.loaded_specifiers(file));
+        self.held().insert(file.to_path_buf(), read.clone());
+        read
+    }
+}
+
+/// How many times each file was parsed in this process, for the test that
+/// holds a second service to the first one's reads.
+#[cfg(test)]
+mod parse_count {
+    use super::*;
+
+    static PARSED: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+    pub(super) fn bump(file: &Path) {
+        *PARSED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry(file.to_path_buf())
+            .or_default() += 1;
+    }
+
+    pub(super) fn of(file: &Path) -> usize {
+        PARSED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .get(file)
+            .copied()
+            .unwrap_or(0)
+    }
+}
 
 /// The files of `walked` that only tests import, as walked.
 ///
@@ -26,9 +97,56 @@ use crate::workspace_resolver::WorkspaceIndex;
 /// alias or workspace package name) keeps it in play. A specifier is read
 /// wherever the file loads a module: `import`, `export ... from`,
 /// `import x = require()`, and `require` or `import()` with a literal.
+///
+/// The set is worked out once per `(repo_root, alias, ignore_patterns)` in
+/// `cache`, and a file is parsed once whatever the alias: `workspace` must be
+/// the index built for `alias`, so services with the same aliases share one
+/// answer. Services with different aliases work out theirs side by side
+/// (carrick#2786).
 pub fn of(
+    cache: &Cache,
     repo_root: &Path,
     walked: &[PathBuf],
+    workspace: &WorkspaceIndex,
+    alias: &AliasKey,
+    ignore_patterns: &[&str],
+) -> HashSet<PathBuf> {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let key: SetKey = (
+        repo_root.to_path_buf(),
+        alias.clone(),
+        ignore_patterns.iter().map(|p| p.to_string()).collect(),
+    );
+    // The map is locked to find this key's cell and no longer: a caller with
+    // the same key waits in `get_or_init`, one with another key does not.
+    let cell = cache
+        .sets
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key)
+        .or_default()
+        .clone();
+    let only = cell
+        .get_or_init(|| {
+            Arc::new(only_tests_import(
+                cache,
+                repo_root,
+                workspace,
+                ignore_patterns,
+            ))
+        })
+        .clone();
+    walked
+        .iter()
+        .filter(|file| only.contains(&canonical(file)))
+        .cloned()
+        .collect()
+}
+
+/// The canonical files below `repo_root` that only tests import.
+fn only_tests_import(
+    cache: &Cache,
+    repo_root: &Path,
     workspace: &WorkspaceIndex,
     ignore_patterns: &[&str],
 ) -> HashSet<PathBuf> {
@@ -41,8 +159,8 @@ pub fn of(
         if crate::file_finder::is_test_source(&file, repo_root) {
             tests.insert(importer.clone());
         }
-        for specifier in reader.loaded_specifiers(&file) {
-            let Some(target) = workspace.resolve_module_path(&file, &specifier) else {
+        for specifier in cache.loaded_specifiers(&mut reader, &file).iter() {
+            let Some(target) = workspace.resolve_module_path(&file, specifier) else {
                 continue;
             };
             let target = canonical(&target);
@@ -71,11 +189,7 @@ pub fn of(
             break;
         }
     }
-    walked
-        .iter()
-        .filter(|file| only.contains(&canonical(file)))
-        .cloned()
-        .collect()
+    only
 }
 
 #[cfg(test)]
@@ -100,10 +214,17 @@ mod tests {
             .map(|(relative, _)| root.join(relative))
             .filter(|path| !crate::file_finder::is_test_source(path, &root))
             .collect();
-        let mut out: Vec<String> = of(&root, &walked, &workspace, &["node_modules"])
-            .iter()
-            .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
-            .collect();
+        let mut out: Vec<String> = of(
+            &Cache::default(),
+            &root,
+            &walked,
+            &workspace,
+            &None,
+            &["node_modules"],
+        )
+        .iter()
+        .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+        .collect();
         out.sort();
         out
     }
@@ -130,5 +251,84 @@ mod tests {
             ("src/lonely.ts", "export const o = 1;\n"),
         ]);
         assert_eq!(got, vec!["src/deep.ts", "src/harness.ts"]);
+    }
+
+    /// Two services of one repo share the walk: the second call returns the
+    /// same set and parses no file again, whether its aliases match the
+    /// first's or not (carrick#2786).
+    #[test]
+    fn a_second_service_parses_no_file_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let files = [
+            ("apps/a/src/app.ts", "export const a = 1;\n"),
+            ("apps/b/src/app.ts", "import '../../../libs/helper';\n"),
+            (
+                "apps/b/src/app.test.ts",
+                "import '../../../libs/only-tests';\n",
+            ),
+            ("libs/helper.ts", "export const h = 1;\n"),
+            ("libs/only-tests.ts", "export const t = 1;\n"),
+        ];
+        for (relative, text) in files {
+            write(&root, relative, text);
+        }
+        let walked: Vec<PathBuf> = files
+            .iter()
+            .map(|(relative, _)| root.join(relative))
+            .filter(|path| !crate::file_finder::is_test_source(path, &root))
+            .collect();
+        let workspace = WorkspaceIndex::build_with_aliases(&root, None);
+        let patterns = ["node_modules"];
+        let cache = Cache::default();
+        let first = of(&cache, &root, &walked, &workspace, &None, &patterns);
+        assert_eq!(
+            first,
+            HashSet::from([root.join("libs/only-tests.ts")]),
+            "the helper only a test imports"
+        );
+        let after_first: Vec<usize> = files
+            .iter()
+            .map(|(relative, _)| parse_count::of(&root.join(relative)))
+            .collect();
+        assert!(
+            after_first.iter().all(|count| *count == 1),
+            "{after_first:?}"
+        );
+        let other_alias = Some((
+            PathBuf::from("apps/b"),
+            PathBuf::from("apps/b/tsconfig.json"),
+        ));
+        for alias in [None, other_alias] {
+            assert_eq!(
+                of(&cache, &root, &walked, &workspace, &alias, &patterns),
+                first
+            );
+        }
+        let after_all: Vec<usize> = files
+            .iter()
+            .map(|(relative, _)| parse_count::of(&root.join(relative)))
+            .collect();
+        assert_eq!(after_all, after_first, "no file parsed twice");
+    }
+
+    /// A path rewritten between two scans of one process gives the new
+    /// answer: a scan's reads die with it (carrick#2786).
+    #[test]
+    fn a_rewritten_file_is_read_again_by_the_next_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "src/a.test.ts", "import './helper';\n");
+        write(&root, "src/helper.ts", "export const h = 1;\n");
+        let walked = vec![root.join("src/helper.ts")];
+        let workspace = WorkspaceIndex::build_with_aliases(&root, None);
+        let scan = |cache: &Cache| of(cache, &root, &walked, &workspace, &None, &["node_modules"]);
+        assert_eq!(scan(&Cache::default()).len(), 1, "only a test imports it");
+        write(&root, "src/prod.ts", "import './helper';\n");
+        write(&root, "src/a.test.ts", "export const t = 1;\n");
+        assert!(
+            scan(&Cache::default()).is_empty(),
+            "production imports it now"
+        );
     }
 }
