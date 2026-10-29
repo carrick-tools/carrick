@@ -255,6 +255,12 @@ type Outcome =
        * itself verified (carrick#2968). Only `request_member_missing`.
        */
       requestDropped?: string;
+      /**
+       * In-process only: on a type receiver, the declarations its type stands
+       * on (`declaredSymbols`), the key a reader joins a receiver by
+       * (carrick#3046).
+       */
+      receiverTypes?: readonly ts.Declaration[];
     }
   | { verdict: 'failed' | 'unchecked'; reason: string };
 
@@ -378,6 +384,10 @@ interface ReceiverPath {
   scope?: string;
   /** The export is a type, read at its defaults (`type`, carrick#2977): no maker, no scope step. */
   type?: true;
+  /** `type:A.B`: a type the export's namespace declares (carrick#3046). */
+  typePath?: string[];
+  /** `type:<module>#A.B`: a type another module declares, a types package (carrick#3046). */
+  typeModule?: string;
 }
 
 export interface VerifyResult {
@@ -586,14 +596,25 @@ export class LibraryClaimsVerifier {
       builtIndex.set(key, importLines.length + builtLines.length);
       builtLines.push(`${expression};`);
     }
-    // A check on receiver `type` (carrick#2977) reads its export as a type,
-    // declared at its defaults after the export's import, as the lister lists it.
+    // A check on a type receiver (carrick#2977) reads its type as declared
+    // after the export's import: the export itself, a type the export's
+    // namespace declares (`type:A.B`), or one another module declares
+    // (`type:<module>#A.B`, carrick#3046). A `lib:` global is named as itself.
     for (const check of checks) {
-      if (!rulesFor(check)?.message || check.receiver !== TYPE_RECEIVER) continue;
-      const key = builtKey(check, TYPE_RECEIVER);
+      const typed = parseReceiver(check.receiver);
+      if (!rulesFor(check)?.message || !typed?.type) continue;
+      const key = builtKey(check, check.receiver);
       if (builtIndex.has(key)) continue;
       builtIndex.set(key, importLines.length + builtLines.length);
-      builtLines.push(typeBuildLine(builtLines.length, `__carrick_e${importIndex.get(exportKey(check))!}`));
+      const local = DEFAULT_LIBRARY.test(check.package) ? check.export : `__carrick_e${importIndex.get(exportKey(check))!}`;
+      builtLines.push(
+        typeBuildLine(
+          builtLines.length,
+          typed.typeModule !== undefined
+            ? `import(${JSON.stringify(typed.typeModule)}).${typed.typePath!.join('.')}`
+            : [local, ...(typed.typePath ?? [])].join('.')
+        )
+      );
     }
     // A `node:` key may name a file of the runtime's types, whose exports are
     // globals (`runtimeGlobalFile`): the probe reads each as `globalThis` holds
@@ -751,14 +772,18 @@ export class LibraryClaimsVerifier {
 
       /**
        * The one receiver of a check on `type` (carrick#2977): the export read
-       * as a type at its declared type-parameter defaults, its home from the
-       * declaration the import names, made by nothing. `type_unresolved` when
-       * the name has no type meaning or needs a type argument.
+       * as a type at its declared type-parameter defaults (a generic with no
+       * default is read at its declared type, its parameters read through
+       * their constraints, ruling R2), its home from the declaration the
+       * probe line names. A name bound under a maker or scope claim reads
+       * as the claim builds it (`boundByType`). `type_unresolved` when the
+       * name has no type meaning.
        */
       const readTypeReceiver = (check: LibraryCheck): Read<MessageReceiver[]> => {
-        const index = builtIndex.get(builtKey(check, TYPE_RECEIVER));
-        const built = index === undefined ? undefined : builtType(checker, statementOf(check), file.statements[index]);
+        const index = builtIndex.get(builtKey(check, check.receiver));
+        const built = index === undefined ? undefined : builtTypeAt(checker, file.statements[index]);
         if (built === undefined) return { reason: 'type_unresolved' };
+        const bound = boundByType(check, built.type);
         return {
           value: [
             {
@@ -768,11 +793,38 @@ export class LibraryClaimsVerifier {
                 reader.homeOf(check.package, [built.symbol, ...typeSymbols(built.type)]),
                 typePackages[check.package]
               ),
-              makerBindsName: false,
-              scoped: false,
+              makerBindsName: bound.maker,
+              scoped: bound.scope,
             },
           ],
         };
+      };
+
+      /**
+       * On a receiver keyed by type, a name is bound by a verified maker or
+       * scope claim of the same package that returns a type with a
+       * declaration in common with the receiver's (`sameDeclared`, never the
+       * same name). Judged only for an op that reads a bound name.
+       */
+      const boundByType = (check: LibraryCheck, type: ts.Type): { maker: boolean; scope: boolean } => {
+        const claim = check.claim;
+        const result = { maker: false, scope: false };
+        if (claim.kind !== 'op' || claim.name === undefined || !('bound' in claim.name)) return result;
+        if (claim.name.bound !== 'maker' && claim.name.bound !== 'scope') return result;
+        checks.forEach((other, i) => {
+          if (other.package !== check.package || other === check) return;
+          const made = other.claim;
+          if ((made.kind !== 'make' && made.kind !== 'scope') || made.name === undefined) return;
+          const judgement = judge(i);
+          if (judgement.outcome.verdict !== 'verified' || !judgement.holding) return;
+          const builtOther = builtReceiver(other);
+          const at = builtOther === undefined ? undefined : atDefaults(other, builtOther);
+          if (judgement.holding.some(sig => sameDeclared(checker, reader.returnOf(sig, at), type))) {
+            if (made.kind === 'make') result.maker = true;
+            else result.scope = true;
+          }
+        });
+        return result;
       };
 
       /**
@@ -852,7 +904,7 @@ export class LibraryClaimsVerifier {
           return { outcome: unchecked('module_workspace') };
         }
         // A type export has no value to read (carrick#2977): `readTypeReceiver` reads it.
-        const typeReceiver = rules.message && check.receiver === TYPE_RECEIVER;
+        const typeReceiver = rules.message && parseReceiver(check.receiver)?.type === true;
         const exportRead: Read<ExportRead> | undefined = typeReceiver ? undefined : readExport(check);
         if (exportRead !== undefined && 'reason' in exportRead) return { outcome: unchecked(exportRead.reason) };
 
@@ -901,6 +953,9 @@ export class LibraryClaimsVerifier {
         const verified: Outcome =
           declarations.length > 0 ? { verdict: 'verified', declarations: sortedDeclarations(declarations) } : { ...VERIFIED };
         if (verified.verdict === 'verified' && members.length > 0) verified.members = members;
+        if (verified.verdict === 'verified' && exportRead === undefined) {
+          verified.receiverTypes = receivers.value.flatMap(r => [...declaredSymbols(checker, r.type)].flatMap(s => s.declarations ?? []));
+        }
         if (verified.verdict === 'verified' && requestDropped !== undefined) verified.requestDropped = requestDropped;
         else if (verified.verdict === 'verified' && bodyMembers.length > 0) verified.bodyMembers = bodyMembers;
         return { outcome: verified, holding };
@@ -1228,6 +1283,85 @@ function builtType(
   return { symbol, type };
 }
 
+/**
+ * The type a type receiver's probe line declares (carrick#3046), read from
+ * the line's own type reference, so a default import, a namespace path, an
+ * `import("module")` path and a `lib:` global all resolve. A generic with no
+ * default is read at its declared type: its type parameters stay, and every
+ * predicate reads them through their constraints (ruling R2). Undefined when
+ * the name has no type meaning (a `const`). The lister reads `builtType`.
+ */
+function builtTypeAt(checker: ts.TypeChecker, buildStatement: ts.Statement | undefined): Omit<BuiltType, 'name'> | undefined {
+  if (!buildStatement || !ts.isVariableStatement(buildStatement)) return undefined;
+  const declaration = buildStatement.declarationList.declarations[0];
+  const node = declaration?.type;
+  if (!declaration || !node) return undefined;
+  let name: ts.Node;
+  if (ts.isTypeReferenceNode(node)) name = ts.isQualifiedName(node.typeName) ? node.typeName.right : node.typeName;
+  else if (ts.isImportTypeNode(node) && node.qualifier) name = ts.isQualifiedName(node.qualifier) ? node.qualifier.right : node.qualifier;
+  else return undefined;
+  const local = checker.getSymbolAtLocation(name);
+  if (!local) return undefined;
+  const symbol = local.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(local) : local;
+  if (checker.isUnknownSymbol(symbol) || (symbol.flags & ts.SymbolFlags.Type) === 0) return undefined;
+  let type = checker.getTypeAtLocation(declaration.name);
+  if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) type = checker.getDeclaredTypeOfSymbol(symbol);
+  if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return undefined;
+  return { symbol, type };
+}
+
+/** How many levels of base types `declaredSymbols` follows. */
+const BASE_DEPTH = 8;
+
+/**
+ * A type's key (carrick#3046): the class, interface and alias symbols the
+ * type stands on. They are the type's own, those of its union and
+ * intersection parts, of its awaited type, of its reference target, and of
+ * its base types, to a bounded depth. A type parameter (`this` inside a
+ * subclass included) is read through its constraint.
+ */
+function declaredSymbols(checker: ts.TypeChecker, type: ts.Type, bases = true): Set<ts.Symbol> {
+  const out = new Set<ts.Symbol>();
+  const wanted = ts.SymbolFlags.Class | ts.SymbolFlags.Interface | ts.SymbolFlags.TypeAlias;
+  const seen = new Set<ts.Type>();
+  const visit = (t: ts.Type, depth: number): void => {
+    if (seen.has(t) || depth > BASE_DEPTH) return;
+    seen.add(t);
+    if (t.flags & ts.TypeFlags.TypeParameter) {
+      const constraint = checker.getBaseConstraintOfType(t);
+      if (constraint && constraint !== t) visit(constraint, depth);
+      return;
+    }
+    const awaited = checker.getAwaitedType(t) ?? t;
+    if (awaited !== t) return visit(awaited, depth);
+    if (t.isUnionOrIntersection()) {
+      for (const part of t.types) visit(part, depth);
+      return;
+    }
+    const reference = t as ts.TypeReference;
+    const target = (t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference ? reference.target : undefined;
+    for (const symbol of [t.getSymbol(), t.aliasSymbol, target?.getSymbol()]) {
+      if (symbol && symbol.flags & wanted) out.add(symbol);
+    }
+    const own = target ?? t;
+    if (bases && own.isClassOrInterface()) for (const base of checker.getBaseTypes(own)) visit(base, depth + 1);
+  };
+  visit(type, 0);
+  return out;
+}
+
+/**
+ * `built` is a `wanted` type: some declaration `wanted` stands on is one
+ * `built` stands on, bases included (an interface that extends the wanted
+ * one builds it too). Never the reverse, and never through a shared base
+ * alone: the same symbol, never the same name.
+ */
+function sameDeclared(checker: ts.TypeChecker, built: ts.Type, wanted: ts.Type): boolean {
+  const left = declaredSymbols(checker, built);
+  for (const symbol of declaredSymbols(checker, wanted, false)) if (left.has(symbol)) return true;
+  return false;
+}
+
 /** The answer to `list_library_surface`. */
 export interface ListedSurface {
   surfaces: LibrarySurface[];
@@ -1272,7 +1406,8 @@ function factoryKey(exportKeyText: string, member: string): string {
 /**
  * `export`, `instance:()`, `instance:new`, `instance:new:<member>` or
  * `instance:<member>`, optionally followed by `>scope:<path.member>`; or
- * `type` (carrick#2977), followed by nothing.
+ * `type` (carrick#2977), `type:<A.B>` or `type:<module>#<A.B>` (carrick#3046),
+ * followed by nothing.
  */
 function parseReceiver(text: string): ReceiverPath | undefined {
   const steps = text.split('>');
@@ -1286,6 +1421,12 @@ function parseReceiver(text: string): ReceiverPath | undefined {
   }
   if (base === 'export') return { base, scope };
   if (base === TYPE_RECEIVER) return scope === undefined ? { base, type: true } : undefined;
+  const typed = /^type:(?:([^#\s]+)#)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)$/.exec(base);
+  if (typed) {
+    return scope === undefined
+      ? { base, type: true, typePath: typed[2].split('.'), ...(typed[1] ? { typeModule: typed[1] } : {}) }
+      : undefined;
+  }
   if (base === 'instance:()') return { base, scope, maker: { form: 'call', member: null } };
   if (base === 'instance:new') return { base, scope, maker: { form: 'new', member: null } };
   let match = /^instance:new:(\S+)$/.exec(base);
@@ -1340,7 +1481,6 @@ function unbuiltPart(claim: LibraryClaim): string | undefined {
     if (claim.protocol !== undefined) return 'protocol';
     if (claim.when !== undefined) return 'when';
   }
-  if ((claim.kind === 'op' || claim.kind === 'scope') && claim.yields?.package !== undefined) return 'yields.package';
   for (const slot of slots) {
     if (slot === undefined) continue;
     const named = slot as NameSlot;
@@ -1435,8 +1575,8 @@ export interface LabelledMembers {
  * `of` is read on exactly that receiver. One with `on` is read on the export
  * (`export`), on an instance of a maker (`instance`) or on either (`both`),
  * and never on a receiver a scope returns, which only `of` names. One with
- * neither names no receiver of its own. `type` is read only by `of: "type"`
- * (carrick#2977). A claim read on a receiver it was
+ * neither names no receiver of its own. A type receiver (`type`, `type:A.B`,
+ * `type:<module>#A.B`) is read only by the `of` that names it (carrick#2977). A claim read on a receiver it was
  * not claimed for could verify a member of the same name with another shape
  * (`client.write(name, value)` against `instance.write(value)`).
  */
@@ -1444,8 +1584,8 @@ function fitsReceiver(check: LibraryCheck): boolean {
   const receiver = parseReceiver(check.receiver);
   if (!receiver) return false;
   const claim = check.claim;
-  // A type export is read only by a claim placed on it (carrick#2977).
-  if (receiver.type) return claim.kind !== 'make' && claim.of === TYPE_RECEIVER;
+  // A type is read only by a claim placed on it, by the same id (carrick#2977, #3046).
+  if (receiver.type) return claim.kind !== 'make' && claim.of === check.receiver;
   if (claim.kind === 'make') return check.receiver === 'export';
   if (claim.of !== undefined) return check.receiver === claim.of;
   if (claim.on === undefined) return true;
@@ -3083,11 +3223,12 @@ class DeclarationReader {
   }
 
   /**
-   * `yields: { param, export, side }` on a receive op or a scope: some
+   * `yields: { param, export, side, package? }` on a receive op or a scope: some
    * signature of the function this overload takes declares a parameter at
    * `param` whose type is either
-   * - the package's own export named `export` (a class, or the interface an
-   *   instance has), declared in the receiver's home packages; or
+   * - the export named `export` (a class, or the interface an instance has),
+   *   declared in the receiver's home packages, or in `package` (and its
+   *   `@types` package) when the claim names one (carrick#3046); or
    * - when `export` is the maker whose own call made the instance the claim
    *   is read on (`madeBy`, carrick#2663): that instance, compared by
    *   declaration (`handsInstance`), since a factory's result has no export
@@ -3098,10 +3239,15 @@ class DeclarationReader {
   private yieldsOutcome(
     signature: ts.Signature,
     handler: ClaimSlot,
-    yields: { param: number; export: string; side: string },
+    yields: { param: number; export: string; side: string; package?: string },
     receiver: MessageReceiver
   ): Outcome | undefined {
     if (yields.side !== 'client' && yields.side !== 'server') return failed('yields_side_invalid');
+    // The handed type is declared in `yields.package` (and its `@types` package) when it names one.
+    const yieldsHome =
+      yields.package === undefined
+        ? receiver.home
+        : new Set([packageNameOf(yields.package), typesPackageOf(packageNameOf(yields.package))]);
     let declared = this.keyParameterAt(signature, handler.arg);
     if (declared !== undefined && handler.key !== undefined) {
       const property = this.declaredProperty(declared, handler.key);
@@ -3117,7 +3263,7 @@ class DeclarationReader {
         const named = typeSymbols(given).some(
           symbol =>
             symbol?.getName() === yields.export &&
-            (symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), receiver.home))
+            (symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), yieldsHome))
         );
         if (named) return undefined;
         if (yields.export === receiver.madeBy && this.handsInstance(given, receiver, signature.typeParameters ?? [])) {

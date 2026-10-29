@@ -99,7 +99,6 @@ const ELEMENTS: Record<string, LibraryCheck> = {
   'returns result': route({ returns: { result: { member: ['data'] } } }),
   'scope form decorate': scope({ form: 'decorate' }),
   'scope name slot ref': scope({ name: { arg: 0, ref: 'class' } }),
-  'yields package': route({ yields: { param: 1, export: 'Reply', side: 'server', package: 'fixture-other' } }),
   'make slot at': check('export', { kind: 'make', form: 'call', member: null, name: { arg: 0, at: ['id'] } }),
 };
 

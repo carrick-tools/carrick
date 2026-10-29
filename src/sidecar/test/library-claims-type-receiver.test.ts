@@ -145,7 +145,7 @@ describe('verify_library_claims: receiver `type` (carrick#2977 B)', () => {
     assert.strictEqual(labels.sends.size, 1);
   });
 
-  it('reads no `on` claim on `type`, and no type from a const or an undefaulted generic', () => {
+  it('reads no `on` claim on `type`, and no type from a const', () => {
     assert.deepStrictEqual(verdicts([send('Reply', { on: 'export' })]), ['unchecked receiver_invalid']);
     assert.deepStrictEqual(verdicts([send('Reply', { on: 'both' })]), ['unchecked receiver_invalid']);
     // `of: "type"` on another receiver, and a scope step after `type`, are refused.
@@ -154,7 +154,8 @@ describe('verify_library_claims: receiver `type` (carrick#2977 B)', () => {
     const outcomes = (exported: string) =>
       verifier.labelledMembers(root, [send(exported, { of: 'type' })], 60_000).outcomes;
     assert.deepStrictEqual(outcomes('notAType'), { 'unchecked type_unresolved': 1 });
-    assert.deepStrictEqual(outcomes('Gen'), { 'unchecked type_unresolved': 1 });
+    // A generic with no default is read at its declared type (ruling R2, carrick#3046).
+    assert.deepStrictEqual(outcomes('Gen'), { verified: 1 });
   });
 
   // Characterisation of decision 11: passes before ticket B.
