@@ -52,6 +52,7 @@ pub(crate) mod served_paths;
 pub mod service_workers;
 pub mod setup_ahead;
 mod siblings;
+mod socket_sites;
 pub(crate) mod type_compat_v2;
 pub(crate) mod upload_boundary;
 mod walk_lane;
@@ -4238,6 +4239,7 @@ async fn analyze_current_repo_incremental(
                 },
             )
             .await;
+            yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
             let site_payloads = site_payloads_of(
                 crate::site_payloads::enabled(),
                 &request_inputs,
@@ -4381,7 +4383,7 @@ async fn analyze_current_repo_incremental(
             append_pubsub_manifest_entries(
                 &mut manifest_entries,
                 &merged_results,
-                &protocol_extractions.sockets,
+                &protocol_extractions.socket_sites,
                 &in_process_pubsub,
                 &library_sites,
                 repo_path,
@@ -4887,6 +4889,20 @@ struct ProtocolExtractions {
     /// The rows and possible calls the decided sites come to (carrick#2439,
     /// [`site_rows_of`]). Empty, and off, unless `CARRICK_SITE_QUESTIONS=1`.
     site: crate::site_rows::SiteRows,
+    /// Where every socket row above stands (carrick#1670 T4), set by
+    /// [`yield_bus_to_sockets`] once the site rows are read: the bus ops
+    /// there are gone, and the model's pub/sub twins fold onto them.
+    socket_sites: socket_sites::SocketSites,
+}
+
+/// The event-bus ops at a socket site give way to the socket row there
+/// (carrick#1670 T4, [`socket_sites`]). Run at both scan paths once the
+/// library and site rows are read, before [`classify_in_process_pubsub`]
+/// reads the bus ops as the other side of a topic.
+fn yield_bus_to_sockets(extractions: &mut ProtocolExtractions, repo_path: &str, service: &Config) {
+    let mut sites = socket_sites::SocketSites::of(extractions, repo_path, service);
+    sites.yield_bus(&mut extractions.event_bus);
+    extractions.socket_sites = sites;
 }
 
 /// The directories to walk for a service's own GraphQL SDL files: its
@@ -4968,6 +4984,7 @@ fn scan_protocol_extractions(
             event_bus,
             library: crate::library_claims::LibraryRows::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: socket_sites::SocketSites::default(),
         },
         document_sites,
     )
@@ -6554,6 +6571,7 @@ fn append_deterministic_protocol_operations(
     append_event_bus_operations(
         cloud_data,
         &extractions.event_bus,
+        extractions.socket_sites.yielded,
         file_results,
         &library,
         &to_producer,
@@ -6562,7 +6580,7 @@ fn append_deterministic_protocol_operations(
     append_pubsub_operations(
         cloud_data,
         file_results,
-        &extractions.sockets,
+        &extractions.socket_sites,
         in_process,
         &library,
         &to_producer,
@@ -6660,10 +6678,7 @@ impl LibrarySiteIndex {
     /// and event-bus folds included (carrick#1874): compared as written, the
     /// two forms never met on a rescan and both rows were stated.
     fn relative(&self, file: &Path) -> PathBuf {
-        let file = normalize_protocol_file(file);
-        file.strip_prefix(&self.repo_root)
-            .map(Path::to_path_buf)
-            .unwrap_or(file)
+        protocol_relative(&self.repo_root, file)
     }
 
     fn states_pubsub(
@@ -6892,9 +6907,13 @@ fn classify_in_process_pubsub(
 /// The tradeoff that accepts: where the model reported a role and the AST
 /// disagrees, the model's role stands. It applies only where both saw the same
 /// site, and #688 (payload anchors here) is what would let this prefer the AST.
+///
+/// `yielded` counts the ops already dropped at socket sites
+/// ([`yield_bus_to_sockets`], carrick#1670 T4), for the debug line.
 fn append_event_bus_operations(
     cloud_data: &mut CloudRepoData,
     event_bus: &crate::event_emitter::BusExtraction,
+    yielded: usize,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     library: &LibrarySiteIndex,
     to_producer: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
@@ -6902,7 +6921,7 @@ fn append_event_bus_operations(
 ) {
     use crate::operation::PubsubRole;
 
-    if event_bus.is_empty() {
+    if event_bus.is_empty() && yielded == 0 {
         return;
     }
     let reported = llm_pubsub_sites(file_results, library);
@@ -6950,7 +6969,10 @@ fn append_event_bus_operations(
     );
     debug!(
         subscribers,
-        publishers, deferred, "Indexing in-process event bus operations"
+        publishers,
+        deferred,
+        yielded_to_sockets = yielded,
+        "Indexing in-process event bus operations"
     );
 }
 
@@ -6985,55 +7007,13 @@ fn normalize_protocol_file(p: &Path) -> PathBuf {
         .collect()
 }
 
-/// Structural fold set: normalized file → the event names for which the
-/// deterministic Socket.IO scan already emitted an operation in that file
-/// (emitter OR listener). The file-analyzer sometimes reports a single
-/// `socket.emit("x", …)` / `socket.on("x", …)` site as BOTH a socket event and
-/// a pub/sub op; the deterministic socket op is the modeled contract, so a
-/// pub/sub op sharing the SAME file AND the SAME event/topic string is folded
-/// away (dropped) in favor of it — otherwise the emit is indexed twice (once
-/// `socket|…`, once `pubsub|…`), inflating the call set.
-///
-/// An in-process bus op does NOT fold anything here: it is on the same channel
-/// as the pub/sub row it would replace, and the model's row is the richer of
-/// the two (it carries a payload anchor), so the deduplication runs the other
-/// way, in `append_event_bus_operations` (carrick#676).
-///
-/// The match keys purely on structural coincidence (same file + same name),
-/// never on a library/broker name, so a genuine Kafka/NATS/Redis/BullMQ publish
-/// in a file that has NO socket op on that event is untouched. Requiring the
-/// same-file socket twin is what keeps real pub/sub (which lives in files
-/// without socket ops) safe.
-///
-/// Keyed as a map of file → event set (rather than a set of owned pairs) so
-/// membership checks borrow `&Path`/`&str` without per-op cloning. The file is
-/// relative to the repo root ([`LibrarySiteIndex::relative`]), and so is the
-/// `file_results` key every reader looks up with.
-fn socket_event_twins(
-    sockets: &crate::socket_io::SocketExtraction,
-    files: &LibrarySiteIndex,
-) -> HashMap<PathBuf, HashSet<String>> {
-    let mut twins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-    for op in sockets.listeners.iter().chain(sockets.emitters.iter()) {
-        if let Some(event) = op.key.socket_event() {
-            twins
-                .entry(files.relative(&op.file_path))
-                .or_default()
-                .insert(event.to_string());
-        }
-    }
-    twins
-}
-
-/// Membership check against [`socket_event_twins`]'s map using borrowed keys.
-fn has_socket_twin(
-    twins: &HashMap<PathBuf, HashSet<String>>,
-    file_norm: &Path,
-    topic: &str,
-) -> bool {
-    twins
-        .get(file_norm)
-        .is_some_and(|events| events.contains(topic))
+/// `file` relative to `root` (both through [`normalize_protocol_file`]),
+/// whichever form the caller holds; a file outside `root` as written.
+fn protocol_relative(root: &Path, file: &Path) -> PathBuf {
+    let file = normalize_protocol_file(file);
+    file.strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or(file)
 }
 
 /// Fold the file-analyzer's `pubsub_operations` into `cloud_data` so they reach
@@ -7064,7 +7044,7 @@ fn has_socket_twin(
 fn append_pubsub_operations(
     cloud_data: &mut CloudRepoData,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    sockets: &crate::socket_io::SocketExtraction,
+    sockets: &socket_sites::SocketSites,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
     library: &LibrarySiteIndex,
     to_producer: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
@@ -7072,7 +7052,6 @@ fn append_pubsub_operations(
 ) {
     use crate::operation::PubsubRole;
 
-    let twins = socket_event_twins(sockets, library);
     let mut subscribers = 0usize;
     let mut publishers = 0usize;
     let mut dropped = 0usize;
@@ -7084,12 +7063,11 @@ fn append_pubsub_operations(
     paths.sort();
     for path in paths {
         let result = &file_results[path];
-        let file_norm = library.relative(Path::new(path));
         for op in &result.pubsub_operations {
             // Same-file socket twin → the file-analyzer double-classified a
-            // socket emit/listen site; keep the deterministic socket op, drop
-            // this pub/sub form so the site is indexed once.
-            if has_socket_twin(&twins, &file_norm, &op.topic) {
+            // socket emit/listen site; keep the socket row, drop this pub/sub
+            // form so the site is indexed once.
+            if sockets.has_twin(Path::new(path), &op.topic) {
                 debug!(
                     topic = %op.topic,
                     file = %path,
@@ -7187,33 +7165,31 @@ fn append_pubsub_operations(
 /// payload type the extractor couldn't capture. An op with no role is skipped
 /// (it was already dropped from `cloud_data` and has nothing to anchor).
 ///
-/// A pub/sub op folded away by the same-file socket-twin guard (see
-/// `socket_event_twins`) is also skipped here: it was dropped from `cloud_data`
-/// by `append_pubsub_operations`, so leaving a manifest anchor for it would
-/// orphan the anchor. The `sockets` extraction feeds the same fold set both
-/// places, and so does `in_process` (carrick#1513): a row it withdrew has no
-/// operation to anchor.
+/// A pub/sub op folded away by the same-file socket-twin guard
+/// ([`socket_sites::SocketSites::has_twin`]) is also skipped here: it was
+/// dropped from `cloud_data` by `append_pubsub_operations`, so leaving a
+/// manifest anchor for it would orphan the anchor. The same `sockets` set
+/// feeds the fold both places, and so does `in_process` (carrick#1513): a
+/// row it withdrew has no operation to anchor.
 fn append_pubsub_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    sockets: &crate::socket_io::SocketExtraction,
+    sockets: &socket_sites::SocketSites,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
     library: &LibrarySiteIndex,
     repo_root: &str,
 ) {
     use crate::operation::PubsubRole;
 
-    let twins = socket_event_twins(sockets, library);
     // Deterministic order: sort paths before emitting manifest entries.
     let mut paths: Vec<&String> = file_results.keys().collect();
     paths.sort();
     for path in paths {
         let result = &file_results[path];
-        let file_norm = library.relative(Path::new(path));
         for op in &result.pubsub_operations {
             // Folded into a same-file socket twin: dropped from cloud_data, so
             // emit no orphan anchor here either.
-            if has_socket_twin(&twins, &file_norm, &op.topic) {
+            if sockets.has_twin(Path::new(path), &op.topic) {
                 continue;
             }
             if let Some(pubsub_role) = op.role
@@ -11472,6 +11448,7 @@ async fn analyze_current_repo(
         },
     )
     .await;
+    yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
     let site_payloads = site_payloads_of(
         crate::site_payloads::enabled(),
         &request_inputs,
@@ -11574,7 +11551,7 @@ async fn analyze_current_repo(
     append_pubsub_manifest_entries(
         &mut manifest_entries,
         &analysis_result.file_results,
-        &protocol_extractions.sockets,
+        &protocol_extractions.socket_sites,
         &in_process_pubsub,
         &library_sites,
         repo_path,
@@ -24459,7 +24436,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &crate::socket_io::SocketExtraction::default(),
+            &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::of(
                 &stated_library_rows(&extractions.library, ".", &Config::default()),
@@ -25688,6 +25665,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         file_results.insert(
@@ -26265,6 +26243,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             sockets: Default::default(),
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
         let mut entries = Vec::new();
         append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
@@ -26741,6 +26720,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
 
         let mut entries = Vec::new();
@@ -26816,6 +26796,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
 
         let mut entries = Vec::new();
@@ -26883,6 +26864,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
 
         let mut entries = Vec::new();
@@ -26948,7 +26930,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &crate::socket_io::SocketExtraction::default(),
+            &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
             ".",
@@ -27032,7 +27014,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &crate::socket_io::SocketExtraction::default(),
+            &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
             ".",
@@ -27149,7 +27131,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &crate::socket_io::SocketExtraction::default(),
+            &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
             ".",
@@ -27325,7 +27307,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_operations(
             &mut cloud_data,
             &file_results,
-            &crate::socket_io::SocketExtraction::default(),
+            &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
             &to_details,
@@ -27355,7 +27337,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &crate::socket_io::SocketExtraction::default(),
+            &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
             ".",
@@ -27410,7 +27392,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let emit_file = "payments-svc/realtime/server.ts";
         let publish_file = "payments-svc/events/orders.ts";
 
-        let extractions = ProtocolExtractions {
+        let mut extractions = ProtocolExtractions {
             event_bus: crate::event_emitter::BusExtraction::default(),
             graphql: crate::graphql::GraphqlExtraction::default(),
             sockets: crate::socket_io::SocketExtraction {
@@ -27426,6 +27408,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -27457,6 +27440,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
 
+        yield_bus_to_sockets(&mut extractions, ".", &Config::default());
         let mut cloud_data = repo_with_bundle("payments-svc", None, "");
         append_deterministic_protocol_operations(
             &mut cloud_data,
@@ -27504,7 +27488,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &extractions.sockets,
+            &extractions.socket_sites,
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
             ".",
@@ -27640,7 +27624,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &extractions.sockets,
+            &extractions.socket_sites,
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
             ".",
@@ -27673,7 +27657,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let socket_file = "payments-svc/realtime/server.ts";
         let discovered = |file: &str| PathBuf::from(format!("{repo_root}/{file}"));
 
-        let extractions = ProtocolExtractions {
+        let mut extractions = ProtocolExtractions {
             event_bus: crate::event_emitter::BusExtraction {
                 subscribers: vec![],
                 publishers: vec![crate::event_emitter::BusOp {
@@ -27713,6 +27697,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         .into_iter()
         .collect();
 
+        yield_bus_to_sockets(&mut extractions, repo_root, &Config::default());
         let mut cloud_data = repo_with_bundle("shop", None, "");
         append_deterministic_protocol_operations(
             &mut cloud_data,
@@ -27758,7 +27743,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &extractions.sockets,
+            &extractions.socket_sites,
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::of(&Default::default(), repo_root),
             repo_root,
@@ -27805,7 +27790,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_pubsub_manifest_entries(
             &mut entries,
             &file_results,
-            &crate::socket_io::SocketExtraction::default(),
+            &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
             ".",
@@ -27845,6 +27830,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
 
         let mut entries = Vec::new();
@@ -27984,6 +27970,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
 
         // The producer manifest entry's alias (Producer, Response).
@@ -28050,6 +28037,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
         };
         assert!(
             orchestrator

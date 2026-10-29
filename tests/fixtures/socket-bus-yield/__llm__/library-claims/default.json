@@ -1,0 +1,64 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/live-wire",
+      "version": "3.1.0",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "@fixture/live-wire",
+          "export": "Live",
+          "role": "socket",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "new",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "emit",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "on",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

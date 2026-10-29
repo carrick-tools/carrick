@@ -247,6 +247,15 @@ fn row<'r>(rows: &'r SiteRows, file: &str) -> Option<&'r SiteRow> {
     rows.rows.iter().find(|row| row.file == file)
 }
 
+/// A fact socket row: `socket|SERVER->CLIENT|chat`, a call at
+/// `src/server-socket.ts:7`. For other modules' tests of what a socket site
+/// row does to the rows beside it.
+pub(crate) fn a_socket_fact_row() -> SiteRow {
+    row(&rows(), "src/server-socket.ts")
+        .cloned()
+        .expect("the server socket's row")
+}
+
 fn lead_reason(rows: &[PossibleCall], file: &str) -> Option<UnreadReason> {
     rows.iter()
         .find(|lead| lead.file_path == file)
