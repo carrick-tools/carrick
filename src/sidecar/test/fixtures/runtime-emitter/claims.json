@@ -1,0 +1,43 @@
+{
+  "package": "node:events",
+  "export": "EventEmitter",
+  "role": "in_process_bus",
+  "claims": [
+    {
+      "member": "emit",
+      "of": "instance:new",
+      "name": "error",
+      "picker": "fixture-picker"
+    },
+    {
+      "member": "emit",
+      "of": "instance:new",
+      "name": "newListener",
+      "picker": "fixture-picker"
+    },
+    {
+      "member": "emit",
+      "of": "instance:new",
+      "name": "removeListener",
+      "picker": "fixture-picker"
+    },
+    {
+      "member": "on",
+      "of": "instance:new",
+      "name": "error",
+      "picker": "fixture-picker"
+    },
+    {
+      "member": "on",
+      "of": "instance:new",
+      "name": "newListener",
+      "picker": "fixture-picker"
+    },
+    {
+      "member": "on",
+      "of": "instance:new",
+      "name": "removeListener",
+      "picker": "fixture-picker"
+    }
+  ]
+}

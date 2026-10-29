@@ -41,6 +41,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
 import { holdsResult, resultCandidatesOf } from './result-candidates.js';
+import { RUNTIME_EMITTER_EVENTS, RUNTIME_TYPE_PACKAGES, isRuntimeEmitterMember } from './runtime-emitter.js';
 import { PathNames, declaringFileName, type PackageDirectoryOf } from './position-rows.js';
 import type {
   ClaimSlot,
@@ -101,20 +102,6 @@ const BUILTIN_INTERFACES: ReadonlySet<string> = new Set([
   'BigInt',
   'Array',
   'ReadonlyArray',
-]);
-
-/**
- * The runtime's own type packages. A type they declare (the runtime's event
- * emitter above all) is never part of another package's own declarations,
- * even when that package's maker returns it: a member only the runtime
- * declares is the runtime's, not the package's. When the named package is
- * one of these, it is its own.
- */
-const RUNTIME_TYPE_PACKAGES: ReadonlySet<string> = new Set([
-  '@types/node',
-  '@types/bun',
-  'bun-types',
-  '@types/deno',
 ]);
 
 /**
@@ -1232,10 +1219,13 @@ export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   // A member's `handlers` (carrick#2674), a signature's `result_candidates`
   // (carrick#2817) and a member's `scope_receiver` (carrick#2774) are out of
-  // the hash at every depth, so a package's key does not change when the
-  // lister learns to list them.
+  // the hash at every depth, and so is a member's `runtime_events`
+  // (carrick#3032), so a package's key does not change when the lister
+  // learns to list them.
   const text = JSON.stringify(listed, (key, value) =>
-    key === 'handlers' || key === 'result_candidates' || key === 'scope_receiver' ? undefined : value
+    key === 'handlers' || key === 'result_candidates' || key === 'scope_receiver' || key === 'runtime_events'
+      ? undefined
+      : value
   );
   return crypto.createHash('sha256').update(text).digest('hex');
 }
@@ -2904,7 +2894,9 @@ class DeclarationReader {
    * overload whose parameter there is that literal, or a key of the map a
    * `keyof` constraint reads. The claim carries no slot, so every parameter
    * is read. A name the library emits itself only ever removes rows, so this
-   * verdict is for the record.
+   * verdict is for the record. The runtime's own emitter members also
+   * reserve the names the runtime gives every emitter, which no declaration
+   * states (`RUNTIME_EMITTER_EVENTS`, carrick#3032).
    */
   private judgeReserved(receiver: MessageReceiver, claim: ReservedClaim): Outcome {
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
@@ -2915,7 +2907,13 @@ class DeclarationReader {
         if (this.literalsAt(signature, { arg }, callee.holder).has(claim.name)) return VERIFIED;
       }
     }
+    if (RUNTIME_EMITTER_EVENTS.includes(claim.name) && this.isRuntimeEmitterProperty(callee.named?.property)) return VERIFIED;
     return failed('reserved_not_declared');
+  }
+
+  /** The property is a member of the runtime's own emitter (`isRuntimeEmitterMember`). */
+  private isRuntimeEmitterProperty(property: ts.Symbol | undefined): boolean {
+    return property !== undefined && isRuntimeEmitterMember(property, file => this.packageOf(file));
   }
 
   /**
@@ -4133,7 +4131,15 @@ class DeclarationReader {
           const listed = this.listHandlers(own ? callee.signatures : library, home);
           if (listed.length > 0) member.handlers = listed;
         });
-        fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, holder.type, take)));
+        fills.push(() => {
+          member.signatures = this.listSignatures(own ? callee.signatures : library, holder.type, take);
+          // The runtime's own emitter members take the names the runtime
+          // gives every emitter, besides the ones a signature spells.
+          if (!RUNTIME_MODULE.test(pkg) || !this.isRuntimeEmitterProperty(property)) return;
+          const spelled = new Set(member.signatures.flatMap(s => s.params.flatMap(p => p.literals ?? [])));
+          const events = RUNTIME_EMITTER_EVENTS.filter(name => !spelled.has(name));
+          if (events.length > 0) member.runtime_events = events;
+        });
       }
     });
     return receiver;

@@ -8,6 +8,8 @@ node_modules/
 !test/fixtures/capture-v2-installed/node_modules/@acme/models/
 !test/fixtures/capture-v2-installed/node_modules/@acme/models/package.json
 !test/fixtures/capture-v2-installed/node_modules/@acme/models/index.d.ts
+!test/fixtures/runtime-emitter/node_modules/
+!test/fixtures/runtime-emitter/layout-25/node_modules/
 
 # Build output
 dist/
