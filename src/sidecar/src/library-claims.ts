@@ -1156,6 +1156,9 @@ function resolvedBuild(checker: ts.TypeChecker, statement: ts.Statement | undefi
   return checker.getResolvedSignature(expression);
 }
 
+/** How many `extends` links `receiver_types` follows from a receiver's type. */
+const RECEIVER_BASE_DEPTH = 8;
+
 /** The receiver id a type export is read on (carrick#2977): the type itself, at its defaults. */
 const TYPE_RECEIVER = 'type';
 
@@ -1571,6 +1574,8 @@ class DeclarationReader {
   private typeContext = '';
   /** `types[]` entries the budget left out of the surface being listed. */
   private typesLeftOut = 0;
+  /** The receivers the surface lists, with the type each is built at: what `receiver_types` maps (carrick#3051). */
+  private receiverSources: Array<{ export: string; receiver: string; type: ts.Type }> = [];
 
   /** Begin one `listSurface` call: its specifiers share `handlerBudget` handler-parameter members. */
   startListing(handlerBudget: number): void {
@@ -3662,6 +3667,7 @@ class DeclarationReader {
     this.typeCandidates.clear();
     this.typeIds.clear();
     this.typesLeftOut = 0;
+    this.receiverSources = [];
     this.typeContext = '';
     this.specifierHome = this.homeOf(pkg, []);
     this.exportTargets = new Map(exported.map(each => [each.target, each.name] as const).reverse());
@@ -3697,6 +3703,7 @@ class DeclarationReader {
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
         this.typeContext = name;
         if (receiverName.startsWith('instance:')) this.noteType(receiverType);
+        this.receiverSources.push({ export: name, receiver: receiverName, type: receiverType });
         const receiver = this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, handlers, fills);
         entry.receivers.push(receiver);
         if (receiverName.startsWith('instance:')) {
@@ -3728,7 +3735,10 @@ class DeclarationReader {
     if (withHandlers) surface.handler_types = this.handlerTypes;
     if (withHandlers || this.listTypes) surface.types = this.listTypeReceivers(pkg, typeExports, maxEntries);
     if (withHandlers) surface.handler_params_left_out = this.handlerParamsLeftOut;
-    if (this.listTypes) surface.types_left_out = this.typesLeftOut;
+    if (this.listTypes) {
+      surface.types_left_out = this.typesLeftOut;
+      surface.receiver_types = this.receiverTypes(surface.types ?? []);
+    }
     return surface;
   }
 
@@ -3808,6 +3818,39 @@ class DeclarationReader {
     for (const run of names) run();
     for (const fill of fills) fill();
     return listed;
+  }
+
+  /**
+   * `receiver_types` (carrick#3051): per export, per receiver the surface
+   * lists, the receiver ids of `types[]` that the receiver's built type and
+   * its base types are declared by, sorted. A receiver whose type has no
+   * listed id is left out, and so is one whose type is a class constructor
+   * (an export's own `export` receiver is the constructor, not an instance).
+   * `type` and `type:<Path>` are relative to an export: they are told of a
+   * receiver only on that export; a `type:<module>#<Path>` is the same on any.
+   */
+  private receiverTypes(types: readonly SurfaceTypeExport[]): Record<string, Record<string, string[]>> {
+    const keyOf = (id: string, exportName: string): string => (id.includes('#') ? id : `${exportName}\0${id}`);
+    const listed = new Set(types.flatMap(entry => entry.receivers.map(each => keyOf(each.receiver, entry.export))));
+    const map: Record<string, Record<string, string[]>> = {};
+    for (const source of this.receiverSources) {
+      const found = new Set<string>();
+      const visit = (type: ts.Type, depth: number): void => {
+        const symbol = type.aliasSymbol ?? type.getSymbol();
+        if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Class) !== 0 && type.getConstructSignatures().length > 0) return;
+        const id = symbol === undefined || type.isUnion() ? undefined : this.idOfSymbol(symbol);
+        if (id !== undefined && listed.has(keyOf(id.id, id.export ?? source.export)) && (id.id.includes('#') || id.export === source.export)) {
+          found.add(id.id);
+        }
+        const target = ((type as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference ? (type as ts.TypeReference).target : type;
+        if (depth >= RECEIVER_BASE_DEPTH || !(((target as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.ClassOrInterface)) return;
+        for (const base of this.checker.getBaseTypes(target as ts.InterfaceType)) visit(base, depth + 1);
+      };
+      visit(source.type, 0);
+      if (found.size === 0) continue;
+      (map[source.export] ??= {})[source.receiver] = [...found].sort(byName);
+    }
+    return map;
   }
 
   /** The properties of a type a service may assign, depth 1, by name (`settable`). */
@@ -3991,6 +4034,7 @@ class DeclarationReader {
         const home = this.homeOf(pkg, [source.target, ...typeSymbols(type)]);
         this.typeContext = source.export;
         this.noteType(type);
+        this.receiverSources.push({ export: source.export, receiver: id, type });
         member.scope_receiver = this.outlineReceiver(pkg, id, type, home, take, names, handlers, fills);
       }
     }

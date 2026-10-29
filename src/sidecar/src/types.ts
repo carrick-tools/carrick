@@ -1336,6 +1336,12 @@ export interface LibrarySurface {
    * (carrick#3050). `truncated` does not count them.
    */
   types_left_out?: number;
+  /**
+   * With `types: true`: per export, per receiver the surface lists, the
+   * `types` receiver ids its built type and base types are declared by
+   * (carrick#3051). Outside `surface_sha256`.
+   */
+  receiver_types?: Record<string, Record<string, string[]>>;
 }
 
 export interface ListLibrarySurfaceResponse extends BaseResponse {
