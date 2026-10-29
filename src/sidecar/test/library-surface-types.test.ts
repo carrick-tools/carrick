@@ -166,13 +166,15 @@ describe('list_library_surface: types (carrick#3050)', () => {
     assert.strictEqual(listed.types_left_out, undefined);
   });
 
-  it('names a handed type declared in another package', async () => {
+  it('names a handed type declared in another package, and lists its settable members', async () => {
     const [listed] = await surface(['fixture-router'], { types: true, handlers: true });
     assert.deepStrictEqual(listed.handler_types!.map(entry => entry.export), ['type:fixture-app#Context']);
     assert.deepStrictEqual(ids(listed), [
       ['type', 'Router'],
       ['type:fixture-app#Context', 'router'],
     ]);
+    const context = listed.types!.find(entry => entry.receivers[0].receiver === 'type:fixture-app#Context')!.receivers[0];
+    assert.deepStrictEqual(context.settable, [{ name: 'body', type: 'unknown', own: true }]);
     // Without `types`, the entry names nothing: the listing is the one #3025 gave.
     const [plain] = await surface(['fixture-router'], { handlers: true });
     assert.deepStrictEqual(plain.handler_types!.map(entry => entry.export), [undefined]);

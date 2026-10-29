@@ -1290,6 +1290,20 @@ export interface SurfaceReceiver {
   call?: SurfaceSignature[];
   construct?: SurfaceSignature[];
   members: SurfaceMember[];
+  /**
+   * With `types: true`, on a `types[]` receiver only: the properties a
+   * service may assign (not a method, not readonly, an open declared type),
+   * depth 1, sorted by name (carrick#3050). Absent when none.
+   */
+  settable?: SurfaceSettable[];
+}
+
+/** A property of a type receiver that `settable` answers `ok` for. */
+export interface SurfaceSettable {
+  name: string;
+  type: string;
+  /** As a member's `own`: the receiver's home declares it. */
+  own: boolean;
 }
 
 export interface SurfaceExport {

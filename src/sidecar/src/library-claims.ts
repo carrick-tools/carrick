@@ -67,6 +67,7 @@ import type {
   SurfaceParam,
   SurfaceReceiver,
   SurfaceSignature,
+  SurfaceSettable,
   SurfaceTypeExport,
 } from './types.js';
 import { memberDeclaration } from './declaration-attribution.js';
@@ -3766,7 +3767,7 @@ class DeclarationReader {
    * `types[]` under `types: true` (carrick#3050): every exported class, and
    * every type the surface's makers, members and handlers reach that has a
    * receiver id (`idOfSymbol`), sorted by id, each outlined as any receiver
-   * is. A `type` id reads the type
+   * is, with the properties a service may assign. A `type` id reads the type
    * the probe built at its defaults; any other, the type as reached when
    * that is its defaults (`atDefaults`). One budget of its own: an entry it
    * leaves out is counted in `types_left_out`.
@@ -3800,11 +3801,57 @@ class DeclarationReader {
       }
       const home = this.homeOf(pkg, [entry.symbol, ...typeSymbols(entry.type)]);
       const receiver = this.outlineReceiver(pkg, entry.id, entry.type, home, take, names, [], fills);
+      const settable = this.settableOf(pkg, entry.type, home);
+      if (settable.length > 0) receiver.settable = settable;
       listed.push({ export: entry.export, receivers: [receiver] });
     }
     for (const run of names) run();
     for (const fill of fills) fill();
     return listed;
+  }
+
+  /** The properties of a type a service may assign, depth 1, by name (`settable`). */
+  private settableOf(pkg: string, type: ts.Type, home: ReadonlySet<string>): SurfaceSettable[] {
+    const holder = this.surfaceHolder(pkg, type, home);
+    const listed: SurfaceSettable[] = [];
+    for (const property of sortedByName(this.namedProperties(type))) {
+      if (this.settable(holder, property) !== 'ok') continue;
+      listed.push({
+        name: property.getName(),
+        type: this.printed(this.checker.getTypeOfSymbol(property)),
+        own: !('failure' in this.ownMember(holder, property.getName())),
+      });
+    }
+    return listed;
+  }
+
+  /**
+   * Whether a service may assign `property` of `holder`, as a reply body is
+   * set (`ctx.body = x`): a property, not a method or a function-typed one
+   * (`set_not_property`); not readonly and not get-only (`set_readonly`); its
+   * declared type open, `unknown` or an unconstrained type parameter
+   * (`set_not_open`), which is what tells a body from a setter such as a
+   * status. No member name is read.
+   */
+  settable(holder: Holder, property: ts.Symbol): 'ok' | 'set_not_property' | 'set_readonly' | 'set_not_open' {
+    const read = this.declaredProperty(holder.type, property.getName()) ?? property;
+    const type = this.checker.getTypeOfSymbol(read);
+    if (
+      (read.flags & ts.SymbolFlags.Method) !== 0 ||
+      this.parts(type).some(part => part.getCallSignatures().length > 0 || part.getConstructSignatures().length > 0)
+    ) {
+      return 'set_not_property';
+    }
+    const declarations = read.declarations ?? [];
+    const getOnly = (read.flags & ts.SymbolFlags.GetAccessor) !== 0 && (read.flags & ts.SymbolFlags.SetAccessor) === 0;
+    if (
+      getOnly ||
+      (declarations.length > 0 &&
+        declarations.every(declaration => (ts.getCombinedModifierFlags(declaration) & ts.ModifierFlags.Readonly) !== 0))
+    ) {
+      return 'set_readonly';
+    }
+    return this.isOpenBody(type) ? 'ok' : 'set_not_open';
   }
 
   /**
