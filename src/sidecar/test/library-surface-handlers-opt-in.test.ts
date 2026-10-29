@@ -66,14 +66,31 @@ export declare class Router {
 
 interface Member {
   name: string;
-  handlers?: Array<{ arg: number; params: Array<{ name: string; members: Array<{ path: string[] }> }> }>;
+  handlers?: Array<{ arg: number; params: Array<{ name: string; type_id: number }> }>;
+}
+interface Entry {
+  id: number;
+  type: string;
+  dropped: number;
+  members: Array<{ path: string[] }>;
 }
 interface Listed {
   status: string;
   errors?: string[];
   surface_sha256: string;
-  surfaces: Array<{ handlers_truncated?: number; exports: Array<{ receivers: Array<{ members: Member[] }> }> }>;
+  surfaces: Array<{
+    handler_types?: Entry[];
+    handler_params_left_out?: number;
+    exports: Array<{ receivers: Array<{ members: Member[] }> }>;
+  }>;
 }
+
+/** The `handler_types` entry a parameter refers to (carrick#2977). */
+const entryOf = (listed: Listed, typeId: number): Entry => {
+  const entry = listed.surfaces[0].handler_types?.find(each => each.id === typeId);
+  assert.ok(entry, `type_id ${typeId} has no entry`);
+  return entry;
+};
 
 describe('list_library_surface: handler members only on request (carrick#2966)', () => {
   let client: SidecarClient;
@@ -134,7 +151,7 @@ describe('list_library_surface: handler members only on request (carrick#2966)',
       const handlers = byName.get(name)!.handlers;
       assert.ok(handlers, `${name} lists no handlers`);
       assert.deepStrictEqual(handlers.map(h => h.arg), [arg]);
-      assert.deepStrictEqual(handlers[0].params[0].members.map(m => m.path.join('.')), ['ack', 'payload', 'topic']);
+      assert.deepStrictEqual(entryOf(listed, handlers[0].params[0].type_id).members.map(m => m.path.join('.')), ['ack', 'payload', 'topic']);
     }
   });
 
@@ -148,7 +165,7 @@ describe('list_library_surface: handler members only on request (carrick#2966)',
     const listed = await list({ handlers: true }, 'fixture-server');
     const byName = new Map(membersOf(listed).map(m => [m.name, m]));
     for (const name of ['first', 'second']) {
-      const paths = byName.get(name)!.handlers![0].params[0].members.map(m => m.path.join('.'));
+      const paths = entryOf(listed, byName.get(name)!.handlers![0].params[0].type_id).members.map(m => m.path.join('.'));
       // Each method keeps a cap of its own, not what the other left.
       assert.strictEqual(paths.length, 500, name);
       // `zz` sorts after 600 nested members, and is kept: top-level first.
@@ -156,10 +173,11 @@ describe('list_library_surface: handler members only on request (carrick#2966)',
       assert.strictEqual(paths[paths.length - 1], 'zz');
       assert.strictEqual(paths[paths.length - 2], 'nested.n496');
     }
-    // 603 members per parameter (three top-level, 600 nested), 500 kept, for two parameters.
-    assert.strictEqual(listed.surfaces[0].handlers_truncated, 206);
+    // 603 members per type (three top-level, 600 nested), 500 kept: each
+    // type's entry counts its own drop once (carrick#2977 decision 8).
+    assert.deepStrictEqual(listed.surfaces[0].handler_types!.map(e => [e.type, e.dropped]), [['WideA', 103], ['WideB', 103]]);
     const without = await list({}, 'fixture-server');
-    assert.strictEqual(without.surfaces[0].handlers_truncated, undefined);
+    assert.strictEqual(without.surfaces[0].handler_types, undefined);
     assert.strictEqual(without.surface_sha256, listed.surface_sha256);
   });
 
@@ -167,18 +185,26 @@ describe('list_library_surface: handler members only on request (carrick#2966)',
   // limit near 512 MB. A server framework handed one request type by thousands
   // of members listed over a gigabyte of members, 50 distinct types inlined
   // per member. A listing spends one budget of handler members across the
-  // whole call; a parameter that would pass it is left out and counted.
-  it('spends one budget of handler members per listing, counts what it leaves out and keeps the hash', async () => {
+  // whole call. With the type table (carrick#2977) a type's members are
+  // written once, so only a new entry spends it: a parameter whose new entry
+  // would pass it is left out and counted, and a reference costs nothing.
+  it('spends one budget of handler members per listing on new entries, counts what it leaves out and keeps the hash', async () => {
     const free = await list({ handlers: true }, 'fixture-routes');
     const all = membersOf(free).filter(m => m.handlers !== undefined).map(m => m.name);
     assert.deepStrictEqual(all, ['del', 'get', 'post', 'put']);
-    assert.strictEqual(free.surfaces[0].handlers_truncated, 0);
+    assert.strictEqual(free.surfaces[0].handler_params_left_out, 0);
+    assert.strictEqual(free.surfaces[0].handler_types!.length, 1);
 
-    // 25 members: two parameters of ten fit, the third would pass it.
-    const bounded = await list({ handlers: true, max_handler_members: 25 }, 'fixture-routes');
-    const kept = membersOf(bounded).filter(m => m.handlers !== undefined).map(m => m.name);
-    assert.deepStrictEqual(kept, ['del', 'get']);
-    assert.strictEqual(bounded.surfaces[0].handlers_truncated, 20);
+    // 10 members: the one ten-member entry fits, so every method refers to it.
+    const fits = await list({ handlers: true, max_handler_members: 10 }, 'fixture-routes');
+    assert.deepStrictEqual(membersOf(fits).filter(m => m.handlers !== undefined).map(m => m.name), all);
+    assert.strictEqual(fits.surfaces[0].handler_params_left_out, 0);
+
+    // 9 members: the entry would pass it, so all four parameters are left out.
+    const bounded = await list({ handlers: true, max_handler_members: 9 }, 'fixture-routes');
+    assert.deepStrictEqual(membersOf(bounded).filter(m => m.handlers !== undefined).map(m => m.name), []);
+    assert.deepStrictEqual(bounded.surfaces[0].handler_types, []);
+    assert.strictEqual(bounded.surfaces[0].handler_params_left_out, 4);
     assert.strictEqual(bounded.surface_sha256, free.surface_sha256);
     const without = await list({}, 'fixture-routes');
     assert.strictEqual(without.surface_sha256, bounded.surface_sha256);

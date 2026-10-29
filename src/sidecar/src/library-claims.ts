@@ -60,11 +60,13 @@ import type {
   SurfaceHandler,
   SurfaceHandlerMember,
   SurfaceHandlerParam,
+  SurfaceHandlerType,
   SurfaceKey,
   SurfaceMember,
   SurfaceParam,
   SurfaceReceiver,
   SurfaceSignature,
+  SurfaceTypeExport,
 } from './types.js';
 import { memberDeclaration } from './declaration-attribution.js';
 
@@ -996,15 +998,30 @@ export class LibraryClaimsVerifier {
           };
     };
 
-    const makers = this.readProbe(fromDir, imports, (_checker, reader, file) =>
+    const read = this.readProbe(fromDir, imports, (_checker, reader, file) =>
       packages.map((pkg, i) => reader.makersOf(pkg, probeOf(file, i), only[pkg]))
     );
 
     const importLines: string[] = [];
     const buildLines: string[] = [];
     const builtIndex = new Map<string, number>();
+    // The type-only exports a handler's parameter may be (carrick#2977): each
+    // imported and declared at its defaults (`typeBuildLine`), as the verifier
+    // reads a `type` receiver. Only with handlers: the table names them.
+    const typeImports = new Map<string, number>();
     packages.forEach((pkg, i) => {
-      for (const { export: name, receivers, scopes } of makers[i]) {
+      if (options.handlers !== true) return;
+      for (const name of read[i].types) {
+        const local = `__carrick_e${importLines.length}`;
+        const key = builtKey({ package: pkg, export: name }, TYPE_RECEIVER);
+        typeImports.set(key, importLines.length);
+        importLines.push(probeLine(pkg, name, local));
+        builtIndex.set(key, buildLines.length);
+        buildLines.push(typeBuildLine(buildLines.length, local));
+      }
+    });
+    packages.forEach((pkg, i) => {
+      for (const { export: name, receivers, scopes } of read[i].makers) {
         const local = `__carrick_e${importLines.length}`;
         importLines.push(probeLine(pkg, name, local));
         // The scope receivers a maker's members may return (carrick#2774) are
@@ -1022,12 +1039,24 @@ export class LibraryClaimsVerifier {
     const surfaces = this.readProbe(fromDir, [...imports, ...importLines, ...buildLines], (checker, reader, file) => {
       // One budget for the whole call, spent across its specifiers: the answer is one line.
       reader.startListing(options.maxHandlerMembers ?? HANDLER_LISTING_BUDGET);
-      return packages.map((pkg, i) =>
-        reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], options, (name, receiver) => {
+      return packages.map((pkg, i) => {
+        const typeExports: BuiltType[] = [];
+        if (options.handlers === true) {
+          for (const name of read[i].types) {
+            const key = builtKey({ package: pkg, export: name }, TYPE_RECEIVER);
+            const built = builtType(
+              checker,
+              file.statements[imports.length + typeImports.get(key)!],
+              file.statements[firstBuild + builtIndex.get(key)!]
+            );
+            if (built) typeExports.push({ ...built, name });
+          }
+        }
+        return reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], options, typeExports, (name, receiver) => {
           const index = builtIndex.get(builtKey({ package: pkg, export: name }, receiver));
           return index === undefined ? undefined : resolvedBuild(checker, file.statements[firstBuild + index]);
-        })
-      );
+        });
+      });
     });
     return { surfaces, surface_sha256: fullSurfaceSha256(surfaces) };
   }
@@ -1098,6 +1127,48 @@ function resolvedBuild(checker: ts.TypeChecker, statement: ts.Statement | undefi
   const expression = statement.expression;
   if (!ts.isCallExpression(expression) && !ts.isNewExpression(expression)) return undefined;
   return checker.getResolvedSignature(expression);
+}
+
+/** The receiver id a type export is read on (carrick#2977): the type itself, at its defaults. */
+const TYPE_RECEIVER = 'type';
+
+/** A type export read as receiver `type`: the symbol the import names and the type built at its defaults. */
+interface BuiltType {
+  name: string;
+  symbol: ts.Symbol;
+  type: ts.Type;
+}
+
+/** The probe line that builds a type export bound to `local` at its declared type-parameter defaults. */
+function typeBuildLine(index: number, local: string): string {
+  return `declare const __carrick_t${index}: ${local};`;
+}
+
+/**
+ * What a type export's probe lines read (carrick#2977): the declaration its
+ * import names (`importStatement`, one named import) and the type
+ * `typeBuildLine` declares. Undefined when the name has no type meaning
+ * (a `const`) or the line does not resolve to a type (a generic whose type
+ * parameter has no default): the checker reads either as `any`.
+ */
+function builtType(
+  checker: ts.TypeChecker,
+  importStatement: ts.Statement | undefined,
+  buildStatement: ts.Statement | undefined
+): Omit<BuiltType, 'name'> | undefined {
+  if (!importStatement || !ts.isImportDeclaration(importStatement)) return undefined;
+  const bindings = importStatement.importClause?.namedBindings;
+  const element = bindings && ts.isNamedImports(bindings) ? bindings.elements[0] : undefined;
+  if (!element || !buildStatement || !ts.isVariableStatement(buildStatement)) return undefined;
+  const local = checker.getSymbolAtLocation(element.name);
+  if (!local) return undefined;
+  const symbol = local.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(local) : local;
+  if (checker.isUnknownSymbol(symbol) || (symbol.flags & ts.SymbolFlags.Type) === 0) return undefined;
+  const declaration = buildStatement.declarationList.declarations[0];
+  if (!declaration) return undefined;
+  const type = checker.getTypeAtLocation(declaration.name);
+  if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return undefined;
+  return { symbol, type };
 }
 
 /** The answer to `list_library_surface`. */
@@ -1420,8 +1491,18 @@ class DeclarationReader {
   /** `takesString` per signature, and `scopeMembers` per type and home: the same types recur across receivers. */
   private readonly takesStringRead = new Map<ts.Signature, boolean>();
   private readonly scopeMembersRead = new Map<ts.Type, Map<string, readonly string[]>>();
-  /** Handler-parameter members `HANDLER_MEMBER_CAP` and the listing's budget dropped in the package being listed. */
-  private handlersDropped = 0;
+  /**
+   * The surface being listed's `handler_types` (carrick#2977): its entries in
+   * id order; per type object and export name, the id it was given (0: the
+   * budget left it out); per content key, the id. Reset per surface.
+   */
+  private handlerTypes: SurfaceHandlerType[] = [];
+  private readonly handlerTypeIds = new Map<ts.Type, Map<string | null, number>>();
+  private readonly handlerTypeByContent = new Map<string, number>();
+  /** The handler parameters the listing's budget left out of the surface being listed (carrick#3016). */
+  private handlerParamsLeftOut = 0;
+  /** The surface being listed's nameable type exports, by the symbol each names (carrick#2977). */
+  private typeExportNames = new Map<ts.Symbol, string>();
   /** Handler-parameter members the rest of this `listSurface` call may still list (carrick#3016). */
   private handlerBudget = HANDLER_LISTING_BUDGET;
 
@@ -3470,6 +3551,7 @@ class DeclarationReader {
     maxEntries: number,
     only: readonly string[] | undefined,
     options: SurfaceOptions,
+    typeExports: readonly BuiltType[],
     built: (exportName: string, receiver: string) => ts.Signature | undefined
   ): LibrarySurface {
     this.setPackage(pkg);
@@ -3496,11 +3578,21 @@ class DeclarationReader {
     };
     // Handler-parameter members (carrick#2674) take nothing from the main cap,
     // so the listing, `truncated` and the hash are the ones the lister gave
-    // before handlers were listed; each parameter has a cap of its own
-    // (`HANDLER_MEMBER_CAP`, carrick#2966).
-    this.handlersDropped = 0;
+    // before handlers were listed; each parameter type has a cap of its own
+    // (`HANDLER_MEMBER_CAP`, carrick#2966), and is listed once per surface in
+    // `handler_types` (carrick#2977).
     this.listResultCandidates = options.resultCandidates === true;
     const withHandlers = options.handlers === true;
+    if (withHandlers) {
+      this.handlerTypes = [];
+      this.handlerTypeIds.clear();
+      this.handlerTypeByContent.clear();
+      this.handlerParamsLeftOut = 0;
+      this.typeExportNames = new Map();
+      for (const each of [...typeExports].sort((a, b) => byName(a.name, b.name))) {
+        if (!this.typeExportNames.has(each.symbol)) this.typeExportNames.set(each.symbol, each.name);
+      }
+    }
     // Four passes: every export and receiver, then every member name, then the
     // members of each handler's parameters (carrick#2674; only when asked,
     // carrick#2966), then signatures.
@@ -3548,8 +3640,42 @@ class DeclarationReader {
     for (const fill of fills) fill();
     this.listScopeReceivers(pkg, instances, maxEntries, withHandlers, built);
     surface.truncated = dropped;
-    if (withHandlers) surface.handlers_truncated = this.handlersDropped;
+    if (withHandlers) {
+      surface.handler_types = this.handlerTypes;
+      surface.types = this.listTypeReceivers(pkg, typeExports, maxEntries);
+      surface.handler_params_left_out = this.handlerParamsLeftOut;
+    }
     return surface;
+  }
+
+  /**
+   * The sixth pass (carrick#2977): each type export a `handler_types` entry
+   * names, sorted by name, as the one receiver `type`, built at its declared
+   * type-parameter defaults as the verifier builds it (`typeBuildLine`), and
+   * outlined as any receiver is, without handlers. Everything it lists draws
+   * on one budget of its own, so `truncated` and the hash are unchanged.
+   */
+  private listTypeReceivers(pkg: string, typeExports: readonly BuiltType[], maxEntries: number): SurfaceTypeExport[] {
+    const named = [...new Set(this.handlerTypes.flatMap(entry => (entry.export === undefined ? [] : [entry.export])))].sort(
+      byName
+    );
+    let budget = maxEntries;
+    const take = (): boolean => budget > 0 && (budget--, true);
+    const names: Array<() => void> = [];
+    const fills: Array<() => void> = [];
+    const listed: SurfaceTypeExport[] = [];
+    for (const name of named) {
+      const built = typeExports.find(each => each.name === name);
+      if (built === undefined || !take()) continue;
+      const home = this.homeOf(pkg, [built.symbol, ...typeSymbols(built.type)]);
+      listed.push({
+        export: name,
+        receivers: [this.outlineReceiver(pkg, TYPE_RECEIVER, built.type, home, take, names, [], fills)],
+      });
+    }
+    for (const run of names) run();
+    for (const fill of fills) fill();
+    return listed;
   }
 
   /**
@@ -3599,11 +3725,12 @@ class DeclarationReader {
     pkg: string,
     probe: SurfaceProbe,
     only: readonly string[] | undefined
-  ): { export: string; receivers: string[]; scopes: string[] }[] {
+  ): { makers: { export: string; receivers: string[]; scopes: string[] }[]; types: string[] } {
     this.setPackage(pkg);
     const moduleRead = 'namespace' in probe ? this.readModule(pkg, probe.namespace, true) : undefined;
-    if (moduleRead?.reason) return [];
-    return (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
+    if (moduleRead?.reason) return { makers: [], types: [] };
+    const types = 'namespace' in probe && !moduleRead?.globalFile ? this.typeExportCandidates(probe.namespace) : [];
+    const makers = (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
       .filter(({ type }) => !this.isOpenTop(type))
       .map(({ name, target, type }) => {
         const makers = this.makers(pkg, target, type);
@@ -3614,6 +3741,35 @@ class DeclarationReader {
         };
       })
       .filter(({ receivers }) => receivers.length > 0);
+    return { makers, types };
+  }
+
+  /**
+   * The type-only exports of a specifier a handler's parameter may be
+   * (carrick#2977 decision 7), sorted by name: an interface or a type alias
+   * with no value meaning, every type parameter defaulted, so the probe can
+   * build it with no type argument. Every one, whatever `only` names: the
+   * value exports a caller wants hand these types to their handlers. A
+   * superset: the listing names one only when a parameter is that
+   * declaration and it is declared in the handing receiver's home.
+   */
+  private typeExportCandidates(namespace: ts.ImportDeclaration): string[] {
+    const moduleSymbol = this.checker.getSymbolAtLocation(namespace.moduleSpecifier);
+    if (!moduleSymbol) return [];
+    const names: string[] = [];
+    for (const symbol of this.checker.getExportsOfModule(moduleSymbol)) {
+      const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
+      if (
+        IDENTIFIER.test(symbol.getName()) &&
+        !this.checker.isUnknownSymbol(target) &&
+        (target.flags & ts.SymbolFlags.Value) === 0 &&
+        (target.flags & (ts.SymbolFlags.Interface | ts.SymbolFlags.TypeAlias)) !== 0 &&
+        typeParametersDefaulted(target)
+      ) {
+        names.push(symbol.getName());
+      }
+    }
+    return names.sort(byName);
   }
 
   /**
@@ -3929,7 +4085,7 @@ class DeclarationReader {
         const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
         handlers.push(() => {
-          const listed = this.listHandlers(own ? callee.signatures : library);
+          const listed = this.listHandlers(own ? callee.signatures : library, home);
           if (listed.length > 0) member.handlers = listed;
         });
         fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, holder.type, take)));
@@ -3945,13 +4101,13 @@ class DeclarationReader {
    * A parameter that declares no member lists nothing, and so does a handler
    * none of whose parameters do.
    */
-  private listHandlers(signatures: readonly ts.Signature[]): SurfaceHandler[] {
+  private listHandlers(signatures: readonly ts.Signature[], home: ReadonlySet<string>): SurfaceHandler[] {
     const listed: SurfaceHandler[] = [];
     const seen = new Set<string>();
     const add = (arg: number, key: string | undefined, slot: ts.Type): void => {
       const place = JSON.stringify([arg, key ?? null]);
       if (seen.has(place)) return;
-      const params = this.listHandlerParams(slot);
+      const params = this.listHandlerParams(slot, home);
       if (params.length === 0) return;
       seen.add(place);
       listed.push(key === undefined ? { arg, params } : { arg, key, params });
@@ -3979,8 +4135,13 @@ class DeclarationReader {
     return listed;
   }
 
-  /** The parameters of a function type's first signature that declare members, each with its members (`handlerMembersOf`). */
-  private listHandlerParams(handler: ts.Type): SurfaceHandlerParam[] {
+  /**
+   * The parameters of a function type's first signature that declare
+   * members, each by the id of its type's entry (`handlerTypeId`). A
+   * parameter whose new entry would pass the listing's budget is left out
+   * and counted (carrick#3016).
+   */
+  private listHandlerParams(handler: ts.Type, home: ReadonlySet<string>): SurfaceHandlerParam[] {
     const slot = this.throughConditional(this.throughConstraint(handler));
     if (slot === VARIADIC) return [];
     const signature = this.parts(slot)
@@ -3991,17 +4152,69 @@ class DeclarationReader {
     signature.getParameters().forEach((parameter, index) => {
       const type = this.checker.getTypeOfSymbol(parameter);
       if (this.namedProperties(type).length === 0) return;
-      const { members, dropped } = this.handlerMembersOf(type);
-      this.handlersDropped += dropped;
-      // Past the listing's budget a parameter is left out whole and counted (carrick#3016).
-      if (members.length > this.handlerBudget) {
-        this.handlersDropped += members.length;
+      const id = this.handlerTypeId(type, home);
+      if (id === 0) {
+        this.handlerParamsLeftOut += 1;
         return;
       }
-      this.handlerBudget -= members.length;
-      listed.push({ param: index, name: parameter.getName(), type: this.printed(type), members });
+      listed.push({ param: index, name: parameter.getName(), type_id: id });
     });
     return listed;
+  }
+
+  /**
+   * The id of a handler parameter's entry in the surface's `handler_types`
+   * (carrick#2977), 0 when the listing's budget leaves it out. One lookup per
+   * parameter by type object and export name; a type object seen for the
+   * first time is keyed by content (its printed type, members and export
+   * name), so equal contents share one entry and a resolved reference is
+   * byte for byte the inline parameter the lister wrote before. Only a new
+   * entry spends the budget: its members are written once.
+   */
+  private handlerTypeId(type: ts.Type, home: ReadonlySet<string>): number {
+    const exportName = this.nameableExport(type, home);
+    let byExport = this.handlerTypeIds.get(type);
+    if (byExport === undefined) this.handlerTypeIds.set(type, (byExport = new Map()));
+    const known = byExport.get(exportName);
+    if (known !== undefined) return known;
+    const { members, dropped } = this.handlerMembersOf(type);
+    const printed = this.printed(type);
+    const content = JSON.stringify([printed, members, exportName]);
+    let id = this.handlerTypeByContent.get(content);
+    if (id === undefined) {
+      if (members.length > this.handlerBudget) {
+        id = 0;
+      } else {
+        this.handlerBudget -= members.length;
+        id = this.handlerTypes.length + 1;
+        const entry: SurfaceHandlerType = { id, type: printed, members, dropped };
+        if (exportName !== null) entry.export = exportName;
+        this.handlerTypes.push(entry);
+      }
+      this.handlerTypeByContent.set(content, id);
+    }
+    byExport.set(exportName, id);
+    return id;
+  }
+
+  /**
+   * The type export of the surface being listed that a handler parameter's
+   * type is (carrick#2977 decision 7): the same symbol (its alias's, then its
+   * own), never the same name, with a declaration in `home`, the packages of
+   * the receiver whose member hands it, as `yieldsOutcome` reads a `yields`.
+   */
+  private nameableExport(type: ts.Type, home: ReadonlySet<string>): string | null {
+    if (this.typeExportNames.size === 0) return null;
+    for (const symbol of [type.aliasSymbol, type.getSymbol()]) {
+      const name = symbol === undefined ? undefined : this.typeExportNames.get(symbol);
+      if (
+        name !== undefined &&
+        (symbol!.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), home))
+      ) {
+        return name;
+      }
+    }
+    return null;
   }
 
   /**
@@ -4706,6 +4919,20 @@ function printTypeNode(node: ts.Node): string {
 }
 
 /** Code-unit order on names. */
+/** Every type parameter of an interface or type alias has a default, in some declaration of it (carrick#2977). */
+function typeParametersDefaulted(symbol: ts.Symbol): boolean {
+  const declarations = (symbol.declarations ?? []).filter(
+    (declaration): declaration is ts.InterfaceDeclaration | ts.TypeAliasDeclaration =>
+      ts.isInterfaceDeclaration(declaration) || ts.isTypeAliasDeclaration(declaration)
+  );
+  if (declarations.length === 0) return false;
+  const count = Math.max(...declarations.map(declaration => declaration.typeParameters?.length ?? 0));
+  for (let index = 0; index < count; index++) {
+    if (!declarations.some(declaration => declaration.typeParameters?.[index]?.default !== undefined)) return false;
+  }
+  return true;
+}
+
 function byName(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }

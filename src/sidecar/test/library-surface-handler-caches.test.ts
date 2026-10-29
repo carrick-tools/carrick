@@ -14,7 +14,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { Project } from 'ts-morph';
-import { SidecarClient } from './helpers.js';
+import { SidecarClient, inlineHandlerParams } from './helpers.js';
 import { LibraryClaimsVerifier, surfaceReadCounts } from '../src/library-claims.js';
 import type { LibrarySurface } from '../src/types.js';
 
@@ -75,10 +75,15 @@ export declare function app(): App;
 
 /**
  * The listing's bytes, minus the fields that carry the fixture's temporary
- * directory (`resolved_file`) and the version the fixture writes.
+ * directory (`resolved_file`) and the version the fixture writes, with each
+ * handler parameter's `type_id` resolved inline (carrick#2977), as the
+ * lister wrote it before the table: so the goldens below still hold.
  */
 function listingSha(surfaces: LibrarySurface[]): string {
-  const kept = surfaces.map(s => [s.package, s.truncated, s.handlers_truncated ?? null, s.exports]);
+  const kept = surfaces.map(s => {
+    const { surface, dropped } = inlineHandlerParams(s as unknown as Record<string, unknown>);
+    return [s.package, s.truncated, 'handler_types' in s ? dropped : null, surface.exports];
+  });
   return crypto.createHash('sha256').update(JSON.stringify(kept)).digest('hex');
 }
 
