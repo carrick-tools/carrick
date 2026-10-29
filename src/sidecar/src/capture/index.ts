@@ -553,13 +553,21 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
   const nodeModulesPresent = fs.existsSync(path.join(dependencyRoot, 'node_modules'));
-  const unresolvedDependencies =
-    deno || !nodeModulesPresent ? [] : unresolvedDeclaredDependencies(dependencyRoot);
-  const bareCheckout = !deno && (!nodeModulesPresent || unresolvedDependencies.length > 0);
+  const declared =
+    deno || !nodeModulesPresent
+      ? { unresolved: [], runtimeDeclared: 0, runtimeResolved: 0 }
+      : declaredDependencyResolution(dependencyRoot);
+  const unresolvedDependencies = declared.unresolved;
+  // Bare: no node_modules, or every declared runtime dependency dangles (a
+  // missing pnpm store). One missing package, or missing devDependencies,
+  // leaves the installed ones usable (carrick#2999).
+  const bareCheckout =
+    !deno &&
+    (!nodeModulesPresent || (declared.runtimeDeclared > 0 && declared.runtimeResolved === 0));
   if (unresolvedDependencies.length > 0) {
     console.error(
-      `[sidecar] capture ${packageName}: bare checkout, declared dependencies do not resolve: ` +
-        unresolvedDependencies.join(', ')
+      `[sidecar] capture ${packageName}: declared dependencies do not resolve` +
+        `${bareCheckout ? ' (bare checkout)' : ''}: ${unresolvedDependencies.join(', ')}`
     );
   }
 
@@ -653,46 +661,55 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 const UNRESOLVED_DEPENDENCIES_NAMED = 5;
 
 /**
- * The first few packages `root/package.json` declares (dependencies and
- * devDependencies) that do not resolve from `root`: no `node_modules/<name>`
- * in `root` or any parent directory. `existsSync` follows links, so a pnpm
- * link into a missing store reads as unresolved (carrick#2999). Declared names
- * only, one stat per ancestor: no module walk.
+ * How `root/package.json` dependencies resolve from `root`: no
+ * `node_modules/<name>` in `root` or any parent directory means unresolved.
+ * `existsSync` follows links, so a pnpm link into a missing store reads as
+ * unresolved (carrick#2999). `unresolved` is the first few names across
+ * dependencies and devDependencies, sorted; the runtime counts cover
+ * `dependencies` only. Declared names only, one stat per ancestor.
  */
-function unresolvedDeclaredDependencies(root: string): string[] {
+function declaredDependencyResolution(root: string): {
+  unresolved: string[];
+  runtimeDeclared: number;
+  runtimeResolved: number;
+} {
+  const none = { unresolved: [], runtimeDeclared: 0, runtimeResolved: 0 };
   let manifest: unknown;
   try {
     manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   } catch {
-    return [];
+    return none;
   }
-  if (manifest === null || typeof manifest !== 'object') return [];
-  const declared = new Set<string>();
-  for (const field of ['dependencies', 'devDependencies'] as const) {
+  if (manifest === null || typeof manifest !== 'object') return none;
+  const names = (field: string): string[] => {
     const group = (manifest as Record<string, unknown>)[field];
-    if (group !== null && typeof group === 'object') {
-      for (const name of Object.keys(group)) declared.add(name);
-    }
-  }
-  const unresolved: string[] = [];
-  for (const name of [...declared].sort()) {
+    return group !== null && typeof group === 'object' ? Object.keys(group) : [];
+  };
+  const resolves = (name: string): boolean => {
     let dir = path.resolve(root);
-    let found = false;
     for (;;) {
-      if (fs.existsSync(path.join(dir, 'node_modules', name))) {
-        found = true;
-        break;
-      }
+      if (fs.existsSync(path.join(dir, 'node_modules', name))) return true;
       const parent = path.dirname(dir);
-      if (parent === dir) break;
+      if (parent === dir) return false;
       dir = parent;
     }
-    if (!found) {
+  };
+  const runtime = new Set(names('dependencies'));
+  const all = new Set([...runtime, ...names('devDependencies')]);
+  let runtimeResolved = 0;
+  const unresolved: string[] = [];
+  for (const name of [...all].sort()) {
+    if (resolves(name)) {
+      if (runtime.has(name)) runtimeResolved++;
+    } else {
       unresolved.push(name);
-      if (unresolved.length === UNRESOLVED_DEPENDENCIES_NAMED) break;
     }
   }
-  return unresolved;
+  return {
+    unresolved: unresolved.slice(0, UNRESOLVED_DEPENDENCIES_NAMED),
+    runtimeDeclared: runtime.size,
+    runtimeResolved,
+  };
 }
 
 /** What one, as text: nothing here is a compiler object. */

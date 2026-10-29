@@ -152,4 +152,49 @@ describe('capture v2: declared dependencies that do not resolve', () => {
     assert.strictEqual(result.bare_checkout, true);
     assert.deepStrictEqual(result.unresolved_dependencies, []);
   });
+
+  it('keeps an installed tree installed when one runtime dependency is missing', () => {
+    const result = capture({
+      'package.json': JSON.stringify({
+        name: 'svc',
+        dependencies: { alpha: '^1.0.0', 'optional-native': '^1.0.0' },
+      }),
+      'node_modules/alpha/package.json': JSON.stringify({ name: 'alpha', version: '1.0.0' }),
+    });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    assert.strictEqual(result.bare_checkout, false);
+    assert.deepStrictEqual(result.unresolved_dependencies, ['optional-native']);
+  });
+
+  it('ignores missing devDependencies when the runtime ones are present', () => {
+    const result = capture({
+      'package.json': JSON.stringify({
+        name: 'svc',
+        dependencies: { alpha: '^1.0.0' },
+        devDependencies: { 'dev-a': '1.0.0', 'dev-b': '1.0.0' },
+      }),
+      'node_modules/alpha/package.json': JSON.stringify({ name: 'alpha', version: '1.0.0' }),
+    });
+    assert.strictEqual(result.bare_checkout, false);
+    assert.deepStrictEqual(result.unresolved_dependencies, ['dev-a', 'dev-b']);
+  });
+
+  it('reads a tree as bare when every runtime dependency dangles', () => {
+    const result = capture(
+      {
+        'package.json': JSON.stringify({
+          name: 'svc',
+          dependencies: { alpha: '^1.0.0', beta: '^2.0.0' },
+          devDependencies: { gamma: '^3.0.0' },
+        }),
+        'node_modules/gamma/package.json': JSON.stringify({ name: 'gamma', version: '3.0.0' }),
+      },
+      {
+        'node_modules/alpha': '../node_modules/.pnpm/alpha@1.0.0/node_modules/alpha',
+        'node_modules/beta': '../node_modules/.pnpm/beta@2.0.0/node_modules/beta',
+      }
+    );
+    assert.strictEqual(result.bare_checkout, true);
+    assert.deepStrictEqual(result.unresolved_dependencies, ['alpha', 'beta']);
+  });
 });
