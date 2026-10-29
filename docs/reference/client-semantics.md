@@ -315,7 +315,16 @@ an HTTP row.
     `receive` is the listener. An export that serves both sides, or says
     nothing, states nothing. An export the store marks `by_origin` has no
     side of its own: it states no library row, and a decided site's label
-    carries no side, so the site's direction is `UNKNOWN`.
+    carries no side. A decided site's side is the origin of its instance
+    instead (the origin rule, carrick#1670), read from the instance ends the
+    receiver trace records: the parameter of a function that a call of a
+    `socket` export of the same package runs (`hub.on("connection", (peer) =>
+    …)`) is handed in on the side that call's op states in `yields`, or else
+    on its export's side; an instance a maker of the same package made is the
+    client's. Every end must give the same side; a hole, an end of another
+    package, or two sides leaves the direction `UNKNOWN`, as does a scan
+    without the receiver trace. A call of the Socket.IO server class names no
+    `yields`, so its export's side is the one read.
   - Every other role, HTTP included, states nothing here.
 
   Each row is a `library_claim` fact with `library_semantics` (its claim

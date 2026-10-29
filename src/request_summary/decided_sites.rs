@@ -65,7 +65,7 @@ mod procedures;
 pub use boundaries::RouteBoundaries;
 pub use composed::Composed;
 pub use instances::{
-    InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
+    InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel, origin_side,
 };
 pub use procedures::{Procedure, ProcedureLabels};
 
@@ -214,6 +214,11 @@ pub struct SiteLabel {
     /// Set on an op claimed on what a scope member returns (carrick#1678).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<LabelScope>,
+    /// A `receive` op's `yields`: what its handler is handed, and on which
+    /// side of the connection. Read by the origin rule that decides a
+    /// `by_origin` socket's side (carrick#1670).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yields: Option<crate::services::type_sidecar::Yields>,
 }
 
 /// The scope member an op is claimed on the result of (carrick#1678):
@@ -257,6 +262,8 @@ impl SiteLabel {
             method: Option<MethodLabel>,
             #[serde(default)]
             request: Option<crate::services::type_sidecar::RequestAt>,
+            #[serde(default)]
+            yields: Option<crate::services::type_sidecar::Yields>,
         }
         #[derive(Deserialize)]
         struct Export {
@@ -301,6 +308,7 @@ impl SiteLabel {
                         runs: None,
                         request: op.request,
                         scope: None,
+                        yields: op.yields,
                     });
                 }
             }
@@ -358,6 +366,7 @@ impl SiteLabel {
                         }),
                         request: None,
                         scope: None,
+                        yields: None,
                     });
                     continue;
                 }
@@ -374,6 +383,7 @@ impl SiteLabel {
                     method_key,
                     method_default,
                     request,
+                    yields,
                     ..
                 } = claim
                 else {
@@ -403,6 +413,7 @@ impl SiteLabel {
                     reserved: reserved_on(&export.claims, member.as_deref(), path, (*on, of)),
                     runs: None,
                     request: request.as_deref().cloned(),
+                    yields: yields.as_deref().cloned(),
                     scope: of
                         .as_deref()
                         .and_then(crate::library_claims::scope_step)
@@ -624,8 +635,9 @@ pub struct DecidedSite {
     /// How discovery matched the labelled call, with the receiver trace on.
     pub reached: Option<super::discovery::ReachedBy>,
     /// With the receiver trace on, the instance the labelled call is made
-    /// on, one end per caller that hands one in (carrick#2474 R2a). Read by
-    /// nothing; never part of a record's state.
+    /// on, one end per caller that hands one in (carrick#2474 R2a). Read
+    /// only by the origin rule that decides a `by_origin` socket's side
+    /// ([`origin_side`], carrick#1670); never part of a record's state.
     pub instances: Vec<InstanceEnd>,
     /// With the receiver trace on, the full path the route is served at
     /// per instance end, every scope and mount prefix joined from the top
@@ -2200,7 +2212,14 @@ fn decide(
     } else {
         Calls::index_with(inputs, siblings, &entered_files)
     };
-    let index = makers.map(|_| instances::WalkIndex::of(&calls, inputs, scopes));
+    let index = makers.map(|_| {
+        instances::WalkIndex::of(
+            &calls,
+            inputs,
+            scopes,
+            instances::HostLabel::of_discovered(root, discovered, labels),
+        )
+    });
     let mut out = Decided::default();
     // The functions some listed site's chain enters: a site whose value
     // still holds a parameter is decided by those callers, which discovery
@@ -2873,6 +2892,7 @@ pub(crate) mod tests {
             vec![
                 SiteLabel {
                     by_origin: false,
+                    yields: None,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("post".into()),
@@ -2894,6 +2914,7 @@ pub(crate) mod tests {
                 },
                 SiteLabel {
                     by_origin: false,
+                    yields: None,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("send".into()),
@@ -3725,6 +3746,7 @@ pub(crate) mod tests {
     ) -> SiteLabel {
         SiteLabel {
             by_origin: false,
+            yields: None,
             package: "@fixture/wire".into(),
             export: "connect".into(),
             member: Some(member.into()),
@@ -3746,6 +3768,7 @@ pub(crate) mod tests {
     pub(crate) fn fetch_label() -> SiteLabel {
         SiteLabel {
             by_origin: false,
+            yields: None,
             package: "lib:lib.dom.d.ts".into(),
             export: "fetch".into(),
             member: None,
@@ -3775,6 +3798,7 @@ pub(crate) mod tests {
     pub(crate) fn child_send_label() -> SiteLabel {
         SiteLabel {
             by_origin: false,
+            yields: None,
             package: "node:child_process".into(),
             export: "ChildProcess".into(),
             member: Some("send".into()),
@@ -4342,6 +4366,7 @@ pub(crate) mod tests {
         let router = http_get_label();
         let scoped = SiteLabel {
             by_origin: false,
+            yields: None,
             name: None,
             handler: Some(ArgSlot { arg: 0, key: None }),
             scope: Some(LabelScope {
@@ -4490,6 +4515,7 @@ pub(crate) mod tests {
     fn http_get_label() -> SiteLabel {
         SiteLabel {
             by_origin: false,
+            yields: None,
             package: "@fixture/http".into(),
             export: "default".into(),
             member: Some("get".into()),

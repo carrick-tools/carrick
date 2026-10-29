@@ -1,0 +1,122 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/rt",
+      "version": "2.0.0",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "@fixture/rt",
+          "export": "Hub",
+          "role": "socket",
+          "side": "server",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "new",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "on",
+              "on": "instance",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/rt",
+          "export": "Gate",
+          "role": "socket",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "new",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "watch",
+              "on": "instance",
+              "yields": {
+                "param": 1,
+                "export": "Peer",
+                "side": "server"
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/rt",
+          "export": "Peer",
+          "role": "socket",
+          "side": "client",
+          "side_rule": "by_origin",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "new",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "send",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "listen",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

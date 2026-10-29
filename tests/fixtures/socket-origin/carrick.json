@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "hub", "directory": "services/hub" },
+    { "name": "peer", "directory": "services/peer" }
+  ]
+}

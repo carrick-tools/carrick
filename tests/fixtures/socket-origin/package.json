@@ -1,0 +1,9 @@
+{
+  "name": "socket-origin-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": ["services/*"],
+  "dependencies": {
+    "@fixture/rt": "^2.0.0"
+  }
+}

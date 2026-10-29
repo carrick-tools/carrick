@@ -140,7 +140,7 @@ fn unverified_roots<'a>(
                 InstanceAt::Root { package, .. } | InstanceAt::Scope { package, .. } => {
                     Some(package.as_str())
                 }
-                InstanceAt::Hole { .. } => None,
+                InstanceAt::Hole { .. } | InstanceAt::Handed { .. } => None,
             })
             .collect();
         if packages.is_empty() {
@@ -350,6 +350,9 @@ fn chains(
         }
     };
     match &end.end {
+        // A socket library's call hands the instance in: nothing mounts it
+        // under a prefix (carrick#1670).
+        InstanceAt::Handed { .. } => ended("handed".to_string(), None, budget),
         InstanceAt::Hole {
             reason, boundary, ..
         } => ended(

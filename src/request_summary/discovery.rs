@@ -4123,6 +4123,7 @@ export function listen(): void {
                 let what = match &end.end {
                     InstanceAt::Root { file, line, .. } => format!("root {file}:{line}"),
                     InstanceAt::Scope { file, line, .. } => format!("scope {file}:{line}"),
+                    InstanceAt::Handed { file, line, .. } => format!("handed {file}:{line}"),
                     InstanceAt::Hole { reason, .. } => serde_json::to_value(reason)
                         .unwrap()
                         .as_str()
@@ -5034,6 +5035,14 @@ export function listen(): void {
                             Prefix::Unread { .. } => "?".to_string(),
                         }
                     ),
+                    InstanceAt::Handed {
+                        package,
+                        export,
+                        side,
+                        ..
+                    } => {
+                        format!("handed {package} {export} {side}")
+                    }
                     InstanceAt::Hole { .. } => format!("{:?}", end.hole()),
                 };
                 out.push(format!("{}:{} <- {} {what}", site.file, site.line, end.at));
