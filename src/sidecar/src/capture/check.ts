@@ -57,23 +57,81 @@ interface SpawnResult {
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
+  /** True when the process outlived its time limit and was killed for it. */
+  timedOut: boolean;
 }
 
 function runProcess(
   command: string,
   args: string[],
   cwd: string,
-  env?: NodeJS.ProcessEnv
+  env?: NodeJS.ProcessEnv,
+  timeoutMs?: number
 ): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // With a limit the child leads its own process group, so the kill takes
+    // the package manager's workers with it and `close` can fire.
+    const child = spawn(command, args, {
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: timeoutMs !== undefined,
+    });
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            try {
+              process.kill(-(child.pid as number), 'SIGKILL');
+            } catch {
+              child.kill('SIGKILL');
+            }
+          }, timeoutMs);
     child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
     child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
-    child.on('error', reject);
-    child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
+    child.on('error', (e) => {
+      if (timer) clearTimeout(timer);
+      reject(e);
+    });
+    child.on('close', (code, signal) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr, timedOut });
+    });
   });
+}
+
+/** The check install's own time limit, in ms (carrick#3021). */
+export const DEFAULT_INSTALL_TIMEOUT_MS = 300_000;
+
+/** What the package manager prints when it cannot reach the registry. */
+const REGISTRY_UNREACHABLE =
+  /ERR_PNPM_META_FETCH_FAIL|ERR_PNPM_FETCH_|ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENETUNREACH/;
+
+/**
+ * Why the check install did not finish, as a gate and a sentence the verdicts
+ * carry. A hang and a refused connection are named apart from a plain failure.
+ */
+export function installFailure(
+  install: Pick<SpawnResult, 'timedOut' | 'stderr' | 'stdout'>,
+  limitMs: number
+): { gate: string; reason: string } {
+  if (install.timedOut) {
+    return {
+      gate: 'install:timeout',
+      reason: `workspace dependency install did not finish within ${Math.round(limitMs / 1000)}s (registry unreachable or too slow)`,
+    };
+  }
+  if (REGISTRY_UNREACHABLE.test(`${install.stderr}\n${install.stdout}`)) {
+    return {
+      gate: 'install:registry-unreachable',
+      reason: 'workspace dependency install failed: the package registry could not be reached',
+    };
+  }
+  return { gate: 'install:failed', reason: 'workspace dependency install failed' };
 }
 
 /** The tail V8 prints on every fatal heap-exhaustion line. */
@@ -402,8 +460,16 @@ export async function runCheck(
 
   // ---- Install (async, off the event loop) --------------------------------
   progress('installing', 'installing pinned dependencies');
-  const install = await runProcess(pnpmPath, ['install'], ws.workspaceDir);
-  if (install.code !== 0) {
+  const installLimitMs = opts.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS;
+  const install = await runProcess(
+    pnpmPath,
+    ['install'],
+    ws.workspaceDir,
+    undefined,
+    installLimitMs
+  );
+  if (install.code !== 0 || install.timedOut) {
+    const failure = installFailure(install, installLimitMs);
     const installError = scrubPaths(
       (install.stderr || install.stdout).trim().slice(0, 2000),
       scrubCtx
@@ -411,15 +477,17 @@ export async function runCheck(
     // `errors` says why the run failed (carrick#1821); each pair the install
     // stopped says it too, because the client reads every pair's own verdict
     // on a failed check (carrick#1833).
-    errors.push(`workspace dependency install failed${installError ? `: ${installError}` : ''}`);
+    errors.push(
+      `${failure.reason}${installError && failure.gate !== 'install:timeout' ? `: ${installError}` : ''}`
+    );
     for (const s of opts.stubs) {
       degraded.push({ service_name: s.service_name, reason: 'workspace install failed' });
     }
     const verdicts = sortVerdicts([
       ...unverifiableAll(
         probing,
-        'install:failed',
-        'workspace dependency install failed; compatibility cannot be verified.' +
+        failure.gate,
+        `${failure.reason}; compatibility cannot be verified.` +
           (installError ? ` Installer output: ${installError}` : '')
       ),
       // Capture-decay verdicts stand regardless of the install outcome.
