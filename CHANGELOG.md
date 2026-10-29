@@ -20,10 +20,6 @@
 * the site fold writes its call-side facts into the mount graph ([#2795](https://github.com/carrick-tools/carrick/issues/2795)) ([#2987](https://github.com/carrick-tools/carrick/issues/2987)) ([41a7be3](https://github.com/carrick-tools/carrick/commit/41a7be3df5cc83f09291a45ff24ba6c49cd89c3a))
 
 
-### Refactoring
-
-* **scanner:** delete Signal 2 and Signal 4, the detection-list and await gates ([#2440](https://github.com/carrick-tools/carrick/issues/2440) C4, C2) ([#2995](https://github.com/carrick-tools/carrick/issues/2995)) ([3fa1486](https://github.com/carrick-tools/carrick/commit/3fa1486fd30a7ccd51c3a0fb00d1d5c962ec0a74))
-
 ## [0.3.135](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.134...carrick-v0.3.135) (2026-10-28)
 
 
