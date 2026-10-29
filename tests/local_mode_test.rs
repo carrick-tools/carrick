@@ -3531,8 +3531,31 @@ const CARRY_ROUTES: &str = "items-api/src/routes.ts";
 /// The fixture's two repos, indexed with the model mocked to the fixture's
 /// cassettes, so the index holds the model's answers a check later replays.
 fn carry_workspace() -> tempfile::TempDir {
+    carry_workspace_with(|_| {})
+}
+
+/// [`carry_workspace`] with `prepare` run on the workspace before it is
+/// committed and indexed, so the index holds the prepared state.
+fn carry_workspace_with(prepare: impl FnOnce(&Path)) -> tempfile::TempDir {
     let workspace = workspace("edited-handler-carry", &["items-api", "items-web"]);
     let root = workspace.path();
+    prepare(root);
+    for repo in ["items-api", "items-web"] {
+        git(&root.join(repo), &["add", "-A"]);
+        git(
+            &root.join(repo),
+            &[
+                "-c",
+                "user.email=fixture@carrick.test",
+                "-c",
+                "user.name=fixture",
+                "commit",
+                "-qm",
+                "prepared",
+                "--allow-empty",
+            ],
+        );
+    }
     for repo in ["items-api", "items-web"] {
         std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
     }
@@ -3757,6 +3780,121 @@ fn an_edited_handler_keeps_its_route_and_is_re_judged() {
         blob["boundary"].get("model_rows_not_carried").is_none(),
         "every row was carried and typed: {:?}",
         blob["boundary"]
+    );
+}
+
+/// The fixture's routes with a field typed through an uninstalled import added
+/// to the first handler, and to the other two when `all` is set, indexed in
+/// that state. Those rows have no usable type on the producer side before the
+/// edit and after it. The line numbers do not move: the import goes last.
+fn carry_workspace_without_types(all: bool) -> tempfile::TempDir {
+    carry_workspace_with(|root| {
+        let file = root.join(CARRY_ROUTES);
+        edit(
+            &file,
+            "return { id, connected: true };",
+            "return { id, connected: true, owner: ownerOf(id) };",
+        );
+        if all {
+            edit(
+                &file,
+                "reply.send({ id, state: 'ready' });",
+                "reply.send({ id, state: 'ready', owner: ownerOf(id) });",
+            );
+            edit(
+                &file,
+                "[{ id: '1', connected: true }]",
+                "[{ id: '1', connected: true, owner: ownerOf('1') }]",
+            );
+        }
+        let mut text = std::fs::read_to_string(&file).expect("read the routes");
+        text.push_str("import { ownerOf } from 'owners-db';\n");
+        std::fs::write(&file, text).expect("append the import");
+    })
+}
+
+fn named_lines(changed: &serde_json::Value) -> Vec<String> {
+    changed["not_type_checked"]
+        .as_array()
+        .expect("not_type_checked is a list")
+        .iter()
+        .map(|row| format!("{}:{}", row["file"], row["line"]))
+        .collect()
+}
+
+/// Every matched route in the changed file has no usable type, so a type edit
+/// on one can be neither seen nor failed. The check names the rows and exits 2
+/// instead of reading as a pass (carrick#3012).
+#[test]
+#[serial]
+fn an_edit_to_a_pair_with_no_usable_type_is_named_not_passed() {
+    let workspace = carry_workspace_without_types(true);
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "connected: true, owner",
+        "connected: 1, owner",
+    );
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(
+        code,
+        Some(2),
+        "nothing was type-checked and nothing fails:\n{changed:#}"
+    );
+    let named = named_lines(&changed);
+    assert!(
+        named.contains(&format!("\"{CARRY_ROUTES}\":4")),
+        "the edited route is named: {named:?}\n{changed:#}"
+    );
+    assert!(
+        named.contains(&format!("\"{CARRY_ROUTES}\":9")),
+        "the other typed-through-import route is named too: {named:?}\n{changed:#}"
+    );
+    assert_eq!(changed["type_checked"], 0, "{changed:#}");
+    assert_eq!(changed["failing"], 0, "{changed:#}");
+}
+
+/// A partial run exits by the rows it did judge: two routes keep a verdict, so
+/// the run passes, and the one it could not judge is still named.
+#[test]
+#[serial]
+fn a_partly_judged_file_names_the_unjudged_row_and_exits_by_the_rest() {
+    let workspace = carry_workspace_without_types(false);
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "connected: true, owner",
+        "connected: 1, owner",
+    );
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(0), "{changed:#}");
+    assert_eq!(
+        named_lines(&changed),
+        vec![format!("\"{CARRY_ROUTES}\":4")],
+        "{changed:#}"
+    );
+    assert_eq!(changed["type_checked"], 2, "{changed:#}");
+}
+
+/// The plain edit judges its pair: no row is left unjudged, and it fails.
+#[test]
+#[serial]
+fn an_edit_to_a_judged_pair_names_no_unjudged_row() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "return { id, connected: true };",
+        "return { id, connected: 1 };",
+    );
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(1), "{changed:#}");
+    assert_eq!(
+        changed["not_type_checked"],
+        serde_json::json!([]),
+        "{changed:#}"
     );
 }
 

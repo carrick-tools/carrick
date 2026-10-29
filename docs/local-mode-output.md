@@ -558,7 +558,18 @@ scanner build]`, does not fail, and the run exits 2 when nothing else fails,
 with one line naming both builds and saying to run `carrick refresh` on the
 main branch (on a branch, `refresh` would take the branch's own new problems
 in as already indexed). What the index did read still decides: a call it
-matched that now reaches no route fails whichever build wrote it. A check that
+matched that now reaches no route fails whichever build wrote it.
+
+**Pairs the check could not judge** (carrick#3012). A matched route or call in
+a changed file whose pair has no verdict, or whose verdict is unresolved
+because one side has no usable type, cannot show a type change. It is counted
+on the summary line as `not type-checked`, listed with `--all` and in the JSON
+as `not_type_checked` (`file`, `line`, `role`, `method`, `path`, `reason`),
+and never counted as a pass. When the changed files hold such pairs, none was
+type-checked (`type_checked` is 0) and nothing fails, the run exits 2. A run
+that judged some pairs exits by those.
+
+A check that
 covered none of the files it was asked about exits 2, which no verdict uses:
 no index, an index not bound to this folder, a file not in the index, a
 service that is not indexed, or the budget spent. It names each file or repo

@@ -63,6 +63,14 @@ pub struct ChangedOutput {
     pub problems: Vec<Problem>,
     /// How many of `problems` fail the run.
     pub failing: usize,
+    /// Matched routes and calls in the changed files whose pair the type
+    /// check reached a verdict on.
+    pub type_checked: usize,
+    /// Matched routes and calls in the changed files whose pair could not be
+    /// judged: no verdict, or one side without a usable type (carrick#3012).
+    /// When this lists rows, `type_checked` is 0 and nothing fails, the run
+    /// exits [`EXIT_NOTHING_COVERED`].
+    pub not_type_checked: Vec<NotTypeChecked>,
     pub elapsed_ms: u64,
     /// Why nothing was checked, when nothing was. The run then exits
     /// [`EXIT_NOTHING_COVERED`].
@@ -150,6 +158,27 @@ pub struct Problem {
     pub fails: bool,
 }
 
+/// A matched route or call in a changed file whose pair the type check could
+/// not judge, so a type change on it cannot be seen. Named, never counted as
+/// a pass (carrick#3012).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NotTypeChecked {
+    /// Workspace-relative, so it opens from where the command ran.
+    pub file: String,
+    pub line: Option<u32>,
+    /// `route` or `call`.
+    pub role: String,
+    pub method: String,
+    pub path: String,
+    /// The verdict's own detail, or that there was none.
+    pub reason: String,
+}
+
+/// The words a customer reads about pairs the check could not judge. Kept
+/// here, in one place; they wait on David's approval (carrick#3012).
+const NOT_TYPE_CHECKED_SUFFIX: &str = "not type-checked (one side has no usable type)";
+const NOTHING_TYPE_CHECKED: &str = "not checked: no matched route or call in the changed files has a usable type on both sides, so a type change cannot be seen";
+
 /// The budget for one pass.
 fn budget() -> Duration {
     std::env::var(BUDGET_ENV)
@@ -200,18 +229,25 @@ impl ChangedOutput {
     /// run, or asked about files and covered none; 1 when a problem is a
     /// fact; [`EXIT_NOTHING_COVERED`] when nothing fails but a problem rests
     /// on an index another scanner build wrote, which cannot say whether it
-    /// is new (carrick#2911); else 0, including when some files were covered
+    /// is new (carrick#2911), or when the changed files hold matched pairs and
+    /// the check judged none of them (carrick#3012); else 0, including when some files were covered
     /// and others skipped (the skipped ones are listed).
     pub fn exit_code(&self) -> i32 {
         if self.not_checked.is_some() || (self.files == 0 && self.nothing_asked_covered()) {
             EXIT_NOTHING_COVERED
         } else if self.failing > 0 {
             1
-        } else if self.other_build() > 0 {
+        } else if self.other_build() > 0 || self.nothing_type_checked() {
             EXIT_NOTHING_COVERED
         } else {
             0
         }
+    }
+
+    /// The changed files hold matched pairs and the check judged none of them
+    /// (carrick#3012). A pass would read the same, so it is not one.
+    fn nothing_type_checked(&self) -> bool {
+        self.type_checked == 0 && !self.not_type_checked.is_empty()
     }
 
     /// Problems the index, written by another scanner build, cannot date.
@@ -249,6 +285,8 @@ fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
         repos: Vec::new(),
         problems: Vec::new(),
         failing: 0,
+        type_checked: 0,
+        not_type_checked: Vec::new(),
         elapsed_ms: 0,
         not_checked: Some(reason.into()),
         index_scanner: None,
@@ -345,6 +383,8 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     output.routes = judged.routes;
     output.calls = judged.calls;
     output.failing = judged.problems.iter().filter(|p| p.fails).count();
+    output.type_checked = judged.type_checked;
+    output.not_type_checked = judged.not_type_checked;
     output.problems = judged.problems;
     output
 }
@@ -532,6 +572,8 @@ struct Judged {
     routes: usize,
     calls: usize,
     problems: Vec<Problem>,
+    type_checked: usize,
+    not_type_checked: Vec<NotTypeChecked>,
 }
 
 /// The problems in the changed files, read off the rebuilt index and the join
@@ -580,6 +622,8 @@ fn judge(
         routes: 0,
         calls: 0,
         problems: Vec::new(),
+        type_checked: 0,
+        not_type_checked: Vec::new(),
     };
     for operation in &join.operations {
         let Some(&(repo, repo_path)) = repo_of.get(operation.service.as_str()) else {
@@ -595,15 +639,42 @@ fn judge(
         let Some(item) = item_of(repo, operation) else {
             continue;
         };
+        let mismatch = item.verdict.as_ref().is_some_and(|verdict| {
+            matches!(
+                verdict.result.as_deref(),
+                Some("type_mismatch" | "method_mismatch")
+            )
+        });
+        // A matched pair the check could not judge is named, not passed
+        // (carrick#3012): no verdict, or a side without a usable type.
+        let unjudged = item
+            .verdict
+            .as_ref()
+            .is_none_or(|verdict| verdict.state == "unresolved");
+        if !mismatch && unjudged && !item.counterparts.is_empty() {
+            judged.not_type_checked.push(NotTypeChecked {
+                file: shown(root, repo_path, &operation.file),
+                line: operation.line,
+                role: item.kind.as_str().to_string(),
+                method: operation.method.clone(),
+                path: operation.path.clone(),
+                reason: item
+                    .verdict
+                    .as_ref()
+                    .map_or_else(|| "no verdict".to_string(), |v| one_line(&v.detail)),
+            });
+            continue;
+        }
         let Some(verdict) = item.verdict.as_ref() else {
             continue;
         };
-        if !matches!(
-            verdict.result.as_deref(),
-            Some("type_mismatch" | "method_mismatch")
-        ) {
+        if !mismatch {
+            if verdict.state == "resolved" && !item.counterparts.is_empty() {
+                judged.type_checked += 1;
+            }
             continue;
         }
+        judged.type_checked += 1;
         let finding = super::index::finding_for(operation, &join.findings);
         // A finding resting only on rows the source states, whose verdict was
         // reached or needs none: the rule the cloud enforces on (cloud#599).
@@ -720,6 +791,8 @@ fn judge(
     }
     judged.problems.sort();
     judged.problems.dedup();
+    judged.not_type_checked.sort();
+    judged.not_type_checked.dedup();
     judged
 }
 
@@ -870,6 +943,12 @@ impl ChangedOutput {
                 join_and(&counts)
             ));
         }
+        if !self.not_type_checked.is_empty() {
+            out.push_str(&format!(
+                ", {} {NOT_TYPE_CHECKED_SUFFIX}",
+                self.not_type_checked.len()
+            ));
+        }
         out.push('\n');
         for problem in listed {
             let at = match problem.line {
@@ -894,6 +973,22 @@ impl ChangedOutput {
                 "{at}  {what}  {} {} {}{with}: {}{note}\n",
                 problem.role, problem.method, problem.path, problem.reason
             ));
+        }
+        if all {
+            for row in &self.not_type_checked {
+                let at = match row.line {
+                    Some(line) => format!("{}:{line}", row.file),
+                    None => row.file.clone(),
+                };
+                out.push_str(&format!(
+                    "{at}  not type-checked  {} {} {}: {}\n",
+                    row.role, row.method, row.path, row.reason
+                ));
+            }
+        }
+        if self.nothing_type_checked() {
+            out.push_str(NOTHING_TYPE_CHECKED);
+            out.push('\n');
         }
         let other_build = self.other_build();
         if other_build > 0 {
