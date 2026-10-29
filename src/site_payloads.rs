@@ -22,8 +22,15 @@
 //!   response entry the response slot. Any other protocol states one payload,
 //!   under its response entry: the request slot.
 //! - **Not moved.** A symbol the reader named still publishes its alias (the
-//!   capture takes symbol anchors first); a slot left empty leaves the
+//!   capture takes symbol anchors first), unless the file's own imports and
+//!   declarations do not name it (below); a slot left empty leaves the
 //!   reader's locator in place.
+//! - **Pub/sub, once a slot types the alias** (carrick#2472 C3). The reader's
+//!   payload locator, whose text the envelope guard tests for the topic, is
+//!   not consulted: no borrow witness is computed from it, and a symbol the
+//!   file does not import or declare (the borrow the guard blocked from being
+//!   demoted to inference) asks nothing, so the slot decides. An alias no slot
+//!   types keeps the guard.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -187,16 +194,23 @@ impl SitePayloads {
     }
 }
 
+/// The aliases `slotted` types: the manifest entries whose payload the
+/// fact layer places, which the model reader's locator and symbol no longer
+/// decide (carrick#2472 C3).
+pub fn slotted_aliases(slotted: &[InferRequestItem]) -> BTreeSet<String> {
+    slotted
+        .iter()
+        .filter_map(|request| request.alias.clone())
+        .collect()
+}
+
 /// `infer` with every request for an alias `slotted` types dropped, and
 /// `slotted` added after the rest. Empty `slotted` leaves `infer` as it was.
 pub fn take_over(infer: &mut Vec<InferRequestItem>, slotted: &[InferRequestItem]) {
     if slotted.is_empty() {
         return;
     }
-    let aliases: BTreeSet<&str> = slotted
-        .iter()
-        .filter_map(|request| request.alias.as_deref())
-        .collect();
+    let aliases = slotted_aliases(slotted);
     infer.retain(|request| {
         request
             .alias

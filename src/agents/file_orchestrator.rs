@@ -781,6 +781,42 @@ struct SymbolTable {
     imported_symbols: HashMap<String, ImportedSymbol>,
 }
 
+/// Where a pub/sub type symbol is named in its own file.
+enum SymbolScope<'a> {
+    /// Declared in the file (no import source).
+    Local,
+    /// Imported, from this source.
+    Imported(&'a str),
+    /// Neither declared nor imported: a name the reader borrowed.
+    Unnamed,
+}
+
+impl SymbolTable {
+    /// Where `symbol` (a type name, or `Namespace.Member`) is named in the
+    /// file this table reads: the AST check `validate_type_hints` applies.
+    fn scope_of(&self, symbol: &str) -> SymbolScope<'_> {
+        let (root, has_member) = symbol
+            .split_once('.')
+            .map(|(root, _)| (root, true))
+            .unwrap_or((symbol, false));
+        if self.local_types.contains(root) {
+            if !has_member {
+                return SymbolScope::Local;
+            }
+        } else if let Some(imported) = self.imported_symbols.get(root) {
+            let namespace_ok = if imported.kind == SymbolKind::Namespace {
+                has_member
+            } else {
+                !has_member
+            };
+            if namespace_ok {
+                return SymbolScope::Imported(imported.source.as_str());
+            }
+        }
+        SymbolScope::Unnamed
+    }
+}
+
 /// One workspace package's published request members, folded across every
 /// module of its surface, with the names its modules declare differently.
 type PackageSurface = (HashMap<String, OwnedMember<PathBuf>>, HashSet<String>);
@@ -5652,11 +5688,17 @@ impl FileOrchestrator {
     /// names. The witness alone changes nothing — it only licenses
     /// `demote_witnessed_borrowed_anchors` to prefer the locator's
     /// tsc-resolved root over the explicit symbol when the two disagree.
+    ///
+    /// An op whose alias is in `slotted` (the fact layer places its payload,
+    /// `crate::site_payloads`) is read at that slot, not at the reader's
+    /// locator: no witness is computed from the locator, and a symbol its
+    /// file neither declares nor imports asks nothing (carrick#2472 C3).
     pub fn collect_pubsub_type_requests(
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
         repo_path: &str,
         modules: &WorkspaceIndex,
+        slotted: &BTreeSet<String>,
     ) -> Vec<SymbolRequest> {
         use crate::operation::{OperationKey, PubsubRole};
 
@@ -5686,6 +5728,9 @@ impl FileOrchestrator {
             // op actually carries both anchors (an explicit symbol AND a
             // payload locator the infer collector will accept).
             let mut annotation_mentions: Option<Option<AnnotationMentionsCollector>> = None;
+            // The file's declared and imported type names, read only for an
+            // op a slot types.
+            let mut symbol_table: Option<SymbolTable> = None;
             for op in &result.pubsub_operations {
                 // Mirror the manifest-side role mapping in
                 // `append_pubsub_manifest_entries`: subscriber = producer,
@@ -5705,48 +5750,6 @@ impl FileOrchestrator {
                     // No import → same-file declaration: resolve against the file.
                     None => file_abs.clone(),
                 };
-                // Borrow witness (#413): computed only against locators the
-                // sibling infer collector will actually resolve — a bare
-                // identifier that does not contain the op's own topic (the
-                // envelope-copy guard) — because arbitration in
-                // `demote_witnessed_borrowed_anchors` needs the second
-                // anchor's inference to exist for the same alias.
-                // FROZEN (old path, 2026-10-21): the topic-literal test in this
-                // expression, a use of the envelope guard below. Deletions and
-                // safety fixes only. Fixes for wrong or missing rows go in the
-                // type-level topic fact on the listed candidates (carrick#2472
-                // C2). Delete when C2 is released, in the deletion release
-                // (carrick#2472, C6).
-                let payload_borrow_witness = op
-                    .payload_expression_text
-                    .as_deref()
-                    .filter(|text| !text.contains(op.topic.as_str()))
-                    .and_then(payload_bare_ident)
-                    .is_some_and(|payload_ident| {
-                        let collector = annotation_mentions.get_or_insert_with(|| {
-                            let cm: Lrc<SourceMap> = Default::default();
-                            let handler = Handler::with_tty_emitter(
-                                ColorConfig::Never,
-                                false,
-                                false,
-                                Some(cm.clone()),
-                            );
-                            parse_file(std::path::Path::new(&file_abs), &cm, &handler).map(
-                                |module| {
-                                    let mut mentions = AnnotationMentionsCollector::default();
-                                    module.visit_with(&mut mentions);
-                                    mentions
-                                },
-                            )
-                        });
-                        collector.as_ref().is_some_and(|mentions| {
-                            pubsub_payload_borrow_witness(
-                                &mentions.mentions_by_binding,
-                                payload_ident,
-                                symbol,
-                            )
-                        })
-                    });
                 let key = OperationKey::pubsub(op.topic.clone());
                 // Mirror the manifest side (`append_pubsub_manifest_entries`):
                 // publishers (consumers) disambiguate by call site so fan-in
@@ -5774,6 +5777,71 @@ impl FileOrchestrator {
                         build_manifest_type_alias(&key, role, ManifestTypeKind::Response)
                     }
                 };
+                let slotted_alias = slotted.contains(&alias);
+                // Typed at a slot (carrick#2472 C3): the reader's symbol names
+                // a type its file neither declares nor imports, the borrow the
+                // envelope guard kept from being demoted to inference. The
+                // slot reads the alias, so the symbol asks nothing.
+                if slotted_alias {
+                    let table = symbol_table.get_or_insert_with(|| {
+                        let cm: Lrc<SourceMap> = Default::default();
+                        let handler = Handler::with_tty_emitter(
+                            ColorConfig::Never,
+                            false,
+                            false,
+                            Some(cm.clone()),
+                        );
+                        Self::extract_symbol_table(std::path::Path::new(&file_abs), &cm, &handler)
+                            .table
+                    });
+                    if matches!(table.scope_of(symbol), SymbolScope::Unnamed) {
+                        continue;
+                    }
+                }
+                // Borrow witness (#413): computed only against locators the
+                // sibling infer collector will actually resolve — a bare
+                // identifier that does not contain the op's own topic (the
+                // envelope-copy guard) — because arbitration in
+                // `demote_witnessed_borrowed_anchors` needs the second
+                // anchor's inference to exist for the same alias. A slot
+                // always gives it one, so a slotted alias skips the topic test
+                // (carrick#2472 C3).
+                // FROZEN (old path, 2026-10-21): the topic-literal test in this
+                // expression, a use of the envelope guard below. Deletions and
+                // safety fixes only. Fixes for wrong or missing rows go in the
+                // type-level topic fact on the listed candidates (carrick#2472
+                // C2). Delete when C2 is released, in the deletion release
+                // (carrick#2472, C6).
+                let payload_borrow_witness = op
+                    .payload_expression_text
+                    .as_deref()
+                    .filter(|text| slotted_alias || !text.contains(op.topic.as_str()))
+                    .and_then(payload_bare_ident)
+                    .is_some_and(|payload_ident| {
+                        let collector = annotation_mentions.get_or_insert_with(|| {
+                            let cm: Lrc<SourceMap> = Default::default();
+                            let handler = Handler::with_tty_emitter(
+                                ColorConfig::Never,
+                                false,
+                                false,
+                                Some(cm.clone()),
+                            );
+                            parse_file(std::path::Path::new(&file_abs), &cm, &handler).map(
+                                |module| {
+                                    let mut mentions = AnnotationMentionsCollector::default();
+                                    module.visit_with(&mut mentions);
+                                    mentions
+                                },
+                            )
+                        });
+                        collector.as_ref().is_some_and(|mentions| {
+                            pubsub_payload_borrow_witness(
+                                &mentions.mentions_by_binding,
+                                payload_ident,
+                                symbol,
+                            )
+                        })
+                    });
                 let dedup_key = format!("{}|{}|{}", source_file, symbol, alias);
                 if seen.insert(dedup_key) {
                     requests.push(SymbolRequest {
@@ -7232,28 +7300,18 @@ impl FileOrchestrator {
                 continue;
             };
 
-            let (root, has_member) = symbol
-                .split_once('.')
-                .map(|(root, _)| (root, true))
-                .unwrap_or((symbol.as_str(), false));
-
-            if symbol_table.local_types.contains(root) {
-                if !has_member {
-                    // Locally declared: by definition there is no import
-                    // source. Overwrite whatever the model said.
+            match symbol_table.scope_of(symbol) {
+                // Locally declared: by definition there is no import
+                // source. Overwrite whatever the model said.
+                SymbolScope::Local => {
                     op.type_import_source = None;
                     continue;
                 }
-            } else if let Some(imported) = symbol_table.imported_symbols.get(root) {
-                let namespace_ok = if imported.kind == SymbolKind::Namespace {
-                    has_member
-                } else {
-                    !has_member
-                };
-                if namespace_ok {
-                    op.type_import_source = Some(imported.source.clone());
+                SymbolScope::Imported(source) => {
+                    op.type_import_source = Some(source.to_string());
                     continue;
                 }
+                SymbolScope::Unnamed => {}
             }
 
             // FROZEN (old path, 2026-10-21): the topic-literal test here, a use
@@ -7261,6 +7319,11 @@ impl FileOrchestrator {
             // Fixes for wrong or missing rows go in the type-level topic fact on
             // the listed candidates (carrick#2472 C2). Delete when C2 is
             // released, in the deletion release (carrick#2472, C6).
+            //
+            // The site slots do not exist yet when this runs (the site records
+            // are built from the merged results). A symbol kept here that a
+            // slot then types asks nothing in `collect_pubsub_type_requests`
+            // (carrick#2472 C3), so the guard decides only unslotted ops.
             let demote_survives_envelope_guard = op
                 .payload_expression_text
                 .as_deref()
@@ -21953,8 +22016,18 @@ export { routes };
         };
 
         let modules = modules_without_config();
-        let first = orchestrator.collect_pubsub_type_requests(&file_results, ".", &modules);
-        let second = orchestrator.collect_pubsub_type_requests(&file_results, ".", &modules);
+        let first = orchestrator.collect_pubsub_type_requests(
+            &file_results,
+            ".",
+            &modules,
+            &BTreeSet::new(),
+        );
+        let second = orchestrator.collect_pubsub_type_requests(
+            &file_results,
+            ".",
+            &modules,
+            &BTreeSet::new(),
+        );
 
         assert_eq!(first.len(), 3, "every typed op should anchor a request");
         assert_eq!(
@@ -22011,6 +22084,7 @@ export function publishWrapped(order: OrderPlaced): void {
             &file_results,
             dir.to_str().unwrap(),
             &repo_modules(dir),
+            &BTreeSet::new(),
         )
     }
 
@@ -22076,6 +22150,124 @@ export function publishWrapped(order: OrderPlaced): void {
                 false, // t.nolocator: no locator at all
             ],
             "requests: {requests:?}"
+        );
+    }
+
+    /// The alias a pub/sub subscriber on `topic` carries (the subscriber side
+    /// takes the plain alias).
+    fn subscriber_alias(topic: &str) -> String {
+        build_manifest_type_alias(
+            &crate::operation::OperationKey::pubsub(topic.to_string()),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+        )
+    }
+
+    /// carrick#2472 C3: a slot always gives the witness its second anchor, so
+    /// the envelope guard's topic-literal test no longer decides whether the
+    /// locator's binding is read. A binding whose name merely contains the
+    /// topic is dropped by the guard unslotted, and read slotted.
+    #[test]
+    fn test_pubsub_borrow_witness_skips_the_topic_test_for_a_slotted_alias() {
+        use crate::operation::PubsubRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_witness_fixture(dir.path());
+        // The binding `evt` holds a payload annotated `OrderPlaced`, so the
+        // symbol `AuditRecord` is a witnessed borrow; the topic is `evt`.
+        let ops = || {
+            vec![pubsub_op(
+                "evt",
+                PubsubRole::Subscriber,
+                Some("AuditRecord"),
+                None,
+                Some("evt"),
+            )]
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert("src/pub.ts".to_string(), pubsub_only_result(ops()));
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let modules = repo_modules(dir.path());
+        let witness_with = |slotted: &BTreeSet<String>| {
+            orchestrator
+                .collect_pubsub_type_requests(
+                    &file_results,
+                    dir.path().to_str().unwrap(),
+                    &modules,
+                    slotted,
+                )
+                .iter()
+                .map(|request| request.payload_borrow_witness)
+                .collect::<Vec<bool>>()
+        };
+
+        assert_eq!(witness_with(&BTreeSet::new()), vec![false], "unslotted");
+        assert_eq!(
+            witness_with(&BTreeSet::from([subscriber_alias("evt")])),
+            vec![true],
+            "slotted"
+        );
+    }
+
+    /// carrick#2472 C3: where a slot types the alias, a symbol the file
+    /// neither declares nor imports asks nothing; a symbol it names, and any
+    /// symbol on an alias no slot types, is asked as before.
+    #[test]
+    fn test_pubsub_symbol_the_file_does_not_name_asks_nothing_where_a_slot_types_the_alias() {
+        use crate::operation::PubsubRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_witness_fixture(dir.path());
+        let sub = |topic: &str, symbol: &str| {
+            pubsub_op(
+                topic,
+                PubsubRole::Subscriber,
+                Some(symbol),
+                None,
+                Some("{ topic: 'x' }"),
+            )
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/pub.ts".to_string(),
+            pubsub_only_result(vec![
+                sub("t.slotted.unnamed", "GhostType"),
+                sub("t.slotted.named", "AuditRecord"),
+                sub("t.unslotted.unnamed", "GhostType"),
+            ]),
+        );
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = |slotted: &BTreeSet<String>| {
+            orchestrator
+                .collect_pubsub_type_requests(
+                    &file_results,
+                    dir.path().to_str().unwrap(),
+                    &repo_modules(dir.path()),
+                    slotted,
+                )
+                .into_iter()
+                .filter_map(|request| request.alias)
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(
+            requests(&BTreeSet::new()),
+            vec![
+                subscriber_alias("t.slotted.unnamed"),
+                subscriber_alias("t.slotted.named"),
+                subscriber_alias("t.unslotted.unnamed"),
+            ],
+            "no slot: every symbol is asked"
+        );
+        assert_eq!(
+            requests(&BTreeSet::from([
+                subscriber_alias("t.slotted.unnamed"),
+                subscriber_alias("t.slotted.named"),
+            ])),
+            vec![
+                subscriber_alias("t.slotted.named"),
+                subscriber_alias("t.unslotted.unnamed"),
+            ]
         );
     }
 

@@ -294,6 +294,13 @@ fn a_slot_takes_over_its_alias_and_nothing_else() {
             .collect()
     };
     assert_eq!(lines(&unchanged), lines(&reader));
+
+    // The aliases a slot types are the ones the pub/sub collectors skip.
+    assert_eq!(
+        slotted_aliases(&slotted),
+        BTreeSet::from(["Res".to_string()])
+    );
+    assert!(slotted_aliases(&[]).is_empty());
 }
 
 #[test]

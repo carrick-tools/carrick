@@ -233,3 +233,59 @@ fn a_caller_that_writes_no_body_through_a_wrapper_is_decided_no_body() {
         "{off_entry:#?}"
     );
 }
+
+/// carrick#2472 C3: a pub/sub payload a slot types is read there, not at the
+/// symbol the reader named.
+///
+/// `tests/fixtures/site-payloads-pubsub/`: a bus the library store labels
+/// (`publish` sends its second argument), whose declarations do not verify the
+/// publish, so each call stands as a site row (as in `site_row_span_test`).
+/// The reader's cassette names, for `src/orders.ts:4`, a symbol the file does
+/// not import (`OrderCreated`, from `src/types.ts`, an unrelated shape) and an
+/// envelope copy of the call as the payload locator, which the envelope guard
+/// treats as no locator and so does not demote the symbol to inference.
+/// `src/relay.ts` is the same shape through a function the store does not
+/// label: no site, no slot.
+///
+/// | alias | switch off | `CARRICK_SITE_PAYLOADS=1` |
+/// |---|---|---|
+/// | `orders.created` (slotted, borrowed symbol) | `OrderCreated` | the envelope's own shape |
+/// | `orders.paid` (slotted, no symbol) | the envelope's own shape | the same |
+/// | `orders.shipped` (no slot, borrowed symbol) | `OrderShipped` | `OrderShipped` |
+#[test]
+fn a_borrowed_pubsub_symbol_gives_way_to_the_slot_that_types_the_alias() {
+    let repo =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-payloads-pubsub");
+    let off = scan(&repo, &[("CARRICK_SITE_QUESTIONS", "1")]);
+    let on = scan(
+        &repo,
+        &[
+            ("CARRICK_SITE_QUESTIONS", "1"),
+            ("CARRICK_SITE_PAYLOADS", "1"),
+        ],
+    );
+    let type_at = |blob: &serde_json::Value, file: &str, line: u64| {
+        let alias = alias_at(blob, "response", file, line);
+        captured_block(blob, &alias)
+    };
+
+    let created_off = type_at(&off, "src/orders.ts", 4);
+    assert!(created_off.contains("OrderCreated"), "off: {created_off}");
+    let created_on = type_at(&on, "src/orders.ts", 4);
+    assert!(
+        created_on.contains("quantity: number") && !created_on.contains("OrderCreated"),
+        "on: {created_on}"
+    );
+
+    // A slotted alias with no symbol is typed at the slot either way.
+    for blob in [&off, &on] {
+        let paid = type_at(blob, "src/orders.ts", 5);
+        assert!(paid.contains("sku: string"), "paid: {paid}");
+    }
+
+    // No slot: the guard decides, as before.
+    for blob in [&off, &on] {
+        let shipped = type_at(blob, "src/relay.ts", 9);
+        assert!(shipped.contains("OrderShipped"), "shipped: {shipped}");
+    }
+}
