@@ -131,12 +131,16 @@ impl ProcedureLabels {
                     }
                     LibraryClaim::Op {
                         member: Some(member),
-                        name:
-                            Some(OpName::Bound {
-                                bound: BoundName::Key,
-                            }),
+                        name: Some(name),
                         ..
-                    } => {
+                    } if matches!(
+                        **name,
+                        OpName::Bound {
+                            bound: BoundName::Key,
+                            ..
+                        }
+                    ) =>
+                    {
                         let keyed = (
                             export.package.clone(),
                             export.export.clone(),

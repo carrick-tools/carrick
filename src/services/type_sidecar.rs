@@ -896,11 +896,109 @@ pub enum LibraryRole {
 
 /// Where one part of a library call sits: argument `arg` (0-based), or,
 /// with `key`, the property `key` of the object passed there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Amendment 7 of carrick#2434 adds `at` (a member path walked from the value
+/// there, `[]` stepping into an array element), `each` (a rest slot, every
+/// element read), and, on a slot that holds a name, `document` and `ref`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimSlot {
     pub arg: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<Box<[String]>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub each: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<ClaimDocument>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ClaimRef>,
+}
+
+impl ClaimSlot {
+    /// A slot at argument `arg`, and nothing else.
+    pub fn at_arg(arg: u32) -> Self {
+        Self {
+            arg,
+            ..Self::default()
+        }
+    }
+}
+
+/// A name slot that holds a document in this language (amendment 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimDocument {
+    Graphql,
+}
+
+/// A name slot that holds a function or a class, named by its declaration
+/// (amendment 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimRef {
+    Function,
+    Class,
+}
+
+/// How a service writes an op (amendment 7); absent is [`OpForm::Call`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpForm {
+    Call,
+    New,
+    Set,
+    Override,
+    Decorate,
+}
+
+impl OpForm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::New => "new",
+            Self::Set => "set",
+            Self::Override => "override",
+            Self::Decorate => "decorate",
+        }
+    }
+}
+
+/// How a service writes a scope (amendment 7); absent is [`ScopeForm::Call`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeForm {
+    Call,
+    Decorate,
+}
+
+/// The protocol an op speaks (amendment 7); absent is the role's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimProtocol {
+    Http,
+    Graphql,
+    Rpc,
+    Socket,
+    Message,
+}
+
+/// The op applies only where argument `arg` (or its `key`) holds `literal`
+/// (amendment 7: `on("message", ...)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimWhen {
+    pub arg: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub literal: String,
+}
+
+/// What a route's receive op sends back (amendment 7): `{}` is a response of
+/// no stated shape, `result` says which part of what the call returns holds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpReturns {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultShape>,
 }
 
 /// A name the call does not carry itself.
@@ -914,6 +1012,12 @@ pub enum BoundName {
     /// The key path the op's value sits under in a `collects` object
     /// (#2474 R6a, contract amendment 3 on carrick#2434).
     Key,
+    /// The property names walked on the receiver, joined (amendment 7).
+    Path,
+    /// The export's own name (amendment 7).
+    Export,
+    /// The name a subscription handler is handed (amendment 7).
+    Subscribed,
 }
 
 /// Where a router member takes its procedures (#2474 R6a, contract
@@ -932,8 +1036,39 @@ pub struct Collects {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OpName {
-    Bound { bound: BoundName },
+    /// `join` is for `path`; `param` and `at` for `subscribed` (amendment 7).
+    Bound {
+        bound: BoundName,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        join: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        param: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<Box<[String]>>,
+    },
+    /// Two or three slots joined (amendment 7).
+    Parts {
+        parts: Vec<ClaimSlot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        join: Option<String>,
+    },
+    /// A name the library fixes (amendment 7).
+    Literal {
+        literal: String,
+    },
     Slot(ClaimSlot),
+}
+
+impl OpName {
+    /// A bound name with none of amendment 7's extras.
+    pub fn bound(bound: BoundName) -> Self {
+        Self::Bound {
+            bound,
+            join: None,
+            param: None,
+            at: None,
+        }
+    }
 }
 
 /// Which call a `runs` slot reads (label structure v2, carrick#2434).
@@ -967,6 +1102,10 @@ pub struct Yields {
     pub param: u32,
     pub export: String,
     pub side: String,
+    /// The package that declares `export`, when it is not the claim's own
+    /// (amendment 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
 }
 
 /// Where a route handler's request holds its path and method (#2474 R0,
@@ -1091,6 +1230,9 @@ pub enum LibraryClaim {
     /// reader drops one with neither.
     Scope {
         member: String,
+        /// Amendment 7: absent is `call`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<ScopeForm>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1136,7 +1278,19 @@ pub enum LibraryClaim {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         of: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<OpName>,
+        name: Option<Box<OpName>>,
+        /// Amendment 7: how the service writes the op; absent is `call`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<OpForm>,
+        /// Amendment 7: the protocol the op speaks; absent is the role's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<ClaimProtocol>,
+        /// Amendment 7: the op applies only where this slot holds this literal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<Box<ClaimWhen>>,
+        /// Amendment 7: what a route's receive op sends back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        returns: Option<Box<OpReturns>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1216,6 +1370,17 @@ pub enum LibraryClaim {
 }
 
 impl LibraryClaim {
+    /// Whether the claim is written as a call. An op or scope whose `form` is
+    /// set and not `call` (amendment 7: `set`, `override`, `decorate`, `new`)
+    /// is not met at a call site, and the readers of call sites skip it.
+    pub fn is_call_form(&self) -> bool {
+        match self {
+            Self::Op { form, .. } => form.is_none_or(|form| form == OpForm::Call),
+            Self::Scope { form, .. } => form.is_none_or(|form| form == ScopeForm::Call),
+            Self::Make { .. } | Self::Result { .. } | Self::Reserved { .. } => true,
+        }
+    }
+
     /// The claim as an op or maker check sends it: without its `result`, so
     /// the verdict on the claim is the one it had before results existed
     /// (carrick#2819). Every other claim is returned as it is.
@@ -5314,6 +5479,7 @@ mod tests {
         let slot = || ClaimSlot {
             arg: 0,
             key: Some("key".into()),
+            ..ClaimSlot::default()
         };
         let key_labels = || BTreeMap::from([("id".to_string(), KeyLabel::Name)]);
         let name_scope = || NameScope {
@@ -5411,13 +5577,17 @@ mod tests {
                         role: LibraryRole::ServerFramework,
                         receiver: "export".into(),
                         claim: LibraryClaim::Op {
+                            form: None,
+                            protocol: None,
+                            when: None,
+                            returns: None,
                             op: LibraryOp::Send,
                             member: Some("json".into()),
                             path: vec![],
                             on: Some(ClaimOn::Export),
                             of: None,
                             name: None,
-                            payload: Some(ClaimSlot { arg: 0, key: None }),
+                            payload: Some(ClaimSlot::at_arg(0)),
                             handler: None,
                             ack: None,
                             key_labels: BTreeMap::new(),
@@ -5574,6 +5744,7 @@ mod tests {
                         result: None,
                     }),
                     library(LibraryClaim::Scope {
+                        form: None,
                         member: "channel".into(),
                         name: Some(slot()),
                         path: vec!["tasks".into()],
@@ -5584,6 +5755,7 @@ mod tests {
                         picker: Some("model/q1".into()),
                         runs: Some(slot()),
                         yields: Some(Box::new(Yields {
+                            package: None,
                             param: 0,
                             export: "App".into(),
                             side: "server".into(),
@@ -5594,6 +5766,7 @@ mod tests {
                     // Procedure routers (#2474 R6a): a router member with no
                     // name, and an op named by its key.
                     library(LibraryClaim::Scope {
+                        form: None,
                         member: "router".into(),
                         name: None,
                         path: vec![],
@@ -5612,14 +5785,16 @@ mod tests {
                         }),
                     }),
                     library(LibraryClaim::Op {
+                        form: None,
+                        protocol: None,
+                        when: None,
+                        returns: None,
                         op: LibraryOp::Receive,
                         member: Some("query".into()),
                         path: vec!["procedure".into()],
                         on: Some(ClaimOn::Instance),
                         of: None,
-                        name: Some(OpName::Bound {
-                            bound: BoundName::Key,
-                        }),
+                        name: Some(Box::new(OpName::bound(BoundName::Key))),
                         payload: None,
                         handler: Some(slot()),
                         ack: None,
@@ -5637,12 +5812,16 @@ mod tests {
                         result: None,
                     }),
                     library(LibraryClaim::Op {
+                        form: None,
+                        protocol: None,
+                        when: None,
+                        returns: None,
                         op: LibraryOp::Send,
                         member: Some("trigger".into()),
                         path: vec!["tasks".into()],
                         on: Some(ClaimOn::Instance),
                         of: Some("instance:task".into()),
-                        name: Some(OpName::Slot(slot())),
+                        name: Some(Box::new(OpName::Slot(slot()))),
                         payload: Some(slot()),
                         handler: Some(slot()),
                         ack: Some(slot()),
@@ -5660,6 +5839,7 @@ mod tests {
                             bound: Some(RunsBound::Maker),
                         })),
                         yields: Some(Box::new(Yields {
+                            package: None,
                             param: 0,
                             export: "Socket".into(),
                             side: "server".into(),
@@ -5674,14 +5854,16 @@ mod tests {
                         result: None,
                     }),
                     library(LibraryClaim::Op {
+                        form: None,
+                        protocol: None,
+                        when: None,
+                        returns: None,
                         op: LibraryOp::Receive,
                         member: Some("on".into()),
                         path: vec!["tasks".into()],
                         on: Some(ClaimOn::Export),
                         of: Some("instance:task".into()),
-                        name: Some(OpName::Bound {
-                            bound: BoundName::Maker,
-                        }),
+                        name: Some(Box::new(OpName::bound(BoundName::Maker))),
                         payload: Some(slot()),
                         handler: Some(slot()),
                         ack: Some(slot()),
@@ -6197,6 +6379,7 @@ mod tests {
         let slot = |arg: u32, key: Option<&str>| ClaimSlot {
             arg,
             key: key.map(str::to_string),
+            ..ClaimSlot::default()
         };
         let request = SidecarRequest::VerifyLibraryClaims {
             request_id: "req-11".into(),
@@ -6233,14 +6416,16 @@ mod tests {
                     LibraryRole::Broker,
                     "instance:task",
                     LibraryClaim::Op {
+                        form: None,
+                        protocol: None,
+                        when: None,
+                        returns: None,
                         op: LibraryOp::Send,
                         member: Some("trigger".into()),
                         path: vec![],
                         on: None,
                         of: Some("instance:task".into()),
-                        name: Some(OpName::Bound {
-                            bound: BoundName::Maker,
-                        }),
+                        name: Some(Box::new(OpName::bound(BoundName::Maker))),
                         payload: Some(slot(0, None)),
                         handler: None,
                         ack: None,
@@ -6263,12 +6448,16 @@ mod tests {
                     LibraryRole::Broker,
                     "export",
                     LibraryClaim::Op {
+                        form: None,
+                        protocol: None,
+                        when: None,
+                        returns: None,
                         op: LibraryOp::Send,
                         member: Some("trigger".into()),
                         path: vec!["tasks".into()],
                         on: Some(ClaimOn::Export),
                         of: None,
-                        name: Some(OpName::Slot(slot(0, None))),
+                        name: Some(Box::new(OpName::Slot(slot(0, None)))),
                         payload: Some(slot(1, None)),
                         handler: None,
                         ack: None,
@@ -6294,6 +6483,7 @@ mod tests {
                     LibraryRole::Broker,
                     "instance:connect",
                     LibraryClaim::Scope {
+                        form: None,
                         member: "channel".into(),
                         name: Some(slot(0, None)),
                         path: vec![],
@@ -6344,12 +6534,16 @@ mod tests {
                     LibraryRole::HttpClient,
                     "export",
                     LibraryClaim::Op {
+                        form: None,
+                        protocol: None,
+                        when: None,
+                        returns: None,
                         op: LibraryOp::Request,
                         member: None,
                         path: vec![],
                         on: None,
                         of: None,
-                        name: Some(OpName::Slot(slot(0, Some("url")))),
+                        name: Some(Box::new(OpName::Slot(slot(0, Some("url"))))),
                         payload: None,
                         handler: None,
                         ack: None,

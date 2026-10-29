@@ -1216,22 +1216,26 @@ impl<'a> Walker<'a> {
     ) -> SiteEnd {
         let op = (!invoke.construction)
             .then(|| {
-                claims.claims.iter().find_map(|claim| match claim {
-                    // An op claimed on what a scope member returns is read
-                    // only where a verified declaration says so
-                    // (carrick#1678), never by the member's name.
-                    LibraryClaim::Op {
-                        op,
-                        member: claimed,
-                        of,
-                        ..
-                    } if claimed.as_deref() == member
-                        && of.as_deref().is_none_or(|of| scope_step(of).is_none()) =>
-                    {
-                        Some(*op)
-                    }
-                    _ => None,
-                })
+                claims
+                    .claims
+                    .iter()
+                    .filter(|claim| claim.is_call_form())
+                    .find_map(|claim| match claim {
+                        // An op claimed on what a scope member returns is read
+                        // only where a verified declaration says so
+                        // (carrick#1678), never by the member's name.
+                        LibraryClaim::Op {
+                            op,
+                            member: claimed,
+                            of,
+                            ..
+                        } if claimed.as_deref() == member
+                            && of.as_deref().is_none_or(|of| scope_step(of).is_none()) =>
+                        {
+                            Some(*op)
+                        }
+                        _ => None,
+                    })
             })
             .flatten();
         SiteEnd {
@@ -1357,24 +1361,28 @@ impl<'a> Walker<'a> {
                     let Some(claims) = self.labels.get(&key, export) else {
                         continue;
                     };
-                    let op = claims.claims.iter().find_map(|claim| match claim {
-                        LibraryClaim::Op {
-                            op,
-                            member: claimed,
-                            path,
-                            on,
-                            of,
-                            ..
-                        } if claimed.as_deref() == Some(member)
-                            && path.is_empty()
-                            && receivers
-                                .iter()
-                                .any(|receiver| applies(*on, of.as_deref(), receiver)) =>
-                        {
-                            Some(*op)
-                        }
-                        _ => None,
-                    });
+                    let op = claims
+                        .claims
+                        .iter()
+                        .filter(|claim| claim.is_call_form())
+                        .find_map(|claim| match claim {
+                            LibraryClaim::Op {
+                                op,
+                                member: claimed,
+                                path,
+                                on,
+                                of,
+                                ..
+                            } if claimed.as_deref() == Some(member)
+                                && path.is_empty()
+                                && receivers
+                                    .iter()
+                                    .any(|receiver| applies(*on, of.as_deref(), receiver)) =>
+                            {
+                                Some(*op)
+                            }
+                            _ => None,
+                        });
                     if let Some(op) = op {
                         return Some((
                             SiteEnd {

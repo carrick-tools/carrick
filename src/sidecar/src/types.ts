@@ -497,10 +497,44 @@ export interface VerifyClientSemanticsRequest extends BaseRequest {
  * Where one part of a library call sits: argument `arg` (0-based), or, with
  * `key`, the property `key` of the object passed there (carrick#1616).
  */
-export interface ClaimSlot {
+export interface SlotPosition {
   arg: number;
   key?: string;
 }
+
+/** A slot of a call (carrick#1616), with the reads amendment 7 adds. */
+export interface ClaimSlot extends SlotPosition {
+  /** A member path walked from the value there; `[]` steps into an array element (amendment 7 of carrick#2434). */
+  at?: string[];
+  /** A rest slot: every element is read (amendment 7). */
+  each?: boolean;
+}
+
+/** A slot that holds a name: also read as a GraphQL document, or as the name of a function or class (amendment 7). */
+export interface NameSlot extends ClaimSlot {
+  document?: 'graphql';
+  ref?: 'function' | 'class';
+}
+
+/** How a service writes an op (amendment 7); absent is `call`. */
+export type ClaimForm = 'call' | 'new' | 'set' | 'override' | 'decorate';
+
+/** The protocol an op speaks (amendment 7); absent is the role's own. */
+export type ClaimProtocol = 'http' | 'graphql' | 'rpc' | 'socket' | 'message';
+
+/** Two or three slots joined into one name (amendment 7). */
+export interface NameParts {
+  parts: ClaimSlot[];
+  join?: string;
+}
+
+/** A name the library fixes (amendment 7). */
+export interface NameLiteral {
+  literal: string;
+}
+
+/** Where an op's name comes from. */
+export type OpNameSource = BoundName | NameParts | NameLiteral | NameSlot;
 
 /**
  * A name the call does not carry: the one the maker's `name` slot bound to
@@ -509,7 +543,13 @@ export interface ClaimSlot {
  * R6a).
  */
 export interface BoundName {
-  bound: 'maker' | 'scope' | 'key';
+  bound: 'maker' | 'scope' | 'key' | 'path' | 'export' | 'subscribed';
+  /** `path`: the property names walked on the receiver are joined by this (amendment 7). */
+  join?: string;
+  /** `subscribed`: the handler parameter that is handed the name. */
+  param?: number;
+  /** `subscribed`: the member path to the name inside that parameter. */
+  at?: string[];
 }
 
 /**
@@ -518,7 +558,7 @@ export interface BoundName {
  * whose property values are procedures or nested collections, each named by
  * its key; nested keys join with `join`.
  */
-export interface Collects extends ClaimSlot {
+export interface Collects extends SlotPosition {
   join: string;
 }
 
@@ -528,7 +568,7 @@ export interface Collects extends ClaimSlot {
  * made the receiver (a mutation object whose `mutate` runs the function its
  * maker was given).
  */
-export interface RunsSlot extends ClaimSlot {
+export interface RunsSlot extends SlotPosition {
   bound?: 'maker';
 }
 
@@ -542,6 +582,8 @@ export interface Yields {
   param: number;
   export: string;
   side: string;
+  /** The package that declares `export`, when it is not the claim's own (amendment 7). */
+  package?: string;
 }
 
 /**
@@ -610,7 +652,7 @@ export type LibraryClaim =
       /** A prefix every name the instance sends gets. */
       prefix?: ClaimSlot;
       /** A definition's id or a queue's name: bound to every op that names `{ bound: 'maker' }`. */
-      name?: ClaimSlot;
+      name?: NameSlot;
       handler?: ClaimSlot;
       /** The function or client the maker runs (label v2). */
       runs?: ClaimSlot;
@@ -624,8 +666,10 @@ export type LibraryClaim =
       /** A member that returns a receiver bound to a name (a channel, room or queue). */
       kind: 'scope';
       member: string;
+      /** Amendment 7: absent is `call`; `decorate` is a class decorator whose name prefixes its methods' ops. */
+      form?: 'call' | 'decorate';
       /** Exactly one of `name` and `collects` (#2474 R6a). */
-      name?: ClaimSlot;
+      name?: NameSlot;
       path?: string[];
       on?: ClaimOn;
       of?: string;
@@ -654,7 +698,15 @@ export type LibraryClaim =
       on?: ClaimOn;
       /** The one receiver the op acts on, by its receiver id. */
       of?: string;
-      name?: ClaimSlot | BoundName;
+      name?: OpNameSource;
+      /** Amendment 7: how the service writes the op; absent is `call`. */
+      form?: ClaimForm;
+      /** Amendment 7: the protocol the op speaks; absent is the role's own. */
+      protocol?: ClaimProtocol;
+      /** Amendment 7: the op applies only where this slot holds this literal. */
+      when?: SlotPosition & { literal: string };
+      /** Amendment 7: the response a route's receive op sends; `{}` is a response of no stated shape. */
+      returns?: { result?: ResultShape };
       payload?: ClaimSlot;
       handler?: ClaimSlot;
       ack?: ClaimSlot;

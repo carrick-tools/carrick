@@ -42,7 +42,8 @@ use crate::request_summary::{
 };
 use crate::services::type_sidecar::{
     BoundName, ClaimOn, ClaimSlot, Collects, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole,
-    MakeForm, NameScope, NameScopeKind, OpName, SemanticsResult, SemanticsVerdict,
+    MakeForm, NameScope, NameScopeKind, OpForm, OpName, ScopeForm, SemanticsResult,
+    SemanticsVerdict,
 };
 
 /// Which end of a socket an export makes. A classification the types
@@ -214,6 +215,11 @@ impl ExportClaims {
             if !scopes && matches!(claim, LibraryClaim::Scope { .. }) {
                 continue;
             }
+            // Written as a set, an override or a decorator, not called
+            // (amendment 7): the readers of call sites do not read it yet.
+            if !claim.is_call_form() {
+                continue;
+            }
             let Some(id) = claim_id(&prefix, claim) else {
                 continue;
             };
@@ -261,36 +267,40 @@ impl ExportClaims {
                 MemberWire::Unlisted
             };
         }
-        let claimed = self.claims.iter().any(|claim| match claim {
-            LibraryClaim::Make {
-                form: MakeForm::Call,
-                member,
-                ..
-            } => receiver == "export" && used.path.is_empty() && *member == used.member,
-            LibraryClaim::Op {
-                member,
-                path,
-                on,
-                of,
-                ..
-            } => {
-                applies(*on, of.as_deref(), receiver)
-                    && *path == used.path
-                    && *member == used.member
-            }
-            LibraryClaim::Scope {
-                member,
-                path,
-                on,
-                of,
-                ..
-            } => {
-                applies(*on, of.as_deref(), receiver)
-                    && *path == used.path
-                    && Some(member) == used.member.as_ref()
-            }
-            _ => false,
-        });
+        let claimed = self
+            .claims
+            .iter()
+            .filter(|claim| claim.is_call_form())
+            .any(|claim| match claim {
+                LibraryClaim::Make {
+                    form: MakeForm::Call,
+                    member,
+                    ..
+                } => receiver == "export" && used.path.is_empty() && *member == used.member,
+                LibraryClaim::Op {
+                    member,
+                    path,
+                    on,
+                    of,
+                    ..
+                } => {
+                    applies(*on, of.as_deref(), receiver)
+                        && *path == used.path
+                        && *member == used.member
+                }
+                LibraryClaim::Scope {
+                    member,
+                    path,
+                    on,
+                    of,
+                    ..
+                } => {
+                    applies(*on, of.as_deref(), receiver)
+                        && *path == used.path
+                        && Some(member) == used.member.as_ref()
+                }
+                _ => false,
+            });
         if claimed {
             return MemberWire::OnWire;
         }
@@ -417,12 +427,22 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             path,
             on,
             of,
+            form,
+            when,
             ..
         } => Some(format!(
-            "{prefix}:op:{}:{}{}",
+            "{prefix}:op:{}:{}{}{}{}",
             op_name(*op),
             hops(path, member.as_deref()),
-            selector(on, of)
+            selector(on, of),
+            match form {
+                Some(form) if *form != OpForm::Call => format!(":form:{}", form.as_str()),
+                _ => String::new(),
+            },
+            match when {
+                Some(when) => format!(":when:{}", when.literal),
+                None => String::new(),
+            }
         )),
         // Asked only beside the claim it sits on, under that claim's id.
         LibraryClaim::Result { .. } => None,
@@ -440,6 +460,7 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
         )),
         LibraryClaim::Scope {
             member,
+            form,
             name,
             path,
             on,
@@ -486,9 +507,13 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
                 (None, None) => return None,
             };
             Some(format!(
-                "{prefix}:scope:{}:{named}{}",
+                "{prefix}:scope:{}:{named}{}{}",
                 hops(path, Some(member)),
-                selector(on, of)
+                selector(on, of),
+                match form {
+                    Some(ScopeForm::Decorate) => ":form:decorate",
+                    Some(ScopeForm::Call) | None => "",
+                }
             ))
         }
     }
@@ -995,13 +1020,14 @@ impl Reading<'_> {
             if !supplied {
                 return None;
             }
-            let (text, scope) = match name.as_ref()? {
+            let (text, scope) = match name.as_deref()? {
                 OpName::Slot(slot) => (
                     self.site.literal(slot_arg(slot), slot_key(slot))?,
                     name_scope.clone(),
                 ),
                 OpName::Bound {
                     bound: BoundName::Maker,
+                    ..
                 } => {
                     let (maker, make) = maker?;
                     let LibraryClaim::Make {
@@ -1019,9 +1045,10 @@ impl Reading<'_> {
                 }
                 // A name a scope member binds is carrick#1678's; one a
                 // router key binds is #2474 R6c's.
-                OpName::Bound {
-                    bound: BoundName::Scope | BoundName::Key,
-                } => return None,
+                // The names amendment 7 adds are read from H3 on.
+                OpName::Bound { .. } | OpName::Parts { .. } | OpName::Literal { .. } => {
+                    return None;
+                }
             };
             if !self.name_ok(text, Some(&receiver)) {
                 return None;
@@ -1476,6 +1503,145 @@ mod tests {
         assert_eq!(major("2.4.1"), "2");
         assert_eq!(major("^10.0.0"), "10");
         assert_eq!(major("latest"), "x");
+    }
+
+    /// Amendment 7 of carrick#2434 (carrick#3045): every new field of the
+    /// grammar reads from the wire and writes back as it was read.
+    #[test]
+    fn amendment_seven_fields_round_trip() {
+        let wire = [
+            json!({ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                    "name": { "arg": 0, "at": ["messages[]", "topic"], "each": true,
+                              "document": "graphql", "ref": "class" },
+                    "payload": { "arg": 1, "at": ["value"] } }),
+            json!({ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                    "name": { "parts": [{ "arg": 0 }, { "arg": 1, "key": "id" }], "join": "/" } }),
+            json!({ "kind": "op", "op": "receive", "member": "on", "on": "export",
+                    "name": { "literal": "connection" } }),
+            json!({ "kind": "op", "op": "receive", "member": "on", "on": "export",
+                    "name": { "bound": "path", "join": "." } }),
+            json!({ "kind": "op", "op": "receive", "member": "on", "on": "export",
+                    "name": { "bound": "export" } }),
+            json!({ "kind": "op", "op": "receive", "member": "on", "on": "export",
+                    "name": { "bound": "subscribed", "param": 0, "at": ["topic"] } }),
+            json!({ "kind": "op", "op": "receive", "member": "get", "on": "export",
+                    "form": "decorate", "protocol": "graphql",
+                    "when": { "arg": 0, "key": "event", "literal": "message" },
+                    "returns": { "result": { "member": ["data"] } } }),
+            json!({ "kind": "op", "op": "receive", "member": "get", "on": "export",
+                    "returns": {} }),
+            json!({ "kind": "scope", "member": "controller", "form": "decorate",
+                    "name": { "arg": 0, "ref": "function" },
+                    "runs": { "arg": 1 },
+                    "yields": { "param": 0, "export": "Ctx", "side": "server",
+                                "package": "fixture-other" } }),
+        ];
+        for value in wire {
+            let claim: LibraryClaim = serde_json::from_value(value.clone()).expect("a claim");
+            assert_eq!(serde_json::to_value(&claim).unwrap(), value);
+        }
+        for form in ["call", "new", "set", "override", "decorate"] {
+            let claim: LibraryClaim = serde_json::from_value(
+                json!({ "kind": "op", "op": "send", "member": "m", "form": form }),
+            )
+            .expect("a form");
+            assert_eq!(claim.is_call_form(), form == "call");
+        }
+        for protocol in ["http", "graphql", "rpc", "socket", "message"] {
+            serde_json::from_value::<LibraryClaim>(
+                json!({ "kind": "op", "op": "send", "member": "m", "protocol": protocol }),
+            )
+            .expect("a protocol");
+        }
+        assert!(
+            serde_json::from_value::<LibraryClaim>(
+                json!({ "kind": "op", "op": "send", "member": "m", "form": "returns" })
+            )
+            .is_err()
+        );
+    }
+
+    /// A claim written without the new fields writes back byte for byte as it
+    /// was read: the wire bytes of a claim the store holds today do not move.
+    #[test]
+    fn a_claim_without_amendment_seven_fields_serialises_byte_identical() {
+        let claims = [
+            r#"{"kind":"op","op":"send","member":"publish","on":"export","name":{"arg":1},"payload":{"arg":0}}"#,
+            r#"{"kind":"op","op":"receive","member":"get","of":"instance:()","name":{"bound":"maker"},"handler":{"arg":1},"method":"GET","yields":{"param":1,"export":"Reply","side":"server"}}"#,
+            r#"{"kind":"scope","member":"mount","name":{"arg":0,"key":"prefix"},"of":"instance:new"}"#,
+            r#"{"kind":"make","form":"call","member":null,"name":{"arg":0}}"#,
+        ];
+        for text in claims {
+            let claim: LibraryClaim = serde_json::from_str(text).expect("a claim");
+            assert_eq!(serde_json::to_string(&claim).unwrap(), text);
+        }
+    }
+
+    /// Amendment 7: `form` (not `call`) and `when` extend the id of the op
+    /// they sit on; every other id is as it was.
+    #[test]
+    fn claim_ids_name_the_form_and_the_when_literal() {
+        let server = export(json!({
+            "package": "fixture-server", "version": "2.1.0", "specifier": "fixture-server",
+            "export": "Server", "role": "server_framework",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": "on", "of": "instance:new" },
+                { "kind": "op", "op": "receive", "member": "on", "of": "instance:new",
+                  "form": "call" },
+                { "kind": "op", "op": "receive", "member": "on", "of": "instance:new",
+                  "form": "set" },
+                { "kind": "op", "op": "receive", "member": "on", "of": "instance:new",
+                  "when": { "arg": 0, "literal": "message" } },
+                { "kind": "op", "op": "receive", "member": "on", "of": "instance:new",
+                  "form": "set", "when": { "arg": 0, "literal": "close" } },
+                { "kind": "scope", "member": "use", "of": "instance:new", "name": { "arg": 0 } },
+                { "kind": "scope", "member": "use", "of": "instance:new", "name": { "arg": 0 },
+                  "form": "decorate" }
+            ]
+        }));
+        let prefix = "fixture-server@2:Server";
+        let claims = server
+            .claims
+            .iter()
+            .map(|claim| claim_id(prefix, claim).unwrap());
+        assert_eq!(
+            claims.collect::<Vec<_>>(),
+            vec![
+                format!("{prefix}:op:receive:on:of:instance:new"),
+                format!("{prefix}:op:receive:on:of:instance:new"),
+                format!("{prefix}:op:receive:on:of:instance:new:form:set"),
+                format!("{prefix}:op:receive:on:of:instance:new:when:message"),
+                format!("{prefix}:op:receive:on:of:instance:new:form:set:when:close"),
+                format!("{prefix}:scope:use:name@0:returns:of:instance:new"),
+                format!("{prefix}:scope:use:name@0:returns:of:instance:new:form:decorate"),
+            ]
+        );
+    }
+
+    /// The readers of call sites do not meet a claim written as a set, an
+    /// override, a decorator or a construction (amendment 7).
+    #[test]
+    fn call_site_readers_skip_claims_written_in_another_form() {
+        let server = export(json!({
+            "package": "fixture-server", "version": "2.1.0", "specifier": "fixture-server",
+            "export": "Server", "role": "server_framework",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": "on", "of": "instance:new" },
+                { "kind": "op", "op": "receive", "member": "onerror", "of": "instance:new",
+                  "form": "set" },
+                { "kind": "scope", "member": "controller", "of": "instance:new",
+                  "name": { "arg": 0 }, "form": "decorate" }
+            ]
+        }));
+        let ids: Vec<String> = server
+            .claims_with_scopes_by_id()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["fixture-server@2:Server:op:receive:on:of:instance:new"]
+        );
     }
 
     /// carrick#2474 R2b: a scope claim's id names its name slot and what it
