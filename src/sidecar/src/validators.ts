@@ -693,7 +693,6 @@ export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({
   handlers: z.boolean().optional(),
   types: z.boolean().optional(),
   result_candidates: z.boolean().optional(),
-  types: z.boolean().optional(),
   max_handler_members: z.number().int().positive().optional(),
 });
 
