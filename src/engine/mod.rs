@@ -4076,7 +4076,6 @@ async fn analyze_current_repo_incremental(
                         .map(|f| (f.to_string_lossy().to_string(), normalize_path(f))),
                     prev_file_results,
                     &unchanged,
-                    &setup.detection.data_fetchers,
                     &setup.detection.messaging_clients,
                 )
             } else {
