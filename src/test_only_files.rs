@@ -26,6 +26,9 @@ pub type AliasKey = Option<(PathBuf, PathBuf)>;
 
 type SetKey = (PathBuf, AliasKey, Vec<String>);
 
+/// One key's slot: filled by the first caller, awaited by the rest.
+type SetSlot = Arc<OnceLock<Arc<HashSet<PathBuf>>>>;
+
 /// What one scan has read, owned by the scan and dropped with it, so a tree
 /// that changes between two scans of one process is read again (carrick#2786).
 /// Per file, the specifiers it loads; per `(repo_root, alias, ignore
@@ -34,7 +37,7 @@ type SetKey = (PathBuf, AliasKey, Vec<String>);
 #[derive(Debug, Default)]
 pub struct Cache {
     read: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
-    sets: Mutex<HashMap<SetKey, Arc<OnceLock<Arc<HashSet<PathBuf>>>>>>,
+    sets: Mutex<HashMap<SetKey, SetSlot>>,
 }
 
 impl Cache {

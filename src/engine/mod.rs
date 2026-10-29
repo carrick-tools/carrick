@@ -9207,6 +9207,7 @@ enum Read {
 /// against the bytes every span is counted in. Binding the rows may take
 /// `rows_budget` (carrick#2564). With `receiver_trace`, it also reads the
 /// files only tests import (carrick#2775).
+#[allow(clippy::too_many_arguments)]
 fn discover_with_positions(
     repo_path: &str,
     service: &Config,
