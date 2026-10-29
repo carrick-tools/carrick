@@ -124,6 +124,7 @@ export declare class Conn {
 }
 export interface App {
   anon(handler: (ctx: { body: unknown; send(body: unknown): void }) => void): this;
+  anon2(handler: (ctx: { body: unknown; send(body: unknown): void }) => void): this;
   gen(handler: (g: Gen<string>) => void): this;
   conn(handler: (c: Conn) => void): this;
   get(path: string, handler: (req: core.Request, res: core.Response) => void): this;
@@ -448,6 +449,8 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
       }
     }
     assert.deepStrictEqual(byName.get('get')!.handlers![0].params.map(p => p.name), ['req', 'res']);
+    // Two anonymous types written alike are two type objects with one content: one entry.
+    assert.strictEqual(byName.get('anon2')!.handlers![0].params[0].type_id, byName.get('anon')!.handlers![0].params[0].type_id);
     assert.deepStrictEqual(unnamed.types, []);
   });
 

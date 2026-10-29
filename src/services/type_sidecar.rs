@@ -958,8 +958,9 @@ pub struct RunsSlot {
 }
 
 /// What a receive op's handler is handed (label structure v2, carrick#2434):
-/// its parameter `param` is an instance of the package's export `export`, on
-/// `side` of the connection. The verifier judges `side` (`client` or
+/// its parameter `param` is an instance of the package's export `export`, or
+/// is the package's type export `export` itself (carrick#2977), on `side` of
+/// the connection. The verifier judges `side` (`client` or
 /// `server`); it is carried as the store wrote it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Yields {
@@ -1286,8 +1287,10 @@ pub struct ServerClaims {
 
 /// One claim to check on one receiver: `export`, `instance:<member>`,
 /// `instance:()`, `instance:new` or `instance:new:<member>`, each optionally
-/// followed by `>scope:<path.member>` (what that scope member returns). The
-/// unit of verification is `(claim_id, receiver)`.
+/// followed by `>scope:<path.member>` (what that scope member returns); or
+/// `type`, the export read as a type at its defaults, which only a claim with
+/// `of: "type"` is read on (carrick#2977). The unit of verification is
+/// `(claim_id, receiver)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryCheck {
     pub claim_id: String,

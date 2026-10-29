@@ -1261,6 +1261,36 @@ mod tests {
         );
     }
 
+    /// carrick#2977 B: a reply that is a type export carries its sends
+    /// `of: "type"`; the verifier reads them on the receiver `type`. `on`
+    /// never reaches that receiver.
+    #[test]
+    fn a_type_exports_send_is_checked_on_receiver_type() {
+        let reply = export(json!({
+            "package": "fixture-server", "version": "2.1.0", "specifier": "fixture-server",
+            "export": "Reply", "role": "server_framework",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "send", "of": "type", "payload": { "arg": 0 } }
+            ]
+        }));
+        let asked: Vec<(String, String, String)> = server_checks(&[reply])
+            .into_iter()
+            .map(|check| (check.export, check.receiver, check.claim_id))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![(
+                "Reply".to_string(),
+                "type".to_string(),
+                "fixture-server@2:Reply:op:send:send:of:type".to_string()
+            )]
+        );
+        assert!(applies(None, Some("type"), "type"));
+        assert!(!applies(Some(ClaimOn::Instance), None, "type"));
+        assert!(!applies(Some(ClaimOn::Both), None, "type"));
+        assert!(!applies(Some(ClaimOn::Export), None, "type"));
+    }
+
     /// A declaration found in a type-only package stands for the package
     /// whose answer lists it; an `@types/*` name keeps its convention; any
     /// other name is itself (carrick#2434).

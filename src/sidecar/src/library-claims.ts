@@ -379,6 +379,8 @@ interface ReceiverPath {
   maker?: { form: 'call' | 'new'; member: string | null };
   /** The scope member, after its path, joined by `.` (`tasks.channel`). */
   scope?: string;
+  /** The export is a type, read at its defaults (`type`, carrick#2977): no maker, no scope step. */
+  type?: true;
 }
 
 export interface VerifyResult {
@@ -587,6 +589,15 @@ export class LibraryClaimsVerifier {
       builtIndex.set(key, importLines.length + builtLines.length);
       builtLines.push(`${expression};`);
     }
+    // A check on receiver `type` (carrick#2977) reads its export as a type,
+    // declared at its defaults after the export's import, as the lister lists it.
+    for (const check of checks) {
+      if (!rulesFor(check)?.message || check.receiver !== TYPE_RECEIVER) continue;
+      const key = builtKey(check, TYPE_RECEIVER);
+      if (builtIndex.has(key)) continue;
+      builtIndex.set(key, importLines.length + builtLines.length);
+      builtLines.push(typeBuildLine(builtLines.length, `__carrick_e${importIndex.get(exportKey(check))!}`));
+    }
     // A `node:` key may name a file of the runtime's types, whose exports are
     // globals (`runtimeGlobalFile`): the probe reads each as `globalThis` holds
     // it, beside its import, and the reader takes the one the key resolves to.
@@ -741,6 +752,32 @@ export class LibraryClaimsVerifier {
       };
 
       /**
+       * The one receiver of a check on `type` (carrick#2977): the export read
+       * as a type at its declared type-parameter defaults, its home from the
+       * declaration the import names, made by nothing. `type_unresolved` when
+       * the name has no type meaning or needs a type argument.
+       */
+      const readTypeReceiver = (check: LibraryCheck): Read<MessageReceiver[]> => {
+        const index = builtIndex.get(builtKey(check, TYPE_RECEIVER));
+        const built = index === undefined ? undefined : builtType(checker, statementOf(check), file.statements[index]);
+        if (built === undefined) return { reason: 'type_unresolved' };
+        return {
+          value: [
+            {
+              type: built.type,
+              pkg: check.package,
+              home: withTypePackages(
+                reader.homeOf(check.package, [built.symbol, ...typeSymbols(built.type)]),
+                typePackages[check.package]
+              ),
+              makerBindsName: false,
+              scoped: false,
+            },
+          ],
+        };
+      };
+
+      /**
        * What a set of maker (or scope) judgements build: the distinct types
        * their common overloads return, each read at its declared
        * type-parameter defaults where `built` (the probe's no-argument build
@@ -815,10 +852,12 @@ export class LibraryClaimsVerifier {
         if (rules.message && LOCAL_RANGE.test(localRanges.get(packageNameOf(check.package)) ?? '')) {
           return { outcome: unchecked('module_workspace') };
         }
-        const exportRead = readExport(check);
-        if ('reason' in exportRead) return { outcome: unchecked(exportRead.reason) };
+        // A type export has no value to read (carrick#2977): `readTypeReceiver` reads it.
+        const typeReceiver = rules.message && check.receiver === TYPE_RECEIVER;
+        const exportRead: Read<ExportRead> | undefined = typeReceiver ? undefined : readExport(check);
+        if (exportRead !== undefined && 'reason' in exportRead) return { outcome: unchecked(exportRead.reason) };
 
-        if (rules.http) {
+        if (rules.http && exportRead !== undefined) {
           const key = exportKey(check);
           const receiverKey = `${key}\u0000${check.receiver}`;
           let receiverRead = httpReceivers.get(receiverKey);
@@ -838,7 +877,7 @@ export class LibraryClaimsVerifier {
         if (check.claim.kind === 'op' && !rules.ops.has(check.claim.op)) {
           return { outcome: unchecked('role_unsupported') };
         }
-        const receivers = readMessageReceivers(index, exportRead.value);
+        const receivers = exportRead === undefined ? readTypeReceiver(check) : readMessageReceivers(index, exportRead.value);
         if ('reason' in receivers) return { outcome: unchecked(receivers.reason) };
         const built = builtReceiver(check);
         const builtAtDefaults = built === undefined ? undefined : atDefaults(check, built);
@@ -1211,7 +1250,8 @@ function factoryKey(exportKeyText: string, member: string): string {
 
 /**
  * `export`, `instance:()`, `instance:new`, `instance:new:<member>` or
- * `instance:<member>`, optionally followed by `>scope:<path.member>`.
+ * `instance:<member>`, optionally followed by `>scope:<path.member>`; or
+ * `type` (carrick#2977), followed by nothing.
  */
 function parseReceiver(text: string): ReceiverPath | undefined {
   const steps = text.split('>');
@@ -1224,6 +1264,7 @@ function parseReceiver(text: string): ReceiverPath | undefined {
     scope = match[1];
   }
   if (base === 'export') return { base, scope };
+  if (base === TYPE_RECEIVER) return scope === undefined ? { base, type: true } : undefined;
   if (base === 'instance:()') return { base, scope, maker: { form: 'call', member: null } };
   if (base === 'instance:new') return { base, scope, maker: { form: 'new', member: null } };
   let match = /^instance:new:(\S+)$/.exec(base);
@@ -1240,15 +1281,16 @@ function scopeStep(claim: ScopeClaim): string {
 
 /**
  * An op, scope or reserved name carries `on` or `of`, never both, and `of` is
- * a receiver a maker or a scope builds, by its receiver id: never the export
- * itself, which `on: 'export'` names (contract amendment 2, B3). "Both the
- * export and one maker's instances" is two elements, not one.
+ * a receiver a maker or a scope builds, by its receiver id, or `type`, the
+ * export read as a type (carrick#2977): never the export itself, which
+ * `on: 'export'` names (contract amendment 2, B3). "Both the export and one
+ * maker's instances" is two elements, not one.
  */
 function placementInvalid(claim: LibraryClaim): boolean {
   if (claim.kind === 'make' || claim.of === undefined) return false;
   if (claim.on !== undefined) return true;
   const of = parseReceiver(claim.of);
-  return of === undefined || (of.maker === undefined && of.scope === undefined);
+  return of === undefined || (of.maker === undefined && of.scope === undefined && of.type === undefined);
 }
 
 /**
@@ -1314,7 +1356,8 @@ export interface LabelledMembers {
  * `of` is read on exactly that receiver. One with `on` is read on the export
  * (`export`), on an instance of a maker (`instance`) or on either (`both`),
  * and never on a receiver a scope returns, which only `of` names. One with
- * neither names no receiver of its own. A claim read on a receiver it was
+ * neither names no receiver of its own. `type` is read only by `of: "type"`
+ * (carrick#2977). A claim read on a receiver it was
  * not claimed for could verify a member of the same name with another shape
  * (`client.write(name, value)` against `instance.write(value)`).
  */
@@ -1322,6 +1365,8 @@ function fitsReceiver(check: LibraryCheck): boolean {
   const receiver = parseReceiver(check.receiver);
   if (!receiver) return false;
   const claim = check.claim;
+  // A type export is read only by a claim placed on it (carrick#2977).
+  if (receiver.type) return claim.kind !== 'make' && claim.of === TYPE_RECEIVER;
   if (claim.kind === 'make') return check.receiver === 'export';
   if (claim.of !== undefined) return check.receiver === claim.of;
   if (claim.on === undefined) return true;
