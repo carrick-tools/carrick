@@ -439,7 +439,7 @@ mod tests {
     /// the gatekeeper raised for it: `None` when its method cannot be read.
     fn module_shape(content: &str) -> Option<WrapperRequestShape> {
         let scanner = SwcScanner::new();
-        let result = scanner.scan_content(&PathBuf::from("client.ts"), content, &[]);
+        let result = scanner.scan_content(&PathBuf::from("client.ts"), content, &[], &[]);
         assert!(!result.parse_failed, "fixture must parse");
         result
             .candidates
