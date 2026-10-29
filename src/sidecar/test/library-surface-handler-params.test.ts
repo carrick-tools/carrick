@@ -427,6 +427,13 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
     assert.ok(!JSON.stringify(routes.types).includes('"scope_receiver"'));
   });
 
+  it('names a handed type export whatever value exports the request asks for', async () => {
+    const [routes] = await surface(['fixture-routes'], { exports: { 'fixture-routes': ['router'] } });
+    assert.deepStrictEqual(routes.exports.map(e => e.export), ['router']);
+    assert.deepStrictEqual(routes.handler_types!.map(e => e.export), ['Request', 'Reply']);
+    assert.deepStrictEqual(routes.types!.map(t => t.export), ['Reply', 'Request']);
+  });
+
   // carrick#2977 ticket A, test 5.
   it('names a context alias inside the namespace of a module exported whole', async () => {
     const [middleware] = await surface(['fixture-middleware']);
