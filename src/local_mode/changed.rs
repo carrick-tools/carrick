@@ -318,6 +318,13 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         }
     };
     output.services = rejoined.services;
+    // A re-scan that could not replay the index's model answers has lost every
+    // row only the model stated, so what it judged is not the whole service
+    // (carrick#3000). That is not a pass.
+    let lost = answers_lost(&rejoined.index, changed.keys());
+    if !lost.is_empty() {
+        output.not_checked = Some(lost.join(" "));
+    }
 
     let wanted: BTreeMap<String, &BTreeSet<String>> = changed
         .iter()
@@ -496,6 +503,29 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
         .collect();
     repos.extend(listed);
     (repos, changed)
+}
+
+/// The sentence for each re-scanned repo whose scan could not replay the
+/// index's model answers (carrick#3000), in repo order.
+fn answers_lost<'a>(
+    rebuilt: &LocalIndex,
+    scanned: impl Iterator<Item = &'a String>,
+) -> Vec<String> {
+    let scanned: BTreeSet<&String> = scanned.collect();
+    rebuilt
+        .repos
+        .iter()
+        .filter(|repo| scanned.contains(&repo.name))
+        .flat_map(|repo| repo.services.iter())
+        .filter_map(|service| {
+            service
+                .boundary
+                .as_ref()?
+                .model_answers_unavailable
+                .as_ref()
+        })
+        .map(super::query::answers_unavailable_sentence)
+        .collect()
 }
 
 struct Judged {

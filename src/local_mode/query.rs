@@ -827,6 +827,21 @@ fn hosted_provenance_clause(hosted: &super::hosted::HostedProvenance) -> String 
     clause
 }
 
+/// The one line for a scan that could not replay the index's model answers
+/// (carrick#3000): what is missing, why, and the move that mends it.
+pub fn answers_unavailable_sentence(lost: &crate::boundary::ModelAnswersUnavailable) -> String {
+    let missing = if lost.rows == 1 {
+        "1 route or call is".to_string()
+    } else {
+        format!("{} routes and calls are", lost.rows)
+    };
+    format!(
+        "the index was written at {}, which this clone does not have and could not fetch from \
+         origin, so {missing} missing. Run `git fetch origin`, then check again.",
+        lost.commit.chars().take(7).collect::<String>(),
+    )
+}
+
 /// What the scan did with the model rows of the files edited since the hosted
 /// index (carrick#2894): how many it carried onto their unchanged lines, and
 /// the first row it could not, with the reason. Empty when the scan carried
@@ -980,6 +995,12 @@ pub fn enrichment_note(
             " The hosted index is older than this CLI; run `carrick index --detach` once from \
              main to refresh it.",
         );
+    }
+    if let Some(lost) = boundary.and_then(|b| b.model_answers_unavailable.as_ref()) {
+        note.push_str(&format!(
+            " Not checked: {}",
+            answers_unavailable_sentence(lost)
+        ));
     }
     // The three ways a read can end short of a replayable hosted index, and
     // each says what it costs the reader and what moves it (carrick#1255).
@@ -1273,6 +1294,25 @@ mod hosted_change_tests {
         assert!(!note.contains("T11:58"), "{note}");
         assert!(!note.contains("307127732"), "{note}");
         assert!(!note.contains("registration_line_changed"), "{note}");
+    }
+
+    /// A lost replay is said once, in plain words, with the commit short and the
+    /// move that mends it (carrick#3000).
+    #[test]
+    fn a_lost_replay_reads_as_plain_english() {
+        let lost = crate::boundary::ModelAnswersUnavailable {
+            commit: "ed47a926aa00000000000000000000000000beef".to_string(),
+            reason: "bad object".to_string(),
+            rows: 595,
+        };
+        assert_eq!(
+            answers_unavailable_sentence(&lost),
+            "the index was written at ed47a92, which this clone does not have and could not \
+             fetch from origin, so 595 routes and calls are missing. Run `git fetch origin`, \
+             then check again."
+        );
+        let one = crate::boundary::ModelAnswersUnavailable { rows: 1, ..lost };
+        assert!(answers_unavailable_sentence(&one).contains("1 route or call is missing"));
     }
 
     /// Every reason a row is not carried has words, and a code with none

@@ -3499,13 +3499,28 @@ fn enforce_payload_size_limit(data: &mut CloudRepoData, staging_available: bool)
 ///
 /// Compared against the working tree, not HEAD: a file edited and not yet
 /// committed is changed here whatever `git diff <base> HEAD` says, and a file
-/// git does not track is never unchanged (carrick#1079). `None` is "git could
-/// not answer", and the caller falls back to a full analysis.
-fn reusable_paths(repo_path: &str, base_commit: &str) -> Option<HashSet<String>> {
-    let reason = match crate::git_state::unchanged_since(repo_path, base_commit) {
-        Ok(paths) => return Some(paths),
+/// git does not track is never unchanged (carrick#1079). `Err` is "git could
+/// not answer", with its reason, and the caller falls back to a full analysis.
+///
+/// A local no-model run whose clone lacks `base_commit` (a PR squash-merged on
+/// GitHub before the user pulled) fetches that one commit by its hash first,
+/// once per repo, and keeps it under a ref Carrick owns (carrick#3000). A
+/// failed fetch is part of the reason returned.
+fn reusable_paths(repo_path: &str, base_commit: &str) -> Result<HashSet<String>, String> {
+    let mut reason = match crate::git_state::unchanged_since(repo_path, base_commit) {
+        Ok(paths) => return Ok(paths),
         Err(reason) => reason,
     };
+    let local = crate::local_mode::no_model();
+    if local && !crate::git_state::has_commit(repo_path, base_commit) {
+        match fetch_indexed_commit_once(repo_path, base_commit) {
+            Ok(()) => match crate::git_state::unchanged_since(repo_path, base_commit) {
+                Ok(paths) => return Ok(paths),
+                Err(again) => reason = again,
+            },
+            Err(why) => reason = format!("{reason}; fetching it from origin failed: {why}"),
+        }
+    }
     // Surface this at warn level with the cause: a shallow clone
     // (actions/checkout defaults to fetch-depth: 1) silently forces a full
     // re-analysis — including its full LLM cost — on every run.
@@ -3518,7 +3533,7 @@ fn reusable_paths(repo_path: &str, base_commit: &str) -> Option<HashSet<String>>
         .output()
         .ok()
         .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
-    if is_shallow {
+    if is_shallow && !local {
         warn!(
             "Incremental mode unavailable: this is a shallow clone, so the previous \
              scan's commit isn't reachable for diffing. Set `fetch-depth: 0` on \
@@ -3531,7 +3546,51 @@ fn reusable_paths(repo_path: &str, base_commit: &str) -> Option<HashSet<String>>
             base_commit, reason
         );
     }
-    None
+    Err(reason)
+}
+
+/// [`crate::git_state::fetch_indexed_commit`], asked once per repo and commit
+/// in this process: a repo with several services must not wait out the same
+/// failed fetch for each of them.
+fn fetch_indexed_commit_once(repo_path: &str, commit: &str) -> Result<(), String> {
+    type Tried = Vec<(String, String, Result<(), String>)>;
+    static TRIED: std::sync::Mutex<Tried> = std::sync::Mutex::new(Vec::new());
+    let mut tried = TRIED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, outcome)) = tried
+        .iter()
+        .find(|(repo, sha, _)| repo == repo_path && sha == commit)
+    {
+        return outcome.clone();
+    }
+    let outcome = crate::git_state::fetch_indexed_commit(repo_path, commit);
+    tried.push((repo_path.to_string(), commit.to_string(), outcome.clone()));
+    outcome
+}
+
+/// What the lost replay costs the user: the rows the previous generation's
+/// model answers held. `None` outside a no-model run, and when the previous
+/// generation held no answers to lose (carrick#3000).
+fn answers_unavailable(
+    prev: &CloudRepoData,
+    reason: &str,
+) -> Option<crate::boundary::ModelAnswersUnavailable> {
+    if !crate::local_mode::no_model() {
+        return None;
+    }
+    let rows: usize = prev
+        .file_results
+        .as_ref()?
+        .values()
+        .map(|file| file.endpoints.len() + file.mounts.len() + file.data_calls.len())
+        .sum();
+    (rows > 0).then(|| crate::boundary::ModelAnswersUnavailable {
+        commit: prev.commit_hash.clone(),
+        reason: crate::findings::truncate_chars(
+            &reason.split_whitespace().collect::<Vec<_>>().join(" "),
+            300,
+        ),
+        rows,
+    })
 }
 
 /// Hash file content for cache invalidation (package.json).
@@ -3743,6 +3802,10 @@ async fn analyze_current_repo_incremental(
         version_matches
     });
 
+    // Set when a no-model run could not replay the previous generation's
+    // model answers; stated on the boundary of the blob the full analysis
+    // below writes (carrick#3000).
+    let mut lost_answers = None;
     if let Some(prev) = can_use_incremental {
         let prev_commit = &prev.commit_hash;
         debug!(
@@ -3751,7 +3814,11 @@ async fn analyze_current_repo_incremental(
         );
 
         // Which files still hold the content the previous scan's commit did.
-        if let Some(unchanged) = reusable_paths(repo_path, prev_commit) {
+        let reusable = reusable_paths(repo_path, prev_commit);
+        if let Err(reason) = &reusable {
+            lost_answers = answers_unavailable(prev, reason);
+        }
+        if let Ok(unchanged) = reusable {
             // Function intents need only discovery's definitions and the
             // previous scan's hashes, so they start now and run beside
             // detection, file analysis and the graph (carrick#1065). Started
@@ -4475,7 +4542,7 @@ async fn analyze_current_repo_incremental(
     // Discovery above already parsed every file, resolved the call edges and
     // walked the manifests; the full analysis reads the same result rather
     // than running all of it a second time (carrick#1108).
-    let analysis = analyze_current_repo(
+    let mut analysis = analyze_current_repo(
         repo_path,
         config,
         packages,
@@ -4497,6 +4564,9 @@ async fn analyze_current_repo_incremental(
         &siblings,
     )
     .await?;
+    if let Some(boundary) = analysis.data.boundary.as_mut() {
+        boundary.model_answers_unavailable = lost_answers;
+    }
 
     let elapsed = start.elapsed();
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
@@ -15608,9 +15678,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let (repo, _) = committed_repo(&[("app.ts", "x")]);
         let root = repo.path().to_str().unwrap();
         // A commit this clone does not hold (what a shallow clone looks like).
-        assert!(reusable_paths(root, "0000000000000000000000000000000000000000").is_none());
+        assert!(reusable_paths(root, "0000000000000000000000000000000000000000").is_err());
         // Not a commit id at all never reaches git.
-        assert!(reusable_paths(root, "--output=/tmp/x").is_none());
+        assert!(reusable_paths(root, "--output=/tmp/x").is_err());
     }
 
     #[test]

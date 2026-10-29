@@ -3836,6 +3836,125 @@ fn a_named_handler_whose_body_changed_is_not_carried() {
     );
 }
 
+/// Point every stored blob at `commit`, as an index written elsewhere would be.
+fn stored_blobs_say_commit(root: &Path, commit: &str) {
+    let dir = root.join(".carrick/repos");
+    for entry in std::fs::read_dir(&dir).expect("read the stored blobs") {
+        let path = entry.expect("dir entry").path();
+        let mut blob: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read a blob"))
+                .expect("a stored blob is JSON");
+        blob["commit_hash"] = serde_json::json!(commit);
+        std::fs::write(&path, serde_json::to_vec(&blob).expect("serialise")).expect("write");
+    }
+}
+
+/// The index was written at a commit this clone does not hold and cannot
+/// fetch: the re-scan cannot replay the model's answers, so every route only
+/// the model stated is gone. That used to exit 0 with a clean report. It is
+/// not a pass (carrick#3000).
+#[test]
+#[serial]
+fn an_index_commit_missing_from_the_clone_is_not_a_pass() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    let missing = "f".repeat(40);
+    stored_blobs_say_commit(root, &missing);
+    rename_connected(root);
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(2), "{changed:#}");
+    let said = changed["not_checked"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("fffffff") && said.contains("routes and calls are missing"),
+        "{changed:#}"
+    );
+    assert!(said.contains("git fetch origin"), "{said}");
+}
+
+/// The same index commit, held by `origin` and gone from the clone (a PR
+/// squash-merged on the host before the user pulled): the scan fetches that one
+/// commit by its hash, keeps it under a ref Carrick owns, replays the model's
+/// answers and judges the edit as it does when the commit is present.
+#[test]
+#[serial]
+fn an_index_commit_origin_holds_is_fetched_and_the_edit_judged() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    // Judged once at the indexed commit, as the test above does.
+    check_json(root, CARRY_ROUTES);
+    let api = root.join("items-api");
+    let indexed = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&api)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    // origin holds the indexed commit; the clone then loses it.
+    let origin = root.join("items-api-origin.git");
+    git(
+        root,
+        &["clone", "-q", "--bare", "items-api", "items-api-origin.git"],
+    );
+    git(
+        &api,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    let mut amend = COMMIT.to_vec();
+    amend.insert(5, "--amend");
+    amend.push("amended");
+    git(&api, &amend);
+    git(&api, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&api, &["gc", "-q", "--prune=now"]);
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&api)
+            .args(["cat-file", "-e", &format!("{indexed}^{{commit}}")])
+            .output()
+            .expect("cat-file")
+            .status
+            .success(),
+        "the clone must not hold the indexed commit"
+    );
+    rename_connected(root);
+    // The per-edit re-check first, as the test above does: the pass below
+    // reads the stubs it leaves.
+    let (code, text) = carrick_code(
+        root,
+        &[
+            "check",
+            CARRY_ROUTES,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(1), "{changed:#}");
+    assert!(changed["not_checked"].is_null(), "{changed:#}");
+    let kept = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&api)
+            .args(["rev-parse", "refs/carrick/indexed"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8");
+    assert_eq!(kept.trim(), indexed, "kept under the ref Carrick owns");
+}
+
 /// A carried answer is joined and never stored: it is keyed by this tree's
 /// candidate ids and mapped from the previous generation's commit, so a stored
 /// copy would be mapped again from the wrong base.

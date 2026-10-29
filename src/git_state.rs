@@ -244,6 +244,92 @@ pub fn unchanged_since(repo_path: &str, commit: &str) -> Result<HashSet<String>,
         .collect())
 }
 
+/// The ref an indexed commit fetched by [`fetch_indexed_commit`] is kept under.
+/// Carrick owns it, so `git gc` keeps the commit and no branch of the user's
+/// moves.
+pub const INDEXED_REF: &str = "refs/carrick/indexed";
+
+/// The longest a fetch of the indexed commit may run.
+const FETCH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether `commit` is a commit object this clone holds.
+pub fn has_commit(repo_path: &str, commit: &str) -> bool {
+    commit.bytes().all(|b| b.is_ascii_hexdigit())
+        && !commit.is_empty()
+        && run_git(
+            repo_path,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )
+        .is_ok()
+}
+
+/// Fetch `commit` from `origin` by its hash and keep it under [`INDEXED_REF`]
+/// (carrick#3000), so a clone that has not pulled the commit an index was
+/// written at (a PR squash-merged on GitHub) can still compare against it.
+///
+/// One `git fetch` of that one commit, never a prompt, and abandoned after
+/// [`FETCH_LIMIT`]. A shallow clone is fetched at depth 1, so no history
+/// comes with it; a full clone is not made shallow by it, and receives only
+/// what the commit adds to history it already holds. `Err` carries the
+/// reason, on one line: offline, no access, no `origin`, or a server that
+/// does not serve an object by its hash.
+pub fn fetch_indexed_commit(repo_path: &str, commit: &str) -> Result<(), String> {
+    if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{commit:?} is not a commit id"));
+    }
+    let shallow = run_git(repo_path, &["rev-parse", "--is-shallow-repository"])
+        .is_ok_and(|out| out.trim() == "true");
+    let refspec = format!("+{commit}:{INDEXED_REF}");
+    let mut command = Command::new("git");
+    command
+        .args(["fetch", "--no-tags", "--quiet", "--no-recurse-submodules"])
+        .args(shallow.then_some("--depth=1"))
+        .args(["origin", &refspec])
+        .current_dir(repo_path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let mut why = String::new();
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut err, &mut why);
+                }
+                let why = why.split_whitespace().collect::<Vec<_>>().join(" ");
+                return Err(if why.is_empty() {
+                    "git fetch failed".to_string()
+                } else {
+                    why
+                });
+            }
+            Ok(None) if started.elapsed() >= FETCH_LIMIT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "git fetch took longer than {}s",
+                    FETCH_LIMIT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
 /// One run of lines a diff replaces: `old_count` lines from `old_start` in the
 /// commit's copy became `new_count` lines from `new_start` in the working
 /// tree. Either count can be zero (a pure insertion or deletion); a zero

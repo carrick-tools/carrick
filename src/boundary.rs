@@ -71,6 +71,18 @@ impl Counted {
     }
 }
 
+/// The previous generation's model answers a no-model scan could not replay
+/// (carrick#3000), and how many rows they held.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelAnswersUnavailable {
+    /// The commit the previous generation was written at.
+    pub commit: String,
+    /// Git's reason the commit could not be compared, on one line.
+    pub reason: String,
+    /// Endpoints, mounts and data calls in the answers that were not replayed.
+    pub rows: usize,
+}
+
 /// What this service's scan could not classify, stated beside what it did.
 ///
 /// One per service, emitted into the index blob and printed as the last lines
@@ -91,6 +103,14 @@ pub struct ServiceBoundary {
     /// checked. Absent when every row was carried and typed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_rows_not_carried: Option<Counted>,
+    /// A no-model scan could not replay the previous generation's model
+    /// answers, because the commit that generation was written at is not in
+    /// this clone and could not be fetched (carrick#3000). Every row that only
+    /// the model stated is missing from this blob, so a check run on it covers
+    /// less than it appears to. Absent when the answers were replayed or the
+    /// previous generation held none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_answers_unavailable: Option<ModelAnswersUnavailable>,
     /// The commit this service's rows were read at. Already on the blob;
     /// repeated here so the whole boundary is one struct: a count means
     /// nothing without the tree it was counted on.
@@ -307,6 +327,7 @@ impl ServiceBoundary {
             candidates_withheld_changed_files: None,
             model_rows_carried: None,
             model_rows_not_carried: None,
+            model_answers_unavailable: None,
             commit_hash: data.commit_hash.clone(),
             files_attempted: stats.files_model_dispatched,
             files_lost: Counted::new(stats.files_analysis_failed, lost),
