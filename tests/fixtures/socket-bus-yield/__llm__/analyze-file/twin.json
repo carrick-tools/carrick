@@ -1,0 +1,17 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "chat.read",
+      "role": "subscriber",
+      "line_number": 5,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "receipt",
+      "payload_expression_line": 5
+    }
+  ]
+}

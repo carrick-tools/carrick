@@ -166,6 +166,13 @@ impl SiteRow {
     fn fact(&self) -> bool {
         self.inference.is_none()
     }
+
+    /// Whether [`fold_rows`] states this row wherever no fact holds its
+    /// line: a fact or an answer in the band, on no label-only slot (a row
+    /// that needs a reader stands only beside one that agrees).
+    pub fn stands(&self) -> bool {
+        (self.fact() || self.in_band) && !self.needs_reader
+    }
 }
 
 /// A service's site rows and possible calls, before the fold.
@@ -1083,4 +1090,4 @@ fn is_reader(row: &ApiEndpointDetails) -> bool {
 pub mod dispatch;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
