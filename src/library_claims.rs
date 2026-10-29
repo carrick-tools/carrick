@@ -961,7 +961,9 @@ impl Reading<'_> {
             if !self.name_ok(text, Some(&receiver)) {
                 return None;
             }
-            let kind = row_kind(self.export.role, *op, self.export.side)?;
+            // A `by_origin` export has no side of its own (see `row_kind`).
+            let side = self.export.side.filter(|_| self.export.side_rule.is_none());
+            let kind = row_kind(self.export.role, *op, side)?;
             let this = (kind, text.to_string(), scoped(self.export.role, scope));
             match &read {
                 Some(seen) if *seen != this => return None,
@@ -1019,8 +1021,10 @@ fn slot_key(slot: &ClaimSlot) -> Option<&str> {
 }
 
 /// The row an op states for a role. A socket's direction is the export's
-/// side's; one that serves both sides, or says nothing, states nothing. A
-/// `request` or an `execute` is no message row.
+/// side's; one that serves both sides, or says nothing, states nothing. An
+/// export the store marks `by_origin` is passed no side: its side is decided
+/// per receiver at a decided site (docs/reference/client-semantics.md,
+/// "Message roles"). A `request` or an `execute` is no message row.
 fn row_kind(role: LibraryRole, op: LibraryOp, side: Option<Side>) -> Option<LibraryRowKind> {
     use LibraryRowKind::{Pubsub, Socket};
     use SocketDirection::{ClientToServer, ServerToClient};
@@ -1718,6 +1722,33 @@ mod tests {
         );
         assert!(kinds(Some("both")).is_empty());
         assert!(kinds(None).is_empty());
+    }
+
+    /// An export the store marks `by_origin` has no side of its own, so the
+    /// side it states is never read as one (carrick#3011).
+    #[test]
+    fn a_by_origin_export_s_stated_side_is_never_its_side() {
+        let socket = export(json!({
+            "package": "@fixture/socket", "version": "4.0.0", "specifier": "@fixture/socket",
+            "export": "client", "role": "socket", "side": "client", "side_rule": "by_origin",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "emit", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 },
+                  "name_scope": { "scope": "global", "namespace": null } },
+                { "kind": "op", "op": "receive", "member": "on", "on": "export",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 },
+                  "name_scope": { "scope": "global", "namespace": null } }
+            ]
+        }));
+        let sites = sites_of(&[(
+            "src/live.ts",
+            "import { client } from \"@fixture/socket\";\n\
+             export function go() {\n\
+             \x20 client.emit(\"chat\", { text: \"hi\" });\n\
+             \x20 client.on(\"chat\", (message) => {});\n\
+             }\n",
+        )]);
+        assert!(rows_of(&sites, &[socket], all).is_empty());
     }
 
     /// An in-process bus's rows are service-scoped whatever the claim says
