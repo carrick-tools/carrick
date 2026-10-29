@@ -476,6 +476,33 @@ export class StatedParams {
   }
 
   /**
+   * What the labels say about one call (carrick#2472 C2): the payload slot
+   * when the called member's declaration is a labelled send; `'setter'` when
+   * the receiver's type has a labelled send member but this member is not
+   * one (a header, cookie or status setter that returns the reply too);
+   * `undefined` when no label speaks, so the caller keeps its own reading.
+   * Matched by declaration, never by name; the receiver's properties are read
+   * as `statedPayload` reads them, so an inherited send counts.
+   */
+  sendAt(call: Node): ClaimSlot | 'setter' | undefined {
+    if (!this.readsReplies || !Node.isCallExpression(call)) return undefined;
+    const callee = call.getExpression();
+    if (!Node.isPropertyAccessExpression(callee)) return undefined;
+    const slot = this.sendSlotOf((callee.getNameNode().getSymbol()?.getDeclarations() ?? []).map((d) => d.compilerNode));
+    if (slot) return slot;
+    let receiver: Type;
+    try {
+      receiver = callee.getExpression().getType().getNonNullableType();
+    } catch {
+      return undefined;
+    }
+    const repliesHere = receiver
+      .getProperties()
+      .some((property) => this.sendSlotOf(property.getDeclarations().map((d) => d.compilerNode)) !== undefined);
+    return repliesHere ? 'setter' : undefined;
+  }
+
+  /**
    * The calls of a labelled send member the handler makes on `parameter`, or
    * on a call chain rooted at it (`res.status(201).json(body)`), each with
    * its payload slot and the keys of the member's declarations.

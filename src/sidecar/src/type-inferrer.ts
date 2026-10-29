@@ -2577,8 +2577,20 @@ export class TypeInferrer {
     const returnedBranches = this.responseReturnedExpressions(func).flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
     );
-    const isSend = (candidate: Node): boolean =>
-      this.isResponseSend(candidate, extractionConfig);
+    // carrick#2472 C2: the service's labels answer first. A labelled send is
+    // a send, an unlabelled member of a labelled reply object is a setter;
+    // where no label speaks, the structural reading decides.
+    const labelledSend = (candidate: Node) =>
+      this.statedParams.sendAt(this.peelTransparentExpression(candidate));
+    const isLabelledSend = (candidate: Node): boolean => {
+      const labelled = labelledSend(candidate);
+      return labelled !== undefined && labelled !== 'setter';
+    };
+    const isSend = (candidate: Node): boolean => {
+      const labelled = labelledSend(candidate);
+      if (labelled !== undefined) return labelled !== 'setter';
+      return this.isResponseSend(candidate, extractionConfig);
+    };
     // carrick#2427: a handler that sends through a parameter returns nothing,
     // its sends are statements, and the located one can be an error send.
     // Statement sends find and drop that branch. A call whose result is
@@ -2608,9 +2620,15 @@ export class TypeInferrer {
       branches = [
         ...returnedBranches,
         ...statementSends
+          // A labelled send is a body wherever it sits (carrick#2472 C2).
           // FROZEN (old path, 2026-10-21): the `statementEndsFunctionPath` test
           // here; see that method.
-          .filter((s) => s.send === locatedBranch || this.statementEndsFunctionPath(s.statement, func))
+          .filter(
+            (s) =>
+              s.send === locatedBranch ||
+              isLabelledSend(s.send) ||
+              this.statementEndsFunctionPath(s.statement, func)
+          )
           .map((s) => s.send),
       ];
     } else {
