@@ -62,6 +62,11 @@ pub(super) struct FieldOrigin {
     pub(super) values: Vec<ValueAt>,
     /// The parameter the field's text is, when it is one.
     pub(super) text: Option<TextOrigin>,
+    /// The constructor parameter, by position, the field is whole and
+    /// plain: a parameter property with no default, or `this.field = p`
+    /// with `p` a parameter with no default and no key taken
+    /// (carrick#1670 T3).
+    pub(super) parameter: Option<usize>,
 }
 
 /// A field whose text is a constructor parameter, or a key of one.
@@ -280,6 +285,8 @@ impl Reader<'_> {
                                 keys: Vec::new(),
                                 fallback: default,
                             }),
+                            parameter: matches!(&prop.param, TsParamPropParam::Ident(_))
+                                .then_some(position),
                         },
                     );
                     pat
@@ -348,6 +355,13 @@ impl Reader<'_> {
                     FieldOrigin {
                         values: self.value_of(value, &scope, &bound),
                         text: self.text_origin(value, &params, &stated),
+                        parameter: match crate::graphql_document_sites::unwrap_expression(value) {
+                            Expr::Ident(ident) => params
+                                .get(&ident_key(ident))
+                                .filter(|at| at.keys.is_empty() && at.default.is_none())
+                                .map(|at| at.position),
+                            _ => None,
+                        },
                     },
                 );
             }

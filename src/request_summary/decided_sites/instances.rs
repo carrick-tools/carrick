@@ -34,19 +34,25 @@
 //!   side of a `by_origin` socket;
 //! - **a hole**, with its reason ([`InstanceHole`]).
 //!
+//! A receiver that is a field of a class (`this.peer`) is the constructor
+//! parameter it is set from when nothing else may set it (carrick#1670):
+//! the instance is what each `new` of the class hands in there, walked as a
+//! call hands in a parameter ([`InstanceWalk::field`]).
+//!
 //! An instance handed to a member labelled with `mounts` is served under
 //! that member's prefix: those edges are read once per service and joined
 //! into each site's composed path ([`super::composed`]).
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::super::constructions::Constructed;
 use super::super::{
-    CallIr, ClientRef, HeldInstance, KeyState, MadeBy, MakerForm, Piece, RequestSummaryInputs,
-    Value, Way,
+    CallIr, ClientRef, HeldInstance, KeyState, Link, MadeBy, MakerForm, Piece,
+    RequestSummaryInputs, Value, Way,
 };
 use super::boundaries::{Boundary, FnAt};
 use super::{Calls, Placed, filled, holds_parameter, relative, to_definition};
@@ -384,6 +390,10 @@ pub(super) struct WalkIndex<'a> {
     /// walked around it (outermost first) and the call: a walk reached
     /// again from another site reads them here.
     parents: RefCell<HashMap<ParentsKey, Vec<InstanceEnd>>>,
+    /// The service's own inputs and the constructions in them, read when a
+    /// field first needs them ([`InstanceWalk::field`]).
+    inputs: &'a RequestSummaryInputs,
+    constructed: OnceCell<Constructed<'a>>,
 }
 
 /// A call by its file and span.
@@ -439,7 +449,7 @@ impl HostLabel {
 impl<'a> WalkIndex<'a> {
     pub(super) fn of(
         calls: &Calls<'a>,
-        inputs: &RequestSummaryInputs,
+        inputs: &'a RequestSummaryInputs,
         scopes: &[ScopeLabel],
         socket_hosts: HashMap<HostSpan, HostLabel>,
     ) -> Self {
@@ -448,6 +458,8 @@ impl<'a> WalkIndex<'a> {
             by_declaration: HashMap::new(),
             socket_hosts,
             parents: RefCell::new(HashMap::new()),
+            inputs,
+            constructed: OnceCell::new(),
         };
         let runs: HashSet<&str> = scopes
             .iter()
@@ -522,6 +534,18 @@ impl<'a> WalkIndex<'a> {
     /// The calls of a `runs` scope member handed a name the compiler
     /// resolves to the declaration `(decl_file, decl_line)`, by that
     /// declaration (carrick#2474 R5a).
+    /// Every construction of the class whose span starts at `class` in
+    /// `file`, when the class is read through its constructions
+    /// ([`super::super::constructions::constructed`]).
+    fn constructions<'s>(&'s self, file: &Path, class: u32) -> Option<&'s [Placed<'a>]> {
+        self.constructed
+            .get_or_init(|| super::super::constructions::constructed(self.inputs))
+            .built
+            .iter()
+            .find(|((built_in, at), _)| *built_in == file && *at == class)
+            .map(|(_, built)| built.as_slice())
+    }
+
     pub(super) fn runs_hosts(&self) -> impl Iterator<Item = (&(String, u32), &[Host<'a>])> {
         self.by_declaration
             .iter()
@@ -573,6 +597,10 @@ pub(super) struct InstanceWalk<'w, 'a> {
     /// The own factories being followed, so a factory that returns its own
     /// call ends. Two calls of one factory each give their end.
     factories: HashSet<(PathBuf, String)>,
+    /// The fields being followed to their constructions, by file, class and
+    /// field: one reached again inside its own walk ends it (a field passed
+    /// back into its own class).
+    fielding: Vec<(PathBuf, u32, String)>,
 }
 
 impl<'w, 'a> InstanceWalk<'w, 'a> {
@@ -596,6 +624,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             walked: HashSet::new(),
             passing: Vec::new(),
             factories: HashSet::new(),
+            fielding: Vec::new(),
         }
     }
 
@@ -717,6 +746,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             let at = self.at(&last);
             match held {
                 Some(held) => self.held(held, last.file, at),
+                None if self.field(last.file, &pieces) => {}
                 None => self.hole(at, InstanceHole::Unread, opaque_text(&pieces)),
             }
             return self.ends;
@@ -1164,8 +1194,75 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         };
         match held {
             Some(held) => self.held(held, caller.file, at),
+            None if self.field(caller.file, value) => {}
             None => self.hole(at, InstanceHole::Unread, opaque_text(value)),
         }
+    }
+
+    /// A field of a class of `file` that is one constructor parameter, and
+    /// nothing else (carrick#1670 T3, [`FieldOrigin::parameter`]), is that
+    /// parameter: the instance is what each `new` of the class hands in
+    /// there, walked as a call hands in a parameter. A field read any other
+    /// way, or of a class not read through its constructions, ends nothing
+    /// here: `false`.
+    ///
+    /// [`FieldOrigin::parameter`]: super::super::constructions::FieldOrigin
+    fn field(&mut self, file: &Path, pieces: &[Piece]) -> bool {
+        let [
+            Piece::Opaque {
+                link: Some(link), ..
+            },
+        ] = pieces
+        else {
+            return false;
+        };
+        let Link::Field(link) = &**link else {
+            return false;
+        };
+        let Some(position) = self
+            .inputs
+            .files
+            .get(file)
+            .and_then(|ir| ir.class_origins.get(&link.class))
+            .and_then(|origin| origin.fields.get(&link.field))
+            .and_then(|from| from.parameter)
+        else {
+            return false;
+        };
+        let index = self.index;
+        let Some(built) = index
+            .constructions(file, link.class)
+            .filter(|built| !built.is_empty())
+        else {
+            return false;
+        };
+        let here = (file.to_path_buf(), link.class, link.field.clone());
+        if self.fielding.contains(&here) {
+            return true;
+        }
+        self.fielding.push(here);
+        let own = [Piece::Param(position, link.field.clone())];
+        for construction in built {
+            // The call graph's own entry for it: where a function it is
+            // written in sits, which the construction index does not keep.
+            let construction = self
+                .calls
+                .at_span(
+                    construction.file,
+                    construction.call.site.span_start,
+                    construction.call.site.span_end,
+                )
+                .unwrap_or(*construction);
+            let construction = &construction;
+            let value = filled(&own, construction.call);
+            if holds_parameter(&value) {
+                self.up(*construction, value);
+            } else {
+                self.handed(construction, &own, &value);
+            }
+        }
+        self.fielding.pop();
+        true
     }
 
     /// What `held`, read in `file`, ends at.

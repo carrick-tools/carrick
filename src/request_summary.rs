@@ -4751,6 +4751,15 @@ impl Reader<'_> {
         for (field, client) in receivers {
             file.field_receivers.insert((fields.class, field), client);
         }
+        // A field is its constructor parameter, for the instance walk, only
+        // where nothing else may set it (carrick#1670 T3).
+        for (field, from) in &mut fields.origins {
+            if from.parameter.is_some()
+                && !library_sites::constructor_only(&ident_key(ident), &module.class_this, field)
+            {
+                from.parameter = None;
+            }
+        }
         if !fields.origins.is_empty() {
             let mut lines: Vec<u32> = class
                 .decorators
