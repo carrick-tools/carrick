@@ -44,7 +44,9 @@
 //! which nothing read (carrick#2432 asks for implementations where discovery
 //! stops). A file of any other version is not
 //! read: its service reads as [`HoleReason::RowsMissing`]. A walk removes any
-//! earlier rows file before it writes, so none outlives the run that wrote it.
+//! earlier rows file before it writes. The rows of a service a later laptop
+//! pass carries are used again instead of walked, only when [`kept_rows`]
+//! finds them exactly what a walk would write (carrick#3027).
 //!
 //! [`FLAG_PUBLISHED`] and [`FLAG_MODULE_DEFAULT`] (carrick#2508) are flag
 //! bits, not a new version: a row written without them
@@ -281,6 +283,14 @@ impl Destination {
         &self.path
     }
 
+    /// Rows an earlier pass kept at `path`: never removed by this run.
+    pub fn kept(path: PathBuf) -> Self {
+        Self {
+            path,
+            temporary: None,
+        }
+    }
+
     /// Whether the file is removed when this is dropped.
     pub fn is_temporary(&self) -> bool {
         self.temporary.is_some()
@@ -337,6 +347,153 @@ pub fn destination_from(
             }
         }
     })
+}
+
+/// The directory a laptop pass keeps its rows in between passes
+/// (carrick#3027). Set by the indexer (`refresh`, `index`, `init`) on its
+/// scans and, read-only, on `check --changed`'s; without it the rows sit in
+/// the store's `positions/` directory, which outlives a run only when the
+/// store does.
+pub const KEPT_DIR_ENV: &str = "CARRICK_KEPT_POSITIONS_DIR";
+
+/// Where an earlier pass may have left `service`'s rows: [`KEPT_DIR_ENV`],
+/// else the local store's `positions/` directory. `None` with neither (the
+/// Action, the cloud runner): their rows are per run and nothing is kept.
+pub fn kept_path(repo_name: &str, service_name: Option<&str>) -> Option<PathBuf> {
+    kept_path_from(
+        std::env::var_os(KEPT_DIR_ENV).map(PathBuf::from).as_deref(),
+        std::env::var_os(CACHE_DIR_ENV)
+            .map(PathBuf::from)
+            .as_deref(),
+        repo_name,
+        service_name,
+    )
+}
+
+/// [`kept_path`] over the settings it reads.
+pub fn kept_path_from(
+    kept: Option<&Path>,
+    store: Option<&Path>,
+    repo_name: &str,
+    service_name: Option<&str>,
+) -> Option<PathBuf> {
+    let present = |dir: &&Path| !dir.as_os_str().is_empty();
+    let dir = kept
+        .filter(present)
+        .map(Path::to_path_buf)
+        .or_else(|| store.filter(present).map(|s| s.join(POSITIONS_DIR)))?;
+    Some(dir.join(format!("{}.jsonl.gz", blob_stem(repo_name, service_name))))
+}
+
+/// Which build wrote a rows file: the walk's own code is part of this binary.
+fn walk_stamp() -> String {
+    let build = match crate::cloud_storage::ScannerBuild::current() {
+        Some(build) => format!(
+            "{}{}",
+            build.commit,
+            if build.dirty { "+dirty" } else { "" }
+        ),
+        None => "unstamped".to_string(),
+    };
+    format!("{} {build}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The record beside a rows file of what its walk was a walk of.
+pub fn walked_at_path(rows: &Path) -> PathBuf {
+    let mut name = rows.as_os_str().to_owned();
+    name.push(".at");
+    PathBuf::from(name)
+}
+
+/// Record that the rows file at `rows` were walked from the inputs a service
+/// has at `commit` (this build's stamp beside it), or, with `None` (a tree
+/// that is not a clean checkout of a commit), that nothing vouches for them.
+/// Any earlier record is removed first.
+pub fn record_walked_at(rows: &Path, commit: Option<&str>) {
+    let record = walked_at_path(rows);
+    let _ = std::fs::remove_file(&record);
+    if let Some(commit) = commit
+        && let Err(error) = std::fs::write(&record, format!("{}\n{commit}\n", walk_stamp()))
+    {
+        debug!(
+            "The walk record {} was not written: {error}",
+            record.display()
+        );
+    }
+}
+
+/// Why kept rows are not used, and the service is walked.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Miss {
+    /// No rows file, or no record of what it was walked from.
+    NotKept,
+    /// Walked by another build of the scanner.
+    OtherBuild,
+    /// Walked from the inputs of another commit than the one this run carries.
+    OtherCommit,
+    /// The rows file could not be read.
+    Unreadable(String),
+    /// The rows name other files than the service has now.
+    FilesDiffer,
+    /// A file's bytes hash otherwise than its rows, or cannot be read.
+    FileChanged(String),
+}
+
+/// Whether the rows file at `rows` is exactly what a walk of `files` (the
+/// service's source files, under `scan_root`) would write now, given that
+/// the service is carried at `commit`: it was walked by this build from the
+/// inputs of that commit, names the same files, and every file's bytes hash
+/// as its rows say (BOM included, as [`PositionIndex::bind`] hashes them).
+/// Any other answer walks, as before (carrick#3027).
+pub fn kept_rows(
+    rows: &Path,
+    commit: &str,
+    scan_root: &Path,
+    files: &[PathBuf],
+) -> Result<(), Miss> {
+    let record = std::fs::read_to_string(walked_at_path(rows)).map_err(|_| Miss::NotKept)?;
+    let mut lines = record.lines();
+    if lines.next() != Some(walk_stamp().as_str()) {
+        return Err(Miss::OtherBuild);
+    }
+    if lines.next() != Some(commit) {
+        return Err(Miss::OtherCommit);
+    }
+    let kept = read_rows_file(rows).map_err(Miss::Unreadable)?;
+    kept_rows_match(&kept, scan_root, files)
+}
+
+/// [`kept_rows`]' check of the rows against the files on disk.
+pub fn kept_rows_match(rows: &RowsFile, scan_root: &Path, files: &[PathBuf]) -> Result<(), Miss> {
+    let named: BTreeSet<&str> = rows.files.iter().map(|file| file.f.as_str()).collect();
+    let wanted: BTreeSet<String> = files
+        .iter()
+        .filter_map(|file| {
+            let relative = file.strip_prefix(scan_root).ok()?;
+            Some(
+                relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            )
+        })
+        .collect();
+    if wanted.len() != files.len()
+        || named.len() != rows.files.len()
+        || named != wanted.iter().map(String::as_str).collect()
+    {
+        return Err(Miss::FilesDiffer);
+    }
+    for file in &rows.files {
+        let current = std::fs::read(scan_root.join(&file.f))
+            .map(|bytes| content_hash(&bytes))
+            .ok();
+        if file.skip == Some(Skip::Unreadable) || file.h.is_none() || file.h != current {
+            return Err(Miss::FileChanged(file.f.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// A service's rows, read once before discovery for the request summaries
@@ -691,14 +848,17 @@ pub struct ServiceWalk<'a> {
 /// returns, so it never overlaps the service's analysis sidecar.
 ///
 /// Any rows file from an earlier run is removed first, so a walk that fails
-/// leaves none: lost rows are lost, never stale. Every failure is the
+/// leaves none: lost rows are lost, never stale. (A pass that carries a
+/// service may instead use rows an earlier pass kept, when
+/// [`kept_rows`] vouches for them: carrick#3027.) Every failure is the
 /// caller's to log; nothing is recorded for the run.
 pub fn record_service_rows(
     recipe: &SidecarRecipe,
     walk: &ServiceWalk<'_>,
 ) -> Result<PositionRowsCounts, String> {
     let partial = partial_path(walk.out);
-    for stale in [walk.out, partial.as_path()] {
+    let record = walked_at_path(walk.out);
+    for stale in [walk.out, partial.as_path(), record.as_path()] {
         match std::fs::remove_file(stale) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1161,5 +1321,122 @@ mod tests {
                 .default_library_globals()
                 .is_none()
         );
+    }
+
+    /// A repo of the given `(name, text)` files with rows that hash them, and
+    /// the rows file written at `rows` with the record of `commit`.
+    fn kept_repo(
+        files: &[(&str, &str)],
+        commit: Option<&str>,
+    ) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![format!(
+            "{{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
+            files.len()
+        )];
+        let mut paths = Vec::new();
+        for (name, text) in files {
+            std::fs::write(dir.path().join(name), text).unwrap();
+            paths.push(dir.path().join(name));
+            lines.push(format!(
+                "{{\"f\":\"{name}\",\"h\":\"{}\",\"r\":[]}}",
+                content_hash(text.as_bytes())
+            ));
+        }
+        let rows = dir.path().join("kept.jsonl.gz");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, (lines.join("\n") + "\n").as_bytes()).unwrap();
+        std::fs::write(&rows, gz.finish().unwrap()).unwrap();
+        record_walked_at(&rows, commit);
+        (dir, rows, paths)
+    }
+
+    /// carrick#3027: kept rows stand in for a walk only when nothing a walk
+    /// reads has moved, and each way they can not says which.
+    #[test]
+    fn kept_rows_are_used_only_when_a_walk_would_write_them() {
+        let (dir, rows, files) = kept_repo(&[("a.ts", "export {}\n")], Some("c1"));
+        let root = dir.path();
+        assert_eq!(kept_rows(&rows, "c1", root, &files), Ok(()));
+        // Carried at another commit than the rows were walked from.
+        assert_eq!(kept_rows(&rows, "c2", root, &files), Err(Miss::OtherCommit));
+        // A file edited since.
+        std::fs::write(&files[0], "export const a = 1;\n").unwrap();
+        assert_eq!(
+            kept_rows(&rows, "c1", root, &files),
+            Err(Miss::FileChanged("a.ts".to_string()))
+        );
+        // A file the rows do not name.
+        let (dir, rows, mut files) = kept_repo(&[("a.ts", "export {}\n")], Some("c1"));
+        std::fs::write(dir.path().join("b.ts"), "export {}\n").unwrap();
+        files.push(dir.path().join("b.ts"));
+        assert_eq!(
+            kept_rows(&rows, "c1", dir.path(), &files),
+            Err(Miss::FilesDiffer)
+        );
+        // A file the service no longer has.
+        let (dir, rows, _) = kept_repo(&[("a.ts", "export {}\n")], Some("c1"));
+        assert_eq!(
+            kept_rows(&rows, "c1", dir.path(), &[]),
+            Err(Miss::FilesDiffer)
+        );
+    }
+
+    #[test]
+    fn rows_nothing_vouches_for_are_not_used() {
+        // Walked from a tree that was not a clean commit: no record.
+        let (dir, rows, files) = kept_repo(&[("a.ts", "export {}\n")], None);
+        assert_eq!(
+            kept_rows(&rows, "c1", dir.path(), &files),
+            Err(Miss::NotKept)
+        );
+        // Another build of the scanner wrote them.
+        record_walked_at(&rows, Some("c1"));
+        let record = walked_at_path(&rows);
+        let text = std::fs::read_to_string(&record).unwrap();
+        std::fs::write(
+            &record,
+            text.replacen(env!("CARGO_PKG_VERSION"), "0.0.0", 1),
+        )
+        .unwrap();
+        assert_eq!(
+            kept_rows(&rows, "c1", dir.path(), &files),
+            Err(Miss::OtherBuild)
+        );
+        // No rows file at all.
+        std::fs::remove_file(&rows).unwrap();
+        record_walked_at(&rows, Some("c1"));
+        assert!(matches!(
+            kept_rows(&rows, "c1", dir.path(), &files),
+            Err(Miss::Unreadable(_))
+        ));
+    }
+
+    #[test]
+    fn a_file_the_walk_could_not_read_or_hash_is_a_miss() {
+        let (dir, rows, files) = kept_repo(&[("a.ts", "export {}\n")], Some("c1"));
+        let mut kept = read_rows_file(&rows).unwrap();
+        kept.files[0].h = None;
+        assert_eq!(
+            kept_rows_match(&kept, dir.path(), &files),
+            Err(Miss::FileChanged("a.ts".to_string()))
+        );
+    }
+
+    #[test]
+    fn rows_are_kept_in_the_named_directory_else_beside_the_store() {
+        let (kept, store) = (Path::new("/kept"), Path::new("/store"));
+        let path = |kept, store| kept_path_from(kept, store, "repo", Some("api"));
+        assert_eq!(
+            path(Some(kept), Some(store)),
+            Some(PathBuf::from("/kept/repo__api.jsonl.gz"))
+        );
+        assert_eq!(
+            path(None, Some(store)),
+            Some(PathBuf::from("/store/positions/repo__api.jsonl.gz"))
+        );
+        // The Action and the cloud runner keep nothing.
+        assert_eq!(path(None, None), None);
+        assert_eq!(path(Some(Path::new("")), Some(Path::new(""))), None);
     }
 }

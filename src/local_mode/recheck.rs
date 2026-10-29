@@ -511,6 +511,14 @@ fn rejoin_held(
         let scan_dir = generation.join(format!("scan-{position}"));
         let mut scan = rescan_command(&exe, repo, &scan_dir, &previous);
         scan.env(JUDGE_ANSWERS_ENV, &judged);
+        // The rows the last `refresh` kept stand in for a walk of a carried
+        // service. Read only: a check writes nothing under `.carrick`.
+        scan.env(
+            crate::position_rows::KEPT_DIR_ENV,
+            workspace
+                .index_dir()
+                .join(crate::position_rows::POSITIONS_DIR),
+        );
         if let Some(narrator) = narrator {
             // The scan states its per-service counts on stderr only when a
             // parent asks; the narrator is that parent here.

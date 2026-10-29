@@ -70,20 +70,26 @@ pub(super) fn signals(count: usize) -> (Vec<oneshot::Sender<()>>, Vec<WalkEnded>
 
 /// Walk `services` in declared order, `width` at a time, each on a thread of
 /// its own, and return each one's [`Walked`] at its position. Each service's
-/// sender in `ended` is dropped as its walk ends.
+/// sender in `ended` is dropped as its walk ends. `at` is, per service, the
+/// commit whose inputs its rows are a walk of, or `None` when no commit
+/// vouches for them (a dirty tree); it is recorded beside the rows so a later
+/// pass that carries the service at that commit can use them (carrick#3027).
 pub(super) async fn walk_all(
     recipe: Option<SidecarRecipe>,
     repo_path: &str,
     services: &[Config],
     width: usize,
     ended: Vec<oneshot::Sender<()>>,
+    mut at: Vec<Option<String>>,
 ) -> Vec<Walked> {
     let mut ended: Vec<Option<oneshot::Sender<()>>> = ended.into_iter().map(Some).collect();
     ended.resize_with(services.len(), || None);
+    at.resize_with(services.len(), || None);
     service_workers::admit_in_declared_order(services.len(), width, |position| {
         let (recipe, repo_path) = (recipe.clone(), repo_path.to_string());
         let service = services[position].clone();
         let ended = ended[position].take();
+        let at = at[position].take();
         service_workers::on_a_thread(format!("carrick-walk-{}", position + 1), move |_| {
             // Dropped when the walk ends, whichever way: the setup waiting
             // for it hears that and is planned.
@@ -91,10 +97,52 @@ pub(super) async fn walk_all(
             let label = service.service_name.as_deref().unwrap_or("(root)");
             let span = tracing::info_span!("service", name = %label);
             let _entered = span.enter();
-            walk(recipe.as_ref(), &repo_path, &service)
+            walk(recipe.as_ref(), &repo_path, &service, at.as_deref())
         })
     })
     .await
+}
+
+/// The files a walk of `service` sends, sorted, each under `scan_root`.
+fn service_files(repo_path: &str, service: &Config, scan_root: &std::path::Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> =
+        super::walk_service(repo_path, service, &super::service_ignore_patterns(service))
+            .files
+            .iter()
+            .map(|file| scan_root.join(file.strip_prefix(repo_path).unwrap_or(file)))
+            .collect();
+    files.sort();
+    files
+}
+
+/// The rows an earlier pass kept for `service`, carried at `commit`, as a
+/// [`Walked`], when they are exactly what a walk would write now
+/// ([`crate::position_rows::kept_rows`]); otherwise why not. Nothing is
+/// spawned: a service this returns for is not walked (carrick#3027).
+pub(super) fn reuse(
+    repo_path: &str,
+    service: &Config,
+    commit: &str,
+) -> Result<Walked, crate::position_rows::Miss> {
+    let canonical = super::canonical_repo_path(repo_path);
+    let scan_root = PathBuf::from(&canonical);
+    let label = service
+        .service_name
+        .as_deref()
+        .unwrap_or("(root)")
+        .to_string();
+    let kept = crate::position_rows::kept_path(
+        &super::get_repository_name(&canonical),
+        service.service_name.as_deref(),
+    )
+    .ok_or(crate::position_rows::Miss::NotKept)?;
+    let files = service_files(repo_path, service, &scan_root);
+    crate::position_rows::kept_rows(&kept, commit, &scan_root, &files)?;
+    Ok(Walked {
+        rows: Some(Destination::kept(kept)),
+        scan_root,
+        label,
+    })
 }
 
 /// Walk one service's per-position compiler rows: written beside its blob
@@ -105,7 +153,12 @@ pub(super) async fn walk_all(
 ///
 /// A run with no sidecar, or a walk that failed, keeps no rows. A walk that
 /// fails says so in the run log, and nothing else.
-fn walk(recipe: Option<&SidecarRecipe>, repo_path: &str, service: &Config) -> Walked {
+fn walk(
+    recipe: Option<&SidecarRecipe>,
+    repo_path: &str,
+    service: &Config,
+    at: Option<&str>,
+) -> Walked {
     let canonical = super::canonical_repo_path(repo_path);
     let scan_root = PathBuf::from(&canonical);
     let label = service
@@ -127,13 +180,7 @@ fn walk(recipe: Option<&SidecarRecipe>, repo_path: &str, service: &Config) -> Wa
     let Some(recipe) = recipe else {
         return no_rows(scan_root, label);
     };
-    let mut files: Vec<PathBuf> =
-        super::walk_service(repo_path, service, &super::service_ignore_patterns(service))
-            .files
-            .iter()
-            .map(|file| scan_root.join(file.strip_prefix(repo_path).unwrap_or(file)))
-            .collect();
-    files.sort();
+    let files = service_files(repo_path, service, &scan_root);
     let service_root = super::service_sidecar_root(repo_path, service);
     let walk = crate::position_rows::ServiceWalk {
         service_root: &service_root,
@@ -147,6 +194,7 @@ fn walk(recipe: Option<&SidecarRecipe>, repo_path: &str, service: &Config) -> Wa
         debug!("Position rows for service {label} were not written: {error}");
         return no_rows(scan_root, label);
     }
+    crate::position_rows::record_walked_at(out.path(), at);
     Walked {
         rows: Some(out),
         scan_root,
@@ -163,7 +211,12 @@ mod tests {
     #[test]
     fn a_walk_without_a_sidecar_keeps_no_rows() {
         let repo = tempfile::tempdir().unwrap();
-        let walked = walk(None, &repo.path().to_string_lossy(), &Config::default());
+        let walked = walk(
+            None,
+            &repo.path().to_string_lossy(),
+            &Config::default(),
+            None,
+        );
         assert!(walked.rows.is_none());
         assert_eq!(walked.index().file_count(), 0);
     }

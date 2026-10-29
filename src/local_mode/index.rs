@@ -340,6 +340,9 @@ fn run_generation(
         // re-reads only the services whose inputs moved, and every other one
         // stands in from its hosted blob (carrick#2840).
         let carry = matches!(pass, Pass::Facts) && !hosted_blobs.is_empty();
+        let kept_rows = workspace
+            .index_dir()
+            .join(crate::position_rows::POSITIONS_DIR);
         let report = scan_repo(
             &exe,
             repo,
@@ -351,7 +354,9 @@ fn run_generation(
             workspace_position,
             targets.len(),
             carry,
+            &kept_rows,
         )?;
+        keep_rows(&scan_dir, &kept_rows);
         pending.extend(report.pending.iter().cloned());
         if let Some(split) = &report.timing {
             timing.add(split);
@@ -729,8 +734,10 @@ fn scan_repo(
     workspace_position: Option<(usize, usize)>,
     run_repos: usize,
     changed_only: bool,
+    kept_rows: &Path,
 ) -> Result<ScanReport, String> {
     let mut command = scan_command(exe, repo, blobs, previous, Some(peers), pass);
+    command.env(crate::position_rows::KEPT_DIR_ENV, kept_rows);
     if changed_only {
         command.arg("--changed-only");
     }
@@ -749,6 +756,43 @@ fn scan_repo(
         },
         HEARTBEAT,
     )
+}
+
+/// Keep the compiler rows the scan in `scan_dir` walked in `kept`, where a
+/// later pass (this indexer's, or `check --changed`'s) finds them for a
+/// service it carries instead of walking it again (carrick#3027). Best
+/// effort: rows that were not kept are walked next time. Each file lands
+/// whole (copied under a temporary name, then renamed), and the record of
+/// what it was walked from lands after it, so a reader never pairs new rows
+/// with an old record.
+fn keep_rows(scan_dir: &Path, kept: &Path) {
+    let Ok(entries) = std::fs::read_dir(scan_dir.join(crate::position_rows::POSITIONS_DIR)) else {
+        return;
+    };
+    if std::fs::create_dir_all(kept).is_err() {
+        return;
+    }
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let Some(name) = path.file_name().filter(|name| {
+            name.to_str()
+                .is_some_and(|name| name.ends_with(".jsonl.gz"))
+        }) else {
+            continue;
+        };
+        let to = kept.join(name);
+        let record = crate::position_rows::walked_at_path(&to);
+        let _ = std::fs::remove_file(&record);
+        let partial = crate::position_rows::partial_path(&to);
+        if std::fs::copy(&path, &partial)
+            .and_then(|_| std::fs::rename(&partial, &to))
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&partial);
+            let _ = std::fs::remove_file(&to);
+            continue;
+        }
+        let _ = std::fs::copy(crate::position_rows::walked_at_path(&path), &record);
+    }
 }
 
 /// Tell each repo's scan how many repos this run covers (cloud#1363).
@@ -3165,5 +3209,36 @@ mod tests {
         // The record is closed: a second signal writes nothing over it.
         super::super::scan_state::interrupted("SIGTERM");
         assert_eq!(super::super::scan_state::read_all(&index_dir), ended);
+    }
+
+    /// carrick#3027: a build keeps the rows its scan walked, each with the
+    /// record of what it was walked from, and drops the record of a file it
+    /// replaces when the new rows have none (a dirty tree).
+    #[test]
+    fn a_build_keeps_the_rows_its_scan_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scan, kept) = (tmp.path().join("scan"), tmp.path().join("kept"));
+        let walked = scan.join(crate::position_rows::POSITIONS_DIR);
+        std::fs::create_dir_all(&walked).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        for name in ["clean", "dirty"] {
+            std::fs::write(
+                walked.join(format!("{name}.jsonl.gz")),
+                format!("new {name}"),
+            )
+            .unwrap();
+            std::fs::write(kept.join(format!("{name}.jsonl.gz")), "old").unwrap();
+            std::fs::write(kept.join(format!("{name}.jsonl.gz.at")), "old record").unwrap();
+        }
+        std::fs::write(walked.join("clean.jsonl.gz.at"), "new record").unwrap();
+        keep_rows(&scan, &kept);
+        let read = |name: &str| std::fs::read_to_string(kept.join(name)).ok();
+        assert_eq!(read("clean.jsonl.gz").as_deref(), Some("new clean"));
+        assert_eq!(read("clean.jsonl.gz.at").as_deref(), Some("new record"));
+        assert_eq!(read("dirty.jsonl.gz").as_deref(), Some("new dirty"));
+        assert_eq!(read("dirty.jsonl.gz.at"), None);
+        // A scan that walked nothing leaves what is kept as it was.
+        keep_rows(&tmp.path().join("none"), &kept);
+        assert_eq!(read("clean.jsonl.gz").as_deref(), Some("new clean"));
     }
 }
