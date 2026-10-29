@@ -29,7 +29,7 @@
 //!
 //! The rules are in `docs/reference/client-semantics.md`, "Message roles".
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,12 @@ pub struct ExportClaims {
     /// never one name.
     #[serde(default)]
     pub patterns: Vec<String>,
+    /// Amendment 7: the `type:` ids each receiver id of this export holds
+    /// (`{ "<receiver id>": ["type:…"] }`), as the store serves them. The
+    /// parse boundary has already lowered the elements on those types onto the
+    /// receiver ids ([`lower_type_receivers`]); the map is kept for the trace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub receiver_types: BTreeMap<String, Vec<String>>,
 }
 
 /// The packages a declaration found in `declaring` stands for: every package
@@ -322,6 +328,65 @@ fn same_form(form: MakeForm, site: MakerForm) -> bool {
         (form, site),
         (MakeForm::Call, MakerForm::Call) | (MakeForm::New, MakerForm::New)
     )
+}
+
+/// Whether `of` names a type (`type:…` or `type`) rather than a receiver.
+fn is_type_receiver(of: &str) -> bool {
+    of == "type" || of.starts_with("type:")
+}
+
+/// Lower the elements on `type:` receivers onto the receiver ids the site
+/// walk reads (carrick#2434 amendment 7, carrick#3049). For each `op`,
+/// `scope` and `reserved` element whose `of` is a type, every receiver id of
+/// `receiver_types` whose list holds that type gets a copy with `of` set to
+/// the id and `on` absent; the original stays. Makers sit on `export` and are
+/// never lowered. A copy whose claim id an earlier element or copy already
+/// holds is not added; returns how many were not.
+pub(crate) fn lower_type_receivers(
+    claims: &mut Vec<LibraryClaim>,
+    receiver_types: &BTreeMap<String, Vec<String>>,
+) -> usize {
+    if receiver_types.is_empty() {
+        return 0;
+    }
+    let mut known: HashSet<String> = claims
+        .iter()
+        .filter_map(|claim| claim_id("", claim))
+        .collect();
+    let mut copies: Vec<LibraryClaim> = Vec::new();
+    let mut shadowed = 0;
+    for claim in claims.iter() {
+        let (LibraryClaim::Op { of: Some(of), .. }
+        | LibraryClaim::Scope { of: Some(of), .. }
+        | LibraryClaim::Reserved { of: Some(of), .. }) = claim
+        else {
+            continue;
+        };
+        if !is_type_receiver(of) {
+            continue;
+        }
+        for (receiver, types) in receiver_types {
+            if !types.contains(of) {
+                continue;
+            }
+            let mut copy = claim.clone();
+            if let LibraryClaim::Op { on, of, .. }
+            | LibraryClaim::Scope { on, of, .. }
+            | LibraryClaim::Reserved { on, of, .. } = &mut copy
+            {
+                *on = None;
+                *of = Some(receiver.clone());
+            }
+            let fresh = claim_id("", &copy).is_none_or(|id| known.insert(id));
+            if fresh {
+                copies.push(copy);
+            } else {
+                shadowed += 1;
+            }
+        }
+    }
+    claims.extend(copies);
+    shadowed
 }
 
 /// The id of one claim under `prefix`.
@@ -1649,6 +1714,46 @@ mod tests {
         let unverified_maker =
             rows_of(&sites, &[queue], |check| !check.claim_id.contains(":make:"));
         assert!(unverified_maker.is_empty(), "the maker must verify");
+    }
+
+    /// Carrick#3049: a queue export written on a `type:` receiver, with
+    /// `receiver_types` naming the instance id that holds it, reads the same
+    /// rows as today's form written on the instance id, once lowered. Without
+    /// the lowering the type form states no row.
+    #[test]
+    fn a_type_receiver_row_reads_the_rows_of_the_instance_form() {
+        let queue = |converted: bool| {
+            let mut value = json!({
+                "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+                "export": "Queue", "role": "broker",
+                "claims": [
+                    { "kind": "make", "form": "new", "member": null, "name": { "arg": 0 },
+                      "name_scope": { "scope": "global", "namespace": "queue" } },
+                    { "kind": "op", "op": "send", "member": "add",
+                      "of": if converted { "type:q#Queue" } else { "instance:new" },
+                      "name": { "bound": "maker" }, "payload": { "arg": 1 } }
+                ]
+            });
+            if converted {
+                value["receiver_types"] = json!({ "instance:new": ["type:q#Queue"] });
+            }
+            let mut export = export(value);
+            let shadowed = lower_type_receivers(&mut export.claims, &export.receiver_types);
+            assert_eq!(shadowed, 0);
+            export
+        };
+        let sites = sites_of(&[(
+            "src/mail.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             const emails = new Queue(\"emails\");\n\
+             export async function welcome() { await emails.add(\"welcome\", {}); }\n",
+        )]);
+        let today = rows_of(&sites, &[queue(false)], all);
+        assert_eq!(today.len(), 1, "{today:#?}");
+        assert_eq!(rows_of(&sites, &[queue(true)], all), today);
+        let mut unlowered = queue(true);
+        unlowered.claims.truncate(2);
+        assert!(rows_of(&sites, &[unlowered], all).is_empty());
     }
 
     /// A definition (the export's maker called with a name and a handler)

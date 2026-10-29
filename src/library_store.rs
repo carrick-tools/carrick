@@ -42,7 +42,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::agent_service::AgentCallError;
-use crate::library_claims::{CallClaim, ExportClaims, Side, SideRule};
+use crate::library_claims::{CallClaim, ExportClaims, Side, SideRule, lower_type_receivers};
 use crate::services::type_sidecar::{LibraryClaim, LibraryRole};
 
 /// The roles this scanner reads rows for: the store spends nothing on others.
@@ -1011,6 +1011,9 @@ pub struct LibraryAnswer {
     pub skipped: usize,
     /// Elements that failed to parse and were dropped.
     pub dropped: usize,
+    /// Copies the `receiver_types` lowering did not add because the row (or an
+    /// earlier copy) already held the claim id (debug log only).
+    pub lowering_shadowed: usize,
 }
 
 /// The store's answer, read one element at a time (contract section 2): an
@@ -1096,6 +1099,7 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
                 &type_packages,
                 export,
                 &mut answer.dropped,
+                &mut answer.lowering_shadowed,
             ) {
                 Some(claims) => answer.exports.push(claims),
                 None => answer.dropped += 1,
@@ -1113,6 +1117,7 @@ fn parse_export(
     type_packages: &[String],
     export: &Value,
     dropped: &mut usize,
+    lowering_shadowed: &mut usize,
 ) -> Option<ExportClaims> {
     let specifier = export.get("specifier")?.as_str()?.to_string();
     let name = export.get("export")?.as_str()?.to_string();
@@ -1179,6 +1184,39 @@ fn parse_export(
             }
         }
     }
+    // Amendment 7: the `type:` ids each receiver holds. A value that is not a
+    // list of strings is skipped and counted.
+    let mut receiver_types: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    match export.get("receiver_types") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            for (receiver, types) in map {
+                let list: Option<Vec<String>> = types.as_array().and_then(|types| {
+                    types
+                        .iter()
+                        .map(|name| name.as_str().map(str::to_string))
+                        .collect()
+                });
+                match list {
+                    Some(list) => {
+                        receiver_types.insert(receiver.clone(), list);
+                    }
+                    None => *dropped += 1,
+                }
+            }
+        }
+        Some(_) => *dropped += 1,
+    }
+    let shadowed = lower_type_receivers(&mut claims, &receiver_types);
+    if shadowed > 0 {
+        debug!(
+            package,
+            export = %name,
+            shadowed,
+            "library store: type-receiver copies not added, the row states them"
+        );
+    }
+    *lowering_shadowed += shadowed;
     let mut calls: Vec<CallClaim> = Vec::new();
     for element in elements("calls") {
         match serde_json::from_value::<CallClaim>(element) {
@@ -1203,6 +1241,7 @@ fn parse_export(
         claims,
         calls,
         patterns,
+        receiver_types,
     })
 }
 
@@ -2474,6 +2513,186 @@ mod tests {
                 ("request", Some("request_runner"), None, &types[..]),
             ]
         );
+    }
+
+    /// A routing package's export as the store answers it: today's form
+    /// (ops on instance receivers) and the converted form (the same ops on
+    /// `type:` receivers, with `receiver_types` naming which receiver holds
+    /// which type). Carrick#3049.
+    fn routing_answer(converted: bool) -> String {
+        let receivers = [
+            ("instance:()", "type:core#App"),
+            ("instance:Router", "type:core#Router"),
+            ("instance:()>scope:route", "type:core#Route"),
+            ("instance:Router>scope:route", "type:core#Route"),
+        ];
+        let at = |receiver: &str| -> String {
+            if converted {
+                receivers
+                    .iter()
+                    .find(|(id, _)| *id == receiver)
+                    .map(|(_, ty)| (*ty).to_string())
+                    .expect("a receiver")
+            } else {
+                receiver.to_string()
+            }
+        };
+        let mut scopes = Vec::new();
+        let mut ops = Vec::new();
+        for base in ["instance:()", "instance:Router"] {
+            scopes.push(serde_json::json!({
+                "member": "route", "name": {"arg": 0}, "of": at(base)
+            }));
+            for member in ["get", "post"] {
+                for receiver in [base.to_string(), format!("{base}>scope:route")] {
+                    let op = serde_json::json!({
+                        "op": "receive", "member": member, "of": at(&receiver),
+                        "name": {"arg": 0}, "handler": {"arg": 1}
+                    });
+                    // The converted form states an element once per type.
+                    if !ops.contains(&op) {
+                        ops.push(op);
+                    }
+                }
+            }
+        }
+        let mut export = serde_json::json!({
+            "specifier": "lib", "export": "default", "role": "server_framework",
+            "makes": [
+                {"form": "call", "member": null},
+                {"form": "new", "member": "Router"}
+            ],
+            "scopes": scopes, "ops": ops,
+            "reserved": [
+                {"member": "get", "name": "*", "of": at("instance:()")}
+            ]
+        });
+        if converted {
+            export["receiver_types"] = serde_json::json!({
+                "instance:()": ["type:core#App"],
+                "instance:Router": ["type:core#Router"],
+                "instance:()>scope:route": ["type:core#Route"],
+                "instance:Router>scope:route": ["type:core#Route"],
+            });
+        }
+        serde_json::json!({"library_claims": [{
+            "package": "lib", "version": "1.0.0", "status": "answered",
+            "exports": [export]
+        }]})
+        .to_string()
+    }
+
+    /// Every `(claim id, of)` pair an export states, scopes included.
+    fn id_of_pairs(export: &ExportClaims) -> BTreeSet<(String, Option<String>)> {
+        export
+            .claims_with_scopes_by_id()
+            .into_iter()
+            .map(|(id, claim)| {
+                let of = serde_json::to_value(claim)
+                    .expect("a claim")
+                    .get("of")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                (id, of)
+            })
+            .collect()
+    }
+
+    /// Carrick#3049: the converted form, lowered, states every `(claim id,
+    /// of)` pair today's form states, and nothing besides the `type:`
+    /// originals.
+    #[test]
+    fn a_converted_row_lowers_to_todays_ids() {
+        let today = parse_answer(&routing_answer(false));
+        let converted = parse_answer(&routing_answer(true));
+        assert_eq!((today.dropped, converted.dropped), (0, 0));
+        assert_eq!(converted.lowering_shadowed, 0);
+        let lowered = id_of_pairs(&converted.exports[0]);
+        let today = id_of_pairs(&today.exports[0]);
+        assert!(!today.is_empty());
+        let (types, receivers): (BTreeSet<_>, BTreeSet<_>) = lowered
+            .into_iter()
+            .partition(|(_, of)| of.as_deref().is_some_and(|of| of.starts_with("type:")));
+        assert_eq!(receivers, today);
+        assert!(!types.is_empty(), "the originals stay");
+    }
+
+    /// A receiver whose list does not hold the type gets no copy; a copy the
+    /// row already states, or an earlier copy states, is counted and not
+    /// added; makers are never lowered.
+    #[test]
+    fn lowering_skips_unheld_types_and_counts_shadowed_copies() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"lib","export":"default","role":"server_framework",
+                 "makes":[{"form":"call","member":null,"of":"type:core#App"}],
+                 "ops":[
+                    {"op":"receive","member":"get","of":"type:core#App","name":{"arg":0},"handler":{"arg":1}},
+                    {"op":"receive","member":"get","of":"type:core#Base","name":{"arg":0},"handler":{"arg":1}},
+                    {"op":"receive","member":"get","of":"instance:Own","name":{"arg":0},"handler":{"arg":1}},
+                    {"op":"receive","member":"get","of":"type:core#Own","name":{"arg":0},"handler":{"arg":1}},
+                    {"op":"receive","member":"put","of":"type:core#Other","name":{"arg":0},"handler":{"arg":1}}
+                 ],
+                 "receiver_types":{
+                    "instance:()":["type:core#App","type:core#Base"],
+                    "instance:Own":["type:core#Own"],
+                    "instance:Lone":["type:core#Unrelated"]
+                 }}]}]}"#,
+        );
+        assert_eq!((answer.dropped, answer.lowering_shadowed), (0, 2));
+        let export = &answer.exports[0];
+        let pairs = id_of_pairs(export);
+        let on = |receiver: &str| {
+            pairs
+                .iter()
+                .filter(|(_, of)| of.as_deref() == Some(receiver))
+                .count()
+        };
+        assert_eq!(on("instance:()"), 1, "the earlier element's copy is kept");
+        assert_eq!(
+            on("instance:Own"),
+            1,
+            "the row's own element is not doubled"
+        );
+        assert_eq!(on("instance:Lone"), 0);
+        assert!(
+            export.claims.iter().any(|claim| matches!(
+                claim,
+                LibraryClaim::Op { member, of: Some(of), .. }
+                    if member.as_deref() == Some("get") && of == "type:core#Base"
+            )),
+            "the original stays"
+        );
+        assert_eq!(
+            export
+                .claims
+                .iter()
+                .filter(|claim| matches!(claim, LibraryClaim::Make { .. }))
+                .count(),
+            1,
+            "a maker is never lowered"
+        );
+    }
+
+    /// No `receiver_types`: the export parses as it did before, and a value
+    /// that is not a list of strings is skipped and counted.
+    #[test]
+    fn receiver_types_absent_changes_nothing_and_a_bad_list_is_dropped() {
+        let answer = parse_answer(&routing_answer(false));
+        assert!(answer.exports[0].receiver_types.is_empty());
+        assert_eq!(answer.lowering_shadowed, 0);
+        let bad = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"lib","export":"default","role":"server_framework",
+                 "ops":[{"op":"receive","member":"get","of":"type:t","name":{"arg":0},"handler":{"arg":1}}],
+                 "receiver_types":{"instance:()":"type:t","instance:A":["type:t",1],"instance:B":["type:t"]}}]}]}"#,
+        );
+        assert_eq!(bad.dropped, 2);
+        assert_eq!(
+            bad.exports[0].receiver_types.keys().collect::<Vec<_>>(),
+            ["instance:B"]
+        );
+        assert_eq!(bad.exports[0].claims.len(), 2, "only instance:B lowered");
     }
 
     /// A v2 field in a shape this build cannot read drops its element and
