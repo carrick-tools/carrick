@@ -2689,6 +2689,29 @@ fn add_a_call_to_no_route(root: &Path, base: &str) {
     std::fs::write(&caller, text).expect("write the caller");
 }
 
+/// The consumer gains a member that hands its origin to a helper from another
+/// file (`sendTo` in send.ts), `sendTo(this.baseUrl, "/path", ...)`, and a caller that makes it a
+/// member the repo uses. The path is bare but the origin is a run-time value.
+fn add_a_call_through_a_handed_base(root: &Path) {
+    let client = root.join("inventory-svc/src/client.ts");
+    edit(
+        &client,
+        "import { send } from",
+        "import { send, sendTo } from",
+    );
+    edit(
+        &client,
+        "  readWidget(widgetId: string)",
+        "  readGadget(gadgetId: string): Promise<Widget> {\n    return sendTo<Widget>(this.baseUrl, `/api/v1/gadgets/${gadgetId}`, {\n      method: \"GET\",\n    });\n  }\n\n  readWidget(widgetId: string)",
+    );
+    let caller = root.join("inventory-svc/src/inventory.ts");
+    let mut text = std::fs::read_to_string(&caller).expect("read the caller");
+    text.push_str(
+        "\nexport async function gadgetName(\n  gadgetId: string,\n  client: CatalogClient\n): Promise<string> {\n  const gadget = await client.readGadget(gadgetId);\n  return gadget.name;\n}\n",
+    );
+    std::fs::write(&caller, text).expect("write the caller");
+}
+
 /// A handler committed on a branch stops sending a field the consumer reads.
 /// The consumer is untouched, so only a pass that re-extracts the producer and
 /// re-judges it against the index can see it, and it is a fact on both sides.
@@ -3032,6 +3055,33 @@ fn check_changed_prints_a_new_call_through_a_runtime_base_as_unconfirmed() {
         problem.contains("[unconfirmed: the base is set at run time, does not fail]"),
         "as unconfirmed:\n{text}"
     );
+    assert_eq!(code, Some(0), "{text}");
+}
+
+/// A new call through an imported member whose helper is handed the origin
+/// (`sendTo(this.baseUrl, "/path", ...)`): the base is injected, so the call
+/// is printed as unconfirmed and does not fail with "no service serves it".
+/// The row exists only with the fact layer on, which `check` runs.
+#[test]
+#[serial]
+fn check_changed_prints_a_new_call_through_a_helper_handed_its_base_as_unconfirmed() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_through_a_handed_base(root);
+
+    let (code, text) = check_changed_all(root);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("/api/v1/gadgets") && line.contains("  no route  "))
+        .collect();
+    assert!(!lines.is_empty(), "the new call is printed:\n{text}");
+    for line in lines {
+        assert!(
+            line.contains("[unconfirmed: the base is set at run time, does not fail]"),
+            "as unconfirmed:\n{text}"
+        );
+    }
     assert_eq!(code, Some(0), "{text}");
 }
 
