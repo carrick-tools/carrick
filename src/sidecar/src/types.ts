@@ -1215,6 +1215,13 @@ export interface SurfaceMember {
    * of the hash.
    */
   scope_receiver?: SurfaceReceiver;
+  /**
+   * The event names Node's runtime gives every emitter (`error`,
+   * `newListener`, `removeListener`) that no signature of this member spells,
+   * on a member of the runtime's own `EventEmitter` that takes an event name
+   * (carrick#3032). Runtime-module surfaces only, and left out of the hash.
+   */
+  runtime_events?: string[];
   signatures: SurfaceSignature[];
 }
 
