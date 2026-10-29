@@ -489,6 +489,7 @@ mod tests {
     fn scoped_pair() -> (SiteLabel, SiteLabel, LabelledEnd, LabelledEnd) {
         let label = |scope: Option<&str>, handler: usize, name: bool, param: u32| SiteLabel {
             by_origin: false,
+            yields: None,
             package: "fixture-router".into(),
             export: "Router".into(),
             member: Some("get".into()),

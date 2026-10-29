@@ -70,7 +70,9 @@ use crate::cloud_storage::CloudRepoData;
 use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::{OperationKey, SocketDirection};
 use crate::possible_calls::{PossibleCall, UnreadReason};
-use crate::request_summary::decided_sites::{Decided, DecidedSite, SiteLabel, Through};
+use crate::request_summary::decided_sites::{
+    Decided, DecidedSite, SiteLabel, Through, origin_side,
+};
 use crate::request_summary::site_record::{Basis, Bucket, SiteRecord, TypeAnchors};
 use crate::site_questions::{Answered, SiteAnswers, SiteQuestion, Slot, SlotAnswer, SlotValue};
 
@@ -459,6 +461,19 @@ fn direction(side: Option<&str>, row: RowSide) -> SocketDirection {
     }
 }
 
+/// The side of the connection a socket site's call is made on. The label's
+/// own, or for an export the store marks `by_origin` the side its instance
+/// came from (carrick#1670): what the instance walk ended at. `None` where
+/// neither states one, as a scan without the receiver trace.
+fn socket_side(label: Option<&SiteLabel>, site: &DecidedSite) -> Option<String> {
+    let label = label?;
+    if label.by_origin {
+        origin_side(&site.instances, &label.package).map(str::to_string)
+    } else {
+        label.side.clone()
+    }
+}
+
 /// The key a kind names for `name`, and its name scope.
 fn key_of(
     kind: &str,
@@ -697,7 +712,7 @@ pub fn of(
             name_text,
             method.as_deref(),
             namespace,
-            label.and_then(|label| label.side.as_deref()),
+            socket_side(label, site).as_deref(),
             side,
         ) else {
             out.leads.push(lead(UnreadReason::BelowBand));

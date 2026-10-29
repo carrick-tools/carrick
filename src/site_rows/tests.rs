@@ -156,6 +156,7 @@ const ASKED: &[Slot] = &[Slot::Kind, Slot::Role, Slot::Name];
 fn labels() -> Vec<SiteLabel> {
     let label = |export: &str, side: Option<&str>| SiteLabel {
         by_origin: false,
+        yields: None,
         package: "@fixture/wire".to_string(),
         export: export.to_string(),
         member: Some("emit".to_string()),
@@ -410,6 +411,91 @@ fn a_by_origin_label_keys_its_socket_event_unknown() {
     assert_eq!(
         row(&rows, "src/server-socket.ts").map(|row| row.key.clone()),
         Some(OperationKey::socket("chat", SocketDirection::Unknown))
+    );
+}
+
+/// A site on a `by_origin` export takes its side from where its instance
+/// came from (carrick#1670): handed in by a server's call, the server's; made
+/// by the package's maker, the client's; and from nothing the instance walk
+/// read, none.
+#[test]
+fn a_by_origin_label_takes_its_side_from_the_instance_ends() {
+    use crate::request_summary::decided_sites::{InstanceAt, InstanceEnd};
+    let exports: Vec<crate::library_claims::ExportClaims> =
+        serde_json::from_value(serde_json::json!([{
+            "package": "@fixture/wire", "version": "1.0.0", "specifier": "@fixture/wire",
+            "export": "Socket", "role": "socket", "side": "client", "side_rule": "by_origin",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "emit", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 } }
+            ]
+        }]))
+        .unwrap();
+    let labels = SiteLabel::from_exports(&exports);
+    let handed = |package: &str, side: &str| InstanceEnd {
+        at: "src/server-socket.ts:3".to_string(),
+        end: InstanceAt::Handed {
+            file: "src/server-socket.ts".to_string(),
+            line: 3,
+            package: package.to_string(),
+            export: "Server".to_string(),
+            side: side.to_string(),
+        },
+    };
+    let made = InstanceEnd {
+        at: "src/client-socket.ts:5".to_string(),
+        end: InstanceAt::Root {
+            file: "src/client-socket.ts".to_string(),
+            line: 5,
+            package: "@fixture/wire".to_string(),
+            export: "connect".to_string(),
+            member: None,
+            receiver: "instance:()".to_string(),
+        },
+    };
+    let direction = |instances: Vec<InstanceEnd>| {
+        let (decided, records) = cases();
+        let decided = Decided {
+            sites: decided
+                .sites
+                .into_iter()
+                .map(|mut site| {
+                    if site.file == "src/server-socket.ts" {
+                        site.end.export = "Socket".to_string();
+                        site.end.op = Some("send".to_string());
+                        site.instances = instances.clone();
+                    }
+                    site
+                })
+                .collect(),
+            ..Decided::default()
+        };
+        let rows = of(&decided, &records, &labels, &cassette());
+        row(&rows, "src/server-socket.ts").map(|row| row.key.clone())
+    };
+    let socket = |direction| Some(OperationKey::socket("chat", direction));
+    assert_eq!(
+        direction(vec![handed("@fixture/wire", "server")]),
+        socket(SocketDirection::ServerToClient)
+    );
+    assert_eq!(
+        direction(vec![handed("@fixture/wire", "client")]),
+        socket(SocketDirection::ClientToServer)
+    );
+    assert_eq!(
+        direction(vec![made.clone()]),
+        socket(SocketDirection::ClientToServer)
+    );
+    // No end read (a scan without the receiver trace), an end of another
+    // package, and two sides: unknown.
+    assert_eq!(direction(Vec::new()), socket(SocketDirection::Unknown));
+    assert_eq!(
+        direction(vec![handed("@fixture/other", "server")]),
+        socket(SocketDirection::Unknown)
+    );
+    assert_eq!(
+        direction(vec![handed("@fixture/wire", "server"), made]),
+        socket(SocketDirection::Unknown)
     );
 }
 

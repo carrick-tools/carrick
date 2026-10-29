@@ -27,6 +27,11 @@
 //!   scoped instance (`app.register(plugin, { prefix })`), under the prefix
 //!   its `name` slot states, whose own instance is the member's receiver,
 //!   walked the same way ([`InstanceAt::Scope`]);
+//! - **a handed instance** (carrick#1670): the parameter of a function a
+//!   socket library's own call runs (`hub.on("connection", (peer) => …)`),
+//!   which that call's export hands in on the side the store states for it
+//!   ([`InstanceAt::Handed`]); [`origin_side`] folds it, and a root, into the
+//!   side of a `by_origin` socket;
 //! - **a hole**, with its reason ([`InstanceHole`]).
 //!
 //! An instance handed to a member labelled with `mounts` is served under
@@ -229,7 +234,7 @@ impl ScopeLabel {
                 receiver,
                 ..
             } => self.applies(package, export, receiver),
-            InstanceAt::Hole { .. } => false,
+            InstanceAt::Hole { .. } | InstanceAt::Handed { .. } => false,
         }
     }
 }
@@ -313,6 +318,18 @@ pub enum InstanceAt {
         receiver: String,
         parents: Vec<InstanceEnd>,
     },
+    /// A function a socket library's call runs, at that call: the parameter
+    /// that holds the instance is one the call's export hands in, on `side`
+    /// of the connection (carrick#1670). The store labels the call (`export`
+    /// is the instance handed in when the op's `yields` names it, else the
+    /// call's own export), so the instance has no maker in this service.
+    Handed {
+        file: String,
+        line: u32,
+        package: String,
+        export: String,
+        side: String,
+    },
     Hole {
         reason: InstanceHole,
         /// What the walk stopped at, as written, where one expression is.
@@ -337,11 +354,11 @@ pub struct InstanceEnd {
 }
 
 impl InstanceEnd {
-    /// The hole reason, or `None` for a root or a scope.
+    /// The hole reason, or `None` for a root, a scope or a handed instance.
     pub fn hole(&self) -> Option<InstanceHole> {
         match &self.end {
             InstanceAt::Hole { reason, .. } => Some(*reason),
-            InstanceAt::Root { .. } | InstanceAt::Scope { .. } => None,
+            InstanceAt::Root { .. } | InstanceAt::Scope { .. } | InstanceAt::Handed { .. } => None,
         }
     }
 }
@@ -360,6 +377,9 @@ pub(super) struct WalkIndex<'a> {
     /// an argument to: the calls of a `runs` scope member handed it
     /// (`app.register(items)`, `items` imported).
     by_declaration: HashMap<(String, u32), Vec<Host<'a>>>,
+    /// The socket calls the store labels, by file and span: what a function
+    /// one of them runs is handed in (carrick#1670).
+    socket_hosts: HashMap<HostSpan, HostLabel>,
     /// The ends of a scope call's own receiver, by the scope calls being
     /// walked around it (outermost first) and the call: a walk reached
     /// again from another site reads them here.
@@ -372,15 +392,61 @@ type HostSpan = (PathBuf, u32, u32);
 /// A scope call, with the scope calls walked around it.
 type ParentsKey = (Vec<HostSpan>, HostSpan);
 
+/// A socket call the store labels, read for what it hands the function it
+/// runs (carrick#1670).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLabel {
+    pub package: String,
+    pub export: String,
+    /// The side the store states for the call's export; `None` for a
+    /// `by_origin` export.
+    pub side: Option<String>,
+    /// What the op's handler is handed, when the store states it.
+    pub yields: Option<crate::services::type_sidecar::Yields>,
+}
+
+impl HostLabel {
+    /// Every discovered call of a socket export the store labels, by the
+    /// file (joined to `root`) and span of the labelled call.
+    pub(super) fn of_discovered(
+        root: &Path,
+        discovered: &[super::DiscoverySite],
+        labels: &[super::SiteLabel],
+    ) -> HashMap<HostSpan, HostLabel> {
+        let mut hosts = HashMap::new();
+        for site in discovered {
+            let Some(end) = site.end.as_ref().filter(|_| site.stop.is_none()) else {
+                continue;
+            };
+            let Some(label) = super::SiteLabel::find(labels, end).filter(|l| l.role == "socket")
+            else {
+                continue;
+            };
+            hosts.insert(
+                (root.join(&end.file), end.span_start, end.span_end),
+                HostLabel {
+                    package: label.package.clone(),
+                    export: label.export.clone(),
+                    side: label.side.clone(),
+                    yields: label.yields.clone(),
+                },
+            );
+        }
+        hosts
+    }
+}
+
 impl<'a> WalkIndex<'a> {
     pub(super) fn of(
         calls: &Calls<'a>,
         inputs: &RequestSummaryInputs,
         scopes: &[ScopeLabel],
+        socket_hosts: HashMap<HostSpan, HostLabel>,
     ) -> Self {
         let mut index = WalkIndex {
             by_name: HashMap::new(),
             by_declaration: HashMap::new(),
+            socket_hosts,
             parents: RefCell::new(HashMap::new()),
         };
         let runs: HashSet<&str> = scopes
@@ -708,7 +774,8 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         };
         let mut scoped = false;
         for (host, arg) in &hosts {
-            scoped |= self.scope(host, *arg, param, at.clone());
+            scoped |= self.scope(host, *arg, param, at.clone())
+                || self.handed_by(host.file, host.call, param, at.clone());
         }
         if callers.is_empty() {
             match (hosts.is_empty(), scoped) {
@@ -789,12 +856,16 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     [Piece::Param(index, _)] => Some(*index),
                     _ => None,
                 };
+                let host_call = host;
                 let host =
                     self.calls
                         .at_span(placed.file, host.site.span_start, host.site.span_end);
                 if let (Some(host), Some(written)) = (host, written)
                     && self.scope(&host, written.arg, param, at.clone())
                 {
+                    return;
+                }
+                if self.handed_by(placed.file, host_call, param, at.clone()) {
                     return;
                 }
                 InstanceHole::RunsByLibrary
@@ -822,6 +893,43 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             })
             .collect();
         self.open(host, labels, at)
+    }
+
+    /// The instance a socket library's call hands the function it runs
+    /// (carrick#1670): an end at `call`, written in `file`, where the store
+    /// labels `call` as a socket op and states the side the instance it
+    /// hands is on. The op's `yields` states it for the parameter `param`
+    /// (a different parameter is not the instance); an op that names no
+    /// `yields` hands in the instance of its own export, on that export's
+    /// side. False where the call is no labelled socket call, or states no
+    /// side (a `by_origin` export hands in nothing of its own).
+    fn handed_by(&mut self, file: &Path, call: &CallIr, param: Option<usize>, at: String) -> bool {
+        let span = (file.to_path_buf(), call.site.span_start, call.site.span_end);
+        let Some(host) = self.index.socket_hosts.get(&span) else {
+            return false;
+        };
+        let (export, side) = match (&host.yields, &host.side) {
+            (Some(yields), _) if param == Some(yields.param as usize) => {
+                (yields.export.clone(), yields.side.clone())
+            }
+            (Some(_), _) => return false,
+            (None, Some(side)) => (host.export.clone(), side.clone()),
+            (None, None) => return false,
+        };
+        if !matches!(side.as_str(), "client" | "server") {
+            return false;
+        }
+        self.push(
+            at,
+            InstanceAt::Handed {
+                file: relative(self.root, file),
+                line: call.site.line,
+                package: host.package.clone(),
+                export,
+                side,
+            },
+        );
+        true
     }
 
     /// The value of the call at `span` in `file`: the scope a member a
@@ -918,7 +1026,9 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             // read the same share one scope end (carrick#2635).
             let origin_of = |parent: &InstanceEnd| match &parent.end {
                 InstanceAt::Scope { file, line, .. } => format!("{file}:{line}"),
-                InstanceAt::Root { .. } | InstanceAt::Hole { .. } => parent.at.clone(),
+                InstanceAt::Root { .. } | InstanceAt::Hole { .. } | InstanceAt::Handed { .. } => {
+                    parent.at.clone()
+                }
             };
             let handers = self.handers(host);
             let paired = !handers.is_empty()
@@ -1286,8 +1396,39 @@ pub(super) fn identity(end: &InstanceEnd) -> Option<(String, String, String)> {
             receiver,
             ..
         } => Some((package.clone(), export.clone(), receiver.clone())),
-        InstanceAt::Hole { .. } => None,
+        InstanceAt::Hole { .. } | InstanceAt::Handed { .. } => None,
     }
+}
+
+/// The side of the connection a `by_origin` socket of `package` is on,
+/// from the instance ends of the site it is called at (carrick#1670; the rule
+/// is stated in docs/reference/client-semantics.md, "Message roles"): the
+/// side a socket library's call hands it in on, or the client's where a
+/// maker of the package made it. Every end must give the same side. A hole,
+/// an end of another package, a scope, or two sides: none, and the site
+/// states no direction.
+pub fn origin_side(ends: &[InstanceEnd], package: &str) -> Option<&'static str> {
+    let mut side: Option<&'static str> = None;
+    for end in ends {
+        let this = match &end.end {
+            InstanceAt::Handed {
+                package: handed,
+                side,
+                ..
+            } if handed == package => match side.as_str() {
+                "client" => "client",
+                "server" => "server",
+                _ => return None,
+            },
+            InstanceAt::Root { package: made, .. } if made == package => "client",
+            _ => return None,
+        };
+        if side.is_some_and(|known| known != this) {
+            return None;
+        }
+        side = Some(this);
+    }
+    side
 }
 
 /// The text of `pieces` where every piece is literal.
@@ -1615,6 +1756,81 @@ mod tests {
     use super::super::super::discovery::AskedScope;
     use super::*;
     use crate::position_rows::Row;
+
+    fn handed(package: &str, side: &str) -> InstanceEnd {
+        InstanceEnd {
+            at: "src/a.ts:1".to_string(),
+            end: InstanceAt::Handed {
+                file: "src/a.ts".to_string(),
+                line: 1,
+                package: package.to_string(),
+                export: "Hub".to_string(),
+                side: side.to_string(),
+            },
+        }
+    }
+
+    fn made(package: &str) -> InstanceEnd {
+        InstanceEnd {
+            at: "src/b.ts:2".to_string(),
+            end: InstanceAt::Root {
+                file: "src/b.ts".to_string(),
+                line: 2,
+                package: package.to_string(),
+                export: "Peer".to_string(),
+                member: None,
+                receiver: "instance:new".to_string(),
+            },
+        }
+    }
+
+    fn hole() -> InstanceEnd {
+        InstanceEnd {
+            at: "src/c.ts:3".to_string(),
+            end: InstanceAt::Hole {
+                reason: InstanceHole::EntryPoint,
+                text: None,
+                boundary: None,
+            },
+        }
+    }
+
+    /// carrick#1670: the side a `by_origin` socket is on is where its
+    /// instance came from.
+    #[test]
+    fn a_handed_instance_is_the_side_it_is_handed_in_on_and_a_made_one_is_the_client() {
+        assert_eq!(origin_side(&[handed("rt", "server")], "rt"), Some("server"));
+        assert_eq!(origin_side(&[handed("rt", "client")], "rt"), Some("client"));
+        assert_eq!(origin_side(&[made("rt")], "rt"), Some("client"));
+        // Ends that agree are one side.
+        assert_eq!(
+            origin_side(&[handed("rt", "server"), handed("rt", "server")], "rt"),
+            Some("server")
+        );
+        assert_eq!(
+            origin_side(&[handed("rt", "client"), made("rt")], "rt"),
+            Some("client")
+        );
+    }
+
+    /// carrick#1670: no end, a hole, an end of another package, a side the
+    /// store does not state as client or server, or two sides: no side.
+    #[test]
+    fn an_origin_that_is_not_one_side_of_the_same_package_is_no_side() {
+        assert_eq!(origin_side(&[], "rt"), None);
+        assert_eq!(origin_side(&[handed("rt", "server"), hole()], "rt"), None);
+        assert_eq!(origin_side(&[handed("other", "server")], "rt"), None);
+        assert_eq!(origin_side(&[made("other")], "rt"), None);
+        assert_eq!(origin_side(&[handed("rt", "both")], "rt"), None);
+        assert_eq!(
+            origin_side(&[handed("rt", "server"), made("rt")], "rt"),
+            None
+        );
+        assert_eq!(
+            origin_side(&[handed("rt", "server"), handed("other", "server")], "rt"),
+            None
+        );
+    }
 
     /// carrick#2474 R2b: a scope label is the claim the trace verified, by
     /// claim id: a sibling claim on the same member that the verifier

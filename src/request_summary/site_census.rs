@@ -234,8 +234,10 @@ fn census_boundaries(
 
 /// An instance end's kind: `root`, or the hole's reason.
 fn end_kind(end: &InstanceEnd) -> String {
-    if matches!(end.end, InstanceAt::Scope { .. }) {
-        return "scope".to_string();
+    match end.end {
+        InstanceAt::Scope { .. } => return "scope".to_string(),
+        InstanceAt::Handed { .. } => return "handed".to_string(),
+        InstanceAt::Root { .. } | InstanceAt::Hole { .. } => {}
     }
     match end.hole() {
         None => "root".to_string(),
@@ -366,6 +368,7 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
             let what = match &end.end {
                 InstanceAt::Root { file, line, .. } => format!("root {file}:{line}"),
                 InstanceAt::Scope { file, line, .. } => format!("scope {file}:{line}"),
+                InstanceAt::Handed { file, line, .. } => format!("handed {file}:{line}"),
                 InstanceAt::Hole { text, .. } => match text {
                     Some(text) => format!("{} {text}", end_kind(end)),
                     None => end_kind(end),
