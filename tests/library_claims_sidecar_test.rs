@@ -73,7 +73,7 @@ fn real_sidecar(repo: &Path) -> TypeSidecar {
 }
 
 fn slot(arg: u32) -> ClaimSlot {
-    ClaimSlot { arg, key: None }
+    ClaimSlot::at_arg(arg)
 }
 
 /// A key of the options object at argument 0.
@@ -81,6 +81,7 @@ fn keyed(key: &str) -> ClaimSlot {
     ClaimSlot {
         arg: 0,
         key: Some(key.into()),
+        ..ClaimSlot::default()
     }
 }
 
@@ -136,6 +137,10 @@ fn placed(place: Place) -> (Option<ClaimOn>, Option<String>) {
 fn send(member: &str, path: &[&str], place: Place, name: OpName, payload: u32) -> LibraryClaim {
     let (on, of) = placed(place);
     LibraryClaim::Op {
+        form: None,
+        protocol: None,
+        when: None,
+        returns: None,
         op: LibraryOp::Send,
         member: Some(member.into()),
         path: path.iter().map(|hop| hop.to_string()).collect(),
@@ -185,7 +190,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
     fixture(&repo);
     let sidecar = real_sidecar(&repo);
 
-    let bound = |bound| OpName::Bound { bound };
+    let bound = OpName::bound;
     let checks = vec![
         check(
             "job",
@@ -218,6 +223,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             "channel",
             "export",
             LibraryClaim::Scope {
+                form: None,
                 member: "channel".into(),
                 name: Some(slot(0)),
                 path: vec![],
@@ -272,6 +278,10 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             "both",
             "export",
             LibraryClaim::Op {
+                form: None,
+                protocol: None,
+                when: None,
+                returns: None,
                 op: LibraryOp::Send,
                 member: Some("trigger".into()),
                 path: vec!["tasks".into()],

@@ -433,15 +433,41 @@ export const VerifyClientSemanticsRequestSchema = BaseRequestSchema.extend({
   budget_ms: z.number().int().nonnegative().optional(),
 });
 
-/** Where one part of a library call sits (carrick#1616). */
+/**
+ * Where one part of a library call sits (carrick#1616). Amendment 7 of
+ * carrick#2434 adds `at`, a member path walked from the value there (`[]`
+ * steps into an array element), and `each`, a rest slot every element of
+ * which is read.
+ */
 const ClaimSlotSchema = z
   .object({
     arg: z.number().int().nonnegative(),
     key: z.string().min(1).optional(),
+    at: z.array(z.string().min(1)).optional(),
+    each: z.boolean().optional(),
   })
   .strict();
 
-const BoundNameSchema = z.object({ bound: z.enum(['maker', 'scope', 'key']) }).strict();
+/** A slot that holds a name: also read as a GraphQL document, or as the name of a function or class (amendment 7). */
+const NameSlotSchema = ClaimSlotSchema.extend({
+  document: z.literal('graphql').optional(),
+  ref: z.enum(['function', 'class']).optional(),
+}).strict();
+
+/** The shapes a name takes beside a slot (amendment 7): two or three slots joined, or a name the library fixes. */
+const NamePartsSchema = z
+  .object({ parts: z.array(ClaimSlotSchema).min(2).max(3), join: z.string().optional() })
+  .strict();
+const NameLiteralSchema = z.object({ literal: z.string().min(1) }).strict();
+
+const BoundNameSchema = z
+  .object({
+    bound: z.enum(['maker', 'scope', 'key', 'path', 'export', 'subscribed']),
+    join: z.string().min(1).optional(),
+    param: z.number().int().nonnegative().optional(),
+    at: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
 
 /** Procedure routers (#2474 R6a): where a router member takes its procedures, and how nested keys join. */
 const CollectsSchema = z
@@ -469,6 +495,7 @@ const YieldsSchema = z
     param: z.number().int().nonnegative(),
     export: z.string().min(1),
     side: z.string().min(1),
+    package: z.string().min(1).optional(),
   })
   .strict();
 
@@ -512,7 +539,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       member: z.string().min(1).nullable(),
       base: ClaimSlotSchema.optional(),
       prefix: ClaimSlotSchema.optional(),
-      name: ClaimSlotSchema.optional(),
+      name: NameSlotSchema.optional(),
       handler: ClaimSlotSchema.optional(),
       runs: ClaimSlotSchema.optional(),
       key_labels: KeyLabelsSchema.optional(),
@@ -525,8 +552,9 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
     .object({
       kind: z.literal('scope'),
       member: z.string().min(1),
+      form: z.enum(['call', 'decorate']).optional(),
       // Exactly one of `name` and `collects`: the verifier's verdict (#2474 R6a).
-      name: ClaimSlotSchema.optional(),
+      name: NameSlotSchema.optional(),
       path: MemberPathSchema.optional(),
       on: ClaimOnSchema.optional(),
       of: z.string().min(1).optional(),
@@ -547,7 +575,14 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       path: MemberPathSchema.optional(),
       on: ClaimOnSchema.optional(),
       of: z.string().min(1).optional(),
-      name: z.union([BoundNameSchema, ClaimSlotSchema]).optional(),
+      form: z.enum(['call', 'new', 'set', 'override', 'decorate']).optional(),
+      protocol: z.enum(['http', 'graphql', 'rpc', 'socket', 'message']).optional(),
+      when: z
+        .object({ arg: z.number().int().nonnegative(), key: z.string().min(1).optional(), literal: z.string().min(1) })
+        .strict()
+        .optional(),
+      returns: z.object({ result: ResultShapeSchema.optional() }).strict().optional(),
+      name: z.union([BoundNameSchema, NamePartsSchema, NameLiteralSchema, NameSlotSchema]).optional(),
       payload: ClaimSlotSchema.optional(),
       handler: ClaimSlotSchema.optional(),
       ack: ClaimSlotSchema.optional(),
@@ -658,6 +693,7 @@ export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({
   handlers: z.boolean().optional(),
   types: z.boolean().optional(),
   result_candidates: z.boolean().optional(),
+  types: z.boolean().optional(),
   max_handler_members: z.number().int().positive().optional(),
 });
 

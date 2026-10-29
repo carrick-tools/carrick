@@ -50,6 +50,7 @@ import type {
   LibraryClaim,
   LibraryRole,
   LibrarySurface,
+  NameSlot,
   RequestAt,
   ResultShape,
   RunsSlot,
@@ -831,6 +832,7 @@ export class LibraryClaimsVerifier {
         // An export given two roles is classified two ways; neither is a fact.
         if ((roles.get(exportKey(check))?.size ?? 0) > 1) return { outcome: unchecked('role_conflict') };
         if (placementInvalid(check.claim)) return { outcome: unchecked('claim_invalid') };
+        if (unbuiltPart(check.claim) !== undefined) return { outcome: unchecked('part_unbuilt') };
         if (rules.http && !HTTP_RECEIVER.test(check.receiver)) return { outcome: unchecked('receiver_invalid') };
         if (rules.message && !fitsReceiver(check)) return { outcome: unchecked('receiver_invalid') };
         reader.setPackage(check.package);
@@ -1282,6 +1284,50 @@ function parseReceiver(text: string): ReceiverPath | undefined {
 /** The scope step a scope claim's results are read through: its path and member, joined by `.`. */
 function scopeStep(claim: ScopeClaim): string {
   return [...(claim.path ?? []), claim.member].join('.');
+}
+
+/**
+ * The first part of a claim that amendment 7 of carrick#2434 adds and no
+ * judge reads yet, or undefined (carrick#3045). The schema takes the whole
+ * grammar so one request never fails on a part; an element that uses one
+ * answers `unchecked part_unbuilt` until the judge for it lands. Each slice
+ * removes the parts it judges from here.
+ */
+function unbuiltPart(claim: LibraryClaim): string | undefined {
+  const slots: (ClaimSlot | NameSlot | undefined)[] = [];
+  if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.name, claim.handler);
+  if (claim.kind === 'scope') slots.push(claim.name, claim.mounts);
+  if (claim.kind === 'op') {
+    const name = claim.name;
+    slots.push(claim.payload, claim.handler, claim.ack, claim.options, claim.method_key, claim.base);
+    if (name !== undefined) {
+      if ('bound' in name) {
+        if (name.bound === 'path' || name.bound === 'export' || name.bound === 'subscribed') return `name.bound.${name.bound}`;
+        if (name.join !== undefined || name.param !== undefined || name.at !== undefined) return 'name.bound';
+      } else if ('parts' in name) {
+        return 'name.parts';
+      } else if ('literal' in name) {
+        return 'name.literal';
+      } else {
+        slots.push(name);
+      }
+    }
+    if (claim.form !== undefined && claim.form !== 'call') return `form.${claim.form}`;
+    if (claim.protocol !== undefined) return 'protocol';
+    if (claim.when !== undefined) return 'when';
+    if (claim.returns !== undefined) return 'returns';
+  }
+  if (claim.kind === 'scope' && claim.form !== undefined && claim.form !== 'call') return `form.${claim.form}`;
+  if ((claim.kind === 'op' || claim.kind === 'scope') && claim.yields?.package !== undefined) return 'yields.package';
+  for (const slot of slots) {
+    if (slot === undefined) continue;
+    const named = slot as NameSlot;
+    if (named.at !== undefined) return 'slot.at';
+    if (named.each !== undefined) return 'slot.each';
+    if (named.document !== undefined) return 'slot.document';
+    if (named.ref !== undefined) return 'slot.ref';
+  }
+  return undefined;
 }
 
 /**
@@ -1975,7 +2021,7 @@ class DeclarationReader {
       return unchecked('claim_invalid');
     }
     const name = claim.name;
-    if (name !== undefined && 'bound' in name) return unchecked('claim_invalid');
+    if (name !== undefined && !('arg' in name)) return unchecked('claim_invalid');
     if (claim.method_key) {
       const at = claim.method_key.arg;
       const methodKey = claim.method_key.key;
@@ -2608,8 +2654,11 @@ class DeclarationReader {
       const bound =
         name.bound === 'maker' ? receiver.makerBindsName : name.bound === 'scope' ? receiver.scoped : receiver.keyBound === true;
       if (!bound) return failed('name_unbound');
-    } else {
+    } else if ('arg' in name) {
       nameSlot = name;
+    } else {
+      // `unbuiltPart` answers before this is reached.
+      return unchecked('part_unbuilt');
     }
     const runs = claim.runs;
     const boundRuns = runs?.bound === 'maker' ? runs : undefined;

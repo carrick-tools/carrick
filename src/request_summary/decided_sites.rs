@@ -370,6 +370,9 @@ impl SiteLabel {
                     });
                     continue;
                 }
+                if !claim.is_call_form() {
+                    continue;
+                }
                 let LibraryClaim::Op {
                     op,
                     member,
@@ -423,7 +426,8 @@ impl SiteLabel {
                             names: matches!(
                                 name,
                                 Some(OpName::Bound {
-                                    bound: BoundName::Scope
+                                    bound: BoundName::Scope,
+                                    ..
                                 })
                             ),
                         }),

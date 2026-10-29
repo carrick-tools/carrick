@@ -134,6 +134,7 @@ impl ProcedureLabels {
                         name:
                             Some(OpName::Bound {
                                 bound: BoundName::Key,
+                                ..
                             }),
                         ..
                     } => {

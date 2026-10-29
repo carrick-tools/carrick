@@ -610,6 +610,16 @@ Rules for the message roles (`broker`, `in_process_bus`, `socket`):
 | An export given two roles in one request | `unchecked role_conflict` |
 | A `workspace:`, `file:`, `link:` or `portal:` dependency (until its own source is verified, #1666) | `unchecked module_workspace` |
 | `graphql_client`, `server_framework` and `none`, and an `execute` op on a message role | `unchecked role_unsupported` |
+| A part of the grammar that amendment 7 of carrick#2434 adds and no judge reads yet (listed below) | `unchecked part_unbuilt` |
+
+Amendment 7 grammar (carrick#3045): the request schema takes the whole of it, so one element never fails a request; the verifier judges none of it yet and answers `unchecked part_unbuilt` for an element that uses a part (`unbuiltPart` in `library-claims.ts`; each later slice removes the parts it judges). All fields are optional:
+
+- A slot: `at` (a member path walked from the value, `[]` steps into an array element) and `each` (a rest slot, every element read). A name slot (`name` of a make, scope or op): `document: "graphql"` or `ref: "function" | "class"`.
+- An op's `name`: `{ "parts": [slot, slot(, slot)], "join" }`, `{ "literal" }`, or a bound name with the values `path` (`join`), `export` or `subscribed` (`param`, `at`) beside `maker`, `scope` and `key`.
+- An op: `form` (`call` is the default; `new`, `set`, `override`, `decorate`), `protocol` (`http`, `graphql`, `rpc`, `socket`, `message`), `when: { "arg", "key?", "literal" }` and `returns: { "result?": <result shape> }`. A scope: `form` (`call` or `decorate`).
+- `yields.package`: the package that declares `export`, when it is not the claim's own.
+- Receiver ids `type:<Path>` and `type:<module>#<Path>` are plain strings; they answer `receiver_invalid` until their judge lands.
+- `list_library_surface` takes `types: boolean`; it is accepted and not read yet.
 
 Not refusable by shape (carrick#1653): an in-process emitter classified as a socket, a raw `send(data, options)` with a wrong name-at-0 claim, and a generic event map defaulting to an index signature.
 
