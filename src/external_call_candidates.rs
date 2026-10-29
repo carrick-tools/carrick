@@ -284,6 +284,9 @@ pub struct WorkspaceScan {
     /// through `&self`, so services analysed side by side share it
     /// (carrick#1066).
     built: std::sync::OnceLock<Built>,
+    /// What the scan has read of the tree for the files only tests import,
+    /// shared by its services and dropped with it (carrick#2786).
+    pub test_only: crate::test_only_files::Cache,
 }
 
 /// Everything the shared pass holds for one repo root.
