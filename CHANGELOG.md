@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.3.137](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.136...carrick-v0.3.137) (2026-10-30)
+
+
+### Features
+
+* a field set from one constructor parameter carries that parameter's origin ([#1670](https://github.com/carrick-tools/carrick/issues/1670) T3) ([#3036](https://github.com/carrick-tools/carrick/issues/3036)) ([c4dfcd2](https://github.com/carrick-tools/carrick/commit/c4dfcd26351bb5d728cc9d4544ad8454eb936dc2))
+* **library:** lower type: receivers onto walked receiver ids from receiver_types (carrick[#3049](https://github.com/carrick-tools/carrick/issues/3049)) ([#3055](https://github.com/carrick-tools/carrick/issues/3055)) ([48381d3](https://github.com/carrick-tools/carrick/commit/48381d34013ec342053c40a448b4e77f34748aed))
+* **local:** no-model passes read the library store, start no build, and run the fact layer ([#2907](https://github.com/carrick-tools/carrick/issues/2907)) ([#2909](https://github.com/carrick-tools/carrick/issues/2909)) ([3535b72](https://github.com/carrick-tools/carrick/commit/3535b72eba06207ad08de4609973ecc0f4dfe74f))
+* origin decides a by_origin socket's side at a decided site ([#1670](https://github.com/carrick-tools/carrick/issues/1670)) ([#3034](https://github.com/carrick-tools/carrick/issues/3034)) ([548806e](https://github.com/carrick-tools/carrick/commit/548806eaa2e770b7625581d749025984f0000785))
+* **scan:** a pass that carries a service uses the rows an earlier pass kept ([#3027](https://github.com/carrick-tools/carrick/issues/3027)) ([#3030](https://github.com/carrick-tools/carrick/issues/3030)) ([5921bb1](https://github.com/carrick-tools/carrick/commit/5921bb149a412ac2c5cdb9c5da6a86e0be51586d))
+* **sidecar:** a handler's reply set by assignment is read from its set label (carrick[#3052](https://github.com/carrick-tools/carrick/issues/3052)) ([#3064](https://github.com/carrick-tools/carrick/issues/3064)) ([6c87287](https://github.com/carrick-tools/carrick/commit/6c872871c85dfe89b6b1cb0a1c5c5633bc31ef7a))
+* **sidecar:** amendment 7 claims grammar; unjudged parts answer part_unbuilt (H1, carrick[#3045](https://github.com/carrick-tools/carrick/issues/3045)) ([#3058](https://github.com/carrick-tools/carrick/issues/3058)) ([870e2a7](https://github.com/carrick-tools/carrick/commit/870e2a7b75ab812bfea524a9e1f7781a0b9d8328))
+* **sidecar:** handler-type table and the type receiver ([#2977](https://github.com/carrick-tools/carrick/issues/2977) A+B) ([#3025](https://github.com/carrick-tools/carrick/issues/3025)) ([86d19cc](https://github.com/carrick-tools/carrick/commit/86d19cca3baf565aa96469bc31326aaed0cd3fed))
+* **sidecar:** handlers returning a labelled new or static reply type the reply from the label (carrick[#3053](https://github.com/carrick-tools/carrick/issues/3053)) ([#3066](https://github.com/carrick-tools/carrick/issues/3066)) ([cb39430](https://github.com/carrick-tools/carrick/commit/cb39430a82b990abccfbb4da6caa2d5a9767e2c1))
+* **sidecar:** labelled sends answer send vs setter in the response-site walk ([#3024](https://github.com/carrick-tools/carrick/issues/3024)) ([4badcb2](https://github.com/carrick-tools/carrick/commit/4badcb2151b41a774a618433eeb4d49b38f74e64))
+* **sidecar:** runtime emitter event names are a built-in fact the lister marks and the verifier accepts ([#3032](https://github.com/carrick-tools/carrick/issues/3032)) ([#3033](https://github.com/carrick-tools/carrick/issues/3033)) ([993c27f](https://github.com/carrick-tools/carrick/commit/993c27f2d08bf51d57ce300575206f2fc0992a78))
+* **sidecar:** the lister lists receiver_types under types: true (carrick[#3051](https://github.com/carrick-tools/carrick/issues/3051)) ([#3057](https://github.com/carrick-tools/carrick/issues/3057)) ([acd368b](https://github.com/carrick-tools/carrick/commit/acd368b41db09a1e833c666088b22b3046f7f187))
+* **sidecar:** the reader takes a route's reply from the returns field on its receive op (carrick[#3054](https://github.com/carrick-tools/carrick/issues/3054)) ([#3065](https://github.com/carrick-tools/carrick/issues/3065)) ([478cce7](https://github.com/carrick-tools/carrick/commit/478cce7a345c3c8b09a9d17be6d2a42626382926))
+* **sidecar:** the verifier judges protocol, its method words and the path, export, literal, document and ref names (carrick[#3048](https://github.com/carrick-tools/carrick/issues/3048)) ([#3063](https://github.com/carrick-tools/carrick/issues/3063)) ([39e5b5a](https://github.com/carrick-tools/carrick/commit/39e5b5ac330cd7a3a37dc27bedf4749d520f40cb))
+* **sidecar:** the verifier judges set, new and decorate forms and the returns field (carrick[#3047](https://github.com/carrick-tools/carrick/issues/3047)) ([#3062](https://github.com/carrick-tools/carrick/issues/3062)) ([de6d58e](https://github.com/carrick-tools/carrick/commit/de6d58e347d3fefde4088b145e0c3f34740872ab))
+* **sidecar:** type receiver paths, R2, bases, bound by type, yields.package (carrick[#3046](https://github.com/carrick-tools/carrick/issues/3046)) ([#3061](https://github.com/carrick-tools/carrick/issues/3061)) ([96ae1f5](https://github.com/carrick-tools/carrick/commit/96ae1f58d55d5d8ce274e54dc2a48ae786e2340c))
+* **types:** a pub/sub payload a site slot types takes no reader locator or symbol ([#3026](https://github.com/carrick-tools/carrick/issues/3026)) ([9c62926](https://github.com/carrick-tools/carrick/commit/9c62926569b6cbbbaa3c260aa3784c3ab33fe93d))
+
+
+### Bug Fixes
+
+* a by_origin export's stated side is never read as its side ([#3011](https://github.com/carrick-tools/carrick/issues/3011)) ([#3013](https://github.com/carrick-tools/carrick/issues/3013)) ([10d27ce](https://github.com/carrick-tools/carrick/commit/10d27ce50b874ebb256999e22fe149b2b679472b))
+* a member whose helper is handed its origin is base injected, not relative ([#3029](https://github.com/carrick-tools/carrick/issues/3029)) ([9fbccb3](https://github.com/carrick-tools/carrick/commit/9fbccb31807d976b74ab35dbfe4b0500fba7fda3))
+* event-bus rows and model pub/sub twins give way to every socket row ([#1670](https://github.com/carrick-tools/carrick/issues/1670) T4) ([#3014](https://github.com/carrick-tools/carrick/issues/3014)) ([89ef398](https://github.com/carrick-tools/carrick/commit/89ef398c7cf226772ddd404dacf8d8ad34a439d1))
+* **install:** retry a failed frozen install once behind a runner switch and print the head of failed logs (carrick[#3069](https://github.com/carrick-tools/carrick/issues/3069)) ([#3071](https://github.com/carrick-tools/carrick/issues/3071)) ([1412d4e](https://github.com/carrick-tools/carrick/commit/1412d4ed4acac5f08b147dbea1329a381f32fafd))
+* **scan:** lowercase the fallback tally's register count and add the model-only counts ([#3068](https://github.com/carrick-tools/carrick/issues/3068)) ([1178758](https://github.com/carrick-tools/carrick/commit/117875867a14ae4a5e3089409e49fbcd2b8920c6))
+* **sidecar:** bound the check install and name why it stopped ([#3021](https://github.com/carrick-tools/carrick/issues/3021)) ([#3023](https://github.com/carrick-tools/carrick/issues/3023)) ([9644c30](https://github.com/carrick-tools/carrick/commit/9644c3071d57e8e05176e0a0919c6414d48c351e))
+
+
+### Refactoring
+
+* **sidecar:** delete T7, calleesProvenSerialiser (carrick[#2472](https://github.com/carrick-tools/carrick/issues/2472) C6d) ([#3019](https://github.com/carrick-tools/carrick/issues/3019)) ([a063be0](https://github.com/carrick-tools/carrick/commit/a063be01e2fbf4cf445c90414ce77434e990c607))
+
+
+### Performance
+
+* test-only file set computed once per scan ([#2786](https://github.com/carrick-tools/carrick/issues/2786) T1) ([#3028](https://github.com/carrick-tools/carrick/issues/3028)) ([a661187](https://github.com/carrick-tools/carrick/commit/a661187caf6c337a4be2bc928ca3a8896ed4c2d9))
+
 ## [0.3.136](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.135...carrick-v0.3.136) (2026-10-29)
 
 
