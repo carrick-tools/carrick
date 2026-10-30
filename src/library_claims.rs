@@ -661,6 +661,13 @@ pub fn server_checks(exports: &[ExportClaims]) -> Vec<LibraryCheck> {
                     on,
                     of,
                     ..
+                }
+                | LibraryClaim::Op {
+                    op: LibraryOp::Receive,
+                    returns: Some(_),
+                    on,
+                    of,
+                    ..
                 } => own_receiver(*on, of.as_deref()),
                 _ => None,
             };
@@ -1300,7 +1307,9 @@ mod tests {
                   "name": { "arg": 0 }, "handler": { "arg": 1 },
                   "request": { "param": 0, "path": ["path"] } },
                 { "kind": "op", "op": "receive", "member": "get", "of": "instance:()",
-                  "name": { "arg": 0 }, "handler": { "arg": 1 } }
+                  "name": { "arg": 0 }, "handler": { "arg": 1 } },
+                { "kind": "op", "op": "receive", "member": "put", "of": "instance:()",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 }, "returns": {} }
             ]
         }));
         let reply = export(json!({
@@ -1347,6 +1356,11 @@ mod tests {
                     "default".to_string(),
                     "instance:()".to_string(),
                     "fixture-server@2:default:op:receive:post:of:instance:()".to_string()
+                ),
+                (
+                    "default".to_string(),
+                    "instance:()".to_string(),
+                    "fixture-server@2:default:op:receive:put:of:instance:()".to_string()
                 ),
                 (
                     "reply".to_string(),

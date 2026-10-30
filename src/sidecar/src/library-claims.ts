@@ -1066,19 +1066,22 @@ export class LibraryClaimsVerifier {
   ): LabelledMembers {
     const sends = new Map<string, ClaimSlot>();
     const sets = new Map<string, ClaimSlot>();
+    const returns = new Map<string, { handler: ClaimSlot; result?: ResultShape }>();
     const bodies = new Set<string>();
     const wanted = checks.filter(
       check =>
         check.role === 'server_framework' &&
         check.claim.kind === 'op' &&
         ((check.claim.op === 'send' && check.claim.payload !== undefined) ||
-          (check.claim.op === 'receive' && check.claim.request?.body !== undefined))
+          (check.claim.op === 'receive' &&
+            (check.claim.request?.body !== undefined ||
+              (check.claim.returns !== undefined && check.claim.handler !== undefined))))
     );
     // A receiver an op is read on can need the maker or scope claims beside it.
     const context = checks.filter(
       check => check.role === 'server_framework' && (check.claim.kind === 'make' || check.claim.kind === 'scope')
     );
-    if (wanted.length === 0) return { sends, sets, bodies };
+    if (wanted.length === 0) return { sends, sets, returns, bodies };
     const outcomes: Record<string, number> = {};
     const observe = (check: LibraryCheck, outcome: Outcome): void => {
       if (check.claim.kind !== 'op') return;
@@ -1094,10 +1097,14 @@ export class LibraryClaimsVerifier {
         const into = check.claim.form === 'set' ? sets : sends;
         for (const member of outcome.members ?? []) into.set(declarationKey(member), check.claim.payload);
       }
+      if (check.claim.op === 'receive' && check.claim.returns !== undefined && check.claim.handler !== undefined) {
+        const read = { handler: check.claim.handler, ...(check.claim.returns.result ? { result: check.claim.returns.result } : {}) };
+        for (const member of outcome.members ?? []) returns.set(declarationKey(member), read);
+      }
       for (const member of outcome.bodyMembers ?? []) bodies.add(declarationKey(member));
     };
     this.run(fromDir, [...context, ...wanted], budgetMs, scanRoot, { observe, readReplies: true, typePackages });
-    return { sends, sets, bodies, outcomes };
+    return { sends, sets, returns, bodies, outcomes };
   }
 
   /**
@@ -1627,6 +1634,13 @@ export interface LabelledMembers {
    * value sits in (always argument 0). Never in `sends`.
    */
   sets: ReadonlyMap<string, ClaimSlot>;
+  /**
+   * The route members whose handler's return is the reply (`returns` on a
+   * receive op, carrick#3054), by {@link declarationKey} of the route member,
+   * with the slot the handler sits in and the part of the return that holds
+   * the body. Never in `sends`.
+   */
+  returns: ReadonlyMap<string, { handler: ClaimSlot; result?: ResultShape }>;
   bodies: ReadonlySet<string>;
   /** How each label read came out (`verified`, or the reason it was not), for the log. */
   outcomes?: Readonly<Record<string, number>>;
