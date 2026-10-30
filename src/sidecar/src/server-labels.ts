@@ -25,7 +25,7 @@ export interface LabelSource extends ModuleGraph {
 }
 
 /** No label: the inferrer reads nothing new. */
-export const NO_LABELS: LabelledMembers = { sends: new Map(), bodies: new Set() };
+export const NO_LABELS: LabelledMembers = { sends: new Map(), sets: new Map(), bodies: new Set() };
 
 /**
  * The members `claims` name in the program behind `key`. A claim the schema
@@ -52,7 +52,7 @@ export function readServerLabels(
     });
     const labels = verifier.labelledMembers(fromDir, checks, budgetMs, claims.scan_root, claims.type_packages);
     log(
-      `Read ${labels.sends.size} labelled send and ${labels.bodies.size} body member(s) for handler parameters ` +
+      `Read ${labels.sends.size} labelled send, ${labels.sets.size} assigned reply and ${labels.bodies.size} body member(s) for handler parameters ` +
         `from ${checks.length} claim(s) in ${fromDir}: ${JSON.stringify(labels.outcomes ?? {})}`
     );
     return labels;

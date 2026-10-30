@@ -40,7 +40,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
-import { holdsResult, resultCandidatesOf } from './result-candidates.js';
+import { holdsResult, resultCandidatesOf, resultCandidatesOfReturn } from './result-candidates.js';
 import { RUNTIME_EMITTER_EVENTS, RUNTIME_TYPE_PACKAGES, isRuntimeEmitterMember } from './runtime-emitter.js';
 import { PathNames, declaringFileName, type PackageDirectoryOf } from './position-rows.js';
 import type {
@@ -228,7 +228,13 @@ const ROLE_TABLE: Readonly<Record<LibraryRole, RoleRules | undefined>> = {
 function hasV2Field(claim: LibraryClaim): boolean {
   if (claim.kind === 'make') return claim.runs !== undefined;
   if (claim.kind !== 'op') return false;
-  return claim.method_default !== undefined || claim.base !== undefined || claim.runs !== undefined || claim.yields !== undefined;
+  return (
+    claim.method_default !== undefined ||
+    claim.base !== undefined ||
+    claim.runs !== undefined ||
+    claim.yields !== undefined ||
+    claim.form === 'new'
+  );
 }
 
 /** How one check came out, before it is stamped with its claim and receiver. */
@@ -354,6 +360,8 @@ interface MessageReceiver extends Holder {
    * names this instance (carrick#2663).
    */
   madeBy?: string;
+  /** The export the claim names (a `decorate` op's verb is its name). */
+  exportName?: string;
 }
 
 /** A check's outcome, and for a maker or scope claim the overloads it holds on. */
@@ -736,6 +744,7 @@ export class LibraryClaimsVerifier {
             makerHolding,
             ...(keyBound === undefined ? {} : { keyBound }),
             madeBy: receiverPath.maker?.member === null && receiverPath.scope === undefined ? check.export : undefined,
+            exportName: check.export,
           })),
         };
       };
@@ -933,6 +942,7 @@ export class LibraryClaimsVerifier {
     typePackages: Readonly<Record<string, readonly string[]>> = {}
   ): LabelledMembers {
     const sends = new Map<string, ClaimSlot>();
+    const sets = new Map<string, ClaimSlot>();
     const bodies = new Set<string>();
     const wanted = checks.filter(
       check =>
@@ -945,7 +955,7 @@ export class LibraryClaimsVerifier {
     const context = checks.filter(
       check => check.role === 'server_framework' && (check.claim.kind === 'make' || check.claim.kind === 'scope')
     );
-    if (wanted.length === 0) return { sends, bodies };
+    if (wanted.length === 0) return { sends, sets, bodies };
     const outcomes: Record<string, number> = {};
     const observe = (check: LibraryCheck, outcome: Outcome): void => {
       if (check.claim.kind !== 'op') return;
@@ -958,12 +968,13 @@ export class LibraryClaimsVerifier {
       outcomes[read] = (outcomes[read] ?? 0) + 1;
       if (outcome.verdict !== 'verified') return;
       if (check.claim.op === 'send' && check.claim.payload !== undefined) {
-        for (const member of outcome.members ?? []) sends.set(declarationKey(member), check.claim.payload);
+        const into = check.claim.form === 'set' ? sets : sends;
+        for (const member of outcome.members ?? []) into.set(declarationKey(member), check.claim.payload);
       }
       for (const member of outcome.bodyMembers ?? []) bodies.add(declarationKey(member));
     };
     this.run(fromDir, [...context, ...wanted], budgetMs, scanRoot, { observe, readReplies: true, typePackages });
-    return { sends, bodies, outcomes };
+    return { sends, sets, bodies, outcomes };
   }
 
   /**
@@ -1290,6 +1301,16 @@ function scopeStep(claim: ScopeClaim): string {
 }
 
 /**
+ * A form no judge reads on this op yet (carrick#3047): `override`, and `set`
+ * on anything but a send (a socket's handler by assignment is a later
+ * slice). A form on an op kind it never belongs to (`new` on a receive,
+ * `decorate` on a send) is `claim_invalid`, read by `judgeOp`.
+ */
+function formUnbuilt(claim: OpClaim): boolean {
+  return claim.form === 'override' || (claim.form === 'set' && claim.op !== 'send');
+}
+
+/**
  * The first part of a claim that amendment 7 of carrick#2434 adds and no
  * judge reads yet, or undefined (carrick#3045). The schema takes the whole
  * grammar so one request never fails on a part; an element that uses one
@@ -1315,12 +1336,10 @@ function unbuiltPart(claim: LibraryClaim): string | undefined {
         slots.push(name);
       }
     }
-    if (claim.form !== undefined && claim.form !== 'call') return `form.${claim.form}`;
+    if (formUnbuilt(claim)) return `form.${claim.form}`;
     if (claim.protocol !== undefined) return 'protocol';
     if (claim.when !== undefined) return 'when';
-    if (claim.returns !== undefined) return 'returns';
   }
-  if (claim.kind === 'scope' && claim.form !== undefined && claim.form !== 'call') return `form.${claim.form}`;
   if ((claim.kind === 'op' || claim.kind === 'scope') && claim.yields?.package !== undefined) return 'yields.package';
   for (const slot of slots) {
     if (slot === undefined) continue;
@@ -1399,6 +1418,12 @@ export function declarationKey(declaration: ts.Node): string {
  */
 export interface LabelledMembers {
   sends: ReadonlyMap<string, ClaimSlot>;
+  /**
+   * The properties a service assigns to reply (`form: set`, carrick#3047),
+   * by {@link declarationKey} of the property, with the slot the assigned
+   * value sits in (always argument 0). Never in `sends`.
+   */
+  sets: ReadonlyMap<string, ClaimSlot>;
   bodies: ReadonlySet<string>;
   /** How each label read came out (`verified`, or the reason it was not), for the log. */
   outcomes?: Readonly<Record<string, number>>;
@@ -2401,6 +2426,7 @@ class DeclarationReader {
    * its return, the collection, is read as a plain scope's is.
    */
   private judgeScope(receiver: MessageReceiver, claim: ScopeClaim, built?: ts.Signature): Judged {
+    if (claim.form === 'decorate') return { outcome: this.decorateScopeOutcome(receiver, claim) };
     if ((claim.runs === undefined) !== (claim.yields === undefined)) return { outcome: unchecked('claim_invalid') };
     if (claim.mounts !== undefined && claim.runs !== undefined) return { outcome: unchecked('claim_invalid') };
     if ((claim.name === undefined) === (claim.collects === undefined)) return { outcome: unchecked('claim_invalid') };
@@ -2633,7 +2659,20 @@ class DeclarationReader {
    * scope.
    */
   private judgeOp(receiver: MessageReceiver, claim: OpClaim, rules: RoleRules): Outcome {
-    const method = this.methodOutcome(claim, rules);
+    // Amendment 7, part 3 (carrick#3047): the form says how the service
+    // writes the op, and the op kinds a form belongs to.
+    const form = claim.form ?? 'call';
+    if (form === 'new' && claim.op !== 'send' && claim.op !== 'request') return unchecked('claim_invalid');
+    if (form === 'decorate' && claim.op !== 'receive') return unchecked('claim_invalid');
+    // `returns` judges the handler a receive op registers.
+    if (claim.returns !== undefined && (claim.op !== 'receive' || claim.handler === undefined)) {
+      return unchecked('claim_invalid');
+    }
+    if (form === 'set') {
+      // Only the server's reply is read by assignment so far.
+      return rules.namelessSends === true ? this.setOutcome(receiver, claim) : unchecked('part_unbuilt');
+    }
+    const method = this.methodOutcome(claim, rules, receiver);
     if (method) return method;
     // What a handler is handed is read on a receive op's handler only.
     if (claim.yields !== undefined && (claim.op !== 'receive' || claim.handler === undefined)) {
@@ -2678,7 +2717,7 @@ class DeclarationReader {
       runs: runs && !boundRuns ? { arg: runs.arg, ...(runs.key === undefined ? {} : { key: runs.key }) } : undefined,
     });
     if ('failure' in layout) return layout.failure;
-    const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
+    const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, form === 'new' ? 'new' : 'call');
     if ('failure' in callee) return callee.failure;
     const labels = claim.key_labels ?? {};
     let best: RankedFailure | undefined;
@@ -2689,9 +2728,21 @@ class DeclarationReader {
     let requestDropped: string | undefined;
     const bodyMembers: ts.Declaration[] = [];
     for (const signature of callee.signatures) {
+      // A decorator is read before the slots: it takes the path, and has no handler.
+      if (form === 'decorate') {
+        const given = this.decoratorOutcome(signature, 'method');
+        if (given) {
+          best = furthest(best, 1, given);
+          continue;
+        }
+      }
       let result = this.messageSignatureOutcome(signature, layout.value, labels);
       if (result.rank === Infinity && claim.yields !== undefined) {
         const given = this.yieldsOutcome(signature, claim.handler!, claim.yields, receiver);
+        if (given) result = { rank: 5, outcome: given };
+      }
+      if (result.rank === Infinity && claim.returns !== undefined) {
+        const given = this.returnsOutcome(signature, claim.handler!, claim.returns);
         if (given) result = { rank: 5, outcome: given };
       }
       if (result.rank === Infinity && claim.request !== undefined) {
@@ -2728,6 +2779,196 @@ class DeclarationReader {
   }
 
   /**
+   * `form: set` on a send (amendment 7 part 3, carrick#3047): the service
+   * assigns the reply (`ctx.body = x`). `member` is a property that `path`
+   * reaches, settable by {@link settable}, and the assigned value is the
+   * call's only argument, `{ arg: 0 }`. It names nothing on the wire and takes
+   * no other part. Verified, it carries the property's declarations as the
+   * members `labelledMembers` keys its `sets` by.
+   */
+  private setOutcome(receiver: MessageReceiver, claim: OpClaim): Outcome {
+    const alone =
+      claim.name === undefined &&
+      claim.handler === undefined &&
+      claim.ack === undefined &&
+      claim.runs === undefined &&
+      claim.yields === undefined &&
+      claim.request === undefined &&
+      claim.returns === undefined &&
+      claim.options === undefined &&
+      claim.method === undefined &&
+      claim.method_key === undefined &&
+      claim.method_default === undefined &&
+      claim.base === undefined;
+    const payload = claim.payload;
+    if (!alone || claim.member === null || payload?.arg !== 0 || payload.key !== undefined) {
+      return unchecked('claim_invalid');
+    }
+    const walked = this.walkHops(receiver, claim.path ?? []);
+    if ('failure' in walked) return walked.failure;
+    const step = this.ownMember(walked.holder, claim.member);
+    if ('failure' in step) return step.failure;
+    const reason = this.settable(walked.holder, step.property);
+    if (reason !== 'ok') return failed(reason);
+    const declarations = this.declarationsOf({
+      signatures: [],
+      named: { property: step.property, holder: walked.holder.type },
+    });
+    const members = step.property.declarations ?? [];
+    return { verdict: 'verified', ...(declarations.length > 0 ? { declarations } : {}), members };
+  }
+
+  /**
+   * `form: decorate` (amendment 7 part 3): the call returns a decorator of
+   * the kind the claim needs, else `decorate_not_decorator`. A route's is a
+   * method decorator, a type that is called with the target, the key and a
+   * descriptor (`MethodDecorator`); a class decorator, which a scope's is,
+   * takes the class alone (`ClassDecorator`). A parameter or property
+   * decorator is neither: it takes a third argument that is not a
+   * descriptor, or none.
+   */
+  private decoratorOutcome(signature: ts.Signature, kind: 'method' | 'class'): Outcome | undefined {
+    const returned = this.checker.getReturnTypeOfSignature(signature);
+    const parts = this.parts(returned);
+    if (parts.some(part => this.isOpenTop(part))) return unchecked('decorate_untyped');
+    const decorates = (handed: ts.Signature): boolean => {
+      const parameters = handed.getParameters();
+      if (kind === 'class') {
+        const required = parameters.filter(
+          parameter =>
+            (parameter.flags & ts.SymbolFlags.Optional) === 0 &&
+            !(parameter.valueDeclaration !== undefined &&
+              ts.isParameter(parameter.valueDeclaration) &&
+              parameter.valueDeclaration.dotDotDotToken !== undefined)
+        );
+        return parameters.length >= 1 && required.length <= 1;
+      }
+      if (parameters.length < 3) return false;
+      const descriptor = this.checker.getTypeOfSymbol(parameters[2]);
+      return (descriptor.flags & (ts.TypeFlags.Object | ts.TypeFlags.Intersection | ts.TypeFlags.Any)) !== 0;
+    };
+    return parts.some(part => part.getCallSignatures().some(decorates)) ? undefined : failed('decorate_not_decorator');
+  }
+
+  /**
+   * A scope with `form: decorate`: a class decorator whose `name` slot takes
+   * a string and whose call returns a class decorator; the names it is given
+   * prefix the ops of the class's methods. The call is the export's own when
+   * `member` is the export's name (a decorator is imported, not read off an
+   * object), else `member` of what `path` reaches. It builds no receiver, so
+   * the claim holds no overloads, as a scope that binds through a
+   * parameter does not.
+   */
+  private decorateScopeOutcome(receiver: MessageReceiver, claim: ScopeClaim): Outcome {
+    if (
+      claim.name === undefined ||
+      claim.collects !== undefined ||
+      claim.runs !== undefined ||
+      claim.yields !== undefined ||
+      claim.mounts !== undefined
+    ) {
+      return unchecked('claim_invalid');
+    }
+    const layout = this.layout({ name: claim.name });
+    if ('failure' in layout) return layout.failure;
+    const own = (claim.path?.length ?? 0) === 0 && claim.member === receiver.exportName;
+    const callee = this.ownCallee(receiver, claim.path ?? [], own ? null : claim.member, 'call');
+    if ('failure' in callee) return callee.failure;
+    let best: RankedFailure | undefined;
+    for (const signature of callee.signatures) {
+      const given = this.decoratorOutcome(signature, 'class');
+      if (given) {
+        best = furthest(best, 1, given);
+        continue;
+      }
+      const result = this.messageSignatureOutcome(signature, layout.value, claim.key_labels ?? {});
+      if (result.rank === Infinity) {
+        const declarations = this.declarationsOf(callee);
+        return declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
+      }
+      best = furthest(best, result.rank, result.outcome);
+    }
+    return best!.outcome;
+  }
+
+  /**
+   * `returns` on a receive op (amendment 7 part 3): what the handler at the
+   * `handler` slot returns is the reply. The function the signature takes
+   * there declares a return, awaited, with a part that is not `void`,
+   * `undefined` or `never` (`replyReturn`). Only void is `returns_void`
+   * (the framework drops it); `any` or `unknown` says nothing
+   * (`returns_untyped`). With `result`, the return holds that part of the
+   * reply as a `result` claim reads a call's return (`result_not_candidate`).
+   * Undefined when it holds.
+   */
+  private returnsOutcome(signature: ts.Signature, handler: ClaimSlot, returns: { result?: ResultShape }): Outcome | undefined {
+    let declared = this.keyParameterAt(signature, handler.arg);
+    if (declared !== undefined && handler.key !== undefined) {
+      const property = this.declaredProperty(declared, handler.key);
+      declared = property ? this.checker.getTypeOfSymbol(property) : undefined;
+    }
+    if (declared === undefined) return failed('param_missing');
+    const slot = this.throughConditional(this.throughConstraint(declared));
+    if (slot === VARIADIC) return unchecked('returns_untyped');
+    const own = signature.typeParameters ?? [];
+    let open = false;
+    let missed = false;
+    for (const part of this.parts(slot)) {
+      for (const handed of part.getCallSignatures()) {
+        const read = this.replyReturn(this.checker.getReturnTypeOfSignature(handed), own);
+        if (read === 'typed') {
+          if (returns.result === undefined) return undefined;
+          const candidates = resultCandidatesOfReturn(this.checker, this.checker.getReturnTypeOfSignature(handed), [
+            ...own,
+            ...(handed.getTypeParameters() ?? []),
+          ]);
+          if (candidates !== undefined && holdsResult(candidates, returns.result)) return undefined;
+          missed = true;
+        } else if (read === 'open') {
+          open = true;
+        }
+      }
+    }
+    if (missed) return failed('result_not_candidate');
+    return open ? unchecked('returns_untyped') : failed('returns_void');
+  }
+
+  /**
+   * What a handler's declared return says about the reply: `typed` when a part
+   * is not `void`, `undefined`, `null` or `never` (a concrete type, or one the
+   * route's own type parameters decide), `open` when the best part is `any`
+   * or `unknown`, `void` when none is. A promise is read through to what it
+   * resolves to.
+   */
+  private replyReturn(type: ts.Type, own: readonly ts.TypeParameter[], depth = 0): 'typed' | 'open' | 'void' {
+    if (depth > 4) return 'open';
+    const NOTHING = ts.TypeFlags.Void | ts.TypeFlags.Undefined | ts.TypeFlags.Never | ts.TypeFlags.Null;
+    let open = false;
+    for (const part of type.isUnion() ? type.types : [type]) {
+      if (part.flags & NOTHING) continue;
+      if (part.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) {
+        open = true;
+        continue;
+      }
+      const resolved = this.checker.getAwaitedType(part);
+      if (resolved !== undefined && resolved !== part) {
+        const read = this.replyReturn(resolved, own, depth + 1);
+        if (read === 'typed') return 'typed';
+        if (read === 'open') open = true;
+        continue;
+      }
+      // A return the route's own type parameters decide (`R`, `Reply[K]`) is typed per route.
+      if (part.flags & (ts.TypeFlags.Conditional | ts.TypeFlags.IndexedAccess | ts.TypeFlags.TypeParameter)) {
+        if (own.some(parameter => this.mentions(part, parameter))) return 'typed';
+        open = true;
+        continue;
+      }
+      return 'typed';
+    }
+    return open ? 'open' : 'void';
+  }
+
+  /**
    * Where a verified op or scope's member is declared, as position rows spell
    * it (`decl_file`, `decl_line`): the declaration the call row names for the
    * member symbol on this receiver ({@link memberDeclaration}), so two members
@@ -2758,7 +2999,9 @@ class DeclarationReader {
    * carrying `method`, `method_key`, `options`, `method_default` or `base` is
    * `claim_invalid`, as before. With them:
    * - `method` is the member's own name, upper-cased (ASCII only), and a
-   *   method word: `get` registers or sends GET (`method_not_member_verb`);
+   *   method word: `get` registers or sends GET (`method_not_member_verb`).
+   *   A `decorate` op whose member is null (the export's own call) takes the
+   *   export's name: `Get` registers GET;
    * - `method_key` is where the method sits, a slot that accepts a string or
    *   a method literal (read with the call's other parts);
    * - `method_default` is a method word (`method_not_word`): beside
@@ -2769,7 +3012,7 @@ class DeclarationReader {
    * Undefined when the fields hold so far; their slots are read with the
    * call's other parts.
    */
-  private methodOutcome(claim: OpClaim, rules: RoleRules): Outcome | undefined {
+  private methodOutcome(claim: OpClaim, rules: RoleRules, receiver: MessageReceiver): Outcome | undefined {
     const words = rules.methods;
     // A procedure named by its key (#2474 R6a): a receive op with a handler
     // whose label states its method, a route word. The member names the
@@ -2797,7 +3040,9 @@ class DeclarationReader {
       return unchecked('claim_invalid');
     }
     if (claim.method !== undefined) {
-      if (claim.member === null || claim.method !== asciiUpperCase(claim.member) || !words.has(claim.method)) {
+      // A decorator export is its own verb (`@Get`): the export, when the call is the export's.
+      const verb = claim.member ?? (claim.form === 'decorate' ? (receiver.exportName ?? null) : null);
+      if (verb === null || claim.method !== asciiUpperCase(verb) || !words.has(claim.method)) {
         return failed('method_not_member_verb');
       }
     }
@@ -3509,6 +3754,28 @@ class DeclarationReader {
   }
 
   /**
+   * The object a claim's member `path` reaches from the receiver, hop by hop,
+   * each a home member whose type says something; `named` is the last member
+   * the path reaches, with the type it is read on (carrick#2654).
+   */
+  private walkHops(
+    receiver: MessageReceiver,
+    hops: readonly string[]
+  ): { holder: Holder; named?: NamedMember } | { failure: Outcome } {
+    let holder: Holder = receiver;
+    let named: NamedMember | undefined;
+    for (const hop of hops) {
+      const step = this.ownMember(holder, hop);
+      if ('failure' in step) return step;
+      const type = step.type;
+      if (this.saysNothing(type)) return { failure: unchecked('member_untyped') };
+      named = { property: step.property, holder: holder.type };
+      holder = { type, home: this.homeOf(receiver.pkg, typeSymbols(type), holder.home) };
+    }
+    return { holder, named };
+  }
+
+  /**
    * The callee of a message claim: the claim's member `path` walked from the
    * receiver hop by hop (`client.tasks.trigger`), then `member` of the object
    * reached (or that object itself, when null), called (`call`) or
@@ -3526,18 +3793,10 @@ class DeclarationReader {
     member: string | null,
     form: 'call' | 'new'
   ): Callable {
-    let holder: Holder = receiver;
-    // The last member the path reaches, with the type it is read on: the
-    // symbol the call row names (carrick#2654).
-    let named: NamedMember | undefined;
-    for (const hop of hops) {
-      const step = this.ownMember(holder, hop);
-      if ('failure' in step) return step;
-      const type = step.type;
-      if (this.saysNothing(type)) return { failure: unchecked('member_untyped') };
-      named = { property: step.property, holder: holder.type };
-      holder = { type, home: this.homeOf(receiver.pkg, typeSymbols(type), holder.home) };
-    }
+    const walked = this.walkHops(receiver, hops);
+    if ('failure' in walked) return walked;
+    const holder = walked.holder;
+    let named = walked.named;
     let type = holder.type;
     // A member of a base the holder binds with its own type (see `isBoundByOwnType`).
     let boundBase = false;
