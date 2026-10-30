@@ -88,6 +88,47 @@ const HTTP_METHODS: ReadonlySet<string> = new Set([
 const ROUTE_METHODS: ReadonlySet<string> = new Set([...HTTP_METHODS, 'ALL']);
 
 /**
+ * The method words of the protocols that are not HTTP (amendment 7, part 4,
+ * carrick#3048): the kind of an RPC procedure, the operation kind of a
+ * GraphQL request.
+ */
+const RPC_WORDS: ReadonlySet<string> = new Set(['QUERY', 'MUTATE', 'MUTATION', 'SUBSCRIBE', 'SUBSCRIPTION']);
+const GRAPHQL_WORDS: ReadonlySet<string> = new Set(['QUERY', 'MUTATION', 'SUBSCRIPTION']);
+
+/** Every protocol value the grammar names; any other is `claim_invalid`. */
+const PROTOCOLS: ReadonlySet<string> = new Set(['http', 'graphql', 'rpc', 'socket', 'message']);
+
+/**
+ * The protocols an op of each role may speak. An HTTP framework and an HTTP
+ * client carry RPC and GraphQL operations over HTTP, so they speak all three;
+ * the message roles speak only their own.
+ */
+const ROLE_PROTOCOLS: Readonly<Record<LibraryRole, ReadonlySet<string>>> = {
+  http_client: new Set(['http', 'rpc', 'graphql']),
+  server_framework: new Set(['http', 'rpc', 'graphql']),
+  graphql_client: new Set(['graphql']),
+  socket: new Set(['socket']),
+  broker: new Set(['message']),
+  in_process_bus: new Set(['message']),
+  none: new Set(),
+};
+
+/** The type names a `document` name slot accepts; a string is accepted too. */
+const DOCUMENT_TYPES: ReadonlySet<string> = new Set([
+  'DocumentNode',
+  'TypedDocumentNode',
+  'RequestDocument',
+  'TypedDocumentString',
+]);
+
+/** The method words an op reads under its protocol; absent, the role's own. */
+function methodWords(claim: OpClaim, rules: RoleRules): ReadonlySet<string> | undefined {
+  if (claim.protocol === 'rpc') return RPC_WORDS;
+  if (claim.protocol === 'graphql') return GRAPHQL_WORDS;
+  return rules.methods;
+}
+
+/**
  * Interfaces whose members every value of that kind inherits. A key found only
  * on one of these (`constructor`, `toString`, a string's `length`) is not a
  * key the library declares.
@@ -234,6 +275,22 @@ function hasV2Field(claim: LibraryClaim): boolean {
     claim.runs !== undefined ||
     claim.yields !== undefined ||
     claim.form === 'new'
+  );
+}
+
+/**
+ * Whether an op uses a field amendment 7 of carrick#2434 adds to the claim
+ * grammar and that picks the v2 rules: a `protocol`, or a name that is bound,
+ * a literal, a document or a reference. A package with one such op reads
+ * every one of its `http_client` exports under the v2 rules (carrick#3048):
+ * the maker of an RPC client carries none of these fields itself.
+ */
+function usesAmendment7(claim: LibraryClaim): boolean {
+  if (claim.kind !== 'op') return false;
+  const name = claim.name;
+  return (
+    claim.protocol !== undefined ||
+    (name !== undefined && (!('arg' in name) || name.document !== undefined || name.ref !== undefined))
   );
 }
 
@@ -549,6 +606,13 @@ export class LibraryClaimsVerifier {
     const v2Exports = new Set<string>();
     for (const check of checks) {
       if (check.role === 'http_client' && hasV2Field(check.claim)) v2Exports.add(exportKey(check));
+    }
+    // A package whose labels use the new grammar reads all its http_client exports as v2.
+    const v2Packages = new Set(
+      checks.filter(check => check.role === 'http_client' && usesAmendment7(check.claim)).map(check => check.package)
+    );
+    for (const check of checks) {
+      if (check.role === 'http_client' && v2Packages.has(check.package)) v2Exports.add(exportKey(check));
     }
     const rulesFor = (check: LibraryCheck): RoleRules | undefined =>
       check.role === 'http_client' && v2Exports.has(exportKey(check))
@@ -893,6 +957,10 @@ export class LibraryClaimsVerifier {
         // An export given two roles is classified two ways; neither is a fact.
         if ((roles.get(exportKey(check))?.size ?? 0) > 1) return { outcome: unchecked('role_conflict') };
         if (placementInvalid(check.claim)) return { outcome: unchecked('claim_invalid') };
+        if (check.claim.kind === 'op' && check.claim.protocol !== undefined) {
+          if (!PROTOCOLS.has(check.claim.protocol)) return { outcome: unchecked('claim_invalid') };
+          if (!ROLE_PROTOCOLS[check.role].has(check.claim.protocol)) return { outcome: unchecked('protocol_role') };
+        }
         if (unbuiltPart(check.claim) !== undefined) return { outcome: unchecked('part_unbuilt') };
         if (rules.http && !HTTP_RECEIVER.test(check.receiver)) return { outcome: unchecked('receiver_invalid') };
         if (rules.message && !fitsReceiver(check)) return { outcome: unchecked('receiver_invalid') };
@@ -1462,18 +1530,18 @@ function unbuiltPart(claim: LibraryClaim): string | undefined {
     slots.push(claim.payload, claim.handler, claim.ack, claim.options, claim.method_key, claim.base);
     if (name !== undefined) {
       if ('bound' in name) {
-        if (name.bound === 'path' || name.bound === 'export' || name.bound === 'subscribed') return `name.bound.${name.bound}`;
-        if (name.join !== undefined || name.param !== undefined || name.at !== undefined) return 'name.bound';
+        if (name.bound === 'subscribed') return `name.bound.${name.bound}`;
+        // A path joins its property names; no other bound name has a join, a param or an `at`.
+        const joins = name.bound === 'path' ? undefined : name.join;
+        if (joins !== undefined || name.param !== undefined || name.at !== undefined) return 'name.bound';
       } else if ('parts' in name) {
         return 'name.parts';
-      } else if ('literal' in name) {
-        return 'name.literal';
-      } else {
-        slots.push(name);
+      } else if (!('literal' in name)) {
+        // A literal is judged in `judgeOp`, a document or reference slot too; a make's or scope's still is not.
+        slots.push({ ...name, document: undefined, ref: undefined });
       }
     }
     if (formUnbuilt(claim)) return `form.${claim.form}`;
-    if (claim.protocol !== undefined) return 'protocol';
     if (claim.when !== undefined) return 'when';
   }
   for (const slot of slots) {
@@ -1710,8 +1778,23 @@ function readLocalRanges(fromDir: string): ReadonlyMap<string, string> {
   }
 }
 
-/** A part of a message claim. `base` and `prefix` are a maker's string parts. */
-type PartName = 'name' | 'base' | 'prefix' | 'payload' | 'handler' | 'ack' | 'method' | 'runs' | 'mounts';
+/**
+ * A part of a message claim. `base` and `prefix` are a maker's string parts;
+ * `document` and `ref` are a name read as a GraphQL document or as a function
+ * or class (amendment 7), which name slot D2 does not compete with strings for.
+ */
+type PartName =
+  | 'name'
+  | 'document'
+  | 'ref'
+  | 'base'
+  | 'prefix'
+  | 'payload'
+  | 'handler'
+  | 'ack'
+  | 'method'
+  | 'runs'
+  | 'mounts';
 
 /** Where the parts of a message claim sit, and which argument holds which keys. */
 interface ClaimLayout {
@@ -2809,6 +2892,10 @@ class DeclarationReader {
     }
     const method = this.methodOutcome(claim, rules, receiver);
     if (method) return method;
+    // The routing name is the property path walked on a proxy (carrick#3048).
+    if (claim.name !== undefined && 'bound' in claim.name && claim.name.bound === 'path') {
+      return this.pathOutcome(receiver, claim);
+    }
     // What a handler is handed is read on a receive op's handler only.
     if (claim.yields !== undefined && (claim.op !== 'receive' || claim.handler === undefined)) {
       return unchecked('claim_invalid');
@@ -2827,14 +2914,37 @@ class DeclarationReader {
       return unchecked('claim_invalid');
     }
     let nameSlot: ClaimSlot | undefined;
+    let documentSlot: ClaimSlot | undefined;
+    let refSlot: ClaimSlot | undefined;
     if (name === undefined) {
       nameSlot = undefined;
+    } else if ('literal' in name) {
+      // A name the library fixes: nothing on the call to read.
+      if (typeof name.literal !== 'string' || name.literal.length === 0) return unchecked('claim_invalid');
     } else if ('bound' in name) {
-      const bound =
-        name.bound === 'maker' ? receiver.makerBindsName : name.bound === 'scope' ? receiver.scoped : receiver.keyBound === true;
-      if (!bound) return failed('name_unbound');
+      if (name.bound === 'export') {
+        // The export is the name (a decorator, a handler class): a receive op with a handler.
+        if (claim.op !== 'receive' || claim.handler === undefined) return unchecked('claim_invalid');
+      } else if (name.bound === 'maker' || name.bound === 'scope' || name.bound === 'key') {
+        const bound =
+          name.bound === 'maker' ? receiver.makerBindsName : name.bound === 'scope' ? receiver.scoped : receiver.keyBound === true;
+        if (!bound) return failed('name_unbound');
+      } else {
+        // `unbuiltPart` answers before this is reached.
+        return unchecked('part_unbuilt');
+      }
     } else if ('arg' in name) {
-      nameSlot = name;
+      const slot: ClaimSlot = { arg: name.arg, ...(name.key === undefined ? {} : { key: name.key }) };
+      if (name.document !== undefined && name.ref !== undefined) return unchecked('claim_invalid');
+      if (name.document !== undefined) {
+        if (name.document !== 'graphql') return unchecked('claim_invalid');
+        documentSlot = slot;
+      } else if (name.ref !== undefined) {
+        if (name.ref !== 'function' && name.ref !== 'class') return unchecked('claim_invalid');
+        refSlot = slot;
+      } else {
+        nameSlot = name;
+      }
     } else {
       // `unbuiltPart` answers before this is reached.
       return unchecked('part_unbuilt');
@@ -2844,6 +2954,8 @@ class DeclarationReader {
     if (boundRuns && !receiver.makerHolding) return failed('runs_unbound');
     const layout = this.layout({
       name: nameSlot,
+      document: documentSlot,
+      ref: refSlot,
       payload: claim.payload,
       handler: claim.handler,
       ack: claim.ack,
@@ -3148,17 +3260,24 @@ class DeclarationReader {
    * call's other parts.
    */
   private methodOutcome(claim: OpClaim, rules: RoleRules, receiver: MessageReceiver): Outcome | undefined {
-    const words = rules.methods;
-    // A procedure named by its key (#2474 R6a): a receive op with a handler
-    // whose label states its method, a route word. The member names the
-    // procedure kind (`query`), not a verb, so it need not equal the method.
+    const words = methodWords(claim, rules);
+    // A procedure named by its key (#2474 R6a): a receive op with a handler.
+    // On http the label states its method, a route word, and the member names
+    // the procedure kind (`query`), not a verb, so it need not equal the
+    // method. On rpc and graphql the kind is the method, so the label may
+    // leave it out, and states it as the member's own name (carrick#3048).
     if (claim.name !== undefined && 'bound' in claim.name && claim.name.bound === 'key') {
-      if (!words || claim.op !== 'receive' || claim.handler === undefined || claim.method === undefined) {
-        return unchecked('claim_invalid');
-      }
+      if (!words || claim.op !== 'receive' || claim.handler === undefined) return unchecked('claim_invalid');
       if (claim.method_key !== undefined || claim.method_default !== undefined || claim.options !== undefined) {
         return unchecked('claim_invalid');
       }
+      if (claim.protocol === 'rpc' || claim.protocol === 'graphql') {
+        if (claim.method === undefined) return undefined;
+        return claim.member !== null && claim.method === asciiUpperCase(claim.member) && words.has(claim.method)
+          ? undefined
+          : failed('method_not_member_verb');
+      }
+      if (claim.method === undefined) return unchecked('claim_invalid');
       return words.has(claim.method) ? undefined : failed('method_not_word');
     }
     if (!words) {
@@ -3183,6 +3302,97 @@ class DeclarationReader {
     }
     if (claim.method_default !== undefined && !words.has(claim.method_default)) return failed('method_not_word');
     return undefined;
+  }
+
+  /**
+   * `name: { bound: 'path' }` (amendment 7, carrick#3048): the routing name is
+   * the property path the service walks on the receiver (`client.a.b.query(x)`),
+   * joined by the name's `join`. That is a recursive proxy of procedures, a
+   * mapped type or an index signature whose members the caller's type argument
+   * names, and not a plain object, whose members are all there is
+   * (`path_not_proxy`). The op's `member` is a callable property the home
+   * packages declare at a leaf (`member_missing`), and a `payload` slot is a
+   * parameter of one of its signatures. The op takes no handler, ack or other
+   * name part.
+   */
+  private pathOutcome(receiver: MessageReceiver, claim: OpClaim): Outcome {
+    if (
+      claim.member === null ||
+      (claim.path?.length ?? 0) > 0 ||
+      claim.handler !== undefined ||
+      claim.ack !== undefined ||
+      claim.runs !== undefined ||
+      claim.yields !== undefined
+    ) {
+      return unchecked('claim_invalid');
+    }
+    const apparent = this.checker.getApparentType(this.checker.getNonNullableType(receiver.type));
+    const proxied = this.parts(apparent).some(
+      part =>
+        (((part as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Mapped) !== 0 ||
+        this.checker.getIndexInfosOfType(part).length > 0
+    );
+    if (!proxied) return failed('path_not_proxy');
+    const found: ts.Declaration[] = [];
+    for (const file of this.program.getSourceFiles()) {
+      if (!this.isOwnFile(file, receiver.home)) continue;
+      const visit = (node: ts.Node): void => {
+        if (
+          (ts.isPropertySignature(node) || ts.isMethodSignature(node)) &&
+          ts.isIdentifier(node.name) &&
+          node.name.text === claim.member &&
+          this.checker.getTypeAtLocation(node).getCallSignatures().length > 0
+        ) {
+          found.push(node);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(file);
+    }
+    if (found.length === 0) return failed('member_missing');
+    const payload = claim.payload;
+    if (
+      payload !== undefined &&
+      !found.some(declaration =>
+        this.checker
+          .getTypeAtLocation(declaration)
+          .getCallSignatures()
+          .some(signature => this.parameterAt(signature, payload.arg) !== undefined)
+      )
+    ) {
+      return failed('payload_missing');
+    }
+    return { verdict: 'verified', members: found };
+  }
+
+  /**
+   * A `document: 'graphql'` name slot: it accepts a string, or a document type
+   * by its name (`DOCUMENT_TYPES`), on some part of the declared type.
+   */
+  private documentFailure(declared: Slot): Outcome | undefined {
+    const slot = this.throughConditional(this.throughConstraint(declared));
+    if (this.acceptsString(slot)) return undefined;
+    if (slot !== VARIADIC) {
+      const parts = this.parts(slot).flatMap(part => (part.isIntersection() ? part.types : [part]));
+      const named = parts.some(part =>
+        typeSymbols(part).some(symbol => symbol !== undefined && DOCUMENT_TYPES.has(symbol.getName()))
+      );
+      if (named) return undefined;
+    }
+    return this.slotFailure(slot, 'name_not_document');
+  }
+
+  /** A `ref` name slot: a function or a class, so every part has a call or a construct signature. */
+  private refFailure(declared: Slot): Outcome | undefined {
+    const slot = this.throughConditional(this.throughConstraint(declared));
+    if (slot === VARIADIC) return unchecked('member_untyped');
+    const parts = this.parts(slot);
+    if (parts.length === 0 || parts.some(part => this.isOpenTop(part) || this.isUnconstrained(part))) {
+      return unchecked('member_untyped');
+    }
+    return parts.every(part => part.getCallSignatures().length > 0 || part.getConstructSignatures().length > 0)
+      ? undefined
+      : failed('ref_not_callable');
   }
 
   /**
@@ -3441,6 +3651,13 @@ class DeclarationReader {
         if (!this.acceptsMethod(declared)) return { rank: 1, outcome: this.slotFailure(declared, 'method_not_string') };
         continue;
       }
+      if (part === 'document' || part === 'ref') {
+        const declared = this.keyParameterAt(signature, arg);
+        if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
+        const bad = part === 'document' ? this.documentFailure(declared) : this.refFailure(declared);
+        if (bad) return { rank: 1, outcome: bad };
+        continue;
+      }
       if (part !== 'name' && part !== 'base' && part !== 'prefix') continue;
       const declared = this.keyParameterAt(signature, arg);
       if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
@@ -3500,6 +3717,14 @@ class DeclarationReader {
           break;
         }
         const type = this.checker.getTypeOfSymbol(property);
+        if (part === 'document' || part === 'ref') {
+          const bad = part === 'document' ? this.documentFailure(type) : this.refFailure(type);
+          if (bad) {
+            failure = { rank: 3, outcome: bad };
+            break;
+          }
+          continue;
+        }
         if ((part === 'name' || part === 'base' || part === 'prefix') && !this.acceptsString(this.throughConditional(type))) {
           failure = { rank: 3, outcome: this.slotFailure(this.throughConditional(type), 'key_not_string') };
           break;
