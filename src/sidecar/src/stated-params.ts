@@ -624,7 +624,9 @@ export class StatedParams {
    * as `statedPayload` reads them, so an inherited send counts.
    */
   sendAt(call: Node): ClaimSlot | 'setter' | undefined {
-    if (this.labels.sends.size === 0 || !Node.isCallExpression(call)) return undefined;
+    if (this.labels.sends.size === 0) return undefined;
+    if (Node.isNewExpression(call)) return this.constructSlotOf(call);
+    if (!Node.isCallExpression(call)) return undefined;
     const callee = call.getExpression();
     if (!Node.isPropertyAccessExpression(callee)) return undefined;
     const slot = this.sendSlotOf((callee.getNameNode().getSymbol()?.getDeclarations() ?? []).map((d) => d.compilerNode));
@@ -639,6 +641,32 @@ export class StatedParams {
       .getProperties()
       .some((property) => this.sendSlotOf(property.getDeclarations().map((d) => d.compilerNode)) !== undefined);
     return repliesHere ? 'setter' : undefined;
+  }
+
+  /**
+   * The payload slot of a labelled `new` send (carrick#3053): the constructed
+   * expression's construct signatures are keyed by the declaration the
+   * verifier read (an inherited constructor is the base's). A signature with
+   * no declaration (a class that writes no constructor and has no base to
+   * borrow one from) has no key; the verifier never labels one with a payload
+   * slot either, so it reads as no label and the structural reading decides.
+   */
+  private constructSlotOf(construct: Node): ClaimSlot | undefined {
+    if (!Node.isNewExpression(construct)) return undefined;
+    let declarations: ts.Node[];
+    try {
+      declarations = construct
+        .getExpression()
+        .getType()
+        .getConstructSignatures()
+        .flatMap((signature) => {
+          const declaration = signature.compilerSignature.getDeclaration();
+          return declaration ? [declaration] : [];
+        });
+    } catch {
+      return undefined;
+    }
+    return this.sendSlotOf(declarations);
   }
 
   /**
