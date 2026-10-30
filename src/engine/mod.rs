@@ -9669,13 +9669,37 @@ fn analysis_fallbacks<T, E>(
 ) -> crate::fallback_tally::Pending {
     let mut pending = crate::fallback_tally::Pending::new(fallbacks);
     if let Ok(done) = analysis {
-        for (signal, count) in &stats(done).fallback_selection {
-            pending
-                .counts()
-                .insert(format!("fallback_selection_{signal}"), *count);
-        }
+        pending.counts().extend(model_fallback_counts(stats(done)));
     }
     pending
+}
+
+/// The tally's counts out of one service's file analysis. Keys are lowercase
+/// (`^[a-z][a-z0-9_]{0,63}$`): the cloud parsers skip any other key. The two
+/// model-only counts are stated only when the model passes ran (answered or
+/// replayed from the cache), as a run with no model stage has no rows of its
+/// own to count.
+fn model_fallback_counts(
+    stats: &crate::agents::file_orchestrator::ProcessingStats,
+) -> std::collections::BTreeMap<String, usize> {
+    let mut counts: std::collections::BTreeMap<String, usize> = stats
+        .fallback_selection
+        .iter()
+        .map(|(signal, count)| {
+            (
+                format!("fallback_selection_{}", signal.to_lowercase()),
+                *count,
+            )
+        })
+        .collect();
+    if stats.files_model_dispatched + stats.files_model_reused > 0 {
+        counts.insert("model_only_rows".into(), stats.model_only_rows);
+        counts.insert(
+            "model_endpoints_dropped_unanchored".into(),
+            stats.model_endpoints_dropped_unanchored,
+        );
+    }
+    counts
 }
 
 /// The service's fallbacks, with the route sites the receiver trace left to
@@ -12014,6 +12038,47 @@ fn finish_type_check(
 #[cfg(test)]
 mod tests {
     use crate::git_state::tests::committed_repo;
+
+    fn cloud_key(key: &str) -> bool {
+        let mut chars = key.chars();
+        key.len() <= 64
+            && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// The cloud parsers skip a count key outside `^[a-z][a-z0-9_]{0,63}$`,
+    /// so a register signal's count must be stated in lowercase.
+    #[test]
+    fn the_tally_states_every_count_under_a_key_the_cloud_reads() {
+        let mut stats = crate::agents::file_orchestrator::ProcessingStats::default();
+        stats.fallback_selection.insert("C3", 2);
+        stats.files_model_dispatched = 1;
+        let counts = super::model_fallback_counts(&stats);
+        assert_eq!(counts.get("fallback_selection_c3"), Some(&2), "{counts:?}");
+        assert!(counts.keys().all(|key| cloud_key(key)), "{counts:?}");
+    }
+
+    /// A model row with no candidate and an endpoint row that named no site
+    /// reach the tally, per service, when the model passes ran.
+    #[test]
+    fn the_tally_counts_the_model_only_rows_when_the_model_ran() {
+        let mut stats = crate::agents::file_orchestrator::ProcessingStats::default();
+        stats.model_only_rows = 1;
+        stats.model_endpoints_dropped_unanchored = 3;
+        assert!(
+            super::model_fallback_counts(&stats).is_empty(),
+            "no model stage, no model counts"
+        );
+        stats.files_model_reused = 1;
+        let counts = super::model_fallback_counts(&stats);
+        assert_eq!(counts.get("model_only_rows"), Some(&1), "{counts:?}");
+        assert_eq!(
+            counts.get("model_endpoints_dropped_unanchored"),
+            Some(&3),
+            "{counts:?}"
+        );
+        assert!(counts.keys().all(|key| cloud_key(key)), "{counts:?}");
+    }
 
     /// A module resolver over a tree with no config: these fixtures name
     /// every file by path, so no alias mapping is in play (carrick#1416).
