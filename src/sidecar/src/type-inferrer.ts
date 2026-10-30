@@ -1602,7 +1602,8 @@ export class TypeInferrer {
       // contract, so it is a claim rather than a guess.
       const machinery =
         unwrapResult.verifiedMachinery === true ||
-        this.typeIsOrContainsResponseMachinery(awaitedType);
+        this.typeIsOrContainsResponseMachinery(awaitedType) ||
+        this.returnsLabelledSend(func);
       const unresolvable = awaitedType.isAny() || awaitedType.isUnknown();
       if (machinery || unresolvable) {
         const recovered = this.recoverPayloadFromReturnStatements(
@@ -2763,6 +2764,22 @@ export class TypeInferrer {
   // wrong or missing types go in labelled sends (carrick#2472 C4). Delete when
   // a delete-and-replay on the four repos moves no row wrongly, after
   // carrick-cloud#2379 and carrick#2445 (carrick#2472, C6).
+  /**
+   * The handler returns a send the service's labels name (carrick#3053): a
+   * `new` construction or a static call whose declaration a verified label
+   * keys. Its result is transport whatever its type looks like, so the body
+   * is read from the send's argument.
+   */
+  private returnsLabelledSend(func: FunctionLike): boolean {
+    if (!this.statedParams.readsReplies) return false;
+    return this.responseReturnedExpressions(func)
+      .flatMap((expression) => this.expandResponseBranches(expression, 0))
+      .some((branch) => {
+        const labelled = this.statedParams.sendAt(this.peelTransparentExpression(branch));
+        return labelled !== undefined && labelled !== 'setter';
+      });
+  }
+
   /**
    * True when `candidate` is a response send: a call or `new` whose result is
    * transport machinery (by the extraction config's verified rule or the
@@ -7605,6 +7622,16 @@ export class TypeInferrer {
     // An error or redirect branch sends no success body (carrick#1161).
     const status = this.responseSiteStatus(call);
     if (status === 'error' || status === 'redirect') return undefined;
+
+    // carrick#3053: a send the service's labels name carries its body in the
+    // slot the label states, read as a labelled call send reads it.
+    const labelled = this.statedParams.sendAt(call);
+    if (labelled !== undefined && labelled !== 'setter') {
+      const body = args[labelled.arg];
+      if (!body || Node.isSpreadElement(body)) return undefined;
+      const slotted = this.unwrapJsonStringifyArg(body);
+      return this.nodeCarriesPayloadContract(slotted, false) ? slotted : undefined;
+    }
 
     const identity = this.calleeIdentity(call);
     const proven = identity !== undefined && serialisers.has(identity);

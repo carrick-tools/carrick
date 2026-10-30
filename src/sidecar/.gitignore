@@ -14,6 +14,10 @@ node_modules/
 !test/fixtures/labelled-sends/node_modules/reply-kit/
 !test/fixtures/labelled-sends/node_modules/reply-kit/package.json
 !test/fixtures/labelled-sends/node_modules/reply-kit/index.d.ts
+!test/fixtures/labelled-construct/node_modules/
+!test/fixtures/labelled-construct/node_modules/fixture-reply/
+!test/fixtures/labelled-construct/node_modules/fixture-reply/package.json
+!test/fixtures/labelled-construct/node_modules/fixture-reply/index.d.ts
 
 # Build output
 dist/

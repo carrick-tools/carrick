@@ -31,6 +31,10 @@ target/
 !src/sidecar/test/fixtures/labelled-sends/node_modules/reply-kit/
 !src/sidecar/test/fixtures/labelled-sends/node_modules/reply-kit/package.json
 !src/sidecar/test/fixtures/labelled-sends/node_modules/reply-kit/index.d.ts
+!src/sidecar/test/fixtures/labelled-construct/node_modules/
+!src/sidecar/test/fixtures/labelled-construct/node_modules/fixture-reply/
+!src/sidecar/test/fixtures/labelled-construct/node_modules/fixture-reply/package.json
+!src/sidecar/test/fixtures/labelled-construct/node_modules/fixture-reply/index.d.ts
 !tests/fixtures/client-semantics/node_modules/
 !tests/fixtures/client-semantics/node_modules/@fixture/
 !tests/fixtures/client-semantics/node_modules/@fixture/http/
