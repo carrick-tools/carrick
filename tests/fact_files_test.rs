@@ -668,11 +668,22 @@ fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
     );
     let fallbacks = on.fallbacks();
     assert!(
-        fallbacks["fallback_selection_C3"].as_u64().unwrap_or(0) >= 1,
+        fallbacks["fallback_selection_c3"].as_u64().unwrap_or(0) >= 1,
         "{fallbacks}"
     );
+    // The cloud parsers skip any count key outside `^[a-z][a-z0-9_]{0,63}$`.
+    for key in fallbacks.as_object().unwrap().keys() {
+        assert!(
+            key.len() <= 64
+                && key.starts_with(|c: char| c.is_ascii_lowercase())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "the cloud would skip `{key}`: {fallbacks}"
+        );
+    }
     assert!(
-        off.fallbacks().get("fallback_selection_C3").is_none(),
+        off.fallbacks().get("fallback_selection_c3").is_none(),
         "without the switch the line is as it was"
     );
 }
