@@ -21,6 +21,7 @@ import {
   SyntaxKind,
   ts,
   type ArrowFunction,
+  type BinaryExpression,
   type CallExpression,
   type FunctionDeclaration,
   type FunctionExpression,
@@ -49,6 +50,12 @@ export interface StatedReply {
 
 /** The status a send's own chain states, as the inferrer reads it. */
 export type ChainStatus = (call: CallExpression) => 'success' | 'error' | 'redirect' | 'variable' | 'undecided' | undefined;
+
+/** The status a value states, read as a send's status argument is: `undecided` when it states none. */
+export type ValueStatus = (value: Node) => 'success' | 'error' | 'redirect' | 'variable' | 'undecided';
+
+/** The node a value is read from: `JSON.stringify(x)` is read as `x`. */
+export type PayloadNode = (value: Node) => Node;
 
 /** Type flags of a value that cannot hold a request body: a string, number, boolean and the like. */
 const PLAIN_VALUE_FLAGS =
@@ -81,17 +88,19 @@ export class StatedParams {
     private readonly labels: LabelledMembers,
     /** True for a file the repo declares itself (not a library's or the runtime's). */
     private readonly isRepoFile: (file: Node) => boolean,
-    private readonly chainStatus: ChainStatus
+    private readonly chainStatus: ChainStatus,
+    private readonly valueStatus: ValueStatus,
+    private readonly payloadNode: PayloadNode
   ) {}
 
   /** No label names a member: every reading answers nothing. */
   get isEmpty(): boolean {
-    return this.labels.sends.size === 0 && this.labels.bodies.size === 0;
+    return this.labels.sends.size === 0 && this.labels.sets.size === 0 && this.labels.bodies.size === 0;
   }
 
-  /** Whether some label names a reply's send member. */
+  /** Whether some label names a reply's send member, called or set by assignment. */
   get readsReplies(): boolean {
-    return this.labels.sends.size > 0;
+    return this.labels.sends.size > 0 || this.labels.sets.size > 0;
   }
 
   // ===========================================================================
@@ -326,11 +335,20 @@ export class StatedParams {
    * success send through the parameter carries.
    */
   reply(handler: HandlerFunction): StatedReply | undefined {
-    if (this.labels.sends.size === 0) return undefined;
+    if (!this.readsReplies) return undefined;
     for (const parameter of handler.getParameters()) {
       const sends = this.sendsThrough(handler, parameter);
-      const stated = this.statedPayload(parameter, new Set(sends.flatMap((send) => send.keys)));
-      if (stated === 'none') continue;
+      const sets = this.setsThrough(handler, parameter);
+      const stated = this.statedPayload(
+        parameter,
+        new Set([...sends, ...sets].flatMap((send) => send.keys))
+      );
+      if (stated === 'none') {
+        const assigned = this.assignedPayloads(sets);
+        if (assigned === 'abstain') return undefined;
+        if (assigned.length > 0) return { variants: assigned, at: parameter };
+        continue;
+      }
       if (stated === 'abstain') return undefined;
       if (stated.isAny() || stated.isUnknown() || stated.isNever()) return undefined;
       const variants = stated.isUnion() ? stated.getUnionTypes().filter((t) => !t.isNull() && !t.isUndefined()) : [stated];
@@ -340,7 +358,8 @@ export class StatedParams {
         const defined = stated.isUnion() ? stated.getUnionTypes().filter((t) => !t.isUndefined()) : [stated];
         return defined.length > 0 ? { variants: defined, at: parameter } : undefined;
       }
-      const carried = this.successPayloads(sends);
+      const assigned = this.assignedPayloads(sets);
+      const carried = [...this.successPayloads(sends), ...(assigned === 'abstain' ? [] : assigned)];
       const kept = variants.filter((variant) => carried.some((sent) => sent.isAssignableTo(variant)));
       return kept.length > 0 ? { variants: kept, at: parameter } : undefined;
     }
@@ -366,7 +385,9 @@ export class StatedParams {
     for (const property of type.getProperties()) {
       const keys = property.getDeclarations().map((d) => declarationKey(d.compilerNode));
       if (!keys.some((key) => called.has(key))) continue;
-      const slot = this.sendSlotOf(property.getDeclarations().map((d) => d.compilerNode));
+      const declarations = property.getDeclarations().map((d) => d.compilerNode);
+      const assigned = this.setSlotOf(declarations);
+      const slot = assigned ?? this.sendSlotOf(declarations);
       if (!slot) continue;
       found = true;
       const through = property
@@ -382,6 +403,14 @@ export class StatedParams {
       try {
         member = property.getTypeAtLocation(parameter);
       } catch {
+        continue;
+      }
+      if (assigned) {
+        // A member set by assignment is its own payload: the type the route
+        // filled, or the declared default when it filled nothing.
+        if (defaults.has(member.compilerType)) continue;
+        if (payload === undefined) payload = member;
+        else if (payload.compilerType !== member.compilerType) return 'abstain';
         continue;
       }
       for (const signature of member.getCallSignatures()) {
@@ -405,6 +434,15 @@ export class StatedParams {
   private sendSlotOf(declarations: readonly ts.Node[]): ClaimSlot | undefined {
     for (const declaration of declarations) {
       const slot = this.labels.sends.get(declarationKey(declaration));
+      if (slot) return slot;
+    }
+    return undefined;
+  }
+
+  /** The payload slot a member set by assignment takes, by any of its declarations. */
+  private setSlotOf(declarations: readonly ts.Node[]): ClaimSlot | undefined {
+    for (const declaration of declarations) {
+      const slot = this.labels.sets.get(declarationKey(declaration));
       if (slot) return slot;
     }
     return undefined;
@@ -485,7 +523,7 @@ export class StatedParams {
    * as `statedPayload` reads them, so an inherited send counts.
    */
   sendAt(call: Node): ClaimSlot | 'setter' | undefined {
-    if (!this.readsReplies || !Node.isCallExpression(call)) return undefined;
+    if (this.labels.sends.size === 0 || !Node.isCallExpression(call)) return undefined;
     const callee = call.getExpression();
     if (!Node.isPropertyAccessExpression(callee)) return undefined;
     const slot = this.sendSlotOf((callee.getNameNode().getSymbol()?.getDeclarations() ?? []).map((d) => d.compilerNode));
@@ -526,6 +564,78 @@ export class StatedParams {
       sends.push({ call, slot, keys: declarations.map(declarationKey) });
     }
     return sends;
+  }
+
+  /**
+   * The assignments `<root chain>.<member> = value` the handler makes through
+   * the parameter to a member a `set` label names, each with the keys of the
+   * member's declarations.
+   */
+  private setsThrough(
+    handler: HandlerFunction,
+    parameter: ParameterDeclaration
+  ): Array<{ assignment: BinaryExpression; keys: string[] }> {
+    const name = parameter.getNameNode();
+    const symbol = Node.isIdentifier(name) ? name.getSymbol() : undefined;
+    const body = handler.getBody();
+    if (!symbol || !body || this.labels.sets.size === 0) return [];
+    const sets: Array<{ assignment: BinaryExpression; keys: string[] }> = [];
+    for (const assignment of body.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+      if (assignment.getOperatorToken().getKind() !== SyntaxKind.EqualsToken) continue;
+      const left = assignment.getLeft();
+      if (!Node.isPropertyAccessExpression(left)) continue;
+      const declarations = (left.getNameNode().getSymbol()?.getDeclarations() ?? []).map((d) => d.compilerNode);
+      if (!this.setSlotOf(declarations)) continue;
+      if (this.rootSymbol(left.getExpression()) !== symbol) continue;
+      sets.push({ assignment, keys: declarations.map(declarationKey) });
+    }
+    return sets;
+  }
+
+  /**
+   * The status a reply set by assignment states (carrick#3052): the nearest
+   * earlier statement of the same block that assigns a number to another
+   * member of the same root and states a status. `undecided` when none does.
+   * No member name is consulted. An assignment of a number to any member
+   * counts, so `ctx.length = 200` before a body reads as a 200 status.
+   */
+  private assignedStatus(assignment: BinaryExpression): ReturnType<ValueStatus> {
+    const statement = assignment.getParent();
+    if (!Node.isExpressionStatement(statement)) return 'undecided';
+    const root = this.rootSymbol(assignment.getLeft());
+    if (!root) return 'undecided';
+    for (const earlier of [...statement.getPreviousSiblings()].reverse()) {
+      if (!Node.isExpressionStatement(earlier)) continue;
+      const set = earlier.getExpression();
+      if (!Node.isBinaryExpression(set) || set.getOperatorToken().getKind() !== SyntaxKind.EqualsToken) continue;
+      const left = set.getLeft();
+      if (!Node.isPropertyAccessExpression(left) || this.rootSymbol(left) !== root) continue;
+      if (this.setSlotOf((left.getNameNode().getSymbol()?.getDeclarations() ?? []).map((d) => d.compilerNode))) continue;
+      const value = set.getRight();
+      if ((value.getType().getFlags() & ts.TypeFlags.NumberLike) === 0) continue;
+      const status = this.valueStatus(value);
+      if (status !== 'undecided') return status;
+    }
+    return 'undecided';
+  }
+
+  /**
+   * The success values the handler assigns: each right side's type, the ones
+   * after an error or redirect status dropped. `abstain` when a value is
+   * typed `any` or `unknown`, which says nothing of what is sent.
+   */
+  private assignedPayloads(sets: ReadonlyArray<{ assignment: BinaryExpression }>): Type[] | 'abstain' {
+    const sent: Type[] = [];
+    for (const { assignment } of sets) {
+      const status = this.assignedStatus(assignment);
+      if (status === 'error' || status === 'redirect') continue;
+      const type = this.payloadNode(assignment.getRight()).getType();
+      if (type.isAny() || type.isUnknown()) return 'abstain';
+      // No body: clearing the reply states no payload.
+      if (type.isNull() || type.isUndefined()) continue;
+      if (!sent.some((each) => each.compilerType === type.compilerType)) sent.push(type);
+    }
+    return sent;
   }
 
   /**

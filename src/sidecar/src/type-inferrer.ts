@@ -10027,7 +10027,9 @@ export class TypeInferrer {
           externalImportsOf(this.project)
         );
       },
-      (call) => this.chainStatus(call)
+      (call) => this.chainStatus(call),
+      (value) => this.statusOfValue(value),
+      (value) => this.unwrapJsonStringifyArg(this.unwrapExpressionNode(value))
     );
   }
 

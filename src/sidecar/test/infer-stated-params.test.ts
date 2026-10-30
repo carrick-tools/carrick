@@ -432,3 +432,155 @@ describe('carrick#2674: bodies a route handler’s parameters state', () => {
     assert.doesNotMatch((await infer('E', 'response_body', false))?.type_string ?? '', /total: number/);
   });
 });
+
+// carrick#3052: a reply set by assignment (`ctx.body = x`), read from the
+// `set` label. The context package is invented from the general shape of a
+// server library that hands its handler one context object: the body is a
+// property typed by a type parameter left open by default, and a status is a
+// plain number property beside it.
+const CTX_PKG = 'ctx-kit';
+const CTX_KIT = `export interface BaseCtx {
+  status: number;
+  length: number;
+  json(body: unknown): void;
+}
+export interface Ctx<S = {}, B = unknown> extends BaseCtx {
+  state: S;
+  body: B;
+}
+export interface Routes {
+  get<C>(path: string, handler: (ctx: C) => unknown): void;
+}
+export declare const routes: Routes;
+`;
+
+const CTX_APP = `import { routes, type Ctx } from 'ctx-kit';
+
+interface User { id: string; name: string }
+declare function loadUser(): Promise<User>;
+declare function findUser(): Promise<User | undefined>;
+declare function loadLoosely(): Promise<any>;
+interface OwnCtx { body: User; status: number }
+
+// A
+routes.get('/a', async (ctx: Ctx) => { ctx.body = await loadUser(); });
+// B
+routes.get('/b', async (ctx: Ctx) => { const user = await loadUser(); ctx.status = 201; ctx.body = user; });
+// C
+routes.get('/c', async (ctx: Ctx) => {
+  const u = await findUser();
+  if (!u) { ctx.status = 404; ctx.body = { error: 'missing' }; return; }
+  ctx.body = u;
+});
+// D
+routes.get('/d', async (ctx: Ctx<{}, User>) => { ctx.body = await loadLoosely(); });
+// E
+routes.get('/e', async (ctx: OwnCtx) => { ctx.body = await loadUser(); });
+// G
+routes.get('/g', async (ctx: Ctx) => { ctx.status = 204; });
+// H
+routes.get('/h', async (ctx: Ctx) => { const user = await loadUser(); ctx.body = JSON.stringify(user); });
+// I
+routes.get('/i', async (ctx: Ctx) => { ctx.body = await loadLoosely(); });
+// J
+routes.get('/j', async (ctx: Ctx) => { const u = await findUser(); ctx.status = 500; ctx.body = u; });
+`;
+
+describe('carrick#3052: a reply set by assignment', () => {
+  let root: string;
+  let appPath: string;
+  let client: SidecarClient;
+  let id = 0;
+  const setLabel = [
+    {
+      claim_id: 'set0',
+      package: CTX_PKG,
+      export: 'Ctx',
+      role: 'server_framework',
+      receiver: 'type',
+      claim: { kind: 'op', op: 'send', member: 'body', of: 'type', form: 'set', payload: { arg: 0 } },
+    },
+  ];
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-set-reply-'));
+    fs.writeFileSync(path.join(root, 'tsconfig.json'), TSCONFIG);
+    fs.mkdirSync(path.join(root, 'node_modules', CTX_PKG), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'node_modules', CTX_PKG, 'package.json'),
+      JSON.stringify({ name: CTX_PKG, version: '1.0.0', types: 'index.d.ts' })
+    );
+    fs.writeFileSync(path.join(root, 'node_modules', CTX_PKG, 'index.d.ts'), CTX_KIT);
+    fs.mkdirSync(path.join(root, 'src'));
+    appPath = path.join(root, 'src', 'app.ts');
+    fs.writeFileSync(appPath, CTX_APP);
+    client = new SidecarClient();
+    await client.start();
+    await client.send({ action: 'init', request_id: 'init', repo_root: root });
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const reply = async (label: string, labels = true): Promise<Inferred | undefined> => {
+    const alias = `${label}_${labels}_${id}`;
+    const line = CTX_APP.split('\n').indexOf(`// ${label}`) + 2;
+    const response = await client.send<{ inferred_types?: Inferred[] }>(
+      {
+        action: 'infer',
+        request_id: `infer-set-${id++}`,
+        requests: [{ file_path: appPath, line_number: line, infer_kind: 'response_body', alias }],
+        ...(labels ? { server_claims: { from_dir: root, checks: setLabel, type_packages: {} } } : {}),
+      },
+      60_000
+    );
+    return response.inferred_types?.find((t) => t.alias === alias);
+  };
+  const same = async (label: string) => {
+    const strip = ({ alias: _alias, ...rest }: Inferred) => rest;
+    const withLabels = await reply(label);
+    const without = await reply(label, false);
+    assert.deepStrictEqual(withLabels && strip(withLabels), without && strip(without), label);
+  };
+
+  it('A: the value assigned to the labelled member is the reply', async () => {
+    assert.match((await reply('A'))?.type_string ?? '', /id: string/);
+    assert.doesNotMatch((await reply('A', false))?.type_string ?? '', /id: string/);
+  });
+
+  it('B: a success status assigned before the body keeps it', async () => {
+    assert.match((await reply('B'))?.type_string ?? '', /id: string/);
+  });
+
+  it('C: a body assigned after an error status is dropped', async () => {
+    const text = (await reply('C'))?.type_string ?? '';
+    assert.match(text, /id: string/);
+    assert.doesNotMatch(text, /error/);
+  });
+
+  it('D: a type argument the route fills states the reply, ahead of a loosely typed value', async () => {
+    assert.match((await reply('D'))?.type_string ?? '', /id: string/);
+  });
+
+  it('E: a member the repo declares under the same name, unlabelled, states nothing', async () => {
+    await same('E');
+  });
+
+  it('G: a status alone sends no reply; the reading without labels stands', async () => {
+    await same('G');
+  });
+
+  it('H: a serialised body reads as the value serialised', async () => {
+    assert.match((await reply('H'))?.type_string ?? '', /id: string/);
+  });
+
+  it('I: a value typed any makes the reply abstain', async () => {
+    await same('I');
+  });
+
+  it('J: a body assigned only after an error status publishes nothing', async () => {
+    await same('J');
+  });
+});
