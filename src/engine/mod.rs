@@ -12062,9 +12062,11 @@ mod tests {
     /// reach the tally, per service, when the model passes ran.
     #[test]
     fn the_tally_counts_the_model_only_rows_when_the_model_ran() {
-        let mut stats = crate::agents::file_orchestrator::ProcessingStats::default();
-        stats.model_only_rows = 1;
-        stats.model_endpoints_dropped_unanchored = 3;
+        let mut stats = crate::agents::file_orchestrator::ProcessingStats {
+            model_only_rows: 1,
+            model_endpoints_dropped_unanchored: 3,
+            ..Default::default()
+        };
         assert!(
             super::model_fallback_counts(&stats).is_empty(),
             "no model stage, no model counts"
