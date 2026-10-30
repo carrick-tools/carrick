@@ -75,6 +75,21 @@
 # Unset, the script behaves as it always has: on a developer's own CI the
 # tree is theirs. `action.yml` leaves it unset.
 #
+# CARRICK_INSTALL_LOCKFILE_RETRY=1 is the hosted runner's lane policy (carrick#3069),
+# separate from the posture above. Unset, nothing here changes. Set, a strict
+# install that fails with anything but a timeout (124, 137) is retried once, with
+# lifecycle scripts still disabled, the same time limit and every untrusted guard:
+#   npm   npm ci                      -> npm install --ignore-scripts --no-audit --no-fund --no-save
+#   pnpm  install --frozen-lockfile   -> install --no-frozen-lockfile --ignore-scripts [--ignore-pnpmfile]
+#   yarn  classic as above            -> yarn install --pure-lockfile --ignore-scripts
+#   bun   as above                    -> bun install --ignore-scripts --no-save
+# Not retried: Yarn Berry (no install mode that reads the lockfile without writing
+# it; zero-install repos commit what a mutable install writes) and Deno (the
+# pre-flight asks only when `nodeModulesDir` is set, and no failing frozen
+# install has been seen). The tree stays the commit: the lockfile, package.json
+# and pnpm-workspace.yaml are restored byte for byte after the retry, and a root
+# that ends uninstalled keeps no node_modules directory the attempts created.
+#
 # CARRICK_CLI names the Carrick to ask for the services. `action.yml` writes a
 # wrapper for whichever copy the run resolved, npm package or release asset.
 # Deliberately NOT `CARRICK_BIN`: that variable names a scanner BINARY to the
@@ -87,6 +102,9 @@ INSTALL_TIMEOUT_SECONDS="${CARRICK_INSTALL_TIMEOUT:-300}"
 
 # Set by a machine that scans repositories it does not own; see the header.
 UNTRUSTED="${CARRICK_INSTALL_UNTRUSTED:-}"
+
+# Set by the hosted runner; see the header. A lane policy, separate from UNTRUSTED.
+LOCKFILE_RETRY="${CARRICK_INSTALL_LOCKFILE_RETRY:-}"
 
 # The delimiter for the one multi-line step output this script writes. A
 # workflow reads `cache_dirs` as the `path:` of actions/cache, which takes one
@@ -393,13 +411,70 @@ yarn_untrusted_refusal() {
   echo "$answer"
 }
 
+# A failed attempt's log: the first 30 lines (npm puts the cause of a refusal
+# there and follows it with usage text), a marker only when lines were cut,
+# then the last 20. A log of 50 lines or fewer prints whole.
+print_failed_log() {
+  local log="$1" total
+  [ -f "$log" ] || return 0
+  total=$(wc -l <"$log" | tr -d ' ')
+  if [ "$total" -le 50 ]; then
+    cat "$log"
+  else
+    head -n 30 "$log"
+    echo "... ($((total - 50)) lines omitted) ..."
+    tail -n 20 "$log"
+  fi
+}
+
+# The files a lockfile-tolerant retry may rewrite, per manager.
+retry_guarded_files() {
+  case "$1" in
+    npm) echo "package-lock.json package.json" ;;
+    pnpm) echo "pnpm-lock.yaml package.json pnpm-workspace.yaml" ;;
+    yarn) echo "yarn.lock package.json" ;;
+    bun) echo "bun.lock bun.lockb package.json" ;;
+  esac
+}
+
+# Every `node_modules` directory under a root, one per line, sorted; `.git` and
+# the `node_modules` found are not descended into.
+node_modules_dirs() {
+  find "$1" -name .git -prune -o -name node_modules -type d -prune -print 2>/dev/null | sort
+}
+
+# The retry command for a manager, run through `run_install` like the strict
+# one, with every untrusted-mode guard the strict install has.
+run_retry_install() {
+  local root="$1" log="$2" manager="$3"
+  case "$manager" in
+    npm)
+      if [ -n "$UNTRUSTED" ]; then
+        npm_trusted_tools
+        run_install "$root" "$log" env "${NPM_TRUSTED_TOOLS[@]}" npm install --ignore-scripts --no-audit --no-fund --no-save
+      else
+        run_install "$root" "$log" npm install --ignore-scripts --no-audit --no-fund --no-save
+      fi
+      ;;
+    pnpm)
+      if [ -n "$UNTRUSTED" ]; then
+        run_install "$root" "$log" corepack pnpm install --no-frozen-lockfile --ignore-scripts --ignore-pnpmfile
+      else
+        run_install "$root" "$log" corepack pnpm install --no-frozen-lockfile --ignore-scripts
+      fi
+      ;;
+    yarn) run_install "$root" "$log" yarn install --pure-lockfile --ignore-scripts ;;
+    bun) run_install "$root" "$log" bun install --ignore-scripts --no-save ;;
+  esac
+}
+
 # Yarn Berry's lockfile opens with a `__metadata` block; classic's does not.
 yarn_is_berry() {
   [ -f "$1/.yarnrc.yml" ] || grep -q '^__metadata:' "$1/yarn.lock" 2>/dev/null
 }
 
 cmd_install_one() {
-  local root="$1" manager="$2" log status refusal
+  local root="$1" manager="$2" log status refusal strict_cmd="" no_retry="" snap="" before=""
   if [ "$manager" != "deno" ] && { [ -f "$root/deno.json" ] || [ -f "$root/deno.jsonc" ]; }; then
     # Mixed roots need the global Deno cache AND the Node compiler's local
     # install. Neither preparation executes authorized project lifecycle code.
@@ -411,8 +486,19 @@ cmd_install_one() {
   # reach the version the repo pins in `packageManager`.
   corepack enable >/dev/null 2>&1 || true
 
+  # Taken before the first attempt, so a retry that fails can remove what the
+  # attempts created and nothing else.
+  if [ -n "$LOCKFILE_RETRY" ]; then
+    before=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/carrick-node-modules.XXXXXX") || before=""
+    [ -n "$before" ] && node_modules_dirs "$root" >"$before"
+  fi
+
   case "$manager" in
     deno)
+      # No retry: the pre-flight asks about a Deno service only when its config
+      # sets `nodeModulesDir`, and no failing `deno install --frozen` has been seen.
+      no_retry=1
+      strict_cmd="deno install --frozen"
       # A project can authorize lifecycle scripts through allowScripts in its
       # config. Deno has no --ignore-scripts: disabling node_modules is what
       # prevents those scripts from running, even for an authorizing config.
@@ -421,6 +507,7 @@ cmd_install_one() {
       status=$?
       ;;
     npm)
+      strict_cmd="npm ci"
       if [ -n "$UNTRUSTED" ]; then
         npm_trusted_tools
         run_install "$root" "$log" env "${NPM_TRUSTED_TOOLS[@]}" npm ci --ignore-scripts
@@ -430,6 +517,7 @@ cmd_install_one() {
       status=$?
       ;;
     pnpm)
+      strict_cmd="pnpm install --frozen-lockfile"
       if [ -n "$UNTRUSTED" ]; then
         # pnpm loads the tree's `.pnpmfile.cjs` on install unless told not to.
         run_install "$root" "$log" corepack pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile
@@ -448,11 +536,19 @@ cmd_install_one() {
       # so the two lines are told apart by what the tree says they are,
       # never by which command happens to exit 0.
       if yarn_is_berry "$root"; then
+        # No retry: Berry has no install mode that reads the lockfile without
+        # writing it, a mutable install can write `.pnp.cjs` and `.yarn/cache`
+        # that zero-install repos commit, and lifting
+        # YARN_ENABLE_IMMUTABLE_INSTALLS undoes the guard from #2246/#2251.
+        no_retry=1
+        strict_cmd="yarn install --mode=skip-build"
         run_install "$root" "$log" yarn install --mode=skip-build
       elif [ -n "$UNTRUSTED" ]; then
         # Frozen, or classic rewrites yarn.lock.
+        strict_cmd="yarn install --frozen-lockfile"
         run_install "$root" "$log" yarn install --frozen-lockfile --ignore-scripts
       else
+        strict_cmd="yarn install"
         run_install "$root" "$log" yarn install --ignore-scripts
       fi
       status=$?
@@ -463,8 +559,10 @@ cmd_install_one() {
         return 0
       fi
       if [ -n "$UNTRUSTED" ]; then
+        strict_cmd="bun install --frozen-lockfile"
         run_install "$root" "$log" bun install --ignore-scripts --frozen-lockfile
       else
+        strict_cmd="bun install"
         run_install "$root" "$log" bun install --ignore-scripts
       fi
       status=$?
@@ -478,10 +576,52 @@ cmd_install_one() {
   if [ $status -eq 0 ]; then
     echo "Installed $root dependencies with $manager (lifecycle scripts disabled)."
     [ -f "$log" ] && tail -n 3 "$log"
+    [ -n "$before" ] && rm -f "$before"
     return 0
   fi
 
-  [ -f "$log" ] && tail -n 20 "$log"
+  print_failed_log "$log"
+
+  # One lockfile-tolerant retry (CARRICK_INSTALL_LOCKFILE_RETRY=1). A timeout
+  # is not retried: a second attempt would only spend the limit again.
+  if [ -n "$LOCKFILE_RETRY" ] && [ -z "$no_retry" ] && [ $status -ne 124 ] && [ $status -ne 137 ]; then
+    echo "Carrick's lockfile install ($strict_cmd) in $root failed (exit $status); retrying once without the frozen lockfile, lifecycle scripts still disabled."
+    snap=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/carrick-retry-snapshot.XXXXXX") || snap=""
+    if [ -z "$snap" ]; then
+      warn "Carrick could not snapshot $root before retrying its install; the scan will refuse that service rather than index \`any\` through its packages."
+      [ -n "$before" ] && rm -f "$before"
+      return 0
+    fi
+    # The tree stays the commit: put the lockfile and manifests back byte for
+    # byte afterwards, whatever the retry did (pnpm rewrites its lockfile).
+    local file
+    for file in $(retry_guarded_files "$manager"); do
+      if [ -e "$root/$file" ]; then cp -p "$root/$file" "$snap/$file"; else : >"$snap/absent.$file"; fi
+    done
+    run_retry_install "$root" "$log" "$manager"
+    status=$?
+    for file in $(retry_guarded_files "$manager"); do
+      if [ -e "$snap/$file" ]; then cp -p "$snap/$file" "$root/$file"; else rm -f "$root/$file"; fi
+    done
+    rm -rf "$snap"
+    if [ $status -eq 0 ]; then
+      echo "Installed $root dependencies with $manager after its lockfile install failed; the lockfile and package.json in the tree are unchanged (lifecycle scripts disabled)."
+      [ -f "$log" ] && tail -n 3 "$log"
+      [ -n "$before" ] && rm -f "$before"
+      return 0
+    fi
+    print_failed_log "$log"
+  fi
+
+  # A root that ends uninstalled keeps no node_modules the attempts created:
+  # the pre-flight reads one as prepared, and the scan would read `any` silently.
+  if [ -n "$before" ]; then
+    local created
+    while IFS= read -r created; do
+      [ -n "$created" ] && rm -rf "$created"
+    done < <(node_modules_dirs "$root" | comm -13 "$before" -)
+    rm -f "$before"
+  fi
   if [ $status -eq 124 ] || [ $status -eq 137 ]; then
     warn "Carrick's dependency install ($manager) in $root hit the ${INSTALL_TIMEOUT_SECONDS}s limit; the scan will refuse that service rather than index \`any\` through its packages."
   else
