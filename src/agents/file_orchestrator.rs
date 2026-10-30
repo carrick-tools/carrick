@@ -5798,14 +5798,24 @@ impl FileOrchestrator {
                         continue;
                     }
                 }
-                // Borrow witness (#413): computed only against a bare
-                // identifier locator, the one the sibling infer collector
-                // resolves, because arbitration in
+                // Borrow witness (#413): computed only against locators the
+                // sibling infer collector will actually resolve — a bare
+                // identifier that does not contain the op's own topic (the
+                // envelope-copy guard) — because arbitration in
                 // `demote_witnessed_borrowed_anchors` needs the second
-                // anchor's inference to exist for the same alias.
+                // anchor's inference to exist for the same alias. A slot
+                // always gives it one, so a slotted alias skips the topic test
+                // (carrick#2472 C3).
+                // FROZEN (old path, 2026-10-21): the topic-literal test in this
+                // expression, a use of the envelope guard below. Deletions and
+                // safety fixes only. Fixes for wrong or missing rows go in the
+                // type-level topic fact on the listed candidates (carrick#2472
+                // C2). Delete when C2 is released, in the deletion release
+                // (carrick#2472, C6).
                 let payload_borrow_witness = op
                     .payload_expression_text
                     .as_deref()
+                    .filter(|text| slotted_alias || !text.contains(op.topic.as_str()))
                     .and_then(payload_bare_ident)
                     .is_some_and(|payload_ident| {
                         let collector = annotation_mentions.get_or_insert_with(|| {
@@ -5933,6 +5943,30 @@ impl FileOrchestrator {
                 let Some(text) = op.payload_expression_text.as_ref() else {
                     continue;
                 };
+                // FROZEN (old path, 2026-10-21): this envelope guard only.
+                // Deletions and safety fixes only. Fixes for wrong or missing
+                // rows go in the type-level topic fact on the listed candidates
+                // (carrick#2472 C2). Delete when C2 is released, in the
+                // deletion release (carrick#2472, C6).
+                // Envelope guard (measured 10/20 on the wrapper-dispatch harness
+                // fixture): the model sometimes copies the whole options/envelope
+                // object or call instead of the payload value. When the locator
+                // text contains the op's own extracted topic literal, it
+                // demonstrably includes the ROUTING key — that text is the
+                // envelope or the call, never the decoded payload. Resolving it
+                // would put the envelope's type on the manifest and feed false
+                // compat verdicts; dropping it keeps the op Unknown, which is
+                // recoverable. Structural on purpose: keyed on this op's topic
+                // string alone, no property-name or library conventions.
+                if text.contains(op.topic.as_str()) {
+                    debug!(
+                        topic = %op.topic,
+                        file = %path,
+                        "pub/sub payload locator contains the topic literal; \
+                         treating as envelope copy and leaving the op unanchored"
+                    );
+                    continue;
+                }
                 let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
                 let key = OperationKey::pubsub(op.topic.clone());
                 let alias = match role {
@@ -7240,8 +7274,9 @@ impl FileOrchestrator {
         //    borrowed symbols, which needs a decoy-fixture A/B first.
         //
         // 2. Guarded demote: a failing symbol is demoted (symbol AND source
-        //    both to null) ONLY when the op carries a payload locator that
-        //    `collect_pubsub_infer_requests` will accept (text present), so the
+        //    both to null) ONLY when the op carries a payload locator that the
+        //    envelope guard in `collect_pubsub_infer_requests` will accept
+        //    (text present and not containing the op's own topic), so the
         //    demoted op is guaranteed to fall through to location-based
         //    inference rather than being dropped. Otherwise the suspect
         //    symbol is kept as the recall floor. This targets the measured
@@ -7279,13 +7314,21 @@ impl FileOrchestrator {
                 SymbolScope::Unnamed => {}
             }
 
+            // FROZEN (old path, 2026-10-21): the topic-literal test here, a use
+            // of the pub/sub envelope guard. Deletions and safety fixes only.
+            // Fixes for wrong or missing rows go in the type-level topic fact on
+            // the listed candidates (carrick#2472 C2). Delete when C2 is
+            // released, in the deletion release (carrick#2472, C6).
+            //
             // The site slots do not exist yet when this runs (the site records
             // are built from the merged results). A symbol kept here that a
             // slot then types asks nothing in `collect_pubsub_type_requests`
-            // (carrick#2472 C3). Only an op with no locator is kept as the
-            // recall floor.
-            let has_locator_to_demote_to = op.payload_expression_text.is_some();
-            if has_locator_to_demote_to {
+            // (carrick#2472 C3), so the guard decides only unslotted ops.
+            let demote_survives_envelope_guard = op
+                .payload_expression_text
+                .as_deref()
+                .is_some_and(|text| !text.contains(op.topic.as_str()));
+            if demote_survives_envelope_guard {
                 debug!(
                     topic = %op.topic,
                     symbol = %symbol,
@@ -16954,10 +16997,10 @@ export * from "./aFetch.js";"#,
         assert!(result.pubsub_operations[1].type_import_source.is_none());
     }
 
-    /// (c) A failing symbol whose locator contains the op's own topic is
-    /// demoted like any other (no topic-literal guard, carrick#2472 C6a). An
-    /// op with no locator is KEPT: demoting would strand it with no anchor
-    /// (the recall floor).
+    /// (c) A failing symbol whose locator contains the op's own topic (the
+    /// envelope case `collect_pubsub_infer_requests` would drop) is KEPT, not
+    /// demoted: demoting would strand the op with no anchor at all. Same for
+    /// an op with no locator (the recall floor).
     #[test]
     fn test_validate_pubsub_type_hints_keeps_symbol_when_demote_target_unusable() {
         use crate::operation::PubsubRole;
@@ -16968,6 +17011,8 @@ export * from "./aFetch.js";"#,
                 PubsubRole::Publisher,
                 Some("WrongSymbol"),
                 Some("./somewhere"),
+                // Envelope copy: contains the topic literal, so the infer
+                // path's envelope guard would drop it.
                 Some("{ topic: 'order.placed', data }"),
             ),
             pubsub_op(
@@ -16987,38 +17032,17 @@ export * from "./aFetch.js";"#,
 
         assert_eq!(
             result.pubsub_operations[0].primary_type_symbol.as_deref(),
-            None,
-            "topic-bearing locator op is demoted to inference"
+            Some("WrongSymbol"),
+            "envelope-locator op must keep its symbol"
         );
-        assert!(result.pubsub_operations[0].type_import_source.is_none());
+        assert_eq!(
+            result.pubsub_operations[0].type_import_source.as_deref(),
+            Some("./somewhere")
+        );
         assert_eq!(
             result.pubsub_operations[1].primary_type_symbol.as_deref(),
             Some("AnotherWrongSymbol"),
             "locator-less op must keep its symbol as the recall floor"
-        );
-    }
-
-    /// carrick#2472 C6a: no topic-literal guard. A payload locator whose text
-    /// contains the op's topic still emits an infer request.
-    #[test]
-    fn test_pubsub_locator_containing_the_topic_still_emits_an_infer_request() {
-        use crate::operation::PubsubRole;
-
-        let result = pubsub_only_result(vec![pubsub_op(
-            "order.placed",
-            PubsubRole::Publisher,
-            None,
-            None,
-            Some("{ topic: 'order.placed', data }"),
-        )]);
-        let orchestrator = FileOrchestrator::new(AgentService::new());
-        let mut file_results = HashMap::new();
-        file_results.insert("src/pub.ts".to_string(), result);
-        let requests = orchestrator.collect_pubsub_infer_requests(&file_results, ".");
-        assert_eq!(
-            requests.len(),
-            1,
-            "no topic-literal guard drops the request"
         );
     }
 
@@ -22142,8 +22166,9 @@ export function publishWrapped(order: OrderPlaced): void {
                 // Non-bare-ident locator: the infer path can't be attributed
                 // to a binding, so no witness.
                 sub("t.encoded", "AuditRecord", Some("jc.encode(evt)")),
-                // Object-literal locator: not a bare identifier, so no
-                // binding to attribute and no witness.
+                // Envelope-copy locator (contains the topic): the infer
+                // collector drops it, so there is no second anchor to
+                // arbitrate against.
                 sub(
                     "t.copy",
                     "AuditRecord",
@@ -22166,7 +22191,7 @@ export function publishWrapped(order: OrderPlaced): void {
                 false, // t.unannotated: payload binding not annotated
                 false, // t.ghost: symbol anchored to no other binding
                 false, // t.encoded: non-bare-ident locator
-                false, // t.copy: object-literal locator, not a bare identifier
+                false, // t.copy: envelope-copy locator (contains the topic)
                 false, // t.nolocator: no locator at all
             ],
             "requests: {requests:?}"
@@ -22181,6 +22206,52 @@ export function publishWrapped(order: OrderPlaced): void {
             ManifestRole::Producer,
             ManifestTypeKind::Response,
         )
+    }
+
+    /// carrick#2472 C3: a slot always gives the witness its second anchor, so
+    /// the envelope guard's topic-literal test no longer decides whether the
+    /// locator's binding is read. A binding whose name merely contains the
+    /// topic is dropped by the guard unslotted, and read slotted.
+    #[test]
+    fn test_pubsub_borrow_witness_skips_the_topic_test_for_a_slotted_alias() {
+        use crate::operation::PubsubRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_witness_fixture(dir.path());
+        // The binding `evt` holds a payload annotated `OrderPlaced`, so the
+        // symbol `AuditRecord` is a witnessed borrow; the topic is `evt`.
+        let ops = || {
+            vec![pubsub_op(
+                "evt",
+                PubsubRole::Subscriber,
+                Some("AuditRecord"),
+                None,
+                Some("evt"),
+            )]
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert("src/pub.ts".to_string(), pubsub_only_result(ops()));
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let modules = repo_modules(dir.path());
+        let witness_with = |slotted: &BTreeSet<String>| {
+            orchestrator
+                .collect_pubsub_type_requests(
+                    &file_results,
+                    dir.path().to_str().unwrap(),
+                    &modules,
+                    slotted,
+                )
+                .iter()
+                .map(|request| request.payload_borrow_witness)
+                .collect::<Vec<bool>>()
+        };
+
+        assert_eq!(witness_with(&BTreeSet::new()), vec![false], "unslotted");
+        assert_eq!(
+            witness_with(&BTreeSet::from([subscriber_alias("evt")])),
+            vec![true],
+            "slotted"
+        );
     }
 
     /// carrick#2472 C3: where a slot types the alias, a symbol the file
