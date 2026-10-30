@@ -32,7 +32,7 @@ import {
   type Type,
 } from 'ts-morph';
 import { declarationKey, type LabelledMembers } from './library-claims.js';
-import type { ClaimSlot } from './types.js';
+import type { ClaimSlot, ResultShape } from './types.js';
 
 /** A function a handler can be: what the inferrer follows a registration to. */
 export type HandlerFunction = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
@@ -45,7 +45,7 @@ export type StatedRequest =
 /** The reply a handler's parameters state: one or more success variants. */
 export interface StatedReply {
   variants: Type[];
-  at: ParameterDeclaration;
+  at: Node;
 }
 
 /** The status a send's own chain states, as the inferrer reads it. */
@@ -95,12 +95,22 @@ export class StatedParams {
 
   /** No label names a member: every reading answers nothing. */
   get isEmpty(): boolean {
-    return this.labels.sends.size === 0 && this.labels.sets.size === 0 && this.labels.bodies.size === 0;
+    return (
+      this.labels.sends.size === 0 &&
+      this.labels.sets.size === 0 &&
+      this.labels.bodies.size === 0 &&
+      this.labels.returns.size === 0
+    );
   }
 
   /** Whether some label names a reply's send member, called or set by assignment. */
   get readsReplies(): boolean {
     return this.labels.sends.size > 0 || this.labels.sets.size > 0;
+  }
+
+  /** Whether some label says a route's handler returns the reply (carrick#3054). */
+  get readsReturns(): boolean {
+    return this.labels.returns.size > 0;
   }
 
   // ===========================================================================
@@ -364,6 +374,97 @@ export class StatedParams {
       return kept.length > 0 ? { variants: kept, at: parameter } : undefined;
     }
     return undefined;
+  }
+
+  /**
+   * The reply a route's handler returns (carrick#3054): the registration
+   * hands the handler in at the slot a `returns` label names on the route
+   * member it calls. The handler's return, awaited, without its `void`,
+   * `undefined`, `null` and `never` parts; with `result`, the part of it
+   * that label names. Undefined when no label names the route, the handler
+   * is not at the slot, nothing is left, a part is `any` or `unknown`, the
+   * named member is missing from a part, or the label reads a parse method
+   * (not read here). The caller reads a labelled send first: a handler that
+   * sends does not also reply by return.
+   */
+  returned(registration: Node, handler: HandlerFunction): StatedReply | undefined {
+    if (this.labels.returns.size === 0 || !Node.isCallExpression(registration)) return undefined;
+    const label = this.returnsLabelOf(registration);
+    if (!label) return undefined;
+    const at = registration.getArguments()[label.handler.arg];
+    if (!at || (at !== handler && this.repoFunction(at) !== handler)) return undefined;
+    const parts: Type[] = [];
+    for (const part of this.settled(handler.getReturnType())) {
+      if (this.isNothing(part)) continue;
+      parts.push(part);
+    }
+    let held = parts;
+    const shape = label.result;
+    if (shape !== undefined) {
+      if ('parse' in shape) return undefined;
+      if ('member' in shape) {
+        held = [];
+        for (const part of parts) {
+          const member = part.getProperty(shape.member[0]);
+          if (!member) return undefined;
+          let type: Type;
+          try {
+            type = member.getTypeAtLocation(handler);
+          } catch {
+            return undefined;
+          }
+          for (const each of this.settled(type)) {
+            if (!this.isNothing(each)) held.push(each);
+          }
+        }
+      }
+    }
+    if (held.length === 0 || held.some((part) => part.isAny() || part.isUnknown())) return undefined;
+    return { variants: held, at: handler };
+  }
+
+  /** The `returns` label of the route member a registration call calls, by its declarations. */
+  private returnsLabelOf(call: CallExpression): { handler: ClaimSlot; result?: ResultShape } | undefined {
+    const declarations: Node[] = [];
+    try {
+      const declaration = call.getProject().getTypeChecker().getResolvedSignature(call)?.getDeclaration();
+      if (declaration) declarations.push(declaration);
+    } catch {
+      // The call resolves no signature: the member's own symbol still names it.
+    }
+    const callee = call.getExpression();
+    const named = Node.isPropertyAccessExpression(callee) ? callee.getNameNode() : callee;
+    declarations.push(...(named.getSymbol()?.getDeclarations() ?? []));
+    for (const declaration of declarations) {
+      const label = this.labels.returns.get(declarationKey(declaration.compilerNode));
+      if (label) return label;
+    }
+    return undefined;
+  }
+
+  private unions(type: Type): Type[] {
+    return type.isUnion() ? type.getUnionTypes() : [type];
+  }
+
+  /** The parts of `type`, each read through its promise. */
+  private settled(type: Type): Type[] {
+    return this.unions(type).flatMap((part) => this.unions(this.awaited(part)));
+  }
+
+  /** A promise read through to what it resolves to, at most four hops. */
+  private awaited(type: Type): Type {
+    let current = type;
+    for (let hop = 0; hop < 4; hop++) {
+      const name = current.getSymbol()?.getName();
+      const inner = current.getTypeArguments()[0];
+      if ((name !== 'Promise' && name !== 'PromiseLike') || !inner) break;
+      current = inner;
+    }
+    return current;
+  }
+
+  private isNothing(type: Type): boolean {
+    return type.isUndefined() || type.isNull() || (type.getFlags() & (ts.TypeFlags.Void | ts.TypeFlags.Never)) !== 0;
   }
 
   /**

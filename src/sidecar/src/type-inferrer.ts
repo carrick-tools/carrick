@@ -832,7 +832,7 @@ export class TypeInferrer {
     onUnwidenedStep?: UnwidenedStepDone
   ): InferResult {
     this.modelSymbols = new Map((modelSymbols ?? []).map((symbol) => [symbol.alias, symbol]));
-    this.statedParams = this.statedParamsFor(labels ?? { sends: new Map(), sets: new Map(), bodies: new Set() });
+    this.statedParams = this.statedParamsFor(labels ?? { sends: new Map(), sets: new Map(), returns: new Map(), bodies: new Set() });
     const inferredTypes: InferredType[] = [];
     const errors: string[] = [];
     /** Response inferences the unwidened reading re-reads (carrick#1516). */
@@ -981,7 +981,7 @@ export class TypeInferrer {
    * members the batch's verified server-framework labels name. Empty when
    * the batch carries no labels, and then it reads nothing.
    */
-  private statedParams = this.statedParamsFor({ sends: new Map(), sets: new Map(), bodies: new Set() });
+  private statedParams = this.statedParamsFor({ sends: new Map(), sets: new Map(), returns: new Map(), bodies: new Set() });
 
   /**
    * carrick#2111: where the model named a type for the response this request
@@ -10038,20 +10038,42 @@ export class TypeInferrer {
    * (nothing, `void`, or an `unknown` the inferrer did not decide), the reply
    * its handler's parameter states, cut to its success variants. A typed
    * reading, or a decided abstain, stands as it is.
+   *
+   * carrick#3054: a route whose receive op carries a `returns` label replies
+   * with what its handler returns. A labelled send the handler's parameters
+   * state wins over the return. The returned reply replaces a typed reading
+   * only where it prints differently (the label names a part of the return,
+   * or a nothing part is dropped); where it prints the same, today's reading
+   * stands with everything it carries.
    */
   private withStatedReply(
     sourceFile: SourceFile,
     request: InferRequestItem,
     today: InferredType | null
   ): InferredType | null {
-    if (!this.statedParams.readsReplies) return today;
-    if (today && !this.isEmptyResponseReading(today)) return today;
-    const handler =
-      this.registrationAtLine(sourceFile, request.line_number)?.handler ??
-      this.exportedFunctionOpeningOn(sourceFile, request.line_number);
+    const reads = this.statedParams.readsReplies;
+    if (!reads && !this.statedParams.readsReturns) return today;
+    const empty = !today || this.isEmptyResponseReading(today);
+    if (reads && !empty && !this.statedParams.readsReturns) return today;
+    const at = this.registrationAtLine(sourceFile, request.line_number);
+    const handler = at?.handler ?? this.exportedFunctionOpeningOn(sourceFile, request.line_number);
     if (!handler) return today;
-    const stated = this.statedParams.reply(handler);
-    if (!stated) return today;
+    const sent = reads ? this.statedParams.reply(handler) : undefined;
+    if (sent) {
+      return empty ? this.publishStatedReply(request, handler, sent, today, "its handler's reply parameter states the body") : today;
+    }
+    const returned = at ? this.statedParams.returned(at.registration, handler) : undefined;
+    if (!returned) return today;
+    return this.publishStatedReply(request, handler, returned, today, 'its handler returns the reply');
+  }
+
+  private publishStatedReply(
+    request: InferRequestItem,
+    handler: FunctionLike,
+    stated: { variants: Type[]; at: Node },
+    today: InferredType | null,
+    why: string
+  ): InferredType | null {
     const texts: string[] = [];
     for (const variant of stated.variants) {
       const text = this.structuralTextFromType(variant, stated.at);
@@ -10061,15 +10083,10 @@ export class TypeInferrer {
       if (!text || printedTypeHoldsTopType(text)) return today;
       texts.push(text);
     }
-    this.log(
-      `Route at ${request.file_path}:${request.line_number}: its handler's reply parameter states the body`
-    );
-    return this.createInferredType(
-      request,
-      texts.length === 1 ? texts[0] : texts.map((text) => `(${text})`).join(' | '),
-      true,
-      this.getNodeLocation(handler)
-    );
+    const printed = texts.length === 1 ? texts[0] : texts.map((text) => `(${text})`).join(' | ');
+    if (today && today.type_string === printed) return today;
+    this.log(`Route at ${request.file_path}:${request.line_number}: ${why}`);
+    return this.createInferredType(request, printed, true, this.getNodeLocation(handler));
   }
 
   /** Nothing read: `void`, or an `unknown` with no decided reason at its root. */
