@@ -144,7 +144,9 @@ stored blob was written at must be present in the clone.
   force push, cannot be fetched; that service runs in full.
 - Keep the tree clean before the scan: install with frozen lockfiles where
   the manager allows it. A rewritten tracked file also marks the upload
-  `dirty`.
+  `dirty`. With `CARRICK_INSTALL_LOCKFILE_RETRY=1` (the runner sets it), a
+  frozen install that fails is retried once without the frozen lockfile and
+  the lockfile in the tree is left byte-identical (`scripts/install-scanned-deps.sh`).
 
 ## Exit codes
 

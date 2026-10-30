@@ -677,13 +677,23 @@ impl Untrusted {
     }
 
     fn install_one(&self, root: &str, manager: &str, untrusted: bool) -> Run {
+        self.install_one_with(root, manager, untrusted, false)
+    }
+
+    /// `retry` sets CARRICK_INSTALL_LOCKFILE_RETRY=1, the hosted runner's lane
+    /// policy (carrick#3069).
+    fn install_one_with(&self, root: &str, manager: &str, untrusted: bool, retry: bool) -> Run {
         let dir = self.repo.join(root);
         let mut command = Command::new("bash");
         command
             .arg(script())
             .args(["install-one", dir.to_str().expect("utf-8 path"), manager])
             .env_remove("CARRICK_CLI")
-            .env_remove("CARRICK_INSTALL_UNTRUSTED");
+            .env_remove("CARRICK_INSTALL_UNTRUSTED")
+            .env_remove("CARRICK_INSTALL_LOCKFILE_RETRY");
+        if retry {
+            command.env("CARRICK_INSTALL_LOCKFILE_RETRY", "1");
+        }
         // Untrusted mode asks the scanner to read Yarn's rc files, as the
         // hosted runner does through its own CARRICK_CLI (carrick#2246).
         if untrusted {
@@ -1802,4 +1812,333 @@ fn untrusted_mode_never_loads_a_pnpmfile_a_config_dependency_ships() {
         run.text()
     );
     untrusted.assert_safe("pnpm", &run);
+}
+
+// ---------------------------------------------------------------------------
+// carrick#3069: CARRICK_INSTALL_LOCKFILE_RETRY=1.
+//
+// The hosted runner sets it. A strict install that fails with anything but a
+// timeout is retried once without the frozen lockfile, lifecycle scripts still
+// disabled, and the tree stays the commit. Every failed attempt prints the head
+// of its log, in every mode.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn retry_installs_a_root_whose_lockfile_is_behind_its_manifest() {
+    for (tool, needs, root, generate) in [
+        ("npm", "npm", "npm", "npm install --ignore-scripts"),
+        (
+            "pnpm",
+            "corepack",
+            "pnpm",
+            "corepack pnpm install --ignore-scripts",
+        ),
+        ("yarn", "yarn", "classic", "yarn install --ignore-scripts"),
+        ("bun", "bun", "bun", "bun install --ignore-scripts"),
+    ] {
+        if !have(needs) {
+            eprintln!("skipped: {needs} is not on PATH");
+            continue;
+        }
+        let t = Untrusted::new();
+        ahead_of_its_lockfile(&t, root, generate);
+        let run = t.install_one_with(root, tool, true, true);
+        assert!(
+            run.text().contains("retrying once"),
+            "{tool}: the retry is announced: {}",
+            run.text()
+        );
+        assert!(
+            t.repo.join(root).join("node_modules/b").exists(),
+            "{tool}: the dependency the lockfile lacked is installed: {}",
+            run.text()
+        );
+        assert!(
+            !run.text().contains("::warning::"),
+            "{tool}: a root the retry installed is not a failed root: {}",
+            run.text()
+        );
+        t.assert_safe(root, &run);
+    }
+}
+
+/// A manager on `PATH` that counts its calls, prints numbered lines, can create
+/// directories and sleep, and exits 1.
+struct StubManager {
+    _scratch: tempfile::TempDir,
+    bin: PathBuf,
+    root: PathBuf,
+    counter: PathBuf,
+}
+
+impl StubManager {
+    fn new(name: &str) -> Self {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let base = scratch.path().canonicalize().expect("canonical scratch");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        fs::create_dir_all(&bin).expect("bin dir");
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(root.join("package.json"), r#"{"name":"s","private":true}"#).expect("manifest");
+        let stub = bin.join(name);
+        fs::write(
+            &stub,
+            "#!/bin/bash\n\
+             echo call >> \"$STUB_COUNTER\"\n\
+             if [ -n \"$STUB_SLEEP\" ]; then exec sleep \"$STUB_SLEEP\"; fi\n\
+             i=1; while [ \"$i\" -le \"${STUB_LINES:-0}\" ]; do echo \"line $i\"; i=$((i+1)); done\n\
+             for d in $STUB_MKDIRS; do mkdir -p \"$d\"; done\n\
+             exit 1\n",
+        )
+        .expect("write stub");
+        make_executable(&stub);
+        Self {
+            counter: base.join("counter"),
+            _scratch: scratch,
+            bin,
+            root,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        fs::read_to_string(&self.counter)
+            .map(|c| c.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn run(&self, manager: &str, retry: bool, env: &[(&str, &str)]) -> Run {
+        let path = format!(
+            "{}:{}",
+            self.bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut command = Command::new("bash");
+        command
+            .arg(script())
+            .args(["install-one", self.root.to_str().expect("utf-8"), manager])
+            .env("PATH", path)
+            .env("STUB_COUNTER", &self.counter)
+            .env_remove("CARRICK_INSTALL_UNTRUSTED")
+            .env_remove("CARRICK_INSTALL_LOCKFILE_RETRY");
+        if retry {
+            command.env("CARRICK_INSTALL_LOCKFILE_RETRY", "1");
+        }
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run install-scanned-deps.sh");
+        Run {
+            out: String::from_utf8_lossy(&output.stdout).into_owned(),
+            err: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: output.status.code().unwrap_or(-1),
+        }
+    }
+}
+
+fn warnings(run: &Run) -> usize {
+    run.text().matches("::warning::").count()
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failed_retry_leaves_no_node_modules_it_created() {
+    let stub = StubManager::new("npm");
+    // One directory that was there before the first attempt, two that were not.
+    fs::create_dir_all(stub.root.join("kept/node_modules")).expect("pre-existing");
+    let run = stub.run(
+        "npm",
+        true,
+        &[("STUB_MKDIRS", "node_modules/x packages/a/node_modules")],
+    );
+    assert_eq!(run.status, 0, "{}", run.text());
+    assert!(!stub.root.join("node_modules").exists(), "{}", run.text());
+    assert!(
+        !stub.root.join("packages/a/node_modules").exists(),
+        "{}",
+        run.text()
+    );
+    assert!(
+        stub.root.join("kept/node_modules").exists(),
+        "a directory that predates the attempts is left alone"
+    );
+    assert_eq!(warnings(&run), 1, "one warning per root: {}", run.text());
+    assert_eq!(stub.calls(), 2, "strict, then one retry: {}", run.text());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_timed_out_install_is_not_retried() {
+    if !have("timeout") {
+        eprintln!("skipped: timeout is not on PATH");
+        return;
+    }
+    let stub = StubManager::new("npm");
+    let run = stub.run(
+        "npm",
+        true,
+        &[("STUB_SLEEP", "30"), ("CARRICK_INSTALL_TIMEOUT", "1")],
+    );
+    assert_eq!(stub.calls(), 1, "{}", run.text());
+    assert!(run.text().contains("hit the 1s limit"), "{}", run.text());
+    assert_eq!(warnings(&run), 1, "{}", run.text());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failed_install_prints_the_head_of_its_log() {
+    let long = StubManager::new("npm");
+    let run = long.run("npm", false, &[("STUB_LINES", "100")]);
+    let lines: Vec<&str> = run.out.lines().collect();
+    let has = |n: usize| lines.contains(&format!("line {n}").as_str());
+    assert!((1..=30).all(has), "the head is printed: {}", run.text());
+    assert!((81..=100).all(has), "the tail is printed: {}", run.text());
+    assert!(!(31..=80).any(has), "the middle is cut: {}", run.text());
+    assert!(
+        lines.contains(&"... (50 lines omitted) ..."),
+        "the marker counts the cut lines: {}",
+        run.text()
+    );
+    assert_eq!(long.calls(), 1, "default mode does not retry");
+
+    let short = StubManager::new("npm");
+    let run = short.run("npm", false, &[("STUB_LINES", "40")]);
+    assert!(
+        (1..=40).all(|n| run.out.lines().any(|l| l == format!("line {n}"))),
+        "a short log prints whole: {}",
+        run.text()
+    );
+    assert!(!run.text().contains("lines omitted"), "{}", run.text());
+}
+
+#[test]
+#[cfg(unix)]
+fn berry_and_deno_are_not_retried() {
+    let berry = StubManager::new("yarn");
+    fs::write(berry.root.join(".yarnrc.yml"), "nodeLinker: node-modules\n").expect("yarnrc");
+    let run = berry.run("yarn", true, &[]);
+    assert_eq!(berry.calls(), 1, "Berry: {}", run.text());
+    assert_eq!(warnings(&run), 1, "{}", run.text());
+
+    let deno = StubManager::new("deno");
+    let run = deno.run("deno", true, &[]);
+    assert_eq!(deno.calls(), 1, "Deno: {}", run.text());
+    assert_eq!(warnings(&run), 1, "{}", run.text());
+}
+
+#[test]
+fn the_retry_never_loads_a_pnpmfile() {
+    if !have("corepack") {
+        eprintln!("skipped: corepack is not on PATH");
+        return;
+    }
+    let build = |t: &Untrusted| {
+        ahead_of_its_lockfile(t, "pnpm", "corepack pnpm install --ignore-scripts");
+        // After the lockfile is generated, or the generation would run it.
+        write(&t.repo, "pnpm/.pnpmfile.cjs", &t.witness("pnpmfile"));
+        t.commit();
+    };
+
+    let default = Untrusted::new();
+    build(&default);
+    let run = default.install_one_with("pnpm", "pnpm", false, true);
+    assert!(
+        default.marker("pnpmfile").exists(),
+        "without untrusted mode the retry runs the pnpmfile, so this case can see it: {}",
+        run.text()
+    );
+
+    let untrusted = Untrusted::new();
+    build(&untrusted);
+    let run = untrusted.install_one_with("pnpm", "pnpm", true, true);
+    assert!(
+        run.text().contains("retrying once"),
+        "the retry is the command under test: {}",
+        run.text()
+    );
+    assert!(
+        !untrusted.marker("pnpmfile").exists(),
+        "the pnpmfile ran in the retry: {}",
+        run.text()
+    );
+    untrusted.assert_safe("pnpm", &run);
+}
+
+#[test]
+#[cfg(unix)]
+fn the_retry_never_runs_a_program_an_npmrc_names() {
+    if !have("npm") || !have("git") {
+        eprintln!("skipped: npm or git is not on PATH");
+        return;
+    }
+    let build = |t: &Untrusted| {
+        let dep = t.markers.parent().expect("scratch").join("dep");
+        write(
+            &dep,
+            "package.json",
+            r#"{"name":"dep","version":"1.0.0","scripts":{"prepare":"node -e 0"}}"#,
+        );
+        sh(
+            &dep,
+            "git init -q . && git add -A \
+             && git -c user.email=t@t -c user.name=t commit -q -m dep",
+        );
+        write(
+            &t.repo,
+            "npm/a/package.json",
+            r#"{"name":"a","version":"1.0.0"}"#,
+        );
+        let manifest = |extra: &str| {
+            format!(
+                r#"{{"name":"n","private":true,"dependencies":{{"dep":"git+file://{}"{extra}}}}}"#,
+                dep.to_str().expect("utf-8 path")
+            )
+        };
+        write(&t.repo, "npm/package.json", &manifest(""));
+        sh(
+            &t.repo.join("npm"),
+            "npm install --package-lock-only --ignore-scripts",
+        );
+        // One entry ahead of the lockfile: `npm ci` refuses, the retry installs.
+        write(&t.repo, "npm/package.json", &manifest(r#","a":"file:./a""#));
+        write(&t.repo, "npm/git.sh", &witness_program(t, "git", "git"));
+        make_executable(&t.repo.join("npm/git.sh"));
+        write(&t.repo, "npm/hook.cjs", &t.witness("node-options"));
+        write(
+            &t.repo,
+            "npm/.npmrc",
+            &format!(
+                "git=./git.sh\nnode-options=--require {}\n",
+                t.repo.join("npm/hook.cjs").to_str().expect("utf-8 path")
+            ),
+        );
+        t.commit();
+    };
+
+    let default = Untrusted::new();
+    build(&default);
+    let run = default.install_one_with("npm", "npm", false, true);
+    for marker in ["git", "node-options"] {
+        assert!(
+            default.marker(marker).exists(),
+            "without untrusted mode the retry runs the .npmrc `{marker}` program: {}",
+            run.text()
+        );
+    }
+
+    let untrusted = Untrusted::new();
+    build(&untrusted);
+    let run = untrusted.install_one_with("npm", "npm", true, true);
+    assert!(
+        run.text().contains("retrying once"),
+        "the retry is the command under test: {}",
+        run.text()
+    );
+    for marker in ["git", "node-options"] {
+        assert!(
+            !untrusted.marker(marker).exists(),
+            "the .npmrc `{marker}` program ran in the retry: {}",
+            run.text()
+        );
+    }
+    untrusted.assert_safe("npm", &run);
 }
