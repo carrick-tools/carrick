@@ -296,9 +296,10 @@ fn the_receiver_trace_switch_moves_only_what_it_finds() {
             // The file's other routes have endpoint rows at their lines.
             "src/helpers.ts:47 get".to_string(),
             "src/helpers.ts:61 get".to_string(),
-            "src/routes.ts:11 get".to_string(),
-            // `src/app.ts:25` and `src/users.ts:8` are served from the top:
-            // the trace writes their rows (carrick#2474 R3 S1).
+            // `src/app.ts:25`, `src/users.ts:8` and `src/routes.ts:11` are
+            // served from the top: the trace writes their rows (carrick#2474
+            // R3 S1). The last is a field set from a constructor parameter,
+            // read through the `new` that hands it the app (carrick#1670 T3).
         ]
     );
     // Only `1` turns it on.

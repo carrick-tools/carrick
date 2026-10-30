@@ -2738,6 +2738,28 @@ pub(super) fn field_receivers(
     out
 }
 
+/// Whether nothing but the class's own constructor may set `field`
+/// (carrick#1670 T3): `this` does not leave the class or a related one, no
+/// related class writes or declares the field, and no accessor or decorator
+/// sets it. The constructor's own writes and the class's methods' are the
+/// caller's to count ([`super::Reader::class_fields`] drops a field written
+/// twice).
+pub(super) fn constructor_only(
+    class: &BindingKey,
+    classes: &HashMap<BindingKey, ClassThis>,
+    field: &str,
+) -> bool {
+    let Some(own) = classes.get(class) else {
+        return false;
+    };
+    let related = relatives(class, classes);
+    !(own.escapes
+        || related
+            .iter()
+            .any(|class| class.escapes || class.sets(field))
+        || (own.opaque.contains(field) && !own.param_props.contains(field)))
+}
+
 /// Whether two instances are one maker's, handed the same arguments: the
 /// same export's maker, or a call to the same binding (carrick#1562),
 /// awaited alike.
@@ -2814,6 +2836,10 @@ pub(super) struct ClassThis {
     /// decorated property, a constructor's parameter property, an accessor
     /// of that name.
     opaque: HashSet<String>,
+    /// The fields a constructor's parameter property declares: in
+    /// [`Self::opaque`] too, since the parameter may set them, but not set
+    /// by an accessor or a decorator ([`constructor_only`]).
+    param_props: HashSet<String>,
     /// `this` is handed to a call or a construction, aliased, destructured,
     /// spread, or read or written by a computed key, or a member is named by
     /// one: any field may hold anything, and a use of one may be unseen.
@@ -2853,6 +2879,7 @@ impl ClassThis {
                             match name {
                                 Some(ident) => {
                                     facts.opaque.insert(ident.sym.to_string());
+                                    facts.param_props.insert(ident.sym.to_string());
                                 }
                                 None => facts.escapes = true,
                             }

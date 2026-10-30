@@ -34,6 +34,21 @@ Two services, `hub` and `peer`. Answer key, with the five site switches on:
 | `peer/src/client.ts:6` | `new Peer(…)` | endpoint `SERVER->CLIENT` `order.accepted` |
 | `peer/src/client.ts:11` | a parameter nothing in the service hands in | call `UNKNOWN` `order.lost` |
 
+carrick#1670 T3 adds `hub/src/conn.ts` and `hub/src/attach.ts`: a field set from
+one constructor parameter is that parameter, so its class's `new` calls say
+where the `Peer` came from. All five classes are built in `attach.ts` with the
+peer a second `Hub` hands in, but `Orphan`, built with a parameter nothing
+hands in.
+
+| Site | The field | Row |
+|---|---|---|
+| `hub/src/conn.ts:10` | `Conn`, a parameter property | endpoint `CLIENT->SERVER` `run.start` |
+| `hub/src/conn.ts:16` | `Conn` | call `SERVER->CLIENT` `run.notify` |
+| `hub/src/conn.ts:29` | `Plain`, one `this.peer = peer` | call `SERVER->CLIENT` `run.done` |
+| `hub/src/conn.ts:42` | `Two`, written again in a method | call `UNKNOWN` `run.ping` |
+| `hub/src/conn.ts:53` | `Leaky`, `this` handed to a call | call `UNKNOWN` `run.flush` |
+| `hub/src/conn.ts:63` | `Orphan`, built with a peer nothing hands in | call `UNKNOWN` `run.lost` |
+
 The two services pair on `order.placed` and `order.accepted`. Every row is a
 `library_claim`. With the switches off there are no site rows and the scan
 states no socket row.

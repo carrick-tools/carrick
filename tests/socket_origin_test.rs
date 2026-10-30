@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 
 const SERVER: &str = "services/hub/src/server.ts";
 const CLIENT: &str = "services/peer/src/client.ts";
+const CONN: &str = "services/hub/src/conn.ts";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/socket-origin")
@@ -225,6 +226,43 @@ fn a_peer_a_hub_hands_in_is_the_servers_end() {
         ),
     ] {
         assert!(rows.contains(&expected), "{expected:?} in {rows:#?}");
+    }
+}
+
+/// A field set from one constructor parameter is that parameter (carrick#1670
+/// T3): a parameter property, or one `this.field = parameter`, reads the peer
+/// each `new` of the class is handed. A field written again, one whose class
+/// lets `this` leave, and a class built with a peer nothing hands in have no
+/// side.
+#[test]
+fn a_field_set_from_a_constructor_parameter_carries_its_origin() {
+    let rows = &with_switches()["hub"];
+    for expected in [
+        row(
+            "endpoints",
+            "socket|client_to_server|run.start",
+            &format!("{CONN}:10"),
+        ),
+        row(
+            "calls",
+            "socket|server_to_client|run.notify",
+            &format!("{CONN}:16"),
+        ),
+        row(
+            "calls",
+            "socket|server_to_client|run.done",
+            &format!("{CONN}:29"),
+        ),
+    ] {
+        assert!(rows.contains(&expected), "{expected:?} in {rows:#?}");
+    }
+    for (event, line) in [("run.ping", 42), ("run.flush", 53), ("run.lost", 63)] {
+        let unknown = row(
+            "calls",
+            &format!("socket|unknown|{event}"),
+            &format!("{CONN}:{line}"),
+        );
+        assert!(rows.contains(&unknown), "{unknown:?} in {rows:#?}");
     }
 }
 
