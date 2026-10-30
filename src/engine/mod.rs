@@ -4076,6 +4076,7 @@ async fn analyze_current_repo_incremental(
                         .map(|f| (f.to_string_lossy().to_string(), normalize_path(f))),
                     prev_file_results,
                     &unchanged,
+                    &setup.detection.data_fetchers,
                     &setup.detection.messaging_clients,
                 )
             } else {
@@ -27178,7 +27179,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// (consumers) — or the resolved payload type never joins back and the op
     /// stays `Unknown`, silently. Also pins the role → InferKind routing, the
     /// two-anchor co-emission (#413: a named anchor no longer suppresses the
-    /// infer request — the sidecar arbitrates), and that a topic-bearing locator is not dropped (C6a).
+    /// infer request — the sidecar arbitrates), and the envelope-copy guard.
     #[test]
     fn pubsub_infer_request_alias_matches_manifest_alias() {
         use crate::operation::PubsubRole;
@@ -27232,6 +27233,17 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                         payload_expression_line: Some(30),
                         backfilled: false,
                     },
+                    // Envelope-copy guard: the locator text contains the op's
+                    // own topic literal (the model copied the whole enqueue
+                    // options object), so it must be dropped — an envelope's
+                    // type on the manifest is a false compat verdict waiting
+                    // to happen; Unknown is recoverable.
+                    locator_op(
+                        "records.reindex",
+                        PubsubRole::Publisher,
+                        41,
+                        "{ id, job: \"records.reindex\", payload: { resourceId } }",
+                    ),
                 ],
                 ..Default::default()
             },
@@ -27255,8 +27267,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let orchestrator = FileOrchestrator::new(AgentService::new());
         let requests = orchestrator.collect_pubsub_infer_requests(&file_results, ".");
 
-        // Co-emission: the two locator-anchored itemArchived ops AND the
-        // named-anchor orders.placed op produce requests (#413).
+        // Co-emission + envelope guard: the two locator-anchored itemArchived
+        // ops AND the named-anchor orders.placed op produce requests (#413);
+        // only the topic-containing envelope copy is excluded.
         assert_eq!(requests.len(), 3, "requests: {requests:?}");
         assert!(
             requests
@@ -27264,6 +27277,14 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 .any(|r| r.expression_text.as_deref() == Some("order")),
             "an op with a primary_type_symbol and a usable locator must ALSO \
              emit an infer request so the sidecar can arbitrate the anchors"
+        );
+        assert!(
+            !requests.iter().any(|r| r
+                .expression_text
+                .as_deref()
+                .is_some_and(|t| t.contains("records.reindex"))),
+            "a locator containing the op's topic literal is an envelope copy \
+             and must be dropped, not resolved"
         );
 
         // Subscriber (producer side): FunctionParam, param_name = locator text,

@@ -27,7 +27,7 @@ fn fixture_path(subpath: &str) -> PathBuf {
 fn scan(path: &Path) -> ScanResult {
     let content = fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
-    SwcScanner::new().scan_content(path, &content, &[])
+    SwcScanner::new().scan_content(path, &content, &[], &[])
 }
 
 fn methods(candidates: &[CandidateTarget]) -> Vec<String> {
