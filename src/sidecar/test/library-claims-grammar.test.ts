@@ -103,8 +103,29 @@ const ELEMENTS: Record<string, LibraryCheck> = {
   'make slot at': check('export', { kind: 'make', form: 'call', member: null, name: { arg: 0, at: ['id'] } }),
 };
 
-/** The elements above whose part a judge reads now. */
-const BUILT = new Set(['form new', 'form decorate', 'returns empty', 'returns result', 'scope form decorate']);
+/**
+ * The elements above whose part a judge reads now: forms and returns
+ * (carrick#3047); the protocol, the path and export bound names, a literal,
+ * a document and a ref name slot (carrick#3048, library-claims-protocol.test.ts).
+ */
+const BUILT = new Set([
+  'form new',
+  'form decorate',
+  'returns empty',
+  'returns result',
+  'scope form decorate',
+  'name slot document',
+  'name slot ref function',
+  'name slot ref class',
+  'name literal',
+  'bound path',
+  'bound export',
+  'protocol http',
+  'protocol graphql',
+  'protocol rpc',
+  'protocol socket',
+  'protocol message',
+]);
 
 describe('verify_library_claims: amendment 7 grammar (carrick#3045)', () => {
   let root: string;
@@ -143,7 +164,7 @@ describe('verify_library_claims: amendment 7 grammar (carrick#3045)', () => {
       assert.deepStrictEqual(settled.checks[0].claim, element.claim);
     });
 
-    // Judged since carrick#3047 (library-claims-forms.test.ts).
+    // Judged since carrick#3047 (library-claims-forms.test.ts) and carrick#3048 (library-claims-protocol.test.ts).
     if (BUILT.has(name)) continue;
     it(`answers unchecked part_unbuilt for ${name}`, () => {
       assert.strictEqual(verdict(element), 'unchecked part_unbuilt');
