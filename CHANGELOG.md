@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.139](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.138...carrick-v0.3.139) (2026-10-31)
+
+
+### Features
+
+* **scan:** store each service's measured memory peaks in its blob ([#3099](https://github.com/carrick-tools/carrick/issues/3099)) ([5c5d9ae](https://github.com/carrick-tools/carrick/commit/5c5d9ae8241361737e5c8d61c1799f49bcf36bea))
+* **sidecar:** reach_graph and reach actions, the affected-set walk with four fixes and stems ([#3100](https://github.com/carrick-tools/carrick/issues/3100)) ([#3107](https://github.com/carrick-tools/carrick/issues/3107)) ([a53f537](https://github.com/carrick-tools/carrick/commit/a53f537aa70e54357da2a659384e77d722458a4c))
+
 ## [0.3.138](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.137...carrick-v0.3.138) (2026-10-31)
 
 
