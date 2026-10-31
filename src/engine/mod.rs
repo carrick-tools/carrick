@@ -28262,6 +28262,65 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(dropped.new_endpoints.is_empty());
     }
 
+    /// carrick#3079: the delta tells routes apart by identity, not by how a
+    /// parameter is spelled; a real change still lists, in each side's own
+    /// spelling.
+    #[test]
+    fn the_pr_delta_ignores_how_a_route_parameter_is_spelled() {
+        const THIS: &str = "0.4.0";
+        let delta_of = |previous: &[&str], current: &[&str]| {
+            let DeltaBaseline::Keys(previous) =
+                DeltaBaseline::of([&service_stating("web", Some(THIS), previous)], THIS)
+            else {
+                panic!("this version's index is the baseline");
+            };
+            let delta = endpoint_delta(&previous, &[service_stating("web", Some(THIS), current)]);
+            let paths = |refs: &[crate::findings::EndpointRef]| -> Vec<String> {
+                refs.iter().map(|r| r.path.clone()).collect()
+            };
+            (paths(&delta.new_endpoints), paths(&delta.removed_endpoints))
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            delta_of(&["/orders/{orderId}/items"], &["/orders/:orderId/items"]),
+            (none.clone(), none.clone())
+        );
+        assert_eq!(
+            delta_of(
+                &["/plans/:id/actions/:action"],
+                &["/plans/:id/actions/${action}"]
+            ),
+            (none.clone(), none.clone())
+        );
+        assert_eq!(
+            delta_of(&[], &["/x/:id", "/x/{id}"]),
+            (vec!["/x/:id".to_string()], none.clone()),
+            "two spellings of one route are one operation"
+        );
+        assert_eq!(
+            delta_of(&["/users/:id"], &["/users/me"]),
+            (
+                vec!["/users/me".to_string()],
+                vec!["/users/:id".to_string()]
+            )
+        );
+        assert_eq!(
+            delta_of(&["/widgets/:id"], &["/gadgets/:id"]),
+            (
+                vec!["/gadgets/:id".to_string()],
+                vec!["/widgets/:id".to_string()]
+            )
+        );
+        assert_eq!(
+            delta_of(&["/gadgets/{id}"], &["/widgets/:id"]),
+            (
+                vec!["/widgets/:id".to_string()],
+                vec!["/gadgets/{id}".to_string()]
+            ),
+            "each row keeps its own spelling"
+        );
+    }
+
     fn repo_with_bundle(
         repo_name: &str,
         service_name: Option<&str>,
