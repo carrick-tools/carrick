@@ -549,9 +549,10 @@ pub fn is_repo_input(path: &str) -> bool {
 /// change is listed, and those manifests and lockfiles then count like a
 /// version-only manifest.
 ///
-/// A run that carries under that rule and uploads would write a stored
-/// manifest projection (`packages`, `package_json`, `package_json_hash`)
-/// older than HEAD's; `refreshed_carried` does not refresh it today because
+/// A run that carries under that rule, or under the dependency-only rule,
+/// and uploads would write a stored manifest projection (`packages`,
+/// `package_json`, `package_json_hash`) older than HEAD's (under the
+/// dependency rule, older dependency versions); `refreshed_carried` does not refresh it today because
 /// no uploading run carries (pinned by
 /// `a_carried_write_keeps_the_stored_manifest_projection`).
 ///

@@ -729,14 +729,10 @@ fn tsconfig_packages(
             packages.insert("react".to_string());
         }
         if let Some(Value::Object(paths)) = options.get("paths") {
-            for target in paths.values().filter_map(Value::as_array).flatten() {
-                if let Some(at) = target
-                    .as_str()
-                    .and_then(|t| t.rfind("node_modules/").map(|at| (t, at)))
-                {
-                    let (target, at) = at;
-                    packages
-                        .insert(package_name(&target[at + "node_modules/".len()..]).to_string());
+            let targets = paths.values().filter_map(Value::as_array).flatten();
+            for target in targets.filter_map(Value::as_str) {
+                if let Some((_, installed)) = target.rsplit_once("node_modules/") {
+                    packages.insert(package_name(installed).to_string());
                 }
             }
         }
