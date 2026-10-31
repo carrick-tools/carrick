@@ -51,6 +51,7 @@ import {
 } from './infer-cache.js';
 import { writePositionRows } from './position-rows.js';
 import { findImplementations } from './implementations.js';
+import { importGraphOf, mergeGraphs, reach, serialiseGraph } from './affected-set.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -69,6 +70,8 @@ import type {
   HealthResponse,
   ShutdownResponse,
   ListProgramFilesResponse,
+  ReachGraphResponse,
+  ReachResponse,
   AddProgramFilesResponse,
   PositionRowsResponse,
   ImplementationsResponse,
@@ -872,6 +875,45 @@ function handleListProgramFiles(
 }
 
 /**
+ * Handle the 'reach_graph' action - the import graph of every program the
+ * process has built, the default one and each owning project's (carrick#3100).
+ * A process that has built none builds the default one, so a replay can ask
+ * after `init` alone. Paths are relative to the scan root.
+ */
+function handleReachGraph(request: SidecarRequest & { action: 'reach_graph' }): ReachGraphResponse {
+  try {
+    const loader = initializedLoader();
+    const startTime = performance.now();
+    if (loader.builtProjects().length === 0) loader.getProject();
+    const root = loader.getScanRoot();
+    const graph = serialiseGraph(
+      mergeGraphs(loader.builtProjects().map((project) => importGraphOf(project.getProgram().compilerObject, root)))
+    );
+    log(`Read the import graph of ${graph.files.length} file(s) in ${Math.round(performance.now() - startTime)}ms`);
+    return { request_id: request.request_id, status: 'success', version: 1, graph };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Reading the import graph failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
+ * Handle the 'reach' action - the files a set of edits can reach in a graph
+ * `reach_graph` wrote (carrick#3100). Reads no program.
+ */
+function handleReach(request: SidecarRequest & { action: 'reach' }): ReachResponse {
+  try {
+    const answer = reach(request.graph, request.changes);
+    return { request_id: request.request_id, status: 'success', ...answer };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Reach failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'add_program_files' action - add the given files to the default
  * project's program in the given order, rebuilding it at most once
  * (carrick#2027). A file a referenced project owns is skipped, as an `infer`
@@ -1037,6 +1079,10 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleListLibrarySurface(request);
     case 'list_program_files':
       return handleListProgramFiles(request);
+    case 'reach_graph':
+      return handleReachGraph(request);
+    case 'reach':
+      return handleReach(request);
     case 'add_program_files':
       return handleAddProgramFiles(request);
     case 'position_rows':

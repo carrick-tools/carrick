@@ -331,6 +331,42 @@ export const ListProgramFilesRequestSchema = BaseRequestSchema.extend({
   action: z.literal('list_program_files'),
 });
 
+export const ReachGraphRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('reach_graph'),
+});
+
+/** The shape `serialiseGraph` writes; an index outside the string table is refused when the graph is read. */
+const SerialGraphSchema = z.object({
+  version: z.literal(1),
+  strings: z.array(z.string()),
+  files: z.array(
+    z.object({
+      p: z.number().int(),
+      g: z.union([z.literal(0), z.literal(1)]),
+      d: z.array(z.number().int()),
+      r: z.array(z.array(z.number().int())),
+      l: z.array(z.array(z.number().int())),
+      e: z.array(z.number().int()),
+      t: z.array(z.array(z.number().int())),
+      b: z.array(z.tuple([z.number().int(), z.number().int(), z.array(z.number().int())])),
+      w: z.array(z.number().int()),
+      s: z.array(z.tuple([z.number().int(), z.array(z.number().int()), z.array(z.number().int())])),
+    })
+  ),
+});
+
+export const ReachRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('reach'),
+  graph: SerialGraphSchema,
+  changes: z.array(
+    z.object({
+      file: z.string().min(1, 'File path cannot be empty'),
+      before: z.string(),
+      after: z.string(),
+    })
+  ),
+});
+
 export const AddProgramFilesRequestSchema = BaseRequestSchema.extend({
   action: z.literal('add_program_files'),
   files: z.array(z.string().min(1, 'File path cannot be empty')),
@@ -717,6 +753,8 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   HealthRequestSchema,
   ShutdownRequestSchema,
   ListProgramFilesRequestSchema,
+  ReachGraphRequestSchema,
+  ReachRequestSchema,
   AddProgramFilesRequestSchema,
   PositionRowsRequestSchema,
   ImplementationsRequestSchema,

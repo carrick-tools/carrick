@@ -1631,6 +1631,14 @@ enum SidecarRequest {
     },
     #[serde(rename = "list_program_files")]
     ListProgramFiles { request_id: String },
+    #[serde(rename = "reach_graph")]
+    ReachGraph { request_id: String },
+    #[serde(rename = "reach")]
+    Reach {
+        request_id: String,
+        graph: serde_json::Value,
+        changes: Vec<ReachChange>,
+    },
     #[serde(rename = "position_rows")]
     PositionRows {
         request_id: String,
@@ -1661,7 +1669,9 @@ impl SidecarRequest {
         match self {
             SidecarRequest::Init { .. }
             | SidecarRequest::ListProgramFiles { .. }
+            | SidecarRequest::ReachGraph { .. }
             | SidecarRequest::Shutdown { .. } => 0,
+            SidecarRequest::Reach { changes, .. } => changes.len(),
             SidecarRequest::AddProgramFiles { files, .. }
             | SidecarRequest::PositionRows { files, .. } => files.len(),
             SidecarRequest::Bundle { symbols, .. } => symbols.len(),
@@ -1675,6 +1685,35 @@ impl SidecarRequest {
             SidecarRequest::VerifyLibraryClaims { checks, .. } => checks.len(),
         }
     }
+}
+
+/// One edit for [`TypeSidecar::reach`]: the file's text before and after, `""`
+/// for the missing side of an added or deleted file.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReachChange {
+    pub file: String,
+    pub before: String,
+    pub after: String,
+}
+
+/// What a set of edits can reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reached {
+    /// An installed file, a file that is not source, or a `.json` file changed.
+    All,
+    /// The changed files and every file whose types read a changed declaration.
+    Files(Vec<String>),
+}
+
+/// The answer to [`TypeSidecar::reach`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachAnswer {
+    pub reached: Reached,
+    /// The changed files holding a script or an augmentation: the caller
+    /// widens each to every file of the programs that hold it.
+    pub augmented: Vec<String>,
+    /// A file that exists on both sides added or removed an export.
+    pub exports_moved: bool,
 }
 
 // ============================================================================
@@ -2029,6 +2068,18 @@ pub struct SidecarResponse {
     /// How many files were added (for add_program_files)
     #[serde(default)]
     pub added: Option<usize>,
+    /// The import graph of the built programs (for reach_graph), opaque here
+    #[serde(default)]
+    pub graph: Option<serde_json::Value>,
+    /// `"all"` or the reached files (for reach)
+    #[serde(default)]
+    pub reached: Option<serde_json::Value>,
+    /// The changed files holding a script or an augmentation (for reach)
+    #[serde(default)]
+    pub augmented: Option<Vec<String>>,
+    /// Whether a file that exists on both sides added or removed an export (for reach)
+    #[serde(default)]
+    pub exports_moved: Option<bool>,
     /// Error messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
@@ -3445,6 +3496,10 @@ impl TypeSidecar {
                 duration_ms: None,
                 files: None,
                 added: None,
+                graph: None,
+                reached: None,
+                augmented: None,
+                exports_moved: None,
                 errors: None,
             });
         }
@@ -3505,6 +3560,10 @@ impl TypeSidecar {
                 duration_ms: None,
                 files: None,
                 added: None,
+                graph: None,
+                reached: None,
+                augmented: None,
+                exports_moved: None,
                 errors: None,
             });
         }
@@ -3588,6 +3647,66 @@ impl TypeSidecar {
             )
         })?;
         Ok(files.into_iter().map(PathBuf::from).collect())
+    }
+
+    /// The import graph of every program the sidecar has built (it builds the
+    /// default one when none is), without statement texts, with paths relative
+    /// to the scan root (carrick#3100). Opaque here: hand it back to
+    /// [`Self::reach`].
+    pub fn reach_graph(&self) -> Result<serde_json::Value, SidecarError> {
+        self.ensure_ready()?;
+        let request = SidecarRequest::ReachGraph {
+            request_id: self.next_request_id(),
+        };
+        self.send_request(&request)?;
+        let response = self.operation_response()?;
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::ReachFailed(errors.join("; ")));
+        }
+        response.graph.ok_or_else(|| {
+            SidecarError::DeserializationError("reach_graph answered without a graph".to_string())
+        })
+    }
+
+    /// The files `changes` can reach in a graph [`Self::reach_graph`] wrote
+    /// (carrick#3100). Paths are relative to the scan root, and `before` or
+    /// `after` is empty for the missing side of an added or deleted file.
+    /// Reads no program.
+    pub fn reach(
+        &self,
+        graph: &serde_json::Value,
+        changes: &[ReachChange],
+    ) -> Result<ReachAnswer, SidecarError> {
+        self.ensure_ready()?;
+        let request = SidecarRequest::Reach {
+            request_id: self.next_request_id(),
+            graph: graph.clone(),
+            changes: changes.to_vec(),
+        };
+        self.send_request(&request)?;
+        let response = self.operation_response()?;
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::ReachFailed(errors.join("; ")));
+        }
+        let unreadable =
+            || SidecarError::DeserializationError("reach answered without its files".to_string());
+        let reached = match response.reached.ok_or_else(unreadable)? {
+            serde_json::Value::String(all) if all == "all" => Reached::All,
+            serde_json::Value::Array(files) => Reached::Files(
+                files
+                    .into_iter()
+                    .map(|file| file.as_str().map(str::to_string).ok_or_else(unreadable))
+                    .collect::<Result<_, _>>()?,
+            ),
+            _ => return Err(unreadable()),
+        };
+        Ok(ReachAnswer {
+            reached,
+            augmented: response.augmented.unwrap_or_default(),
+            exports_moved: response.exports_moved.unwrap_or(false),
+        })
     }
 
     /// Add `files` the init'd project has not loaded, in the given order,
@@ -4825,6 +4944,8 @@ pub enum SidecarError {
     CheckFailed(String),
     /// The sidecar could not list or add its program's files
     ProgramFilesFailed(String),
+    /// The sidecar answered a reach_graph or reach request with an error (carrick#3100)
+    ReachFailed(String),
     /// The sidecar answered a position-rows walk with an error (carrick#2405)
     PositionRowsFailed(String),
     /// The sidecar answered an implementations request with an error (carrick#2432)
@@ -4879,6 +5000,7 @@ impl SidecarError {
             | SidecarError::CaptureFailed(_)
             | SidecarError::CheckFailed(_)
             | SidecarError::ProgramFilesFailed(_)
+            | SidecarError::ReachFailed(_)
             | SidecarError::PositionRowsFailed(_)
             | SidecarError::ImplementationsFailed(_) => false,
             SidecarError::SpawnFailed(_)
@@ -4906,6 +5028,7 @@ impl std::fmt::Display for SidecarError {
             SidecarError::CaptureFailed(e) => write!(f, "v2 capture failed: {}", e),
             SidecarError::CheckFailed(e) => write!(f, "v2 check failed: {}", e),
             SidecarError::ProgramFilesFailed(e) => write!(f, "Program files request failed: {}", e),
+            SidecarError::ReachFailed(e) => write!(f, "Reach request failed: {}", e),
             SidecarError::PositionRowsFailed(e) => write!(f, "Position rows walk failed: {}", e),
             SidecarError::ImplementationsFailed(e) => {
                 write!(f, "Implementations request failed: {}", e)
@@ -5893,6 +6016,23 @@ mod tests {
                 scan_root: Some("/repo".into()),
             },
             SidecarRequest::ListProgramFiles { request_id: id() },
+            SidecarRequest::ReachGraph { request_id: id() },
+            SidecarRequest::Reach {
+                request_id: id(),
+                graph: serde_json::json!({
+                    "version": 1,
+                    "strings": ["src/a.ts", "x", "src/b.ts", "*"],
+                    "files": [{
+                        "p": 0, "g": 0, "d": [1], "r": [[1, 1]], "l": [[1]], "e": [1],
+                        "t": [[1, 1]], "b": [[1, 1, [2, 3]]], "w": [1], "s": [[2, [1], [2]]]
+                    }]
+                }),
+                changes: vec![ReachChange {
+                    file: "src/a.ts".into(),
+                    before: "export const x = 1;".into(),
+                    after: "export const x = 2;".into(),
+                }],
+            },
             SidecarRequest::AddProgramFiles {
                 request_id: id(),
                 files: vec!["/repo/apps/web/tools/seed.ts".into()],

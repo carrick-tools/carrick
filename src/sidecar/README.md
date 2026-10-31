@@ -136,6 +136,8 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
 | `list_program_files` | yes | The files the program was built from, in order |
 | `add_program_files` | yes | Add files to the program in a given order |
+| `reach_graph` | yes | The import graph of every built program (builds the default one first), without statement texts, paths relative to the scan root |
+| `reach` | no | The files a set of edits can reach in a `reach_graph` graph: `{ reached, augmented, exports_moved }` |
 | `position_rows` | yes | Write the compiler's rows for every call, member access, comparison and identifier of a service's files (record-only) |
 | `implementations` | yes | The implementations of the bodyless declaration each given call goes through |
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
@@ -893,6 +895,27 @@ Response:
 To give a second process the first one's program, send the first one's `list_program_files` answer to the second one's `add_program_files` before the second one answers any other request. Both processes then build from the same roots in the same order, so they hold the same files in the same order. A process that has already added files keeps them where they are.
 
 Both actions read the default project, the one that types every file no referenced project owns. A file a referenced project owns (carrick#1604) is in that project's program from its tsconfig, so `add_program_files` skips it, and no request adds files to that program.
+
+#### `reach_graph` and `reach` - Which files an edit can reach (carrick#3100)
+
+A check that re-types only what a change can reach asks two questions. `reach_graph` reads the import graph of every program the process has built (the default project and each owning project's), builds the default project first when none is built, and answers `{ "version": 1, "graph": ... }`. The graph holds repo files only (nothing under `node_modules`), by path relative to the scan root, with no statement texts: per file its declared names, the identifiers they mention that can matter, its exports, its bindings with the file and name each resolves to, and the stem each import was looked up at. Names and paths are indices into one string table.
+
+`reach` takes that graph and `changes` (`{ file, before, after }`, paths relative to the scan root, `''` for the missing side of an added or deleted file) and reads no program, so it needs no `init`:
+
+```json
+{ "request_id": "14", "action": "reach", "graph": {}, "changes": [{ "file": "src/orders.ts", "before": "...", "after": "..." }] }
+```
+
+Response:
+```json
+{ "request_id": "14", "status": "success", "reached": ["src/orders.ts", "src/views.ts"], "augmented": [], "exports_moved": false }
+```
+
+- `reached` is the changed files (an added file, not a deleted one) and every file whose types read a changed declaration, followed name by name through re-exports. It is `"all"` for an installed file or a file that is not TypeScript or JavaScript source (`.json` included).
+- An added or deleted file is an empty module on its missing side. Its export names are not matched against importers elsewhere; its importers are reached through the graph, and so is any file with an import looked up at the file's stem (a new `y.ts` beside `y/index.ts`).
+- `augmented` lists the changed files that are scripts (no import or export), hold a `declare global` or `declare module 'x'` that changed, or read a changed name of one. The caller widens each to every file of the programs that hold it.
+- CommonJS JavaScript is a module. A file the graph reads as a script but its text reads as a module, or the reverse, is a script.
+- `exports_moved` is true when a file that exists on both sides added or removed an export.
 
 #### `position_rows` - The compiler's rows for every position (carrick#2405)
 

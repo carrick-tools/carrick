@@ -588,6 +588,19 @@ export class ProjectLoader {
   }
 
   /**
+   * Every program a request has built: the default project and each owning
+   * project's (carrick#1604), without building any (carrick#3100).
+   */
+  builtProjects(): Project[] {
+    return [...(this.project ? [this.project] : []), ...this.ownerProjects.values()];
+  }
+
+  /** The scanned repo's root when init named one, else the service root. */
+  getScanRoot(): string {
+    return this.scanRoot ?? this.repoRoot;
+  }
+
+  /**
    * The registry package a resolved file belongs to, when the module graph
    * names one (carrick#1260). `undefined` for a project that did not resolve
    * through Deno, and for a file the workspace itself owns.
