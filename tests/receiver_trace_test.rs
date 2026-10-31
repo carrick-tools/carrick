@@ -222,7 +222,13 @@ fn run_scan_printing(cmd: &mut Command, storage: &Path) -> (Blobs, Fallbacks, St
         let mut blob: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         if let Some(object) = blob.as_object_mut() {
-            for stamp in ["scanner_version", "scanner_build", "last_updated"] {
+            for stamp in [
+                "scanner_version",
+                "scanner_build",
+                "last_updated",
+                // Measured, so it differs run to run (carrick#3083).
+                "memory_peaks",
+            ] {
                 object.remove(stamp);
             }
         }

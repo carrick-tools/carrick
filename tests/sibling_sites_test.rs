@@ -213,6 +213,25 @@ fn a_service_states_the_requests_a_sibling_s_code_makes_at_its_own_calls() {
     assert_app_rows(&blobs);
 }
 
+/// carrick#3083: a walked service states what its compiler walk held.
+#[test]
+fn a_walked_service_stores_its_walk_s_memory_peak() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let blobs = scan(&repo, store.path(), &[], false);
+    for service in ["app", "client"] {
+        let peaks = &blob_of(&blobs, service)["memory_peaks"];
+        assert!(
+            peaks["walk_mb"].as_u64().unwrap_or(0) > 0,
+            "{service}: no walk peak: {peaks}"
+        );
+    }
+}
+
 /// A scan of a change to the consumer alone carries the client, walks it for
 /// the app's calls, and states the same rows as a full scan.
 #[test]
