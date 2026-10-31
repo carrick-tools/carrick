@@ -30,7 +30,7 @@ use swc_common::errors::Handler;
 use swc_common::sync::Lrc;
 use swc_common::{FileName, SourceMap, SourceMapper, Spanned};
 use swc_ecma_visit::VisitWith;
-use tracing::debug;
+use tracing::info;
 
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
@@ -448,7 +448,10 @@ pub fn block_for_run(
                 .flat_map(|service| service.function_definitions.values()),
         )),
         Err(reason) => {
-            debug!("The functions this PR changed are not named: {reason}");
+            // At info, on one line: git's stderr can run to several, and a
+            // runner's log keeps each line as its own event (carrick#2285).
+            let reason = reason.lines().collect::<Vec<_>>().join("; ");
+            info!("The functions this PR changed are not named: {reason}");
             FunctionsBlock::Unknown {
                 unknown: FunctionsUnknown::BaseUnavailable,
             }
@@ -826,6 +829,166 @@ export function n(): number {
             block_json(&block_for_run(root, Some(absent), &services, &[])),
             json!({ "unknown": "base_unavailable" })
         );
+    }
+
+    /// Whether this machine's git reads a partial clone without fetching
+    /// (`GIT_NO_LAZY_FETCH`, git 2.44 and later). CI's does. An older git is
+    /// refused before any read.
+    fn git_reads_offline() -> bool {
+        std::process::Command::new("git")
+            .args(["--no-lazy-fetch", "version"])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// The cloud runner's clone of a pull request (carrick-cloud
+    /// `runner/image/src/clone.ts`): the merge of the PR's head into its
+    /// base, fetched by id at depth 2 with no file contents and checked out
+    /// detached. With `prefetch`, one full diff from the base fetches the
+    /// changed files' copies on both sides, as the runner does before the
+    /// scan. The PR edits `a.ts`, renames `b.ts` to `c.ts` with an edit, so
+    /// pairing the two reads both copies, and adds `e.ts`.
+    ///
+    /// Returns the server, the clone and the base. The server still serves,
+    /// so a fetch the scan made would succeed and show.
+    fn runner_clone(prefetch: bool) -> (tempfile::TempDir, tempfile::TempDir, String) {
+        let (server, base) = base_repo();
+        let path = server.path();
+        git_in(path, &["config", "uploadpack.allowFilter", "true"]);
+        git_in(path, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+        git_in(path, &["checkout", "-q", "-b", "pr"]);
+        std::fs::write(path.join("a.ts"), A_HEAD).unwrap();
+        git_in(path, &["mv", "b.ts", "c.ts"]);
+        std::fs::write(path.join("c.ts"), B.replace("return 1;", "return 10;")).unwrap();
+        std::fs::write(path.join("e.ts"), E).unwrap();
+        let head = commit_all(path);
+        let tree = format!("{head}^{{tree}}");
+        let merge = git_in(
+            path,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-p",
+                &head,
+                "-m",
+                "merge",
+            ],
+        );
+
+        let clone = tempfile::TempDir::new().unwrap();
+        let dir = clone.path();
+        let url = format!("file://{}", path.display());
+        git_in(dir, &["init", "-q"]);
+        git_in(dir, &["remote", "add", "origin", &url]);
+        git_in(
+            dir,
+            &[
+                "fetch",
+                "-q",
+                "--depth=2",
+                "--filter=blob:none",
+                "--no-tags",
+                "origin",
+                &merge,
+            ],
+        );
+        git_in(dir, &["checkout", "-q", "--detach", &merge]);
+        if prefetch {
+            git_in(
+                dir,
+                &[
+                    "diff",
+                    "-M",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--output=/dev/null",
+                    &base,
+                    "HEAD",
+                    "--",
+                ],
+            );
+        }
+        (server, clone, base)
+    }
+
+    /// How many objects the base and HEAD name that the clone does not hold.
+    /// `--missing=print` lists them and fetches none.
+    fn missing_objects(clone: &Path, base: &str) -> usize {
+        git_in(
+            clone,
+            &["rev-list", "--objects", "--missing=print", base, "HEAD"],
+        )
+        .lines()
+        .filter(|line| line.starts_with('?'))
+        .count()
+    }
+
+    /// carrick#2285: a partial clone was refused whole, so every PR the cloud
+    /// runner scanned said `base_unavailable`. The runner's clone holds the
+    /// merge base and the changed files' copies; with its remote gone, as the
+    /// scan holds no credential, the PR's functions are named from them.
+    #[test]
+    fn a_runner_clone_names_the_prs_functions_from_the_copies_it_holds() {
+        let (_server, clone, base) = runner_clone(true);
+        git_in(
+            clone.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "file:///nonexistent/carrick-2285",
+            ],
+        );
+        let root = clone.path().to_str().unwrap();
+        let block = block_for_run(root, Some(&base), &[Config::default()], &[]);
+        if !git_reads_offline() {
+            assert_eq!(block_json(&block), json!({ "unknown": "base_unavailable" }));
+            return;
+        }
+        let file = |f: &str| f.to_string();
+        assert_eq!(
+            listed(&block),
+            (
+                vec![
+                    (file("a.ts"), file("f"), FunctionChange::Edited),
+                    (file("a.ts"), file("k"), FunctionChange::Added),
+                    (file("c.ts"), file("p"), FunctionChange::Edited),
+                    (file("e.ts"), file("n"), FunctionChange::Added),
+                ],
+                vec![at("a.ts", "h")],
+            )
+        );
+        let FunctionsBlock::Named(named) = &block else {
+            unreachable!()
+        };
+        let p = named.changed.iter().find(|f| f.name == "p").unwrap();
+        assert_eq!(p.previous_file.as_deref(), Some("b.ts"));
+    }
+
+    /// A copy the clone does not hold is never fetched: the run says
+    /// `base_unavailable`, and the clone holds what it held before. The
+    /// server still serves, so a lazy fetch would succeed here.
+    #[test]
+    fn a_runner_clone_without_a_copy_fetches_nothing() {
+        let (_server, clone, base) = runner_clone(false);
+        let root = clone.path().to_str().unwrap();
+        let before = missing_objects(clone.path(), &base);
+        assert!(
+            before > 0,
+            "the base's copies of the changed files are absent"
+        );
+        assert_eq!(
+            block_json(&block_for_run(root, Some(&base), &[Config::default()], &[])),
+            json!({ "unknown": "base_unavailable" })
+        );
+        assert_eq!(missing_objects(clone.path(), &base), before);
+        if git_reads_offline() {
+            // Read alone, past the pairing that fails first above.
+            assert!(crate::git_state::file_at(root, &base, "a.ts").is_err());
+            assert_eq!(missing_objects(clone.path(), &base), before);
+        }
     }
 
     /// The scope a run uses: the service's own walk for the PR's tree, and

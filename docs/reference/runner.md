@@ -164,6 +164,14 @@ stored blob was written at must be present in the clone.
   (`resolve-repos` lists them per service as `hash`), not one.
 - A stored commit that no longer exists on the remote, for example after a
   force push, cannot be fetched; that service runs in full.
+- A `--pr` scan names the functions the pull request added, edited or
+  removed by reading each changed file at the merge base of HEAD and
+  `--pr-base`. The clone must hold that merge base and, in a partial clone,
+  both copies of every changed file: one `git diff -M <base> HEAD` with its
+  output discarded fetches them. The scan reads only what the clone holds
+  (git 2.44 or later), so a missing copy leaves the result's `functions` as
+  `base_unavailable` and the reason in an info line (`changed_files`,
+  `src/git_state.rs`).
 - Keep the tree clean before the scan: install with frozen lockfiles where
   the manager allows it. A rewritten tracked file also marks the upload
   `dirty`. With `CARRICK_INSTALL_LOCKFILE_RETRY=1` (the runner sets it), a

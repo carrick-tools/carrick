@@ -778,24 +778,30 @@ fn no_base_message(repo_path: &str, branch: &str) -> String {
 /// names a rename. Two commits and never the working tree: what a build step
 /// wrote there is no part of either.
 ///
-/// `Err` also for a partial clone: pairing renames reads file contents, and a
-/// copy the clone does not hold would be fetched from its remote.
+/// Pairing renames reads file contents. A partial clone (the cloud runner's)
+/// is read from the copies it holds and never fetches one (carrick#2285): the
+/// runner fetches the changed files on both sides before the scan, which
+/// holds no credential to fetch more. A copy the clone lacks is an `Err`, and
+/// so is a git too old to read a partial clone without fetching. The clone
+/// this needs is stated in `docs/reference/runner.md`, "Clone shape".
 pub fn changed_files(repo_path: &str, from: &str, to: &str) -> Result<Vec<FileChange>, String> {
+    // Before any read: a git that ignores `NO_LAZY_FETCH` would fetch.
+    if is_partial_clone(repo_path) && run_git(repo_path, &["--no-lazy-fetch", "version"]).is_err() {
+        return Err("a partial clone needs git 2.44 or later to read without fetching".to_string());
+    }
     for commit in [from, to] {
         // As in `changed_paths`: nothing but a hex object name reaches git.
         if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(format!("{commit:?} is not a commit id"));
         }
-        run_git(
+        run_git_env(
             repo_path,
             &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+            &NO_LAZY_FETCH,
         )?;
     }
-    if is_partial_clone(repo_path) {
-        return Err("a partial clone does not hold every file's earlier copy".to_string());
-    }
     let args = ["diff", "--name-status", "-M", "-z", from, to, "--"];
-    let mut fields = nul_paths(run_git(repo_path, &args)?).into_iter();
+    let mut fields = nul_paths(run_git_env(repo_path, &args, &NO_LAZY_FETCH)?).into_iter();
     let mut changed = Vec::new();
     while let Some(status) = fields.next() {
         let Some(letter) = status.chars().next() else {
@@ -822,7 +828,8 @@ pub fn changed_files(repo_path: &str, from: &str, to: &str) -> Result<Vec<FileCh
 /// The text of `path` (relative to the repository's top level) as `commit`
 /// holds it. Bytes that are not UTF-8 are replaced, so one odd file reads as
 /// text that does not parse and not as git failing. `Err` means git could not
-/// read it.
+/// read it, which on a partial clone includes a copy it does not hold: as in
+/// [`changed_files`], nothing is fetched.
 pub fn file_at(repo_path: &str, commit: &str, path: &str) -> Result<String, String> {
     if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("{commit:?} is not a commit id"));
@@ -833,6 +840,7 @@ pub fn file_at(repo_path: &str, commit: &str, path: &str) -> Result<String, Stri
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .envs(NO_LAZY_FETCH)
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -886,15 +894,28 @@ pub fn ignored_paths(repo_path: &Path) -> Result<Vec<String>, String> {
     )?))
 }
 
+/// Set on a read that must not fetch: git answers from the objects the clone
+/// holds, and an absent one is an error, never a fetch from a partial clone's
+/// remote. Nothing is fetched lazily from a full clone, so there it changes
+/// nothing. Honoured by git 2.44 and later; [`changed_files`] refuses an
+/// older git on a partial clone before reading.
+const NO_LAZY_FETCH: [(&str, &str); 1] = [("GIT_NO_LAZY_FETCH", "1")];
+
 /// Run git in `repo_path` with the inherited git environment cleared (see
 /// [`inspect`]), returning stdout, or stderr as the error.
 fn run_git(repo_path: &str, args: &[&str]) -> Result<String, String> {
+    run_git_env(repo_path, args, &[])
+}
+
+/// [`run_git`] with `env` set on the git process.
+fn run_git_env(repo_path: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(repo_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .envs(env.iter().copied())
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
