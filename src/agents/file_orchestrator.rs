@@ -55,9 +55,9 @@ use crate::{
         TypeSidecar,
     },
     swc_scanner::{
-        CandidateTarget, ControllerRouteBinding, DecoratorRoute, PubsubAnchorOp,
-        RouteDescriptorEndpoint, SwcScanner, collect_import_sources, is_producer_route_path,
-        normalize_path_params,
+        CandidateTarget, ControllerRouteBinding, DecoratorRoute, DescriptorDataArray,
+        PubsubAnchorOp, RouteDescriptorEndpoint, RouteDescriptors, SwcScanner,
+        collect_import_sources, is_producer_route_path, normalize_path_params,
     },
     type_manifest::{
         build_manifest_type_alias, build_manifest_type_alias_with_site_id, build_site_id,
@@ -2978,11 +2978,30 @@ impl FileOrchestrator {
             // dropped from `http_candidates` below (matched by span): a file whose
             // only candidates are deterministically-owned descriptors then skips
             // the LLM entirely, like a file-based route.
-            let descriptor_endpoints =
+            //
+            // A table of `{ method, path }` records that only describes routes
+            // (carrick#3082) emits nothing, and its candidates stay off the
+            // model as well, so the model is asked exactly what it was asked
+            // before the table was read as data.
+            let (descriptor_endpoints, descriptor_data) =
                 Self::route_descriptor_endpoints(&self.swc_scanner, file_path, &content);
+            for array in &descriptor_data {
+                debug!(
+                    "Read the array at {}:{} as data, not routes ({} records): {}",
+                    file_path.display(),
+                    array.line_number,
+                    array.spans.len(),
+                    array.reason.as_str()
+                );
+            }
             let descriptor_spans: HashSet<(u32, u32)> = descriptor_endpoints
                 .iter()
                 .filter_map(|e| Some((e.call_expression_span_start?, e.call_expression_span_end?)))
+                .chain(
+                    descriptor_data
+                        .iter()
+                        .flat_map(|array| array.spans.iter().copied()),
+                )
                 .collect();
             let http_candidates: Vec<_> = http_candidates
                 .into_iter()
@@ -5257,6 +5276,7 @@ impl FileOrchestrator {
                                         Path::new(&file_path_absolute),
                                         &content,
                                     )
+                                    .endpoints
                                     .into_iter()
                                     .filter(|descriptor| descriptor.handler_followable)
                                     .map(|descriptor| descriptor.span_start)
@@ -7519,9 +7539,12 @@ impl FileOrchestrator {
         scanner: &SwcScanner,
         file_path: &Path,
         content: &str,
-    ) -> Vec<EndpointResult> {
-        scanner
-            .route_descriptor_endpoints(file_path, content)
+    ) -> (Vec<EndpointResult>, Vec<DescriptorDataArray>) {
+        let RouteDescriptors {
+            endpoints,
+            data_arrays,
+        } = scanner.route_descriptor_endpoints(file_path, content);
+        let rows = endpoints
             .into_iter()
             .filter(|d| is_http_method(&d.method))
             .map(|d: RouteDescriptorEndpoint| {
@@ -7553,7 +7576,8 @@ impl FileOrchestrator {
                     resolution_source: None,
                 }
             })
-            .collect()
+            .collect();
+        (rows, data_arrays)
     }
 
     /// Build deterministic endpoints for the routes a class declares with
@@ -18334,7 +18358,8 @@ export function serializeWidget(w) { return w; }
         );
         let content = std::fs::read_to_string(&fixture).expect("fixture must exist");
 
-        let endpoints = FileOrchestrator::route_descriptor_endpoints(&scanner, &fixture, &content);
+        let (endpoints, _) =
+            FileOrchestrator::route_descriptor_endpoints(&scanner, &fixture, &content);
 
         assert_eq!(
             endpoints.len(),
@@ -18360,11 +18385,11 @@ export function serializeWidget(w) { return w; }
         let scanner = SwcScanner::new();
         let content = r#"
 const routes = [
-  { method: 'POST', path: '/widgets' },
+  { method: 'POST', path: '/widgets', responses: { 201: {} } },
 ];
 export { routes };
 "#;
-        let endpoints =
+        let (endpoints, _) =
             FileOrchestrator::route_descriptor_endpoints(&scanner, Path::new("routes.ts"), content);
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].method, "POST");

@@ -1,0 +1,7 @@
+{
+  "name": "descriptor-route-data",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: arrays of method/path records, some declaring routes and some holding data (carrick#3082)",
+  "main": "src/registry.ts"
+}

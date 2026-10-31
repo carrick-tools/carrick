@@ -401,6 +401,54 @@ pub struct RouteDescriptorEndpoint {
     pub span_end: u32,
 }
 
+/// What [`SwcScanner::route_descriptor_endpoints`] read from one file.
+#[derive(Debug, Default)]
+pub struct RouteDescriptors {
+    /// The descriptors that are routes.
+    pub endpoints: Vec<RouteDescriptorEndpoint>,
+    /// The arrays whose handler-less records were read as data, not routes.
+    pub data_arrays: Vec<DescriptorDataArray>,
+}
+
+impl RouteDescriptors {
+    /// The `(start, end)` span of every record read as data.
+    pub fn data_spans(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.data_arrays
+            .iter()
+            .flat_map(|array| array.spans.iter().copied())
+    }
+}
+
+/// An array of `{ method, path }` records read as data (carrick#3082).
+#[derive(Debug)]
+pub struct DescriptorDataArray {
+    /// 1-based line of the array literal.
+    pub line_number: usize,
+    /// The `(start, end)` span of each handler-less record left out.
+    pub spans: Vec<(u32, u32)>,
+    /// Why the table is not a route declaration.
+    pub reason: DescriptorDataReason,
+}
+
+/// The clause of the route-table rule a table of records failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorDataReason {
+    /// The array is built inside a function body.
+    InsideFunction,
+    /// A handler-less record states nothing beyond its method and path, or
+    /// only scalar values.
+    NoContractMember,
+}
+
+impl DescriptorDataReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InsideFunction => "array inside a function body",
+            Self::NoContractMember => "a record states only scalar values beside method and path",
+        }
+    }
+}
+
 /// A request target written as a base binding followed by a literal path
 /// (carrick#733): `` `${API_URL}/api/users/${id}` ``, or the same statement
 /// written as a concatenation.
@@ -947,21 +995,27 @@ impl SwcScanner {
     /// these facts directly, bypassing the LLM. Only descriptors whose method
     /// *and* path are string literals are returned; the rest stay on the
     /// recall-boost candidate path.
-    pub fn route_descriptor_endpoints(
-        &self,
-        file_path: &Path,
-        content: &str,
-    ) -> Vec<RouteDescriptorEndpoint> {
+    ///
+    /// A handler-less table is routes only when it declares them (carrick#3082):
+    /// see [`RouteDescriptorVisitor`]. The records of a table read as data are
+    /// returned as spans, so the caller keeps their recall candidates off the
+    /// emitted set exactly as it keeps the emitted rows'.
+    pub fn route_descriptor_endpoints(&self, file_path: &Path, content: &str) -> RouteDescriptors {
         let Some((sm, module)) = parse_standalone_module(file_path, content) else {
-            return Vec::new();
+            return RouteDescriptors::default();
         };
 
         let mut visitor = RouteDescriptorVisitor {
             source_map: sm,
+            function_depth: 0,
             endpoints: Vec::new(),
+            data_arrays: Vec::new(),
         };
         module.visit_with(&mut visitor);
-        visitor.endpoints
+        RouteDescriptors {
+            endpoints: visitor.endpoints,
+            data_arrays: visitor.data_arrays,
+        }
     }
 
     /// The routes the classes in `content` declare with decorators
@@ -1954,7 +2008,10 @@ pub fn is_producer_route_path(path: &str) -> bool {
 /// authoritative.
 struct RouteDescriptorVisitor {
     source_map: Lrc<SourceMap>,
+    /// How many function bodies enclose the node being visited.
+    function_depth: usize,
     endpoints: Vec<RouteDescriptorEndpoint>,
+    data_arrays: Vec<DescriptorDataArray>,
 }
 
 impl RouteDescriptorVisitor {
@@ -1971,17 +2028,15 @@ impl RouteDescriptorVisitor {
             || trimmed.starts_with("https://")
     }
 
-    /// Emit a deterministic endpoint for `node` when it carries a literal
-    /// method + a route-shaped literal path. Used only for object literals that
-    /// are direct elements of an array literal (the registry context, #241).
-    fn try_emit(&mut self, node: &ObjectLit) {
-        let Some(descriptor) = CandidateVisitor::route_descriptor(node) else {
-            return;
-        };
+    /// The endpoint for `node` when it carries a literal method + a
+    /// route-shaped literal path. Used only for object literals that are
+    /// direct elements of an array literal (the registry context, #241).
+    fn gated_endpoint(&self, node: &ObjectLit) -> Option<RouteDescriptorEndpoint> {
+        let descriptor = CandidateVisitor::route_descriptor(node)?;
         // The deterministic path requires literal method *and* path; a
         // descriptor missing either keeps only its recall-boost candidate.
         let (Some(method), Some(path)) = (descriptor.method, descriptor.path) else {
-            return;
+            return None;
         };
         // #241: reject non-route paths (bare tokens, RPC method names) so a
         // config object that merely carries `method`/`path` keys is not
@@ -1989,10 +2044,10 @@ impl RouteDescriptorVisitor {
         // full URL is rejected too — it is never the path a route is served
         // at.
         if !is_producer_route_path(&path) {
-            return;
+            return None;
         }
         let span = node.span;
-        self.endpoints.push(RouteDescriptorEndpoint {
+        Some(RouteDescriptorEndpoint {
             method,
             path,
             handler: descriptor.handler,
@@ -2000,7 +2055,90 @@ impl RouteDescriptorVisitor {
             line_number: self.source_map.lookup_char_pos(span.lo).line,
             span_start: span.lo.0,
             span_end: span.hi.0,
-        });
+        })
+    }
+
+    /// The name a property is declared under, when it is a plain name.
+    fn property_name(prop: &Prop) -> Option<String> {
+        let key = match prop {
+            Prop::KeyValue(kv) => &kv.key,
+            Prop::Method(method) => &method.key,
+            Prop::Getter(getter) => &getter.key,
+            Prop::Setter(setter) => &setter.key,
+            Prop::Shorthand(ident) => return Some(ident.sym.to_string()),
+            Prop::Assign(assign) => return Some(assign.key.sym.to_string()),
+        };
+        match key {
+            PropName::Ident(id) => Some(id.sym.to_string()),
+            PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// Whether the record names a handler: a property called `handler` in any
+    /// case, with any value.
+    fn names_a_handler(record: &ObjectLit) -> bool {
+        record.props.iter().any(|prop| {
+            matches!(prop, PropOrSpread::Prop(prop)
+                if Self::property_name(prop).is_some_and(|name| name.eq_ignore_ascii_case("handler")))
+        })
+    }
+
+    /// Whether `expr`, past the wrappers that only restate its type, is a
+    /// scalar literal: a string, number, bigint, boolean, `null`,
+    /// `undefined`, a template literal, or a signed number.
+    fn is_scalar_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Paren(inner) => Self::is_scalar_literal(&inner.expr),
+            Expr::TsAs(inner) => Self::is_scalar_literal(&inner.expr),
+            Expr::TsSatisfies(inner) => Self::is_scalar_literal(&inner.expr),
+            Expr::TsNonNull(inner) => Self::is_scalar_literal(&inner.expr),
+            Expr::TsTypeAssertion(inner) => Self::is_scalar_literal(&inner.expr),
+            Expr::TsConstAssertion(inner) => Self::is_scalar_literal(&inner.expr),
+            Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::BigInt(_) | Lit::Bool(_) | Lit::Null(_)) => {
+                true
+            }
+            Expr::Tpl(_) => true,
+            Expr::Ident(id) => &*id.sym == "undefined",
+            Expr::Unary(unary) => {
+                matches!(unary.op, UnaryOp::Minus | UnaryOp::Plus)
+                    && matches!(Self::strip_wrappers(&unary.arg), Expr::Lit(Lit::Num(_)))
+            }
+            _ => false,
+        }
+    }
+
+    fn strip_wrappers(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Paren(inner) => Self::strip_wrappers(&inner.expr),
+            Expr::TsAs(inner) => Self::strip_wrappers(&inner.expr),
+            Expr::TsSatisfies(inner) => Self::strip_wrappers(&inner.expr),
+            Expr::TsNonNull(inner) => Self::strip_wrappers(&inner.expr),
+            Expr::TsTypeAssertion(inner) => Self::strip_wrappers(&inner.expr),
+            Expr::TsConstAssertion(inner) => Self::strip_wrappers(&inner.expr),
+            other => other,
+        }
+    }
+
+    /// Whether the record carries a member that states something beyond
+    /// identity: a property other than `method`/`path` whose value is not a
+    /// scalar literal, a shorthand, a method, a getter or setter, or a spread.
+    /// A documentation entry states its responses, parameters or a body; a
+    /// record of bookkeeping carries only scalars.
+    fn states_a_contract(record: &ObjectLit) -> bool {
+        record.props.iter().any(|prop| {
+            let PropOrSpread::Prop(prop) = prop else {
+                return true;
+            };
+            match &**prop {
+                Prop::KeyValue(kv) => {
+                    let identity = Self::property_name(prop)
+                        .is_some_and(|name| name == "method" || name == "path");
+                    !identity && !Self::is_scalar_literal(&kv.value)
+                }
+                _ => true,
+            }
+        })
     }
 }
 
@@ -2009,13 +2147,86 @@ impl Visit for RouteDescriptorVisitor {
         // #241: only object literals that are *direct elements* of an array
         // (a routes registry) qualify for deterministic emission. A standalone
         // config object — e.g. an axios `{ method, path, headers }` options bag
-        // — never reaches `try_emit`, so it falls through to the LLM path.
+        // — never reaches the gate, so it falls through to the LLM path.
+        //
+        // carrick#3082: a record naming a handler is a route. A handler-less
+        // record is one only in a table that declares routes: every
+        // handler-less record states a contract beyond its identity, and the
+        // array is a declaration of the module, not a value a function builds
+        // (a test expectation, a payload, a list of calls to make).
+        let mut handled = Vec::new();
+        let mut handler_less: Vec<(RouteDescriptorEndpoint, &ObjectLit)> = Vec::new();
         for element in node.elems.iter().flatten() {
-            if let Expr::Object(obj) = &*element.expr {
-                self.try_emit(obj);
+            let Expr::Object(obj) = &*element.expr else {
+                continue;
+            };
+            let Some(endpoint) = self.gated_endpoint(obj) else {
+                continue;
+            };
+            if Self::names_a_handler(obj) {
+                handled.push(endpoint);
+            } else {
+                handler_less.push((endpoint, obj));
             }
         }
+        self.endpoints.extend(handled);
+
+        let reason = if handler_less.is_empty() {
+            None
+        } else if self.function_depth > 0 {
+            Some(DescriptorDataReason::InsideFunction)
+        } else if !handler_less
+            .iter()
+            .all(|(_, record)| Self::states_a_contract(record))
+        {
+            Some(DescriptorDataReason::NoContractMember)
+        } else {
+            None
+        };
+        match reason {
+            None => self
+                .endpoints
+                .extend(handler_less.into_iter().map(|(endpoint, _)| endpoint)),
+            Some(reason) => self.data_arrays.push(DescriptorDataArray {
+                line_number: self.source_map.lookup_char_pos(node.span.lo).line,
+                spans: handler_less
+                    .iter()
+                    .map(|(endpoint, _)| (endpoint.span_start, endpoint.span_end))
+                    .collect(),
+                reason,
+            }),
+        }
         node.visit_children_with(self);
+    }
+
+    fn visit_function(&mut self, node: &Function) {
+        self.function_depth += 1;
+        node.visit_children_with(self);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
+        self.function_depth += 1;
+        node.visit_children_with(self);
+        self.function_depth -= 1;
+    }
+
+    fn visit_constructor(&mut self, node: &Constructor) {
+        self.function_depth += 1;
+        node.visit_children_with(self);
+        self.function_depth -= 1;
+    }
+
+    fn visit_getter_prop(&mut self, node: &GetterProp) {
+        self.function_depth += 1;
+        node.visit_children_with(self);
+        self.function_depth -= 1;
+    }
+
+    fn visit_setter_prop(&mut self, node: &SetterProp) {
+        self.function_depth += 1;
+        node.visit_children_with(self);
+        self.function_depth -= 1;
     }
 }
 
@@ -4464,8 +4675,9 @@ const routeRegistry = [
 export { routeRegistry };
 "#;
         let scanner = SwcScanner::new();
-        let endpoints =
-            scanner.route_descriptor_endpoints(&PathBuf::from("health.handler.ts"), content);
+        let endpoints = scanner
+            .route_descriptor_endpoints(&PathBuf::from("health.handler.ts"), content)
+            .endpoints;
         assert_eq!(endpoints.len(), 1, "expected one route descriptor endpoint");
         let ep = &endpoints[0];
         assert_eq!(ep.method, "GET");
@@ -4473,6 +4685,175 @@ export { routeRegistry };
         assert_eq!(ep.handler.as_deref(), Some("healthCheckHandler"));
         assert_ne!(ep.handler.as_deref(), Some("GET"));
         assert!(ep.span_end > ep.span_start);
+    }
+
+    /// What `route_descriptor_endpoints` reads from `content`: the paths it
+    /// emits, in order, and the number of records it sets aside as data.
+    fn read_descriptors(content: &str) -> (Vec<String>, usize, RouteDescriptors) {
+        let read =
+            SwcScanner::new().route_descriptor_endpoints(&PathBuf::from("routes.ts"), content);
+        let paths = read.endpoints.iter().map(|d| d.path.clone()).collect();
+        let data = read.data_spans().count();
+        (paths, data, read)
+    }
+
+    /// Every record of `content` that is not emitted is a data span.
+    fn assert_read_as_data(content: &str, reason: DescriptorDataReason, records: usize) {
+        let (paths, data, read) = read_descriptors(content);
+        assert!(paths.is_empty(), "no row expected, got {paths:?}");
+        assert_eq!(data, records, "{read:?}");
+        assert!(read.data_arrays.iter().all(|array| array.reason == reason));
+    }
+
+    #[test]
+    fn a_table_of_scalar_records_is_data_not_routes() {
+        // carrick#3082: bookkeeping about routes (a line number, a label).
+        assert_read_as_data(
+            r#"
+const RECORDS = [
+  { method: 'GET', path: '/orders/:id', line: 12, source: 'fixture' },
+  { method: 'POST', path: '/orders', line: -3, source: `x${y}`, ok: true, none: null },
+];
+export const all = () => RECORDS;
+"#,
+            DescriptorDataReason::NoContractMember,
+            2,
+        );
+    }
+
+    #[test]
+    fn a_table_whose_only_extras_are_identity_is_data_not_routes() {
+        assert_read_as_data(
+            "const T = [{ method: 'GET', path: '/a' }, { method: 'GET', path: '/b' }];",
+            DescriptorDataReason::NoContractMember,
+            2,
+        );
+    }
+
+    #[test]
+    fn a_table_nested_in_a_plain_object_is_judged_on_its_own_records() {
+        // The hash-input shape: the outer object is no record, the inner
+        // array holds scalars only.
+        assert_read_as_data(
+            r#"
+const HASH_INPUT = {
+  routes: [{ service: 'orders', repo: 'acme/orders', method: 'POST', path: '/orders' }],
+};
+"#,
+            DescriptorDataReason::NoContractMember,
+            1,
+        );
+    }
+
+    #[test]
+    fn a_table_with_a_nested_property_in_every_record_is_routes() {
+        // A table whose records all state a contract is kept.
+        let (paths, data, _) = read_descriptors(
+            r#"
+const docs = [
+  { method: 'GET', path: '/a', responses: { 200: {} } },
+  { method: 'GET', path: '/b', parameters: [{ name: 'id' }] },
+  { method: 'GET', path: '/c', schema: (x as Schema) },
+];
+"#,
+        );
+        assert_eq!(paths, ["/a", "/b", "/c"]);
+        assert_eq!(data, 0);
+    }
+
+    #[test]
+    fn a_table_with_one_scalar_only_record_among_nested_ones_is_data() {
+        // One record that states nothing beyond scalars makes the table
+        // bookkeeping: the table is judged as one.
+        assert_read_as_data(
+            r#"
+const CALLS = [
+  { method: 'POST', path: '/session', auth: false, body: { user: u } },
+  { method: 'GET', path: '/orders', auth: true },
+];
+"#,
+            DescriptorDataReason::NoContractMember,
+            2,
+        );
+    }
+
+    #[test]
+    fn a_table_built_inside_a_function_body_is_data() {
+        for content in [
+            "function f() { const r = [{ method: 'GET', path: '/a', responses: {} }]; return r; }",
+            "const f = () => [{ method: 'GET', path: '/a', responses: {} }];",
+            "const f = function () { return [{ method: 'GET', path: '/a', responses: {} }]; };",
+            "class C { m() { return [{ method: 'GET', path: '/a', responses: {} }]; } }",
+            "class C { constructor() { this.t = [{ method: 'GET', path: '/a', responses: {} }]; } }",
+            "class C { get t() { return [{ method: 'GET', path: '/a', responses: {} }]; } }",
+            "const o = { get t() { return [{ method: 'GET', path: '/a', responses: {} }]; } };",
+            "const o = { set t(v) { this.x = [{ method: 'GET', path: '/a', responses: {} }]; } };",
+        ] {
+            assert_read_as_data(content, DescriptorDataReason::InsideFunction, 1);
+        }
+    }
+
+    #[test]
+    fn a_table_at_module_scope_or_in_a_class_field_is_routes() {
+        for content in [
+            "const t = [{ method: 'GET', path: '/a', responses: {} }];",
+            "class C { static t = [{ method: 'GET', path: '/a', responses: {} }]; }",
+            "register([{ method: 'GET', path: '/a', responses: {} }]);",
+        ] {
+            let (paths, data, _) = read_descriptors(content);
+            assert_eq!(paths, ["/a"], "{content}");
+            assert_eq!(data, 0, "{content}");
+        }
+    }
+
+    #[test]
+    fn a_record_naming_a_handler_is_a_route_in_any_table() {
+        // A string `handler` and a handler in a table of scalars or in a
+        // function body: emitted exactly as before.
+        let (paths, data, _) = read_descriptors(
+            r#"
+const t = [
+  { method: 'GET', path: '/a', handler: 'orders.list' },
+  { method: 'GET', path: '/b', Handler: 3 },
+];
+function f() {
+  return [{ method: 'GET', path: '/c', handler: h }];
+}
+"#,
+        );
+        assert_eq!(paths, ["/a", "/b", "/c"]);
+        assert_eq!(data, 0);
+    }
+
+    #[test]
+    fn handler_records_stay_routes_when_their_table_has_data_records() {
+        let (paths, data, read) = read_descriptors(
+            r#"
+const t = [
+  { method: 'GET', path: '/a', handler: h },
+  { method: 'GET', path: '/b', line: 3 },
+];
+"#,
+        );
+        assert_eq!(paths, ["/a"]);
+        assert_eq!(data, 1);
+        assert_eq!(read.data_arrays[0].line_number, 2);
+    }
+
+    #[test]
+    fn a_shorthand_method_getter_or_spread_record_states_a_contract() {
+        let (paths, data, _) = read_descriptors(
+            r#"
+const t = [
+  { method: 'GET', path: '/a', summary },
+  { method: 'GET', path: '/b', ...base },
+  { method: 'GET', path: '/c', run() { return 1; } },
+  { method: 'GET', path: '/d', get info() { return 1; } },
+];
+"#,
+        );
+        assert_eq!(paths, ["/a", "/b", "/c", "/d"]);
+        assert_eq!(data, 0);
     }
 
     #[test]
@@ -4487,7 +4868,9 @@ const routes = [
 export { routes };
 "#;
         let scanner = SwcScanner::new();
-        let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("routes.ts"), dynamic);
+        let endpoints = scanner
+            .route_descriptor_endpoints(&PathBuf::from("routes.ts"), dynamic)
+            .endpoints;
         assert!(
             endpoints.is_empty(),
             "non-literal method must not yield a deterministic endpoint, got {endpoints:?}"
@@ -4500,12 +4883,14 @@ export { routes };
         // deterministic endpoint; the owner is left unresolved for the caller.
         let content = r#"
 const routes = [
-  { method: 'POST', path: '/widgets' },
+  { method: 'POST', path: '/widgets', responses: { 201: {} } },
 ];
 export { routes };
 "#;
         let scanner = SwcScanner::new();
-        let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("routes.ts"), content);
+        let endpoints = scanner
+            .route_descriptor_endpoints(&PathBuf::from("routes.ts"), content)
+            .endpoints;
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].method, "POST");
         assert_eq!(endpoints[0].path, "/widgets");
@@ -4525,12 +4910,13 @@ const routes = [
   { method: 'GET', path: '/d', Handler: (getD as Fn) },
   { method: 'GET', path: '/e', handler: controller.getE },
   { method: 'GET', path: '/f', handler: makeHandler() },
-  { method: 'GET', path: '/g', summary: 'documented only' },
+  { method: 'GET', path: '/g', summary: 'documented only', responses: {} },
 ];
 "#;
         let scanner = SwcScanner::new();
         let followable: Vec<(String, bool)> = scanner
             .route_descriptor_endpoints(&PathBuf::from("routes.ts"), content)
+            .endpoints
             .into_iter()
             .map(|d| (d.path, d.handler_followable))
             .collect();
@@ -4564,8 +4950,9 @@ const response = await client({
 });
 "#;
         let scanner = SwcScanner::new();
-        let endpoints =
-            scanner.route_descriptor_endpoints(&PathBuf::from("client.ts"), axios_config);
+        let endpoints = scanner
+            .route_descriptor_endpoints(&PathBuf::from("client.ts"), axios_config)
+            .endpoints;
         assert!(
             endpoints.is_empty(),
             "standalone {{ method, path, headers }} config must not be a route descriptor, got {endpoints:?}"
@@ -4593,7 +4980,9 @@ const handlers = [
 export { handlers };
 "#;
         let scanner = SwcScanner::new();
-        let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("handlers.ts"), content);
+        let endpoints = scanner
+            .route_descriptor_endpoints(&PathBuf::from("handlers.ts"), content)
+            .endpoints;
         assert!(
             endpoints.is_empty(),
             "a non-route path (bare token) must not yield a deterministic endpoint, got {endpoints:?}"
@@ -4613,7 +5002,9 @@ const routes = [
 export { routes };
 "#;
         let scanner = SwcScanner::new();
-        let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("routes.ts"), content);
+        let endpoints = scanner
+            .route_descriptor_endpoints(&PathBuf::from("routes.ts"), content)
+            .endpoints;
         assert!(
             endpoints.is_empty(),
             "an absolute URL must not be emitted as a producer route path, got {endpoints:?}"
