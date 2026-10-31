@@ -6,11 +6,15 @@
 //! times that, and each service's local work (its sidecar starting, discovery,
 //! signatures, capture) was time with no request outstanding.
 //!
-//! - [`width`] decides how many run at once, from the machine and
-//!   [`SERVICE_CONCURRENCY_ENV`].
-//! - [`in_declared_order`] admits services in declared order as a slot frees.
-//!   It knows nothing of threads, so a replay on a paused clock drives the
-//!   same admission the scan uses.
+//! - [`Plan`] decides how many may run at once and the memory budget they
+//!   share, from the machine and [`SERVICE_CONCURRENCY_ENV`]; each service's
+//!   [`ServiceMemory`] is its heap cap and its reservation against that
+//!   budget, from the memory peak its previous generation stored
+//!   (carrick#3084).
+//! - [`in_declared_order`] admits services in declared order while each
+//!   next one's reservation fits what the [`Ledger`] has left. It knows
+//!   nothing of threads, so a replay on a paused clock drives the same
+//!   admission the scan uses.
 //! - [`on_a_thread`] runs one service's analysis on a plain `std::thread` that
 //!   drives it with [`tokio::runtime::Handle::block_on`]. Not `tokio::spawn`:
 //!   the analysis future is `!Send` (`swc_common::Lrc` is an `Rc`, and the
@@ -49,6 +53,12 @@ const SERVICE_OVERHEAD_MB: u64 = 1024;
 /// `CARRICK_SIDECAR_MAX_OLD_SPACE_MB` turned the cap off.
 const V8_DEFAULT_HEAP_MB: u64 = 4096;
 
+/// The smallest heap cap a service with a stored peak is started with.
+const MIN_SERVICE_HEAP_MB: u64 = 2048;
+
+/// Heap caps are rounded up to this many MB.
+const HEAP_STEP_MB: u64 = 256;
+
 /// The stack each service's thread runs on: the main thread's, which the
 /// analysis ran on before it had threads of its own. A spawned thread's
 /// default is a quarter of it, and the parser recurses as deep as the source.
@@ -63,28 +73,257 @@ const SERVICES: machine::Sizing = machine::Sizing {
     knob_capped_by_memory: false,
 };
 
-/// How many of a pass's `services` are analysed at once, and why.
-///
-/// A dispatched run analyses one at a time: whether a service builds its
-/// prompts for the job or generates its intents depends on whether the run
-/// has collected any prompt yet, a run-level fact that services side by side
-/// would race for.
-pub fn width(services: usize, dispatching: bool) -> machine::Size {
-    let forced = std::env::var(SERVICE_CONCURRENCY_ENV)
+fn forced_count() -> Option<usize> {
+    std::env::var(SERVICE_CONCURRENCY_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0);
+        .filter(|n| *n > 0)
+}
+
+/// How many of `services` the walk lane walks at once, and why: every walk
+/// counted at the run's full heap cap, as the analysis was before it was
+/// sized by stored peaks. The lane does not admit against the [`Ledger`]
+/// (carrick#3085 moves it there).
+///
+/// A dispatched run walks one at a time, as it analyses.
+pub fn walk_width(services: usize, dispatching: bool) -> machine::Size {
     width_for(
         services,
         dispatching,
         machine::available_memory_mb(),
         machine::cores(),
         crate::services::type_sidecar::heap_cap_mb(),
-        forced,
+        forced_count(),
     )
 }
 
-/// [`width`] with its inputs given: min(services, [`MAX_SERVICES_AT_ONCE`],
+/// One service's memory in a pass (carrick#3084): the V8 heap cap its
+/// sidecar starts with, and what it reserves of the run's budget while it
+/// is analysed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceMemory {
+    /// `None` starts its sidecar with V8's own limit.
+    pub heap_cap_mb: Option<u64>,
+    pub reservation_mb: u64,
+    /// The peak its previous generation stored, which sized it.
+    pub stored_peak_mb: Option<u64>,
+}
+
+impl ServiceMemory {
+    /// Sized from `stored_peak_mb` under the run's cap `run_cap_mb`:
+    /// - a stored peak `p`: a cap of 1.5 × `p` rounded up to 256 MB, no less
+    ///   than [`MIN_SERVICE_HEAP_MB`] and no more than the run's cap;
+    /// - no stored peak: the run's cap;
+    /// - the run's cap turned off: no cap, reserved at V8's own limit.
+    ///
+    /// The reservation is the cap and [`SERVICE_OVERHEAD_MB`].
+    pub fn sized(stored_peak_mb: Option<u64>, run_cap_mb: Option<u64>) -> Self {
+        let heap_cap_mb = run_cap_mb.map(|run_cap| match stored_peak_mb {
+            Some(peak) => ((peak * 3).div_ceil(2).div_ceil(HEAP_STEP_MB) * HEAP_STEP_MB)
+                .max(MIN_SERVICE_HEAP_MB)
+                .min(run_cap),
+            None => run_cap,
+        });
+        ServiceMemory {
+            heap_cap_mb,
+            reservation_mb: heap_cap_mb.unwrap_or(V8_DEFAULT_HEAP_MB) + SERVICE_OVERHEAD_MB,
+            stored_peak_mb,
+        }
+    }
+
+    /// At the run's cap, whatever was stored: a service analysed again alone
+    /// after a memory death, and every service of a dispatched run.
+    pub fn at_run_cap(run_cap_mb: Option<u64>) -> Self {
+        Self::sized(None, run_cap_mb)
+    }
+}
+
+/// How a pass admits services: how many at most at once, and the memory
+/// budget their reservations share (carrick#3084).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The most in flight at once, never below one.
+    most_at_once: usize,
+    /// What reservations may add up to; `None` when the count alone decides
+    /// ([`SERVICE_CONCURRENCY_ENV`], a dispatched run, a fixed width) or
+    /// the free memory could not be read (then one at a time).
+    budget_mb: Option<u64>,
+    /// Why, for the width line.
+    why: String,
+}
+
+impl Plan {
+    /// The plan for this run's analysis, from the memory it can spend now
+    /// ([`machine::available_memory`]), read once, its cores and
+    /// [`SERVICE_CONCURRENCY_ENV`].
+    ///
+    /// A dispatched run analyses one at a time: whether a service builds its
+    /// prompts for the job or generates its intents depends on whether the
+    /// run has collected any prompt yet, a run-level fact that services side
+    /// by side would race for.
+    pub fn for_run(dispatching: bool) -> Self {
+        Self::new(
+            dispatching,
+            machine::available_memory(),
+            machine::cores(),
+            forced_count(),
+        )
+    }
+
+    /// [`Self::for_run`] with its inputs given.
+    fn new(
+        dispatching: bool,
+        available: Option<machine::Available>,
+        cores: usize,
+        forced: Option<usize>,
+    ) -> Self {
+        if dispatching {
+            return Self::count(1, "a dispatched run analyses one at a time");
+        }
+        if let Some(count) = forced {
+            return Self::count(
+                count,
+                &format!("asked for by {SERVICE_CONCURRENCY_ENV}; the budget is not read"),
+            );
+        }
+        let most = cores
+            .saturating_sub(1)
+            .max(SERVICES.cores_floor)
+            .min(MAX_SERVICES_AT_ONCE);
+        match available {
+            Some(available) => {
+                let budget = available.mb.saturating_sub(machine::HEADROOM_MB);
+                Plan {
+                    most_at_once: most,
+                    budget_mb: Some(budget),
+                    why: format!(
+                        "budget {budget} MB (limit from {}), at most {most} at once",
+                        available.source.as_str()
+                    ),
+                }
+            }
+            None => Self::count(1, "the free memory could not be read"),
+        }
+    }
+
+    /// At most `count` at once, whatever they reserve.
+    pub fn count(count: usize, why: &str) -> Self {
+        let count = count.max(1);
+        Plan {
+            most_at_once: count,
+            budget_mb: None,
+            why: format!("at most {count} at once: {why}"),
+        }
+    }
+
+    /// One at a time: the pass that analyses a service again alone.
+    pub fn alone() -> Self {
+        Self::count(1, "alone")
+    }
+
+    /// The most in flight at once.
+    pub fn most_at_once(&self) -> usize {
+        self.most_at_once
+    }
+
+    /// Whether a service reserving `reservation_mb` may start while
+    /// `in_flight` services reserve `reserved_mb`: always when none is in
+    /// flight (a service alone starts whatever it reserves); otherwise only
+    /// below the count, and, when there is a budget, while it fits what is
+    /// left of it.
+    fn may_start(&self, reservation_mb: u64, in_flight: usize, reserved_mb: u64) -> bool {
+        if in_flight == 0 {
+            return true;
+        }
+        if in_flight >= self.most_at_once {
+            return false;
+        }
+        match self.budget_mb {
+            Some(budget) => reserved_mb + reservation_mb <= budget,
+            None => true,
+        }
+    }
+
+    /// The width line: the budget and where its limit came from, the most at
+    /// once, and how many of `services` were sized by a stored peak and how
+    /// many start at the run's full cap `run_cap_mb`.
+    pub fn line(&self, services: &[ServiceMemory], run_cap_mb: Option<u64>) -> String {
+        let with_peak = services
+            .iter()
+            .filter(|service| service.stored_peak_mb.is_some())
+            .count();
+        let at_full_cap = services
+            .iter()
+            .filter(|service| service.heap_cap_mb == run_cap_mb)
+            .count();
+        format!(
+            "Analysing services by memory: {}; {with_peak} with a stored peak, {at_full_cap} at \
+             the full cap",
+            self.why
+        )
+    }
+}
+
+/// What the services in flight reserve of the run's budget, and how many
+/// they are (carrick#3084). One object for the run: every pass of the
+/// analysis admits against it, and a memory death reads it to say whether
+/// another service was in flight ([`run_ledger`]).
+#[derive(Debug, Default)]
+pub struct Ledger {
+    held: Mutex<Held>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Held {
+    in_flight: usize,
+    reserved_mb: u64,
+}
+
+impl Ledger {
+    pub const fn new() -> Self {
+        Ledger {
+            held: Mutex::new(Held {
+                in_flight: 0,
+                reserved_mb: 0,
+            }),
+        }
+    }
+
+    /// How many are in flight now.
+    pub fn in_flight(&self) -> usize {
+        self.held.lock().map(|held| held.in_flight).unwrap_or(0)
+    }
+
+    /// Take `reservation_mb` when `plan` lets it start, or when `alone`: the
+    /// admitter has nothing of its own in flight, so a wait would never end.
+    fn try_take(&self, plan: &Plan, reservation_mb: u64, alone: bool) -> bool {
+        let Ok(mut held) = self.held.lock() else {
+            return alone;
+        };
+        if !alone && !plan.may_start(reservation_mb, held.in_flight, held.reserved_mb) {
+            return false;
+        }
+        held.in_flight += 1;
+        held.reserved_mb += reservation_mb;
+        true
+    }
+
+    fn give_back(&self, reservation_mb: u64) {
+        if let Ok(mut held) = self.held.lock() {
+            held.in_flight = held.in_flight.saturating_sub(1);
+            held.reserved_mb = held.reserved_mb.saturating_sub(reservation_mb);
+        }
+    }
+}
+
+static RUN_LEDGER: Ledger = Ledger::new();
+
+/// The run's ledger: what the scan's analysis admits against.
+pub fn run_ledger() -> &'static Ledger {
+    &RUN_LEDGER
+}
+
+/// [`walk_width`] with its inputs given: min(services, [`MAX_SERVICES_AT_ONCE`],
 /// max(2, cores - 1), the services the free memory holds after
 /// [`machine::HEADROOM_MB`] at the heap cap and [`SERVICE_OVERHEAD_MB`] each).
 /// `forced` replaces everything but the service count.
@@ -130,6 +369,7 @@ pub(crate) fn width_with(
 /// services really ran side by side and finished out of order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schedule {
+    /// The most the plan let run at once.
     pub width: usize,
     /// The most services in flight at once.
     pub most_in_flight: usize,
@@ -148,27 +388,34 @@ pub fn take_schedules() -> Vec<Schedule> {
         .unwrap_or_default()
 }
 
-/// Run `count` jobs, at most `width` at once, each started in declared order
-/// as a slot frees, and return their results by index.
+/// Run one job per entry of `reservations`, each started in declared order
+/// while `plan` and what `ledger` has left let it start, and return their
+/// results by index. A job's reservation is given back when it ends.
+///
+/// The order is strict: a job that does not fit holds the ones behind it,
+/// so a large one is never starved, and the order of starts depends only on
+/// the order of finishing.
 ///
 /// The admission and nothing else: `start` decides where a job runs.
 pub async fn in_declared_order<R, Fut>(
-    count: usize,
-    width: usize,
+    ledger: &Ledger,
+    plan: &Plan,
+    reservations: &[u64],
     start: impl FnMut(usize) -> Fut,
 ) -> Vec<R>
 where
     Fut: Future<Output = R>,
 {
-    let (results, schedule) = admit(count, width, start).await;
+    let (results, schedule) = admit(ledger, plan, reservations, start).await;
     if let Ok(mut passes) = SCHEDULES.lock() {
         passes.push(schedule);
     }
     results
 }
 
-/// [`in_declared_order`] for work that is not a pass of the analysis, such
-/// as the walk lane: its schedule is not one [`take_schedules`] returns.
+/// `count` jobs, at most `width` at once, for work that is not a pass of the
+/// analysis, such as the walk lane: it admits against a ledger of its own,
+/// and its schedule is not one [`take_schedules`] returns.
 pub(super) async fn admit_in_declared_order<R, Fut>(
     count: usize,
     width: usize,
@@ -177,27 +424,29 @@ pub(super) async fn admit_in_declared_order<R, Fut>(
 where
     Fut: Future<Output = R>,
 {
-    admit(count, width, start).await.0
+    let plan = Plan::count(width, "a fixed width");
+    admit(&Ledger::new(), &plan, &vec![0; count], start).await.0
 }
 
 async fn admit<R, Fut>(
-    count: usize,
-    width: usize,
+    ledger: &Ledger,
+    plan: &Plan,
+    reservations: &[u64],
     mut start: impl FnMut(usize) -> Fut,
 ) -> (Vec<R>, Schedule)
 where
     Fut: Future<Output = R>,
 {
-    let width = width.max(1);
+    let count = reservations.len();
     let mut results: Vec<Option<R>> = (0..count).map(|_| None).collect();
     let mut schedule = Schedule {
-        width,
+        width: plan.most_at_once,
         ..Schedule::default()
     };
     let mut running = FuturesUnordered::new();
     let mut next = 0;
     loop {
-        while next < count && running.len() < width {
+        while next < count && ledger.try_take(plan, reservations[next], running.is_empty()) {
             let index = next;
             next += 1;
             let job = start(index);
@@ -207,6 +456,7 @@ where
         let Some((index, result)) = running.next().await else {
             break;
         };
+        ledger.give_back(reservations[index]);
         schedule.finished.push(index);
         results[index] = Some(result);
     }
@@ -316,7 +566,8 @@ mod tests {
         take_schedules();
         let took = [5u64, 1, 2, 1];
         let started = std::cell::RefCell::new(Vec::new());
-        let results = in_declared_order(took.len(), 2, |index| {
+        let plan = Plan::count(2, "the test's");
+        let results = in_declared_order(&Ledger::new(), &plan, &[0; 4], |index| {
             started.borrow_mut().push(index);
             async move {
                 tokio::time::sleep(Duration::from_secs(took[index])).await;
@@ -332,6 +583,195 @@ mod tests {
         // 1 ends at 1s and 2 starts; 2 ends at 3s and 3 starts; 3 ends at
         // 4s; 0 at 5s.
         assert_eq!(passes[0].finished, vec![1, 2, 3, 0]);
+    }
+
+    /// The analysis sidecar peaks, in MB and declared order, of the 35
+    /// services of a pilot copy analysed one at a time (plan ticket M3).
+    const PILOT_PEAKS: [u64; 35] = [
+        1120, 1739, 4159, 399, 535, 795, 522, 845, 493, 405, 470, 490, 846, 401, 539, 492, 497,
+        516, 455, 850, 848, 937, 403, 434, 450, 598, 941, 950, 606, 943, 925, 1694, 400, 4088, 938,
+    ];
+
+    /// The sets of services in flight, one per start, when `memories` are
+    /// admitted under `plan`, each taking a different few seconds.
+    async fn in_flight_at_each_start(
+        plan: &Plan,
+        memories: &[ServiceMemory],
+    ) -> Vec<std::collections::BTreeSet<usize>> {
+        let running = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let reservations: Vec<u64> = memories.iter().map(|m| m.reservation_mb).collect();
+        let ledger = Ledger::new();
+        in_declared_order(&ledger, plan, &reservations, |index| {
+            running.borrow_mut().insert(index);
+            seen.borrow_mut().push(running.borrow().clone());
+            let running = &running;
+            async move {
+                tokio::time::sleep(Duration::from_secs(5 + (index as u64 * 7) % 11)).await;
+                running.borrow_mut().remove(&index);
+            }
+        })
+        .await;
+        assert_eq!(ledger.in_flight(), 0, "every reservation is given back");
+        seen.into_inner()
+    }
+
+    /// What the run may spend, as a runner that sets the env reads it:
+    /// `limit` less what the scanner and its sidecars hold.
+    fn plan_under(limit: u64, held: u64, cores: usize, forced: Option<usize>) -> Plan {
+        Plan::new(
+            false,
+            Some(machine::Available {
+                mb: limit - held,
+                source: machine::MemorySource::Env,
+            }),
+            cores,
+            forced,
+        )
+    }
+
+    fn most_in_flight(starts: &[std::collections::BTreeSet<usize>]) -> usize {
+        starts.iter().map(|set| set.len()).max().unwrap_or(0)
+    }
+
+    /// carrick#3084, the admission table: a 16 GB task with 1.7 GB held,
+    /// the run's cap at 12 GB and 4 cores. Sized by the pilot's stored peaks,
+    /// its two largest services never run at once and the others run up to
+    /// three at a time. With no stored peaks every service reserves the full
+    /// cap, and they run one at a time, as they did.
+    #[tokio::test(start_paused = true)]
+    async fn services_are_admitted_by_their_stored_peaks() {
+        take_schedules();
+        let run_cap = Some(12_288);
+        let plan = plan_under(16_384, 1_700, 4, None);
+        assert_eq!(plan.budget_mb, Some(12_636));
+        let sized: Vec<ServiceMemory> = PILOT_PEAKS
+            .iter()
+            .map(|peak| ServiceMemory::sized(Some(*peak), run_cap))
+            .collect();
+        let starts = in_flight_at_each_start(&plan, &sized).await;
+        assert_eq!(starts.len(), 35, "every service starts once");
+        let (largest, next) = (2, 33);
+        assert_eq!((PILOT_PEAKS[largest], PILOT_PEAKS[next]), (4159, 4088));
+        assert!(
+            starts
+                .iter()
+                .all(|set| !(set.contains(&largest) && set.contains(&next))),
+            "the two largest ran at once: {starts:?}"
+        );
+        assert_eq!(most_in_flight(&starts), 3, "{starts:?}");
+
+        let peakless: Vec<ServiceMemory> = PILOT_PEAKS
+            .iter()
+            .map(|_| ServiceMemory::sized(None, run_cap))
+            .collect();
+        let starts = in_flight_at_each_start(&plan, &peakless).await;
+        assert_eq!(most_in_flight(&starts), 1, "{starts:?}");
+        take_schedules();
+    }
+
+    /// An 8 GB task at a 6 GB run cap holds one of the pilot's services at a
+    /// time, sized or not.
+    #[tokio::test(start_paused = true)]
+    async fn an_eight_gb_task_analyses_one_at_a_time() {
+        take_schedules();
+        let run_cap = Some(6_144);
+        let plan = plan_under(8_192, 1_700, 4, None);
+        let sized: Vec<ServiceMemory> = PILOT_PEAKS
+            .iter()
+            .map(|peak| ServiceMemory::sized(Some(*peak), run_cap))
+            .collect();
+        let starts = in_flight_at_each_start(&plan, &sized).await;
+        assert_eq!(most_in_flight(&starts), 1, "{starts:?}");
+        take_schedules();
+    }
+
+    /// A service with no stored peak reserves the full cap: among services
+    /// with peaks it starts only when nothing else is in flight, and the ones
+    /// behind it wait for it, in declared order.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_with_no_peak_starts_only_alone() {
+        take_schedules();
+        let run_cap = Some(12_288);
+        let plan = plan_under(16_384, 1_700, 4, None);
+        let peaks = [Some(400), Some(900), None, Some(400), Some(600), Some(500)];
+        let memories: Vec<ServiceMemory> = peaks
+            .iter()
+            .map(|peak| ServiceMemory::sized(*peak, run_cap))
+            .collect();
+        let starts = in_flight_at_each_start(&plan, &memories).await;
+        for set in &starts {
+            if set.contains(&2) {
+                assert_eq!(
+                    set.len(),
+                    1,
+                    "the peakless one ran beside another: {starts:?}"
+                );
+            }
+        }
+        // Strict order: none behind it started before it.
+        let started_alone = starts.iter().position(|set| set.contains(&2)).unwrap();
+        assert_eq!(started_alone, 2, "{starts:?}");
+        assert!(most_in_flight(&starts) >= 2, "{starts:?}");
+        take_schedules();
+    }
+
+    /// The knob forces the count, the budget unread; the caps stay derived.
+    #[tokio::test(start_paused = true)]
+    async fn the_knob_forces_the_count_whatever_the_budget() {
+        take_schedules();
+        let plan = plan_under(16_384, 1_700, 4, Some(3));
+        let peakless = vec![ServiceMemory::sized(None, Some(12_288)); 6];
+        let starts = in_flight_at_each_start(&plan, &peakless).await;
+        assert_eq!(most_in_flight(&starts), 3, "{starts:?}");
+        // A dispatched run: one, whatever is asked.
+        let dispatched = Plan::new(true, None, 64, Some(4));
+        assert_eq!(dispatched.most_at_once(), 1);
+        // Memory that cannot be read: one.
+        assert_eq!(Plan::new(false, None, 16, None).most_at_once(), 1);
+        take_schedules();
+    }
+
+    /// A service's cap is 1.5 times its stored peak, rounded up to 256 MB,
+    /// between 2 GB and the run's cap; with no peak, the run's cap; with the
+    /// run's cap off, none. Each reserves its cap and 1 GB.
+    #[test]
+    fn a_service_is_capped_by_its_stored_peak() {
+        let cap = |peak, run| ServiceMemory::sized(peak, run).heap_cap_mb;
+        assert_eq!(cap(Some(1_000), Some(12_288)), Some(2_048));
+        assert_eq!(cap(Some(1_739), Some(12_288)), Some(2_816));
+        assert_eq!(cap(Some(4_159), Some(12_288)), Some(6_400));
+        assert_eq!(cap(Some(20_000), Some(12_288)), Some(12_288));
+        assert_eq!(cap(None, Some(12_288)), Some(12_288));
+        // A run's cap below the floor: the run's cap, never a panic.
+        assert_eq!(cap(Some(100), Some(512)), Some(512));
+        assert_eq!(cap(Some(1_000), None), None);
+        assert_eq!(
+            ServiceMemory::sized(Some(4_159), Some(12_288)).reservation_mb,
+            7_424
+        );
+        assert_eq!(ServiceMemory::sized(Some(100), None).reservation_mb, 5_120);
+    }
+
+    #[test]
+    fn the_width_line_says_the_budget_and_the_caps() {
+        let run_cap = Some(12_288);
+        let memories = [
+            ServiceMemory::sized(Some(400), run_cap),
+            ServiceMemory::sized(None, run_cap),
+            ServiceMemory::sized(Some(9_000), run_cap),
+        ];
+        assert_eq!(
+            plan_under(16_384, 1_700, 4, None).line(&memories, run_cap),
+            "Analysing services by memory: budget 12636 MB (limit from env), at most 3 at once; \
+             2 with a stored peak, 2 at the full cap"
+        );
+        assert_eq!(
+            plan_under(16_384, 1_700, 4, Some(2)).line(&memories, run_cap),
+            "Analysing services by memory: at most 2 at once: asked for by \
+             CARRICK_SERVICE_CONCURRENCY; the budget is not read; 2 with a stored peak, 2 at the \
+             full cap"
+        );
     }
 
     /// The services of the first index of 43 the setups-ahead queue was
@@ -351,7 +791,11 @@ mod tests {
         let mut projected = Vec::new();
         for width in 1..=8 {
             let started = tokio::time::Instant::now();
-            in_declared_order(took.len(), width, |index| tokio::time::sleep(took[index])).await;
+            let plan = Plan::count(width, "the projection's");
+            in_declared_order(&Ledger::new(), &plan, &vec![0; took.len()], |index| {
+                tokio::time::sleep(took[index])
+            })
+            .await;
             projected.push(started.elapsed());
         }
         take_schedules();

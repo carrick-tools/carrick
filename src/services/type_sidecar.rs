@@ -2314,39 +2314,6 @@ fn old_space_cap_mb(total_memory_mb: Option<u64>) -> u64 {
     derived.clamp(MIN_OLD_SPACE_MB, MAX_OLD_SPACE_MB)
 }
 
-/// The cgroup memory limit in MB, when this process runs under one.
-///
-/// `/proc/meminfo` reports the HOST's memory, so a scanner inside a
-/// memory-limited container would otherwise derive a cap from memory it
-/// cannot touch and be OS-killed at the limit — exactly the silent failure
-/// the sizing exists to avoid. cgroup v2 first, then v1. `max` (v2) and v1's
-/// "no limit" sentinel both read as no limit.
-#[cfg(target_os = "linux")]
-fn cgroup_memory_limit_mb() -> Option<u64> {
-    const V2: &str = "/sys/fs/cgroup/memory.max";
-    const V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
-    for path in [V2, V1] {
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let trimmed = raw.trim();
-        if trimmed == "max" {
-            continue;
-        }
-        let Ok(bytes) = trimmed.parse::<u64>() else {
-            continue;
-        };
-        // v1 writes a near-u64::MAX sentinel when unlimited. Anything past a
-        // terabyte is that sentinel, not a real container limit.
-        let mb = bytes / (1024 * 1024);
-        if mb == 0 || mb > 1024 * 1024 {
-            continue;
-        }
-        return Some(mb);
-    }
-    None
-}
-
 /// How many processes the kernel has killed for memory in this process's
 /// cgroup, when it runs under one that says (carrick#2208).
 ///
@@ -2469,7 +2436,7 @@ fn total_memory_mb() -> Option<u64> {
             .parse()
             .ok()?;
         let host_mb = kb / 1024;
-        return Some(match cgroup_memory_limit_mb() {
+        return Some(match crate::services::machine::cgroup_memory_limit_mb() {
             Some(limit) => host_mb.min(limit),
             None => host_mb,
         });
@@ -2500,10 +2467,16 @@ pub fn heap_cap_mb() -> Option<u64> {
     }
 }
 
-/// The `--max-old-space-size` argument for this run, or `None` when the
-/// override disables it.
-fn max_old_space_arg() -> Option<String> {
-    heap_cap_mb().map(|mb| format!("--max-old-space-size={}", mb))
+/// The ids of every sidecar process this process still owns, for what the
+/// run holds against its memory limit (carrick#3084).
+pub fn live_sidecar_pids() -> Vec<u32> {
+    let held: Vec<Arc<Mutex<Child>>> = match LIVE_SIDECARS.lock() {
+        Ok(live) => live.iter().filter_map(std::sync::Weak::upgrade).collect(),
+        Err(_) => return Vec::new(),
+    };
+    held.iter()
+        .filter_map(|child| child.lock().ok().map(|child| child.id()))
+        .collect()
 }
 
 // ============================================================================
@@ -2594,16 +2567,16 @@ struct StderrEvidence {
 }
 
 impl SidecarProcess {
-    /// Start `node <sidecar_path>` with the heap flag for this run and both
-    /// reader threads. Returns as soon as the process exists; nothing has
-    /// been asked of it yet.
-    fn spawn(sidecar_path: &Path) -> Result<Self, SidecarError> {
+    /// Start `node <sidecar_path>` with `heap_cap_mb` as its heap flag (none
+    /// when `None`) and both reader threads. Returns as soon as the process
+    /// exists; nothing has been asked of it yet.
+    fn spawn(sidecar_path: &Path, heap_cap_mb: Option<u64>) -> Result<Self, SidecarError> {
         debug!("[type_sidecar] Spawning sidecar from: {:?}", sidecar_path);
 
         // Spawn the Node.js process. V8 flags MUST precede the script path,
         // or node passes them to the script instead of applying them.
         let mut command = Command::new("node");
-        if let Some(heap_arg) = max_old_space_arg() {
+        if let Some(heap_arg) = heap_cap_mb.map(|mb| format!("--max-old-space-size={mb}")) {
             debug!("[type_sidecar] Sidecar heap flag: {}", heap_arg);
             command.arg(heap_arg);
         }
@@ -2842,6 +2815,11 @@ pub struct TypeSidecar {
     /// Nothing is recorded for the run and nothing is restarted
     /// ([`Self::record_only`]).
     record_only: bool,
+    /// The V8 old-space cap this sidecar's processes start with, in MB:
+    /// [`heap_cap_mb`] unless its recipe set another
+    /// ([`SidecarRecipe::with_heap_cap_mb`]). A restart keeps it, and a
+    /// memory death records it. `None` starts them with V8's own.
+    heap_cap_mb: Option<u64>,
 }
 
 /// How a sidecar process that is gone came to an end, with what it left to
@@ -2871,9 +2849,23 @@ pub struct SidecarRecipe {
     sidecar_path: PathBuf,
     operation_timeout: Duration,
     scan_root: Option<PathBuf>,
+    heap_cap_mb: Option<u64>,
 }
 
 impl SidecarRecipe {
+    /// This recipe, starting its processes with `heap_cap_mb` as their V8
+    /// old-space cap (V8's own when `None`) instead of the one it was taken
+    /// with (carrick#3084: a service's sidecar is capped by its stored peak).
+    pub fn with_heap_cap_mb(mut self, heap_cap_mb: Option<u64>) -> Self {
+        self.heap_cap_mb = heap_cap_mb;
+        self
+    }
+
+    /// The V8 old-space cap this recipe's processes start with, in MB.
+    pub fn heap_cap_mb(&self) -> Option<u64> {
+        self.heap_cap_mb
+    }
+
     /// A process from this recipe, initialised to `repo_root` and ready. Its
     /// program is built by its first request.
     pub fn spawn_scoped(
@@ -2901,8 +2893,8 @@ impl SidecarRecipe {
         tsconfig_path: Option<&str>,
         record_only: bool,
     ) -> Result<TypeSidecar, SidecarError> {
-        let mut sidecar =
-            TypeSidecar::spawn(&self.sidecar_path)?.with_operation_timeout(self.operation_timeout);
+        let mut sidecar = TypeSidecar::spawn_with_heap_cap(&self.sidecar_path, self.heap_cap_mb)?
+            .with_operation_timeout(self.operation_timeout);
         if record_only {
             sidecar = sidecar.record_only();
         }
@@ -2928,13 +2920,22 @@ impl TypeSidecar {
     /// # Returns
     /// A new `TypeSidecar` instance in the `Spawning` state.
     pub fn spawn(sidecar_path: &Path) -> Result<Self, SidecarError> {
+        Self::spawn_with_heap_cap(sidecar_path, heap_cap_mb())
+    }
+
+    /// [`Self::spawn`], its processes started with `heap_cap_mb` as their V8
+    /// old-space cap (V8's own when `None`) instead of the run's.
+    fn spawn_with_heap_cap(
+        sidecar_path: &Path,
+        heap_cap_mb: Option<u64>,
+    ) -> Result<Self, SidecarError> {
         let spawn_time = Instant::now();
         let SidecarProcess {
             child,
             stdin,
             responses,
             evidence,
-        } = SidecarProcess::spawn(sidecar_path)?;
+        } = SidecarProcess::spawn(sidecar_path, heap_cap_mb)?;
 
         debug!(
             "[type_sidecar] Sidecar spawned in {:?}",
@@ -2961,6 +2962,7 @@ impl TypeSidecar {
             death_noted: AtomicBool::new(false),
             replaced_peak: AtomicU64::new(0),
             record_only: false,
+            heap_cap_mb,
         })
     }
 
@@ -3051,7 +3053,9 @@ impl TypeSidecar {
         }
         match death.memory_death() {
             Some(kind) => {
-                let cap = heap_cap_mb();
+                // The dying process's own cap, not the run's: a service's
+                // sidecar may start below the run's cap (carrick#3084).
+                let cap = self.heap_cap_mb;
                 // The log's, not the terminal's: a run told to stop on it says
                 // so in its failure, and one that is not loses the service's
                 // types with today's words (carrick#2208).
@@ -3115,6 +3119,7 @@ impl TypeSidecar {
             sidecar_path: self.sidecar_path.clone(),
             operation_timeout: self.operation_timeout,
             scan_root: self.scan_root.lock().unwrap().clone(),
+            heap_cap_mb: self.heap_cap_mb,
         }
     }
 
@@ -3382,7 +3387,7 @@ impl TypeSidecar {
             Err(SidecarError::NotReady(reason))
         };
 
-        let process = match SidecarProcess::spawn(&self.sidecar_path) {
+        let process = match SidecarProcess::spawn(&self.sidecar_path, self.heap_cap_mb) {
             Ok(process) => process,
             Err(e) => return failed(e.to_string()),
         };

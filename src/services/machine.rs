@@ -102,9 +102,111 @@ pub fn cores() -> usize {
         .unwrap_or(1)
 }
 
-/// Memory the machine can hand out now, in MB: what is free plus what the
-/// system would reclaim first. `None` when it cannot be read.
+/// The memory this run's task may use, in MB, set by a runner that knows its
+/// box (carrick#3084). The scan then spends at most this, less what it and
+/// its sidecars already hold, whatever the host's own reading says.
+/// Documented for runners in `docs/reference/runner.md`.
+pub const MEMORY_LIMIT_ENV: &str = "CARRICK_MEMORY_LIMIT_MB";
+
+/// Where the figure [`available_memory`] settled on came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySource {
+    /// [`MEMORY_LIMIT_ENV`], less what this process and its sidecars hold.
+    Env,
+    /// The cgroup's limit, less what the cgroup uses.
+    Cgroup,
+    /// The machine's own reading.
+    Machine,
+}
+
+impl MemorySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemorySource::Env => "env",
+            MemorySource::Cgroup => "cgroup",
+            MemorySource::Machine => "machine",
+        }
+    }
+}
+
+/// Memory this run can hand out now, and where the figure came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Available {
+    pub mb: u64,
+    pub source: MemorySource,
+}
+
+/// Memory this run can hand out now, in MB: [`available_memory`]'s figure.
+/// `None` when it cannot be read.
 pub fn available_memory_mb() -> Option<u64> {
+    available_memory().map(|available| available.mb)
+}
+
+/// Memory this run can hand out now (carrick#3084): the machine's reading,
+/// lowered to the first of these that is known:
+/// - [`MEMORY_LIMIT_ENV`] less what this process and every live sidecar hold;
+/// - the cgroup's limit less what the cgroup uses (v2, then v1).
+///
+/// A container that sets no memory of its own reads the host's, which is not
+/// the run's to spend. With neither known, the reading is the machine's.
+pub fn available_memory() -> Option<Available> {
+    let env_limit = env_limit_mb();
+    settle(
+        machine_available_mb(),
+        env_limit.map(|limit| (limit, held_mb())),
+        if env_limit.is_some() {
+            None
+        } else {
+            cgroup_memory_left_mb()
+        },
+    )
+}
+
+/// [`available_memory`] over its readings: the machine's, the env limit with
+/// what is held against it, and what the cgroup has left. The env's figure is
+/// read first, the cgroup's only without it; either lowers the machine's when
+/// it is lower, and stands alone when the machine cannot be read.
+fn settle(
+    machine: Option<u64>,
+    env_limit_and_held: Option<(u64, u64)>,
+    cgroup_left: Option<u64>,
+) -> Option<Available> {
+    let limited = env_limit_and_held
+        .map(|(limit, held)| (limit.saturating_sub(held), MemorySource::Env))
+        .or_else(|| cgroup_left.map(|left| (left, MemorySource::Cgroup)));
+    match (machine, limited) {
+        (Some(machine), Some((left, source))) if left < machine => {
+            Some(Available { mb: left, source })
+        }
+        (Some(machine), _) => Some(Available {
+            mb: machine,
+            source: MemorySource::Machine,
+        }),
+        (None, Some((left, source))) => Some(Available { mb: left, source }),
+        (None, None) => None,
+    }
+}
+
+fn env_limit_mb() -> Option<u64> {
+    std::env::var(MEMORY_LIMIT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|mb| *mb > 0)
+}
+
+/// What this process and every sidecar it still owns hold now, in MB.
+fn held_mb() -> u64 {
+    let own = resident_bytes(std::process::id()).unwrap_or(0);
+    let sidecars: u64 = crate::services::type_sidecar::live_sidecar_pids()
+        .into_iter()
+        .filter_map(resident_bytes)
+        .sum();
+    (own + sidecars) / (1024 * 1024)
+}
+
+/// The machine's own reading, in MB: what is free plus what the system
+/// would reclaim first.
+fn machine_available_mb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -115,18 +217,7 @@ pub fn available_memory_mb() -> Option<u64> {
             .next()?
             .parse()
             .ok()?;
-        let available = kb / 1024;
-        // Inside a container the host's figure is not ours to spend.
-        let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()
-            .and_then(|max| max.trim().parse::<u64>().ok())
-            .zip(
-                std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-                    .ok()
-                    .and_then(|used| used.trim().parse::<u64>().ok()),
-            )
-            .map(|(max, used)| max.saturating_sub(used) / (1024 * 1024));
-        return Some(cgroup.map_or(available, |left| left.min(available)));
+        return Some(kb / 1024);
     }
     #[cfg(target_os = "macos")]
     {
@@ -135,6 +226,68 @@ pub fn available_memory_mb() -> Option<u64> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// cgroup v2's files, then v1's: the limit, and what the cgroup uses now.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const CGROUP_FILES: [(&str, &str); 2] = [
+    ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+    (
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ),
+];
+
+/// The cgroup memory limit in MB, when this process runs under one.
+///
+/// `/proc/meminfo` reports the HOST's memory, so a scanner inside a
+/// memory-limited container would otherwise derive a cap from memory it
+/// cannot touch and be OS-killed at the limit. cgroup v2 first, then v1.
+#[cfg(target_os = "linux")]
+pub fn cgroup_memory_limit_mb() -> Option<u64> {
+    CGROUP_FILES
+        .iter()
+        .find_map(|(limit, _)| cgroup_limit_mb(&std::fs::read_to_string(limit).ok()?))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cgroup_memory_limit_mb() -> Option<u64> {
+    None
+}
+
+/// What the cgroup has left under its limit, in MB: v2's `memory.max` less
+/// `memory.current`, then v1's `limit_in_bytes` less `usage_in_bytes`.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_left_mb() -> Option<u64> {
+    CGROUP_FILES.iter().find_map(|(limit, usage)| {
+        cgroup_left_mb(
+            &std::fs::read_to_string(limit).ok()?,
+            &std::fs::read_to_string(usage).ok()?,
+        )
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_left_mb() -> Option<u64> {
+    None
+}
+
+/// A cgroup limit file's text in MB. `max` (v2) and v1's near-`u64::MAX`
+/// sentinel both read as no limit: anything past a terabyte is that
+/// sentinel, not a real container limit.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_limit_mb(text: &str) -> Option<u64> {
+    let mb = text.trim().parse::<u64>().ok()? / (1024 * 1024);
+    (mb > 0 && mb <= 1024 * 1024).then_some(mb)
+}
+
+/// What is left under a cgroup's limit, in MB, from its limit and usage
+/// files' texts. `None` when there is no limit.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_left_mb(limit_text: &str, usage_text: &str) -> Option<u64> {
+    let limit = cgroup_limit_mb(limit_text)?;
+    let used = usage_text.trim().parse::<u64>().ok()? / (1024 * 1024);
+    Some(limit.saturating_sub(used))
 }
 
 /// Free, inactive and speculative pages from `vm_stat`'s output, in MB.
@@ -289,5 +442,73 @@ mod tests {
         // (65536 + 131072 + 1024) * 16 KB = 3088 MB.
         assert_eq!(vm_stat_available_mb(text), Some(3088));
         assert_eq!(vm_stat_available_mb("no header"), None);
+    }
+
+    /// carrick#3084: v2's and v1's files read the same, and a cgroup with no
+    /// limit reads as none.
+    #[test]
+    fn cgroup_v1_and_v2_texts_read_the_same() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let limit = format!("{}\n", 16 * GB);
+        let used = format!("{}\n", 5 * GB);
+        // v2 and v1 carry the same numbers in the same shape.
+        assert_eq!(cgroup_left_mb(&limit, &used), Some(11 * 1024));
+        assert_eq!(cgroup_limit_mb(&limit), Some(16 * 1024));
+        // v2's no-limit word, and v1's sentinel.
+        assert_eq!(cgroup_left_mb("max\n", &used), None);
+        assert_eq!(cgroup_left_mb("9223372036854771712\n", &used), None);
+        assert_eq!(cgroup_limit_mb("max"), None);
+        // Over the limit: nothing left, never a wrap.
+        assert_eq!(cgroup_left_mb(&used, &limit), Some(0));
+        assert_eq!(cgroup_left_mb(&limit, "garbage"), None);
+    }
+
+    /// carrick#3084: with the env set, the reading is the limit less what
+    /// this process and its sidecars hold, lowering the machine's; without
+    /// it, the cgroup's; with neither, the machine's, as before.
+    #[test]
+    fn the_machine_reading_is_lowered_to_a_known_limit() {
+        let available = |mb, source| Some(Available { mb, source });
+        // The host reads 29 GB; the task may use 16 GB, and 1.7 GB is held.
+        assert_eq!(
+            settle(Some(29_720), Some((16_384, 1_700)), None),
+            available(14_684, MemorySource::Env)
+        );
+        // The env wins over the cgroup, which is not read beside it.
+        assert_eq!(
+            settle(Some(29_720), Some((16_384, 1_700)), Some(4_096)),
+            available(14_684, MemorySource::Env)
+        );
+        // A machine reading below the limit stands.
+        assert_eq!(
+            settle(Some(8_000), Some((16_384, 1_700)), None),
+            available(8_000, MemorySource::Machine)
+        );
+        // More held than the limit: nothing left, never a wrap.
+        assert_eq!(
+            settle(Some(8_000), Some((1_024, 1_700)), None),
+            available(0, MemorySource::Env)
+        );
+        assert_eq!(
+            settle(Some(29_720), None, Some(11_264)),
+            available(11_264, MemorySource::Cgroup)
+        );
+        assert_eq!(
+            settle(None, None, Some(4_096)),
+            available(4_096, MemorySource::Cgroup)
+        );
+        assert_eq!(
+            settle(Some(12_000), None, None),
+            available(12_000, MemorySource::Machine)
+        );
+        assert_eq!(settle(None, None, None), None);
+    }
+
+    /// What is held against the env's limit is read from the kernel: this
+    /// test process alone holds some.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn what_this_process_holds_is_read() {
+        assert!(held_mb() > 0);
     }
 }

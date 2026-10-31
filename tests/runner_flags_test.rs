@@ -391,13 +391,24 @@ fn service_repo(root: &Path, services: &[&str]) -> PathBuf {
 /// meets a full heap: V8's fatal line on stderr, then an abort. It writes
 /// `died` first, so the test knows the death happened rather than guessing.
 fn sidecar_that_runs_out_of_heap_in_beta(home: &Path, died: &Path) {
-    sidecar_stand_in(home, died, false);
+    sidecar_stand_in(home, died, false, BetaDies::Always);
+}
+
+/// Which of `beta`'s processes the stand-in kills with a full heap.
+#[derive(Clone, Copy)]
+enum BetaDies {
+    /// Every one.
+    Always,
+    /// The first, the one that finds no `died` file. A run that writes
+    /// `died` beforehand has a `beta` that lives.
+    Once,
 }
 
 /// The stand-in, and with `alpha_waits` its `alpha` process holds its first
 /// type request until `beta`'s has died (30 seconds at most), and two
 /// seconds more: `alpha` is still being analysed when the death is recorded.
-fn sidecar_stand_in(home: &Path, died: &Path, alpha_waits: bool) {
+/// Every process notes its scope and its V8 flags in `home/argv` at `init`.
+fn sidecar_stand_in(home: &Path, died: &Path, alpha_waits: bool, beta_dies: BetaDies) {
     let dir = home.join("sidecar/dist/src");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -405,6 +416,7 @@ fn sidecar_stand_in(home: &Path, died: &Path, alpha_waits: bool) {
         format!(
             r#"const fs = require("fs");
 const pause = new Int32Array(new SharedArrayBuffer(4));
+const dies = {always} || !fs.existsSync({died:?});
 let waited = false;
 let root = "";
 let buffered = "";
@@ -422,6 +434,7 @@ process.stdin.on("data", (chunk) => {{
     if (request.action === "shutdown") process.exit(0);
     if (request.action === "init") {{
       root = request.repo_root || "";
+      fs.appendFileSync({argv:?}, root + "\t" + process.execArgv.join(" ") + "\n");
       answer({{ status: "ready", init_time_ms: 1 }});
       continue;
     }}
@@ -431,7 +444,7 @@ process.stdin.on("data", (chunk) => {{
       Atomics.wait(pause, 0, 0, 2000);
       waited = true;
     }}
-    if (root.endsWith("beta")) {{
+    if (root.endsWith("beta") && dies) {{
       fs.writeFileSync({died:?}, request.action);
       fs.writeSync(2, "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n");
       process.abort();
@@ -456,6 +469,8 @@ process.stdin.resume();
 "#,
             died = died.to_string_lossy(),
             alpha_waits = alpha_waits,
+            always = matches!(beta_dies, BetaDies::Always),
+            argv = home.join("argv").to_string_lossy(),
         ),
     )
     .unwrap();
@@ -497,8 +512,21 @@ fn typed_scan_of(
     fail_on_type_memory: bool,
     env: &[(&str, &str)],
 ) -> TypedScan {
+    typed_scan_into(repo, home, died, fail_on_type_memory, env, None)
+}
+
+/// [`typed_scan_of`], its blobs written to `store` when given
+/// (`CARRICK_LOCAL_STORAGE_DIR`) instead of the mock's log, and `env` set
+/// last, so it can replace the 512 MB heap cap.
+fn typed_scan_into(
+    repo: &Path,
+    home: &Path,
+    died: &Path,
+    fail_on_type_memory: bool,
+    env: &[(&str, &str)],
+    store: Option<&Path>,
+) -> TypedScan {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
-    cmd.envs(env.iter().copied());
     cmd.arg(repo)
         .args(["--allow-unprepared", "--upload"])
         .env("HOME", home)
@@ -519,12 +547,19 @@ fn typed_scan_of(
         "CI",
         "CARRICK_OUTPUT_JSON",
         "CARRICK_LOCAL_STORAGE_DIR",
+        "CARRICK_LOCAL_STORAGE_ISOLATE",
         "CARRICK_ALLOW_MISSING_TYPES",
         "CARRICK_RUN_ID",
+        "CARRICK_SERVICE_CONCURRENCY",
+        "CARRICK_MEMORY_LIMIT_MB",
         "ACTIONS_ID_TOKEN_REQUEST_URL",
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     ] {
         cmd.env_remove(var);
+    }
+    cmd.envs(env.iter().copied());
+    if let Some(store) = store {
+        cmd.env("CARRICK_LOCAL_STORAGE_DIR", store);
     }
     let output = cmd.output().expect("failed to spawn carrick");
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -599,19 +634,20 @@ fn without_the_variable_a_memory_death_costs_only_the_types() {
     );
 }
 
-/// carrick#1066 with carrick#2208: services analysed side by side, and the
-/// type checker of the second dies of memory while the first is still being
-/// analysed. The run still stops with exit 3 and names the service whose
-/// checker died; the first, whose own checker lived, lands although it ends
-/// after the death; and the third, not yet started when the death was
-/// recorded, is never started.
+/// carrick#1066 with carrick#2208 and carrick#3084: services analysed side by
+/// side, and the type checker of the second dies of memory, every time,
+/// while the first is still being analysed. A death beside another service
+/// no longer stops the run: the third starts, and the second is analysed
+/// again alone at the run's cap after the pass. It dies there too, alone at
+/// the run's cap, and that stops the run with exit 3, naming it. The first
+/// and the third, whose checkers lived, land.
 #[test]
 fn a_memory_death_in_one_of_several_workers_stops_the_run_with_exit_3() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = service_repo(tmp.path(), &["alpha", "beta", "gamma"]);
     let home = tmp.path().join("home");
     let died = tmp.path().join("died");
-    sidecar_stand_in(&home, &died, true);
+    sidecar_stand_in(&home, &died, true, BetaDies::Always);
     let run = typed_scan_of(
         &repo,
         &home,
@@ -629,16 +665,183 @@ fn a_memory_death_in_one_of_several_workers_stops_the_run_with_exit_3() {
         "{}",
         run.stderr
     );
-    assert_eq!(run.uploaded(), ["alpha"], "{}", run.log);
-    assert!(
-        run.log.contains("Analyzing service alpha (1/3)")
-            && run.log.contains("Analyzing service beta (2/3)"),
-        "alpha and beta were analysed:\n{}",
+    assert_eq!(run.uploaded(), ["alpha", "gamma"], "{}", run.log);
+    assert_eq!(
+        run.log.matches("Analyzing service beta (2/3)").count(),
+        2,
+        "beta was analysed beside alpha, then alone:\n{}",
         run.log
     );
     assert!(
-        !run.log.contains("Analyzing service gamma"),
-        "gamma was started after the death:\n{}",
+        run.log.contains(
+            "Service beta died of memory beside another service; analysing it again alone at \
+             512 MB"
+        ),
+        "{}",
         run.log
     );
+}
+
+/// Every blob in a local store, by service, without the fields that state
+/// the run rather than the service: when it ran and what it measured.
+fn stored_blobs(store: &Path) -> std::collections::BTreeMap<String, serde_json::Value> {
+    std::fs::read_dir(store)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| {
+            let mut blob: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+            let service = blob["service_name"].as_str()?.to_string();
+            let object = blob.as_object_mut()?;
+            object.remove("last_updated");
+            object.remove("memory_peaks");
+            Some((service, blob))
+        })
+        .collect()
+}
+
+/// carrick#3084: told to stop on a memory death, a run whose second service's
+/// type checker dies of memory beside the first does not stop. The second is
+/// analysed again alone after the pass, its process lives there, and every
+/// service lands with its types and exit 0. What it lands is what a run one
+/// at a time, in which its process lived, lands.
+#[test]
+fn a_memory_death_beside_another_service_is_analysed_again_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = service_repo(tmp.path(), &["alpha", "beta", "gamma"]);
+    let home = tmp.path().join("home");
+    let died = tmp.path().join("died");
+    let store = tmp.path().join("store");
+    sidecar_stand_in(&home, &died, true, BetaDies::Once);
+    let run = typed_scan_into(
+        &repo,
+        &home,
+        &died,
+        true,
+        &[("CARRICK_SERVICE_CONCURRENCY", "2")],
+        Some(&store),
+    );
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
+    assert!(
+        run.log.contains(
+            "Service beta died of memory beside another service; analysing it again alone at \
+             512 MB"
+        ),
+        "{}",
+        run.log
+    );
+    let landed = stored_blobs(&store);
+    assert_eq!(
+        landed.keys().collect::<Vec<_>>(),
+        ["alpha", "beta", "gamma"],
+        "{}",
+        run.log
+    );
+    for (service, blob) in &landed {
+        assert!(
+            blob.get("types_degraded").is_none_or(|v| v.is_null()),
+            "{service} lost its types: {}\n{}",
+            blob["types_degraded"],
+            run.log
+        );
+    }
+
+    // The same fixture one at a time, in a run whose beta lives.
+    let one_home = tmp.path().join("one-home");
+    let one_store = tmp.path().join("one-store");
+    let lived = tmp.path().join("lived");
+    std::fs::write(&lived, "written first, so beta lives").unwrap();
+    sidecar_stand_in(&one_home, &lived, false, BetaDies::Once);
+    let one = typed_scan_into(
+        &repo,
+        &one_home,
+        &lived,
+        true,
+        &[("CARRICK_SERVICE_CONCURRENCY", "1")],
+        Some(&one_store),
+    );
+    assert_eq!(one.code, Some(0), "{}\n{}", one.stderr, one.log);
+    assert_eq!(
+        serde_json::to_string_pretty(&landed["beta"]).unwrap(),
+        serde_json::to_string_pretty(&stored_blobs(&one_store)["beta"]).unwrap()
+    );
+}
+
+/// carrick#3084: a service whose previous scan stored a 1,000 MB peak starts
+/// its sidecar with a 2,048 MB heap cap, under a run cap of 4,096 MB; one
+/// with no stored peak starts at the run's cap.
+#[test]
+fn a_stored_peak_caps_the_service_s_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = two_service_repo(tmp.path());
+    let home = tmp.path().join("home");
+    let lived = tmp.path().join("lived");
+    let store = tmp.path().join("store");
+    std::fs::write(&lived, "written first, so beta lives").unwrap();
+    sidecar_stand_in(&home, &lived, false, BetaDies::Once);
+    let run_cap = [("CARRICK_SIDECAR_MAX_OLD_SPACE_MB", "4096")];
+    let first = typed_scan_into(&repo, &home, &lived, false, &run_cap, Some(&store));
+    assert_eq!(first.code, Some(0), "{}\n{}", first.stderr, first.log);
+
+    // Beta's stored peak, as a previous scan measured it; alpha's, none.
+    for (service, peaks) in [
+        ("beta", serde_json::json!({ "analysis_mb": 1000 })),
+        ("alpha", serde_json::Value::Null),
+    ] {
+        let (path, mut blob) = stored_blob_file(&store, service);
+        blob["memory_peaks"] = peaks;
+        std::fs::write(&path, serde_json::to_string_pretty(&blob).unwrap()).unwrap();
+    }
+    std::fs::remove_file(home.join("argv")).unwrap();
+
+    let second = typed_scan_into(&repo, &home, &lived, false, &run_cap, Some(&store));
+    assert_eq!(second.code, Some(0), "{}\n{}", second.stderr, second.log);
+    let argv = std::fs::read_to_string(home.join("argv")).unwrap();
+    let flags_of = |service: &str| -> Vec<String> {
+        argv.lines()
+            .filter(|line| line.split('\t').next().unwrap_or("").ends_with(service))
+            .map(|line| line.split('\t').nth(1).unwrap_or("").to_string())
+            .collect()
+    };
+    // Every process of each, the one a capture restarts included.
+    let (beta, alpha) = (flags_of("beta"), flags_of("alpha"));
+    assert!(
+        !beta.is_empty()
+            && beta
+                .iter()
+                .all(|flags| flags == "--max-old-space-size=2048"),
+        "{argv}\n{}",
+        second.log
+    );
+    assert!(
+        !alpha.is_empty()
+            && alpha
+                .iter()
+                .all(|flags| flags == "--max-old-space-size=4096"),
+        "{argv}"
+    );
+    assert!(
+        second
+            .log
+            .contains("Service beta started: heap cap 2048 MB (stored peak 1000 MB)"),
+        "{}",
+        second.log
+    );
+}
+
+/// The path and the parsed blob of `service` in a local store.
+fn stored_blob_file(store: &Path, service: &str) -> (PathBuf, serde_json::Value) {
+    std::fs::read_dir(store)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .find_map(|path| {
+            let blob: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+            (blob["service_name"] == service).then_some((path, blob))
+        })
+        .unwrap_or_else(|| panic!("{service}'s blob is stored"))
 }
