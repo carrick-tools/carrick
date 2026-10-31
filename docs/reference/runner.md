@@ -68,6 +68,28 @@ carrick <path> --repo <owner/name> --upload
 
 None of these flags is listed in `carrick --help`.
 
+### The endpoint delta
+
+A pull request scan lists an operation (HTTP route, GraphQL field, socket
+event or pub/sub topic) as new or removed only when the pull request's own
+diff places it (carrick#3080, `src/pr_delta_anchor.rs`). The diff runs from
+the merge base of the base commit and HEAD to the tree the scan read.
+
+- A new operation is listed when the pull request adds its file, when its
+  line is one the pull request added or changed, or when main's index holds
+  an operation at the same place (an edit elsewhere changed what that
+  registration resolves to, such as a mount prefix or a path constant).
+- A removed operation is listed when the pull request deletes its file or
+  replaces its line, or when this scan holds another operation at the place
+  its line moved to. One main changed between its indexed commit and the
+  merge base is main's, not the pull request's. When git cannot read the
+  file at main's commit, the operation is listed only if the pull request
+  edits or deletes that file.
+- Everything else is a reading that moved. It is counted in one info line of
+  the run log and not listed.
+- With no base commit, or when git cannot read the diff, the scan lists no
+  endpoint changes and says why in the run log.
+
 ## What `--changed-only` analyses
 
 A service's base is its own stored blob's commit; services of one

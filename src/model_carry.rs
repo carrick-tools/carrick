@@ -110,7 +110,7 @@ pub fn carry_edited_files(
         }
         let git_path = format!("./{relative}");
         let old_text = file_at_commit(repo_path, prev_commit, &git_path);
-        let hunks = changed_hunks(repo_path, prev_commit, &relative);
+        let hunks = changed_hunks(repo_path, prev_commit, &relative, None);
         let new_text = std::fs::read_to_string(&key).ok();
         let carry = match (old_text, hunks, new_text) {
             (Some(old), Ok(hunks), Some(new)) => carry_file(
