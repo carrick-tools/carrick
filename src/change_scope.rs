@@ -220,6 +220,131 @@ impl ServiceInputs {
     }
 }
 
+/// Whether `path` is a `.gitignore`, wherever it sits.
+fn is_gitignore(path: &str) -> bool {
+    path.rsplit('/').next() == Some(".gitignore")
+}
+
+impl ServiceInputs {
+    /// Whether a `.gitignore` is in a workspace package the service reads
+    /// whole. An install that copies the package by its pack list reads the
+    /// package's `.gitignore` when it has no `files` field and no `.npmignore`.
+    fn reads_the_dir_of(&self, gitignore: &str) -> bool {
+        let dir = parent_of(gitignore);
+        self.dirs.iter().any(|read| under(dir, read))
+    }
+}
+
+/// Whether an edit to `gitignore` can move what this service reads
+/// (carrick#3113).
+///
+/// A `.gitignore` decides only which untracked paths a walk leaves out: a
+/// tracked file is read whatever it says, and an untracked file it does not
+/// ignore is already listed as added. So an edit counts against a service when
+/// an untracked path under the `.gitignore`'s folder is one the service reads
+/// and its walk could enter, or when the service reads the folder whole
+/// ([`ServiceInputs::reads_the_dir_of`]).
+///
+/// `untracked` is every untracked path, ignored or not
+/// ([`crate::git_state::untracked_paths`]); `None` when git could not list
+/// them, and then the edit counts. `walk_enters(base, path, is_dir)` says
+/// whether a walk reading `base` could enter `path` below it.
+fn gitignore_moves(
+    gitignore: &str,
+    inputs: &ServiceInputs,
+    untracked: Option<&[String]>,
+    mut walk_enters: impl FnMut(&str, &str, bool) -> bool,
+) -> bool {
+    let Some(untracked) = untracked else {
+        return true;
+    };
+    if inputs.reads_the_dir_of(gitignore) {
+        return true;
+    }
+    let governed = parent_of(gitignore);
+    untracked.iter().any(|entry| {
+        let is_dir = entry.ends_with('/');
+        let path = entry.trim_end_matches('/');
+        if !under(path, governed) && !(is_dir && under(governed, path)) {
+            return false;
+        }
+        // An untracked folder that holds something the service reads whole
+        // (a root, a directory, a closure file) is not narrowed.
+        if is_dir
+            && (inputs.roots.iter().any(|root| under(&root.dir, path))
+                || inputs.dirs.iter().any(|dir| under(dir, path))
+                || inputs.files.iter().any(|file| under(file, path)))
+        {
+            return true;
+        }
+        if inputs.files.contains(path) {
+            return true;
+        }
+        let bases = inputs
+            .roots
+            .iter()
+            .filter(|root| {
+                under(path, &root.dir) && !root.left_out.iter().any(|dir| under(path, dir))
+            })
+            .map(|root| root.dir.as_str())
+            .chain(
+                inputs
+                    .dirs
+                    .iter()
+                    .filter(|dir| under(path, dir))
+                    .map(String::as_str),
+            );
+        let mut bases: Vec<&str> = bases.collect();
+        bases.sort_unstable();
+        bases.dedup();
+        bases
+            .into_iter()
+            .any(|base| walk_enters(base, path, is_dir))
+    })
+}
+
+/// Whether a walk rooted at `base` (repository-relative) could enter `path`
+/// below it: none of the folders between is one the walk skips by name
+/// (`skip`), and none is a stop the walk makes whatever `.gitignore` says
+/// ([`crate::file_finder::boundary_other_than_ignored`]). The walk's own root
+/// is never a stop. `stops` remembers each folder's answer.
+fn walk_could_enter(
+    top: &Path,
+    skip: &[&str],
+    base: &str,
+    path: &str,
+    is_dir: bool,
+    stops: &mut HashMap<PathBuf, bool>,
+) -> bool {
+    let below = path
+        .strip_prefix(base)
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    if below.is_empty() {
+        return true;
+    }
+    let segments: Vec<&str> = below.split('/').collect();
+    let folders = if is_dir {
+        segments.len()
+    } else {
+        segments.len() - 1
+    };
+    let mut at = top.join(base);
+    for segment in &segments[..folders] {
+        if skip.contains(segment) {
+            return false;
+        }
+        at.push(segment);
+        let stopped = *stops.entry(at.clone()).or_insert_with(|| {
+            crate::file_finder::boundary_other_than_ignored(&at, true).is_some()
+        });
+        if stopped {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether `path` is `dir` or under it. `""` is the whole repository.
 fn under(path: &str, dir: &str) -> bool {
     dir.is_empty()
@@ -326,6 +451,9 @@ pub fn is_repo_input(path: &str) -> bool {
 /// top-level `version` ([`only_version_differs`]); it is asked only of a
 /// repo input, and such a manifest is read only by the services that import
 /// its package, not by the one whose manifest it is (carrick#2566).
+/// `gitignore_moves` says whether an edit to a `.gitignore` can move what the
+/// service reads ([`gitignore_moves`]); a `.gitignore` is judged by it alone,
+/// not as a repo input or a path under a root (carrick#3113).
 ///
 /// A run that carries under that rule and uploads would write a stored
 /// manifest projection (`packages`, `package_json`, `package_json_hash`)
@@ -344,6 +472,7 @@ pub fn decide(
     config_json: Option<&str>,
     changed: Result<&[ChangedPath], &str>,
     mut version_only: impl FnMut(&ChangedPath) -> bool,
+    mut gitignore_moves: impl FnMut(&str, &ServiceInputs) -> bool,
     inputs: impl FnOnce() -> ServiceInputs,
 ) -> Scope {
     let Some(stored) = stored else {
@@ -431,24 +560,34 @@ pub fn decide(
             ),
         );
     }
-    let version_only: Vec<bool> = changed
+    let others: Vec<&ChangedPath> = changed
+        .iter()
+        .filter(|change| !is_gitignore(&change.path))
+        .collect();
+    let version_only: Vec<bool> = others
         .iter()
         .map(|change| is_repo_input(&change.path) && version_only(change))
         .collect();
-    if let Some((change, _)) = changed
+    if let Some((change, _)) = others
         .iter()
         .zip(&version_only)
         .find(|(change, only)| is_repo_input(&change.path) && !**only)
     {
         return Scope::analysed(Reason::RepoInputChanged, change.path.clone());
     }
-    if let Some((change, _)) = changed.iter().zip(&version_only).find(|(change, only)| {
+    if let Some((change, _)) = others.iter().zip(&version_only).find(|(change, only)| {
         if **only {
             inputs.reads_outside_roots(change)
         } else {
             inputs.reads(change)
         }
     }) {
+        return Scope::analysed(Reason::InputsChanged, change.path.clone());
+    }
+    if let Some(change) = changed
+        .iter()
+        .find(|change| is_gitignore(&change.path) && gitignore_moves(&change.path, &inputs))
+    {
         return Scope::analysed(Reason::InputsChanged, change.path.clone());
     }
     Scope::Carried {
@@ -543,6 +682,9 @@ pub fn plan<'a>(
         .then(|| crate::git_state::untracked_root_config(repo_path))
         .flatten();
     let mut version_only: HashMap<(String, String), bool> = HashMap::new();
+    // Listed once, and only when a `.gitignore` changed (carrick#3113).
+    let untracked: std::cell::OnceCell<Option<Vec<String>>> = std::cell::OnceCell::new();
+    let mut stops: HashMap<PathBuf, bool> = HashMap::new();
     let mut changed_by_commit: HashMap<String, Result<Vec<ChangedPath>, String>> = HashMap::new();
     let mut closure_took = std::time::Duration::ZERO;
     let mut walked = 0usize;
@@ -589,6 +731,18 @@ pub fn plan<'a>(
                 config_json.as_deref(),
                 changed,
                 version_only,
+                |gitignore, inputs| {
+                    let untracked = untracked
+                        .get_or_init(|| crate::git_state::untracked_paths(repo_path).ok())
+                        .as_deref();
+                    let Some(top) = &top else {
+                        return true;
+                    };
+                    let skip = crate::engine::service_ignore_patterns(service);
+                    gitignore_moves(gitignore, inputs, untracked, |base, path, is_dir| {
+                        walk_could_enter(top, &skip, base, path, is_dir, &mut stops)
+                    })
+                },
                 || {
                     let started = Instant::now();
                     walked += 1;
@@ -1083,11 +1237,13 @@ impl<'a> CopyJudge<'a> {
         if pr_edits_an_outside_input {
             return whole_tree();
         }
-        Some(
-            changed
-                .iter()
-                .any(|change| is_repo_input(&change.path) || inputs.reads(change)),
-        )
+        Some(changed.iter().any(|change| {
+            if is_gitignore(&change.path) {
+                inputs.reads_the_dir_of(&change.path)
+            } else {
+                is_repo_input(&change.path) || inputs.reads(change)
+            }
+        }))
     }
 }
 
@@ -1219,6 +1375,7 @@ mod tests {
             Some("{\"serviceName\":\"api\"}"),
             changes,
             |_| false,
+            |gitignore, inputs| gitignore_moves(gitignore, inputs, Some(&[]), |_, _, _| true),
             || inputs,
         )
     }
@@ -1263,7 +1420,7 @@ mod tests {
                 Some(Reason::RepoInputChanged),
             ),
             (('M', "schema/a.graphqls"), Some(Reason::RepoInputChanged)),
-            (('M', "apps/web/.gitignore"), Some(Reason::RepoInputChanged)),
+            (('M', "apps/web/.gitignore"), None),
             (('M', "carrick.json"), Some(Reason::RepoInputChanged)),
             (('M', ".npmrc"), Some(Reason::RepoInputChanged)),
             (
@@ -1449,6 +1606,7 @@ mod tests {
             Some("{\"serviceName\":\"api\"}"),
             Ok(&changes),
             |_| false,
+            |_, _| false,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1469,6 +1627,7 @@ mod tests {
             Some("{\"serviceName\":\"api\"}"),
             Ok(&changes),
             |_| false,
+            |_, _| false,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1552,6 +1711,7 @@ mod tests {
                 Some("{\"serviceName\":\"api\"}"),
                 Ok(&changes),
                 |_| false,
+                |_, _| false,
                 api_inputs,
             )
         };
@@ -2288,5 +2448,173 @@ mod tests {
         let written = refreshed_carried(payload, &stored, &[], "1234567fff", false).unwrap();
         assert_eq!(written.package_json, stored.package_json);
         assert_eq!(written.package_json_hash, stored.package_json_hash);
+    }
+    /// The stored index sits at A, where a root `.gitignore` exists.
+    fn ignoring_workspace() -> (tempfile::TempDir, String, Vec<Config>) {
+        let (repo, _, services) = workspace();
+        for dir in ["apps/web", "packages/shared"] {
+            std::fs::write(repo.path().join(dir).join(".gitignore"), "out/\n").unwrap();
+        }
+        std::fs::write(
+            repo.path().join(".gitignore"),
+            "coverage/\ngen/\nnode_modules/\ndist/\n.cache/\n",
+        )
+        .unwrap();
+        let a = commit_all(repo.path(), "ignores");
+        (repo, a, services)
+    }
+
+    fn write_untracked(repo: &Path, path: &str) {
+        let full = repo.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, "export const out = 1;\n").unwrap();
+    }
+
+    /// Scopes of `api`, `web`, `worker` after `edit` is committed at B.
+    fn after_ignore_edit(edit: impl FnOnce(&Path), untracked: &[&str]) -> Vec<Option<Reason>> {
+        let (repo, a, services) = ignoring_workspace();
+        let blobs = stored_at(&services, &a);
+        edit(repo.path());
+        commit_all(repo.path(), "edit");
+        for path in untracked {
+            write_untracked(repo.path(), path);
+        }
+        reasons(&scopes_of(
+            repo.path(),
+            &services,
+            &blobs,
+            &names_of(&services),
+        ))
+    }
+
+    fn edit_file(path: &'static str, text: &'static str) -> impl FnOnce(&Path) {
+        move |repo| std::fs::write(repo.join(path), text).unwrap()
+    }
+
+    #[test]
+    fn a_gitignore_edit_with_no_untracked_file_carries_every_service() {
+        assert_eq!(
+            after_ignore_edit(
+                edit_file(
+                    ".gitignore",
+                    "coverage/\ngen/\nnode_modules/\ndist/\n.cache/\n# edited\n"
+                ),
+                &[]
+            ),
+            [None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_gitignore_edit_analyses_the_service_that_reads_an_untracked_file() {
+        let reasons = after_ignore_edit(
+            edit_file(
+                ".gitignore",
+                "coverage/\ngen/\nnode_modules/\ndist/\n.cache/\n# edited\n",
+            ),
+            &["apps/api/gen/out.ts"],
+        );
+        assert_eq!(reasons, [Some(Reason::InputsChanged), None, None]);
+    }
+
+    #[test]
+    fn untracked_files_the_walk_cannot_enter_move_nothing() {
+        let reasons = after_ignore_edit(
+            edit_file(
+                ".gitignore",
+                "coverage/\ngen/\nnode_modules/\ndist/\n.cache/\n# edited\n",
+            ),
+            &[
+                "apps/web/node_modules/pkg/index.ts",
+                "apps/api/dist/out.ts",
+                "apps/api/.cache/out.ts",
+            ],
+        );
+        assert_eq!(reasons, [None, None, None]);
+    }
+
+    #[test]
+    fn a_gitignore_edit_reaches_only_the_folder_it_governs() {
+        // web's own `.gitignore` is edited; the untracked file sits in api.
+        let reasons = after_ignore_edit(
+            edit_file("apps/web/.gitignore", "out/\n# edited\n"),
+            &["apps/api/gen/out.ts"],
+        );
+        assert_eq!(reasons, [None, None, None]);
+    }
+
+    #[test]
+    fn a_workspace_package_gitignore_reaches_the_services_that_enter_it() {
+        let reasons = after_ignore_edit(
+            edit_file("packages/shared/.gitignore", "out/\n# edited\n"),
+            &[],
+        );
+        assert_eq!(reasons, [None, None, Some(Reason::InputsChanged)]);
+    }
+
+    #[test]
+    fn a_gitignore_edit_and_a_source_edit_each_count_for_their_own_service() {
+        let reasons = after_ignore_edit(
+            |repo| {
+                edit_file(
+                    ".gitignore",
+                    "coverage/\ngen/\nnode_modules/\ndist/\n.cache/\n# edited\n",
+                )(repo);
+                edit_file(
+                    "apps/worker/src/job.ts",
+                    "import { x } from \"@fixture/shared\";\nexport const job = x + 1;\n",
+                )(repo);
+            },
+            &[],
+        );
+        assert_eq!(reasons, [None, None, Some(Reason::InputsChanged)]);
+    }
+
+    #[test]
+    fn a_gitignore_edit_counts_for_every_service_when_git_cannot_list_untracked_files() {
+        assert!(gitignore_moves(
+            ".gitignore",
+            &api_inputs(),
+            None,
+            |_, _, _| false
+        ));
+        let none: [String; 0] = [];
+        assert!(!gitignore_moves(
+            ".gitignore",
+            &api_inputs(),
+            Some(&none),
+            |_, _, _| true
+        ));
+    }
+
+    /// Both sides of the main-copy verdict are commits, so only a workspace
+    /// package's own `.gitignore` can move what a service reads.
+    #[test]
+    fn a_copy_stored_before_a_gitignore_edit_is_current() {
+        let (repo, a, services) = ignoring_workspace();
+        let b = commit_edit(repo.path(), ".gitignore", "coverage/\n# edited\n");
+        let main_self = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &b),
+            MainCopy::Current
+        );
+        let c = commit_edit(
+            repo.path(),
+            "packages/shared/.gitignore",
+            "out/\n# edited\n",
+        );
+        let main_self = [
+            copy_at("api", &c),
+            copy_at("web", &b),
+            copy_at("worker", &b),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &c),
+            MainCopy::Stale
+        );
     }
 }

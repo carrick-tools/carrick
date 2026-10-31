@@ -554,6 +554,14 @@ pub fn git_boundary(entry: &walkdir::DirEntry) -> Option<GitBoundary> {
 
 /// [`git_boundary`] for `path`, a directory or not, below a walk's root.
 fn boundary_at(path: &Path, is_dir: bool) -> Option<GitBoundary> {
+    boundary_other_than_ignored(path, is_dir)
+        .or_else(|| is_git_ignored(path).then_some(GitBoundary::Ignored))
+}
+
+/// [`boundary_at`] without the ignore rule: the stops no `.gitignore` edit
+/// can move. A change scope asks it of the folders above a path an edit may
+/// un-ignore.
+pub fn boundary_other_than_ignored(path: &Path, is_dir: bool) -> Option<GitBoundary> {
     if is_dir {
         if path.file_name().is_some_and(|name| name == ".git") {
             return Some(GitBoundary::Records);
@@ -565,7 +573,7 @@ fn boundary_at(path: &Path, is_dir: bool) -> Option<GitBoundary> {
             return Some(GitBoundary::UntrackedDotFolder);
         }
     }
-    is_git_ignored(path).then_some(GitBoundary::Ignored)
+    None
 }
 
 /// Whether a walk rooted at `root` would stop before it reached `path`

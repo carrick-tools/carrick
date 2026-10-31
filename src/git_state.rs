@@ -605,6 +605,24 @@ pub fn changed_paths(
     Ok(changed)
 }
 
+/// Every path under `repo_path` that git does not track, ignored or not,
+/// relative to the repository's top level: a file, or a folder written with a
+/// trailing `/` when nothing under it is tracked. Empty folders are left out.
+/// `Err` means git could not answer.
+pub fn untracked_paths(repo_path: &str) -> Result<Vec<String>, String> {
+    Ok(nul_paths(run_git(
+        repo_path,
+        &[
+            "ls-files",
+            "--others",
+            "--directory",
+            "--no-empty-directory",
+            "--full-name",
+            "-z",
+        ],
+    )?))
+}
+
 /// The top-level-relative path of the scan root's `carrick.json` when the
 /// tree holds one that no commit does: untracked, and absent from HEAD. The
 /// runner writes the project config there before it scans, so it is the
