@@ -1,0 +1,60 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/queue",
+      "version": "2.4.1",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "@fixture/queue",
+          "export": "bus",
+          "role": "broker",
+          "side": null,
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "publish",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "subscribe",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": [
+            "*"
+          ]
+        }
+      ]
+    }
+  ]
+}

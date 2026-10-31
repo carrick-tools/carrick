@@ -1,0 +1,30 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_operations": [],
+  "pubsub_operations": [
+    {
+      "topic": "payments.settled",
+      "role": "subscriber",
+      "line_number": 9,
+      "primary_type_symbol": "PaymentSettled",
+      "type_import_source": null,
+      "broker": "queue",
+      "payload_expression_text": null,
+      "payload_expression_line": null
+    },
+    {
+      "topic": "orders.shipped",
+      "role": "publisher",
+      "line_number": 15,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": "queue",
+      "payload_expression_text": "{ orderId, carrier: \"post\" }",
+      "payload_expression_line": 15
+    }
+  ],
+  "graphql_consumer_locates": [],
+  "dispatch_tables": []
+}
