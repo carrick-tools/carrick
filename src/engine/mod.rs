@@ -437,8 +437,53 @@ enum DeltaBaseline {
     /// scanned by this version, the versions agree and the delta returns.
     /// Holds the versions it names, for the log.
     OtherScanner(Vec<String>),
-    /// The stored index's operations, by service and key.
-    Keys(HashSet<ServiceEndpointKey>),
+    /// The stored index's operations. Keyed by service and route identity, each holding the operation as
+    /// stored (the spelling a removed row shows).
+    Keys(HashMap<ServiceEndpointKey, DeltaRow>),
+}
+
+/// What the delta compares an operation by: an HTTP path with every parameter
+/// spelling folded to one token (`carrick_match::route_identity`); any other
+/// protocol's key as it is (carrick#3079).
+fn delta_identity(key: &crate::operation::OperationKey) -> crate::operation::OperationKey {
+    match key {
+        crate::operation::OperationKey::Http { method, path } => {
+            crate::operation::OperationKey::Http {
+                method: method.clone(),
+                path: carrick_match::route_identity(path),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// One operation as a scan states it: the key in its own spelling and the
+/// file and line it was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeltaRow {
+    key: crate::operation::OperationKey,
+    file_path: std::path::PathBuf,
+}
+
+/// `endpoint` under its identity for `service`. When two spellings of one
+/// route meet, the first in (method, path) order is the one kept, with its
+/// own file and line.
+fn keep_first_spelling(
+    keys: &mut HashMap<ServiceEndpointKey, DeltaRow>,
+    service: &Option<String>,
+    endpoint: &ApiEndpointDetails,
+) {
+    let row = DeltaRow {
+        key: endpoint.key.clone(),
+        file_path: endpoint.file_path.clone(),
+    };
+    keys.entry((service.clone(), delta_identity(&endpoint.key)))
+        .and_modify(|kept| {
+            if row.key.display_labels() < kept.key.display_labels() {
+                *kept = row.clone();
+            }
+        })
+        .or_insert(row);
 }
 
 impl DeltaBaseline {
@@ -465,16 +510,13 @@ impl DeltaBaseline {
             versions.dedup();
             return Self::OtherScanner(versions);
         }
-        Self::Keys(
-            stored
-                .iter()
-                .flat_map(|repo| {
-                    repo.endpoints
-                        .iter()
-                        .map(|e| (repo.service_name.clone(), e.key.clone()))
-                })
-                .collect(),
-        )
+        let mut keys = HashMap::new();
+        for repo in &stored {
+            for endpoint in &repo.endpoints {
+                keep_first_spelling(&mut keys, &repo.service_name, endpoint);
+            }
+        }
+        Self::Keys(keys)
     }
 }
 
@@ -483,7 +525,7 @@ impl DeltaBaseline {
 /// path, service) so the output is deterministic even when two services add
 /// or drop the same operation.
 fn endpoint_delta(
-    previous: &HashSet<ServiceEndpointKey>,
+    previous: &HashMap<ServiceEndpointKey, DeltaRow>,
     current: &[CloudRepoData],
 ) -> crate::findings::PrDelta {
     let endpoint_ref = |service: &Option<String>, key: &crate::operation::OperationKey| {
@@ -499,22 +541,21 @@ fn endpoint_delta(
             (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
         });
     };
-    let mut current_keys = HashSet::new();
-    let mut new_endpoints = Vec::new();
-    let mut seen = HashSet::new();
+    let mut current_keys = HashMap::new();
     for service_data in current {
         for endpoint in &service_data.endpoints {
-            let id = (service_data.service_name.clone(), endpoint.key.clone());
-            current_keys.insert(id.clone());
-            if !previous.contains(&id) && seen.insert(id) {
-                new_endpoints.push(endpoint_ref(&service_data.service_name, &endpoint.key));
-            }
+            keep_first_spelling(&mut current_keys, &service_data.service_name, endpoint);
         }
     }
+    let mut new_endpoints: Vec<crate::findings::EndpointRef> = current_keys
+        .iter()
+        .filter(|(id, _)| !previous.contains_key(*id))
+        .map(|((service, _), row)| endpoint_ref(service, &row.key))
+        .collect();
     let mut removed_endpoints: Vec<crate::findings::EndpointRef> = previous
         .iter()
-        .filter(|id| !current_keys.contains(*id))
-        .map(|(service, key)| endpoint_ref(service, key))
+        .filter(|(id, _)| !current_keys.contains_key(*id))
+        .map(|((service, _), row)| endpoint_ref(service, &row.key))
         .collect();
     sort_refs(&mut new_endpoints);
     sort_refs(&mut removed_endpoints);
