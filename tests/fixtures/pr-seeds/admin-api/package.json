@@ -1,0 +1,8 @@
+{
+  "name": "admin-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-server": "^1.0.0"
+  }
+}

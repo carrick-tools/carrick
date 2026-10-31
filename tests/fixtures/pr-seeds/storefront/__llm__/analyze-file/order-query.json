@@ -1,0 +1,13 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_consumer_locates": [
+    {
+      "kind": "query",
+      "field": "order",
+      "result_type_symbol": "OrderData",
+      "result_type_source": null
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:16",
+      "line_number": 16,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/api/v1/admin/orders",
+      "handler_name": "listOrders",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:17",
+      "line_number": 17,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/api/v1/admin/orders/:orderId/cancel",
+      "handler_name": "cancelOrder",
+      "pattern_matched": ".post(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:20",
+      "line_number": 20,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/api/v1/admin/reports/${period}",
+      "handler_name": "report",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

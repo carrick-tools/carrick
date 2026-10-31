@@ -1,0 +1,9 @@
+type Query {
+  order(id: ID!): OrderView
+}
+
+type OrderView {
+  id: ID!
+  total: Int!
+  currency: String!
+}

@@ -1895,3 +1895,943 @@ async fn a_pr_with_no_base_commit_shows_no_endpoint_delta() {
     let delta = pr_delta(&store, &producer).await;
     assert!(delta.is_null(), "{delta:#}");
 }
+
+// carrick#3095: one seeded change per finding kind and per protocol, run as a
+// real PR scan against main's stored index. The fixture and its answer key are
+// `tests/fixtures/pr-seeds/README.md`. Every seed edits `orders-api` (or
+// `admin-api`) and leaves `storefront` as main has it, so each break is a
+// consumer the PR did not update. A seed whose payload is dark today holds its
+// full assertion under `#[ignore]`, naming the issue that fixes it; that issue
+// removes the ignore as its failing-first test.
+
+/// Set the five switches the cloud runner sets for every workspace
+/// (carrick-cloud `runner/image/src/proc.ts`) until the guard drops.
+struct FactLayer(Vec<(&'static str, Option<String>)>);
+
+impl FactLayer {
+    const SWITCHES: [&'static str; 5] = [
+        "CARRICK_SITE_QUESTIONS",
+        "CARRICK_POSITION_ROWS",
+        "CARRICK_RECEIVER_TRACE",
+        "CARRICK_FACT_FILES",
+        "CARRICK_SITE_PAYLOADS",
+    ];
+
+    fn on() -> Self {
+        let before = Self::SWITCHES
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        for name in Self::SWITCHES {
+            // SAFETY: the tests in this binary run one at a time (SERIAL).
+            unsafe { std::env::set_var(name, "1") };
+        }
+        FactLayer(before)
+    }
+}
+
+impl Drop for FactLayer {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            // SAFETY: the tests in this binary run one at a time (SERIAL).
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
+/// The process environment a seed scan starts from: the model replayed from
+/// cassettes, and no runner event.
+fn seed_env() {
+    // SAFETY: the tests in this binary run one at a time (SERIAL).
+    unsafe {
+        std::env::set_var("CARRICK_MOCK_ALL", "1");
+        std::env::remove_var("GITHUB_REF");
+        std::env::remove_var("GITHUB_EVENT_NAME");
+        std::env::remove_var("GITHUB_REPOSITORY");
+        std::env::remove_var("GITHUB_EVENT_PATH");
+    }
+}
+
+/// A fresh git repo holding a copy of `tests/fixtures/pr-seeds/<name>`.
+fn seed_repo(root: &Path, name: &str) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/pr-seeds")
+        .join(name);
+    let repo = unlinked(root).join(name);
+    copy_dir(&src, &repo);
+    git(&repo, &["init", "-q"]);
+    commit(&repo, "init");
+    repo
+}
+
+/// Replace each `from` in `file` of `repo` with its `to`. A `from` the file
+/// lacks panics, so a seed that stops applying fails loudly.
+fn edit(repo: &Path, file: &str, replacements: &[(&str, &str)]) {
+    let path = repo.join(file);
+    let mut source = std::fs::read_to_string(&path).unwrap();
+    for (from, to) in replacements {
+        assert!(
+            source.contains(from),
+            "seed edit: {from:?} is not in {file}"
+        );
+        source = source.replace(from, to);
+    }
+    std::fs::write(&path, source).unwrap();
+}
+
+/// Main's index of the seed fixture, built once per run of this binary: the
+/// stored rows of the `orders-api` and `storefront` store, of the `admin-api`
+/// store (its router stub pins a package no registry has, which would fail
+/// every cross-repo type check it joined, trap 1), and the trees they came
+/// from. Each seed copies what it edits.
+struct MainSnapshot {
+    trees: PathBuf,
+    shared_rows: Vec<CloudRepoData>,
+    admin_rows: Vec<CloudRepoData>,
+}
+
+static MAIN: tokio::sync::OnceCell<MainSnapshot> = tokio::sync::OnceCell::const_new();
+
+/// Scan `repo` typed, with the model answering from its own `__llm__`.
+async fn scan_seed_repo(store: &Store, repo: &Path) {
+    let _cassettes = Cassettes::from(&repo.join("__llm__"));
+    scan_with(store, repo, true).await;
+}
+
+async fn main_snapshot() -> &'static MainSnapshot {
+    MAIN.get_or_init(|| async {
+        seed_env();
+        let _fact_layer = FactLayer::on();
+        // The trees outlive the run: a static is never dropped, and each seed
+        // copies from them for as long as the binary runs.
+        let trees = tempfile::tempdir().unwrap().keep();
+        let orders = seed_repo(&trees, "orders-api");
+        let storefront = seed_repo(&trees, "storefront");
+        let admin = seed_repo(&trees, "admin-api");
+        let shared = Store::default();
+        scan_seed_repo(&shared, &orders).await;
+        scan_seed_repo(&shared, &storefront).await;
+        scan_seed_repo(&shared, &orders).await;
+        let admin_store = Store::default();
+        scan_seed_repo(&admin_store, &admin).await;
+        MainSnapshot {
+            trees: unlinked(&trees),
+            shared_rows: shared.repos.lock().unwrap().clone(),
+            admin_rows: admin_store.repos.lock().unwrap().clone(),
+        }
+    })
+    .await
+}
+
+/// The result of scanning `repo_name` of the fixture as a PR that applies
+/// `change` on top of main.
+async fn seed_payload(repo_name: &str, change: impl FnOnce(&Path)) -> serde_json::Value {
+    let main = main_snapshot().await;
+    seed_env();
+    let _fact_layer = FactLayer::on();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = unlinked(tmp.path()).join(repo_name);
+    copy_dir(&main.trees.join(repo_name), &repo);
+    let base = head(&repo);
+    git(&repo, &["checkout", "-q", "-b", "pr"]);
+    change(&repo);
+    commit(&repo, "pr: seed");
+    event_with_base(tmp.path(), &base);
+    let rows = if repo_name == "admin-api" {
+        &main.admin_rows
+    } else {
+        &main.shared_rows
+    };
+    let store = Store {
+        repos: Arc::new(Mutex::new(rows.clone())),
+        pr_results: Arc::default(),
+    };
+    let _cassettes = Cassettes::from(&repo.join("__llm__"));
+    pr_payload_with(&store, &repo, true).await
+}
+
+/// The finding of `kind` for `method path` that names `site` among its call
+/// sites (any, when `site` is `None`).
+fn seed_finding(
+    payload: &serde_json::Value,
+    kind: &str,
+    method: &str,
+    path: &str,
+    site: Option<&str>,
+) -> serde_json::Value {
+    let findings = findings_of(payload);
+    findings
+        .iter()
+        .find(|f| {
+            f["kind"] == kind
+                && f["method"] == method
+                && f["path"] == path
+                && site.is_none_or(|site| {
+                    f["call_sites"]
+                        .as_array()
+                        .is_some_and(|sites| sites.iter().any(|s| s == site))
+                })
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no {kind} {method} {path} at {site:?} in {findings:#?}"))
+}
+
+/// The finding of `kind` at call site `site`, whatever labels it carries.
+fn seed_finding_at(payload: &serde_json::Value, kind: &str, site: &str) -> serde_json::Value {
+    let findings = findings_of(payload);
+    findings
+        .iter()
+        .find(|f| {
+            f["kind"] == kind
+                && f["call_sites"]
+                    .as_array()
+                    .is_some_and(|sites| sites.iter().any(|s| s == site))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no {kind} at {site} in {findings:#?}"))
+}
+
+/// What a finding says about main and about how its pair was made. `None`
+/// means the field is absent.
+fn assert_marks(
+    finding: &serde_json::Value,
+    on_main: Option<bool>,
+    edge_source: Option<&str>,
+    verdict_state: Option<&str>,
+) {
+    assert_eq!(
+        finding.get("on_main").and_then(|v| v.as_bool()),
+        on_main,
+        "on_main: {finding:#}"
+    );
+    assert_eq!(
+        finding.get("edge_source").and_then(|v| v.as_str()),
+        edge_source,
+        "edge_source: {finding:#}"
+    );
+    assert_eq!(
+        finding.get("verdict_state").and_then(|v| v.as_str()),
+        verdict_state,
+        "verdict_state: {finding:#}"
+    );
+}
+
+/// The `kind` rows the payload holds for `name`, which is a path or a package.
+fn rows_named(payload: &serde_json::Value, kind: &str, name: &str) -> usize {
+    findings_of(payload)
+        .iter()
+        .filter(|f| f["kind"] == kind && (f["path"] == name || f["package_name"] == name))
+        .count()
+}
+
+fn assert_delta(payload: &serde_json::Value, new: &[&str], removed: &[&str]) {
+    assert_eq!(
+        delta_rows(&payload["delta"], "new_endpoints"),
+        new,
+        "new: {payload:#}"
+    );
+    assert_eq!(
+        delta_rows(&payload["delta"], "removed_endpoints"),
+        removed,
+        "removed: {payload:#}"
+    );
+}
+
+/// `file:name:change` of every function the PR changed.
+fn changed_functions(payload: &serde_json::Value) -> Vec<String> {
+    payload["functions"]["changed"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    format!(
+                        "{}:{}:{}",
+                        r["file"].as_str().unwrap_or_default(),
+                        r["name"].as_str().unwrap_or_default(),
+                        r["change"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const ORDER_ROUTE: &str = "app/routes/api.v1.orders.$orderId.ts";
+const ORDER_PATH: &str = "/api/v1/orders/:orderId";
+/// The two call sites of the consumer's request helper (trap 3): the helper
+/// call inside the client member, and the caller that reads the response.
+const ORDER_SITES: [&str; 2] = ["src/checkout.ts:4", "src/orders-client.ts:14"];
+
+fn assert_order_type_mismatch(payload: &serde_json::Value) {
+    for site in ORDER_SITES {
+        let finding = seed_finding(payload, "type_mismatch", "GET", ORDER_PATH, Some(site));
+        assert_marks(&finding, Some(false), Some("fact"), Some("resolved"));
+    }
+    assert_delta(payload, &[], &[]);
+}
+
+// ---- HTTP --------------------------------------------------------------
+
+#[tokio::test]
+async fn seed_http_field_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            ORDER_ROUTE,
+            &[
+                ("total: number;", "amount: number;"),
+                ("total: 1200", "amount: 1200"),
+            ],
+        )
+    })
+    .await;
+    assert_order_type_mismatch(&payload);
+}
+
+#[tokio::test]
+async fn seed_http_field_removal() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            ORDER_ROUTE,
+            &[("  currency: string;\n", ""), (", currency: \"EUR\"", "")],
+        )
+    })
+    .await;
+    assert_order_type_mismatch(&payload);
+}
+
+#[tokio::test]
+async fn seed_http_verb_change() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            ORDER_ROUTE,
+            &[(
+                "export async function loader",
+                "export async function action",
+            )],
+        )
+    })
+    .await;
+    let finding = seed_finding(&payload, "method_mismatch", "GET", ORDER_PATH, None);
+    assert_eq!(finding["expected_method"], "POST", "{finding:#}");
+    assert_eq!(
+        finding["call_sites"],
+        serde_json::json!(ORDER_SITES),
+        "{finding:#}"
+    );
+    assert_marks(&finding, Some(false), Some("fact"), Some("not_checked"));
+    assert_delta(
+        &payload,
+        &["POST /api/v1/orders/:orderId"],
+        &["GET /api/v1/orders/:orderId"],
+    );
+}
+
+async fn http_route_rename() -> serde_json::Value {
+    seed_payload("orders-api", |repo| {
+        git(
+            repo,
+            &["mv", ORDER_ROUTE, "app/routes/api.v1.purchases.$orderId.ts"],
+        )
+    })
+    .await
+}
+
+#[tokio::test]
+async fn seed_http_route_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = http_route_rename().await;
+    let finding = seed_finding(
+        &payload,
+        "missing_endpoint",
+        "GET",
+        "/api/v1/orders/:encoded",
+        None,
+    );
+    assert_eq!(
+        finding["call_sites"],
+        serde_json::json!(ORDER_SITES),
+        "{finding:#}"
+    );
+    assert_delta(
+        &payload,
+        &["GET /api/v1/purchases/:orderId"],
+        &["GET /api/v1/orders/:orderId"],
+    );
+}
+
+#[test]
+#[ignore = "carrick#3092: the rename marking shape is not pinned"]
+fn seed_http_route_rename_marking() {
+    panic!("carrick#3092: shape not pinned");
+}
+
+// ---- GraphQL -----------------------------------------------------------
+
+const ORDER_QUERY_SITE: &str = "src/order-query.ts:9";
+
+fn graphql_field_rename(repo: &Path) {
+    edit(
+        repo,
+        "src/schema.graphql",
+        &[("  total: Int!", "  amount: Int!")],
+    );
+    edit(
+        repo,
+        "src/resolvers.ts",
+        &[("  total: number;", "  amount: number;")],
+    );
+}
+
+/// The removed line sits above the resolver, so the model's answer for the
+/// file moves its resolver line with it.
+fn graphql_field_removal(repo: &Path) {
+    edit(repo, "src/schema.graphql", &[("  currency: String!\n", "")]);
+    edit(repo, "src/resolvers.ts", &[("  currency: string;\n", "")]);
+    edit(
+        repo,
+        "__llm__/analyze-file/resolvers.json",
+        &[("\"resolver_line\": 11", "\"resolver_line\": 10")],
+    );
+}
+
+/// What holds today: the break is found at the consumer, as a PR's, resolved.
+fn assert_graphql_found(payload: &serde_json::Value) {
+    let finding = seed_finding_at(payload, "type_mismatch", ORDER_QUERY_SITE);
+    assert_eq!(finding["on_main"], false, "{finding:#}");
+    assert_eq!(finding["verdict_state"], "resolved", "{finding:#}");
+    assert_delta(payload, &[], &[]);
+}
+
+fn assert_graphql_marked(payload: &serde_json::Value) {
+    let finding = seed_finding(
+        payload,
+        "type_mismatch",
+        "QUERY",
+        "order",
+        Some(ORDER_QUERY_SITE),
+    );
+    assert_marks(&finding, Some(false), Some("fact"), Some("resolved"));
+}
+
+#[tokio::test]
+async fn seed_graphql_field_rename() {
+    let _serial = SERIAL.lock().await;
+    assert_graphql_found(&seed_payload("orders-api", graphql_field_rename).await);
+}
+
+#[tokio::test]
+#[ignore = "carrick#3090: the label is a join pseudo-label (GRAPHQL query|order); carrick#3091: no edge_source"]
+async fn seed_graphql_field_rename_marking() {
+    let _serial = SERIAL.lock().await;
+    assert_graphql_marked(&seed_payload("orders-api", graphql_field_rename).await);
+}
+
+#[tokio::test]
+async fn seed_graphql_field_removal() {
+    let _serial = SERIAL.lock().await;
+    assert_graphql_found(&seed_payload("orders-api", graphql_field_removal).await);
+}
+
+#[tokio::test]
+#[ignore = "carrick#3090: the label is a join pseudo-label (GRAPHQL query|order); carrick#3091: no edge_source"]
+async fn seed_graphql_field_removal_marking() {
+    let _serial = SERIAL.lock().await;
+    assert_graphql_marked(&seed_payload("orders-api", graphql_field_removal).await);
+}
+
+#[tokio::test]
+async fn seed_graphql_root_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/schema.graphql",
+            &[("  order(id: ID!)", "  orderById(id: ID!)")],
+        );
+        edit(
+            repo,
+            "src/resolvers.ts",
+            &[("    order: (_parent", "    orderById: (_parent")],
+        );
+        edit(
+            repo,
+            "__llm__/analyze-file/resolvers.json",
+            &[
+                ("\"field\": \"order\"", "\"field\": \"orderById\""),
+                (
+                    "\"resolver_function\": \"order\"",
+                    "\"resolver_function\": \"orderById\"",
+                ),
+            ],
+        );
+    })
+    .await;
+    seed_finding(
+        &payload,
+        "missing_endpoint",
+        "QUERY",
+        "order",
+        Some(ORDER_QUERY_SITE),
+    );
+    seed_finding(&payload, "orphaned_endpoint", "QUERY", "orderById", None);
+    assert_delta(&payload, &["QUERY orderById"], &["QUERY order"]);
+}
+
+#[test]
+#[ignore = "carrick#3092: the rename marking shape is not pinned"]
+fn seed_graphql_root_rename_marking() {
+    panic!("carrick#3092: shape not pinned");
+}
+
+// ---- Socket events -----------------------------------------------------
+
+async fn socket_field_rename() -> serde_json::Value {
+    seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/realtime.ts",
+            &[("  status: string;", "  state: string;")],
+        )
+    })
+    .await
+}
+
+#[tokio::test]
+async fn seed_socket_field_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = socket_field_rename().await;
+    let finding = seed_finding_at(&payload, "type_mismatch", "src/live.ts:12");
+    assert_eq!(finding["on_main"], false, "{finding:#}");
+    assert_eq!(finding["verdict_state"], "resolved", "{finding:#}");
+    assert_delta(&payload, &[], &[]);
+}
+
+#[tokio::test]
+#[ignore = "carrick#3090: the label is a join pseudo-label (SOCKET CLIENT->SERVER|order:update); carrick#3091: no edge_source"]
+async fn seed_socket_field_rename_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = socket_field_rename().await;
+    let finding = seed_finding(
+        &payload,
+        "type_mismatch",
+        "CLIENT->SERVER",
+        "order:update",
+        Some("src/live.ts:12"),
+    );
+    assert_marks(&finding, Some(false), Some("fact"), Some("resolved"));
+}
+
+/// The emit's payload is an inline object literal the emitter's own file
+/// states; dropping `carrier` from it breaks the listener in `storefront`.
+#[tokio::test]
+#[ignore = "carrick#3094: the emitter's inline payload reads unknown, so the pair is unverifiable; then carrick#3090 (labels) and carrick#3091 (edge_source)"]
+async fn seed_socket_field_removal() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/realtime.ts",
+            &[(
+                "{ orderId: update.orderId, carrier: \"post\" }",
+                "{ orderId: update.orderId }",
+            )],
+        )
+    })
+    .await;
+    let finding = seed_finding(
+        &payload,
+        "type_mismatch",
+        "SERVER->CLIENT",
+        "order:shipped",
+        Some("src/realtime.ts:12"),
+    );
+    assert_marks(&finding, Some(false), Some("fact"), Some("resolved"));
+}
+
+#[tokio::test]
+async fn seed_socket_listener_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/realtime.ts",
+            &[("socket.on(\"order:update\"", "socket.on(\"order:changed\"")],
+        )
+    })
+    .await;
+    seed_finding(
+        &payload,
+        "missing_endpoint",
+        "CLIENT->SERVER",
+        "order:update",
+        Some("src/live.ts:12"),
+    );
+    assert_delta(
+        &payload,
+        &["CLIENT->SERVER order:changed"],
+        &["CLIENT->SERVER order:update"],
+    );
+}
+
+#[test]
+#[ignore = "carrick#3092: the rename marking shape is not pinned"]
+fn seed_socket_listener_rename_marking() {
+    panic!("carrick#3092: shape not pinned");
+}
+
+/// The emit is a call, so the delta, which reads endpoints, shows nothing.
+#[tokio::test]
+async fn seed_socket_emit_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/realtime.ts",
+            &[("io.emit(\"order:shipped\"", "io.emit(\"order:dispatched\"")],
+        )
+    })
+    .await;
+    seed_finding(
+        &payload,
+        "missing_endpoint",
+        "SERVER->CLIENT",
+        "order:dispatched",
+        Some("src/realtime.ts:12"),
+    );
+    seed_finding(
+        &payload,
+        "orphaned_endpoint",
+        "SERVER->CLIENT",
+        "order:shipped",
+        None,
+    );
+    assert_delta(&payload, &[], &[]);
+}
+
+#[test]
+#[ignore = "carrick#3092: the rename marking shape is not pinned"]
+fn seed_socket_emit_rename_marking() {
+    panic!("carrick#3092: shape not pinned");
+}
+
+// ---- Pub/sub -----------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "carrick#3089: library-stated pub/sub rows have no type manifest entry, so both pairs are not_compared"]
+async fn seed_pubsub_field_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/events.ts",
+            &[
+                ("  amount: number;", "  total: number;"),
+                ("event.amount", "event.total"),
+            ],
+        )
+    })
+    .await;
+    let finding = seed_finding(
+        &payload,
+        "type_mismatch",
+        "PUBSUB",
+        "payments.settled",
+        Some("src/payments.ts:10"),
+    );
+    assert_marks(&finding, Some(false), Some("fact"), Some("resolved"));
+}
+
+#[tokio::test]
+#[ignore = "carrick#3089: library-stated pub/sub rows have no type manifest entry, so both pairs are not_compared"]
+async fn seed_pubsub_field_removal() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/events.ts",
+            &[("{ orderId, carrier: \"post\" }", "{ orderId }")],
+        );
+        edit(
+            repo,
+            "__llm__/analyze-file/events.json",
+            &[(r#""{ orderId, carrier: \"post\" }""#, r#""{ orderId }""#)],
+        );
+    })
+    .await;
+    let finding = seed_finding(
+        &payload,
+        "type_mismatch",
+        "PUBSUB",
+        "orders.shipped",
+        Some("src/events.ts:15"),
+    );
+    assert_marks(&finding, Some(false), Some("fact"), Some("resolved"));
+}
+
+#[tokio::test]
+async fn seed_pubsub_subscriber_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/events.ts",
+            &[(
+                "bus.subscribe(\"payments.settled\"",
+                "bus.subscribe(\"payments.cleared\"",
+            )],
+        );
+        edit(
+            repo,
+            "__llm__/analyze-file/events.json",
+            &[(
+                "\"topic\": \"payments.settled\"",
+                "\"topic\": \"payments.cleared\"",
+            )],
+        );
+    })
+    .await;
+    seed_finding(
+        &payload,
+        "missing_endpoint",
+        "PUBSUB",
+        "payments.settled",
+        Some("src/payments.ts:10"),
+    );
+    assert_delta(
+        &payload,
+        &["PUBSUB payments.cleared"],
+        &["PUBSUB payments.settled"],
+    );
+}
+
+#[test]
+#[ignore = "carrick#3092: the rename marking shape is not pinned"]
+fn seed_pubsub_subscriber_rename_marking() {
+    panic!("carrick#3092: shape not pinned");
+}
+
+#[tokio::test]
+async fn seed_pubsub_publish_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "src/events.ts",
+            &[(
+                "bus.publish(\"orders.shipped\"",
+                "bus.publish(\"orders.dispatched\"",
+            )],
+        );
+        edit(
+            repo,
+            "__llm__/analyze-file/events.json",
+            &[(
+                "\"topic\": \"orders.shipped\"",
+                "\"topic\": \"orders.dispatched\"",
+            )],
+        );
+    })
+    .await;
+    seed_finding(
+        &payload,
+        "missing_endpoint",
+        "PUBSUB",
+        "orders.dispatched",
+        Some("src/events.ts:15"),
+    );
+    seed_finding(
+        &payload,
+        "orphaned_endpoint",
+        "PUBSUB",
+        "orders.shipped",
+        None,
+    );
+    assert_delta(&payload, &[], &[]);
+}
+
+#[test]
+#[ignore = "carrick#3092: the rename marking shape is not pinned"]
+fn seed_pubsub_publish_rename_marking() {
+    panic!("carrick#3092: shape not pinned");
+}
+
+// ---- Functions and dependencies ----------------------------------------
+
+/// The copy of `storefront`'s `formatMinor` is a function the PR added. The
+/// similarity row is the cloud's (carrick-cloud#2433).
+#[tokio::test]
+async fn seed_copied_helper() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        let money = "export function formatMinor(amount: number, currency: string): string {\n  const major = Math.trunc(amount / 100);\n  const minor = String(Math.abs(amount % 100)).padStart(2, \"0\");\n  return `${currency} ${major}.${minor}`;\n}\n";
+        std::fs::write(repo.join("src/money.ts"), money).unwrap();
+    })
+    .await;
+    assert!(
+        changed_functions(&payload).contains(&"src/money.ts:formatMinor:added".to_string()),
+        "{payload:#}"
+    );
+    assert!(findings_of(&payload).is_empty(), "{payload:#}");
+}
+
+#[tokio::test]
+async fn seed_major_bump() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "package.json",
+            &[("\"zod\": \"^3.22.0\"", "\"zod\": \"^4.0.0\"")],
+        )
+    })
+    .await;
+    let finding = findings_of(&payload)
+        .into_iter()
+        .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == "zod")
+        .unwrap_or_else(|| panic!("no dependency_conflict on zod in {payload:#}"));
+    assert_eq!(finding["tier"], "major", "{finding:#}");
+    assert_eq!(
+        finding["changed_by_pr"],
+        serde_json::json!([{ "service": "orders-api", "from": "^3.22.0", "to": "^4.0.0" }]),
+        "{finding:#}"
+    );
+    assert_marks(&finding, Some(false), None, None);
+    assert_eq!(
+        payload["checked"]["dependencies"]["changed"], 1,
+        "{payload:#}"
+    );
+}
+
+// ---- Negatives ---------------------------------------------------------
+
+/// `typescript` moves a major in a `devDependencies` block and `storefront`
+/// keeps its own, also a dev dependency: no runtime code shares the package.
+#[tokio::test]
+#[ignore = "carrick#3093: a dev-only major split is reported as a dependency conflict"]
+async fn seed_dev_only_split() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        edit(
+            repo,
+            "package.json",
+            &[("\"typescript\": \"^5.4.0\"", "\"typescript\": \"^6.0.0\"")],
+        )
+    })
+    .await;
+    assert_eq!(
+        rows_named(&payload, "dependency_conflict", "typescript"),
+        0,
+        "{payload:#}"
+    );
+}
+
+/// A respelled route parameter is the same route.
+#[tokio::test]
+async fn seed_respell_param() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        let renamed = "app/routes/api.v1.orders.$id.ts";
+        git(repo, &["mv", ORDER_ROUTE, renamed]);
+        edit(
+            repo,
+            renamed,
+            &[
+                ("params: { orderId: string }", "params: { id: string }"),
+                ("params.orderId", "params.id"),
+            ],
+        );
+    })
+    .await;
+    assert_delta(&payload, &[], &[]);
+    assert!(findings_of(&payload).is_empty(), "{payload:#}");
+}
+
+/// A route module copied under a new name is a real new route and a new
+/// function. The reuse row it would earn is the cloud's (carrick-cloud#2433).
+#[tokio::test]
+async fn seed_convention_copy() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("orders-api", |repo| {
+        let copy = "app/routes/api.v1.invoices.$invoiceId.ts";
+        std::fs::copy(repo.join(ORDER_ROUTE), repo.join(copy)).unwrap();
+        edit(repo, copy, &[("orderId", "invoiceId")]);
+    })
+    .await;
+    assert!(
+        changed_functions(&payload)
+            .contains(&"app/routes/api.v1.invoices.$invoiceId.ts:loader:added".to_string()),
+        "{payload:#}"
+    );
+    assert_delta(&payload, &["GET /api/v1/invoices/:invoiceId"], &[]);
+    assert!(
+        findings_of(&payload)
+            .iter()
+            .all(|f| f["kind"] == "orphaned_endpoint"),
+        "{payload:#}"
+    );
+}
+
+/// Registrations that swap places keep their keys, so the delta lists none.
+#[tokio::test]
+async fn seed_route_moved_within_its_file() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("admin-api", |repo| {
+        edit(
+            repo,
+            "src/admin.ts",
+            &[(
+                "app.get(\"/api/v1/admin/orders\", listOrders);\napp.post(\"/api/v1/admin/orders/:orderId/cancel\", cancelOrder);",
+                "// Cancelling comes first now.\napp.post(\"/api/v1/admin/orders/:orderId/cancel\", cancelOrder);\n\n// The list.\napp.get(\"/api/v1/admin/orders\", listOrders);",
+            )],
+        );
+        // The model's answer moves its lines with the registrations.
+        edit(
+            repo,
+            "__llm__/analyze-file/admin.json",
+            &[
+                ("\"candidate_id\": \"@line:16\",\n      \"line_number\": 16,", "\"candidate_id\": \"@line:20\",\n      \"line_number\": 20,"),
+                (
+                    "\"candidate_id\": \"@line:20\",\n      \"line_number\": 20,\n      \"owner_node\": \"app\",\n      \"method\": \"GET\",\n      \"path\": \"/api/v1/admin/reports",
+                    "\"candidate_id\": \"@line:23\",\n      \"line_number\": 23,\n      \"owner_node\": \"app\",\n      \"method\": \"GET\",\n      \"path\": \"/api/v1/admin/reports",
+                ),
+            ],
+        );
+    })
+    .await;
+    assert_delta(&payload, &[], &[]);
+}
+
+/// A loop's registration is one model row with template text; editing inside
+/// the loop keeps its key (carrick#2093).
+#[tokio::test]
+async fn seed_loop_route_edit() {
+    let _serial = SERIAL.lock().await;
+    let payload = seed_payload("admin-api", |repo| {
+        edit(
+            repo,
+            "src/admin.ts",
+            &[(
+                "  app.get(`/api/v1/admin/reports/${period}`, report);",
+                "  // One report route per period.\n  app.get(`/api/v1/admin/reports/${period}`, (_request, response) => response.send({ rows: [], period }));",
+            )],
+        );
+        edit(
+            repo,
+            "__llm__/analyze-file/admin.json",
+            &[("\"candidate_id\": \"@line:20\",\n      \"line_number\": 20,", "\"candidate_id\": \"@line:21\",\n      \"line_number\": 21,")],
+        );
+    })
+    .await;
+    assert_delta(&payload, &[], &[]);
+}

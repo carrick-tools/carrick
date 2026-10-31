@@ -1,0 +1,17 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_operations": [
+    {
+      "kind": "query",
+      "field": "order",
+      "resolver_function": "order",
+      "resolver_line": 11,
+      "primary_type_symbol": "OrderView",
+      "type_import_source": null,
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    }
+  ]
+}
