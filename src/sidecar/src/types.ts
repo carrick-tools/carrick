@@ -322,6 +322,27 @@ export interface ShutdownRequest extends BaseRequest {
 }
 
 /**
+ * Server mode only (carrick#2879): the first frame on every connection. A
+ * daemon whose build id differs refuses it and closes the connection, so a
+ * client never reads an answer from another build.
+ */
+export interface HelloRequest extends BaseRequest {
+  action: 'hello';
+  /** The build id of the sidecar the client would have spawned (`--build-id`). */
+  build_id: string;
+}
+
+/** Server mode only: what the daemon holds. */
+export interface StatusRequest extends BaseRequest {
+  action: 'status';
+}
+
+/** Server mode only: stop the daemon, removing its socket and record. */
+export interface StopRequest extends BaseRequest {
+  action: 'stop';
+}
+
+/**
  * List the root files the init'd project's program was built from, in order
  * (carrick#2027).
  */
@@ -837,6 +858,9 @@ export type SidecarRequest =
   | ResolveDefinitionsRequest
   | HealthRequest
   | ShutdownRequest
+  | HelloRequest
+  | StatusRequest
+  | StopRequest
   | ListProgramFilesRequest
   | AddProgramFilesRequest
   | PositionRowsRequest
@@ -1052,6 +1076,43 @@ export interface HealthResponse extends BaseResponse {
  * Response for shutdown action
  */
 export interface ShutdownResponse extends BaseResponse {
+  status: 'success';
+}
+
+/** Response for hello: the daemon's build id and process. */
+export interface HelloResponse extends BaseResponse {
+  status: 'success';
+  build_id: string;
+  pid: number;
+}
+
+/** One service a daemon holds: the root and scan root its `init` named. */
+export interface HeldService {
+  repo_root: string;
+  scan_root: string | null;
+  /** Whether a request has built its program yet (`init` builds nothing). */
+  built: boolean;
+}
+
+/** Response for status. */
+export interface StatusResponse extends BaseResponse {
+  status: 'success';
+  daemon: {
+    pid: number;
+    build_id: string;
+    cli_version: string | null;
+    socket: string;
+    started_at: string;
+    uptime_ms: number;
+    idle_ms: number;
+    services: HeldService[];
+    heap_used_mb: number;
+    rss_mb: number;
+  };
+}
+
+/** Response for stop, written before the daemon exits. */
+export interface StopResponse extends BaseResponse {
   status: 'success';
 }
 
@@ -1425,6 +1486,9 @@ export type SidecarResponse =
   | ResolveDefinitionsResponse
   | HealthResponse
   | ShutdownResponse
+  | HelloResponse
+  | StatusResponse
+  | StopResponse
   | ListProgramFilesResponse
   | AddProgramFilesResponse
   | PositionRowsResponse
