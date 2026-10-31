@@ -86,7 +86,7 @@ jobs:
             partitioned: --test local_mode_test
             partition: slice:1/2
             targets: >-
-              --test sidecar_parent_gone_test --test library_claims_sidecar_test --test log_value_guard_test --test file_based_routing_test --test url_alias_matching_test --test parallel_services_test
+              --test sidecar_parent_gone_test --test library_claims_sidecar_test --test log_value_guard_test --test file_based_routing_test --test url_alias_matching_test --test parallel_services_test --test call_through_result_label_test
           - shard: n4
             runner: nextest
             partitioned: --test call_through_rows_test
