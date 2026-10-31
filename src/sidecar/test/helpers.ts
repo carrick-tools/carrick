@@ -354,3 +354,32 @@ export function inlineHandlerParams(surface: Record<string, unknown>): {
   }) as Record<string, unknown>;
   return { surface: inline, dropped };
 }
+
+/**
+ * Server-framework labels as the store answers them, for a package whose body
+ * sends are `members` of each exported reply value in `exports`. A reply
+ * member not listed is a setter (carrick#2472 C2). Pass the result as an
+ * infer request's `server_claims`.
+ */
+export function replySendClaims(
+  pkg: string,
+  fromDir: string,
+  exports: string[],
+  members: string[]
+): { from_dir: string; checks: Array<Record<string, unknown>>; type_packages: Record<string, never> } {
+  let sequence = 0;
+  return {
+    from_dir: fromDir,
+    type_packages: {},
+    checks: exports.flatMap((exported) =>
+      members.map((member) => ({
+        claim_id: `${pkg}-${sequence++}`,
+        package: pkg,
+        export: exported,
+        role: 'server_framework',
+        receiver: 'export',
+        claim: { kind: 'op', op: 'send', member, on: 'export', payload: { arg: 0 } },
+      }))
+    ),
+  };
+}
