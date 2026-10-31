@@ -188,8 +188,7 @@ impl Plan {
         }
         let most = cores
             .saturating_sub(1)
-            .max(SERVICES.cores_floor)
-            .min(MAX_SERVICES_AT_ONCE);
+            .clamp(SERVICES.cores_floor, MAX_SERVICES_AT_ONCE);
         match available {
             Some(available) => {
                 let budget = available.mb.saturating_sub(machine::HEADROOM_MB);
