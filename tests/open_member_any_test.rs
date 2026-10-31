@@ -159,6 +159,8 @@ fn a_side_with_one_declared_any_member_is_served_as_its_shape() {
     let served: Vec<(String, Option<String>)> = std::fs::read_dir(storage.path())
         .expect("storage dir")
         .flatten()
+        // Blobs only: a type-reach record sits beside each (carrick#3101).
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .filter_map(|entry| {
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(entry.path()).ok()?).ok()
         })

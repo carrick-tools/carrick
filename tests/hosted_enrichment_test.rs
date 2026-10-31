@@ -93,7 +93,10 @@ fn init_repo(path: &Path) -> String {
 fn blobs(root: &Path) -> Vec<Value> {
     std::fs::read_dir(root.join(".carrick/repos"))
         .unwrap()
-        .map(|e| serde_json::from_slice(&std::fs::read(e.unwrap().path()).unwrap()).unwrap())
+        .map(|e| e.unwrap().path())
+        // Blobs only: a type-reach record sits beside each (carrick#3101).
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
         .collect()
 }
 

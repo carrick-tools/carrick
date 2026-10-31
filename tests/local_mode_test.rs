@@ -2496,6 +2496,8 @@ fn stored_blob(root: &Path, repo: &str) -> serde_json::Value {
     std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         .map(|entry| entry.expect("dir entry").path())
+        // Blobs only: a type-reach record sits beside each (carrick#3101).
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .map(|path| {
             serde_json::from_str::<serde_json::Value>(
                 &std::fs::read_to_string(&path).expect("read a stored blob"),
@@ -4039,6 +4041,10 @@ fn stored_blobs_say_commit(root: &Path, commit: &str) {
     let dir = root.join(".carrick/repos");
     for entry in std::fs::read_dir(&dir).expect("read the stored blobs") {
         let path = entry.expect("dir entry").path();
+        // Blobs only: a type-reach record sits beside each (carrick#3101).
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
         let mut blob: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read a blob"))
                 .expect("a stored blob is JSON");

@@ -80,6 +80,8 @@ fn scan(repo: &Path) -> serde_json::Value {
     let mut blobs: Vec<serde_json::Value> = std::fs::read_dir(storage.path())
         .expect("storage dir")
         .flatten()
+        // Blobs only: a type-reach record sits beside each (carrick#3101).
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .map(|entry| {
             serde_json::from_slice(&std::fs::read(entry.path()).expect("read blob"))
                 .expect("parse blob")

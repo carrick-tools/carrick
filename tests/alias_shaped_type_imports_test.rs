@@ -82,6 +82,8 @@ fn scan_blob() -> serde_json::Value {
     let entry = std::fs::read_dir(storage.path())
         .expect("storage dir")
         .flatten()
+        // Blobs only: a type-reach record sits beside each (carrick#3101).
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .next()
         .expect("one blob");
     let blob: serde_json::Value =
