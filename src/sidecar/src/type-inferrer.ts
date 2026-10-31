@@ -7165,14 +7165,16 @@ export class TypeInferrer {
    *    envelope is read in its place. Its own stated status decides the
    *    branch; only when it states none does a status the outer call's
    *    arguments state decide (`log(ctx, 503, "code", prebuilt)`).
+   *  - an envelope built earlier, one def-use hop away (`readPrebuiltEnvelope`).
    * Anything else, and a payload holding `any` or `unknown`, is unread, with
-   * its cause.
+   * its cause. `hopped` is set once a hop was taken, so a second never is.
    */
   private readEnvelopeBranch(
     expression: Node,
     scope: FunctionLike,
     wire: WireFormat,
-    depth: number
+    depth: number,
+    hopped = false
   ): EnvelopeBranchRead {
     if (depth > RESPONSE_HELPER_MAX_DEPTH) return { unread: 'builder' };
     const node = this.peelTransparentExpression(expression);
@@ -7184,7 +7186,9 @@ export class TypeInferrer {
       return payload ? this.envelopePayloadCandidate(payload, wire) : { unread: 'not_serialised' };
     }
 
-    if (!Node.isCallExpression(node)) return { unread: 'prebuilt' };
+    if (!Node.isCallExpression(node)) {
+      return hopped ? { unread: 'prebuilt' } : this.readPrebuiltEnvelope(node, scope, wire, depth);
+    }
 
     const builder = this.envelopeBuilderOf(node);
     if (builder === 'failure') return 'dropped';
@@ -7207,7 +7211,139 @@ export class TypeInferrer {
       if (outer === 'error' || outer === 'redirect') return 'dropped';
     }
     if (!inner) return { unread: 'builder' };
-    return this.readEnvelopeBranch(inner, scope, wire, depth + 1);
+    return this.readEnvelopeBranch(inner, scope, wire, depth + 1, hopped);
+  }
+
+  /**
+   * A returned envelope that was built earlier (carrick#2205), followed one
+   * def-use hop to where it was built:
+   *  - an identifier naming a `const` this function declares, initialised by
+   *    an envelope literal or a call, and never written through afterwards
+   *    (`out.body = ...`): that initializer is read as the branch;
+   *  - `x.member`, where `x` is such a `const` initialised by a call to a
+   *    function this repository declares: every object literal that function
+   *    returns with `member` must state an error or redirect envelope there
+   *    (directly, through a followable builder, or a pass-through stating
+   *    one), and the branch drops. Literals without `member` put nothing
+   *    there; a returned call to another function the repository declares is
+   *    followed into its returns.
+   * Anything else, a second hop included, is unread as `prebuilt`.
+   */
+  private readPrebuiltEnvelope(
+    node: Node,
+    scope: FunctionLike,
+    wire: WireFormat,
+    depth: number
+  ): EnvelopeBranchRead {
+    if (Node.isIdentifier(node)) {
+      const initializer = this.unwrittenConstInitializer(node, scope);
+      if (!initializer) return { unread: 'prebuilt' };
+      return this.readEnvelopeBranch(initializer, scope, wire, depth + 1, true);
+    }
+
+    if (!Node.isPropertyAccessExpression(node)) return { unread: 'prebuilt' };
+    const base = this.peelTransparentExpression(node.getExpression());
+    const initializer = Node.isIdentifier(base)
+      ? this.unwrittenConstInitializer(base, scope)
+      : undefined;
+    const call = initializer ? this.peelTransparentExpression(initializer) : undefined;
+    if (!call || !Node.isCallExpression(call)) return { unread: 'prebuilt' };
+    const values = this.memberValuesReturnedBy(call, node.getName(), depth + 1);
+    if (!values || values.length === 0) return { unread: 'prebuilt' };
+    const allDropped = values.every(
+      ({ value, producer }) =>
+        this.readEnvelopeBranch(value, producer, wire, depth + 1, true) === 'dropped'
+    );
+    return allDropped ? 'dropped' : { unread: 'prebuilt' };
+  }
+
+  /**
+   * The initializer of the `const` an identifier names, when `scope` declares
+   * it and nothing in `scope` writes through it afterwards (an assignment,
+   * `delete`, `++`/`--` whose target is the binding or a member chain rooted
+   * at it). `const` stops a rebinding, not a member write.
+   */
+  private unwrittenConstInitializer(identifier: Node, scope: FunctionLike): Node | undefined {
+    const initializer = this.constInitializerInScope(identifier, scope);
+    const symbol = this.valueSymbolOf(identifier);
+    if (!initializer || !symbol) return undefined;
+    const written = scope.getDescendantsOfKind(SyntaxKind.Identifier).some((reference) => {
+      if (reference.getSymbol() !== symbol) return false;
+      let target: Node = reference;
+      let parent = target.getParent();
+      while (
+        parent &&
+        (Node.isPropertyAccessExpression(parent) ||
+          Node.isElementAccessExpression(parent) ||
+          Node.isNonNullExpression(parent) ||
+          Node.isParenthesizedExpression(parent)) &&
+        parent.getExpression() === target
+      ) {
+        target = parent;
+        parent = target.getParent();
+      }
+      if (!parent) return false;
+      if (Node.isBinaryExpression(parent)) {
+        const operator = parent.getOperatorToken().getKind();
+        return (
+          parent.getLeft() === target &&
+          operator >= SyntaxKind.FirstAssignment &&
+          operator <= SyntaxKind.LastAssignment
+        );
+      }
+      if (Node.isPrefixUnaryExpression(parent) || Node.isPostfixUnaryExpression(parent)) {
+        const operator = parent.getOperatorToken();
+        return operator === SyntaxKind.PlusPlusToken || operator === SyntaxKind.MinusMinusToken;
+      }
+      return Node.isDeleteExpression(parent);
+    });
+    return written ? undefined : initializer;
+  }
+
+  /**
+   * The values the object literals a call's callee returns put under
+   * `member`, each with the function that returns it. The callee must be a
+   * function this repository declares; a returned call to another such
+   * function is followed into its returns. `undefined` when any return is
+   * something else, or a literal spreads in members or gives `member` by a
+   * shorthand, a method or an accessor.
+   */
+  private memberValuesReturnedBy(
+    call: CallExpression,
+    member: string,
+    depth: number
+  ): Array<{ value: Node; producer: BuilderFunction }> | undefined {
+    if (depth > RESPONSE_HELPER_MAX_DEPTH) return undefined;
+    let symbol = call.getExpression().getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    if (!symbol || this.symbolIsLibOrExternalOrigin(symbol)) return undefined;
+    const producer = this.builderFunctionOf(symbol);
+    if (!producer) return undefined;
+
+    const values: Array<{ value: Node; producer: BuilderFunction }> = [];
+    const returned = this.returnedExpressions(producer).flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    for (const expression of returned) {
+      const literal = this.peelTransparentExpression(expression);
+      if (Node.isCallExpression(literal)) {
+        const nested = this.memberValuesReturnedBy(literal, member, depth + 1);
+        if (!nested) return undefined;
+        values.push(...nested);
+        continue;
+      }
+      if (!Node.isObjectLiteralExpression(literal)) return undefined;
+      if (literal.getProperties().some((property) => Node.isSpreadAssignment(property))) {
+        return undefined;
+      }
+      const property = literal.getProperty(member);
+      if (!property) continue;
+      if (!Node.isPropertyAssignment(property)) return undefined;
+      const value = property.getInitializer();
+      if (!value) return undefined;
+      values.push({ value, producer });
+    }
+    return values;
   }
 
   /** The status a builder call sends: its status argument, or the builder's literal. */
