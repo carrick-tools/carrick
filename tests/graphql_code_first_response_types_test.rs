@@ -94,7 +94,8 @@ fn scan_graphql_response_types() -> BTreeMap<String, (String, Option<String>)> {
     let entry = std::fs::read_dir(storage.path())
         .expect("storage dir")
         .flatten()
-        .next()
+        // Blobs only: a type-reach record sits beside each (carrick#3101).
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .expect("one blob");
     let blob: serde_json::Value =
         serde_json::from_slice(&std::fs::read(entry.path()).expect("read blob"))

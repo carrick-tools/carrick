@@ -160,6 +160,30 @@ impl UploadBoundary {
         }
     }
 
+    /// Scrub a value that rides beside the payload rather than in it, such
+    /// as a service's type-reach record (carrick#3101), in place, with the
+    /// walk and the same log lines [`Self::scrub`] uses. Answers how many
+    /// strings it rewrote.
+    pub(crate) fn scrub_value(&self, value: &mut serde_json::Value, what: &str) -> usize {
+        if self.prefixes.is_empty() {
+            return 0;
+        }
+        let mut fields = Vec::new();
+        self.value(value, "", &mut fields);
+        if fields.is_empty() {
+            return 0;
+        }
+        warn!(
+            "Upload boundary replaced a machine path in {} string(s) of {what}; \
+             an upstream pass missed them",
+            fields.len()
+        );
+        for field in &fields {
+            debug!("Upload boundary scrubbed {what}: {field}");
+        }
+        fields.len()
+    }
+
     /// The payload to upload: `None` when nothing in it holds a machine path
     /// (upload the original), otherwise a scrubbed copy. Logs the count for
     /// `service` and, at debug, each field.
@@ -174,18 +198,8 @@ impl UploadBoundary {
                 return None;
             }
         };
-        let mut fields = Vec::new();
-        self.value(&mut json, "", &mut fields);
-        if fields.is_empty() {
+        if self.scrub_value(&mut json, service) == 0 {
             return None;
-        }
-        warn!(
-            "Upload boundary replaced a machine path in {} string(s) of {service}; \
-             an upstream pass missed them",
-            fields.len()
-        );
-        for field in &fields {
-            debug!("Upload boundary scrubbed {service}: {field}");
         }
         match serde_json::from_value(json) {
             Ok(scrubbed) => Some(scrubbed),
@@ -220,6 +234,25 @@ mod tests {
             "import(\"<checkout>/node_modules/x/index\").T | <home>/.cache/y"
         );
         assert_eq!(hits, 2);
+    }
+
+    /// A value that rides beside the payload, such as a type-reach record
+    /// (carrick#3101), passes the same walk, keys included.
+    #[test]
+    fn scrubs_a_value_beside_the_payload_in_place() {
+        let mut value = serde_json::json!({
+            "graph": { "strings": ["src/a.ts", "/home/user/work/app/src/b.ts"] },
+            "aliases": { "/home/user/work/app/x": ["src/a.ts"] }
+        });
+        assert_eq!(boundary().scrub_value(&mut value, "a record"), 2);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "graph": { "strings": ["src/a.ts", "<checkout>/src/b.ts"] },
+                "aliases": { "<checkout>/x": ["src/a.ts"] }
+            })
+        );
+        assert_eq!(boundary().scrub_value(&mut value, "a record"), 0);
     }
 
     #[test]

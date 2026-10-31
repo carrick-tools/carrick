@@ -65,7 +65,38 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         call_through: None,
         route_boundaries: None,
         memory_peaks: None,
+        type_reach: None,
     }
+}
+
+/// carrick#3101: the mock keeps a record beside the blob it stamps, and
+/// reads it back only for a blob that names it.
+#[tokio::test]
+async fn a_type_reach_record_is_kept_beside_its_blob_and_read_back() {
+    use carrick::cloud_storage::{TypeReachObject, TypeReachRecord};
+    let storage = MockStorage::new();
+    let blob = create_test_repo_data("orders", "4f2a1c9");
+    let record = TypeReachRecord {
+        version: 1,
+        scanner_build: None,
+        graph: serde_json::json!({ "version": 1, "strings": ["src/a.ts"], "files": [] }),
+        aliases: BTreeMap::from([(
+            "Endpoint_Response".to_string(),
+            vec!["src/a.ts".to_string()],
+        )]),
+    };
+    let object = TypeReachObject::encode(&serde_json::to_value(&record).unwrap()).unwrap();
+
+    storage
+        .upload_repo_data_with_reach(&blob, Some(&object), true)
+        .await
+        .unwrap();
+    let (stored, _) = storage.download_all_repo_data().await.unwrap();
+    assert_eq!(stored[0].type_reach.as_ref(), Some(object.reference()));
+    let records = storage.type_reach_records(&stored).await;
+    assert_eq!(records.get("orders"), Some(&record));
+    // A blob that names no record reads none.
+    assert!(storage.type_reach_records(&[blob]).await.is_empty());
 }
 
 #[tokio::test]

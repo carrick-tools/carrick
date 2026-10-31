@@ -2183,6 +2183,34 @@ pub struct TypeResolutionResult {
     /// The explicit requests the anchor arbitration re-aimed or dropped
     /// before the bundle ran (carrick#1779).
     pub anchor_changes: Vec<AnchorChange>,
+    /// Each alias the type stage asked about, with the file of every request
+    /// that carried it, as the requests named them (carrick#3101). Filled by
+    /// the caller that built the requests; the type-reach record reads it.
+    pub request_files: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl TypeResolutionResult {
+    /// The files each alias was asked about in, over every request the type
+    /// stage sent: explicit symbols and inference sites alike (carrick#3101).
+    /// A request with no alias names no manifest row, so it is not listed.
+    pub fn note_request_files(&mut self, explicit: &[SymbolRequest], infer: &[InferRequestItem]) {
+        let named = explicit
+            .iter()
+            .map(|request| (request.alias.as_ref(), &request.source_file))
+            .chain(
+                infer
+                    .iter()
+                    .map(|request| (request.alias.as_ref(), &request.file_path)),
+            );
+        for (alias, file) in named {
+            if let Some(alias) = alias {
+                self.request_files
+                    .entry(alias.clone())
+                    .or_default()
+                    .insert(file.clone());
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -4066,6 +4094,7 @@ impl TypeSidecar {
             symbol_failures: vec![],
             errors: vec![],
             anchor_changes: vec![],
+            request_files: Default::default(),
         };
 
         // Infer implicit types FIRST: a successful inference is the compiler's

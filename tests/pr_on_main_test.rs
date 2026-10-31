@@ -2874,3 +2874,144 @@ export function describeRecords() {
         "a table of records is not a route: {delta:#}"
     );
 }
+
+/// Run the built binary over `repo` as a main scan does, or as a
+/// `pull_request` run when `pr` is set, offline, writing to the local store
+/// `store`. Returns the run's output.
+fn binary_scan(repo: &Path, store: &Path, pr: bool) -> String {
+    std::fs::create_dir_all(store).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(".")
+        .current_dir(repo)
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env("CARRICK_LOCAL_STORAGE_DIR", store);
+    if pr {
+        cmd.env("GITHUB_EVENT_NAME", "pull_request")
+            .env("GITHUB_REF", "refs/pull/7/merge")
+            .env("CARRICK_PR_RESULT_OUT", store.join("pr-result.json"));
+    } else {
+        cmd.env_remove("GITHUB_EVENT_NAME").env_remove("GITHUB_REF");
+    }
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_EVENT_PATH",
+        "GITHUB_RUN_ID",
+        "GITHUB_ACTIONS",
+        "CI",
+        "CARRICK_OUTPUT_JSON",
+        "CARRICK_LOCAL_STORAGE_ISOLATE",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    let run = cmd.output().expect("failed to spawn carrick");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.status.success(), "{output}");
+    output
+}
+
+/// The stored blob of a single-service repo named `name`, as JSON.
+fn stored_blob(store: &Path, name: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(store.join(format!("{name}.json")))
+        .unwrap_or_else(|error| panic!("no blob for {name} ({error})"));
+    serde_json::from_str(&text).unwrap()
+}
+
+/// carrick#3101: a main scan stores the service's type-reach record beside
+/// its blob, and the blob names it. The record holds the import graph of the
+/// program that typed the service, with paths relative to the repo root, and
+/// each alias the type stage asked about with the file of its request.
+#[tokio::test]
+async fn a_main_scan_stores_the_type_reach_record_of_a_typed_service() {
+    use sha2::Digest;
+    use std::io::Read;
+
+    let _serial = SERIAL.lock().await;
+    let (tmp, _producer, consumer) = setup();
+    let store = tmp.path().join("main-store");
+    let output = binary_scan(&consumer, &store, false);
+
+    let blob = stored_blob(&store, "inventory-svc");
+    let reference = blob
+        .get("type_reach")
+        .unwrap_or_else(|| panic!("the blob names no type-reach record:\n{output}"));
+    let object = std::fs::read(store.join("inventory-svc.type-reach.json.gz"))
+        .unwrap_or_else(|error| panic!("no type-reach object ({error}):\n{output}"));
+    // The blob names exactly the bytes stored.
+    assert_eq!(reference["bytes"], serde_json::json!(object.len()));
+    assert_eq!(
+        reference["sha256"],
+        serde_json::json!(format!("{:x}", sha2::Sha256::digest(&object)))
+    );
+    eprintln!("type-reach record: {} bytes gzipped", object.len());
+
+    let mut json = String::new();
+    flate2::read::GzDecoder::new(&object[..])
+        .read_to_string(&mut json)
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(record["version"], 1);
+    assert!(record.get("scanner_build").is_some(), "{record:#}");
+
+    // The graph names the fixture's source files, relative to the repo.
+    let strings: Vec<&str> = record["graph"]["strings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a graph with no string table: {record:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for file in ["src/client.ts", "src/inventory.ts", "src/send.ts"] {
+        assert!(strings.contains(&file), "{file} missing from {strings:?}");
+    }
+    assert!(
+        !strings.iter().any(|s| s.starts_with('/')),
+        "a machine path in the graph: {strings:?}"
+    );
+
+    // Each alias maps to the file of the request that carried it, and every
+    // alias the manifest typed is there.
+    let aliases = record["aliases"].as_object().unwrap();
+    let manifest = blob["type_manifest"].as_array().unwrap();
+    let typed: Vec<&serde_json::Value> = manifest
+        .iter()
+        .filter(|entry| entry["type_state"] != "unknown")
+        .collect();
+    assert!(!typed.is_empty(), "the fixture types nothing: {blob:#}");
+    for entry in typed {
+        let alias = entry["type_alias"].as_str().unwrap();
+        assert_eq!(
+            aliases.get(alias),
+            Some(&serde_json::json!([entry["file_path"]])),
+            "{alias} in {aliases:#?}"
+        );
+    }
+    for alias in aliases.keys() {
+        assert!(
+            manifest.iter().any(|entry| entry["type_alias"] == **alias),
+            "{alias} is not a manifest alias"
+        );
+    }
+}
+
+/// carrick#3101: a pull request run reads main's record and stores none,
+/// even where its store keeps what it uploads.
+#[tokio::test]
+async fn a_pull_request_scan_stores_no_type_reach_record() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _producer, consumer) = setup();
+    let store = tmp.path().join("pr-store");
+    let output = binary_scan(&consumer, &store, true);
+
+    assert!(
+        !store.join("inventory-svc.type-reach.json.gz").exists(),
+        "a PR run stored a type-reach record:\n{output}"
+    );
+    let blob = stored_blob(&store, "inventory-svc");
+    assert!(blob.get("type_reach").is_none(), "{blob:#}");
+}

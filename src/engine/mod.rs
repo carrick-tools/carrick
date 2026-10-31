@@ -1385,7 +1385,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 // services analysed side by side it is the last stage any of
                 // them entered, as `scan_stage` keeps it.
                 let failed_in = crate::scan_stage::current();
-                upload_service_payloads(storage, &payloads, no_cache, false, &boundary).await;
+                upload_service_payloads(
+                    storage,
+                    &payloads,
+                    &type_reach_objects(&runs),
+                    no_cache,
+                    false,
+                    &boundary,
+                )
+                .await;
                 crate::scan_stage::enter(failed_in);
             }
         }
@@ -1805,6 +1813,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         debug!("Skipping upload (PR/branch mode)");
         None
     };
+    // Each analysed service's type-reach record, for its store to keep beside
+    // the payload above (carrick#3101).
+    let type_reach = type_reach_objects(&runs);
 
     // On a PR run, read what this repo's last uploaded index (main) says
     // before it is removed below, so the delta can surface what this change
@@ -2034,35 +2045,42 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     enter_stage(crate::scan_stage::Stage::CrossRepoCheck)?;
     let sp = logging::spinner("Running cross-repo analysis...");
-    let analyzer = match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar)
-        .await
-    {
-        Ok((analyzer, type_check)) => {
-            // For the indexer that spawned this scan, which swallows the
-            // warning a skipped check logs (carrick#1490). A no-op anywhere
-            // else.
-            crate::progress::report_type_check(&type_check);
-            analyzer
-        }
-        Err(e) => {
-            // Cross-repo analysis (which is what runs the type check) failed. Close
-            // the spinner with a warning first so the upload's own spinner
-            // and log lines don't interleave with an unfinished one in
-            // non-TTY CI logs, then preserve the prior behavior where the
-            // per-repo index upload happened BEFORE cross-repo analysis:
-            // still upload this run's data — verdict-less — so the index
-            // stays fresh, then propagate the failure.
-            logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
-            if let Some(payloads) = &upload_payloads {
-                // Whatever the upload could not confirm has already been
-                // named in its own summary line and annotation; the error
-                // this path returns is the analysis failure that brought it
-                // here, which is the one worth raising (carrick#1067).
-                upload_service_payloads(storage, payloads, no_cache, !incomplete, &boundary).await;
+    let analyzer =
+        match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
+            Ok((analyzer, type_check)) => {
+                // For the indexer that spawned this scan, which swallows the
+                // warning a skipped check logs (carrick#1490). A no-op anywhere
+                // else.
+                crate::progress::report_type_check(&type_check);
+                analyzer
             }
-            return Err(e);
-        }
-    };
+            Err(e) => {
+                // Cross-repo analysis (which is what runs the type check) failed. Close
+                // the spinner with a warning first so the upload's own spinner
+                // and log lines don't interleave with an unfinished one in
+                // non-TTY CI logs, then preserve the prior behavior where the
+                // per-repo index upload happened BEFORE cross-repo analysis:
+                // still upload this run's data — verdict-less — so the index
+                // stays fresh, then propagate the failure.
+                logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
+                if let Some(payloads) = &upload_payloads {
+                    // Whatever the upload could not confirm has already been
+                    // named in its own summary line and annotation; the error
+                    // this path returns is the analysis failure that brought it
+                    // here, which is the one worth raising (carrick#1067).
+                    upload_service_payloads(
+                        storage,
+                        payloads,
+                        &type_reach,
+                        no_cache,
+                        !incomplete,
+                        &boundary,
+                    )
+                    .await;
+                }
+                return Err(e);
+            }
+        };
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let mut results = analyzer.get_results();
@@ -2246,8 +2264,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .report_scan_closed(crate::change_scope::NO_CHANGE_REASON)
                 .await;
         } else {
-            unconfirmed_uploads =
-                upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
+            unconfirmed_uploads = upload_service_payloads(
+                storage,
+                &payloads,
+                &type_reach,
+                no_cache,
+                closes_run,
+                &boundary,
+            )
+            .await;
         }
     }
 
@@ -2492,6 +2517,9 @@ struct ServiceRun {
     /// are counted in, or as the run ends early. `None` for a carried
     /// service, which states none.
     fallbacks: Option<crate::fallback_tally::Pending>,
+    /// Its type-reach record, stored beside its payload (carrick#3101).
+    /// `None` for a carried service and wherever the type stage made none.
+    type_reach: Option<crate::cloud_storage::TypeReachObject>,
 }
 
 impl ServiceRun {
@@ -2518,6 +2546,7 @@ impl ServiceRun {
             call_through,
             boundaries,
             fallbacks: None,
+            type_reach: None,
         }
     }
 }
@@ -2824,6 +2853,7 @@ impl ServiceScan {
             call_through: analysis.call_through,
             boundaries: analysis.route_boundaries,
             fallbacks: analysis.fallbacks,
+            type_reach: analysis.type_reach,
         })
     }
 }
@@ -2910,6 +2940,25 @@ async fn dispatch_analysis_job<T: CloudStorage + Sync>(
 
 /// The upload payloads for `services`, stripped and stamped with the state
 /// of the tree they describe.
+/// Each service's type-reach record by the `(repo, service)` its payload
+/// names (carrick#3101).
+type TypeReachObjects = HashMap<(String, Option<String>), crate::cloud_storage::TypeReachObject>;
+
+/// The records the run's analysed services read. A carried service has none:
+/// its stored generation stands in for it and nothing typed it this run.
+fn type_reach_objects(runs: &[ServiceRun]) -> TypeReachObjects {
+    runs.iter()
+        .filter(|run| !run.carried)
+        .filter_map(|run| {
+            let object = run.type_reach.clone()?;
+            Some((
+                (run.data.repo_name.clone(), run.data.service_name.clone()),
+                object,
+            ))
+        })
+        .collect()
+}
+
 fn upload_payloads_for<T: CloudStorage>(
     storage: &T,
     repo_path: &str,
@@ -3403,9 +3452,10 @@ fn payload_reached_the_analyzer(payload: &CloudRepoData) -> bool {
 /// Uploads are keyed per (repo, service) and idempotent, so a re-run restores
 /// consistency; until then the index is mixed-generation for this repo, and
 /// the summary says so when some services landed and others did not.
-async fn upload_service_payloads<T: CloudStorage>(
+async fn upload_service_payloads<T: CloudStorage + Sync>(
     storage: &T,
     payloads: &[CloudRepoData],
+    type_reach: &TypeReachObjects,
     forced: bool,
     // Whether the last write closes the scan. False when the run leaves a
     // service incomplete, which is closed by its fail marker instead.
@@ -3460,7 +3510,12 @@ async fn upload_service_payloads<T: CloudStorage>(
         // placeholder. The payload in memory is not touched.
         let scrubbed = boundary.scrub(payload, service);
         let outgoing = scrubbed.as_ref().unwrap_or(payload);
-        match storage.upload_repo_data(outgoing, final_in_run).await {
+        // The record passed the same boundary when it was built.
+        let record = type_reach.get(&(payload.repo_name.clone(), payload.service_name.clone()));
+        match storage
+            .upload_repo_data_with_reach(outgoing, record, final_in_run)
+            .await
+        {
             Ok(outcome) => {
                 outcomes.push(outcome);
                 confirmed.push(service);
@@ -4615,7 +4670,10 @@ async fn analyze_current_repo_incremental(
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
             // Type resolution via sidecar (+ v2 capture stub for this service)
-            let stub_dir = resolve_types_if_available(
+            let TypesOutcome {
+                stub_dir,
+                type_reach,
+            } = resolve_types_if_available(
                 sidecar,
                 &file_orchestrator,
                 &merged_results,
@@ -4700,6 +4758,7 @@ async fn analyze_current_repo_incremental(
                 call_through,
                 route_boundaries,
                 fallbacks: Some(fallbacks),
+                type_reach,
             });
         } else {
             debug!("git could not compare the tree, falling back to full analysis");
@@ -8589,6 +8648,7 @@ fn build_cloud_data_from_mount_graph(
         call_through: None,
         route_boundaries: None,
         memory_peaks: None,
+        type_reach: None,
     }
 }
 
@@ -8697,6 +8757,20 @@ fn service_module_index(
     )
 }
 
+/// What the type stage leaves a service beside its payload.
+#[derive(Default)]
+struct TypesOutcome {
+    /// The on-disk capture stub dir when capture succeeded (the definitions
+    /// re-point reads from it; the caller owns cleanup).
+    stub_dir: Option<PathBuf>,
+    /// Its type-reach record, gzipped, for the store to keep beside the
+    /// blob (carrick#3101). `None` on a PR run and wherever the type stage
+    /// did not run whole.
+    type_reach: Option<crate::cloud_storage::TypeReachObject>,
+}
+
+/// Resolve types through the sidecar, read the service's type-reach record
+/// from the program that answered, and run the v2 capture.
 #[allow(clippy::too_many_arguments)]
 fn resolve_types_if_available(
     sidecar: Option<&TypeSidecar>,
@@ -8712,7 +8786,7 @@ fn resolve_types_if_available(
     payload_infer: &[crate::services::type_sidecar::InferRequestItem],
     server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
     cloud_data: &mut CloudRepoData,
-) -> Option<PathBuf> {
+) -> TypesOutcome {
     let Some(sidecar) = sidecar else {
         // The reason the run recorded at spawn, not a list of everything that
         // could have gone wrong: this string is what the boundary line reads
@@ -8729,7 +8803,7 @@ fn resolve_types_if_available(
             stage: "spawn".to_string(),
             detail,
         });
-        return None;
+        return TypesOutcome::default();
     };
 
     debug!("Starting sidecar type resolution");
@@ -8802,6 +8876,12 @@ fn resolve_types_if_available(
                         );
                     }
 
+                    // Read now, from the process whose program answered the
+                    // requests: the capture below runs in a fresh one that
+                    // has built nothing (carrick#1916).
+                    let type_reach =
+                        type_reach_object(sidecar, &type_resolution, repo_path, config);
+
                     // v2 capture ("tsc as the serializer"): derive anchors
                     // from the SAME collected requests the bundle path used —
                     // collect_type_requests is deterministic over the same
@@ -8825,7 +8905,10 @@ fn resolve_types_if_available(
                         cloud_data,
                     );
                     crate::phase_timing::mark(crate::phase_timing::Phase::Capture);
-                    captured
+                    TypesOutcome {
+                        stub_dir: captured,
+                        type_reach,
+                    }
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
@@ -8836,7 +8919,7 @@ fn resolve_types_if_available(
                         stage: "resolve".to_string(),
                         detail: e.to_string(),
                     });
-                    None
+                    TypesOutcome::default()
                 }
             }
         }
@@ -8853,9 +8936,99 @@ fn resolve_types_if_available(
                 config.service_name.as_deref().unwrap_or("(root)"),
                 &e.to_string(),
             );
-            None
+            TypesOutcome::default()
         }
     }
+}
+
+/// The service's type-reach record (carrick#3101), gzipped: the import graph
+/// of the program that answered its type requests, and the repo-relative
+/// files each alias was asked about in. A PR scan reads main's record to
+/// re-type only what its change can reach.
+///
+/// `None` on a PR run, which reads main's and stores nothing. `None`, with a
+/// warning naming the service, when the graph cannot be read or the record
+/// is over [`crate::cloud_storage::TYPE_REACH_CAP_BYTES`]: a PR scan then
+/// types the service whole, as it does today.
+fn type_reach_object(
+    sidecar: &TypeSidecar,
+    resolution: &crate::services::type_sidecar::TypeResolutionResult,
+    repo_path: &str,
+    config: &Config,
+) -> Option<crate::cloud_storage::TypeReachObject> {
+    use crate::cloud_storage::{
+        ScannerBuild, TYPE_REACH_CAP_BYTES, TYPE_REACH_RECORD_VERSION, TypeReachObject,
+        TypeReachRecord,
+    };
+    if pr_context().is_some() {
+        return None;
+    }
+    let service = config.service_name.as_deref().unwrap_or("(root)");
+    let started = Instant::now();
+    let graph = match sidecar.reach_graph() {
+        Ok(graph) => graph,
+        Err(e) => {
+            warn!(
+                "Could not read the import graph of service {service} ({e}); its type-reach \
+                 record is not stored, so a pull request scan types it whole"
+            );
+            return None;
+        }
+    };
+    let aliases = resolution
+        .request_files
+        .iter()
+        .map(|(alias, files)| {
+            let mut files: Vec<String> = files
+                .iter()
+                .map(|file| repo_relative(file, repo_path))
+                .collect();
+            files.sort();
+            files.dedup();
+            (alias.clone(), files)
+        })
+        .collect();
+    let record = TypeReachRecord {
+        version: TYPE_REACH_RECORD_VERSION,
+        scanner_build: ScannerBuild::current(),
+        graph,
+        aliases,
+    };
+    let encoded = serde_json::to_value(&record)
+        .map_err(|e| e.to_string())
+        .and_then(|mut value| {
+            // The record leaves the machine beside the blob, so it passes the
+            // same boundary the blob does.
+            upload_boundary::UploadBoundary::for_scan(repo_path)
+                .scrub_value(&mut value, &format!("the type-reach record of {service}"));
+            TypeReachObject::encode(&value)
+        });
+    let object = match encoded {
+        Ok(object) => object,
+        Err(e) => {
+            warn!(
+                "Could not encode the type-reach record of service {service} ({e}); it is not \
+                 stored, so a pull request scan types it whole"
+            );
+            return None;
+        }
+    };
+    if object.gz().len() > TYPE_REACH_CAP_BYTES {
+        warn!(
+            "The type-reach record of service {service} is {} bytes gzipped, over the {} byte \
+             cap; it is not stored, so a pull request scan types it whole",
+            object.gz().len(),
+            TYPE_REACH_CAP_BYTES
+        );
+        return None;
+    }
+    info!(
+        "Type-reach record of service {service}: {} alias(es), {} bytes gzipped, read in {:.2}s",
+        record.aliases.len(),
+        object.gz().len(),
+        started.elapsed().as_secs_f64()
+    );
+    Some(object)
 }
 
 /// Derive capture anchors and run `capture_v2` for one service, storing the
@@ -11855,7 +12028,10 @@ async fn analyze_current_repo(
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
-    let stub_dir = resolve_types_if_available(
+    let TypesOutcome {
+        stub_dir,
+        type_reach,
+    } = resolve_types_if_available(
         sidecar,
         &file_orchestrator,
         &analysis_result.file_results,
@@ -11956,6 +12132,7 @@ async fn analyze_current_repo(
         call_through,
         route_boundaries,
         fallbacks: Some(fallbacks),
+        type_reach,
     })
 }
 
@@ -12972,6 +13149,7 @@ mod tests {
             symbol_failures: vec![],
             errors: vec![],
             anchor_changes: vec![],
+            request_files: Default::default(),
         };
         run_capture_for_service(
             &sidecar,
@@ -13184,6 +13362,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     symbol_failures: vec![],
                     errors: vec![],
                     anchor_changes: vec![],
+                    request_files: Default::default(),
                 },
                 &mut data,
             );
@@ -13957,6 +14136,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         }
     }
 
@@ -14157,6 +14337,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let unconfirmed = upload_service_payloads(
             &storage,
             &payloads,
+            &TypeReachObjects::new(),
             false,
             true,
             &upload_boundary::UploadBoundary::new(root, Some(home)),
@@ -14217,6 +14398,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let unconfirmed = upload_service_payloads(
             &storage,
             &payloads,
+            &TypeReachObjects::new(),
             false,
             true,
             &upload_boundary::UploadBoundary::new(root, Some(home)),
@@ -14287,6 +14469,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 analyzed_service("orders", 0),
                 analyzed_service("billing", 3),
             ],
+            &TypeReachObjects::new(),
             false,
             true,
             &no_boundary(),
@@ -14317,6 +14500,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 analyzed_service("orders", 0),
                 analyzed_service("billing", 0),
             ],
+            &TypeReachObjects::new(),
             false,
             true,
             &no_boundary(),
@@ -14337,8 +14521,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             vec![Ok(true)],
         );
 
-        let unconfirmed =
-            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &two_services(),
+            &TypeReachObjects::new(),
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
 
         assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
         assert_eq!(storage.uploaded(), vec!["orders", "billing"]);
@@ -14355,8 +14546,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             vec![Ok(false)],
         );
 
-        let unconfirmed =
-            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &two_services(),
+            &TypeReachObjects::new(),
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
 
         assert_eq!(unconfirmed.len(), 1);
         assert_eq!(unconfirmed[0].service, "orders");
@@ -14379,8 +14577,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             vec![],
         );
 
-        let unconfirmed =
-            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &two_services(),
+            &TypeReachObjects::new(),
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
 
         assert_eq!(unconfirmed.len(), 1);
         assert!(
@@ -14402,8 +14607,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             vec![Ok(false), Ok(false), Ok(true)],
         );
 
-        let unconfirmed =
-            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &two_services(),
+            &TypeReachObjects::new(),
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
 
         assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
         assert_eq!(storage.landed_asks().len(), 3);
@@ -14419,9 +14631,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             vec![Err(StorageError::ConnectionError("no remote".to_string()))],
         );
 
-        let unconfirmed =
-            upload_service_payloads(&storage, &two_services()[..1], false, true, &no_boundary())
-                .await;
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &two_services()[..1],
+            &TypeReachObjects::new(),
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
 
         assert_eq!(unconfirmed.len(), 1);
     }
@@ -14931,6 +15149,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         relativize_cloud_paths(
@@ -15152,6 +15371,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -15209,6 +15429,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         }];
 
         // Test Config merging
@@ -15311,6 +15532,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -16054,6 +16276,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -16116,6 +16339,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -16191,6 +16415,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 call_through: None,
                 route_boundaries: None,
                 memory_peaks: None,
+                type_reach: None,
             }
         }
 
@@ -16275,6 +16500,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -16501,6 +16727,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -16654,6 +16881,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         attach_external_call_candidates(
@@ -16784,6 +17012,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         attach_external_call_candidates(
@@ -16908,6 +17137,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -20869,6 +21099,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             symbol_failures: vec![],
             errors: vec![],
             anchor_changes: vec![],
+            request_files: Default::default(),
         }
     }
 
@@ -28546,6 +28777,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         }
     }
 

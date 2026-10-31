@@ -3365,6 +3365,7 @@ mod tests {
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         }
     }
 

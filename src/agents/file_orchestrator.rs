@@ -10763,9 +10763,11 @@ impl FileOrchestrator {
         // phase line's `types` covers this round trip plus the scanner-side
         // request collection (carrick#767).
         let round_trip = std::time::Instant::now();
-        let result = sidecar
+        let mut result = sidecar
             .resolve_all_types(&explicit, &infer, extraction_config, server_claims)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        // Every request as sent, for the type-reach record (carrick#3101).
+        result.note_request_files(&explicit, &infer);
         debug!(
             "[FileOrchestrator] Sidecar type resolution round trip: {:.1}s",
             round_trip.elapsed().as_secs_f64()

@@ -24,12 +24,13 @@
 //! it is in eval mode — same contract as `MockStorage`.
 
 use crate::cloud_storage::{
-    CloudRepoData, CloudStorage, JobSubmission, StorageError, UploadOutcome, read_peer_blob,
+    CloudRepoData, CloudStorage, JobSubmission, StorageError, TypeReachObject, TypeReachRecord,
+    UploadOutcome, decode_type_reach, read_peer_blob, type_reach,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use tracing::{debug, info};
+use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
 
 /// Env var holding the cache directory. Its presence at startup also selects
 /// this backend over `MockStorage`/`AwsStorage`.
@@ -116,6 +117,24 @@ impl LocalDirStorage {
             .join(format!("{}.json", blob_stem(repo_name, service_name)))
     }
 
+    /// Where a `(repo, service)` pair's type-reach object sits in `dir`,
+    /// beside its blob (carrick#3101). Not a `.json` file, so the blob reads
+    /// never take it for one.
+    fn type_reach_path(dir: &Path, data: &CloudRepoData) -> PathBuf {
+        dir.join(format!(
+            "{}.type-reach.json.gz",
+            blob_stem(&data.repo_name, data.service_name.as_deref())
+        ))
+    }
+
+    /// The directory the blobs a run reads were stored in.
+    fn read_dir(&self) -> &Path {
+        match &self.reads {
+            CrossRepoReads::Peers(dir) => dir,
+            CrossRepoReads::Isolated | CrossRepoReads::CacheDir => &self.cache_dir,
+        }
+    }
+
     /// Write `data` to its cache file.
     pub(crate) fn write_cache_file(&self, data: &CloudRepoData) -> Result<(), StorageError> {
         let path = self.cache_path(&data.repo_name, data.service_name.as_deref());
@@ -179,6 +198,52 @@ impl CloudStorage for LocalDirStorage {
         // check to short-circuit on — and nothing here is metered, so there is
         // no spend to report either.
         Ok(UploadOutcome::default())
+    }
+
+    /// Writes the object beside the blob, then the blob stamped with what it
+    /// wrote (carrick#3101). An object that cannot be written leaves the blob
+    /// unstamped: the record is best-effort, the index is not.
+    async fn upload_repo_data_with_reach(
+        &self,
+        data: &CloudRepoData,
+        type_reach: Option<&TypeReachObject>,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
+        let Some(object) = type_reach else {
+            return self.upload_repo_data(data, final_in_run).await;
+        };
+        let path = Self::type_reach_path(&self.cache_dir, data);
+        match std::fs::write(&path, object.gz()) {
+            Ok(()) => {
+                let mut stamped = data.clone();
+                stamped.type_reach = Some(object.reference().clone());
+                self.upload_repo_data(&stamped, final_in_run).await
+            }
+            Err(e) => {
+                warn!(
+                    "Could not write the type-reach record of {} to {}: {e}; storing the \
+                     index without it",
+                    type_reach::service_id(data),
+                    path.display()
+                );
+                self.upload_repo_data(data, final_in_run).await
+            }
+        }
+    }
+
+    async fn type_reach_records(
+        &self,
+        stored: &[CloudRepoData],
+    ) -> HashMap<String, TypeReachRecord> {
+        stored
+            .iter()
+            .filter_map(|data| {
+                let reference = data.type_reach.as_ref()?;
+                let bytes = std::fs::read(Self::type_reach_path(self.read_dir(), data)).ok()?;
+                let record = decode_type_reach(&bytes, reference)?;
+                Some((type_reach::service_id(data).to_string(), record))
+            })
+            .collect()
     }
 
     /// Read the cache file back and compare the commit it carries.
@@ -350,6 +415,49 @@ mod tests {
             store.cache_path("a/b", Some("c\\d")),
             dir.path().join("a_b__c_d.json")
         );
+    }
+
+    /// carrick#3101: the record is written beside the blob, the blob names
+    /// it, the blob read never takes the object for a blob, and the record
+    /// reads back only while the blob names its bytes.
+    #[tokio::test]
+    async fn a_type_reach_record_is_stored_beside_its_blob_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LocalDirStorage::new(dir.path().to_path_buf(), CrossRepoReads::CacheDir).unwrap();
+        let blob: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "orders", "service_name": "api",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-10-31T00:00:00Z",
+            "commit_hash": "4f2a1c9"
+        }))
+        .unwrap();
+        let record = TypeReachRecord {
+            version: crate::cloud_storage::TYPE_REACH_RECORD_VERSION,
+            scanner_build: None,
+            graph: serde_json::json!({ "version": 1, "strings": [], "files": [] }),
+            aliases: Default::default(),
+        };
+        let object = TypeReachObject::encode(&serde_json::to_value(&record).unwrap()).unwrap();
+
+        store
+            .upload_repo_data_with_reach(&blob, Some(&object), true)
+            .await
+            .unwrap();
+        assert!(dir.path().join("orders__api.type-reach.json.gz").exists());
+        let (stored, _) = store.download_all_repo_data().await.unwrap();
+        assert_eq!(stored.len(), 1, "the object read as a blob");
+        assert_eq!(stored[0].type_reach.as_ref(), Some(object.reference()));
+        let records = store.type_reach_records(&stored).await;
+        assert_eq!(records.get("api"), Some(&record));
+
+        // A later write without a record leaves a blob that names none, and
+        // the object left on disk is not read for it.
+        store.upload_repo_data(&blob, true).await.unwrap();
+        let (stored, _) = store.download_all_repo_data().await.unwrap();
+        assert_eq!(stored[0].type_reach, None);
+        assert!(store.type_reach_records(&stored).await.is_empty());
     }
 
     /// The local join runs after every laptop scan, in the same log file. When
