@@ -1545,6 +1545,77 @@ fn as_written_by(store: &Store, repo_name: &str, version: Option<&str>) {
     }
 }
 
+/// Main's stored HTTP endpoint paths of `repo_name` with `from` replaced by
+/// `to`, the scanner version kept: the same index as an earlier reading of
+/// this release spelled them.
+fn respell_stored_paths(store: &Store, repo_name: &str, from: &str, to: &str) {
+    for stored in store
+        .repos
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .filter(|stored| stored.repo_name == repo_name)
+    {
+        for endpoint in stored.endpoints.iter_mut() {
+            if let carrick::operation::OperationKey::Http { path, .. } = &mut endpoint.key {
+                *path = path.replace(from, to);
+            }
+        }
+    }
+}
+
+/// carrick#3079: a route spelled differently in main's index and in the PR's
+/// scan is not new and not removed; a different route still is both.
+#[tokio::test]
+async fn a_pr_delta_ignores_how_a_route_parameter_is_spelled() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, _consumer) = setup();
+    let repo_name = producer.file_name().unwrap().to_str().unwrap().to_string();
+    let paths = |delta: &serde_json::Value, side: &str| -> Vec<String> {
+        delta[side]
+            .as_array()
+            .map(|refs| {
+                refs.iter()
+                    .map(|r| r["path"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    for respelled in [
+        "/api/v1/widgets/{widgetId}",
+        "/api/v1/widgets/${widgetId}",
+        "/api/v1/widgets/:id",
+    ] {
+        let store = Store::default();
+        scan(&store, &producer).await;
+        respell_stored_paths(&store, &repo_name, "/api/v1/widgets/:widgetId", respelled);
+        let delta = pr_delta(&store, &producer).await;
+        assert!(!delta.is_null(), "{respelled}: a delta is posted");
+        assert!(
+            paths(&delta, "new_endpoints").is_empty(),
+            "{respelled}: {delta:#}"
+        );
+        assert!(
+            paths(&delta, "removed_endpoints").is_empty(),
+            "{respelled}: {delta:#}"
+        );
+    }
+
+    let store = Store::default();
+    scan(&store, &producer).await;
+    respell_stored_paths(&store, &repo_name, "/widgets/", "/gadgets/");
+    let delta = pr_delta(&store, &producer).await;
+    assert_eq!(
+        paths(&delta, "new_endpoints"),
+        vec!["/api/v1/widgets/:widgetId"]
+    );
+    assert_eq!(
+        paths(&delta, "removed_endpoints"),
+        vec!["/api/v1/gadgets/:widgetId"]
+    );
+}
+
 /// carrick#1712: a row the PR did not add never shows as new. Main's index
 /// written by this release lacking an endpoint the PR's scan states is a real
 /// difference, and the delta lists it; the same index written by another

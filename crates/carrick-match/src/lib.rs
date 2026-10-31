@@ -33,7 +33,7 @@
 //! extraction gap, not a call to every route, so no producer may claim it.
 //!
 //! The `wasm` feature (default off) adds wasm-bindgen exports for
-//! [`paths_match`], [`is_param_segment`], [`match_agreement`],
+//! [`paths_match`], [`is_param_segment`], [`route_identity`], [`match_agreement`],
 //! [`path_literal_specificity`], [`is_catch_all_path`],
 //! [`is_unknown_call_path`], [`match_verdict`], [`reportable_agreement`],
 //! [`classify_relationship`], [`method_matches`], and the body-dispatch trio [`dispatch_key`],
@@ -557,6 +557,56 @@ pub fn is_param_segment(seg: &str) -> bool {
         || (seg.starts_with('[') && seg.ends_with(']'))
 }
 
+/// True when `seg` is exactly one template hole, `${...}`, spanning the whole
+/// segment (nested braces inside the hole are balanced).
+fn is_whole_template_hole(seg: &str) -> bool {
+    let Some(inner) = seg.strip_prefix("${") else {
+        return false;
+    };
+    let mut depth = 1usize;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + c.len_utf8() == inner.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A route path's identity with every parameter spelling folded to one token.
+///
+/// A whole segment that [`is_param_segment`] accepts, or that is exactly one
+/// `${...}` template hole, becomes `:` with its name dropped; a trailing `?`
+/// stays on the token. Every other segment (literals, mixed segments such as
+/// `v${n}`, wildcards) is kept as written, case included.
+///
+/// This answers identity only (does a PR's delta list one route twice?). It
+/// is not a matcher: routing stays with [`paths_match`], and a `${...}` hole
+/// is not a parameter there.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn route_identity(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            let (body, optional) = match seg.strip_suffix('?') {
+                Some(body) => (body, "?"),
+                None => (seg, ""),
+            };
+            if is_param_segment(body) || is_whole_template_hole(body) {
+                format!(":{optional}")
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Match paths with wildcard patterns, returning the literal agreement count.
 ///
 /// Match semantics as implemented (kept byte-identical to the scanner's
@@ -891,6 +941,36 @@ mod tests {
         // the default; a producer-side entry defaults to a route definition so
         // pre-existing matches keep their producer/consumer classification.
         assert_eq!(MatchEvidence::default(), MatchEvidence::RouteDefinition);
+    }
+
+    #[test]
+    fn test_route_identity_folds_parameter_spellings() {
+        let one = route_identity("/a/:id/b");
+        for same in [
+            "/a/{id}/b",
+            "/a/${id}/b",
+            "/a/${encodeURIComponent(id)}/b",
+            "/a/<id>/b",
+            "/a/[id]/b",
+            "/a/[...id]/b",
+            "/a/:other/b",
+        ] {
+            assert_eq!(route_identity(same), one, "{same}");
+        }
+        assert_eq!(route_identity("/a/:id?"), "/a/:?");
+        assert_eq!(route_identity("/a/{id}?"), route_identity("/a/:id?"));
+        assert_ne!(route_identity("/a/:id?"), route_identity("/a/:id"));
+        for different in [
+            "/a/v${n}/b",
+            "/a/${x}-${y}/b",
+            "/a/${x}${y}/b",
+            "/a/foo{bar}baz/b",
+            "/a/me/b",
+            "/A/:id/b",
+            "/a/*/b",
+        ] {
+            assert_ne!(route_identity(different), one, "{different}");
+        }
     }
 
     #[test]
