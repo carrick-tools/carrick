@@ -28,6 +28,7 @@ use tracing::{debug, info};
 
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
+use crate::dependency_move::{DependencyMove, DependencyReach, dependency_move, loaded_packages};
 use crate::git_state::ChangedPath;
 
 /// What `--changed-only` together with `--no-cache` is told: a usage error.
@@ -173,7 +174,8 @@ pub enum CouldBe {
     /// A bare specifier no manifest declares: a file whose path, extension
     /// dropped, ends with it (a `baseUrl` import the resolver missed). A
     /// package changes through its manifest or lockfile, which is a repo
-    /// input of every service already.
+    /// input of every service already, or a dependency-only move the service
+    /// loads ([`crate::dependency_move`]).
     Named(String),
 }
 
@@ -305,7 +307,7 @@ fn test_edit_keeps_imports(
 }
 
 /// Whether `path` is a `.gitignore`, wherever it sits.
-fn is_gitignore(path: &str) -> bool {
+pub(crate) fn is_gitignore(path: &str) -> bool {
     path.rsplit('/').next() == Some(".gitignore")
 }
 
@@ -430,7 +432,7 @@ fn walk_could_enter(
 }
 
 /// Whether `path` is `dir` or under it. `""` is the whole repository.
-fn under(path: &str, dir: &str) -> bool {
+pub(crate) fn under(path: &str, dir: &str) -> bool {
     dir.is_empty()
         || path == dir
         || path
@@ -438,7 +440,7 @@ fn under(path: &str, dir: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn parent_of(path: &str) -> &str {
+pub(crate) fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
@@ -541,6 +543,11 @@ pub fn is_repo_input(path: &str) -> bool {
 /// `keeps_imports` says whether an edited test source still loads what it
 /// loaded ([`test_edit_keeps_imports`]); it is asked only of a modified test
 /// source the service reads by a root or a directory (carrick#3114).
+/// `dependencies` says whether the service loads a package the other repo
+/// input changes moved, when they are a dependency-only move
+/// ([`crate::dependency_move`], carrick#3115); it is asked only when such a
+/// change is listed, and those manifests and lockfiles then count like a
+/// version-only manifest.
 ///
 /// A run that carries under that rule and uploads would write a stored
 /// manifest projection (`packages`, `package_json`, `package_json_hash`)
@@ -562,6 +569,7 @@ pub fn decide(
     mut version_only: impl FnMut(&ChangedPath) -> bool,
     mut gitignore_moves: impl FnMut(&str, &ServiceInputs) -> bool,
     mut keeps_imports: impl FnMut(&ChangedPath) -> bool,
+    dependencies: impl FnOnce(&ServiceInputs) -> DependencyReach,
     inputs: impl FnOnce() -> ServiceInputs,
 ) -> Scope {
     let Some(stored) = stored else {
@@ -657,15 +665,24 @@ pub fn decide(
         .iter()
         .map(|change| is_repo_input(&change.path) && version_only(change))
         .collect();
+    let mut moved_dependencies = false;
     if let Some((change, _)) = others
         .iter()
         .zip(&version_only)
         .find(|(change, only)| is_repo_input(&change.path) && !**only)
     {
-        return Scope::analysed(Reason::RepoInputChanged, change.path.clone());
+        match dependencies(&inputs) {
+            DependencyReach::Unread => {
+                return Scope::analysed(Reason::RepoInputChanged, change.path.clone());
+            }
+            DependencyReach::Reaches { file, package } => {
+                return Scope::analysed(Reason::InputsChanged, format!("{file}: {package}"));
+            }
+            DependencyReach::Nothing => moved_dependencies = true,
+        }
     }
     if let Some((change, _)) = others.iter().zip(&version_only).find(|(change, only)| {
-        if **only {
+        if **only || (moved_dependencies && is_repo_input(&change.path)) {
             inputs.reads_outside_roots(change, &mut keeps_imports)
         } else {
             inputs.reads(change, &mut keeps_imports)
@@ -775,6 +792,7 @@ pub fn plan<'a>(
     let untracked: std::cell::OnceCell<Option<Vec<String>>> = std::cell::OnceCell::new();
     let mut stops: HashMap<PathBuf, bool> = HashMap::new();
     let mut keeps_imports_of: HashMap<(String, String), bool> = HashMap::new();
+    let mut moved_by_commit: HashMap<String, Option<DependencyMove>> = HashMap::new();
     let mut changed_by_commit: HashMap<String, Result<Vec<ChangedPath>, String>> = HashMap::new();
     let mut closure_took = std::time::Duration::ZERO;
     let mut walked = 0usize;
@@ -834,6 +852,22 @@ pub fn plan<'a>(
                         )
                     })
             };
+            let dependencies = |inputs: &ServiceInputs| {
+                let (Some(blob), Some(top), Ok(paths)) = (stored, &top, changed) else {
+                    return DependencyReach::Unread;
+                };
+                let moved = moved_by_commit
+                    .entry(blob.commit_hash.clone())
+                    .or_insert_with(|| {
+                        dependency_move(repo_path, top, &blob.commit_hash, None, paths)
+                    });
+                match moved {
+                    Some(moved) => moved.reach(inputs, |moved| {
+                        loaded_packages(repo_path, top, service, inputs, &reads, moved)
+                    }),
+                    None => DependencyReach::Unread,
+                }
+            };
             let scope = decide(
                 stored,
                 this_run,
@@ -853,6 +887,7 @@ pub fn plan<'a>(
                     })
                 },
                 keeps_imports,
+                dependencies,
                 || {
                     let started = Instant::now();
                     walked += 1;
@@ -994,7 +1029,7 @@ impl Default for ClosureReads {
 impl ClosureReads {
     /// Keyed by the file's real path: one walk reaches a file by the path it
     /// walked, another through a link or by the resolver's real path.
-    fn loaded_specifiers(&self, file: &Path) -> Vec<String> {
+    pub(crate) fn loaded_specifiers(&self, file: &Path) -> Vec<String> {
         let key = self.canonical(file);
         if let Some(known) = self.specifiers.borrow().get(&key) {
             return known.clone();
@@ -1229,7 +1264,11 @@ pub fn service_inputs(
 
 /// The tsconfig that governs `service`: the one carrick.json names, else the
 /// nearest `tsconfig.json` at or above its directory. Repo-relative.
-fn service_tsconfig_path(root: &Path, service_root: &Path, service: &Config) -> Option<PathBuf> {
+pub(crate) fn service_tsconfig_path(
+    root: &Path,
+    service_root: &Path,
+    service: &Config,
+) -> Option<PathBuf> {
     let found = match &service.tsconfig {
         Some(named) => Some(service_root.join(named)).filter(|path| path.is_file()),
         None => service_root
@@ -1291,7 +1330,11 @@ pub struct CopyJudge<'a> {
     pr_changes: std::cell::OnceCell<Result<Vec<ChangedPath>, String>>,
     /// What the services' closure walks read, shared between the copies.
     reads: ClosureReads,
+    /// What each (copy commit, base) pair's dependency-only move moved.
+    moved: std::cell::RefCell<MovedByPair>,
 }
+
+type MovedByPair = HashMap<(String, String), Option<std::rc::Rc<DependencyMove>>>;
 
 impl<'a> CopyJudge<'a> {
     pub fn new(repo_path: &'a str, services: &'a [Config], main_self: &[CloudRepoData]) -> Self {
@@ -1306,6 +1349,7 @@ impl<'a> CopyJudge<'a> {
             top: crate::git_state::toplevel(repo_path).ok(),
             pr_changes: std::cell::OnceCell::new(),
             reads: ClosureReads::default(),
+            moved: Default::default(),
         }
     }
 
@@ -1316,7 +1360,9 @@ impl<'a> CopyJudge<'a> {
     /// base's where the pull request itself edits a file outside the
     /// service's roots that the service reads: then, and for a copy whose
     /// service this tree does not configure or whose inputs cannot be read
-    /// whole, the whole trees are compared as before.
+    /// whole, the whole trees are compared as before. A changed manifest or
+    /// lockfile counts as in [`decide`]: a dependency-only move counts where
+    /// the service loads a moved package.
     pub fn differs(&self, copy: &CloudRepoData, base: &str) -> Option<bool> {
         if copy.commit_hash == base {
             return Some(false);
@@ -1352,9 +1398,39 @@ impl<'a> CopyJudge<'a> {
         if pr_edits_an_outside_input {
             return whole_tree();
         }
+        // A dependency-only move counts only where the service loads a
+        // moved package (carrick#3115). What it loads is read on this tree,
+        // so a pull request that edits anything it reads, or a repository
+        // input, leaves the move unread.
+        let mut moved_dependencies = false;
+        if changed
+            .iter()
+            .any(|change| is_repo_input(&change.path) && !is_gitignore(&change.path))
+        {
+            let pr_edits_what_it_loads = match pr_changes {
+                Ok(pr_changes) => pr_changes.iter().any(|change| {
+                    is_repo_input(&change.path) || inputs.reads(change, &mut |_| false)
+                }),
+                Err(_) => true,
+            };
+            let moved = (!pr_edits_what_it_loads)
+                .then(|| self.moved(&copy.commit_hash, base, &changed, top))
+                .flatten();
+            let reach = moved.map_or(DependencyReach::Unread, |moved| {
+                moved.reach(&inputs, |moved| {
+                    loaded_packages(self.repo_path, top, service, &inputs, &self.reads, moved)
+                })
+            });
+            if reach != DependencyReach::Nothing {
+                return Some(true);
+            }
+            moved_dependencies = true;
+        }
         Some(changed.iter().any(|change| {
             if is_gitignore(&change.path) {
                 inputs.reads_the_dir_of(&change.path)
+            } else if moved_dependencies && is_repo_input(&change.path) {
+                inputs.reads_outside_roots(change, &mut |_| false)
             } else {
                 is_repo_input(&change.path)
                     || inputs.reads(change, &mut |change| {
@@ -1371,6 +1447,25 @@ impl<'a> CopyJudge<'a> {
                     })
             }
         }))
+    }
+
+    /// What the manifests and lockfiles moved between `from` and `base`,
+    /// read once for every copy stored at `from`.
+    fn moved(
+        &self,
+        from: &str,
+        base: &str,
+        changed: &[ChangedPath],
+        top: &Path,
+    ) -> Option<std::rc::Rc<DependencyMove>> {
+        self.moved
+            .borrow_mut()
+            .entry((from.to_string(), base.to_string()))
+            .or_insert_with(|| {
+                dependency_move(self.repo_path, top, from, Some(base), changed)
+                    .map(std::rc::Rc::new)
+            })
+            .clone()
     }
 }
 
@@ -1504,6 +1599,7 @@ mod tests {
             |_| false,
             |gitignore, inputs| gitignore_moves(gitignore, inputs, Some(&[]), |_, _, _| true),
             |_| false,
+            |_| DependencyReach::Unread,
             || inputs,
         )
     }
@@ -1738,6 +1834,7 @@ mod tests {
             |_| false,
             |_, _| false,
             |_| false,
+            |_| DependencyReach::Unread,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1760,6 +1857,7 @@ mod tests {
             |_| false,
             |_, _| false,
             |_| false,
+            |_| DependencyReach::Unread,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1845,6 +1943,7 @@ mod tests {
                 |_| false,
                 |_, _| false,
                 |_| false,
+                |_| DependencyReach::Unread,
                 api_inputs,
             )
         };
@@ -3304,8 +3403,16 @@ mod tests {
     /// manifest.
     #[test]
     fn a_manifest_move_without_its_lockfile_analyses_every_service() {
-        let versions = first_versions();
-        let scopes = scopes_after(Manager::Npm, &moved(&versions, "lib-b", "1.1.0"), &versions);
+        let (repo, a, services) = dependency_workspace(Manager::Npm);
+        let blobs = stored_at(&services, &a);
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        write_dependencies(repo.path(), Manager::Npm, &bumped, &bumped);
+        git_in(
+            repo.path(),
+            &["checkout", "HEAD", "--", "package-lock.json"],
+        );
+        commit_all(repo.path(), "move");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
         assert_eq!(
             reasons(&scopes),
             [Some(Reason::RepoInputChanged); 3],

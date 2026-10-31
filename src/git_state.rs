@@ -675,6 +675,24 @@ pub fn file_at_commit(repo_path: &str, commit: &str, path: &str) -> Option<Strin
         .flatten()
 }
 
+/// Which of `paths` (relative to the repository's top level) `commit`'s tree
+/// holds. Read from the tree alone, so a blobless clone answers without
+/// fetching.
+pub fn paths_at_commit(
+    repo_path: &str,
+    commit: &str,
+    paths: &[String],
+) -> Result<HashSet<String>, String> {
+    if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{commit:?} is not a commit id"));
+    }
+    let mut args = vec!["ls-tree", "--full-tree", "--name-only", "-z", commit, "--"];
+    args.extend(paths.iter().map(String::as_str));
+    Ok(nul_paths(run_git_env(repo_path, &args, &NO_LAZY_FETCH)?)
+        .into_iter()
+        .collect())
+}
+
 /// One file that differs between two trees, with the path it was renamed
 /// from when git pairs it with one.
 #[derive(Debug, Clone, PartialEq, Eq)]
