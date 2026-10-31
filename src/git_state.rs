@@ -363,16 +363,25 @@ pub fn parse_hunk_header(line: &str) -> Option<Hunk> {
     })
 }
 
-/// The hunks that turn `path` as `commit` holds it into the working tree's
-/// copy, in file order, with no context lines (carrick#2894).
+/// The hunks that turn `path` as `commit` holds it into the copy `to` holds
+/// (another commit, or the working tree when `None`), in file order, with no
+/// context lines (carrick#2894).
 ///
-/// Run from `repo_path`, with `path` relative to it. Guarded as
-/// [`unchanged_since`] is: a value that is not a hex object name never reaches
-/// git, a partial clone's stat-refresh is off, and no blob is fetched. `Err`
-/// is "git could not answer", which is not the same as no hunks.
-pub fn changed_hunks(repo_path: &str, commit: &str, path: &str) -> Result<Vec<Hunk>, String> {
-    if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("{commit:?} is not a commit id"));
+/// Run from `repo_path`, with `path` relative to it, read literally (a
+/// `[id].ts` route is not a glob). Guarded as [`unchanged_since`] is: a value
+/// that is not a hex object name never reaches git, a partial clone's
+/// stat-refresh is off, and no blob is fetched. `Err` is "git could not
+/// answer", which is not the same as no hunks.
+pub fn changed_hunks(
+    repo_path: &str,
+    commit: &str,
+    path: &str,
+    to: Option<&str>,
+) -> Result<Vec<Hunk>, String> {
+    for id in std::iter::once(commit).chain(to) {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{id:?} is not a commit id"));
+        }
     }
     let mut args = vec![];
     if is_partial_clone(repo_path) {
@@ -386,12 +395,13 @@ pub fn changed_hunks(repo_path: &str, commit: &str, path: &str) -> Result<Vec<Hu
         "--no-renames",
         "--relative",
         commit,
-        "--",
-        path,
     ]);
+    args.extend(to);
+    args.extend(["--", path]);
     let output = Command::new("git")
         .args(&args)
         .current_dir(repo_path)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")

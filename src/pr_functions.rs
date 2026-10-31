@@ -159,7 +159,7 @@ pub struct Scope<'a> {
 /// Read segment by segment, never as text, so a `.` segment counts for
 /// nothing wherever it sits: a scan root of `.` with a service directory of
 /// `.` walks `././src/a.ts`, and that is `src/a.ts`.
-fn blob_path(path: &Path, root: &Path) -> Option<String> {
+pub(crate) fn blob_path(path: &Path, root: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
     Some(
         relative

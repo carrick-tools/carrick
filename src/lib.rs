@@ -71,6 +71,7 @@ pub mod position_rows;
 pub mod possible_calls;
 pub mod pr_baseline;
 pub mod pr_context;
+pub mod pr_delta_anchor;
 pub mod pr_functions;
 pub mod preflight;
 pub mod progress;

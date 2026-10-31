@@ -173,13 +173,13 @@ fn span_of(def: &FunctionDefinition) -> Option<HandlerSpan> {
 }
 
 /// `"src/routes.ts:12"` → `("src/routes.ts", 12)`.
-fn split_location(location: &str) -> Option<(String, u32)> {
+pub(crate) fn split_location(location: &str) -> Option<(String, u32)> {
     let (file, line) = location.rsplit_once(':')?;
     let line = line.parse::<u32>().ok().filter(|l| *l > 0)?;
     Some((normalize(file), line))
 }
 
-fn normalize(path: &str) -> String {
+pub(crate) fn normalize(path: &str) -> String {
     path.strip_prefix("./").unwrap_or(path).replace('\\', "/")
 }
 

@@ -457,33 +457,36 @@ fn delta_identity(key: &crate::operation::OperationKey) -> crate::operation::Ope
     }
 }
 
-/// One operation as a scan states it: the key in its own spelling and the
-/// file and line it was read from.
+/// One operation as a scan states it: the key in its own spelling, every
+/// file and line a row of it was read from, and the commit the service that
+/// states it was stored at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeltaRow {
     key: crate::operation::OperationKey,
-    file_path: std::path::PathBuf,
+    places: Vec<std::path::PathBuf>,
+    commit: String,
 }
 
 /// `endpoint` under its identity for `service`. When two spellings of one
-/// route meet, the first in (method, path) order is the one kept, with its
-/// own file and line.
+/// route meet, the first in (method, path) order is the spelling kept; the
+/// place of every row is kept (carrick#3080).
 fn keep_first_spelling(
     keys: &mut HashMap<ServiceEndpointKey, DeltaRow>,
     service: &Option<String>,
     endpoint: &ApiEndpointDetails,
+    commit: &str,
 ) {
-    let row = DeltaRow {
-        key: endpoint.key.clone(),
-        file_path: endpoint.file_path.clone(),
-    };
-    keys.entry((service.clone(), delta_identity(&endpoint.key)))
-        .and_modify(|kept| {
-            if row.key.display_labels() < kept.key.display_labels() {
-                *kept = row.clone();
-            }
-        })
-        .or_insert(row);
+    let row = keys
+        .entry((service.clone(), delta_identity(&endpoint.key)))
+        .or_insert_with(|| DeltaRow {
+            key: endpoint.key.clone(),
+            places: Vec::new(),
+            commit: commit.to_string(),
+        });
+    if endpoint.key.display_labels() < row.key.display_labels() {
+        row.key = endpoint.key.clone();
+    }
+    row.places.push(endpoint.file_path.clone());
 }
 
 impl DeltaBaseline {
@@ -513,55 +516,136 @@ impl DeltaBaseline {
         let mut keys = HashMap::new();
         for repo in &stored {
             for endpoint in &repo.endpoints {
-                keep_first_spelling(&mut keys, &repo.service_name, endpoint);
+                keep_first_spelling(&mut keys, &repo.service_name, endpoint, &repo.commit_hash);
             }
         }
         Self::Keys(keys)
     }
 }
 
-/// The operations `current` states that `previous` lacks, and those
-/// `previous` states that `current` no longer does, each sorted by (method,
-/// path, service) so the output is deterministic even when two services add
-/// or drop the same operation.
-fn endpoint_delta(
+/// The delta's candidates: the operations `current` states that `previous`
+/// lacks, and those `previous` states that `current` no longer does, each with
+/// every place its rows sit at. The PR's diff then decides which are listed
+/// (`pr_delta_anchor`).
+struct DeltaCandidates {
+    new: Vec<crate::pr_delta_anchor::Candidate<crate::findings::EndpointRef>>,
+    removed: Vec<crate::pr_delta_anchor::Candidate<crate::findings::EndpointRef>>,
+}
+
+fn delta_candidates(
     previous: &HashMap<ServiceEndpointKey, DeltaRow>,
     current: &[CloudRepoData],
-) -> crate::findings::PrDelta {
-    let endpoint_ref = |service: &Option<String>, key: &crate::operation::OperationKey| {
-        let (label, name) = key.display_labels();
-        crate::findings::EndpointRef {
-            method: label,
-            path: name,
-            service: service.clone(),
+) -> DeltaCandidates {
+    let candidate = |service: &Option<String>, row: &DeltaRow| {
+        let (label, name) = row.key.display_labels();
+        crate::pr_delta_anchor::Candidate {
+            item: crate::findings::EndpointRef {
+                method: label,
+                path: name,
+                service: service.clone(),
+            },
+            places: row
+                .places
+                .iter()
+                .map(|place| {
+                    crate::pr_delta_anchor::Place::parse(service, &place.to_string_lossy())
+                })
+                .collect(),
         }
     };
+    let mut current_keys = HashMap::new();
+    for service_data in current {
+        for endpoint in &service_data.endpoints {
+            keep_first_spelling(&mut current_keys, &service_data.service_name, endpoint, "");
+        }
+    }
+    DeltaCandidates {
+        new: current_keys
+            .iter()
+            .filter(|(id, _)| !previous.contains_key(*id))
+            .map(|((service, _), row)| candidate(service, row))
+            .collect(),
+        removed: previous
+            .iter()
+            .filter(|(id, _)| !current_keys.contains_key(*id))
+            .map(|((service, _), row)| candidate(service, row))
+            .collect(),
+    }
+}
+
+/// The listed operations as the PR comment's delta, sorted by (method, path,
+/// service) so the output is deterministic even when two services add or drop
+/// the same operation.
+fn delta_of(
+    mut new_endpoints: Vec<crate::findings::EndpointRef>,
+    mut removed_endpoints: Vec<crate::findings::EndpointRef>,
+) -> crate::findings::PrDelta {
     let sort_refs = |refs: &mut Vec<crate::findings::EndpointRef>| {
         refs.sort_by(|a, b| {
             (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
         });
     };
-    let mut current_keys = HashMap::new();
-    for service_data in current {
-        for endpoint in &service_data.endpoints {
-            keep_first_spelling(&mut current_keys, &service_data.service_name, endpoint);
-        }
-    }
-    let mut new_endpoints: Vec<crate::findings::EndpointRef> = current_keys
-        .iter()
-        .filter(|(id, _)| !previous.contains_key(*id))
-        .map(|((service, _), row)| endpoint_ref(service, &row.key))
-        .collect();
-    let mut removed_endpoints: Vec<crate::findings::EndpointRef> = previous
-        .iter()
-        .filter(|(id, _)| !current_keys.contains_key(*id))
-        .map(|((service, _), row)| endpoint_ref(service, &row.key))
-        .collect();
     sort_refs(&mut new_endpoints);
     sort_refs(&mut removed_endpoints);
     crate::findings::PrDelta {
         new_endpoints,
         removed_endpoints,
+    }
+}
+
+/// What a PR changes in its endpoints: the key comparison with main's index,
+/// kept to the rows the PR's own diff places (carrick#3080). `None` when the
+/// run does not know the PR's base commit or git cannot read the diff, with
+/// the reason logged.
+fn anchored_delta(
+    repo_path: &str,
+    base: Option<&str>,
+    previous: &HashMap<ServiceEndpointKey, DeltaRow>,
+    current: &[CloudRepoData],
+) -> Option<crate::findings::PrDelta> {
+    let Some(base) = base else {
+        info!(
+            "This run does not know the PR's base commit, so the PR comment lists no endpoint \
+             changes"
+        );
+        return None;
+    };
+    let DeltaCandidates { new, removed } = delta_candidates(previous, current);
+    let scan: Vec<crate::pr_delta_anchor::Place> = current
+        .iter()
+        .flat_map(|data| {
+            data.endpoints.iter().map(|endpoint| {
+                crate::pr_delta_anchor::Place::parse(
+                    &data.service_name,
+                    &endpoint.file_path.to_string_lossy(),
+                )
+            })
+        })
+        .collect();
+    let main: Vec<crate::pr_delta_anchor::MainSource> = previous
+        .iter()
+        .flat_map(|((service, _), row)| {
+            row.places
+                .iter()
+                .map(|place| crate::pr_delta_anchor::MainSource {
+                    place: crate::pr_delta_anchor::Place::parse(service, &place.to_string_lossy()),
+                    commit: row.commit.clone(),
+                })
+        })
+        .collect();
+    match crate::pr_delta_anchor::run(repo_path, base, new, removed, &scan, main) {
+        Ok(anchored) => {
+            info!("{}", anchored.summary());
+            Some(delta_of(anchored.new, anchored.removed))
+        }
+        Err(reason) => {
+            info!(
+                "Git could not read this PR's diff ({}), so the PR comment lists no endpoint \
+                 changes",
+                reason.trim()
+            );
+            None
+        }
     }
 }
 
@@ -1870,7 +1954,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // landed on main since its last scan rather than in this PR. Computed
     // before `current_services_data` is moved into the analyzer.
     let pr_delta = match delta_baseline {
-        DeltaBaseline::Keys(previous) => Some(endpoint_delta(&previous, &current_services_data)),
+        DeltaBaseline::Keys(previous) => anchored_delta(
+            repo_path,
+            pr_base.as_deref(),
+            &previous,
+            &current_services_data,
+        ),
         DeltaBaseline::OtherScanner(versions) => {
             info!(
                 "Main's index was written by Carrick {} and this run is Carrick {}, so the PR \
@@ -28258,6 +28347,19 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         repo
     }
 
+    /// The key comparison alone, as the delta lists it before the PR's diff
+    /// decides which candidates stay.
+    fn key_delta(
+        previous: &HashMap<ServiceEndpointKey, DeltaRow>,
+        current: &[CloudRepoData],
+    ) -> crate::findings::PrDelta {
+        let DeltaCandidates { new, removed } = delta_candidates(previous, current);
+        delta_of(
+            new.into_iter().map(|c| c.item).collect(),
+            removed.into_iter().map(|c| c.item).collect(),
+        )
+    }
+
     /// carrick#1712: a PR's endpoint delta compares with main's index only
     /// when this scanner version wrote every stored service of the repo.
     /// Another version, or none named, gives no delta, so a row the PR did
@@ -28289,7 +28391,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let DeltaBaseline::Keys(previous) = DeltaBaseline::of([&same], THIS) else {
             panic!("this version's index is the baseline");
         };
-        let delta = endpoint_delta(
+        let delta = key_delta(
             &previous,
             &[service_stating("web", Some(THIS), &["/orders", "/users"])],
         );
@@ -28298,7 +28400,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         };
         assert_eq!(paths(&delta.new_endpoints), vec!["/users"]);
         assert!(delta.removed_endpoints.is_empty());
-        let dropped = endpoint_delta(&previous, &[service_stating("web", Some(THIS), &[])]);
+        let dropped = key_delta(&previous, &[service_stating("web", Some(THIS), &[])]);
         assert_eq!(paths(&dropped.removed_endpoints), vec!["/orders"]);
         assert!(dropped.new_endpoints.is_empty());
     }
@@ -28315,7 +28417,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             else {
                 panic!("this version's index is the baseline");
             };
-            let delta = endpoint_delta(&previous, &[service_stating("web", Some(THIS), current)]);
+            let delta = key_delta(&previous, &[service_stating("web", Some(THIS), current)]);
             let paths = |refs: &[crate::findings::EndpointRef]| -> Vec<String> {
                 refs.iter().map(|r| r.path.clone()).collect()
             };
