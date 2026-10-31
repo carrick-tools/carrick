@@ -166,7 +166,13 @@ fn scan(trace: Option<&str>) -> Scan {
             }
         }
         if let Some(object) = blob.as_object_mut() {
-            for stamp in ["scanner_version", "scanner_build", "last_updated"] {
+            for stamp in [
+                "scanner_version",
+                "scanner_build",
+                "last_updated",
+                // Measured, so it differs run to run (carrick#3083).
+                "memory_peaks",
+            ] {
                 object.remove(stamp);
             }
         }

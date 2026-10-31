@@ -133,8 +133,10 @@ fn read_blobs(storage: &Path) -> Blobs {
         .filter_map(|entry| Some(entry.ok()?.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .filter_map(|path| {
-            let blob: serde_json::Value =
+            let mut blob: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+            // Peaks are measured, so they differ run to run (carrick#3083).
+            blob.as_object_mut()?.remove("memory_peaks");
             Some((blob["service_name"].as_str()?.to_string(), blob))
         })
         .collect();

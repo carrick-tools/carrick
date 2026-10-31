@@ -131,8 +131,10 @@ fn read_blobs(storage: &Path) -> BTreeMap<String, (PathBuf, serde_json::Value)> 
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .filter_map(|path| {
-            let blob: serde_json::Value =
+            let mut blob: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            // Peaks are measured, so they differ run to run (carrick#3083).
+            blob.as_object_mut()?.remove("memory_peaks");
             let service = blob["service_name"].as_str()?.to_string();
             Some((service, (path, blob)))
         })

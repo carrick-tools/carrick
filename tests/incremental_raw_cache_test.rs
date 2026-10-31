@@ -954,6 +954,8 @@ fn uploaded_text(storage: &StubStorage) -> std::collections::BTreeMap<String, St
         .map(|blob| {
             let mut blob = blob.clone();
             blob.last_updated = chrono::DateTime::UNIX_EPOCH;
+            // Measured, so it differs run to run (carrick#3083).
+            blob.memory_peaks = None;
             if let Some(boundary) = blob.boundary.as_mut() {
                 boundary.files_attempted = 0;
             }

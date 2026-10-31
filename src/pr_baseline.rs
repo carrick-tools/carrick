@@ -1069,6 +1069,8 @@ fn surface(data: &CloudRepoData) -> serde_json::Value {
     data.sdk_edges = None;
     data.sdk_unresolved = None;
     data.boundary = None;
+    // Measured per run, so two scans of one tree differ (carrick#3083).
+    data.memory_peaks = None;
     for row in data.endpoints.iter_mut().chain(data.calls.iter_mut()) {
         strip_parsed_types(row);
     }
