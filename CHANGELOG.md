@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.138](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.137...carrick-v0.3.138) (2026-10-31)
+
+
+### Features
+
+* **engine:** log analysis width, walk-lane width and sidecar peak at info ([#3077](https://github.com/carrick-tools/carrick/issues/3077)) ([3fc2a88](https://github.com/carrick-tools/carrick/commit/3fc2a881290371486fa5ae49607d1da9b0a68fd0))
+* **engine:** PR endpoint delta lists only rows the PR's diff places ([#3087](https://github.com/carrick-tools/carrick/issues/3087)) ([d43f9f1](https://github.com/carrick-tools/carrick/commit/d43f9f12265fe17655d2210c355e321fe179e0e2))
+
+
+### Bug Fixes
+
+* **engine:** PR delta compares routes by identity, not parameter spelling ([#3081](https://github.com/carrick-tools/carrick/issues/3081)) ([cd696eb](https://github.com/carrick-tools/carrick/commit/cd696eb9f41f54f39acf4ccce4e571f986b1ae3b))
+* **pr:** read a partial clone's copies instead of refusing it ([#2285](https://github.com/carrick-tools/carrick/issues/2285)) ([#3096](https://github.com/carrick-tools/carrick/issues/3096)) ([f99af95](https://github.com/carrick-tools/carrick/commit/f99af9558c10cb6746e5b78b960b538c3e798719))
+* **scan:** ignore CARRICK_SKIP_SIGNATURES in a run that uploads ([#3098](https://github.com/carrick-tools/carrick/issues/3098)) ([b37f515](https://github.com/carrick-tools/carrick/commit/b37f515899e90f070aed5ab640eae9f2b2b44a2d))
+* **scanner:** read a handler-less table of method/path records as routes only when it declares them ([#3088](https://github.com/carrick-tools/carrick/issues/3088)) ([0694f7b](https://github.com/carrick-tools/carrick/commit/0694f7b677ea5c166d0ebb7e17ff0ed5e13b5e13)), closes [#3082](https://github.com/carrick-tools/carrick/issues/3082)
+
 ## [0.3.137](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.136...carrick-v0.3.137) (2026-10-30)
 
 
