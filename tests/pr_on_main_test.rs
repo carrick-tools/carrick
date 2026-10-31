@@ -1545,6 +1545,65 @@ fn as_written_by(store: &Store, repo_name: &str, version: Option<&str>) {
     }
 }
 
+/// Main's stored copies of `repo_name` without their HTTP endpoint `path`,
+/// everything else as this release wrote it: an earlier reading of the same
+/// tree that did not state the route.
+fn forget_stored_route(store: &Store, repo_name: &str, path: &str) {
+    for stored in store
+        .repos
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .filter(|stored| stored.repo_name == repo_name)
+    {
+        stored.endpoints.retain(|endpoint| {
+            !matches!(
+                &endpoint.key,
+                carrick::operation::OperationKey::Http { path: stored, .. } if stored == path
+            )
+        });
+    }
+}
+
+/// The `method path` of every row on one side of a posted delta.
+fn delta_rows(delta: &serde_json::Value, side: &str) -> Vec<String> {
+    delta[side]
+        .as_array()
+        .map(|refs| {
+            refs.iter()
+                .map(|r| {
+                    format!(
+                        "{} {}",
+                        r["method"].as_str().unwrap_or_default(),
+                        r["path"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const WIDGET_ROUTE: &str = "/api/v1/widgets/:widgetId";
+const WIDGETS_FILE: &str = "app/routes/api.v1.widgets.$widgetId.ts";
+const HEALTH_FILE: &str = "app/routes/api.v1.health.ts";
+
+/// Append `text` to `file` under `repo`.
+fn append_to(repo: &Path, file: &str, text: &str) {
+    let path = repo.join(file);
+    let mut source = std::fs::read_to_string(&path).unwrap();
+    source.push_str(text);
+    std::fs::write(path, source).unwrap();
+}
+
+/// Replace the first line of `file` under `repo` with `line`.
+fn replace_line_two(repo: &Path, file: &str, line: &str) {
+    let path = repo.join(file);
+    let source = std::fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<&str> = source.lines().collect();
+    lines[1] = line;
+    std::fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+}
+
 /// Main's stored HTTP endpoint paths of `repo_name` with `from` replaced by
 /// `to`, the scanner version kept: the same index as an earlier reading of
 /// this release spelled them.
@@ -1590,6 +1649,7 @@ async fn a_pr_delta_ignores_how_a_route_parameter_is_spelled() {
         let store = Store::default();
         scan(&store, &producer).await;
         respell_stored_paths(&store, &repo_name, "/api/v1/widgets/:widgetId", respelled);
+        event_with_base(_tmp.path(), &head(&producer));
         let delta = pr_delta(&store, &producer).await;
         assert!(!delta.is_null(), "{respelled}: a delta is posted");
         assert!(
@@ -1605,6 +1665,7 @@ async fn a_pr_delta_ignores_how_a_route_parameter_is_spelled() {
     let store = Store::default();
     scan(&store, &producer).await;
     respell_stored_paths(&store, &repo_name, "/widgets/", "/gadgets/");
+    event_with_base(_tmp.path(), &head(&producer));
     let delta = pr_delta(&store, &producer).await;
     assert_eq!(
         paths(&delta, "new_endpoints"),
@@ -1640,9 +1701,20 @@ async fn a_pr_shows_no_endpoint_delta_against_an_index_another_release_wrote() {
     let store = Store::default();
     scan(&store, &producer).await;
     as_written_by(&store, &repo_name, Some(env!("CARGO_PKG_VERSION")));
+    // The PR adds a route file, so the rows its scan states there are the
+    // PR's own, and this release's index lacks them (carrick#3080).
+    let base = head(&producer);
+    std::fs::write(
+        producer.join("app/routes/api.v1.gizmos.ts"),
+        "export async function loader(): Promise<{ ok: boolean }> {\n  return { ok: true };\n}\n",
+    )
+    .unwrap();
+    commit(&producer, "pr: a gizmos route");
+    event_with_base(_tmp.path(), &base);
     let delta = pr_delta(&store, &producer).await;
-    assert!(
-        !new_paths(&delta).is_empty(),
+    assert_eq!(
+        new_paths(&delta),
+        vec!["/api/v1/gizmos"],
         "this release's index lacks the endpoint, so the PR lists it: {delta:#}"
     );
 
@@ -1650,7 +1722,176 @@ async fn a_pr_shows_no_endpoint_delta_against_an_index_another_release_wrote() {
         let store = Store::default();
         scan(&store, &producer).await;
         as_written_by(&store, &repo_name, other);
+        event_with_base(_tmp.path(), &head(&producer));
         let delta = pr_delta(&store, &producer).await;
         assert!(delta.is_null(), "{other:?}: {delta:#}");
     }
+}
+
+/// carrick#3080: the delta lists a row only when the PR's own diff places it.
+/// A route main's reading lacked, in a file the PR edits on other lines or
+/// does not touch, is a reading that moved, not the PR's.
+#[tokio::test]
+async fn a_pr_delta_lists_only_rows_the_prs_diff_places() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, _consumer) = setup();
+    let repo_name = producer.file_name().unwrap().to_str().unwrap().to_string();
+
+    // Edited file: the PR changes a comment on line 2 of the widgets file.
+    // Main's reading lacked the route that file has always held.
+    let store = Store::default();
+    scan(&store, &producer).await;
+    forget_stored_route(&store, &repo_name, WIDGET_ROUTE);
+    let base = head(&producer);
+    replace_line_two(
+        &producer,
+        WIDGETS_FILE,
+        "// GET /api/v1/widgets/:widgetId, edited.",
+    );
+    commit(&producer, "pr: a comment");
+    event_with_base(tmp.path(), &base);
+    let delta = pr_delta(&store, &producer).await;
+    assert!(!delta.is_null(), "a delta is posted: {delta:#}");
+    assert_eq!(
+        delta_rows(&delta, "new_endpoints"),
+        Vec::<String>::new(),
+        "{delta:#}"
+    );
+    assert_eq!(
+        delta_rows(&delta, "removed_endpoints"),
+        Vec::<String>::new(),
+        "{delta:#}"
+    );
+
+    // Edited file with a new route: the same PR adds an `action` export, and
+    // only the route it adds is listed.
+    append_to(
+        &producer,
+        WIDGETS_FILE,
+        "\nexport async function action(): Promise<{ ok: boolean }> {\n  return { ok: true };\n}\n",
+    );
+    commit(&producer, "pr: an action");
+    event_with_base(tmp.path(), &base);
+    let delta = pr_delta(&store, &producer).await;
+    assert_eq!(
+        delta_rows(&delta, "new_endpoints"),
+        vec![format!("POST {WIDGET_ROUTE}")],
+        "{delta:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_pr_delta_leaves_out_a_row_in_a_file_the_pr_did_not_touch() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, _consumer) = setup();
+    let repo_name = producer.file_name().unwrap().to_str().unwrap().to_string();
+    let store = Store::default();
+    scan(&store, &producer).await;
+    forget_stored_route(&store, &repo_name, WIDGET_ROUTE);
+    let base = head(&producer);
+    append_to(&producer, HEALTH_FILE, "\n// A note.\n");
+    commit(&producer, "pr: health note");
+    event_with_base(tmp.path(), &base);
+    let delta = pr_delta(&store, &producer).await;
+    assert!(!delta.is_null(), "a delta is posted: {delta:#}");
+    assert_eq!(
+        delta_rows(&delta, "new_endpoints"),
+        Vec::<String>::new(),
+        "{delta:#}"
+    );
+    assert_eq!(
+        delta_rows(&delta, "removed_endpoints"),
+        Vec::<String>::new(),
+        "{delta:#}"
+    );
+}
+
+/// Main gained a route file after the PR branched, and its index was scanned
+/// there: the route is main's, not one the PR removed.
+#[tokio::test]
+async fn a_pr_delta_does_not_list_a_route_main_gained_after_the_pr_branched() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, _consumer) = setup();
+    let base = head(&producer);
+
+    git(&producer, &["checkout", "-q", "-b", "main-moves"]);
+    std::fs::write(
+        producer.join("app/routes/api.v1.gadgets.ts"),
+        "export async function loader(): Promise<{ ok: boolean }> {\n  return { ok: true };\n}\n",
+    )
+    .unwrap();
+    commit(&producer, "main: a gadgets route");
+    let moved = head(&producer);
+    let store = Store::default();
+    scan(&store, &producer).await;
+
+    git(&producer, &["checkout", "-q", "-b", "pr", &base]);
+    append_to(&producer, HEALTH_FILE, "\n// A note.\n");
+    commit(&producer, "pr: health note");
+    event_with_base(tmp.path(), &moved);
+    let delta = pr_delta(&store, &producer).await;
+    assert!(!delta.is_null(), "a delta is posted: {delta:#}");
+    assert_eq!(
+        delta_rows(&delta, "removed_endpoints"),
+        Vec::<String>::new(),
+        "{delta:#}"
+    );
+    assert_eq!(
+        delta_rows(&delta, "new_endpoints"),
+        Vec::<String>::new(),
+        "{delta:#}"
+    );
+}
+
+/// Controls: a route file the PR adds is new, and one it deletes is removed.
+#[tokio::test]
+async fn a_pr_delta_lists_a_route_file_the_pr_adds_or_deletes() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, _consumer) = setup();
+    let repo_name = producer.file_name().unwrap().to_str().unwrap().to_string();
+    let store = Store::default();
+    scan(&store, &producer).await;
+    let base = head(&producer);
+
+    std::fs::write(
+        producer.join("app/routes/api.v1.gizmos.ts"),
+        "export async function loader(): Promise<{ ok: boolean }> {\n  return { ok: true };\n}\n",
+    )
+    .unwrap();
+    commit(&producer, "pr: a gizmos route");
+    event_with_base(tmp.path(), &base);
+    let delta = pr_delta(&store, &producer).await;
+    assert_eq!(
+        delta_rows(&delta, "new_endpoints"),
+        vec!["GET /api/v1/gizmos"],
+        "{delta:#}"
+    );
+    assert_eq!(
+        delta_rows(&delta, "removed_endpoints"),
+        Vec::<String>::new(),
+        "{delta:#}"
+    );
+
+    git(&producer, &["rm", "-q", HEALTH_FILE]);
+    commit(&producer, "pr: drop the health route");
+    let delta = pr_delta(&store, &producer).await;
+    assert_eq!(
+        delta_rows(&delta, "removed_endpoints"),
+        vec!["GET /api/v1/health"],
+        "{repo_name}: {delta:#}"
+    );
+}
+
+/// Without a base commit the run cannot tell what the PR changed, so it
+/// shows no delta.
+#[tokio::test]
+async fn a_pr_with_no_base_commit_shows_no_endpoint_delta() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, _consumer) = setup();
+    let repo_name = producer.file_name().unwrap().to_str().unwrap().to_string();
+    let store = Store::default();
+    scan(&store, &producer).await;
+    forget_stored_route(&store, &repo_name, WIDGET_ROUTE);
+    let delta = pr_delta(&store, &producer).await;
+    assert!(delta.is_null(), "{delta:#}");
 }
