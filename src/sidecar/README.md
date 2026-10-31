@@ -900,10 +900,14 @@ Both actions read the default project, the one that types every file no referenc
 
 A check that re-types only what a change can reach asks two questions. `reach_graph` reads the import graph of every program the process has built (the default project and each owning project's), builds the default project first when none is built, and answers `{ "version": 1, "graph": ... }`. The graph holds repo files only (nothing under `node_modules`), by path relative to the scan root, with no statement texts: per file its declared names, the identifiers they mention that can matter, its exports, its bindings with the file and name each resolves to, and the stem each import was looked up at. Names and paths are indices into one string table.
 
+```json
+{ "request_id": "13", "action": "reach_graph" }
+```
+
 `reach` takes that graph and `changes` (`{ file, before, after }`, paths relative to the scan root, `''` for the missing side of an added or deleted file) and reads no program, so it needs no `init`:
 
 ```json
-{ "request_id": "14", "action": "reach", "graph": {}, "changes": [{ "file": "src/orders.ts", "before": "...", "after": "..." }] }
+{ "request_id": "14", "action": "reach", "graph": { "version": 1, "strings": ["src/orders.ts"], "files": [{ "p": 0, "g": 0, "d": [], "r": [], "l": [], "e": [], "t": [], "b": [], "w": [], "s": [] }] }, "changes": [{ "file": "src/orders.ts", "before": "export type A = string;", "after": "export type A = number;" }] }
 ```
 
 Response:
