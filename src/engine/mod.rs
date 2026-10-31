@@ -10157,7 +10157,7 @@ fn without_source_lines(members: &[String], services: &[String]) -> Vec<String> 
 }
 
 /// Build-artifact directories to skip everywhere.
-fn service_ignore_patterns(_service: &Config) -> Vec<&'static str> {
+pub(crate) fn service_ignore_patterns(_service: &Config) -> Vec<&'static str> {
     crate::packages::MANIFEST_SKIP_DIRS.to_vec()
 }
 
