@@ -2835,3 +2835,42 @@ async fn seed_loop_route_edit() {
     .await;
     assert_delta(&payload, &[], &[]);
 }
+
+/// carrick#3082: a PR that adds a table of `{ method, path }` bookkeeping
+/// records adds no endpoint, so the delta lists none of its paths.
+#[tokio::test]
+async fn a_pr_adding_a_table_of_route_records_lists_no_new_endpoint() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, _consumer) = setup();
+
+    let store = Store::default();
+    scan(&store, &producer).await;
+    std::fs::write(
+        producer.join("app/fixture-data.js"),
+        r#"const RECORDS = [
+  { method: "GET", path: "/shipments/:id", line: 12, source: "fixture" },
+  { method: "POST", path: "/shipments", line: 20, source: "fixture" },
+];
+
+export function describeRecords() {
+  return RECORDS.map((record) => `${record.method} ${record.path}`);
+}
+"#,
+    )
+    .unwrap();
+    commit(&producer, "pr: add a table of route records");
+
+    let delta = pr_delta(&store, &producer).await;
+    let new_paths: Vec<String> = delta["new_endpoints"]
+        .as_array()
+        .map(|refs| {
+            refs.iter()
+                .map(|r| r["path"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !new_paths.iter().any(|path| path.contains("/shipments")),
+        "a table of records is not a route: {delta:#}"
+    );
+}

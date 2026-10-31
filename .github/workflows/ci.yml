@@ -124,7 +124,7 @@ jobs:
           - shard: scan-2
             runner: cargo
             targets: >-
-              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test undeclared_external_host_test --test open_member_any_test
+              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test descriptor_route_data_test --test undeclared_external_host_test --test open_member_any_test
           - shard: scan-5
             runner: cargo
             targets: >-
