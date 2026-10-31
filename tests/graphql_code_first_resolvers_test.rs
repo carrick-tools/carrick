@@ -98,8 +98,7 @@ fn scan_graphql_endpoints(cassettes: &Path) -> BTreeSet<(String, String)> {
         .expect("storage dir")
         .flatten()
         // Blobs only: a type-reach record sits beside each (carrick#3101).
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .next()
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .expect("one blob");
     let blob: serde_json::Value =
         serde_json::from_slice(&std::fs::read(entry.path()).expect("read blob"))
