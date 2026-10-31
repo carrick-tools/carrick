@@ -1000,6 +1000,23 @@ fn analysed_side_by_side_a_carried_service_is_never_analysed() {
         "{}",
         side_by_side.output
     );
+    // The speed lines a runner log is read for: the width and why, the walk
+    // lane, and each analysed service's sidecar peak.
+    let said = |needle: &str| {
+        side_by_side
+            .output
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
+    assert_eq!(
+        said("Analysing services 2 at a time: "),
+        1,
+        "{}",
+        side_by_side.output
+    );
+    assert_eq!(said("Walk lane off: "), 1, "{}", side_by_side.output);
+    assert_eq!(said("sidecar peak "), 2, "{}", side_by_side.output);
     let one_at_a_time = workspace.scan_with(
         &one_at_a_time_store,
         &["--changed-only"],
