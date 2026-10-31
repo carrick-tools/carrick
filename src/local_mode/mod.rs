@@ -68,7 +68,8 @@ pub const JOIN_OUT_ENV: &str = "CARRICK_LOCAL_JOIN_OUT";
 /// hosted function index and nothing a contract verdict reads. Measured on a
 /// 123-file package: 4 s of scan and 9 s of signature inference (carrick#1036).
 /// The re-check behind an edit sets this because it has ten seconds for the
-/// whole answer and reads no signature; a scan that uploads never sets it.
+/// whole answer and reads no signature. A run that uploads to the hosted index
+/// ignores it, with one warning, so main never stores `unknown` signatures.
 pub const SKIP_SIGNATURES_ENV: &str = "CARRICK_SKIP_SIGNATURES";
 
 /// Whether this process runs without its model stage. Read from the
@@ -86,8 +87,25 @@ pub fn skip_signature_inference() -> bool {
     // no intents: it writes no index for them to live in, and inferring the
     // slots the source left unannotated is a sidecar pass over every function
     // in the service (carrick#1229).
-    std::env::var(SKIP_SIGNATURES_ENV).as_deref() == Ok("1")
-        || crate::analysis_channel::has_prompts()
+    let requested = std::env::var(SKIP_SIGNATURES_ENV).as_deref() == Ok("1");
+    let uploads = crate::engine::uploads_to_hosted_index();
+    if requested && uploads {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "{SKIP_SIGNATURES_ENV} is ignored in a run that uploads: main's index must \
+                 not store unresolved signatures"
+            );
+        });
+    }
+    skip_signatures_decision(requested, uploads, crate::analysis_channel::has_prompts())
+}
+
+/// The switch is honoured only where no hosted index is written: a run that
+/// uploads would store `unknown` signatures the function index serves. A
+/// dispatched run (`has_prompts`) writes no index and always skips.
+fn skip_signatures_decision(requested: bool, uploads: bool, dispatched: bool) -> bool {
+    (requested && !uploads) || dispatched
 }
 
 /// The guidance map a no-model run analyses with: one entry per LLM-routed
@@ -176,5 +194,18 @@ mod tests {
         // The orchestrator treats a missing HTTP entry as a hard error, so an
         // empty map would abort every no-model scan.
         assert!(offline_guidance().contains_key(&crate::operation::Protocol::Http));
+    }
+}
+
+#[cfg(test)]
+mod skip_signatures_tests {
+    use super::skip_signatures_decision;
+
+    #[test]
+    fn an_uploading_run_ignores_the_switch_and_a_non_uploading_run_honours_it() {
+        assert!(!skip_signatures_decision(true, true, false));
+        assert!(skip_signatures_decision(true, false, false));
+        assert!(!skip_signatures_decision(false, true, false));
+        assert!(skip_signatures_decision(false, true, true));
     }
 }
