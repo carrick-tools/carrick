@@ -855,7 +855,7 @@ pub struct ServiceWalk<'a> {
 pub fn record_service_rows(
     recipe: &SidecarRecipe,
     walk: &ServiceWalk<'_>,
-) -> Result<PositionRowsCounts, String> {
+) -> Result<(PositionRowsCounts, Option<u64>), String> {
     let partial = partial_path(walk.out);
     let record = walked_at_path(walk.out);
     for stale in [walk.out, partial.as_path(), record.as_path()] {
@@ -894,7 +894,7 @@ pub fn record_service_rows(
                 peak.map(|bytes| format!("{} MB", bytes / (1024 * 1024)))
                     .unwrap_or_else(|| "unknown".to_string()),
             );
-            Ok(counts)
+            Ok((counts, peak.map(|bytes| bytes / (1024 * 1024))))
         }
         Err(error) => {
             // The sidecar renames into place only once the file is whole; a

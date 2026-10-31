@@ -903,6 +903,33 @@ pub struct CloudRepoData {
     /// as a service with none: what a carried service recorded before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_boundaries: Option<crate::request_summary::decided_sites::RouteBoundaries>,
+    /// What this service's sidecars held at their peak when it was analysed
+    /// (carrick#3083). Written for every analysed service; a carried service
+    /// keeps its stored blob, peaks included. Nothing reads it yet: the next
+    /// scan will size its width by it (carrick#3084).
+    ///
+    /// Scanner-only: the cloud stores it and hands it back unread. Absent on
+    /// blobs written before the field existed, which read as "no peak
+    /// known". Not part of `CACHE_VERSION`. Peaks differ from run to run, so
+    /// a compare of two blobs drops it as it drops `last_updated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_peaks: Option<MemoryPeaks>,
+}
+
+/// The measured memory peaks of one service's analysis (carrick#3083), in MB.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryPeaks {
+    /// The service's analysis sidecar at its peak, restarts folded in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_mb: Option<u64>,
+    /// Its compiler walk at its peak. `None` when the service was not walked
+    /// or the walk's kept rows were reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_mb: Option<u64>,
+    /// The V8 old-space cap the analysis sidecar ran under: a peak at the cap
+    /// may have been clipped by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heap_cap_mb: Option<u64>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -1100,6 +1127,7 @@ impl CloudRepoData {
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         }
     }
 }
@@ -1945,6 +1973,50 @@ mod tests {
     use super::*;
     use crate::services::type_sidecar::InferKind;
 
+    /// carrick#3083: peaks ride the wire as `memory_peaks`, an older blob
+    /// without the field reads `None`, and an unset field is absent, not null.
+    #[test]
+    fn memory_peaks_ride_the_wire_and_an_older_blob_reads_none() {
+        let mut repo = empty_repo("orders-service", None);
+        let bare = serde_json::to_value(&repo).unwrap();
+        assert!(bare.get("memory_peaks").is_none(), "unset is absent");
+        let older: CloudRepoData = serde_json::from_value(bare).unwrap();
+        assert_eq!(older.memory_peaks, None);
+
+        repo.memory_peaks = Some(MemoryPeaks {
+            analysis_mb: Some(412),
+            walk_mb: None,
+            heap_cap_mb: Some(12288),
+        });
+        let json = serde_json::to_value(&repo).unwrap();
+        assert_eq!(
+            json["memory_peaks"],
+            serde_json::json!({ "analysis_mb": 412, "heap_cap_mb": 12288 })
+        );
+        let back: CloudRepoData = serde_json::from_value(json).unwrap();
+        assert_eq!(back.memory_peaks, repo.memory_peaks);
+    }
+
+    /// A blob serialises identically whatever order its maps were filled in.
+    #[test]
+    fn a_blob_with_peaks_serialises_the_same_whatever_order_its_maps_fill() {
+        let build = |keys: [&str; 3]| {
+            let mut repo = empty_repo("orders-service", None);
+            repo.memory_peaks = Some(MemoryPeaks::default());
+            repo.last_updated = DateTime::UNIX_EPOCH;
+            for key in keys {
+                repo.apps.insert(
+                    key.to_string(),
+                    AppContext {
+                        name: key.to_string(),
+                    },
+                );
+            }
+            serde_json::to_string(&repo).unwrap()
+        };
+        assert_eq!(build(["a", "b", "c"]), build(["c", "a", "b"]));
+    }
+
     /// The cloud compares the stored row's scanner version against this field,
     /// so it has to survive the wire under exactly that name — and stay absent
     /// (not `null`) when unset, so a blob written by an older scanner still
@@ -2683,6 +2755,7 @@ mod tests {
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         }
     }
 

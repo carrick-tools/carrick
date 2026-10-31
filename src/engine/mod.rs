@@ -2694,6 +2694,11 @@ impl ServiceScan {
             .as_ref()
             .and_then(|walks| walks.get(index))
             .map(walk_lane::Walked::index);
+        let walk_peak_mb = self
+            .walks
+            .as_ref()
+            .and_then(|walks| walks.get(index))
+            .and_then(walk_lane::Walked::peak_mb);
 
         // A sidecar process of the service's own, scoped to its directory and
         // tsconfig, at the full heap cap. It is dropped, and its process
@@ -2776,9 +2781,19 @@ impl ServiceScan {
                 .unwrap_or_else(|| "unknown".to_string()),
             crate::scan_timing::files_of_current_service().unwrap_or(0),
         );
+        let analysis_peak_mb = sidecar
+            .as_ref()
+            .and_then(TypeSidecar::peak_resident_bytes)
+            .map(|bytes| bytes / (1024 * 1024));
         drop(sidecar);
 
         let mut data = analysis.data;
+        // What the next scan sizes this service's width by (carrick#3083).
+        data.memory_peaks = Some(crate::cloud_storage::MemoryPeaks {
+            analysis_mb: analysis_peak_mb,
+            walk_mb: walk_peak_mb,
+            heap_cap_mb: crate::services::type_sidecar::heap_cap_mb(),
+        });
         if data.bundled_types.is_some() {
             debug!(
                 "Type resolution ({}): {} bundled types, {} manifest entries",
@@ -8573,6 +8588,7 @@ fn build_cloud_data_from_mount_graph(
         possible_calls_omitted: None,
         call_through: None,
         route_boundaries: None,
+        memory_peaks: None,
     }
 }
 
@@ -13940,6 +13956,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         }
     }
 
@@ -14913,6 +14930,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         relativize_cloud_paths(
@@ -15133,6 +15151,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -15189,6 +15208,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         }];
 
         // Test Config merging
@@ -15290,6 +15310,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -16032,6 +16053,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -16093,6 +16115,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -16167,6 +16190,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 possible_calls_omitted: None,
                 call_through: None,
                 route_boundaries: None,
+                memory_peaks: None,
             }
         }
 
@@ -16250,6 +16274,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -16475,6 +16500,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -16627,6 +16653,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         attach_external_call_candidates(
@@ -16756,6 +16783,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         attach_external_call_candidates(
@@ -16879,6 +16907,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -28516,6 +28545,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
             call_through: None,
             route_boundaries: None,
+            memory_peaks: None,
         }
     }
 

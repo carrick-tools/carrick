@@ -103,6 +103,9 @@ impl StubStorage {
             .map(|blob| {
                 let mut blob = blob.clone();
                 blob.last_updated = chrono::DateTime::UNIX_EPOCH;
+                // Peaks are measured, so they differ from run to run at any
+                // width (carrick#3083).
+                blob.memory_peaks = None;
                 // The commit names the copy, and the copy with its services
                 // reversed is another tree.
                 blob.commit_hash = String::new();
@@ -299,6 +302,22 @@ fn assert_all_landed(storage: &StubStorage, what: &str, with_types: bool) {
         rows >= 10,
         "{what}: the scan must index the fixture's operations ({rows} rows)"
     );
+    // carrick#3083: every analysed service states what its sidecar held.
+    let cap = carrick::services::type_sidecar::heap_cap_mb();
+    for blob in &blobs {
+        let peaks = blob
+            .memory_peaks
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: {:?} carries no memory_peaks", blob.service_name));
+        // Without types there is no analysis sidecar to measure.
+        assert_eq!(
+            peaks.analysis_mb.unwrap_or(0) > 0,
+            with_types,
+            "{what}: {:?} analysis peak: {peaks:?}",
+            blob.service_name
+        );
+        assert_eq!(peaks.heap_cap_mb, cap, "{what}: {:?}", blob.service_name);
+    }
     if with_types {
         for blob in &blobs {
             assert!(

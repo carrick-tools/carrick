@@ -43,9 +43,17 @@ pub(super) struct Walked {
     rows: Option<Destination>,
     scan_root: PathBuf,
     label: String,
+    /// The walk's sidecar at its peak, in MB (carrick#3083). `None` when
+    /// nothing was walked, the walk failed, kept rows were reused, or the
+    /// platform could not say.
+    peak_mb: Option<u64>,
 }
 
 impl Walked {
+    pub(super) fn peak_mb(&self) -> Option<u64> {
+        self.peak_mb
+    }
+
     /// The service's rows for one pass of its analysis, read from the file
     /// its walk wrote. A walk that wrote none gives an index with no rows,
     /// every lookup in which is a hole.
@@ -142,6 +150,7 @@ pub(super) fn reuse(
         rows: Some(Destination::kept(kept)),
         scan_root,
         label,
+        peak_mb: None,
     })
 }
 
@@ -170,6 +179,7 @@ fn walk(
         rows: None,
         scan_root,
         label,
+        peak_mb: None,
     };
     let Some(out) = crate::position_rows::destination(
         &super::get_repository_name(&canonical),
@@ -190,15 +200,19 @@ fn walk(
         out: out.path(),
         service: &label,
     };
-    if let Err(error) = crate::position_rows::record_service_rows(recipe, &walk) {
-        debug!("Position rows for service {label} were not written: {error}");
-        return no_rows(scan_root, label);
-    }
+    let peak_mb = match crate::position_rows::record_service_rows(recipe, &walk) {
+        Ok((_, peak_mb)) => peak_mb,
+        Err(error) => {
+            debug!("Position rows for service {label} were not written: {error}");
+            return no_rows(scan_root, label);
+        }
+    };
     crate::position_rows::record_walked_at(out.path(), at);
     Walked {
         rows: Some(out),
         scan_root,
         label,
+        peak_mb,
     }
 }
 
