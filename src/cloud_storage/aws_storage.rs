@@ -1910,8 +1910,11 @@ impl AwsStorage {
     /// action and `403 wrong_key_kind`, leaves the service out; none is
     /// retried past what the transport already does for a 5xx.
     async fn read_type_reach(&self, stored: &[CloudRepoData]) -> HashMap<String, TypeReachRecord> {
+        // One repo per call, as the trait states: the first blob's.
+        let repo = stored.first().map(|data| data.repo_name.as_str());
         let named: HashMap<TypeReachKey, (&CloudRepoData, &TypeReachRef)> = stored
             .iter()
+            .filter(|data| Some(data.repo_name.as_str()) == repo)
             .filter_map(|data| {
                 let reference = data.type_reach.as_ref()?;
                 // The slug the cloud keys the object by and echoes back, so

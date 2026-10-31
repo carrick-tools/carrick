@@ -1538,6 +1538,10 @@ pub trait CloudStorage {
     /// its service id ([`type_reach::service_id`]), for a PR scan to read
     /// main's (carrick#3101, read by carrick#3102).
     ///
+    /// `stored` is ONE repo's blobs (the run's own main copy): the answer is
+    /// keyed by service alone, and the cloud read names one repo. A blob of
+    /// another repo than the first is not asked about.
+    ///
     /// Best-effort and never an error: a service whose record cannot be
     /// fetched, does not match the length and digest its blob names, or
     /// does not parse, is absent from the answer, and a PR scan re-types it
