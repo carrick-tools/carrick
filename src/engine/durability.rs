@@ -182,6 +182,9 @@ pub struct ServiceAnalysis {
     /// Its fallbacks, stated once the routes across services are written:
     /// `None` where they were stated already.
     pub fallbacks: Option<crate::fallback_tally::Pending>,
+    /// Its type-reach record, for the store to keep beside its blob
+    /// (carrick#3101). Never serialised into the blob.
+    pub type_reach: Option<crate::cloud_storage::TypeReachObject>,
 }
 
 /// The model work one service still owes once its analysis has run.

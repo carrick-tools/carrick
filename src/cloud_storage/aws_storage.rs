@@ -1,7 +1,8 @@
 use crate::agent_service::is_oidc_rejection;
 use crate::cloud_storage::{
-    CloudRepoData, CloudStorage, JobSubmission, RunContext, RunStart, StorageError, UnanalysedFile,
-    UploadOutcome,
+    CloudRepoData, CloudStorage, JobSubmission, RunContext, RunStart, StorageError,
+    TypeReachObject, TypeReachRecord, TypeReachRef, UnanalysedFile, UploadOutcome,
+    decode_type_reach,
 };
 use crate::credentials::CloudAuth;
 use crate::oidc::OidcProvider;
@@ -669,6 +670,53 @@ struct LambdaRequest {
     /// it ignores it.
     #[serde(skip_serializing_if = "Option::is_none")]
     declared_services: Option<Vec<Option<String>>>,
+    /// On check-or-upload only, and only for a service with a type-reach
+    /// record (carrick#3101): ask for a presigned PUT for it. A cloud before
+    /// carrick-cloud#2785 ignores it and answers no URL.
+    #[serde(rename = "wantsTypeReachUrl")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wants_type_reach_url: Option<bool>,
+    /// On the two write actions, and only after the record's PUT answered
+    /// 2xx: the lowercase-hex SHA-256 of the gzipped bytes PUT. The cloud
+    /// heads the object and stamps the blob's `type_reach` when it matches.
+    #[serde(rename = "typeReachSha256")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    type_reach_sha256: Option<String>,
+    /// The length of those same bytes, beside `typeReachSha256`.
+    #[serde(rename = "typeReachSize")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    type_reach_size: Option<u64>,
+}
+
+/// `get-type-reach` (carrick#3101): presigned GETs for the type-reach records
+/// of the services named, under the project `get-cross-repo-data` reads.
+#[derive(Serialize)]
+struct GetTypeReachRequest<'a> {
+    action: &'a str,
+    repo: &'a str,
+    services: Vec<TypeReachKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
+}
+
+/// One record, by the key its blob is stored under.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+struct TypeReachKey {
+    service: String,
+    hash: String,
+}
+
+#[derive(Deserialize)]
+struct GetTypeReachResponse {
+    #[serde(default)]
+    records: Vec<TypeReachUrl>,
+}
+
+#[derive(Deserialize)]
+struct TypeReachUrl {
+    service: String,
+    hash: String,
+    url: String,
 }
 
 /// `start-scan`: the first thing a laptop run does, before a single model
@@ -856,6 +904,12 @@ struct LambdaResponse {
     #[serde(rename = "payloadUploadUrl")]
     #[serde(default)]
     payload_upload_url: Option<String>,
+    /// Presigned PUT URL for the service's type-reach record (carrick#3101).
+    /// Only present when the request set `wantsTypeReachUrl` and the cloud
+    /// deployed carrick-cloud#2785.
+    #[serde(rename = "typeReachUploadUrl")]
+    #[serde(default)]
+    type_reach_upload_url: Option<String>,
     #[allow(dead_code)]
     hash: String,
     #[serde(default)]
@@ -1560,6 +1614,7 @@ impl AwsStorage {
         data: &CloudRepoData,
         s3_url: &str,
         staged: Option<&StagedPayload>,
+        type_reach: Option<&TypeReachRef>,
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
         let lost = self.unanalysed_files(data);
@@ -1585,6 +1640,9 @@ impl AwsStorage {
             scan_final: final_in_run.then_some(true),
             pending_services: self.pending_services_on(final_in_run),
             declared_services: self.declared_services(),
+            wants_type_reach_url: None,
+            type_reach_sha256: type_reach.map(|r| r.sha256.clone()),
+            type_reach_size: type_reach.map(|r| r.bytes),
         };
 
         let response: WriteActionResponse = self.call_lambda(&request).await?;
@@ -1801,6 +1859,124 @@ impl AwsStorage {
         );
         self.upload_to_s3_with_content_type(url, serialized.as_bytes(), "application/json")
             .await
+    }
+
+    /// PUT a service's type-reach record to the URL check-or-upload minted
+    /// for it, and answer what the write action names it by (carrick#3101).
+    ///
+    /// Best-effort: the index is stored either way. No URL means a cloud
+    /// before carrick-cloud#2785, which is an ordinary state, so it is said
+    /// at info. A PUT that fails is said at warn, and the write then names no
+    /// record, so the cloud stamps none.
+    async fn store_type_reach<'a>(
+        &self,
+        object: &'a TypeReachObject,
+        upload_url: Option<&str>,
+        data: &CloudRepoData,
+    ) -> Option<&'a TypeReachRef> {
+        let service = super::type_reach::service_id(data);
+        let Some(url) = upload_url else {
+            info!(
+                "The cloud offered no place for the type-reach record of {service}; storing \
+                 the index without it"
+            );
+            return None;
+        };
+        match self
+            .upload_to_s3_with_content_type(url, object.gz(), "application/gzip")
+            .await
+        {
+            Ok(()) => {
+                debug!(
+                    "Stored the type-reach record of {service} ({} bytes gzipped)",
+                    object.reference().bytes
+                );
+                Some(object.reference())
+            }
+            Err(e) => {
+                warn!(
+                    "Could not store the type-reach record of {service} ({e}); storing the \
+                     index without it"
+                );
+                None
+            }
+        }
+    }
+
+    /// Main's type-reach records for the services of `stored` whose blob
+    /// names one (carrick#3101). One `get-type-reach` for all of them, then
+    /// a GET per record, each checked against its blob's digest and length.
+    /// Any failure, including `404 unknown_action` from a cloud before the
+    /// action and `403 wrong_key_kind`, leaves the service out; none is
+    /// retried past what the transport already does for a 5xx.
+    async fn read_type_reach(&self, stored: &[CloudRepoData]) -> HashMap<String, TypeReachRecord> {
+        let named: HashMap<TypeReachKey, (&CloudRepoData, &TypeReachRef)> = stored
+            .iter()
+            .filter_map(|data| {
+                let reference = data.type_reach.as_ref()?;
+                // The slug the cloud keys the object by and echoes back, so
+                // the answer matches the ask whatever the service's spelling.
+                let key = TypeReachKey {
+                    service: indexed_service_slug(data.service_name.as_deref(), &data.repo_name),
+                    hash: data.commit_hash.clone(),
+                };
+                Some((key, (data, reference)))
+            })
+            .collect();
+        let mut records = HashMap::new();
+        let Some((first, _)) = named.values().next() else {
+            return records;
+        };
+        let mut services: Vec<TypeReachKey> = named.keys().cloned().collect();
+        services.sort_by(|a, b| (&a.service, &a.hash).cmp(&(&b.service, &b.hash)));
+        let request = GetTypeReachRequest {
+            action: "get-type-reach",
+            repo: &first.repo_name,
+            services,
+            project_id: self.project_id.get().cloned(),
+        };
+        let response: GetTypeReachResponse =
+            match self.call_lambda_generic(request.action, &request).await {
+                Ok(response) => response,
+                Err(e) => {
+                    info!("No type-reach records read ({e}); each service is typed whole");
+                    return records;
+                }
+            };
+        for entry in response.records {
+            let key = TypeReachKey {
+                service: entry.service,
+                hash: entry.hash,
+            };
+            let Some((data, reference)) = named.get(&key) else {
+                continue;
+            };
+            match self.fetch_type_reach(&entry.url, reference).await {
+                Some(record) => {
+                    records.insert(super::type_reach::service_id(data).to_string(), record);
+                }
+                None => info!(
+                    "The type-reach record of {} could not be read; it is typed whole",
+                    key.service
+                ),
+            }
+        }
+        records
+    }
+
+    /// One record from its presigned GET: plain request, no Authorization
+    /// header (the URL carries its own auth), then checked and parsed.
+    async fn fetch_type_reach(
+        &self,
+        url: &str,
+        reference: &TypeReachRef,
+    ) -> Option<TypeReachRecord> {
+        let response = self.http_client.get(url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bytes = response.bytes().await.ok()?;
+        decode_type_reach(&bytes, reference)
     }
 
     /// Hand over a dispatched scan's prompts: mint the URL, PUT the object,
@@ -2043,6 +2219,20 @@ impl CloudStorage for AwsStorage {
         data: &CloudRepoData,
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
+        self.upload_repo_data_with_reach(data, None, final_in_run)
+            .await
+    }
+
+    /// The record rides the same three steps as the blob (carrick#3101):
+    /// check-or-upload asks for its URL, the bytes are PUT, and the write
+    /// action names them. The cloud stamps the blob's `type_reach` itself,
+    /// after heading the object, so this side never sets it.
+    async fn upload_repo_data_with_reach(
+        &self,
+        data: &CloudRepoData,
+        type_reach: Option<&TypeReachObject>,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
         // Everything below — the action bodies' `repo`, the inline
         // `cloudRepoData`, the staged payload's bytes — names the repository
         // from this one blob, so the substitution happens once, here.
@@ -2092,6 +2282,9 @@ impl CloudStorage for AwsStorage {
             scan_final: None,
             pending_services: None,
             declared_services: None,
+            wants_type_reach_url: type_reach.is_some().then_some(true),
+            type_reach_sha256: None,
+            type_reach_size: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&check_request).await?;
@@ -2104,6 +2297,19 @@ impl CloudStorage for AwsStorage {
             )
             .await?;
         }
+
+        // Named on the write only once its bytes are stored.
+        let stored_reach = match type_reach {
+            Some(object) => {
+                self.store_type_reach(
+                    object,
+                    lambda_response.type_reach_upload_url.as_deref(),
+                    data,
+                )
+                .await
+            }
+            None => None,
+        };
 
         // Step 2: Upload type file if needed
         if let Some(upload_url) = lambda_response.upload_url {
@@ -2135,6 +2341,9 @@ impl CloudStorage for AwsStorage {
                     scan_final: final_in_run.then_some(true),
                     pending_services: self.pending_services_on(final_in_run),
                     declared_services: self.declared_services(),
+                    wants_type_reach_url: None,
+                    type_reach_sha256: stored_reach.map(|r| r.sha256.clone()),
+                    type_reach_size: stored_reach.map(|r| r.bytes),
                 };
 
                 let complete_response: WriteActionResponse =
@@ -2151,15 +2360,29 @@ impl CloudStorage for AwsStorage {
                     data,
                     &lambda_response.s3_url,
                     staged.as_ref(),
+                    stored_reach,
                     final_in_run,
                 )
                 .await
             }
         } else {
             debug!("Type file already exists, just updating metadata");
-            self.store_repo_metadata(data, &lambda_response.s3_url, staged.as_ref(), final_in_run)
-                .await
+            self.store_repo_metadata(
+                data,
+                &lambda_response.s3_url,
+                staged.as_ref(),
+                stored_reach,
+                final_in_run,
+            )
+            .await
         }
+    }
+
+    async fn type_reach_records(
+        &self,
+        stored: &[CloudRepoData],
+    ) -> HashMap<String, TypeReachRecord> {
+        self.read_type_reach(stored).await
     }
 
     async fn upload_type_file(
@@ -2193,6 +2416,9 @@ impl CloudStorage for AwsStorage {
             scan_final: None,
             pending_services: None,
             declared_services: None,
+            wants_type_reach_url: None,
+            type_reach_sha256: None,
+            type_reach_size: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
@@ -2295,6 +2521,7 @@ impl CloudStorage for AwsStorage {
                     call_through: None,
                     route_boundaries: None,
                     memory_peaks: None,
+                    type_reach: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);
@@ -2625,6 +2852,9 @@ impl CloudStorage for AwsStorage {
             scan_final: None,
             pending_services: None,
             declared_services: None,
+            wants_type_reach_url: None,
+            type_reach_sha256: None,
+            type_reach_size: None,
         };
 
         match self.call_lambda::<LambdaResponse>(&request).await {
@@ -2870,6 +3100,9 @@ mod tests {
             scan_final: None,
             pending_services: None,
             declared_services: None,
+            wants_type_reach_url: None,
+            type_reach_sha256: None,
+            type_reach_size: None,
         };
         let json = serde_json::to_string(&bare).unwrap();
         assert!(!json.contains("wantsPayloadUrl"));
@@ -2972,6 +3205,9 @@ mod tests {
             scan_final: None,
             pending_services: None,
             declared_services: None,
+            wants_type_reach_url: None,
+            type_reach_sha256: None,
+            type_reach_size: None,
         };
         let json = serde_json::to_string(&inline).unwrap();
         assert!(!json.contains("payloadSha256"));
@@ -3018,6 +3254,9 @@ mod tests {
             scan_final: None,
             pending_services: None,
             declared_services: None,
+            wants_type_reach_url: None,
+            type_reach_sha256: None,
+            type_reach_size: None,
         };
         let json = serde_json::to_string(&cached).unwrap();
         assert!(
@@ -3616,6 +3855,9 @@ mod tests {
             scan_final: None,
             pending_services: None,
             declared_services: None,
+            wants_type_reach_url: None,
+            type_reach_sha256: None,
+            type_reach_size: None,
         };
         let json = serde_json::to_string(&ci).unwrap();
         for field in [
@@ -3726,6 +3968,9 @@ mod tests {
             scan_final: Some(true),
             pending_services: Some(vec!["api".to_string()]),
             declared_services: None,
+            wants_type_reach_url: None,
+            type_reach_sha256: None,
+            type_reach_size: None,
         })
         .unwrap()
     }
@@ -5954,5 +6199,264 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("a_source_from_a_later_release"), "{error}");
+    }
+
+    // carrick#3101: the type-reach record rides check-or-upload, a presigned
+    // PUT and the write action, and is read back through `get-type-reach`.
+
+    fn reach_object() -> TypeReachObject {
+        TypeReachObject::encode(&serde_json::json!({
+            "version": 1,
+            "scanner_build": null,
+            "graph": { "version": 1, "strings": ["src/a.ts"], "files": [] },
+            "aliases": { "Endpoint_Response": ["src/a.ts"] }
+        }))
+        .unwrap()
+    }
+
+    fn storage_at(base: &str) -> AwsStorage {
+        AwsStorage::for_test(
+            &format!("{base}/types/check-or-upload"),
+            CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+            false,
+        )
+    }
+
+    /// check-or-upload's answer, offering `reach_url` for the record.
+    fn check_offering(reach_url: Option<&str>) -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "exists": true, "s3Url": "s3://bucket/api.json",
+                "uploadUrl": null, "hash": "4f2a1c9", "multiService": true,
+                "typeReachUploadUrl": reach_url
+            })
+            .to_string(),
+        )
+    }
+
+    fn write_ok() -> (u16, String) {
+        (200, serde_json::json!({ "success": true }).to_string())
+    }
+
+    /// A one-shot server answering one request with `status` and raw `body`
+    /// bytes, as S3 answers a presigned GET.
+    fn byte_server(status: u16, body: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = crate::agent_service::tests::read_stub_request(&mut stream);
+            let head = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn a_record_is_asked_for_put_and_named_on_the_write() {
+        let object = reach_object();
+        let (s3, s3_server) = crate::agent_service::tests::stub_server(vec![(200, String::new())]);
+        let put_url = format!("{s3}/reach-object");
+        let (base, server) = crate::agent_service::tests::stub_server(vec![
+            check_offering(Some(&put_url)),
+            write_ok(),
+        ]);
+        storage_at(&base)
+            .upload_repo_data_with_reach(&blob(), Some(&object), true)
+            .await
+            .unwrap();
+
+        let requests = server.join().unwrap();
+        let check = body_of(&requests[0]);
+        assert_eq!(check["action"], "check-or-upload");
+        assert_eq!(check["wantsTypeReachUrl"], true);
+        let put = &s3_server.join().unwrap()[0];
+        assert!(put.starts_with("PUT /reach-object"), "{put}");
+        assert!(has_header(put, "content-type", "application/gzip"), "{put}");
+        assert!(!has_header(put, "authorization", ""), "{put}");
+        let write = body_of(&requests[1]);
+        assert_eq!(write["action"], "store-metadata");
+        assert_eq!(write["typeReachSha256"], object.reference().sha256);
+        assert_eq!(write["typeReachSize"], object.reference().bytes);
+        // The cloud stamps the blob; this side never does.
+        assert!(
+            write["cloudRepoData"].get("type_reach").is_none(),
+            "{write}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_without_a_record_asks_for_no_url_and_names_none() {
+        let (base, server) =
+            crate::agent_service::tests::stub_server(vec![check_offering(None), write_ok()]);
+        storage_at(&base)
+            .upload_repo_data_with_reach(&blob(), None, true)
+            .await
+            .unwrap();
+        let requests = server.join().unwrap();
+        let check = body_of(&requests[0]);
+        assert!(check.get("wantsTypeReachUrl").is_none(), "{check}");
+        let write = body_of(&requests[1]);
+        assert!(write.get("typeReachSha256").is_none(), "{write}");
+        assert!(write.get("typeReachSize").is_none(), "{write}");
+    }
+
+    /// A cloud before carrick-cloud#2785 offers no URL: the index is stored
+    /// and the record is not.
+    #[tokio::test]
+    async fn a_cloud_that_offers_no_url_stores_the_index_without_the_record() {
+        let object = reach_object();
+        let (base, server) =
+            crate::agent_service::tests::stub_server(vec![check_offering(None), write_ok()]);
+        storage_at(&base)
+            .upload_repo_data_with_reach(&blob(), Some(&object), true)
+            .await
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let write = body_of(&requests[1]);
+        assert!(write.get("typeReachSha256").is_none(), "{write}");
+        assert!(write.get("typeReachSize").is_none(), "{write}");
+    }
+
+    /// The digest rides the write only after a 2xx PUT.
+    #[tokio::test]
+    async fn a_refused_put_names_no_record_on_the_write() {
+        let object = reach_object();
+        let (s3, s3_server) =
+            crate::agent_service::tests::stub_server(vec![(403, "AccessDenied".to_string())]);
+        let put_url = format!("{s3}/reach-object");
+        let (base, server) = crate::agent_service::tests::stub_server(vec![
+            check_offering(Some(&put_url)),
+            write_ok(),
+        ]);
+        storage_at(&base)
+            .upload_repo_data_with_reach(&blob(), Some(&object), true)
+            .await
+            .unwrap();
+        assert_eq!(s3_server.join().unwrap().len(), 1);
+        let write = body_of(&server.join().unwrap()[1]);
+        assert!(write.get("typeReachSha256").is_none(), "{write}");
+        assert!(write.get("typeReachSize").is_none(), "{write}");
+    }
+
+    fn blob_naming(object: &TypeReachObject) -> CloudRepoData {
+        let mut data = blob();
+        data.type_reach = Some(object.reference().clone());
+        data
+    }
+
+    #[tokio::test]
+    async fn no_blob_naming_a_record_reads_nothing() {
+        let (base, server) = crate::agent_service::tests::stub_server(vec![]);
+        let records = storage_at(&base).type_reach_records(&[blob()]).await;
+        assert!(records.is_empty());
+        assert!(server.join().unwrap().is_empty(), "nothing is asked");
+    }
+
+    #[tokio::test]
+    async fn a_named_record_is_read_and_checked() {
+        let object = reach_object();
+        let (s3, s3_server) = byte_server(200, object.gz().to_vec());
+        let (base, server) = crate::agent_service::tests::stub_server(vec![(
+            200,
+            serde_json::json!({ "records": [
+                { "service": "api", "hash": "4f2a1c9", "url": format!("{s3}/reach-get") }
+            ] })
+            .to_string(),
+        )]);
+        let records = storage_at(&base)
+            .type_reach_records(&[blob_naming(&object)])
+            .await;
+        let ask = body_of(&server.join().unwrap()[0]);
+        assert_eq!(ask["action"], "get-type-reach");
+        assert_eq!(ask["repo"], "api");
+        assert_eq!(
+            ask["services"],
+            serde_json::json!([{ "service": "api", "hash": "4f2a1c9" }])
+        );
+        let get = s3_server.join().unwrap();
+        assert!(get.starts_with("GET /reach-get"), "{get}");
+        assert!(!has_header(&get, "authorization", ""), "{get}");
+        assert_eq!(
+            records.get("api").map(|record| &record.aliases),
+            Some(&std::collections::BTreeMap::from([(
+                "Endpoint_Response".to_string(),
+                vec!["src/a.ts".to_string()]
+            )]))
+        );
+    }
+
+    /// The cloud keys and echoes a service by its slug; the answer is keyed
+    /// by the blob's own service name.
+    #[tokio::test]
+    async fn a_service_is_asked_for_by_its_slug_and_answered_by_its_name() {
+        let object = reach_object();
+        let (s3, s3_server) = byte_server(200, object.gz().to_vec());
+        let (base, server) = crate::agent_service::tests::stub_server(vec![(
+            200,
+            serde_json::json!({ "records": [
+                { "service": "orders-api", "hash": "4f2a1c9", "url": format!("{s3}/reach-get") }
+            ] })
+            .to_string(),
+        )]);
+        let mut data = blob_naming(&object);
+        data.service_name = Some("Orders_API".to_string());
+        let records = storage_at(&base).type_reach_records(&[data]).await;
+        let ask = body_of(&server.join().unwrap()[0]);
+        assert_eq!(ask["services"][0]["service"], "orders-api");
+        s3_server.join().unwrap();
+        assert!(records.contains_key("Orders_API"), "{:?}", records.keys());
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_bytes_do_not_match_its_blob_reads_as_none() {
+        let object = reach_object();
+        let other = TypeReachObject::encode(&serde_json::json!({
+            "version": 1, "scanner_build": null, "graph": {}, "aliases": {}
+        }))
+        .unwrap();
+        let (s3, s3_server) = byte_server(200, other.gz().to_vec());
+        let (base, server) = crate::agent_service::tests::stub_server(vec![(
+            200,
+            serde_json::json!({ "records": [
+                { "service": "api", "hash": "4f2a1c9", "url": format!("{s3}/reach-get") }
+            ] })
+            .to_string(),
+        )]);
+        let records = storage_at(&base)
+            .type_reach_records(&[blob_naming(&object)])
+            .await;
+        server.join().unwrap();
+        s3_server.join().unwrap();
+        assert!(records.is_empty());
+    }
+
+    /// A cloud before the action answers `404 unknown_action`; one with a key
+    /// that may not read it, `403 wrong_key_kind`. Both read as no record,
+    /// asked once.
+    #[tokio::test]
+    async fn a_cloud_that_refuses_the_read_has_no_records_and_is_asked_once() {
+        let object = reach_object();
+        for (status, code) in [(404, "unknown_action"), (403, "wrong_key_kind")] {
+            let (base, server) = crate::agent_service::tests::stub_server(vec![(
+                status,
+                serde_json::json!({ "error": code, "code": code }).to_string(),
+            )]);
+            let records = storage_at(&base)
+                .type_reach_records(&[blob_naming(&object)])
+                .await;
+            assert!(records.is_empty(), "{code}");
+            assert_eq!(server.join().unwrap().len(), 1, "{code} was retried");
+        }
     }
 }

@@ -1,4 +1,7 @@
-use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
+use crate::cloud_storage::{
+    CloudRepoData, CloudStorage, StorageError, TypeReachObject, TypeReachRecord, UploadOutcome,
+    decode_type_reach, type_reach,
+};
 use crate::packages::{PackageJson, Packages};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -9,6 +12,18 @@ use tracing::debug;
 
 /// `(repo, stage, reason)`, as one pre-scan failure was reported.
 type PreflightFailure = (Option<String>, String, String);
+
+/// `(repo, service, commit)`: where a stored type-reach object sits, beside
+/// the blob of the same key, as the cloud keys it under the blob's prefix.
+type ReachKey = (String, Option<String>, String);
+
+fn reach_key(data: &CloudRepoData) -> ReachKey {
+    (
+        data.repo_name.clone(),
+        data.service_name.clone(),
+        data.commit_hash.clone(),
+    )
+}
 
 pub struct MockStorage {
     data: Mutex<Vec<CloudRepoData>>,
@@ -21,6 +36,8 @@ pub struct MockStorage {
     preflight_failures: Mutex<Vec<PreflightFailure>>,
     /// Every run log this storage was handed, as the redaction left it.
     logs: Mutex<Vec<String>>,
+    /// The type-reach objects written beside the blobs (carrick#3101).
+    type_reach: Mutex<HashMap<ReachKey, Vec<u8>>>,
 }
 
 impl Default for MockStorage {
@@ -37,6 +54,7 @@ impl MockStorage {
             scan_failures: Mutex::new(Vec::new()),
             preflight_failures: Mutex::new(Vec::new()),
             logs: Mutex::new(Vec::new()),
+            type_reach: Mutex::new(HashMap::new()),
         }
     }
 
@@ -75,6 +93,41 @@ impl CloudStorage for MockStorage {
         // The mock always stores what it is given — it has no freshness check
         // to short-circuit on, and no meter behind it to report a spend from.
         Ok(UploadOutcome::default())
+    }
+
+    /// Writes the object, then stamps the blob with what it wrote, so the
+    /// blob names only an object this store holds (carrick#3101).
+    async fn upload_repo_data_with_reach(
+        &self,
+        data: &CloudRepoData,
+        type_reach: Option<&TypeReachObject>,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
+        let Some(object) = type_reach else {
+            return self.upload_repo_data(data, final_in_run).await;
+        };
+        self.type_reach
+            .lock()
+            .unwrap()
+            .insert(reach_key(data), object.gz().to_vec());
+        let mut stamped = data.clone();
+        stamped.type_reach = Some(object.reference().clone());
+        self.upload_repo_data(&stamped, final_in_run).await
+    }
+
+    async fn type_reach_records(
+        &self,
+        stored: &[CloudRepoData],
+    ) -> HashMap<String, TypeReachRecord> {
+        let objects = self.type_reach.lock().unwrap();
+        stored
+            .iter()
+            .filter_map(|data| {
+                let reference = data.type_reach.as_ref()?;
+                let record = decode_type_reach(objects.get(&reach_key(data))?, reference)?;
+                Some((type_reach::service_id(data).to_string(), record))
+            })
+            .collect()
     }
 
     /// What the in-memory store holds, answered from the store itself: an
@@ -191,6 +244,7 @@ impl CloudStorage for MockStorage {
                     call_through: None,
                     route_boundaries: None,
                     memory_peaks: None,
+                    type_reach: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -233,6 +287,7 @@ impl CloudStorage for MockStorage {
                     call_through: None,
                     route_boundaries: None,
                     memory_peaks: None,
+                    type_reach: None,
                 },
             ];
             result.extend(mock_repos);

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::cloud_storage::{
     AwsStorage, CloudRepoData, CloudStorage, LocalDirStorage, RunContext, RunStart, StorageError,
-    UploadOutcome,
+    TypeReachObject, TypeReachRecord, UploadOutcome,
 };
 
 /// Set to `1` alongside `CARRICK_LOCAL_STORAGE_DIR` to make a local-index scan
@@ -76,7 +76,20 @@ impl CloudStorage for TeeStorage {
         data: &CloudRepoData,
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
-        self.local.upload_repo_data(data, final_in_run).await?;
+        self.upload_repo_data_with_reach(data, None, final_in_run)
+            .await
+    }
+
+    /// Both halves keep the record beside their own blob (carrick#3101).
+    async fn upload_repo_data_with_reach(
+        &self,
+        data: &CloudRepoData,
+        type_reach: Option<&TypeReachObject>,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
+        self.local
+            .upload_repo_data_with_reach(data, type_reach, final_in_run)
+            .await?;
         // A resume finishing at an older commit than the one the cloud already
         // serves writes the local half and stops there (carrick#1229). Local
         // first and cloud never, rather than "do not upload": the read model
@@ -103,7 +116,19 @@ impl CloudStorage for TeeStorage {
             }
             return Ok(UploadOutcome::default());
         }
-        self.cloud.upload_repo_data(data, final_in_run).await
+        self.cloud
+            .upload_repo_data_with_reach(data, type_reach, final_in_run)
+            .await
+    }
+
+    /// The LOCAL side, as the cross-repo read below: the blobs this run
+    /// reads are the local copies, and each names the object written beside
+    /// it.
+    async fn type_reach_records(
+        &self,
+        stored: &[CloudRepoData],
+    ) -> HashMap<String, TypeReachRecord> {
+        self.local.type_reach_records(stored).await
     }
 
     async fn begin_run(&self, run: &RunContext) -> Result<RunStart, StorageError> {

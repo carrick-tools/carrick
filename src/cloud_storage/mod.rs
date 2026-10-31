@@ -31,6 +31,11 @@ mod tee_storage;
 pub(crate) use local_dir_storage::blob_stem;
 pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage, PEERS_ENV};
 pub use tee_storage::{LAPTOP_SCAN_ENV, TeeStorage, laptop_scan_requested};
+mod type_reach;
+pub use type_reach::{
+    TYPE_REACH_CAP_BYTES, TYPE_REACH_RECORD_VERSION, TypeReachObject, TypeReachRecord,
+    TypeReachRef, decode_type_reach,
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -914,6 +919,17 @@ pub struct CloudRepoData {
     /// a compare of two blobs drops it as it drops `last_updated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_peaks: Option<MemoryPeaks>,
+    /// The service's type-reach record, stored as its own object beside this
+    /// blob (carrick#3101): the gzipped object's digest and length.
+    ///
+    /// Set by the store, never by the scan: the cloud stamps it after it has
+    /// checked the object it holds (carrick-cloud#2785), and the local
+    /// stores after they wrote it. So a blob never names a record its store
+    /// does not hold. A struct, not an enum, because [`read_peer_blob`]
+    /// refuses an enum value it does not know. Not part of `CACHE_VERSION`;
+    /// a blob without it makes a PR scan re-type the service whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_reach: Option<TypeReachRef>,
 }
 
 /// The measured memory peaks of one service's analysis (carrick#3083), in MB.
@@ -1128,6 +1144,7 @@ impl CloudRepoData {
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         }
     }
 }
@@ -1497,6 +1514,41 @@ pub trait CloudStorage {
         data: &CloudRepoData,
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError>;
+
+    /// Upload one service's payload with its type-reach record beside it
+    /// (carrick#3101), in the same write: the cloud stamps the blob's
+    /// `type_reach` only on the write that names the object it checked.
+    ///
+    /// The record is best-effort. A store that cannot keep it, or a cloud
+    /// that offers no place for it, stores the blob without it, and a PR
+    /// scan then re-types that service whole. The engine calls this for
+    /// every write; the default stores the blob alone, which is what a test
+    /// store that does not model records wants. A store that keeps records
+    /// overrides it, and one that wraps another forwards it.
+    async fn upload_repo_data_with_reach(
+        &self,
+        data: &CloudRepoData,
+        _type_reach: Option<&TypeReachObject>,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
+        self.upload_repo_data(data, final_in_run).await
+    }
+
+    /// The type-reach record of each of `stored` that names one, keyed by
+    /// its service id ([`type_reach::service_id`]), for a PR scan to read
+    /// main's (carrick#3101, read by carrick#3102).
+    ///
+    /// Best-effort and never an error: a service whose record cannot be
+    /// fetched, does not match the length and digest its blob names, or
+    /// does not parse, is absent from the answer, and a PR scan re-types it
+    /// whole. A blob without `type_reach` is never asked about, so when no
+    /// blob names a record nothing is read. The default holds none.
+    async fn type_reach_records(
+        &self,
+        _stored: &[CloudRepoData],
+    ) -> HashMap<String, TypeReachRecord> {
+        HashMap::new()
+    }
 
     /// Whether THIS run's write of this payload reached the stored index — the
     /// question a [`StorageError::UncertainWrite`] leaves open (carrick#1067).
@@ -2756,6 +2808,7 @@ mod tests {
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         }
     }
 

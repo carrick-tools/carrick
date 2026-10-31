@@ -276,6 +276,7 @@ mod tests {
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            type_reach: None,
         };
         for (i, d) in defs.into_iter().enumerate() {
             data.function_definitions
