@@ -108,7 +108,7 @@ jobs:
           - shard: n7
             runner: nextest
             targets: >-
-              --test paired_method_url_test --test prompt_determinism_test --test own_route_calls_test --test dispatch_file_route_test --test unanchored_route_rows_test --test graphql_schema_identity_test --test sidecar_program_files_test --test inline_registration_scope_test --test socket_generic_test --test socket_origin_test --test dependency_analysis_test
+              --test paired_method_url_test --test prompt_determinism_test --test own_route_calls_test --test dispatch_file_route_test --test unanchored_route_rows_test --test graphql_schema_identity_test --test sidecar_program_files_test --test sidecar_reach_test --test inline_registration_scope_test --test socket_generic_test --test socket_origin_test --test dependency_analysis_test
           - shard: n8
             runner: nextest
             targets: >-

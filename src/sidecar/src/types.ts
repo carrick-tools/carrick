@@ -330,6 +330,51 @@ export interface ListProgramFilesRequest extends BaseRequest {
 }
 
 /**
+ * The import graph without statement texts. Every name and path is an index
+ * into `strings`. Per file: its path, whether it is a script, its declared
+ * names, the identifiers each declared name mentions that can matter (a
+ * binding, a whole-module local or one of the file's own declared names), the
+ * same for each loose statement, its exports, its export targets, its
+ * bindings (local, imported name or -1, origin file and name pairs), its
+ * whole-module locals, and its stems (target file or -1, locals, stems).
+ */
+export interface SerialGraph {
+  version: 1;
+  strings: string[];
+  files: Array<{
+    p: number;
+    g: 0 | 1;
+    d: number[];
+    r: number[][];
+    l: number[][];
+    e: number[];
+    t: number[][];
+    b: Array<[number, number, number[]]>;
+    w: number[];
+    s: Array<[number, number[], number[]]>;
+  }>;
+}
+
+/**
+ * The import graph of every program the process has built, without statement
+ * texts (carrick#3100). Builds the default program when none is built.
+ */
+export interface ReachGraphRequest extends BaseRequest {
+  action: 'reach_graph';
+}
+
+/**
+ * The files a set of edits can reach in a graph `reach_graph` wrote
+ * (carrick#3100). Needs no program and no `init`. Paths are relative to the
+ * scan root; a missing side of an added or deleted file is `''`.
+ */
+export interface ReachRequest extends BaseRequest {
+  action: 'reach';
+  graph: SerialGraph;
+  changes: Array<{ file: string; before: string; after: string }>;
+}
+
+/**
  * Add files to the programs that type them, in the given order
  * (carrick#2027).
  */
@@ -838,6 +883,8 @@ export type SidecarRequest =
   | HealthRequest
   | ShutdownRequest
   | ListProgramFilesRequest
+  | ReachGraphRequest
+  | ReachRequest
   | AddProgramFilesRequest
   | PositionRowsRequest
   | ImplementationsRequest;
@@ -1093,6 +1140,29 @@ export interface PositionRowsCounts {
 export interface ListProgramFilesResponse extends BaseResponse {
   /** The program's root files, as absolute paths, in order. */
   files?: string[];
+  errors?: string[];
+}
+
+/**
+ * Response for reach_graph action
+ */
+export interface ReachGraphResponse extends BaseResponse {
+  version?: 1;
+  graph?: SerialGraph;
+  errors?: string[];
+}
+
+/**
+ * Response for reach action. `reached` is `'all'` for an installed file, a
+ * file that is not source, or a `.json` file. `augmented` lists the changed
+ * files that hold a script, global declaration or module augmentation, or read
+ * a changed name of one: the caller widens each to every file of the programs
+ * that hold it.
+ */
+export interface ReachResponse extends BaseResponse {
+  reached?: string[] | 'all';
+  augmented?: string[];
+  exports_moved?: boolean;
   errors?: string[];
 }
 
@@ -1426,6 +1496,8 @@ export type SidecarResponse =
   | HealthResponse
   | ShutdownResponse
   | ListProgramFilesResponse
+  | ReachGraphResponse
+  | ReachResponse
   | AddProgramFilesResponse
   | PositionRowsResponse
   | ImplementationsResponse
