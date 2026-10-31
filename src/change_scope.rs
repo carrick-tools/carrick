@@ -197,26 +197,110 @@ impl CouldBe {
     }
 }
 
+/// Says whether an edited test source still loads what it loaded, and
+/// declares nothing program-wide ([`test_edit_keeps_imports`]).
+type KeepsImports<'a> = &'a mut dyn FnMut(&ChangedPath) -> bool;
+
 impl ServiceInputs {
     /// Whether `change` touches an input of this service that is not under
     /// one of its roots.
-    fn reads_outside_roots(&self, change: &ChangedPath) -> bool {
+    fn reads_outside_roots(&self, change: &ChangedPath, keeps_imports: KeepsImports) -> bool {
         let in_root = self.roots.iter().any(|root| {
             under(&change.path, &root.dir)
                 && !root.left_out.iter().any(|dir| under(&change.path, dir))
         });
-        !in_root && self.reads(change)
+        !in_root && self.reads(change, keeps_imports)
     }
 
-    fn reads(&self, change: &ChangedPath) -> bool {
+    /// Whether `change` touches an input of this service (carrick#3114).
+    ///
+    /// Under a root or a directory read whole, only a file some pass reads
+    /// counts ([`read_by_input_rule`]), and a test source counts unless it was
+    /// edited and still loads what it loaded. An exact closure file, and an
+    /// add or delete beside one, always count.
+    fn reads(&self, change: &ChangedPath, keeps_imports: KeepsImports) -> bool {
         let path = change.path.as_str();
-        let in_root = self.roots.iter().any(|root| {
-            under(path, &root.dir) && !root.left_out.iter().any(|dir| under(path, dir))
-        });
-        in_root
-            || self.files.contains(path)
-            || self.dirs.iter().any(|dir| under(path, dir))
+        if self.files.contains(path)
             || (change.adds_or_deletes() && self.lookup_dirs.contains(parent_of(path)))
+        {
+            return true;
+        }
+        let roots = self
+            .roots
+            .iter()
+            .filter(|root| {
+                under(path, &root.dir) && !root.left_out.iter().any(|dir| under(path, dir))
+            })
+            .map(|root| root.dir.as_str());
+        let dirs = self
+            .dirs
+            .iter()
+            .filter(|dir| under(path, dir))
+            .map(String::as_str);
+        let bases: Vec<&str> = roots.chain(dirs).collect();
+        if bases.is_empty() || !read_by_input_rule(path) {
+            return false;
+        }
+        let is_test =
+            |base: &&str| crate::file_finder::is_test_source(Path::new(path), Path::new(base));
+        if bases.iter().all(is_test) {
+            return !(change.status == 'M' && keeps_imports(change));
+        }
+        true
+    }
+}
+
+/// Whether a scan reads `path` under the published input rule
+/// (`carrickInputs`, [`INPUT_RULE`] 1): a repo-input or deploy-config name, a
+/// source, GraphQL or config extension, or no extension. The one statement of
+/// the rule in Rust; `the_published_rule_reads_what_the_scanner_reads` holds it
+/// to the published field. Tests count as read here, as the rule says.
+pub fn read_by_input_rule(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    let extension = name
+        .rsplit_once('.')
+        .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+        .map(|(_, ext)| ext);
+    let named = REPO_INPUT_NAMES
+        .iter()
+        .chain(&crate::service_derivation::DEPLOY_CONFIG)
+        .any(|known| known.to_lowercase() == name);
+    let by_extension = extension.is_some_and(|ext| {
+        crate::file_finder::is_source_extension(ext)
+            || REPO_INPUT_EXTENSIONS.contains(&ext)
+            || CONFIG_EXTENSIONS.contains(&ext)
+    });
+    named || by_extension || extension.is_none()
+}
+
+/// Whether an edit to the test source at `path` left its module edges alone:
+/// both copies parse as modules, neither augments types program-wide, and both
+/// load the same specifiers (carrick#3114). The receiver trace reads which
+/// files only tests import, and the type program loads augmentations and
+/// scripts from tests, so only an edit that moves neither is skippable. A copy
+/// that cannot be read says no.
+fn test_edit_keeps_imports(
+    reads: &ClosureReads,
+    path: &str,
+    before: Option<String>,
+    after: Option<String>,
+) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
+    };
+    let file = Path::new(path);
+    let mut reader = reads.reader.borrow_mut();
+    let before = reader.module_shape_of_text(file, "before", before);
+    let after = reader.module_shape_of_text(file, "after", after);
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            before.is_module
+                && after.is_module
+                && !before.augments_types
+                && !after.augments_types
+                && before.reach == after.reach
+        }
+        _ => false,
     }
 }
 
@@ -454,6 +538,9 @@ pub fn is_repo_input(path: &str) -> bool {
 /// `gitignore_moves` says whether an edit to a `.gitignore` can move what the
 /// service reads ([`gitignore_moves`]); a `.gitignore` is judged by it alone,
 /// not as a repo input or a path under a root (carrick#3113).
+/// `keeps_imports` says whether an edited test source still loads what it
+/// loaded ([`test_edit_keeps_imports`]); it is asked only of a modified test
+/// source the service reads by a root or a directory (carrick#3114).
 ///
 /// A run that carries under that rule and uploads would write a stored
 /// manifest projection (`packages`, `package_json`, `package_json_hash`)
@@ -473,6 +560,7 @@ pub fn decide(
     changed: Result<&[ChangedPath], &str>,
     mut version_only: impl FnMut(&ChangedPath) -> bool,
     mut gitignore_moves: impl FnMut(&str, &ServiceInputs) -> bool,
+    mut keeps_imports: impl FnMut(&ChangedPath) -> bool,
     inputs: impl FnOnce() -> ServiceInputs,
 ) -> Scope {
     let Some(stored) = stored else {
@@ -577,9 +665,9 @@ pub fn decide(
     }
     if let Some((change, _)) = others.iter().zip(&version_only).find(|(change, only)| {
         if **only {
-            inputs.reads_outside_roots(change)
+            inputs.reads_outside_roots(change, &mut keeps_imports)
         } else {
-            inputs.reads(change)
+            inputs.reads(change, &mut keeps_imports)
         }
     }) {
         return Scope::analysed(Reason::InputsChanged, change.path.clone());
@@ -685,6 +773,7 @@ pub fn plan<'a>(
     // Listed once, and only when a `.gitignore` changed (carrick#3113).
     let untracked: std::cell::OnceCell<Option<Vec<String>>> = std::cell::OnceCell::new();
     let mut stops: HashMap<PathBuf, bool> = HashMap::new();
+    let mut keeps_imports_of: HashMap<(String, String), bool> = HashMap::new();
     let mut changed_by_commit: HashMap<String, Result<Vec<ChangedPath>, String>> = HashMap::new();
     let mut closure_took = std::time::Duration::ZERO;
     let mut walked = 0usize;
@@ -725,6 +814,25 @@ pub fn plan<'a>(
                         manifest_moves_only_version(repo_path, top, &blob.commit_hash, change)
                     })
             };
+            let keeps_imports = |change: &ChangedPath| {
+                let (Some(blob), Some(top)) = (stored, &top) else {
+                    return false;
+                };
+                *keeps_imports_of
+                    .entry((blob.commit_hash.clone(), change.path.clone()))
+                    .or_insert_with(|| {
+                        test_edit_keeps_imports(
+                            &reads,
+                            &change.path,
+                            crate::git_state::file_at_commit(
+                                repo_path,
+                                &blob.commit_hash,
+                                &change.path,
+                            ),
+                            std::fs::read_to_string(top.join(&change.path)).ok(),
+                        )
+                    })
+            };
             let scope = decide(
                 stored,
                 this_run,
@@ -743,6 +851,7 @@ pub fn plan<'a>(
                         walk_could_enter(top, &skip, base, path, is_dir, &mut stops)
                     })
                 },
+                keeps_imports,
                 || {
                     let started = Instant::now();
                     walked += 1;
@@ -956,10 +1065,12 @@ pub fn service_inputs(
             left_out: Vec::new(),
         }));
     }
-    let in_roots = |path: &str| {
-        roots
-            .iter()
-            .any(|root| under(path, &root.dir) && !root.left_out.iter().any(|dir| under(path, dir)))
+    let scanned_in_a_root = |path: &str| {
+        roots.iter().any(|root| {
+            under(path, &root.dir)
+                && !root.left_out.iter().any(|dir| under(path, dir))
+                && crate::file_finder::is_scanned_source(Path::new(path), Path::new(&root.dir))
+        })
     };
 
     // Its import closure: every walked file's imports, and the imports of
@@ -1049,7 +1160,10 @@ pub fn service_inputs(
             if let Some(dir) = Path::new(&path).parent() {
                 lookup_dirs.insert(dir.to_string_lossy().replace('\\', "/"));
             }
-            if !in_roots(&path) {
+            // A target a scan reads is read by its root; one it does not (a
+            // test source, an asset) is read only because this file imports
+            // it, so it is a closure file (carrick#3114).
+            if !scanned_in_a_root(&path) {
                 files.insert(path);
             }
             if seen.insert(canonical(&target)) {
@@ -1231,7 +1345,7 @@ impl<'a> CopyJudge<'a> {
         let pr_edits_an_outside_input = match pr_changes {
             Ok(pr_changes) => pr_changes
                 .iter()
-                .any(|change| inputs.reads_outside_roots(change)),
+                .any(|change| inputs.reads_outside_roots(change, &mut |_| false)),
             Err(_) => true,
         };
         if pr_edits_an_outside_input {
@@ -1241,7 +1355,19 @@ impl<'a> CopyJudge<'a> {
             if is_gitignore(&change.path) {
                 inputs.reads_the_dir_of(&change.path)
             } else {
-                is_repo_input(&change.path) || inputs.reads(change)
+                is_repo_input(&change.path)
+                    || inputs.reads(change, &mut |change| {
+                        test_edit_keeps_imports(
+                            &self.reads,
+                            &change.path,
+                            crate::git_state::file_at_commit(
+                                self.repo_path,
+                                &copy.commit_hash,
+                                &change.path,
+                            ),
+                            crate::git_state::file_at_commit(self.repo_path, base, &change.path),
+                        )
+                    })
             }
         }))
     }
@@ -1376,6 +1502,7 @@ mod tests {
             changes,
             |_| false,
             |gitignore, inputs| gitignore_moves(gitignore, inputs, Some(&[]), |_, _, _| true),
+            |_| false,
             || inputs,
         )
     }
@@ -1540,6 +1667,7 @@ mod tests {
         ];
         for p in read {
             assert!(rule_reads(&field, p), "{p} should be read");
+            assert!(read_by_input_rule(p), "{p} should be read");
             // The scanner never reads less than the rule says.
             let scanner = is_repo_input(p)
                 || crate::file_finder::is_scanned_source(Path::new(p), Path::new(""));
@@ -1547,6 +1675,7 @@ mod tests {
         }
         for p in not_read {
             assert!(!rule_reads(&field, p), "{p} should not be read");
+            assert!(!read_by_input_rule(p), "{p} should not be read");
             assert!(
                 !is_repo_input(p)
                     && !crate::file_finder::is_scanned_source(Path::new(p), Path::new("")),
@@ -1607,6 +1736,7 @@ mod tests {
             Ok(&changes),
             |_| false,
             |_, _| false,
+            |_| false,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1628,6 +1758,7 @@ mod tests {
             Ok(&changes),
             |_| false,
             |_, _| false,
+            |_| false,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1712,6 +1843,7 @@ mod tests {
                 Ok(&changes),
                 |_| false,
                 |_, _| false,
+                |_| false,
                 api_inputs,
             )
         };
@@ -2616,5 +2748,226 @@ mod tests {
             judged(repo.path(), &services, &main_self, &c),
             MainCopy::Stale
         );
+    }
+    // --- carrick#3114: files no pass reads, and test edits that keep their imports ---
+
+    const DOC_FILES: [(&str, &str); 9] = [
+        ("apps/api/README.md", "api\n"),
+        ("apps/api/docs/flow.svg", "<svg/>\n"),
+        ("packages/shared/CHANGELOG.md", "# changes\n"),
+        (
+            "apps/api/src/__tests__/server.test.ts",
+            "import { server } from \"../server\";\ntest(\"a\", () => server);\n",
+        ),
+        (
+            "apps/api/test/setup.ts",
+            "declare global { var flag: boolean }\nexport {};\n",
+        ),
+        ("apps/api/test/globals.ts", "var shared = 1;\n"),
+        ("apps/api/Dockerfile", "FROM node\n"),
+        ("apps/api/src/data.json", "{ \"a\": 1 }\n"),
+        ("apps/api/src/fixtures/seed.ts", "export const seed = 1;\n"),
+    ];
+
+    /// The stored index sits at A, which holds the files above; `server.ts`
+    /// imports the seed fixture when `seeded`.
+    fn documented_workspace(seeded: bool) -> (tempfile::TempDir, String, Vec<Config>) {
+        let (repo, _, services) = workspace();
+        for (path, text) in DOC_FILES {
+            write_file(repo.path(), path, text);
+        }
+        if seeded {
+            write_file(
+                repo.path(),
+                "apps/api/src/server.ts",
+                "import { seed } from \"./fixtures/seed\";\nexport const server = seed;\n",
+            );
+        }
+        let a = commit_all(repo.path(), "documented");
+        (repo, a, services)
+    }
+
+    fn write_file(repo: &Path, path: &str, text: &str) {
+        let full = repo.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, text).unwrap();
+    }
+
+    /// Scopes of `api`, `web`, `worker` after `edit` is committed at B.
+    fn after_edit(seeded: bool, edit: impl FnOnce(&Path)) -> Vec<Option<Reason>> {
+        let (repo, a, services) = documented_workspace(seeded);
+        let blobs = stored_at(&services, &a);
+        edit(repo.path());
+        commit_all(repo.path(), "edit");
+        reasons(&scopes_of(
+            repo.path(),
+            &services,
+            &blobs,
+            &names_of(&services),
+        ))
+    }
+
+    const API_ONLY: [Option<Reason>; 3] = [Some(Reason::InputsChanged), None, None];
+
+    #[test]
+    fn docs_and_images_under_a_root_or_a_package_move_nothing() {
+        assert_eq!(
+            after_edit(false, |repo| {
+                write_file(repo, "apps/api/README.md", "api, edited\n");
+                write_file(repo, "apps/api/docs/flow.svg", "<svg id=\"b\"/>\n");
+            }),
+            [None, None, None]
+        );
+        assert_eq!(
+            after_edit(false, |repo| write_file(
+                repo,
+                "packages/shared/CHANGELOG.md",
+                "# changes\n- more\n"
+            )),
+            [None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_test_edit_that_keeps_its_imports_moves_nothing() {
+        assert_eq!(
+            after_edit(false, |repo| write_file(
+                repo,
+                "apps/api/src/__tests__/server.test.ts",
+                "import { server } from \"../server\";\ntest(\"b\", () => expect(server).toBe(1));\n",
+            )),
+            [None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_test_edit_that_changes_its_imports_or_its_globals_analyses_the_service() {
+        for (path, text) in [
+            (
+                "apps/api/src/__tests__/server.test.ts",
+                "import { server } from \"../server\";\nimport \"../types\";\ntest(\"a\", () => server);\n",
+            ),
+            ("apps/api/src/__tests__/b.test.ts", "export const b = 1;\n"),
+            (
+                "apps/api/test/setup.ts",
+                "declare global { var flag: boolean; var other: number }\nexport {};\n",
+            ),
+            ("apps/api/test/globals.ts", "var shared = 2;\n"),
+        ] {
+            assert_eq!(
+                after_edit(false, |repo| write_file(repo, path, text)),
+                API_ONLY,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deleted_test_file_analyses_the_service() {
+        assert_eq!(
+            after_edit(false, |repo| std::fs::remove_file(
+                repo.join("apps/api/src/__tests__/server.test.ts")
+            )
+            .unwrap()),
+            API_ONLY
+        );
+    }
+
+    #[test]
+    fn config_and_extensionless_files_under_a_root_still_count() {
+        for (path, text) in [
+            ("apps/api/Dockerfile", "FROM node:22\n"),
+            ("apps/api/src/data.json", "{ \"a\": 2 }\n"),
+        ] {
+            assert_eq!(
+                after_edit(false, |repo| write_file(repo, path, text)),
+                API_ONLY,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_test_path_file_that_production_code_imports_is_analysed_like_any_source() {
+        assert_eq!(
+            after_edit(true, |repo| write_file(
+                repo,
+                "apps/api/src/fixtures/seed.ts",
+                "export const seed = 2;\n"
+            )),
+            API_ONLY
+        );
+        // Unimported, the same edit is a test edit that keeps its imports.
+        assert_eq!(
+            after_edit(false, |repo| write_file(
+                repo,
+                "apps/api/src/fixtures/seed.ts",
+                "export const seed = 2;\n"
+            )),
+            [None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_test_edit_whose_main_copy_cannot_be_read_counts() {
+        let reads = ClosureReads::default();
+        let text = Some("import { a } from \"./a\";\nexport {};\n".to_string());
+        let path = "apps/api/src/__tests__/x.test.ts";
+        assert!(test_edit_keeps_imports(
+            &reads,
+            path,
+            text.clone(),
+            text.clone()
+        ));
+        assert!(!test_edit_keeps_imports(&reads, path, None, text.clone()));
+        assert!(!test_edit_keeps_imports(&reads, path, text.clone(), None));
+        // A CommonJS test is a module only in JavaScript.
+        let cjs = Some("const a = require(\"./a\");\n".to_string());
+        assert!(test_edit_keeps_imports(
+            &reads,
+            "t/x.test.js",
+            cjs.clone(),
+            cjs.clone()
+        ));
+        assert!(!test_edit_keeps_imports(
+            &reads,
+            "t/x.test.ts",
+            cjs.clone(),
+            cjs
+        ));
+    }
+
+    #[test]
+    fn a_copy_stored_before_a_doc_edit_is_current() {
+        let (repo, a, services) = documented_workspace(false);
+        let b = commit_edit(repo.path(), "apps/api/README.md", "api, edited\n");
+        // `api`'s own copy sits at A, before the README edit.
+        let main_self = [
+            copy_at("api", &a),
+            copy_at("web", &b),
+            copy_at("worker", &b),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &b),
+            MainCopy::Current
+        );
+        let c = commit_edit(repo.path(), "apps/api/src/data.json", "{ \"a\": 3 }\n");
+        let main_self = [
+            copy_at("api", &c),
+            copy_at("web", &b),
+            copy_at("worker", &b),
+        ];
+        // `web` imports a file of `api`, not its data file: current. A copy
+        // of `api` itself stored before the data edit is stale.
+        let stale = [
+            copy_at("api", &b),
+            copy_at("web", &c),
+            copy_at("worker", &c),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &c),
+            MainCopy::Current
+        );
+        assert_eq!(judged(repo.path(), &services, &stale, &c), MainCopy::Stale);
     }
 }
