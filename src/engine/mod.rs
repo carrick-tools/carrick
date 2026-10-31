@@ -1072,7 +1072,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // others, and each result is kept at its service's index. A carried
     // service is no job: it is never handed to a worker.
     let width = service_workers::width(analysed.len(), crate::analysis_channel::dispatching());
-    debug!(
+    info!(
         "Analysing services {} at a time: {}",
         width.count, width.why
     );
@@ -1082,6 +1082,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // Every analysed service's compiler walk, when the run walks, in a lane
     // of its own that ends before the loop starts (carrick#2413 slice G1).
     let walking = walk_lane::requested();
+    if walking {
+        info!(
+            "Walking {} service(s) {} at a time before the analysis loop",
+            analysed.len(),
+            width.count
+        );
+    } else {
+        info!("Walk lane off: no per-position rows are walked");
+    }
     let clean_commit =
         (!git_state.dirty && !git_state.commit.is_empty()).then(|| git_state.commit.clone());
     let (walk_ends, walked) = if walking {
@@ -2620,7 +2629,7 @@ impl ServiceScan {
 
         // What runner box shapes are sized from: how much the service's
         // sidecar held at its peak, and how many files its analysis read.
-        debug!(
+        info!(
             "Service {} ended: sidecar peak {}, {} file(s) read",
             label,
             sidecar
