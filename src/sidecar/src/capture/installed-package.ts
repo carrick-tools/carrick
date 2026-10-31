@@ -286,34 +286,49 @@ function entrySubpaths(manifest: PackageManifest): string[] {
   return [''];
 }
 
-/**
- * Declaration keys (`file\0declaredName`) of what `file` exports as `name`.
- * A chunk can declare a type under its public name and export it under a
- * short one (`export { type OmitKeyof as O }`), so the name read off the
- * import is not the name the declaration carries.
- */
-function declarationKeysOfExport(file: string, name: string): string[] {
-  const program = ts.createProgram([file], RESOLUTION_OPTIONS);
-  const checker = program.getTypeChecker();
-  const source = program.getSourceFile(file);
-  const moduleSymbol = source && checker.getSymbolAtLocation(source);
-  const symbol = moduleSymbol && checker.getExportsOfModule(moduleSymbol).find((s) => s.getName() === name);
-  if (!symbol) return [];
+/** Alias chain of an exported symbol followed to the symbol that declares it. */
+function resolveAliasTarget(checker: ts.TypeChecker, symbol: ts.Symbol): ts.Symbol {
   let target = symbol;
   for (let hops = 0; target.flags & ts.SymbolFlags.Alias && hops < 16; hops++) {
     const next = checker.getAliasedSymbol(target);
     if (next === target) break;
     target = next;
   }
-  const keys: string[] = [];
-  for (const declaration of target.declarations ?? []) {
-    try {
-      keys.push(`${fs.realpathSync(declaration.getSourceFile().fileName)}\0${target.getName()}`);
-    } catch {
-      // declaration outside the real file system: ignore
+  return target;
+}
+
+const declarationKeysCache = new Map<string, Map<string, string[]>>();
+
+/**
+ * Declaration keys (`file\0declaredName`) of what `file` exports as `name`.
+ * A chunk can declare a type under its public name and export it under a
+ * short one (`export { type OmitKeyof as O }`), so the name read off the
+ * import is not the name the declaration carries. One program per file answers
+ * every name asked of it (carrick#3117).
+ */
+function declarationKeysOfExport(file: string, name: string): string[] {
+  let byName = declarationKeysCache.get(file);
+  if (!byName) {
+    byName = new Map();
+    const program = ts.createProgram([file], RESOLUTION_OPTIONS);
+    const checker = program.getTypeChecker();
+    const source = program.getSourceFile(file);
+    const moduleSymbol = source && checker.getSymbolAtLocation(source);
+    for (const symbol of moduleSymbol ? checker.getExportsOfModule(moduleSymbol) : []) {
+      const target = resolveAliasTarget(checker, symbol);
+      const keys: string[] = [];
+      for (const declaration of target.declarations ?? []) {
+        try {
+          keys.push(`${fs.realpathSync(declaration.getSourceFile().fileName)}\0${target.getName()}`);
+        } catch {
+          // declaration outside the real file system: ignore
+        }
+      }
+      if (!byName.has(symbol.getName())) byName.set(symbol.getName(), keys);
     }
+    declarationKeysCache.set(file, byName);
   }
-  return keys;
+  return byName.get(name) ?? [];
 }
 
 interface EntryExports {
@@ -339,13 +354,8 @@ function exportsOf(entryFile: string): EntryExports {
   const source = program.getSourceFile(entryFile);
   const moduleSymbol = source && checker.getSymbolAtLocation(source);
   for (const symbol of moduleSymbol ? checker.getExportsOfModule(moduleSymbol) : []) {
-    let target = symbol;
     // Follow the alias chain until it stops (an entry can re-export a re-export).
-    for (let hops = 0; target.flags & ts.SymbolFlags.Alias && hops < 16; hops++) {
-      const next = checker.getAliasedSymbol(target);
-      if (next === target) break;
-      target = next;
-    }
+    const target = resolveAliasTarget(checker, symbol);
     const files = new Set<string>();
     for (const declaration of target.declarations ?? []) {
       try {
