@@ -2582,6 +2582,7 @@ mod tests {
         assert_eq!(written.package_json, stored.package_json);
         assert_eq!(written.package_json_hash, stored.package_json_hash);
     }
+
     /// The stored index sits at A, where a root `.gitignore` exists.
     fn ignoring_workspace() -> (tempfile::TempDir, String, Vec<Config>) {
         let (repo, _, services) = workspace();
@@ -2970,5 +2971,433 @@ mod tests {
             MainCopy::Current
         );
         assert_eq!(judged(repo.path(), &services, &stale, &c), MainCopy::Stale);
+    }
+
+    // --- carrick#3115: a dependency-only change reaches the services that
+    // load a moved package ---
+
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Copy)]
+    enum Manager {
+        Npm,
+        Pnpm,
+    }
+
+    /// Each manifest: its directory, its name, the map it declares in and
+    /// what it declares. `api` loads `lib-a` (which depends on `lib-c`),
+    /// `@fixture/shared` loads `lib-b`, `worker` loads `@fixture/shared`.
+    /// The root declares `lib-d`, which nothing loads, `lib-e`, which a test
+    /// of `web` loads, `lib-f`, which `web`'s tsconfig names, and
+    /// `@types/node`.
+    const LAYOUT: [(&str, &str, &str, &[&str]); 5] = [
+        (
+            "",
+            "mono",
+            "devDependencies",
+            &["@types/node", "lib-d", "lib-e", "lib-f"],
+        ),
+        ("apps/api", "api", "dependencies", &["lib-a"]),
+        ("apps/web", "web", "dependencies", &[]),
+        (
+            "apps/worker",
+            "worker",
+            "dependencies",
+            &["@fixture/shared"],
+        ),
+        (
+            "packages/shared",
+            "@fixture/shared",
+            "dependencies",
+            &["lib-b"],
+        ),
+    ];
+
+    /// Every external package at its first version.
+    fn first_versions() -> BTreeMap<String, String> {
+        [
+            "@types/node",
+            "lib-a",
+            "lib-b",
+            "lib-c",
+            "lib-d",
+            "lib-e",
+            "lib-f",
+        ]
+        .iter()
+        .map(|name| (name.to_string(), "1.0.0".to_string()))
+        .collect()
+    }
+
+    fn workspace_spec(manager: Manager) -> &'static str {
+        match manager {
+            Manager::Npm => "*",
+            Manager::Pnpm => "workspace:*",
+        }
+    }
+
+    /// Every manifest, declaring each external at `declared`'s spec, and the
+    /// lockfile, installing each at `installed`'s version.
+    fn write_dependencies(
+        repo: &Path,
+        manager: Manager,
+        declared: &BTreeMap<String, String>,
+        installed: &BTreeMap<String, String>,
+    ) {
+        let spec = |name: &str| match name {
+            "@fixture/shared" => workspace_spec(manager).to_string(),
+            name => declared[name].clone(),
+        };
+        let declarations = |deps: &[&str]| -> serde_json::Value {
+            deps.iter()
+                .map(|dep| (dep.to_string(), serde_json::Value::from(spec(dep))))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        };
+        for (dir, name, section, deps) in LAYOUT {
+            let mut manifest = serde_json::json!({ "name": name });
+            if dir.is_empty() {
+                manifest["private"] = serde_json::json!(true);
+                if let Manager::Npm = manager {
+                    manifest["workspaces"] = serde_json::json!(["apps/*", "packages/*"]);
+                }
+            }
+            if name == "@fixture/shared" {
+                manifest["main"] = serde_json::json!("src/x.ts");
+            }
+            if !deps.is_empty() {
+                manifest[section] = declarations(deps);
+            }
+            let path = Path::new(dir).join("package.json");
+            std::fs::write(
+                repo.join(path),
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+        let depends_on = |package: &str| -> Vec<&str> {
+            if package == "lib-a" {
+                vec!["lib-c"]
+            } else {
+                vec![]
+            }
+        };
+        match manager {
+            Manager::Npm => {
+                let mut packages = serde_json::Map::new();
+                for (dir, name, section, deps) in LAYOUT {
+                    let mut entry = serde_json::json!({ "name": name });
+                    if !deps.is_empty() {
+                        entry[section] = declarations(deps);
+                    }
+                    if !dir.is_empty() {
+                        packages.insert(
+                            format!("node_modules/{name}"),
+                            serde_json::json!({ "resolved": dir, "link": true }),
+                        );
+                    }
+                    packages.insert(dir.to_string(), entry);
+                }
+                for (package, version) in installed {
+                    let mut entry = serde_json::json!({
+                        "version": version,
+                        "resolved": format!("https://registry.npmjs.org/{package}/-/{package}-{version}.tgz"),
+                        "integrity": format!("sha512-{package}-{version}"),
+                    });
+                    for dep in depends_on(package) {
+                        entry["dependencies"][dep] = serde_json::json!("^1.0.0");
+                    }
+                    packages.insert(format!("node_modules/{package}"), entry);
+                }
+                let lock = serde_json::json!({
+                    "name": "mono",
+                    "lockfileVersion": 3,
+                    "requires": true,
+                    "packages": packages,
+                });
+                std::fs::write(
+                    repo.join("package-lock.json"),
+                    serde_json::to_string_pretty(&lock).unwrap(),
+                )
+                .unwrap();
+            }
+            Manager::Pnpm => {
+                std::fs::write(
+                    repo.join("pnpm-workspace.yaml"),
+                    "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+                )
+                .unwrap();
+                let mut importers = serde_json::Map::new();
+                for (dir, _, section, deps) in LAYOUT {
+                    let mut entry = serde_json::json!({});
+                    for dep in deps {
+                        let version = match *dep {
+                            "@fixture/shared" => "link:../../packages/shared".to_string(),
+                            dep => installed[dep].clone(),
+                        };
+                        entry[section][dep] =
+                            serde_json::json!({ "specifier": spec(dep), "version": version });
+                    }
+                    let key = if dir.is_empty() { "." } else { dir };
+                    importers.insert(key.to_string(), entry);
+                }
+                let mut packages = serde_json::Map::new();
+                let mut snapshots = serde_json::Map::new();
+                for (package, version) in installed {
+                    let key = format!("{package}@{version}");
+                    packages.insert(
+                        key.clone(),
+                        serde_json::json!({ "resolution": { "integrity": format!("sha512-{key}") } }),
+                    );
+                    let mut snapshot = serde_json::json!({});
+                    for dep in depends_on(package) {
+                        snapshot["dependencies"][dep] = serde_json::json!(installed[dep]);
+                    }
+                    snapshots.insert(key, snapshot);
+                }
+                let lock = serde_json::json!({
+                    "lockfileVersion": "9.0",
+                    "settings": { "autoInstallPeers": true, "excludeLinksFromLockfile": false },
+                    "importers": importers,
+                    "packages": packages,
+                    "snapshots": snapshots,
+                });
+                std::fs::write(
+                    repo.join("pnpm-lock.yaml"),
+                    serde_yaml_ng::to_string(&lock).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// [`workspace`] with the dependencies of [`LAYOUT`], each source file
+    /// importing what its manifest declares, a test of `web` importing
+    /// `lib-e` and `web`'s tsconfig naming `lib-f`. Every service is stored
+    /// at the returned commit.
+    fn dependency_workspace(manager: Manager) -> (tempfile::TempDir, String, Vec<Config>) {
+        let (repo, _, services) = workspace();
+        let versions = first_versions();
+        write_dependencies(repo.path(), manager, &versions, &versions);
+        for (path, contents) in [
+            (
+                "apps/api/src/server.ts",
+                "import { a } from \"lib-a\";\nexport const server = a;\n",
+            ),
+            (
+                "packages/shared/src/x.ts",
+                "import { b } from \"lib-b\";\nexport const x = b;\n",
+            ),
+            (
+                "apps/web/src/checkout.test.ts",
+                "import { e } from \"lib-e\";\nexport const t = e;\n",
+            ),
+            (
+                "apps/web/tsconfig.json",
+                r#"{ "compilerOptions": { "types": ["lib-f"] } }"#,
+            ),
+        ] {
+            std::fs::write(repo.path().join(path), contents).unwrap();
+        }
+        let a = commit_all(repo.path(), "dependencies");
+        (repo, a, services)
+    }
+
+    /// `versions` with `package` at `version`.
+    fn moved(
+        versions: &BTreeMap<String, String>,
+        package: &str,
+        version: &str,
+    ) -> BTreeMap<String, String> {
+        let mut moved = versions.clone();
+        moved.insert(package.to_string(), version.to_string());
+        moved
+    }
+
+    /// The scopes of every service after the commit `declared` and
+    /// `installed` write, the services stored at the fixture's commit.
+    fn scopes_after(
+        manager: Manager,
+        declared: &BTreeMap<String, String>,
+        installed: &BTreeMap<String, String>,
+    ) -> Vec<Scope> {
+        let (repo, a, services) = dependency_workspace(manager);
+        let blobs = stored_at(&services, &a);
+        write_dependencies(repo.path(), manager, declared, installed);
+        commit_all(repo.path(), "move");
+        scopes_of(repo.path(), &services, &blobs, &names_of(&services))
+    }
+
+    /// The fixture's services, in order: api, web, worker.
+    #[test]
+    fn a_bump_of_a_package_one_service_loads_analyses_that_service_alone() {
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let scopes = scopes_after(manager, &bumped, &bumped);
+            assert_eq!(
+                reasons(&scopes),
+                [None, None, Some(Reason::InputsChanged)],
+                "{scopes:?}"
+            );
+        }
+    }
+
+    /// `lib-c` moved in the lockfile alone: no manifest names it, and `api`
+    /// loads it through `lib-a`.
+    #[test]
+    fn a_lockfile_only_move_reaches_the_services_that_load_it_through_another_package() {
+        let versions = first_versions();
+        let scopes = scopes_after(Manager::Npm, &versions, &moved(&versions, "lib-c", "1.0.1"));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::InputsChanged), None, None],
+            "{scopes:?}"
+        );
+        let Scope::Analysed { detail, .. } = &scopes[0] else {
+            unreachable!()
+        };
+        assert_eq!(detail, "package-lock.json: lib-c");
+    }
+
+    #[test]
+    fn a_bump_of_a_package_nothing_loads_carries_every_service() {
+        let bumped = moved(&first_versions(), "lib-d", "1.1.0");
+        let scopes = scopes_after(Manager::Npm, &bumped, &bumped);
+        assert_eq!(carried(&scopes), [true, true, true], "{scopes:?}");
+    }
+
+    #[test]
+    fn a_move_of_the_compilers_own_types_analyses_every_service() {
+        let bumped = moved(&first_versions(), "@types/node", "20.1.0");
+        let scopes = scopes_after(Manager::Npm, &bumped, &bumped);
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::InputsChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    /// The root manifest alone declares `lib-e`; a test of `web` loads it.
+    #[test]
+    fn a_package_a_test_loads_is_loaded_by_its_service() {
+        let bumped = moved(&first_versions(), "lib-e", "1.1.0");
+        let scopes = scopes_after(Manager::Npm, &bumped, &bumped);
+        assert_eq!(
+            reasons(&scopes),
+            [None, Some(Reason::InputsChanged), None],
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_the_tsconfig_names_is_loaded_by_its_service() {
+        let bumped = moved(&first_versions(), "lib-f", "1.1.0");
+        let scopes = scopes_after(Manager::Npm, &bumped, &bumped);
+        assert_eq!(
+            reasons(&scopes),
+            [None, Some(Reason::InputsChanged), None],
+            "{scopes:?}"
+        );
+    }
+
+    /// The install is not frozen to a lockfile that did not move with its
+    /// manifest.
+    #[test]
+    fn a_manifest_move_without_its_lockfile_analyses_every_service() {
+        let versions = first_versions();
+        let scopes = scopes_after(Manager::Npm, &moved(&versions, "lib-b", "1.1.0"), &versions);
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_moved_workspace_package_analyses_every_service() {
+        let (repo, a, services) = dependency_workspace(Manager::Npm);
+        let blobs = stored_at(&services, &a);
+        for path in ["apps/worker/package.json", "package-lock.json"] {
+            let path = repo.path().join(path);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                text.replace(
+                    "\"@fixture/shared\": \"*\"",
+                    "\"@fixture/shared\": \"^1.0.0\"",
+                ),
+            )
+            .unwrap();
+        }
+        commit_all(repo.path(), "move");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_lockfile_this_rule_does_not_read_analyses_every_service() {
+        let (repo, _, services) = dependency_workspace(Manager::Npm);
+        std::fs::create_dir_all(repo.path().join("tools")).unwrap();
+        std::fs::write(repo.path().join("tools/yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        let a = commit_all(repo.path(), "yarn");
+        let blobs = stored_at(&services, &a);
+        std::fs::write(
+            repo.path().join("tools/yarn.lock"),
+            "# yarn lockfile v1\n\nlib-x@1.0.0:\n  version \"1.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "move");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    /// A blobless clone with no remote holds the commit's tree but not its
+    /// copy of the lockfile, so nothing says what moved.
+    #[test]
+    fn a_stored_lockfile_the_clone_cannot_read_analyses_every_service() {
+        let (server, a, services) = dependency_workspace(Manager::Npm);
+        let bumped = moved(&first_versions(), "lib-d", "1.1.0");
+        write_dependencies(server.path(), Manager::Npm, &bumped, &bumped);
+        commit_all(server.path(), "move");
+        let clone = crate::git_state::tests::clone_without_remote(server.path(), &a, true);
+        let blobs = stored_at(&services, &a);
+        let scopes = scopes_of(
+            &clone.path().join("clone"),
+            &services,
+            &blobs,
+            &names_of(&services),
+        );
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    /// Main's copy of `api` sits at A, before a bump of `lib-b` that `api`
+    /// does not load: it is still main's at the base. `worker` loads it.
+    #[test]
+    fn a_copy_stored_before_a_dependency_move_it_does_not_load_is_current() {
+        let (repo, a, services) = dependency_workspace(Manager::Npm);
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        write_dependencies(repo.path(), Manager::Npm, &bumped, &bumped);
+        let b = commit_all(repo.path(), "move");
+        let main_self = [
+            copy_at("api", &a),
+            copy_at("web", &b),
+            copy_at("worker", &b),
+        ];
+        let repo_path = repo.path().to_string_lossy();
+        let judge = CopyJudge::new(&repo_path, &services, &main_self);
+        assert_eq!(judge.differs(&main_self[0], &b), Some(false));
+        assert_eq!(judge.differs(&copy_at("worker", &a), &b), Some(true));
     }
 }

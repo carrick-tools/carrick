@@ -1647,22 +1647,52 @@ pub(crate) mod tests {
         std::fs::write(server.join("a.txt"), "two\n").unwrap();
         git_in(&server, &["commit", "-qam", "head"]);
 
+        let clone = clone_and_fetch(root.path(), &server, &base, filter);
+        std::fs::rename(&server, root.path().join("server-gone")).unwrap();
+        (root, clone, base)
+    }
+
+    /// A runner's partial clone of the repository at `server` as
+    /// [`partial_clone_without_remote`] makes it, whose remote then names a
+    /// path that does not exist. The clone is the returned directory's
+    /// `clone`.
+    pub(crate) fn clone_without_remote(
+        server: &std::path::Path,
+        stored: &str,
+        filter: bool,
+    ) -> tempfile::TempDir {
+        git_in(server, &["config", "uploadpack.allowFilter", "true"]);
+        git_in(server, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+        let root = tempfile::TempDir::new().unwrap();
+        let clone = clone_and_fetch(root.path(), server, stored, filter);
+        let gone = format!("file://{}", root.path().join("gone").display());
+        git_in(&clone, &["remote", "set-url", "origin", &gone]);
+        root
+    }
+
+    /// `server` cloned at depth 1 into `root/clone`, then `stored` fetched
+    /// the same way, without blobs when `filter`.
+    fn clone_and_fetch(
+        root: &std::path::Path,
+        server: &std::path::Path,
+        stored: &str,
+        filter: bool,
+    ) -> std::path::PathBuf {
         let url = format!("file://{}", server.display());
-        let clone = root.path().join("clone");
+        let clone = root.join("clone");
         let mut args = vec!["clone", "-q", "--depth=1"];
         if filter {
             args.push("--filter=blob:none");
         }
         args.extend([url.as_str(), clone.to_str().unwrap()]);
-        git_in(root.path(), &args);
+        git_in(root, &args);
         let mut fetch = vec!["fetch", "-q", "--depth=1"];
         if filter {
             fetch.push("--filter=blob:none");
         }
-        fetch.extend(["origin", base.as_str()]);
+        fetch.extend(["origin", stored]);
         git_in(&clone, &fetch);
-        std::fs::rename(&server, root.path().join("server-gone")).unwrap();
-        (root, clone, base)
+        clone
     }
 
     fn missing_objects(clone: &std::path::Path) -> usize {
