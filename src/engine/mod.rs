@@ -198,6 +198,13 @@ fn should_upload_data() -> bool {
     upload_decision_from_env().unwrap_or(false)
 }
 
+/// Whether this run writes main's hosted index. A run that names a local cache
+/// directory (`CARRICK_LOCAL_STORAGE_DIR`, the local check and indexer) uploads
+/// to that directory, not to the index, so it does not count.
+pub(crate) fn uploads_to_hosted_index() -> bool {
+    should_upload_data() && env::var(CACHE_DIR_ENV).is_err()
+}
+
 /// The decision itself, pure, so the table test reads no process environment.
 fn upload_decision(switch: Option<bool>, context: UploadContext<'_>) -> Result<bool, &'static str> {
     // Eval runs (`CARRICK_OUTPUT_JSON`) are read-only benchmarks against throwaway
