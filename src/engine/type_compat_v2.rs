@@ -2975,6 +2975,7 @@ fn retype_items<'a>(
                 outcome: RetypeVerdict::Abstain,
                 diagnostics: Vec::new(),
                 reason: Some(reason.to_string()),
+                run_failed: false,
             });
             continue;
         }
