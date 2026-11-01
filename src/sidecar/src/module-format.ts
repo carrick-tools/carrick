@@ -29,7 +29,38 @@
  * and is left unresolved rather than given another import's mode.
  */
 
-import { ts, type ResolutionHostFactory } from 'ts-morph';
+import tsMorphCommon from '@ts-morph/common';
+import { ts, type ResolutionHost, type ResolutionHostFactory } from 'ts-morph';
+
+/**
+ * A resolution host that also hands the compiler a module resolution cache.
+ * ts-morph's `ResolutionHost` has no such member, and its `createHosts`
+ * copies only the three it declares onto the compiler host, so a host with
+ * its own `resolveModuleNames` left every program without a cache: the
+ * compiler then read the `package.json` scope above every file again on
+ * every rebuild (37% of a retyped call in a large program).
+ */
+export interface CachingResolutionHost extends ResolutionHost {
+  getModuleResolutionCache(): ts.ModuleResolutionCache;
+}
+
+// The `createHosts` ts-morph calls is a property of this same CommonJS
+// exports object (ts-morph reads `common.createHosts` when a project builds
+// its language service), so wrapping it here reaches every project built
+// after this module loads. Both copies must be one instance, or the wrap
+// would silently miss: fail at load instead.
+if (tsMorphCommon.ts !== ts) {
+  throw new Error('@ts-morph/common is not the instance ts-morph loads; pin it to the version ts-morph requires');
+}
+const createHosts = tsMorphCommon.createHosts;
+(tsMorphCommon as { createHosts: typeof createHosts }).createHosts = (options) => {
+  const hosts = createHosts(options);
+  const cache = (options.resolutionHost as Partial<CachingResolutionHost>).getModuleResolutionCache;
+  // The compiler host is the one ts-morph's own program is built with. The
+  // language service's programs keep their own host (a named follow-up).
+  if (cache) (hosts.compilerHost as ts.CompilerHost).getModuleResolutionCache = cache;
+  return hosts;
+};
 
 /** Whether the compiler decides an import's mode from the importing file's format. */
 function formatDecidesMode(options: ts.CompilerOptions): boolean {
@@ -76,18 +107,32 @@ export interface ResolutionRedirect {
  * The resolution host factory, resolving through `redirect` when the owner
  * config references other projects.
  */
-export const moduleFormatResolutionHost = (redirect?: ResolutionRedirect): ResolutionHostFactory => (host, getOptions) => {
+export const moduleFormatResolutionHost = (redirect?: ResolutionRedirect) => (
+  host: ts.ModuleResolutionHost,
+  getOptions: () => ts.CompilerOptions
+): CachingResolutionHost => {
   const resolutionHost = redirect ? redirect.resolutionHost(host) : host;
+  // One cache per project, handed to the compiler. The compiler resolves no
+  // module name itself while this host does, so only its package.json entries
+  // fill: each file's format scope, and the packages type references reach.
+  // It lives as long as the project, because no package.json changes while a
+  // scan runs; the edits a project sees are to its source files.
+  const programCache = ts.createModuleResolutionCache(process.cwd(), (fileName) => fileName, getOptions());
+  const packageJsonCache = programCache.getPackageJsonInfoCache();
+  // The resolver's own module answers stay per program (each rebuild passes
+  // a new options object), so an answer is never carried past a rebuild; only
+  // the package.json reads behind them are shared.
   let cache: ts.ModuleResolutionCache | undefined;
   let cacheOptions: ts.CompilerOptions | undefined;
   const cacheFor = (options: ts.CompilerOptions): ts.ModuleResolutionCache => {
     if (!cache || cacheOptions !== options) {
-      cache = ts.createModuleResolutionCache(process.cwd(), (fileName) => fileName, options);
+      cache = ts.createModuleResolutionCache(process.cwd(), (fileName) => fileName, options, packageJsonCache);
       cacheOptions = options;
     }
     return cache;
   };
   return {
+    getModuleResolutionCache: () => programCache,
     resolveModuleNames: (moduleNames, containingFile, _reusedNames, redirectedReference, options, containingSourceFile) => {
       const compilerOptions = options ?? getOptions();
       const resolutionCache = cacheFor(compilerOptions);
