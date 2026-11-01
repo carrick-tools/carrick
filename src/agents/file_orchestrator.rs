@@ -1429,7 +1429,8 @@ pub struct FileOrchestrator {
     ahead: crate::agents::asked_ahead::AheadRole,
     /// As the lane, what it asks through: `file_analyzer` sending each
     /// request once. A lane ask that fails is asked again by the analysis
-    /// with its own retries, so the lane adds at most one request per file.
+    /// with its own retries, so the lane adds at most the requests of one
+    /// first ask per file (one, or one per part for a file over the line).
     ahead_analyzer: Option<FileAnalyzerAgent>,
 }
 
@@ -1780,7 +1781,7 @@ impl FileOrchestrator {
 
     /// Which side of a service's answers asked ahead this orchestrator works
     /// for (carrick#3131). As [`AheadRole::Lane`] it builds the prompts,
-    /// publishes them to the slot, asks each file asked whole once, and
+    /// publishes them to the slot, sends each file's first ask once, and
     /// returns an empty result.
     ///
     /// [`AheadRole::Lane`]: crate::agents::asked_ahead::AheadRole::Lane
@@ -1910,24 +1911,68 @@ impl FileOrchestrator {
         }
     }
 
-    /// What `file`'s answer asked ahead is held under (carrick#3131), and the
-    /// one request a lane sends for it: the file's whole prompt, held under
-    /// every byte of it, guidance included. `None` for a file asked in parts,
-    /// asked nothing, or too large to ask: the lane leaves it to the
-    /// analysis, whose parts and cuts take more than one request.
+    /// What `file`'s answer asked ahead is held under (carrick#3131), and
+    /// what a lane sends for it: the requests of its first ask, its whole
+    /// prompt or each of its parts, held under every byte of them, guidance
+    /// included. `None` for a file asked nothing or too large to ask.
     fn asked_ahead_as(
         &self,
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
-    ) -> Option<(crate::agents::asked_ahead::AheadKey, AnalysisPrompt)> {
-        let Ok(Asking::Whole(prompt)) = self.asking(file, guidance) else {
-            return None;
+    ) -> Option<(crate::agents::asked_ahead::AheadKey, Asking)> {
+        let asking = self.asking(file, guidance).ok()?;
+        let texts: Vec<&str> = match &asking {
+            Asking::Whole(prompt) => vec![prompt.text.as_str()],
+            Asking::Parts(plan) => plan
+                .parts
+                .iter()
+                .map(|(_, prompt)| prompt.text.as_str())
+                .collect(),
+            Asking::Nothing => return None,
         };
         let key = crate::agents::asked_ahead::AheadKey {
             prompt_path: file.prompt_path.to_string(),
-            prompt_id: crate::analysis_job::body_id(&prompt.text),
+            prompt_id: crate::analysis_job::body_id(&texts.join("\u{0}")),
         };
-        Some((key, prompt))
+        Some((key, asking))
+    }
+
+    /// A lane's ask of `file` (carrick#3131): each request of its first ask
+    /// sent once, through `analyzer`, which retries nothing. No part is
+    /// halved and no file cut: any failure is `None`, a miss the analysis
+    /// asks with its own retries and cuts. So the lane adds at most the
+    /// requests of one first ask per file to what the analysis sends.
+    async fn ask_ahead_once(
+        &self,
+        analyzer: &FileAnalyzerAgent,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        asking: Asking,
+    ) -> Option<FileAnalysisResult> {
+        match asking {
+            Asking::Whole(prompt) => analyzer
+                .analyze_prompt(file.prompt_path, &prompt, guidance)
+                .await
+                .ok(),
+            Asking::Parts(plan) => {
+                let labels: Vec<String> = plan.parts.iter().map(|(part, _)| part.label()).collect();
+                let outcomes = futures::future::join_all(plan.parts.iter().zip(&labels).map(
+                    |((_, prompt), label)| {
+                        analyzer.analyze_part_prompt(file.prompt_path, label, prompt, guidance)
+                    },
+                ))
+                .await;
+                let mut answers = Vec::new();
+                for ((part, _), outcome) in plan.parts.iter().zip(outcomes) {
+                    answers.push(PartAnswer {
+                        window: part.window(),
+                        answer: outcome.ok()?,
+                    });
+                }
+                Some(merge_part_answers(file.listed, answers))
+            }
+            Asking::Nothing => None,
+        }
     }
 
     /// The parts `file` is asked in so that no request carries more than
@@ -4225,9 +4270,10 @@ impl FileOrchestrator {
         }
 
         // A lane asking ahead (carrick#3131) stops here, as a dispatched
-        // service does: it holds a place for each file asked whole under the
-        // bytes it built, publishes them for the service's analysis, and asks
-        // each once, at most a queue's depth at a time. An ask that fails, or
+        // service does: it holds a place for each file under the bytes of its
+        // first ask, publishes them for the service's analysis, and sends
+        // each of those requests once ([`Self::ask_ahead_once`]), at most a
+        // queue's depth of files at a time. An ask that fails, or
         // one never sent because the run's patience is spent or nothing more
         // is wanted for the service, is a miss the analysis asks for itself
         // with its own retries and cuts. Nothing is recorded here: the
@@ -4240,15 +4286,11 @@ impl FileOrchestrator {
             use tracing::Instrument;
             use tracing::instrument::WithSubscriber;
             let ahead = std::sync::Arc::new(crate::agents::asked_ahead::AskedAhead::default());
-            let held: Vec<(
-                &PendingFile,
-                AnalysisPrompt,
-                crate::agents::asked_ahead::Hold,
-            )> = to_dispatch
+            let held: Vec<(&PendingFile, Asking, crate::agents::asked_ahead::Hold)> = to_dispatch
                 .iter()
                 .filter_map(|pf| {
-                    let (key, prompt) = self.asked_ahead_as(&pf.parted(), guidance)?;
-                    ahead.hold(key).map(|hold| (pf, prompt, hold))
+                    let (key, asking) = self.asked_ahead_as(&pf.parted(), guidance)?;
+                    ahead.hold(key).map(|hold| (pf, asking, hold))
                 })
                 .collect();
             let label = crate::current_service::name().unwrap_or_else(|| "(root)".to_string());
@@ -4261,7 +4303,7 @@ impl FileOrchestrator {
                 });
                 let ahead = &ahead;
                 let label = &label;
-                futures::stream::iter(held.into_iter().map(|(pf, prompt, hold)| async move {
+                futures::stream::iter(held.into_iter().map(|(pf, asking, hold)| async move {
                     if stop.load(std::sync::atomic::Ordering::SeqCst)
                         || crate::retry_budget::remaining().is_zero()
                     {
@@ -4272,12 +4314,11 @@ impl FileOrchestrator {
                         log,
                         || tracing::info_span!("service", name = %label),
                     );
-                    let answer = analyzer
-                        .analyze_prompt(&pf.prompt_path, &prompt, guidance)
+                    let answer = self
+                        .ask_ahead_once(analyzer, &pf.parted(), guidance, asking)
                         .instrument(span)
                         .with_subscriber(log.clone())
-                        .await
-                        .ok();
+                        .await;
                     hold.answer(answer);
                 }))
                 .buffer_unordered(concurrency)

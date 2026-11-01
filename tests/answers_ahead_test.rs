@@ -372,6 +372,64 @@ async fn a_lane_ask_is_one_request_and_never_cut_or_retried() {
     );
 }
 
+/// The review of carrick#3131: a file over the line, asked in parts from its
+/// first request, is asked ahead part by part, each part once. Every part
+/// answered, the analysis takes the merged answer and asks nothing; a part
+/// that fails is a miss for the whole file, which the analysis then asks in
+/// its own parts, so the lane adds no more than one first ask.
+#[tokio::test]
+#[serial]
+async fn a_file_asked_in_parts_is_asked_ahead_each_part_once() {
+    offline();
+    let pad = "x".repeat(700);
+    let mut source = "declare function makeTable(): any;\nconst table = makeTable();\n".to_string();
+    for at in 0..400 {
+        source.push_str(&format!(
+            "table.get(\"/parts/r{at}\", (req: any, res: any) => res.send({{ pad: \"{pad}\" }}));\n"
+        ));
+    }
+    let routes = Routes::of(vec![("big".to_string(), source)]);
+    let (main, parts) = routes.analyze_counting(AheadRole::None).await;
+    assert!(parts > 1, "the file is asked in parts");
+
+    let slot = Arc::new(AheadSlot::default());
+    let (_, lane_asks) = routes.analyze_counting(lane(&slot)).await;
+    let held = slot.held().expect("the lane published");
+    let (analysed, analysis_asks) = routes
+        .analyze_counting(AheadRole::Analysis(slot.clone()))
+        .await;
+    assert_eq!((lane_asks, analysis_asks), (parts, 0));
+    assert_eq!((held.asked(), held.taken(), held.unused()), (1, 1, 0));
+    let raw = |result: &FileCentricAnalysisResult| -> BTreeMap<String, String> {
+        result
+            .raw_model_results
+            .iter()
+            .map(|(file, answer)| (file.clone(), serde_json::to_string(answer).unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        raw(&analysed),
+        raw(&main),
+        "the merged answer is the answer"
+    );
+
+    let slot = Arc::new(AheadSlot::default());
+    // The last part's answer does not fit one response: the analysis would
+    // halve that part, and the lane does not.
+    agent_service::inject_mock_envelope(ROUTE, "/parts/r399\\\"", 1, &cut());
+    let (_, lane_asks) = routes.analyze_counting(lane(&slot)).await;
+    let held = slot.held().expect("the lane published");
+    let (_, analysis_asks) = routes
+        .analyze_counting(AheadRole::Analysis(slot.clone()))
+        .await;
+    assert_eq!(lane_asks, parts, "each part sent once, the failed one too");
+    assert_eq!(
+        analysis_asks, parts,
+        "the analysis asks the file in its parts"
+    );
+    assert_eq!((held.asked(), held.taken(), held.unused()), (1, 0, 0));
+}
+
 /// The review of carrick#3131: the lane makes none of the analysis's side
 /// effects. It counts no file attempted, records no loss and no file read
 /// for the service's timing line, even when an ask fails. The analysis, in
