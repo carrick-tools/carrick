@@ -3911,6 +3911,7 @@ mod tests {
                 outcome: RetypeVerdict::Abstain,
                 diagnostics: Vec::new(),
                 reason: Some(WHY.to_string()),
+                run_failed: false,
             }]
         );
 
@@ -11134,6 +11135,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             span_end: None,
             expression_text: Some("api.post('/p')".to_string()),
             expression_line: Some(line),
+            prescreen: None,
         };
         LocalConsumers::from([(
             "web".to_string(),
