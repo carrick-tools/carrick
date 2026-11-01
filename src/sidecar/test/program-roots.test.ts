@@ -55,6 +55,10 @@ function writeTree(files: Record<string, string>): string {
 
 const roots = (project: Project): string[] => [...project.getProgram().compilerObject.getRootFileNames()];
 const files = (project: Project): string[] => project.getProgram().compilerObject.getSourceFiles().map((file) => file.fileName);
+/** TypeScript's internal reuse verdict: 2 is `Completely`. */
+const reused = (project: Project): number | undefined =>
+  (project.getProgram().compilerObject as unknown as { structureIsReused?: number }).structureIsReused;
+
 function cycles(project: Project, indexPath: string, count: number): void {
   const original = project.getSourceFileOrThrow(indexPath).getFullText();
   const program = files(project);
@@ -63,9 +67,11 @@ function cycles(project: Project, indexPath: string, count: number): void {
     replaceFileText(project.getSourceFileOrThrow(indexPath), `${original}\nexport const probe${i} = ${i};\n`);
     assert.deepStrictEqual(roots(project), first, `roots after edit ${i}`);
     assert.deepStrictEqual(files(project), program, `files after edit ${i}`);
+    assert.strictEqual(reused(project), 2, `program reused after edit ${i}`);
     replaceFileText(project.getSourceFileOrThrow(indexPath), original);
     assert.deepStrictEqual(roots(project), first, `roots after restore ${i}`);
     assert.deepStrictEqual(files(project), program, `files after restore ${i}`);
+    assert.strictEqual(reused(project), 2, `program reused after restore ${i}`);
   }
 }
 

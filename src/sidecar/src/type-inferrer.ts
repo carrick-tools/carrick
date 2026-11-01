@@ -78,6 +78,7 @@ import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.j
 import type { LabelledMembers } from './library-claims.js';
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
+import { replaceFileText } from './program-files.js';
 import {
   classifyStatusCodes,
   constituents,
@@ -1219,7 +1220,7 @@ export class TypeInferrer {
 
     try {
       for (const [file, list] of insertions) {
-        file.replaceWithText(applyInsertions(originals.get(file)!, list));
+        replaceFileText(file, applyInsertions(originals.get(file)!, list));
       }
 
       // A diagnostic the marking added sits in a function on some request's
@@ -1287,7 +1288,7 @@ export class TypeInferrer {
       }
       report();
     } finally {
-      for (const [file, text] of originals) file.replaceWithText(text);
+      for (const [file, text] of originals) replaceFileText(file, text);
     }
   }
 

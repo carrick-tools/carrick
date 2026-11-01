@@ -58,10 +58,18 @@ export function pinProgramRoots(project: Project, resolvedByProject: readonly So
 }
 
 /**
- * Set `sourceFile`'s text.
+ * Set `sourceFile`'s text and keep the module format the project's resolver
+ * stamped on it (carrick#3146). Under `node16`..`nodenext` ts-morph's
+ * `replaceWithText` makes a fresh node without that format, and TypeScript
+ * then reuses only part of the old program. A text edit cannot change a file's
+ * format, which comes from its extension and its `package.json` scope, and the
+ * resolver stamps the same value in the rebuild, so the program is unchanged
+ * and the old one is reused whole.
  */
 export function replaceFileText(sourceFile: SourceFile, text: string): void {
+  const format = sourceFile.compilerNode.impliedNodeFormat;
   sourceFile.replaceWithText(text);
+  (sourceFile.compilerNode as { impliedNodeFormat?: typeof format }).impliedNodeFormat = format;
 }
 
 /**
