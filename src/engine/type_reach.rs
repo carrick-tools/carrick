@@ -146,6 +146,24 @@ pub(crate) struct Gate<'a> {
     pub scope: Option<&'a Scope>,
 }
 
+/// Whether two builds are one: the same scanner commit, or both unnamed (a
+/// debug binary, carrick#2157).
+pub(crate) fn same_build(a: Option<&ScannerBuild>, b: Option<&ScannerBuild>) -> bool {
+    a.map(|build| &build.commit) == b.map(|build| &build.commit)
+}
+
+/// Whether `stored` was written by `this_build` in this cache format: what
+/// main's generation must be for a pull request run to reuse anything of it
+/// (carrick#3102, carrick#3104).
+pub(crate) fn written_by_this_build(
+    stored: &CloudRepoData,
+    this_build: Option<&ScannerBuild>,
+    cache_version: u32,
+) -> bool {
+    same_build(stored.scanner_build.as_ref(), this_build)
+        && stored.cache_version == Some(cache_version)
+}
+
 /// The first whole-service reason that holds before the change is read,
 /// in the order carrick#3102 lists them.
 pub(crate) fn gate_reason(gate: &Gate<'_>) -> Option<String> {
@@ -155,10 +173,7 @@ pub(crate) fn gate_reason(gate: &Gate<'_>) -> Option<String> {
     let Some(stored) = gate.stored else {
         return Some("no_stored".to_string());
     };
-    let build_commit = |build: Option<&ScannerBuild>| build.map(|build| build.commit.clone());
-    if build_commit(stored.scanner_build.as_ref()) != build_commit(gate.this_build.as_ref())
-        || stored.cache_version != Some(gate.cache_version)
-    {
+    if !written_by_this_build(stored, gate.this_build.as_ref(), gate.cache_version) {
         return Some("other_build".to_string());
     }
     if stored.dirty == Some(true) {
@@ -172,7 +187,7 @@ pub(crate) fn gate_reason(gate: &Gate<'_>) -> Option<String> {
     }
     let record_usable = gate.record.is_some_and(|record| {
         record.version == TYPE_REACH_RECORD_VERSION
-            && build_commit(record.scanner_build.as_ref()) == build_commit(gate.this_build.as_ref())
+            && same_build(record.scanner_build.as_ref(), gate.this_build.as_ref())
     });
     if !record_usable {
         return Some("no_record".to_string());

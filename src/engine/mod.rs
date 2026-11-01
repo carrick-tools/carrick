@@ -47,6 +47,7 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 pub mod durability;
+mod pair_settle;
 mod route_boundaries;
 pub(crate) mod served_paths;
 pub mod service_workers;
@@ -1087,7 +1088,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // process's own warning is swallowed by the indexer that spawned it
         // (carrick#1490).
         let (analyzer, type_check) =
-            build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar).await?;
+            build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar, None).await?;
         let results = analyzer.get_results();
         crate::local_mode::LocalJoin::from_results(&results, type_check, &analyzer.call_bases())
             .write(&out_path)?;
@@ -1944,6 +1945,24 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .into_iter()
         .partition(|repo| repo.repo_name == repo_name);
     let all_repo_data = peers;
+    // A pull request run takes main's stored outcome for each pair its change
+    // cannot reach (carrick#3104). A run that uploads never settles, and the
+    // reach decision's off switch turns it off too. Read here, before main's
+    // copy moves into the baseline input.
+    let settle = (is_pr_run && !should_upload && !type_reach::turned_off()).then(|| {
+        pair_settle::SettleFrom::new(
+            &main_self_data,
+            runs.iter().filter(|run| run.carried).map(|run| {
+                run.data
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| run.data.repo_name.clone())
+            }),
+            type_compat_v2::type_reach_decisions(),
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+            CACHE_VERSION,
+        )
+    });
     let pr_base = is_pr_run.then(|| pr_base_commit(repo_path)).flatten();
     // Main's copy by commit, read here because the copy moves into the
     // baseline input below (carrick#2284).
@@ -2124,42 +2143,48 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     enter_stage(crate::scan_stage::Stage::CrossRepoCheck)?;
     let sp = logging::spinner("Running cross-repo analysis...");
-    let analyzer =
-        match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
-            Ok((analyzer, type_check)) => {
-                // For the indexer that spawned this scan, which swallows the
-                // warning a skipped check logs (carrick#1490). A no-op anywhere
-                // else.
-                crate::progress::report_type_check(&type_check);
-                analyzer
+    let analyzer = match build_cross_repo_analyzer(
+        all_repo_data,
+        current_services_data,
+        sidecar,
+        settle,
+    )
+    .await
+    {
+        Ok((analyzer, type_check)) => {
+            // For the indexer that spawned this scan, which swallows the
+            // warning a skipped check logs (carrick#1490). A no-op anywhere
+            // else.
+            crate::progress::report_type_check(&type_check);
+            analyzer
+        }
+        Err(e) => {
+            // Cross-repo analysis (which is what runs the type check) failed. Close
+            // the spinner with a warning first so the upload's own spinner
+            // and log lines don't interleave with an unfinished one in
+            // non-TTY CI logs, then preserve the prior behavior where the
+            // per-repo index upload happened BEFORE cross-repo analysis:
+            // still upload this run's data — verdict-less — so the index
+            // stays fresh, then propagate the failure.
+            logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
+            if let Some(payloads) = &upload_payloads {
+                // Whatever the upload could not confirm has already been
+                // named in its own summary line and annotation; the error
+                // this path returns is the analysis failure that brought it
+                // here, which is the one worth raising (carrick#1067).
+                upload_service_payloads(
+                    storage,
+                    payloads,
+                    &type_reach,
+                    no_cache,
+                    !incomplete,
+                    &boundary,
+                )
+                .await;
             }
-            Err(e) => {
-                // Cross-repo analysis (which is what runs the type check) failed. Close
-                // the spinner with a warning first so the upload's own spinner
-                // and log lines don't interleave with an unfinished one in
-                // non-TTY CI logs, then preserve the prior behavior where the
-                // per-repo index upload happened BEFORE cross-repo analysis:
-                // still upload this run's data — verdict-less — so the index
-                // stays fresh, then propagate the failure.
-                logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
-                if let Some(payloads) = &upload_payloads {
-                    // Whatever the upload could not confirm has already been
-                    // named in its own summary line and annotation; the error
-                    // this path returns is the analysis failure that brought it
-                    // here, which is the one worth raising (carrick#1067).
-                    upload_service_payloads(
-                        storage,
-                        payloads,
-                        &type_reach,
-                        no_cache,
-                        !incomplete,
-                        &boundary,
-                    )
-                    .await;
-                }
-                return Err(e);
-            }
-        };
+            return Err(e);
+        }
+    };
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let mut results = analyzer.get_results();
@@ -2267,6 +2292,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             &mut payloads,
             &results.cross_repo_matches,
             &analyzer.pair_directions(),
+        );
+        // Each consumer's final pair outcomes, for a pull request run to
+        // settle the pairs its change cannot reach (carrick#3104).
+        crate::cloud_storage::attach_pair_outcomes(
+            &mut payloads,
+            analyzer.pair_outcomes(),
+            &git_state.commit,
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
         );
         // SDK edges ride along on the same terms as the verdicts: small,
         // consumer-side, canonical-keyed, and attached before the size guard.
@@ -3890,6 +3923,19 @@ fn enforce_payload_size_limit(data: &mut CloudRepoData, staging_available: bool)
         return;
     }
 
+    // The stored pair outcomes go first (carrick#3104): without them a pull
+    // request run judges the service's pairs, as it did before they existed.
+    if data.pair_outcomes.take().is_some() {
+        warn!(
+            "Payload size {}KB exceeds {}KB limit and this backend does not stage oversized \
+             payloads, so the stored pair outcomes are dropped for this upload",
+            serialized.len() / 1024,
+            MAX_PAYLOAD_BYTES / 1024
+        );
+        if serde_json::to_string(&data).is_ok_and(|json| json.len() <= MAX_PAYLOAD_BYTES) {
+            return;
+        }
+    }
     warn!(
         "Payload size {}KB exceeds {}KB limit and this backend does not stage oversized \
          payloads, so the file_results cache is dropped for this upload — the next scan \
@@ -8912,6 +8958,7 @@ fn build_cloud_data_from_mount_graph(
         route_boundaries: None,
         memory_peaks: None,
         type_reach: None,
+        pair_outcomes: None,
     }
 }
 
@@ -12524,7 +12571,7 @@ async fn main_side_findings(
         peers.iter().chain(main_self.iter()),
         main_self.iter(),
     );
-    let (analyzer, type_check) = build_cross_repo_analyzer(peers, main_self, sidecar).await?;
+    let (analyzer, type_check) = build_cross_repo_analyzer(peers, main_self, sidecar, None).await?;
     let main_results = analyzer.get_results();
     let sdk_join = crate::sdk_edges::join(
         &sdk_input,
@@ -12545,6 +12592,7 @@ async fn build_cross_repo_analyzer(
     mut all_repo_data: Vec<CloudRepoData>,
     current_repos: Vec<CloudRepoData>,
     sidecar: Option<&TypeSidecar>,
+    settle: Option<pair_settle::SettleFrom>,
 ) -> Result<(Analyzer, crate::local_mode::JoinTypeCheck), Box<dyn std::error::Error>> {
     // Add the freshly-analyzed local services (one per service) to the mix
     all_repo_data.extend(current_repos);
@@ -12592,7 +12640,7 @@ async fn build_cross_repo_analyzer(
     let type_check = if let Some(sidecar) = sidecar {
         let local_consumers = type_compat_v2::take_local_consumers();
         let (outcomes, state) = finish_type_check(|| {
-            type_compat_v2::run_check(sidecar, &all_repo_data, &local_consumers)
+            type_compat_v2::run_check(sidecar, &all_repo_data, &local_consumers, settle.as_ref())
         });
         if let Some(outcomes) = outcomes {
             analyzer.set_pair_outcomes(outcomes);
@@ -14403,6 +14451,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }
     }
 
@@ -15416,6 +15465,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         relativize_cloud_paths(
@@ -15638,6 +15688,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -15696,6 +15747,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }];
 
         // Test Config merging
@@ -15799,6 +15851,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -16543,6 +16596,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -16606,6 +16660,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -16682,6 +16737,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 route_boundaries: None,
                 memory_peaks: None,
                 type_reach: None,
+                pair_outcomes: None,
             }
         }
 
@@ -16767,6 +16823,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -16834,6 +16891,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             unresolved_reason: None,
             notes: Vec::new(),
             consumer_reads: Vec::new(),
+            spec_hash: String::new(),
+            judged: true,
         }];
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
@@ -16994,6 +17053,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -17148,6 +17208,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         attach_external_call_candidates(
@@ -17279,6 +17340,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         attach_external_call_candidates(
@@ -17404,6 +17466,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -29044,6 +29107,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }
     }
 

@@ -308,21 +308,12 @@ fn git_in(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// carrick#2567: `--changed-only` carries a consumer whose files did not
-/// change, and its untyped calls are judged by retyping them, as a full scan
-/// judges them. Commit A has `api` answer `{ x }`, which `web` reads; both
-/// are stored at A. Commit B drops `x`. A `--pr` run of B with
-/// `--changed-only` analyses `api` alone and carries `web`, and it posts
-/// the findings and the checked-pair counts a full `--pr` run posts.
-#[test]
-fn a_carried_consumer_is_retyped_as_a_full_scan_retypes_it() {
-    if !sidecar_built() {
-        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
-        return;
-    }
-    let dir = tempfile::tempdir().expect("temp dir");
+/// The fixture in `dir`, made so `--changed-only` can carry both services:
+/// `--changed-only` analyses every service with an import it cannot
+/// resolve, and the fixture's libraries are ambient `declare module`
+/// blocks.
+fn carriable_fixture(dir: &Path) -> PathBuf {
     let root = dir
-        .path()
         .canonicalize()
         .expect("canonical temp dir")
         .join("retype-http-client");
@@ -359,6 +350,23 @@ fn a_carried_consumer_is_retyped_as_a_full_scan_retypes_it() {
         assert_ne!(source, relative, "{module} is imported by name");
         std::fs::write(&importer, relative).expect("write the importer");
     }
+    root
+}
+
+/// carrick#2567: `--changed-only` carries a consumer whose files did not
+/// change, and its untyped calls are judged by retyping them, as a full scan
+/// judges them. Commit A has `api` answer `{ x }`, which `web` reads; both
+/// are stored at A. Commit B drops `x`. A `--pr` run of B with
+/// `--changed-only` analyses `api` alone and carries `web`, and it posts
+/// the findings and the checked-pair counts a full `--pr` run posts.
+#[test]
+fn a_carried_consumer_is_retyped_as_a_full_scan_retypes_it() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = carriable_fixture(dir.path());
     let routes = root.join("api/src/routes.ts");
     let dropped = std::fs::read_to_string(&routes).expect("read routes");
     let returned = dropped
@@ -423,4 +431,102 @@ fn a_carried_consumer_is_retyped_as_a_full_scan_retypes_it() {
         scoped["checked"]["pairs"], full["checked"]["pairs"],
         "the scoped run counts the pairs the full run counts"
     );
+}
+
+/// carrick#3104: a pull request whose change reaches neither service takes
+/// main's stored outcome for every pair, so nothing is judged or retyped,
+/// and it posts what the same run posts with the reach decision off, which
+/// judges and retypes every pair. Main's outcomes include the two reads only
+/// the retype finds.
+#[test]
+fn a_pr_that_reaches_no_pair_posts_mains_stored_outcomes() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = carriable_fixture(dir.path());
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-q", "-m", "A"]);
+    let a = git_in(&root, &["rev-parse", "HEAD"]);
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(&store).expect("create the store");
+    scan_stored(&root, &store, &[], &[]);
+
+    std::fs::write(root.join("NOTES.txt"), "unscanned\n").expect("write notes");
+    git_in(&root, &["add", "NOTES.txt"]);
+    git_in(&root, &["commit", "-q", "-m", "B: notes"]);
+    let b = git_in(&root, &["rev-parse", "HEAD"]);
+
+    let pr = |off: bool| -> (serde_json::Value, String) {
+        let out = dir.path().join(format!("pr-{off}.json"));
+        let flags = [
+            "--pr",
+            "7",
+            "--pr-head",
+            &b,
+            "--pr-base",
+            &a,
+            "--changed-only",
+        ];
+        let mut env: Vec<(&str, &Path)> = vec![("CARRICK_PR_RESULT_OUT", &out)];
+        if off {
+            env.push(("CARRICK_TYPE_REACH", Path::new("off")));
+        }
+        let log = scan_stored(&root, &store, &flags, &env);
+        let posted = std::fs::read_to_string(&out)
+            .unwrap_or_else(|error| panic!("the PR run posted no result ({error}):\n{log}"));
+        (
+            serde_json::from_str(&posted).expect("parse the PR result"),
+            log,
+        )
+    };
+    let (judged, judged_log) = pr(true);
+    let (settled, settled_log) = pr(false);
+
+    let settled_line = settled_log
+        .lines()
+        .find(|line| line.contains("pairs settled from main"))
+        .unwrap_or_else(|| panic!("no settle line:\n{settled_log}"));
+    eprintln!("{settled_line}");
+    let counts: Vec<usize> = settled_line
+        .split_whitespace()
+        .filter_map(|word| word.parse().ok())
+        .collect();
+    assert!(
+        counts.len() == 2 && counts[0] > 0 && counts[0] == counts[1],
+        "every pair settles: {settled_line}"
+    );
+    assert!(
+        !settled_log.contains("Retyped web's consumer calls"),
+        "nothing is retyped:\n{settled_log}"
+    );
+    assert!(
+        judged_log.contains("Retyped web's consumer calls"),
+        "the control retypes:\n{judged_log}"
+    );
+    assert!(
+        !judged_log.contains("pairs settled from main"),
+        "{judged_log}"
+    );
+
+    let mismatches = |payload: &serde_json::Value| -> Vec<String> {
+        let mut sites: Vec<String> = payload["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter(|f| f["kind"] == "type_mismatch")
+            .map(|f| f["call_sites"][0].as_str().unwrap_or_default().to_string())
+            .collect();
+        sites.sort();
+        sites
+    };
+    assert_eq!(
+        mismatches(&settled),
+        ["web/src/checkout.ts:11", "web/src/checkout.ts:6"],
+        "main's retyped reads are posted: {settled:#}"
+    );
+    assert_eq!(settled["findings"], judged["findings"]);
+    assert_eq!(settled["checked"], judged["checked"]);
 }

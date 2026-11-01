@@ -119,15 +119,17 @@ export class Retyper {
     const before = new Map<SourceFile, Diag[]>();
     return items.map((item) => {
       if (performance.now() >= deadline) {
-        return abstain(item, `the retype check ran out of its ${budgetMs}ms budget`);
+        return runFailed(abstain(item, `the retype check ran out of its ${budgetMs}ms budget`));
       }
       let outcome: RetypeOutcome;
       try {
         outcome = this.runOne(item, before);
       } catch (err) {
-        outcome = abstain(
-          item,
-          `the retype check failed: ${err instanceof Error ? err.message : String(err)}`
+        outcome = runFailed(
+          abstain(
+            item,
+            `the retype check failed: ${err instanceof Error ? err.message : String(err)}`
+          )
         );
       }
       onJudged?.();
@@ -511,6 +513,11 @@ export class Retyper {
 
 function abstain(item: RetypeItem, reason: string): RetypeOutcome {
   return { item_id: item.item_id, outcome: 'abstain', diagnostics: [], reason };
+}
+
+/** `outcome`, marked as an abstention the run caused (carrick#3104). */
+function runFailed(outcome: RetypeOutcome): RetypeOutcome {
+  return { ...outcome, run_failed: true };
 }
 
 function asLocator(item: RetypeItem): InferRequestItem {

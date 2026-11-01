@@ -245,6 +245,7 @@ impl CloudStorage for MockStorage {
                     route_boundaries: None,
                     memory_peaks: None,
                     type_reach: None,
+                    pair_outcomes: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -288,6 +289,7 @@ impl CloudStorage for MockStorage {
                     route_boundaries: None,
                     memory_peaks: None,
                     type_reach: None,
+                    pair_outcomes: None,
                 },
             ];
             result.extend(mock_repos);

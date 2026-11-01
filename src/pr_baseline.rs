@@ -1073,6 +1073,8 @@ fn surface(data: &CloudRepoData) -> serde_json::Value {
     data.memory_peaks = None;
     // Stamped by main's store and never on a PR run's copy (carrick#3101).
     data.type_reach = None;
+    // Written by main's scans only (carrick#3104).
+    data.pair_outcomes = None;
     for row in data.endpoints.iter_mut().chain(data.calls.iter_mut()) {
         strip_parsed_types(row);
     }

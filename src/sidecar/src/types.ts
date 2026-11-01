@@ -1207,6 +1207,8 @@ export interface RetypeOutcome {
   outcome: 'mismatch' | 'agrees' | 'wider' | 'abstain';
   diagnostics: RetypeDiagnostic[];
   reason?: string;
+  /** Abstained because of how the run went (out of time, a judge that threw), not because of the call: the next run judges it again (carrick#3104). */
+  run_failed?: boolean;
 }
 
 export interface RetypeCheckResponse extends BaseResponse {

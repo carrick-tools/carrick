@@ -1675,6 +1675,13 @@ pub struct PairCheckOutcome {
     /// empty on every other outcome. Such a consumer states no type of its
     /// own, so its finding names these reads instead (carrick#1517).
     pub consumer_reads: Vec<u32>,
+    /// Lowercase hex SHA-256 of everything the pair was judged on
+    /// (carrick#3104): equal hashes mean a stored outcome is this pair's.
+    pub spec_hash: String,
+    /// False when the outcome came from how the run went (a check or retype
+    /// that did not run, a compiler that died of memory, a time limit), not
+    /// from the two types (carrick#3104). Such an outcome is never settled.
+    pub judged: bool,
 }
 
 /// The pairing a type-mismatch outcome is about (carrick-cloud#1369): the
@@ -7600,6 +7607,8 @@ mod tests {
             unresolved_reason: None,
             notes: Vec::new(),
             consumer_reads: Vec::new(),
+            spec_hash: String::new(),
+            judged: true,
         }
     }
 

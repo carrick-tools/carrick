@@ -1497,8 +1497,8 @@ impl<'a> CopyJudge<'a> {
 }
 
 /// Whether a carried service's join fields differ from its stored blob's: its
-/// type verdicts, its SDK edges and what they left unresolved, and its
-/// boundary (carrick#2227). Read on the payload as the upload would send it,
+/// type verdicts and pair outcomes, its SDK edges and what they left
+/// unresolved, and its boundary (carrick#2227, carrick#3104). Read on the payload as the upload would send it,
 /// before it is stamped. An absent list and an empty one are the same answer,
 /// and order is not a difference.
 pub fn join_fields_changed(payload: &CloudRepoData, stored: &CloudRepoData) -> bool {
@@ -1511,7 +1511,18 @@ pub fn join_fields_changed(payload: &CloudRepoData, stored: &CloudRepoData) -> b
         rows.sort();
         rows
     }
+    // The stored pair outcomes by their rows, not their commit and build
+    // stamps: those move on every run (carrick#3104).
+    let outcomes = |data: &CloudRepoData| {
+        rows(
+            &data
+                .pair_outcomes
+                .as_ref()
+                .map(|record| record.outcomes.clone()),
+        )
+    };
     rows(&payload.compat_verdicts) != rows(&stored.compat_verdicts)
+        || outcomes(payload) != outcomes(stored)
         || rows(&payload.sdk_edges) != rows(&stored.sdk_edges)
         || rows(&payload.sdk_unresolved) != rows(&stored.sdk_unresolved)
         || payload.boundary != stored.boundary
@@ -2121,6 +2132,40 @@ mod tests {
         assert!(!join_fields_changed(&payload, &stored));
         payload.boundary = Some(crate::boundary::ServiceBoundary::default());
         assert!(join_fields_changed(&payload, &stored));
+    }
+
+    /// carrick#3104: a carried consumer is rewritten when its stored pair
+    /// outcomes' rows differ, and not when only their stamps do.
+    #[test]
+    fn stored_pair_outcomes_compare_by_their_rows() {
+        use crate::cloud_storage::{StoredPairOutcome, StoredPairOutcomes};
+        let row = |hash: &str| StoredPairOutcome {
+            pair_key: "api/P~web/C".to_string(),
+            spec_hash: hash.to_string(),
+            judged: true,
+            bucket: crate::services::type_sidecar::VerdictBucket::Compatible,
+            gate: None,
+            diagnostic: None,
+            resolved: true,
+            unresolved_reason: None,
+            notes: Vec::new(),
+            consumer_reads: Vec::new(),
+        };
+        let record = |commit: &str, hash: &str| StoredPairOutcomes {
+            version: crate::cloud_storage::PAIR_OUTCOMES_VERSION,
+            commit: commit.to_string(),
+            scanner_build: None,
+            outcomes: vec![row(hash)],
+        };
+        let mut stored = stored("abcdef1234");
+        stored.pair_outcomes = Some(record("abcdef1234", "aa"));
+        let mut payload = stored.clone();
+        payload.pair_outcomes = Some(record("fedcba4321", "aa"));
+        assert!(!join_fields_changed(&payload, &stored), "stamps only");
+        payload.pair_outcomes = Some(record("fedcba4321", "bb"));
+        assert!(join_fields_changed(&payload, &stored), "a moved spec_hash");
+        payload.pair_outcomes = None;
+        assert!(join_fields_changed(&payload, &stored), "no record any more");
     }
 
     #[test]

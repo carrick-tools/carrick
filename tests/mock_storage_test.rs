@@ -66,6 +66,7 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         route_boundaries: None,
         memory_peaks: None,
         type_reach: None,
+        pair_outcomes: None,
     }
 }
 
