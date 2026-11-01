@@ -6588,18 +6588,6 @@ mod tests {
         }
     }
 
-    fn symbol_anchor(alias: &str) -> CaptureAnchor {
-        CaptureAnchor::Symbol {
-            alias: alias.to_string(),
-            symbol_name: "Notification".to_string(),
-            source_file: "src/routes.ts".to_string(),
-            anchor_origin: AnchorOrigin::LlmSymbol,
-            array_depth: None,
-            consumer_response: false,
-            absent_body_tolerated: false,
-        }
-    }
-
     fn death(phase: Option<(&str, &str)>, end: Option<ProcessEnd>) -> CaptureDeath {
         CaptureDeath {
             error: "Sidecar process died unexpectedly".to_string(),
