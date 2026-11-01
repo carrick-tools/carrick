@@ -121,10 +121,38 @@ A service is analysed, and the run logs why, when:
 | `stored_incomplete` | The stored blob records degraded types, or (on a run that asks the model) files the model never answered or candidates no model was asked about. |
 | `config_changed` | Its `carrick.json` entry differs from the stored one. |
 | `commit_missing` | git cannot compare the stored commit, for example because the clone lacks it. |
-| `unresolved_import` | An import in it or in its closure resolves to nothing, is neither a declared dependency nor a runtime builtin, and could name a changed path: for a relative specifier, that path with any extension or a directory index under it; for an alias whose target is missing, anything under the target; for any other bare specifier, a file whose path without its extension ends with the specifier. An unresolved import that could name no changed path is not a reason (carrick#2826): a package that changed shows as a `repo_input_changed`. |
+| `unresolved_import` | An import in it or in its closure resolves to nothing, is neither a declared dependency nor a runtime builtin, and could name a changed path: for a relative specifier, that path with any extension or a directory index under it; for an alias whose target is missing, anything under the target; for any other bare specifier, a file whose path without its extension ends with the specifier. An unresolved import that could name no changed path is not a reason (carrick#2826): a package that changed shows as a `repo_input_changed`, or as an `inputs_changed` when a dependency-only move moved it. |
 | `extends_unfollowed` | A tsconfig `extends` it reads could not be followed. |
-| `repo_input_changed` | A lockfile, any `package.json`, `pnpm-workspace.yaml`, any `deno.json` or `deno.jsonc`, `.gitattributes` or `.gitmodules`, any `.npmrc`, `.yarnrc`, `.yarnrc.yml` or `bunfig.toml`, any `*.graphql`, `*.gql` or `*.graphqls`, or `carrick.json` changed. Every service is analysed. Two changes are not one: a `carrick.json` the tree holds untracked that names exactly the stored services, and a `package.json` that differs from the stored copy only in its top-level `version` (that one is read only by the services that import its package). |
-| `inputs_changed` | A changed file a scan reads is under a root, in the closure, or under an input directory (a README, an image or a changelog there is not read; a test source there counts unless it was edited and still loads the same modules and declares no global or module augmentation), or a path was added or deleted in a directory where one of its imports is looked up. A changed `.gitignore` is judged apart from the repo inputs: it counts for a service when an untracked path under its folder is one the service reads and its walk could enter, or when the service reads the `.gitignore`'s folder whole (a workspace package it enters). |
+| `repo_input_changed` | A lockfile, any `package.json`, `pnpm-workspace.yaml`, any `deno.json` or `deno.jsonc`, `.gitattributes` or `.gitmodules`, any `.npmrc`, `.yarnrc`, `.yarnrc.yml` or `bunfig.toml`, any `*.graphql`, `*.gql` or `*.graphqls`, or `carrick.json` changed. Every service is analysed. Three changes are not one: a `carrick.json` the tree holds untracked that names exactly the stored services, a `package.json` that differs from the stored copy only in its top-level `version` (that one is read only by the services that import its package), and a dependency-only move (below). |
+| `inputs_changed` | A changed file a scan reads is under a root, in the closure, or under an input directory (a README, an image or a changelog there is not read; a test source there counts unless it was edited and still loads the same modules and declares no global or module augmentation), or a path was added or deleted in a directory where one of its imports is looked up. A changed `.gitignore` is judged apart from the repo inputs: it counts for a service when an untracked path under its folder is one the service reads and its walk could enter, or when the service reads the `.gitignore`'s folder whole (a workspace package it enters). Or the service loads a package a dependency-only move moved; the detail is then `<file>: <package>`, the changed manifest or lockfile that moved it. |
+
+A **dependency-only move** (carrick#3115, `src/dependency_move.rs`) is a
+change whose repository inputs are all modified `package.json` files that
+differ only in `dependencies`, `devDependencies`, `peerDependencies`,
+`optionalDependencies` and the top-level `version`, and modified
+`pnpm-lock.yaml` (v6, v9), `package-lock.json` or `npm-shrinkwrap.json`
+(v2, v3) files, with both copies of each read and parsed. Every manifest
+whose dependency maps moved must have a changed lockfile in its install root
+(the nearest directory at or above it that holds a lockfile, holding exactly
+one), and no moved name may be a workspace package. Any other change to a
+repository input (another key, an added or deleted file, `yarn.lock`,
+`bun.lock`, `deno.lock`, `pnpm-workspace.yaml`, `.npmrc`, a lockfile setting
+or format version) is a `repo_input_changed`.
+
+What moved, per install root: every name a manifest re-specified and every
+package whose lockfile entry was added, removed or changed. A service loads
+a moved package when, in an install root holding one of its paths, the
+package is reachable through the lockfile's dependency graph (both copies,
+every version) from a package the service names: the package of every bare
+specifier its source files read (tests included), its closure files and
+every source file under its input directories read, a `#` import's package
+targets, and its tsconfig chain's package `extends`, `types`,
+`jsxImportSource` (`react` for a React `jsx` mode) and `paths` targets under
+`node_modules`. A moved `typescript` or `@types/*` package counts for every
+service under its install root. A changed manifest or lockfile otherwise
+counts only where it sits outside the service's roots in a path it reads.
+A changed `.gitignore` is judged by its own rule and does not stop a move
+from being dependency-only.
 
 Otherwise it is carried. Each service gets one `scope:` log line, followed
 by a summary and the closure walk's wall time.

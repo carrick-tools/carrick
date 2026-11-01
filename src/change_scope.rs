@@ -28,6 +28,7 @@ use tracing::{debug, info};
 
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
+use crate::dependency_move::{DependencyMove, DependencyReach, dependency_move, loaded_packages};
 use crate::git_state::ChangedPath;
 
 /// What `--changed-only` together with `--no-cache` is told: a usage error.
@@ -173,7 +174,8 @@ pub enum CouldBe {
     /// A bare specifier no manifest declares: a file whose path, extension
     /// dropped, ends with it (a `baseUrl` import the resolver missed). A
     /// package changes through its manifest or lockfile, which is a repo
-    /// input of every service already.
+    /// input of every service already, or a dependency-only move the service
+    /// loads ([`crate::dependency_move`]).
     Named(String),
 }
 
@@ -305,7 +307,7 @@ fn test_edit_keeps_imports(
 }
 
 /// Whether `path` is a `.gitignore`, wherever it sits.
-fn is_gitignore(path: &str) -> bool {
+pub(crate) fn is_gitignore(path: &str) -> bool {
     path.rsplit('/').next() == Some(".gitignore")
 }
 
@@ -430,7 +432,7 @@ fn walk_could_enter(
 }
 
 /// Whether `path` is `dir` or under it. `""` is the whole repository.
-fn under(path: &str, dir: &str) -> bool {
+pub(crate) fn under(path: &str, dir: &str) -> bool {
     dir.is_empty()
         || path == dir
         || path
@@ -438,7 +440,7 @@ fn under(path: &str, dir: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn parent_of(path: &str) -> &str {
+pub(crate) fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
@@ -541,10 +543,16 @@ pub fn is_repo_input(path: &str) -> bool {
 /// `keeps_imports` says whether an edited test source still loads what it
 /// loaded ([`test_edit_keeps_imports`]); it is asked only of a modified test
 /// source the service reads by a root or a directory (carrick#3114).
+/// `dependencies` says whether the service loads a package the other repo
+/// input changes moved, when they are a dependency-only move
+/// ([`crate::dependency_move`], carrick#3115); it is asked only when such a
+/// change is listed, and those manifests and lockfiles then count like a
+/// version-only manifest.
 ///
-/// A run that carries under that rule and uploads would write a stored
-/// manifest projection (`packages`, `package_json`, `package_json_hash`)
-/// older than HEAD's; `refreshed_carried` does not refresh it today because
+/// A run that carries under that rule, or under the dependency-only rule,
+/// and uploads would write a stored manifest projection (`packages`,
+/// `package_json`, `package_json_hash`) older than HEAD's (under the
+/// dependency rule, older dependency versions); `refreshed_carried` does not refresh it today because
 /// no uploading run carries (pinned by
 /// `a_carried_write_keeps_the_stored_manifest_projection`).
 ///
@@ -562,6 +570,7 @@ pub fn decide(
     mut version_only: impl FnMut(&ChangedPath) -> bool,
     mut gitignore_moves: impl FnMut(&str, &ServiceInputs) -> bool,
     mut keeps_imports: impl FnMut(&ChangedPath) -> bool,
+    dependencies: impl FnOnce(&ServiceInputs) -> DependencyReach,
     inputs: impl FnOnce() -> ServiceInputs,
 ) -> Scope {
     let Some(stored) = stored else {
@@ -657,15 +666,24 @@ pub fn decide(
         .iter()
         .map(|change| is_repo_input(&change.path) && version_only(change))
         .collect();
+    let mut moved_dependencies = false;
     if let Some((change, _)) = others
         .iter()
         .zip(&version_only)
         .find(|(change, only)| is_repo_input(&change.path) && !**only)
     {
-        return Scope::analysed(Reason::RepoInputChanged, change.path.clone());
+        match dependencies(&inputs) {
+            DependencyReach::Unread => {
+                return Scope::analysed(Reason::RepoInputChanged, change.path.clone());
+            }
+            DependencyReach::Reaches { file, package } => {
+                return Scope::analysed(Reason::InputsChanged, format!("{file}: {package}"));
+            }
+            DependencyReach::Nothing => moved_dependencies = true,
+        }
     }
     if let Some((change, _)) = others.iter().zip(&version_only).find(|(change, only)| {
-        if **only {
+        if **only || (moved_dependencies && is_repo_input(&change.path)) {
             inputs.reads_outside_roots(change, &mut keeps_imports)
         } else {
             inputs.reads(change, &mut keeps_imports)
@@ -775,6 +793,7 @@ pub fn plan<'a>(
     let untracked: std::cell::OnceCell<Option<Vec<String>>> = std::cell::OnceCell::new();
     let mut stops: HashMap<PathBuf, bool> = HashMap::new();
     let mut keeps_imports_of: HashMap<(String, String), bool> = HashMap::new();
+    let mut moved_by_commit: HashMap<String, Option<DependencyMove>> = HashMap::new();
     let mut changed_by_commit: HashMap<String, Result<Vec<ChangedPath>, String>> = HashMap::new();
     let mut closure_took = std::time::Duration::ZERO;
     let mut walked = 0usize;
@@ -834,6 +853,22 @@ pub fn plan<'a>(
                         )
                     })
             };
+            let dependencies = |inputs: &ServiceInputs| {
+                let (Some(blob), Some(top), Ok(paths)) = (stored, &top, changed) else {
+                    return DependencyReach::Unread;
+                };
+                let moved = moved_by_commit
+                    .entry(blob.commit_hash.clone())
+                    .or_insert_with(|| {
+                        dependency_move(repo_path, top, &blob.commit_hash, None, paths)
+                    });
+                match moved {
+                    Some(moved) => moved.reach(inputs, |moved| {
+                        loaded_packages(repo_path, top, service, inputs, &reads, moved)
+                    }),
+                    None => DependencyReach::Unread,
+                }
+            };
             let scope = decide(
                 stored,
                 this_run,
@@ -853,6 +888,7 @@ pub fn plan<'a>(
                     })
                 },
                 keeps_imports,
+                dependencies,
                 || {
                     let started = Instant::now();
                     walked += 1;
@@ -994,7 +1030,7 @@ impl Default for ClosureReads {
 impl ClosureReads {
     /// Keyed by the file's real path: one walk reaches a file by the path it
     /// walked, another through a link or by the resolver's real path.
-    fn loaded_specifiers(&self, file: &Path) -> Vec<String> {
+    pub(crate) fn loaded_specifiers(&self, file: &Path) -> Vec<String> {
         let key = self.canonical(file);
         if let Some(known) = self.specifiers.borrow().get(&key) {
             return known.clone();
@@ -1229,7 +1265,11 @@ pub fn service_inputs(
 
 /// The tsconfig that governs `service`: the one carrick.json names, else the
 /// nearest `tsconfig.json` at or above its directory. Repo-relative.
-fn service_tsconfig_path(root: &Path, service_root: &Path, service: &Config) -> Option<PathBuf> {
+pub(crate) fn service_tsconfig_path(
+    root: &Path,
+    service_root: &Path,
+    service: &Config,
+) -> Option<PathBuf> {
     let found = match &service.tsconfig {
         Some(named) => Some(service_root.join(named)).filter(|path| path.is_file()),
         None => service_root
@@ -1291,7 +1331,11 @@ pub struct CopyJudge<'a> {
     pr_changes: std::cell::OnceCell<Result<Vec<ChangedPath>, String>>,
     /// What the services' closure walks read, shared between the copies.
     reads: ClosureReads,
+    /// What each (copy commit, base) pair's dependency-only move moved.
+    moved: std::cell::RefCell<MovedByPair>,
 }
+
+type MovedByPair = HashMap<(String, String), Option<std::rc::Rc<DependencyMove>>>;
 
 impl<'a> CopyJudge<'a> {
     pub fn new(repo_path: &'a str, services: &'a [Config], main_self: &[CloudRepoData]) -> Self {
@@ -1306,6 +1350,7 @@ impl<'a> CopyJudge<'a> {
             top: crate::git_state::toplevel(repo_path).ok(),
             pr_changes: std::cell::OnceCell::new(),
             reads: ClosureReads::default(),
+            moved: Default::default(),
         }
     }
 
@@ -1316,7 +1361,9 @@ impl<'a> CopyJudge<'a> {
     /// base's where the pull request itself edits a file outside the
     /// service's roots that the service reads: then, and for a copy whose
     /// service this tree does not configure or whose inputs cannot be read
-    /// whole, the whole trees are compared as before.
+    /// whole, the whole trees are compared as before. A changed manifest or
+    /// lockfile counts as in [`decide`]: a dependency-only move counts where
+    /// the service loads a moved package.
     pub fn differs(&self, copy: &CloudRepoData, base: &str) -> Option<bool> {
         if copy.commit_hash == base {
             return Some(false);
@@ -1352,9 +1399,39 @@ impl<'a> CopyJudge<'a> {
         if pr_edits_an_outside_input {
             return whole_tree();
         }
+        // A dependency-only move counts only where the service loads a
+        // moved package (carrick#3115). What it loads is read on this tree,
+        // so a pull request that edits anything it reads, or a repository
+        // input, leaves the move unread.
+        let mut moved_dependencies = false;
+        if changed
+            .iter()
+            .any(|change| is_repo_input(&change.path) && !is_gitignore(&change.path))
+        {
+            let pr_edits_what_it_loads = match pr_changes {
+                Ok(pr_changes) => pr_changes.iter().any(|change| {
+                    is_repo_input(&change.path) || inputs.reads(change, &mut |_| false)
+                }),
+                Err(_) => true,
+            };
+            let moved = (!pr_edits_what_it_loads)
+                .then(|| self.moved(&copy.commit_hash, base, &changed, top))
+                .flatten();
+            let reach = moved.map_or(DependencyReach::Unread, |moved| {
+                moved.reach(&inputs, |moved| {
+                    loaded_packages(self.repo_path, top, service, &inputs, &self.reads, moved)
+                })
+            });
+            if reach != DependencyReach::Nothing {
+                return Some(true);
+            }
+            moved_dependencies = true;
+        }
         Some(changed.iter().any(|change| {
             if is_gitignore(&change.path) {
                 inputs.reads_the_dir_of(&change.path)
+            } else if moved_dependencies && is_repo_input(&change.path) {
+                inputs.reads_outside_roots(change, &mut |_| false)
             } else {
                 is_repo_input(&change.path)
                     || inputs.reads(change, &mut |change| {
@@ -1371,6 +1448,25 @@ impl<'a> CopyJudge<'a> {
                     })
             }
         }))
+    }
+
+    /// What the manifests and lockfiles moved between `from` and `base`,
+    /// read once for every copy stored at `from`.
+    fn moved(
+        &self,
+        from: &str,
+        base: &str,
+        changed: &[ChangedPath],
+        top: &Path,
+    ) -> Option<std::rc::Rc<DependencyMove>> {
+        self.moved
+            .borrow_mut()
+            .entry((from.to_string(), base.to_string()))
+            .or_insert_with(|| {
+                dependency_move(self.repo_path, top, from, Some(base), changed)
+                    .map(std::rc::Rc::new)
+            })
+            .clone()
     }
 }
 
@@ -1504,6 +1600,7 @@ mod tests {
             |_| false,
             |gitignore, inputs| gitignore_moves(gitignore, inputs, Some(&[]), |_, _, _| true),
             |_| false,
+            |_| DependencyReach::Unread,
             || inputs,
         )
     }
@@ -1738,6 +1835,7 @@ mod tests {
             |_| false,
             |_, _| false,
             |_| false,
+            |_| DependencyReach::Unread,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1760,6 +1858,7 @@ mod tests {
             |_| false,
             |_, _| false,
             |_| false,
+            |_| DependencyReach::Unread,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1845,6 +1944,7 @@ mod tests {
                 |_| false,
                 |_, _| false,
                 |_| false,
+                |_| DependencyReach::Unread,
                 api_inputs,
             )
         };
@@ -2582,6 +2682,7 @@ mod tests {
         assert_eq!(written.package_json, stored.package_json);
         assert_eq!(written.package_json_hash, stored.package_json_hash);
     }
+
     /// The stored index sits at A, where a root `.gitignore` exists.
     fn ignoring_workspace() -> (tempfile::TempDir, String, Vec<Config>) {
         let (repo, _, services) = workspace();
@@ -2970,5 +3071,441 @@ mod tests {
             MainCopy::Current
         );
         assert_eq!(judged(repo.path(), &services, &stale, &c), MainCopy::Stale);
+    }
+
+    // --- carrick#3115: a dependency-only change reaches the services that
+    // load a moved package ---
+
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Copy)]
+    enum Manager {
+        Npm,
+        Pnpm,
+    }
+
+    /// Each manifest: its directory, its name, the map it declares in and
+    /// what it declares. `api` loads `lib-a` (which depends on `lib-c`),
+    /// `@fixture/shared` loads `lib-b`, `worker` loads `@fixture/shared`.
+    /// The root declares `lib-d`, which nothing loads, `lib-e`, which a test
+    /// of `web` loads, `lib-f`, which `web`'s tsconfig names, and
+    /// `@types/node`.
+    const LAYOUT: [(&str, &str, &str, &[&str]); 5] = [
+        (
+            "",
+            "mono",
+            "devDependencies",
+            &["@types/node", "lib-d", "lib-e", "lib-f"],
+        ),
+        ("apps/api", "api", "dependencies", &["lib-a"]),
+        ("apps/web", "web", "dependencies", &[]),
+        (
+            "apps/worker",
+            "worker",
+            "dependencies",
+            &["@fixture/shared"],
+        ),
+        (
+            "packages/shared",
+            "@fixture/shared",
+            "dependencies",
+            &["lib-b"],
+        ),
+    ];
+
+    /// Every external package at its first version.
+    fn first_versions() -> BTreeMap<String, String> {
+        [
+            "@types/node",
+            "lib-a",
+            "lib-b",
+            "lib-c",
+            "lib-d",
+            "lib-e",
+            "lib-f",
+        ]
+        .iter()
+        .map(|name| (name.to_string(), "1.0.0".to_string()))
+        .collect()
+    }
+
+    fn workspace_spec(manager: Manager) -> &'static str {
+        match manager {
+            Manager::Npm => "*",
+            Manager::Pnpm => "workspace:*",
+        }
+    }
+
+    /// Every manifest, declaring each external at `declared`'s spec, and the
+    /// lockfile, installing each at `installed`'s version.
+    fn write_dependencies(
+        repo: &Path,
+        manager: Manager,
+        declared: &BTreeMap<String, String>,
+        installed: &BTreeMap<String, String>,
+    ) {
+        let spec = |name: &str| match name {
+            "@fixture/shared" => workspace_spec(manager).to_string(),
+            name => declared[name].clone(),
+        };
+        let declarations = |deps: &[&str]| -> serde_json::Value {
+            deps.iter()
+                .map(|dep| (dep.to_string(), serde_json::Value::from(spec(dep))))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        };
+        for (dir, name, section, deps) in LAYOUT {
+            let mut manifest = serde_json::json!({ "name": name });
+            if dir.is_empty() {
+                manifest["private"] = serde_json::json!(true);
+                if let Manager::Npm = manager {
+                    manifest["workspaces"] = serde_json::json!(["apps/*", "packages/*"]);
+                }
+            }
+            if name == "@fixture/shared" {
+                manifest["main"] = serde_json::json!("src/x.ts");
+            }
+            if !deps.is_empty() {
+                manifest[section] = declarations(deps);
+            }
+            let path = Path::new(dir).join("package.json");
+            std::fs::write(
+                repo.join(path),
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+        let depends_on = |package: &str| -> Vec<&str> {
+            if package == "lib-a" {
+                vec!["lib-c"]
+            } else {
+                vec![]
+            }
+        };
+        match manager {
+            Manager::Npm => {
+                let mut packages = serde_json::Map::new();
+                for (dir, name, section, deps) in LAYOUT {
+                    let mut entry = serde_json::json!({ "name": name });
+                    if !deps.is_empty() {
+                        entry[section] = declarations(deps);
+                    }
+                    if !dir.is_empty() {
+                        packages.insert(
+                            format!("node_modules/{name}"),
+                            serde_json::json!({ "resolved": dir, "link": true }),
+                        );
+                    }
+                    packages.insert(dir.to_string(), entry);
+                }
+                for (package, version) in installed {
+                    let mut entry = serde_json::json!({
+                        "version": version,
+                        "resolved": format!("https://registry.npmjs.org/{package}/-/{package}-{version}.tgz"),
+                        "integrity": format!("sha512-{package}-{version}"),
+                    });
+                    for dep in depends_on(package) {
+                        entry["dependencies"][dep] = serde_json::json!("^1.0.0");
+                    }
+                    packages.insert(format!("node_modules/{package}"), entry);
+                }
+                let lock = serde_json::json!({
+                    "name": "mono",
+                    "lockfileVersion": 3,
+                    "requires": true,
+                    "packages": packages,
+                });
+                std::fs::write(
+                    repo.join("package-lock.json"),
+                    serde_json::to_string_pretty(&lock).unwrap(),
+                )
+                .unwrap();
+            }
+            Manager::Pnpm => {
+                std::fs::write(
+                    repo.join("pnpm-workspace.yaml"),
+                    "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+                )
+                .unwrap();
+                let mut importers = serde_json::Map::new();
+                for (dir, _, section, deps) in LAYOUT {
+                    let mut entry = serde_json::json!({});
+                    for dep in deps {
+                        let version = match *dep {
+                            "@fixture/shared" => "link:../../packages/shared".to_string(),
+                            dep => installed[dep].clone(),
+                        };
+                        entry[section][dep] =
+                            serde_json::json!({ "specifier": spec(dep), "version": version });
+                    }
+                    let key = if dir.is_empty() { "." } else { dir };
+                    importers.insert(key.to_string(), entry);
+                }
+                let mut packages = serde_json::Map::new();
+                let mut snapshots = serde_json::Map::new();
+                for (package, version) in installed {
+                    let key = format!("{package}@{version}");
+                    packages.insert(
+                        key.clone(),
+                        serde_json::json!({ "resolution": { "integrity": format!("sha512-{key}") } }),
+                    );
+                    let mut snapshot = serde_json::json!({});
+                    for dep in depends_on(package) {
+                        snapshot["dependencies"][dep] = serde_json::json!(installed[dep]);
+                    }
+                    snapshots.insert(key, snapshot);
+                }
+                let lock = serde_json::json!({
+                    "lockfileVersion": "9.0",
+                    "settings": { "autoInstallPeers": true, "excludeLinksFromLockfile": false },
+                    "importers": importers,
+                    "packages": packages,
+                    "snapshots": snapshots,
+                });
+                std::fs::write(
+                    repo.join("pnpm-lock.yaml"),
+                    serde_yaml_ng::to_string(&lock).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// [`workspace`] with the dependencies of [`LAYOUT`], each source file
+    /// importing what its manifest declares, a test of `web` importing
+    /// `lib-e` and `web`'s tsconfig naming `lib-f`. Every service is stored
+    /// at the returned commit.
+    fn dependency_workspace(manager: Manager) -> (tempfile::TempDir, String, Vec<Config>) {
+        let (repo, _, services) = workspace();
+        let versions = first_versions();
+        write_dependencies(repo.path(), manager, &versions, &versions);
+        for (path, contents) in [
+            (
+                "apps/api/src/server.ts",
+                "import { a } from \"lib-a\";\nexport const server = a;\n",
+            ),
+            (
+                "packages/shared/src/x.ts",
+                "import { b } from \"lib-b\";\nexport const x = b;\n",
+            ),
+            (
+                "apps/web/src/checkout.test.ts",
+                "import { e } from \"lib-e\";\nexport const t = e;\n",
+            ),
+            (
+                "apps/web/tsconfig.json",
+                r#"{ "compilerOptions": { "types": ["lib-f"] } }"#,
+            ),
+        ] {
+            std::fs::write(repo.path().join(path), contents).unwrap();
+        }
+        let a = commit_all(repo.path(), "dependencies");
+        (repo, a, services)
+    }
+
+    /// `versions` with `package` at `version`.
+    fn moved(
+        versions: &BTreeMap<String, String>,
+        package: &str,
+        version: &str,
+    ) -> BTreeMap<String, String> {
+        let mut moved = versions.clone();
+        moved.insert(package.to_string(), version.to_string());
+        moved
+    }
+
+    /// The scopes of every service after the commit `declared` and
+    /// `installed` write, the services stored at the fixture's commit.
+    fn scopes_after(
+        manager: Manager,
+        declared: &BTreeMap<String, String>,
+        installed: &BTreeMap<String, String>,
+    ) -> Vec<Scope> {
+        let (repo, a, services) = dependency_workspace(manager);
+        let blobs = stored_at(&services, &a);
+        write_dependencies(repo.path(), manager, declared, installed);
+        commit_all(repo.path(), "move");
+        scopes_of(repo.path(), &services, &blobs, &names_of(&services))
+    }
+
+    /// The fixture's services, in order: api, web, worker.
+    #[test]
+    fn a_bump_of_a_package_one_service_loads_analyses_that_service_alone() {
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let scopes = scopes_after(manager, &bumped, &bumped);
+            assert_eq!(
+                reasons(&scopes),
+                [None, None, Some(Reason::InputsChanged)],
+                "{scopes:?}"
+            );
+        }
+    }
+
+    /// `lib-c` moved in the lockfile alone: no manifest names it, and `api`
+    /// loads it through `lib-a`.
+    #[test]
+    fn a_lockfile_only_move_reaches_the_services_that_load_it_through_another_package() {
+        let versions = first_versions();
+        let scopes = scopes_after(Manager::Npm, &versions, &moved(&versions, "lib-c", "1.0.1"));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::InputsChanged), None, None],
+            "{scopes:?}"
+        );
+        let Scope::Analysed { detail, .. } = &scopes[0] else {
+            unreachable!()
+        };
+        assert_eq!(detail, "package-lock.json: lib-c");
+    }
+
+    #[test]
+    fn a_bump_of_a_package_nothing_loads_carries_every_service() {
+        let bumped = moved(&first_versions(), "lib-d", "1.1.0");
+        let scopes = scopes_after(Manager::Npm, &bumped, &bumped);
+        assert_eq!(carried(&scopes), [true, true, true], "{scopes:?}");
+    }
+
+    #[test]
+    fn a_move_of_the_compilers_own_types_analyses_every_service() {
+        let bumped = moved(&first_versions(), "@types/node", "20.1.0");
+        let scopes = scopes_after(Manager::Npm, &bumped, &bumped);
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::InputsChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    /// The root manifest alone declares `lib-e`; a test of `web` loads it.
+    #[test]
+    fn a_package_a_test_loads_is_loaded_by_its_service() {
+        let bumped = moved(&first_versions(), "lib-e", "1.1.0");
+        let scopes = scopes_after(Manager::Npm, &bumped, &bumped);
+        assert_eq!(
+            reasons(&scopes),
+            [None, Some(Reason::InputsChanged), None],
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_the_tsconfig_names_is_loaded_by_its_service() {
+        let bumped = moved(&first_versions(), "lib-f", "1.1.0");
+        let scopes = scopes_after(Manager::Npm, &bumped, &bumped);
+        assert_eq!(
+            reasons(&scopes),
+            [None, Some(Reason::InputsChanged), None],
+            "{scopes:?}"
+        );
+    }
+
+    /// The install is not frozen to a lockfile that did not move with its
+    /// manifest.
+    #[test]
+    fn a_manifest_move_without_its_lockfile_analyses_every_service() {
+        let (repo, a, services) = dependency_workspace(Manager::Npm);
+        let blobs = stored_at(&services, &a);
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        write_dependencies(repo.path(), Manager::Npm, &bumped, &bumped);
+        git_in(
+            repo.path(),
+            &["checkout", "HEAD", "--", "package-lock.json"],
+        );
+        commit_all(repo.path(), "move");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_moved_workspace_package_analyses_every_service() {
+        let (repo, a, services) = dependency_workspace(Manager::Npm);
+        let blobs = stored_at(&services, &a);
+        for path in ["apps/worker/package.json", "package-lock.json"] {
+            let path = repo.path().join(path);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                text.replace(
+                    "\"@fixture/shared\": \"*\"",
+                    "\"@fixture/shared\": \"^1.0.0\"",
+                ),
+            )
+            .unwrap();
+        }
+        commit_all(repo.path(), "move");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_lockfile_this_rule_does_not_read_analyses_every_service() {
+        let (repo, _, services) = dependency_workspace(Manager::Npm);
+        std::fs::create_dir_all(repo.path().join("tools")).unwrap();
+        std::fs::write(repo.path().join("tools/yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        let a = commit_all(repo.path(), "yarn");
+        let blobs = stored_at(&services, &a);
+        std::fs::write(
+            repo.path().join("tools/yarn.lock"),
+            "# yarn lockfile v1\n\nlib-x@1.0.0:\n  version \"1.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "move");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    /// A blobless clone with no remote holds the commit's tree but not its
+    /// copy of the lockfile, so nothing says what moved.
+    #[test]
+    fn a_stored_lockfile_the_clone_cannot_read_analyses_every_service() {
+        let (server, a, services) = dependency_workspace(Manager::Npm);
+        let bumped = moved(&first_versions(), "lib-d", "1.1.0");
+        write_dependencies(server.path(), Manager::Npm, &bumped, &bumped);
+        commit_all(server.path(), "move");
+        let clone = crate::git_state::tests::clone_without_remote(server.path(), &a, true);
+        let blobs = stored_at(&services, &a);
+        let scopes = scopes_of(
+            &clone.path().join("clone"),
+            &services,
+            &blobs,
+            &names_of(&services),
+        );
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+    }
+
+    /// Main's copy of `api` sits at A, before a bump of `lib-b` that `api`
+    /// does not load: it is still main's at the base. `worker` loads it.
+    #[test]
+    fn a_copy_stored_before_a_dependency_move_it_does_not_load_is_current() {
+        let (repo, a, services) = dependency_workspace(Manager::Npm);
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        write_dependencies(repo.path(), Manager::Npm, &bumped, &bumped);
+        let b = commit_all(repo.path(), "move");
+        let main_self = [
+            copy_at("api", &a),
+            copy_at("web", &b),
+            copy_at("worker", &b),
+        ];
+        let repo_path = repo.path().to_string_lossy();
+        let judge = CopyJudge::new(&repo_path, &services, &main_self);
+        assert_eq!(judge.differs(&main_self[0], &b), Some(false));
+        assert_eq!(judge.differs(&copy_at("worker", &a), &b), Some(true));
     }
 }

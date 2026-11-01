@@ -22,6 +22,7 @@ pub mod credentials;
 pub mod current_service;
 pub mod declared_verbs;
 pub mod deno_support;
+pub mod dependency_move;
 pub mod derive_candidates;
 pub mod derive_reach;
 pub mod dispatch;
