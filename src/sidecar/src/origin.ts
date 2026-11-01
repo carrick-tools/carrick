@@ -78,13 +78,16 @@ export function isExternalOrigin(
  * The compiler keeps that verdict on each program (rule 4 of
  * `isExternalOrigin`), but ts-morph rebuilds the program after any edit to the
  * project, such as a probe file created and removed or a file rewritten and
- * restored, and passes every file it has loaded as a ROOT file. The compiler
- * marks no root file as external, so after the first edit no dependency is.
- * Where a path test cannot answer (a Deno project serves npm types from its own
- * cache), every library type then read as the user's: framework machinery was
- * published as a contract and the printer inlined library types it keeps by
- * name. The resolver's answer for a file does not change with the project's
- * history, so it is kept here for as long as the project lives.
+ * restored, and by default passes every file it has loaded as a ROOT file.
+ * The compiler marks no root file as external, so after the first edit no
+ * dependency was. Where a path test cannot answer (a Deno project serves npm
+ * types from its own cache), every library type then read as the user's:
+ * framework machinery was published as a contract and the printer inlined
+ * library types it keeps by name. The resolver's answer for a file does not
+ * change with the project's history, so it is kept here for as long as the
+ * project lives. The loader's projects now pin their roots (carrick#3146), so
+ * a rebuild no longer names a dependency as a root; the record stays for the
+ * Deno resolver and for any project the loader does not build.
  *
  * The compiler's verdict also carries down: a file a library imports, even by
  * a relative path the resolver answers as not external, is reached while the

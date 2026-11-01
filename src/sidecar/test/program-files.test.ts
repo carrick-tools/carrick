@@ -285,8 +285,8 @@ describe('list_program_files and add_program_files (carrick#2027)', () => {
     await ask(first, root, [KENNEL]);
     const firstFiles = await list(first);
     assert.ok(
-      firstFiles.some((file) => /\/lib\.[^/]*\.d\.ts$/.test(file)),
-      `the second build's roots hold the compiler's library files: ${firstFiles.join('\n')}`
+      !firstFiles.some((file) => /\/lib\.[^/]*\.d\.ts$/.test(file) || file.includes('/node_modules/')),
+      `a rebuild does not add the compiler's library files or installed dependencies to the roots (carrick#3146): ${firstFiles.join('\n')}`
     );
 
     const second = await processFor(root);

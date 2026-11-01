@@ -415,13 +415,14 @@ export const hex = encodeHex(new Uint8Array());
     }
   });
   it('keeps a Deno-cached dependency read as library origin after the project is edited (carrick#1731)', async () => {
-    // ts-morph rebuilds the program after any edit to the project with every
-    // file it has loaded as a ROOT file, and the compiler marks no root file
+    // ts-morph rebuilt the program after any edit to the project with every
+    // file it had loaded as a ROOT file, and the compiler marks no root file
     // as an external-library import. On a Deno project that flag is the only
     // thing that says an npm dependency's types are not the user's (no path
     // carries `node_modules`), so an edit made every later answer read the
     // dependency as user source: machinery stopped abstaining, and the printer
-    // inlined library types it keeps by name.
+    // inlined library types it keeps by name. The loader now pins the roots
+    // (carrick#3146), so the compiler keeps the flag through an edit too.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-origin-history-'));
     const client = new SidecarClient();
     try {
@@ -440,8 +441,8 @@ export const hex = encodeHex(new Uint8Array());
       const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
       assert.equal(installed.status, 0, installed.stderr);
 
-      // The trap itself, in process: one probe file created and removed, and
-      // the compiler's flag is gone for the dependency's declaration file.
+      // The trap, in process: one probe file created and removed, and the
+      // compiler's flag stays for the dependency's declaration file.
       const loader = new ProjectLoader({ repoRoot: root });
       assert.equal(loader.load().success, true);
       const project = loader.getProject();
@@ -451,8 +452,8 @@ export const hex = encodeHex(new Uint8Array());
       assert.equal(project.getProgram().compilerObject.isSourceFileFromExternalLibrary(declaring.compilerNode), true);
       project.removeSourceFile(project.createSourceFile(path.join(root, '__probe.ts'), 'export {};\n'));
       const edited = project.getProgram().compilerObject;
-      assert.equal(edited.isSourceFileFromExternalLibrary(declaring.compilerNode), false,
-        'the fixture must reproduce the compiler forgetting the flag, or this test proves nothing');
+      assert.equal(edited.isSourceFileFromExternalLibrary(declaring.compilerNode), true,
+        'the rebuilt program does not name the dependency as a root');
 
       // The answers, through the protocol, before and after each kind of edit
       // a scan makes on the warm project.

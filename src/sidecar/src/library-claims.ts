@@ -1937,9 +1937,10 @@ class DeclarationReader {
    * installed dependency. A `paths` alias to the service's own code, or a
    * `declare module` block the service writes, stands in for the package and
    * says nothing about it (`module_local`). The resolver's flag is read, not
-   * `program.isSourceFileFromExternalLibrary`: once ts-morph has loaded a
-   * dependency, the next program lists it as a root file and the program no
-   * longer calls it external. `resolved_file` and `installed_version` both
+   * `program.isSourceFileFromExternalLibrary`: a program names a
+   * dependency a project loaded itself (a file added through the project API)
+   * as a root file, and the program does not call a root file external. The
+   * loader's own rebuilds no longer add dependencies to the roots (carrick#3146). `resolved_file` and `installed_version` both
    * come from that one agreeing answer.
    */
   readModule(pkg: string, declaration: ts.ImportDeclaration, runtimeModules = false): ModuleRead {

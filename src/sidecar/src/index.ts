@@ -44,7 +44,6 @@ import {
   keepable,
   programDifference,
   programRecord,
-  rebuildProgram,
   readEntry,
   requestDigest,
   writeEntry,
@@ -554,11 +553,10 @@ function inferAnswerKey(
 /**
  * carrick#2843: the kept answer for `key` when every program it was read in
  * is, built again now, the same program. Each is built from its tsconfig and
- * given the roots the kept one had, in order, and rebuilt once more when the
- * kept one had been, so a match leaves the program the inference would have
- * left. A program that does not match is dropped
- * again, so the inference that follows builds it as it would have with no
- * cache.
+ * given the roots the kept one had, in order. A rebuild does not change a
+ * program's roots (carrick#3146), so a match leaves the program the inference
+ * would have left. A program that does not match is dropped again, so the
+ * inference that follows builds it as it would have with no cache.
  */
 function servedAnswer(key: AnswerKey): KeptAnswer | undefined {
   const entry = readEntry(key);
@@ -582,14 +580,7 @@ function servedAnswer(key: AnswerKey): KeptAnswer | undefined {
       same = false;
     });
     if (!same) break;
-    let now = programRecord(kept.key, project);
-    if (now.roots.length < kept.roots.length) {
-      // The inference's own rewrites rebuilt the program after its first
-      // build, and a rebuild names every file the first one reached as a
-      // root. Rebuilt once more here, it names the same.
-      rebuildProgram(project);
-      now = programRecord(kept.key, project);
-    }
+    const now = programRecord(kept.key, project);
     const difference = programDifference(kept, now);
     if (difference) {
       same = false;

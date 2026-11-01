@@ -28,6 +28,7 @@ import {
 } from './capture/index.js';
 import { moduleFormatResolutionHost } from './module-format.js';
 import { ExternalImports, registerExternalImports } from './origin.js';
+import { pinProgramRoots } from './program-files.js';
 
 /**
  * Options for ProjectLoader construction
@@ -272,6 +273,7 @@ export class ProjectLoader {
             compilerOptions: sidecarCompilerOptions(optionsFor(kind, this.snapshotToCompilerOptions(snapshot))),
             skipAddingFilesFromTsConfig: true,
           });
+          pinProgramRoots(project, []);
           if (kind === 'listed') this.addDefaultSourceFiles(project);
           return project;
         };
@@ -302,6 +304,7 @@ export class ProjectLoader {
               })),
             });
             registerExternalImports(project, imports);
+            pinProgramRoots(project, []);
             if (kind === 'listed') {
               for (const file of deno.parsed.fileNames) project.addSourceFileAtPath(file);
               for (const diagnostic of deno.diagnostics) this.logError(diagnostic);
@@ -321,6 +324,7 @@ export class ProjectLoader {
               compilerOptions: sidecarCompilerOptions(optionsFor(kind, DEFAULT_COMPILER_OPTIONS)),
               skipAddingFilesFromTsConfig: true,
             });
+            pinProgramRoots(project, []);
             // Add source files from common locations
             if (kind === 'listed') this.addDefaultSourceFiles(project, (file) => this.projectKeyFor(file) === '');
             return project;
@@ -445,13 +449,18 @@ export class ProjectLoader {
       // Over the tsconfig's own options: ts-morph lays these on top.
       compilerOptions: sidecarCompilerOptions(optionsFor(kind, options)),
       skipAddingFilesFromTsConfig: kind === 'scripts',
+      // The dependency pass is run below, so the files it marks in-project
+      // can be kept out of the program's roots (carrick#3146).
+      skipFileDependencyResolution: true,
       // Each import resolves in its file's own module format (carrick#1619),
       // a referenced project's unbuilt output reads as its source, under its
       // own options (carrick#2418), and every external-library answer is kept
       // past the program rebuilds that drop it (carrick#1731).
       resolutionHost: imports.recording(moduleFormatResolutionHost(referenceRedirectOf(configPath, this.repoRoot))),
     });
+    const resolved = kind === 'listed' ? project.resolveSourceFileDependencies() : [];
     registerExternalImports(project, imports);
+    pinProgramRoots(project, resolved);
     return project;
   }
 
