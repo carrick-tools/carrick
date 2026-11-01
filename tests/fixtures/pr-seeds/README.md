@@ -9,7 +9,12 @@ five fact-layer switches the cloud runner sets.
 - `orders-api` serves an HTTP route (`app/routes/api.v1.orders.$orderId.ts`),
   a GraphQL schema and resolver (`src/schema.graphql`, `src/resolvers.ts`), a
   socket listener and one emit (`src/realtime.ts`), and a pub/sub subscriber
-  and publisher (`src/events.ts`).
+  and publisher (`src/events.ts`). For the type-reach seeds (carrick#3102) it
+  also holds a contracts barrel (`src/contracts/`): the route's `Order` and
+  the listener's `OrderUpdate` each intersect one of its two types, imported
+  on line 2 so no other line moves. `src/augment.ts` augments
+  `@fixture/queue`, and `src/legacy.js` is a CommonJS helper outside the
+  tsconfig's program. Each has an empty answer.
 - `storefront` is the other side of each. Seeds never edit it, so every break
   is a consumer the PR did not update.
 - `admin-api` registers routes in code through a router stub, for two
@@ -58,3 +63,19 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `loop-route-edit` (`admin-api`) | edit inside the loop at `src/admin.ts:20` | empty delta | passes |
 
 RPC routers have no seed: no client row exists to pair with (carrick#937).
+
+## Type-reach seeds (carrick#3102)
+
+`reach_*` tests of `tests/pr_on_main_test.rs`. Each edits `orders-api` and
+reads its dumped decision (`CARRICK_TYPE_REACH_DUMP`).
+
+| Seed | Edit | Asserts |
+| :--- | :--- | :--- |
+| `a_contract_edit_reaches_only_its_routes_aliases` | `src/contracts/order-ref.ts` gains a field | partial: only HTTP aliases reached |
+| `a_resolver_edit_reaches_only_graphql_aliases` | `src/resolvers.ts:7` initial value | partial: only GraphQL aliases reached |
+| `an_edit_to_the_socket_file_reaches_only_socket_aliases` | `src/realtime.ts:8` port | partial: only socket aliases reached |
+| `an_edit_to_the_publisher_reaches_only_pubsub_aliases` | `src/events.ts:10` | partial: only pub/sub aliases reached |
+| `an_augmentation_edit_is_whole` | `src/augment.ts` | `whole (augmentation)` |
+| `a_schema_edit_is_whole` | `src/schema.graphql` | `whole (repo_input)` |
+| `a_tsconfig_edit_is_whole` | `tsconfig.json` target | `whole (config_file)` |
+| `off_is_whole_and_changes_no_payload` | the contract edit, with `CARRICK_TYPE_REACH=off` | `whole (off)`, and the payload equals the run with the decision on |

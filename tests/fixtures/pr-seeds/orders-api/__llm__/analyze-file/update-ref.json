@@ -1,0 +1,9 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_operations": [],
+  "pubsub_operations": [],
+  "graphql_consumer_locates": [],
+  "dispatch_tables": []
+}

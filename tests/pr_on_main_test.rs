@@ -9,12 +9,15 @@
 //! real sidecar.
 
 use async_trait::async_trait;
-use carrick::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
+use carrick::cloud_storage::{
+    CloudRepoData, CloudStorage, StorageError, TypeReachObject, TypeReachRecord, UploadOutcome,
+    decode_type_reach,
+};
 use carrick::engine::run_analysis_engine_with_sidecar;
 use carrick::findings::PrResultPayload;
 use carrick::pr_baseline::{MainSideFault, inject_mock_main_side_fault, main_side_runs};
 use carrick::services::type_sidecar::TypeSidecar;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -24,11 +27,16 @@ use std::time::Duration;
 /// fault, so they run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Each service's stored type-reach record (carrick#3101), gzipped, by repo
+/// and service.
+type ReachObjects = HashMap<(String, Option<String>), Vec<u8>>;
+
 /// In-memory index plus every PR result the run posted.
 #[derive(Default, Clone)]
 struct Store {
     repos: Arc<Mutex<Vec<CloudRepoData>>>,
     pr_results: Arc<Mutex<Vec<PrResultPayload>>>,
+    type_reach: Arc<Mutex<ReachObjects>>,
 }
 
 #[async_trait]
@@ -44,6 +52,40 @@ impl CloudStorage for Store {
         });
         repos.push(data.clone());
         Ok(UploadOutcome::default())
+    }
+    // The record is kept beside the blob and the blob names it, as the
+    // cloud stamps it (carrick#3101), so a PR run reads main's.
+    async fn upload_repo_data_with_reach(
+        &self,
+        data: &CloudRepoData,
+        type_reach: Option<&TypeReachObject>,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
+        let Some(object) = type_reach else {
+            return self.upload_repo_data(data, final_in_run).await;
+        };
+        self.type_reach.lock().unwrap().insert(
+            (data.repo_name.clone(), data.service_name.clone()),
+            object.gz().to_vec(),
+        );
+        let mut stamped = data.clone();
+        stamped.type_reach = Some(object.reference().clone());
+        self.upload_repo_data(&stamped, final_in_run).await
+    }
+    async fn type_reach_records(
+        &self,
+        stored: &[CloudRepoData],
+    ) -> HashMap<String, TypeReachRecord> {
+        let objects = self.type_reach.lock().unwrap();
+        stored
+            .iter()
+            .filter_map(|data| {
+                let object = objects.get(&(data.repo_name.clone(), data.service_name.clone()))?;
+                let record = decode_type_reach(object, data.type_reach.as_ref()?)?;
+                let id = data.service_name.clone().unwrap_or(data.repo_name.clone());
+                Some((id, record))
+            })
+            .collect()
     }
     async fn index_landed(
         &self,
@@ -1992,7 +2034,9 @@ fn edit(repo: &Path, file: &str, replacements: &[(&str, &str)]) {
 struct MainSnapshot {
     trees: PathBuf,
     shared_rows: Vec<CloudRepoData>,
+    shared_reach: ReachObjects,
     admin_rows: Vec<CloudRepoData>,
+    admin_reach: ReachObjects,
 }
 
 static MAIN: tokio::sync::OnceCell<MainSnapshot> = tokio::sync::OnceCell::const_new();
@@ -2022,7 +2066,9 @@ async fn main_snapshot() -> &'static MainSnapshot {
         MainSnapshot {
             trees: unlinked(&trees),
             shared_rows: shared.repos.lock().unwrap().clone(),
+            shared_reach: shared.type_reach.lock().unwrap().clone(),
             admin_rows: admin_store.repos.lock().unwrap().clone(),
+            admin_reach: admin_store.type_reach.lock().unwrap().clone(),
         }
     })
     .await
@@ -2042,14 +2088,15 @@ async fn seed_payload(repo_name: &str, change: impl FnOnce(&Path)) -> serde_json
     change(&repo);
     commit(&repo, "pr: seed");
     event_with_base(tmp.path(), &base);
-    let rows = if repo_name == "admin-api" {
-        &main.admin_rows
+    let (rows, reach) = if repo_name == "admin-api" {
+        (&main.admin_rows, &main.admin_reach)
     } else {
-        &main.shared_rows
+        (&main.shared_rows, &main.shared_reach)
     };
     let store = Store {
         repos: Arc::new(Mutex::new(rows.clone())),
         pr_results: Arc::default(),
+        type_reach: Arc::new(Mutex::new(reach.clone())),
     };
     let _cassettes = Cassettes::from(&repo.join("__llm__"));
     pr_payload_with(&store, &repo, true).await
@@ -3014,4 +3061,212 @@ async fn a_pull_request_scan_stores_no_type_reach_record() {
     );
     let blob = stored_blob(&store, "inventory-svc");
     assert!(blob.get("type_reach").is_none(), "{blob:#}");
+}
+
+// ---- Type reach (carrick#3102) -------------------------------------------
+//
+// A PR run decides, per service, which manifest aliases its change can reach
+// and dumps the decision (`CARRICK_TYPE_REACH_DUMP`). It changes nothing
+// else yet: the payload is the same with the decision off.
+
+/// Sets one environment variable for its lifetime.
+struct EnvVar(&'static str, Option<String>);
+
+impl EnvVar {
+    fn set(name: &'static str, value: &str) -> Self {
+        let before = std::env::var(name).ok();
+        // SAFETY: the tests in this binary run one at a time (SERIAL).
+        unsafe { std::env::set_var(name, value) };
+        EnvVar(name, before)
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        // SAFETY: the tests in this binary run one at a time (SERIAL).
+        unsafe {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+}
+
+/// The PR run's payload and `orders-api`'s dumped decision, for `change`.
+async fn reach_of(change: impl FnOnce(&Path)) -> (serde_json::Value, serde_json::Value) {
+    let dump = tempfile::tempdir().unwrap();
+    let _dump = EnvVar::set("CARRICK_TYPE_REACH_DUMP", &dump.path().to_string_lossy());
+    let payload = seed_payload("orders-api", change).await;
+    let file = dump.path().join("orders-api.json");
+    let decided = serde_json::from_str(
+        &std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("no dump at {}: {e}", file.display())),
+    )
+    .unwrap();
+    (payload, decided)
+}
+
+/// The reason of a whole decision.
+fn whole_reason(dump: &serde_json::Value) -> &str {
+    let decided = &dump["decided"];
+    assert_eq!(decided["decision"], "whole", "{dump:#}");
+    decided["reason"].as_str().unwrap()
+}
+
+/// The protocol of each alias of a partial decision, split by whether the
+/// change reached it.
+fn reached_protocols(dump: &serde_json::Value) -> (BTreeSet<String>, BTreeSet<String>) {
+    let decided = &dump["decided"];
+    assert_eq!(decided["decision"], "partial", "{dump:#}");
+    let (mut reached, mut unreached) = (BTreeSet::new(), BTreeSet::new());
+    for alias in decided["aliases"].as_array().unwrap() {
+        let protocol = alias["protocol"].as_str().unwrap().to_string();
+        if alias["reached"] == true {
+            reached.insert(protocol);
+        } else {
+            unreached.insert(protocol);
+        }
+    }
+    (reached, unreached)
+}
+
+/// A partial decision reached `protocol`'s aliases, no other's, and left
+/// some alias unreached.
+fn assert_reached_only(dump: &serde_json::Value, protocol: &str) {
+    let (reached, unreached) = reached_protocols(dump);
+    assert_eq!(
+        reached,
+        BTreeSet::from([protocol.to_string()]),
+        "reached: {dump:#}"
+    );
+    assert!(!unreached.is_empty(), "nothing left unreached: {dump:#}");
+}
+
+fn edit_contract(repo: &Path) {
+    edit(
+        repo,
+        "src/contracts/order-ref.ts",
+        &[("  id: string;", "  id: string;\n  region?: string;")],
+    );
+}
+
+#[tokio::test]
+async fn reach_a_contract_edit_reaches_only_its_routes_aliases() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(edit_contract).await;
+    assert_reached_only(&dump, "http");
+}
+
+#[tokio::test]
+async fn reach_a_resolver_edit_reaches_only_graphql_aliases() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        edit(
+            repo,
+            "src/resolvers.ts",
+            &[(
+                "new Map<string, OrderView>();",
+                "new Map<string, OrderView>([]);",
+            )],
+        )
+    })
+    .await;
+    assert_reached_only(&dump, "graphql");
+}
+
+#[tokio::test]
+async fn reach_an_edit_to_the_socket_file_reaches_only_socket_aliases() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        edit(
+            repo,
+            "src/realtime.ts",
+            &[("new Server(4000)", "new Server(4001)")],
+        )
+    })
+    .await;
+    assert_reached_only(&dump, "websocket");
+}
+
+#[tokio::test]
+async fn reach_an_edit_to_the_publisher_reaches_only_pubsub_aliases() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        edit(
+            repo,
+            "src/events.ts",
+            &[("void event.amount;", "void event.orderId;")],
+        )
+    })
+    .await;
+    // Library-stated pub/sub rows carry no manifest entry yet
+    // (carrick#3089), so the service has no pub/sub alias to reach: the
+    // publisher's file is reached and no other protocol's alias is.
+    let (reached, _) = reached_protocols(&dump);
+    assert!(
+        reached.iter().all(|protocol| protocol == "pubsub"),
+        "{dump:#}"
+    );
+    assert!(
+        dump["decided"]["reached_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file == "src/events.ts"),
+        "{dump:#}"
+    );
+}
+
+#[tokio::test]
+async fn reach_an_augmentation_edit_is_whole() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        edit(
+            repo,
+            "src/augment.ts",
+            &[("drain(): Promise<void>;", "drain(): Promise<boolean>;")],
+        )
+    })
+    .await;
+    assert_eq!(whole_reason(&dump), "augmentation");
+}
+
+#[tokio::test]
+async fn reach_a_schema_edit_is_whole() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        edit(
+            repo,
+            "src/schema.graphql",
+            &[("currency: String!", "currency: String")],
+        )
+    })
+    .await;
+    assert_eq!(whole_reason(&dump), "repo_input");
+}
+
+#[tokio::test]
+async fn reach_a_tsconfig_edit_is_whole() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        edit(
+            repo,
+            "tsconfig.json",
+            &[("\"target\": \"es2020\"", "\"target\": \"es2021\"")],
+        )
+    })
+    .await;
+    assert_eq!(whole_reason(&dump), "config_file");
+}
+
+#[tokio::test]
+async fn reach_off_is_whole_and_changes_no_payload() {
+    let _serial = SERIAL.lock().await;
+    let (on, dump) = reach_of(edit_contract).await;
+    assert_eq!(dump["decided"]["decision"], "partial", "{dump:#}");
+    let _off = EnvVar::set("CARRICK_TYPE_REACH", "off");
+    let (off, dump) = reach_of(edit_contract).await;
+    assert_eq!(whole_reason(&dump), "off");
+    assert_eq!(on, off);
 }

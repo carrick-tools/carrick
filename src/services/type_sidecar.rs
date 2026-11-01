@@ -1689,7 +1689,7 @@ impl SidecarRequest {
 
 /// One edit for [`TypeSidecar::reach`]: the file's text before and after, `""`
 /// for the missing side of an added or deleted file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReachChange {
     pub file: String,
     pub before: String,
@@ -2194,23 +2194,36 @@ impl TypeResolutionResult {
     /// stage sent: explicit symbols and inference sites alike (carrick#3101).
     /// A request with no alias names no manifest row, so it is not listed.
     pub fn note_request_files(&mut self, explicit: &[SymbolRequest], infer: &[InferRequestItem]) {
-        let named = explicit
-            .iter()
-            .map(|request| (request.alias.as_ref(), &request.source_file))
-            .chain(
-                infer
-                    .iter()
-                    .map(|request| (request.alias.as_ref(), &request.file_path)),
-            );
-        for (alias, file) in named {
-            if let Some(alias) = alias {
-                self.request_files
-                    .entry(alias.clone())
-                    .or_default()
-                    .insert(file.clone());
-            }
+        for (alias, files) in request_files(explicit, infer) {
+            self.request_files.entry(alias).or_default().extend(files);
         }
     }
+}
+
+/// Each alias `explicit` and `infer` carry, with the file of every request
+/// that carries it, as the requests name them. A request with no alias names
+/// no manifest row, so it is not listed. Read by the type-reach record
+/// (carrick#3101) and by a pull request scan's reach decision (carrick#3102).
+pub fn request_files(
+    explicit: &[SymbolRequest],
+    infer: &[InferRequestItem],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut files: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let named = explicit
+        .iter()
+        .map(|request| (request.alias.as_ref(), &request.source_file))
+        .chain(
+            infer
+                .iter()
+                .map(|request| (request.alias.as_ref(), &request.file_path)),
+        );
+    for (alias, file) in named {
+        if let Some(alias) = alias {
+            files.entry(alias.clone()).or_default().insert(file.clone());
+        }
+    }
+    files
 }
 
 // ============================================================================

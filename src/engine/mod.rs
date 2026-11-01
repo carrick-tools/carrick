@@ -54,6 +54,7 @@ pub mod setup_ahead;
 mod siblings;
 mod socket_sites;
 pub(crate) mod type_compat_v2;
+mod type_reach;
 pub(crate) mod upload_boundary;
 mod walk_lane;
 
@@ -1163,8 +1164,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // Under `--changed-only`, which services are analysed and which carry
     // their stored generation (carrick#2227). A carried service is in no
     // part of the analysis: not asked ahead, not scanned, not retried.
-    let scopes: Vec<crate::change_scope::Scope> = if crate::change_scope::requested() {
-        crate::change_scope::plan(
+    //
+    // A pull request run decides, per service, which aliases its change can
+    // reach (carrick#3102). It and the scope plan read one listing of the
+    // paths changed since each stored commit.
+    let pr_run = pr_context().is_some();
+    let changes = (crate::change_scope::requested() || pr_run).then(|| {
+        std::sync::Arc::new(crate::change_scope::ChangedSince::new(
             repo_path,
             &services,
             &previous_generations
@@ -1172,6 +1178,16 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .filter(|generation| generation.repo_name == repo_name)
                 .map(|generation| generation.service_name.clone())
                 .collect::<Vec<_>>(),
+        ))
+    });
+    let scopes: Vec<crate::change_scope::Scope> = if let Some(changes) = changes
+        .as_deref()
+        .filter(|_| crate::change_scope::requested())
+    {
+        crate::change_scope::plan(
+            repo_path,
+            &services,
+            changes,
             |service| previous_generation(previous_generations, &repo_name, service),
             crate::change_scope::ThisRun {
                 scanner_version: env!("CARGO_PKG_VERSION"),
@@ -1198,6 +1214,29 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .filter(|(_, at)| at.is_some())
         .map(|(service, _)| service.clone())
         .collect();
+    type_compat_v2::clear_type_reach();
+    let reach = match changes.filter(|_| pr_run) {
+        Some(changes) => {
+            let own: Vec<CloudRepoData> = previous_generations
+                .iter()
+                .filter(|generation| generation.repo_name == repo_name)
+                .cloned()
+                .collect();
+            let mut analysed_scopes = vec![None; analysed.len()];
+            for (scope, at) in scopes.iter().zip(&scan_index) {
+                if let Some(at) = at {
+                    analysed_scopes[*at] = Some(scope.clone());
+                }
+            }
+            Some(type_reach::ReachRun::new(
+                repo_path,
+                storage.type_reach_records(&own).await,
+                analysed_scopes,
+                changes,
+            ))
+        }
+        None => None,
+    };
     let recipe = sidecar.map(TypeSidecar::recipe);
     // Several services at once, each on a thread of its own and each started
     // in declared order (carrick#1066). A failure in one stops none of the
@@ -1308,6 +1347,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         setups: std::sync::Arc::new(setups),
         workspace: workspace_scan,
         walks: walking.then_some(walks),
+        reach,
     });
     let upload_blocked = multi_service && !storage.supports_multi_service();
     let jobs: Vec<ServiceJob> = services
@@ -1335,6 +1375,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // again, that death stops the run below, as one alone always has.
     for (at, outcome) in outcomes.iter_mut().enumerate() {
         scan.analyse_again_alone(at, outcome, run_cap_mb).await;
+    }
+    if let Some(line) = type_reach::total_line(&type_compat_v2::type_reach_decisions()) {
+        info!("{line}");
     }
     crate::scan_timing::pass_ended(pass_started.elapsed().as_secs_f64());
     let mut runs: Vec<ServiceRun> = Vec::with_capacity(services.len());
@@ -2530,6 +2573,9 @@ struct ServiceScan {
     /// The other services of the run, read for the walks that enter them
     /// (carrick#2618).
     siblings: siblings::SiblingRegistry,
+    /// What a pull request run reads to decide each service's type reach
+    /// (carrick#3102); `None` on any other run.
+    reach: Option<type_reach::ReachRun>,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -2891,6 +2937,15 @@ impl ServiceScan {
                         registry: &self.siblings,
                         own,
                         walks: self.walks.as_deref(),
+                    }),
+                // A retry re-enters this run's own blob: the decision made
+                // against main's stands.
+                self.reach
+                    .as_ref()
+                    .filter(|_| generation == PreviousGeneration::Stored)
+                    .map(|run| type_reach::ReachContext {
+                        run,
+                        scope: run.scopes.get(index).and_then(Option::as_ref),
                     }),
             )))
             .await;
@@ -4115,6 +4170,7 @@ async fn analyze_current_repo_incremental(
     graphql_schemas: &crate::graphql::SchemaCatalogue,
     positions: Option<crate::position_rows::PositionIndex>,
     neighbours: Option<siblings::Neighbours<'_>>,
+    reach: Option<type_reach::ReachContext<'_>>,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -4801,6 +4857,36 @@ async fn analyze_current_repo_incremental(
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
+            // A pull request run decides which aliases its change can reach
+            // (carrick#3102), over the requests the type stage below sends:
+            // collected as it collects them, which is deterministic over the
+            // same inputs. Logged and kept; nothing reads it yet.
+            if let Some(context) = reach {
+                let (mut explicit, mut infer, _) = file_orchestrator.collect_type_requests(
+                    &merged_results,
+                    repo_path,
+                    &mount_graph,
+                    config,
+                    &service_modules,
+                );
+                explicit.extend_from_slice(&protocol_requests);
+                infer.extend_from_slice(&protocol_infer);
+                crate::site_payloads::take_over(&mut infer, &payload_infer);
+                type_reach::decide_service(
+                    context,
+                    &type_reach::ServiceFacts {
+                        id: prev.service_name.as_deref().unwrap_or(&prev.repo_name),
+                        label: config.service_name.as_deref().unwrap_or("(root)"),
+                        config,
+                        stored: Some(prev),
+                        repo_path,
+                    },
+                    &cloud_data,
+                    &crate::services::type_sidecar::request_files(&explicit, &infer),
+                    sidecar,
+                );
+            }
+
             // Type resolution via sidecar (+ v2 capture stub for this service)
             let TypesOutcome {
                 stub_dir,
@@ -4899,6 +4985,18 @@ async fn analyze_current_repo_incremental(
 
     // Fallback: full analysis (analyze_current_repo now populates cache fields)
     debug!("Running full analysis...");
+    if let Some(context) = reach {
+        type_reach::decide_service_whole(
+            context,
+            &type_reach::ServiceFacts {
+                id: config.service_name.as_deref().unwrap_or(&repo_name),
+                label: config.service_name.as_deref().unwrap_or("(root)"),
+                config,
+                stored: previous_data,
+                repo_path,
+            },
+        );
+    }
     // The intent content-hash cache is keyed purely on content
     // (INTENT_CACHE_VERSION + body + callee intents), so it stays valid even
     // when the ANALYSIS cache is unusable (cache_version bump, missing

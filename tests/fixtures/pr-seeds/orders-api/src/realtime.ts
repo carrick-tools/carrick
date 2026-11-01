@@ -1,6 +1,6 @@
 import { Server } from "socket.io";
-
-export type OrderUpdate = {
+import type { UpdateRef } from "./contracts";
+export type OrderUpdate = UpdateRef & {
   orderId: string;
   status: string;
 };
