@@ -216,6 +216,144 @@ pub struct PartAnswer {
     pub answer: FileAnalysisResult,
 }
 
+/// The id a part gives the candidate it lists `ordinal`th, counting from 1
+/// (carrick#2794). A file's own id names a byte range of the file, which an
+/// edit anywhere above it moves, so a part names its candidates by their place
+/// in the part. `c<n>` cannot be a file id (`span:<a>-<b>`).
+fn part_candidate_id(ordinal: usize) -> String {
+    format!("c{ordinal}")
+}
+
+impl PartAnswer {
+    /// A part's answer read back into the file's own terms (carrick#2794).
+    ///
+    /// The model answered in what its prompt showed: the part's candidate ids
+    /// ([`part_candidate_id`]) and the part's line numbers
+    /// ([`ShownLines::prompt_line`]). Everything stored, merged and joined is
+    /// in the file's ids and lines, so this is the one place the two meet,
+    /// called wherever a part's answer arrives.
+    ///
+    /// - A row's `candidate_id` that is one of the part's ids becomes the file
+    ///   id of that candidate. Any other id is kept as the model wrote it: it
+    ///   cannot be a file id by shape, so it is an id the model made up, which
+    ///   is what it is for a whole file.
+    /// - Every line the extraction schema asks for is mapped with
+    ///   [`ShownLines::file_line`]. A line that names no shown line becomes `0`
+    ///   where the row must have one and `None` where it may not. It is never
+    ///   replaced by the candidate's own line: the model-row join asks whether
+    ///   a row was stated AT its site by the line the model gave (carrick#1395).
+    pub fn read(
+        file_path: &str,
+        part: &SourcePart,
+        listed: &[ListedCandidate],
+        mut answer: FileAnalysisResult,
+    ) -> PartAnswer {
+        let shown = part.shown();
+        let file_ids: HashMap<String, &str> = part
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(index, position)| {
+                (
+                    part_candidate_id(index + 1),
+                    listed[*position].candidate_id.as_str(),
+                )
+            })
+            .collect();
+        let file_line = |line: i32| -> Option<i32> {
+            shown
+                .file_line(i64::from(line))
+                .and_then(|file| i32::try_from(file).ok())
+        };
+        let mut unmapped = 0usize;
+        let mut required = |line: i32| -> i32 {
+            file_line(line).unwrap_or_else(|| {
+                unmapped += 1;
+                0
+            })
+        };
+        for row in &mut answer.mounts {
+            row.line_number = required(row.line_number);
+        }
+        for row in &mut answer.endpoints {
+            if let Some(id) = file_ids.get(&row.candidate_id) {
+                row.candidate_id = (*id).to_string();
+            }
+            row.line_number = required(row.line_number);
+        }
+        for row in &mut answer.data_calls {
+            if let Some(id) = file_ids.get(&row.candidate_id) {
+                row.candidate_id = (*id).to_string();
+            }
+            row.line_number = required(row.line_number);
+        }
+        for row in &mut answer.pubsub_operations {
+            row.line_number = required(row.line_number);
+        }
+        let mut optional = |line: &mut Option<i32>| {
+            if let Some(prompt) = *line {
+                *line = file_line(prompt);
+                if line.is_none() {
+                    unmapped += 1;
+                }
+            }
+        };
+        for row in &mut answer.endpoints {
+            optional(&mut row.payload_expression_line);
+            optional(&mut row.response_expression_line);
+        }
+        for row in &mut answer.data_calls {
+            optional(&mut row.call_expression_line);
+            optional(&mut row.payload_expression_line);
+        }
+        for row in &mut answer.pubsub_operations {
+            optional(&mut row.payload_expression_line);
+        }
+        for row in &mut answer.graphql_operations {
+            optional(&mut row.resolver_line);
+        }
+        for table in &mut answer.dispatch_tables {
+            if let Some(prompt) = table.line_number {
+                table.line_number = shown.file_line(i64::from(prompt));
+                if table.line_number.is_none() {
+                    unmapped += 1;
+                }
+            }
+        }
+        if unmapped > 0 {
+            debug!(
+                "{file_path}: part {} answered {unmapped} line(s) that name no line it shows",
+                part.label()
+            );
+        }
+        PartAnswer {
+            window: part.window(),
+            answer,
+        }
+    }
+}
+
+/// What a part's eval dump states beside its prompt (carrick#2794): the file
+/// id each local candidate id stands for, and the file lines the part shows,
+/// so a harness reads the part's answer as [`PartAnswer::read`] does.
+fn part_dump_facts(part: &SourcePart, listed: &[ListedCandidate]) -> serde_json::Value {
+    let candidate_ids: serde_json::Map<String, serde_json::Value> = part
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(index, position)| {
+            (
+                part_candidate_id(index + 1),
+                serde_json::json!(listed[*position].candidate_id),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "candidate_ids": candidate_ids,
+        "shown_runs": part.shown().runs,
+    })
+}
+
 /// A file's candidates as groups in source order: the candidates that share a
 /// start are one group, held as positions in the prompt's listing, in the
 /// order the prompt lists them.
@@ -415,6 +553,9 @@ struct PartedFile<'a> {
     graphql_consumer_hints: &'a [String],
     wrapper_context: &'a [String],
     wrapper_imports: &'a BTreeMap<String, Vec<usize>>,
+    /// The file's candidates by id, from which a part renders its own hints
+    /// and contexts (carrick#2794).
+    candidate_map: &'a HashMap<String, CandidateTarget>,
 }
 
 impl PartedFile<'_> {
@@ -2054,15 +2195,22 @@ impl FileOrchestrator {
         let mut wave = std::mem::take(&mut plan.parts);
         while !wave.is_empty() {
             let labels: Vec<String> = wave.iter().map(|(part, _)| part.label()).collect();
+            let facts: Vec<serde_json::Value> = wave
+                .iter()
+                .map(|(part, _)| part_dump_facts(part, file.listed))
+                .collect();
             let outcomes =
-                futures::future::join_all(wave.iter().zip(&labels).map(|((_, prompt), label)| {
-                    self.file_analyzer.analyze_part_prompt(
-                        file.prompt_path,
-                        label,
-                        prompt,
-                        guidance,
-                    )
-                }))
+                futures::future::join_all(wave.iter().zip(labels.iter().zip(&facts)).map(
+                    |((_, prompt), (label, facts))| {
+                        self.file_analyzer.analyze_part_prompt(
+                            file.prompt_path,
+                            label,
+                            prompt,
+                            guidance,
+                            facts,
+                        )
+                    },
+                ))
                 .await;
             // `join_all` answers in the order it was given the parts, which is
             // source order, so the failure kept is the first in the source
@@ -2072,10 +2220,12 @@ impl FileOrchestrator {
             for ((part, prompt), outcome) in wave.into_iter().zip(outcomes) {
                 let error = match outcome {
                     Ok(answer) => {
-                        answers.push(PartAnswer {
-                            window: part.window(),
+                        answers.push(PartAnswer::read(
+                            file.prompt_path,
+                            &part,
+                            file.listed,
                             answer,
-                        });
+                        ));
                         continue;
                     }
                     Err(_) if lost.is_some() => continue,
@@ -2153,15 +2303,38 @@ impl FileOrchestrator {
         attached: PartModules,
     ) -> Option<AnalysisPrompt> {
         let positions = &part.candidates;
-        let hints: Vec<String> = positions
-            .iter()
-            .map(|position| file.candidate_hints[*position].clone())
-            .collect();
-        let contexts: Vec<String> = positions
-            .iter()
-            .map(|position| file.candidate_contexts[*position].clone())
-            .collect();
         let shown = part.shown();
+        // Each candidate as the part states it: its place in the part for an
+        // id, the line the part numbers it on, and no byte offset, so that
+        // nothing the part shows moves with an edit elsewhere in the file
+        // (carrick#2794).
+        let mut hints: Vec<String> = Vec::with_capacity(positions.len());
+        let mut contexts: Vec<String> = Vec::with_capacity(positions.len());
+        for (index, position) in positions.iter().enumerate() {
+            let id = part_candidate_id(index + 1);
+            let candidate = file.candidate_map.get(&file.listed[*position].candidate_id);
+            let line = candidate.and_then(|candidate| {
+                shown.prompt_line(u32::try_from(candidate.line_number).ok()?)
+            });
+            match (candidate, line) {
+                (Some(candidate), Some(line)) => {
+                    hints.push(candidate.part_hint(&id, line));
+                    contexts.push(candidate.part_context(&id, line));
+                }
+                // Not reachable while `list` and `unlist` keep the map and the
+                // listing in step, and a part shows the line each of its
+                // candidates starts on. The file's own text is better than a
+                // part that drops the candidate.
+                _ => {
+                    debug!(
+                        "{}: candidate {} has no part-local hint; using the file's",
+                        file.prompt_path, file.listed[*position].candidate_id
+                    );
+                    hints.push(file.candidate_hints[*position].clone());
+                    contexts.push(file.candidate_contexts[*position].clone());
+                }
+            }
+        }
         let shown_names = cut.names_on(&shown);
         let places: Option<BTreeSet<usize>> = if file.listed.is_empty() {
             // A file with no candidate records no name for its modules, and a
@@ -2508,6 +2681,7 @@ impl FileOrchestrator {
                     graphql_consumer_hints: &self.graphql_consumer_hints,
                     wrapper_context: &self.wrapper_context,
                     wrapper_imports: &self.wrapper_imports,
+                    candidate_map: &self.candidate_map,
                 }
             }
         }
@@ -4066,9 +4240,8 @@ impl FileOrchestrator {
                         .iter()
                         .map(|(part, prompt)| {
                             answer_to(prompt).map(|answer| {
-                                answer.map(|answer| PartAnswer {
-                                    window: part.window(),
-                                    answer,
+                                answer.map(|answer| {
+                                    PartAnswer::read(&pf.prompt_path, part, &pf.listed, answer)
                                 })
                             })
                         })
@@ -24113,6 +24286,179 @@ export async function POST(request: Request): Promise<Response> {
         })
     }
 
+    /// Every row array of the extraction schema, with the properties of its
+    /// rows that hold a line: `line_number` and anything ending in `_line`.
+    fn line_fields_of_the_schema() -> Vec<(String, String)> {
+        let schema = crate::agents::schemas::AgentSchemas::file_analysis_schema();
+        let mut fields = Vec::new();
+        for (array, spec) in schema["properties"].as_object().expect("properties") {
+            let Some(row) = spec["items"]["properties"].as_object() else {
+                continue;
+            };
+            for name in row.keys() {
+                if name == "line_number" || name.ends_with("_line") {
+                    fields.push((array.clone(), name.clone()));
+                }
+            }
+        }
+        fields.sort();
+        fields
+    }
+
+    /// One row of every array the schema asks for, with `line` in every line
+    /// field the schema names.
+    fn an_answer_with_every_line_set_to(line: i64) -> FileAnalysisResult {
+        let mut answer = serde_json::json!({
+            "mounts": [mount_row("child")],
+            "endpoints": [route_row("c1", "/a")],
+            "data_calls": [{
+                "candidate_id": "c1", "line_number": 1, "target": "/t",
+                "pattern_matched": "call", "call_expression_text": null,
+                "payload_expression_text": null,
+            }],
+            "graphql_operations": [{
+                "kind": "query", "field": "order", "resolver_function": "resolve",
+            }],
+            "pubsub_operations": [{
+                "topic": "ready", "role": "publisher", "line_number": 1,
+            }],
+            "graphql_consumer_locates": [],
+            "dispatch_tables": [{
+                "handler_name": "h", "line_number": 1, "location": "body",
+                "field": "op", "values": ["a"],
+            }],
+        });
+        for (array, name) in line_fields_of_the_schema() {
+            if let Some(row) = answer[array.as_str()]
+                .as_array_mut()
+                .and_then(|rows| rows.first_mut())
+            {
+                row[name.as_str()] = serde_json::json!(line);
+            }
+        }
+        part_answer(answer)
+    }
+
+    /// carrick#2794: a part's answer is in the part's numbers. A line field
+    /// the schema asks for that `PartAnswer::read` does not map would reach
+    /// the index as a line of the part, so this walks the schema and not a
+    /// list.
+    #[test]
+    fn every_line_the_schema_asks_for_is_read_back_into_file_lines() {
+        let source = "\
+declare const table: any;
+table.get(\"/a\", 1);
+table.get(\"/b\", 2);
+table.get(\"/c\", 3);
+table.get(\"/d\", 4);
+table.get(\"/e\", 5);
+table.get(\"/f\", 6);
+";
+        let listed = listed_at(&calls_of(source, "table.get("));
+        let parts = crate::agents::source_parts::source_parts(
+            Path::new("src/table.ts"),
+            source,
+            &listed,
+            &Limits {
+                window_bytes: 60,
+                context_bytes: 1_000,
+                candidates: 2,
+            },
+        )
+        .expect("the table parses");
+        let part = parts
+            .iter()
+            .find(|part| part.first_line > 3)
+            .expect("a part below the first lines");
+        let shown = part.shown();
+        let expected = shown.file_line(3).expect("prompt line 3 is shown");
+        assert_ne!(expected, 3, "the part's numbers are not the file's");
+
+        let fields = line_fields_of_the_schema();
+        assert!(fields.len() >= 11, "the schema's line fields: {fields:?}");
+
+        let read = PartAnswer::read(
+            "src/table.ts",
+            part,
+            &listed,
+            an_answer_with_every_line_set_to(3),
+        );
+        let read = serde_json::to_value(&read.answer).unwrap();
+        for (array, name) in &fields {
+            assert_eq!(
+                read[array.as_str()][0][name.as_str()],
+                serde_json::json!(expected),
+                "{array}.{name}"
+            );
+        }
+
+        let past = PartAnswer::read(
+            "src/table.ts",
+            part,
+            &listed,
+            an_answer_with_every_line_set_to(99),
+        );
+        let past = serde_json::to_value(&past.answer).unwrap();
+        for (array, name) in &fields {
+            let value = &past[array.as_str()][0][name.as_str()];
+            assert!(
+                *value == serde_json::json!(0) || value.is_null(),
+                "{array}.{name} named no shown line and came back {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_answer_names_candidates_by_the_ids_its_part_gave() {
+        let source = "\
+declare const table: any;
+table.get(\"/a\", 1);
+table.get(\"/b\", 2);
+table.get(\"/c\", 3);
+table.get(\"/d\", 4);
+";
+        let listed = listed_at(&calls_of(source, "table.get("));
+        let parts = crate::agents::source_parts::source_parts(
+            Path::new("src/table.ts"),
+            source,
+            &listed,
+            &Limits {
+                window_bytes: 60,
+                context_bytes: 1_000,
+                candidates: 2,
+            },
+        )
+        .expect("the table parses");
+        let last = parts
+            .iter()
+            .find(|part| part.candidates.len() >= 2)
+            .expect("a part of two candidates");
+        let answer = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [
+                route_row("c2", "/second"),
+                route_row("c9", "/made-up"),
+                route_row("span:1-2", "/file-id"),
+            ],
+        }));
+        let read = PartAnswer::read("src/table.ts", last, &listed, answer);
+        let ids: Vec<&str> = read
+            .answer
+            .endpoints
+            .iter()
+            .map(|row| row.candidate_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                listed[last.candidates[1]].candidate_id.as_str(),
+                "c9",
+                "span:1-2"
+            ],
+            "a listed part id is the file's id, any other id is kept"
+        );
+    }
+
     #[test]
     fn merged_rows_follow_the_source_and_rows_that_name_no_candidate_come_last() {
         let listed = listed_at(&[(10, 20), (30, 40), (50, 60), (70, 80)]);
@@ -24383,6 +24729,9 @@ export async function POST(request: Request): Promise<Response> {
         spans
     }
 
+    static NO_CANDIDATES: std::sync::LazyLock<HashMap<String, CandidateTarget>> =
+        std::sync::LazyLock::new(HashMap::new);
+
     fn parted<'a>(
         content: &'a str,
         listed: &'a [ListedCandidate],
@@ -24400,6 +24749,7 @@ export async function POST(request: Request): Promise<Response> {
             graphql_consumer_hints: &[],
             wrapper_context: &[],
             wrapper_imports,
+            candidate_map: &NO_CANDIDATES,
         }
     }
 

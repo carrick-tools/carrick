@@ -206,6 +206,41 @@ pub fn normalize_path_params(path: &str) -> String {
 impl CandidateTarget {
     /// Format as a hint string for the LLM prompt
     pub fn format_hint(&self) -> String {
+        self.hint_line(
+            &self.candidate_id,
+            self.line_number,
+            Some((self.span_start, self.span_end)),
+        )
+    }
+
+    /// The hint a part of a file carries (carrick#2794): the same line as
+    /// [`Self::format_hint`] under `id` and `line` as the part names them,
+    /// and with no span. The file's own id, line and byte offsets move with
+    /// any edit above the candidate, and a part's prompt must not.
+    pub fn part_hint(&self, id: &str, line: u32) -> String {
+        self.hint_line(id, line as usize, None)
+    }
+
+    /// The candidate context a part of a file carries (carrick#2794): the
+    /// serialized candidate with `candidate_id` and `line_number` as the part
+    /// names them and without `span_start` and `span_end`, which are
+    /// positions in the whole file.
+    ///
+    /// Every other serialized field is kept. A field added to
+    /// `CandidateTarget` that is positional must be removed here; the test
+    /// that pins the key set fails until someone decides.
+    pub fn part_context(&self, id: &str, line: u32) -> String {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("candidate_id".to_string(), serde_json::json!(id));
+            object.insert("line_number".to_string(), serde_json::json!(line));
+            object.remove("span_start");
+            object.remove("span_end");
+        }
+        value.to_string()
+    }
+
+    fn hint_line(&self, id: &str, line: usize, span: Option<(u32, u32)>) -> String {
         let callee = match &self.callee_property {
             Some(prop) => format!("{}.{}", self.callee_object, prop),
             None => self.callee_object.clone(),
@@ -215,17 +250,14 @@ impl CandidateTarget {
             .as_deref()
             .unwrap_or("unknown_function");
         let path = self.path_snippet.as_deref().unwrap_or("<path unavailable>");
+        let span = match span {
+            Some((start, end)) => format!(" (span {start}-{end})"),
+            None => String::new(),
+        };
 
         format!(
-            "- Candidate {}: Line {} (span {}-{}) {} [fn: {}] [path: {}] - `{}`",
-            self.candidate_id,
-            self.line_number,
-            self.span_start,
-            self.span_end,
-            callee,
-            func,
-            path,
-            self.code_snippet
+            "- Candidate {}: Line {}{} {} [fn: {}] [path: {}] - `{}`",
+            id, line, span, callee, func, path, self.code_snippet
         )
     }
 }
@@ -5655,6 +5687,78 @@ async function fetchUser(id: string) {
         assert!(hint.contains("handler"));
         assert!(hint.contains("[path: '/users']"));
         assert!(hint.contains("app.get('/users', handler)"));
+    }
+
+    fn hinted_candidate() -> CandidateTarget {
+        CandidateTarget {
+            protocol: Protocol::Http,
+            candidate_id: "span:100-140".to_string(),
+            span_start: 100,
+            span_end: 140,
+            line_number: 15,
+            end_line: 15,
+            callee_object: "app".to_string(),
+            callee_property: Some("get".to_string()),
+            enclosing_function: Some("handler".to_string()),
+            path_snippet: Some("'/users'".to_string()),
+            code_snippet: "app.get('/users', handler)".to_string(),
+            request_spec: None,
+            new_url_path: None,
+            request_shape: RequestShapeSignal::NotARequest,
+            receiver_ident: Some("app".to_string()),
+            base_path_target: None,
+            url_binding: None,
+        }
+    }
+
+    /// carrick#2794: a part of a file names a candidate by its place in the
+    /// part and by the line the part numbers, and states no byte offset. The
+    /// whole prompt's hint is the bytes it always was.
+    #[test]
+    fn a_part_hint_and_context_state_no_position_in_the_file() {
+        let candidate = hinted_candidate();
+        assert_eq!(
+            candidate.format_hint(),
+            "- Candidate span:100-140: Line 15 (span 100-140) app.get [fn: handler] \
+             [path: '/users'] - `app.get('/users', handler)`"
+        );
+
+        let hint = candidate.part_hint("c2", 4);
+        assert_eq!(
+            hint,
+            "- Candidate c2: Line 4 app.get [fn: handler] [path: '/users'] - \
+             `app.get('/users', handler)`"
+        );
+        assert!(!hint.contains("(span"), "{hint}");
+
+        // The part's context has the whole context's keys, minus the two that
+        // are positions in the file. The keys are pinned: a field added to the
+        // candidate fails here until someone decides whether it is positional.
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let whole: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&candidate).unwrap()).unwrap();
+        let part: serde_json::Value =
+            serde_json::from_str(&candidate.part_context("c2", 4)).unwrap();
+        let kept = [
+            "callee_object",
+            "callee_property",
+            "candidate_id",
+            "code_snippet",
+            "enclosing_function",
+            "line_number",
+            "path_snippet",
+        ];
+        assert_eq!(keys(&part), kept);
+        let mut with_spans: Vec<&str> = kept.to_vec();
+        with_spans.extend(["span_end", "span_start"]);
+        with_spans.sort();
+        assert_eq!(keys(&whole), with_spans);
+        assert_eq!(part["candidate_id"], "c2");
+        assert_eq!(part["line_number"], 4);
     }
 
     /// carrick#610: the candidate hands the analyzer the path the URL

@@ -87,6 +87,12 @@ mod walk_lane;
 /// and it bumps under the clause above. carrick#693 tracks the fact that none
 /// of this is enforceable from inside this repo.
 ///
+/// A change to how a PART of a file is shown does not bump, when the part's
+/// answer is read back into the file's own lines and candidate ids before it
+/// is stored (`PartAnswer::read`, carrick#2794): the stored answer means the
+/// same under either form, and a bump would make every repo pay every part
+/// of every large file once more.
+///
 /// Invalidation is keyed by repo-relative path: a file goes back to the model
 /// when its content on disk is not what the previous scan's commit holds (an
 /// uncommitted edit counts, and an untracked file always does), or when the
