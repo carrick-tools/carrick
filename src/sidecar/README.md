@@ -65,7 +65,7 @@ sidecar.start_init(&absolute_repo_path, None);
 
 // Requests block until the sidecar is ready, then until they answer
 let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests, None, None)?;
-let captured = sidecar.capture_v2(&repo_root, service_name, &anchors, &out_dir, None)?;
+let captured = sidecar.capture_v2(&repo_root, service_name, &anchors, &out_dir, None, None)?;
 ```
 
 ### Standalone
@@ -236,6 +236,8 @@ An anchor is one of four kinds, discriminated on `kind`:
   "service_name": "orders-api",
   "out_dir": "/absolute/path/to/.carrick/stubs/orders-api",
   "tsconfig_path": "tsconfig.json",
+  "backfill_texts": { "Endpoint_c3d4_Response": "{ id: string; total: number; }" },
+  "backfill_out_dir": "/absolute/path/to/.carrick/stubs/orders-api-backfill",
   "anchors": [
     {
       "kind": "symbol",
@@ -292,6 +294,16 @@ the reason recorded; the expression on the line is never read in its place.
 A literal anchor's optional `source_file` names the file its text was printed
 from; it joins the analysis program so names the text prints bare are found
 declared, and is omitted for inline text that has no file.
+
+`backfill_texts` (alias to literal type text) and `backfill_out_dir` ask for
+the literal backfill in the same request (carrick#2041). An alias the capture
+demotes (its anchor did not resolve, or its module's declaration emit was
+skipped) that has a text there is captured again, re-anchored as a literal at
+`anchor-backfill` origin, into `backfill_out_dir`, on the programs the first
+surface was read and emitted on. The result then carries `backfill: {
+backfilled, result }`: the re-anchored aliases and the second stub exactly as
+a capture of the re-anchored set answers it. The caller keeps one of the two
+stubs and deletes the other.
 
 Response (`result` is a `CaptureStubResult`, abbreviated here):
 ```json

@@ -188,6 +188,7 @@ fn capture(sidecar: TypeSidecar, alias: &'static str) -> (TypeSidecar, SidecarEr
             }],
             "/out",
             None,
+            None,
         )
     });
     let error = result.expect_err("the stand-in never answers a capture with a result");

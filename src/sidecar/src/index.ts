@@ -360,6 +360,8 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
       outDir: request.out_dir,
       tsconfigPath: request.tsconfig_path,
       scanRoot: request.scan_root,
+      backfillTexts: request.backfill_texts,
+      backfillOutDir: request.backfill_out_dir,
       onProgress: (phase, message) => {
         if (phase === stage) return withinStage(phase, message);
         stage = phase;

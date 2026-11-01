@@ -34,6 +34,7 @@ import * as path from 'node:path';
 import type {
   AnchorOrigin,
   CaptureAliasRecord,
+  CaptureAnchorRequest,
   CaptureFidelity,
   CapturePhase,
   CaptureStubOptions,
@@ -48,7 +49,8 @@ import { installedResolutionEdges, RESOLUTION_FILE } from './resolution-edges.js
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
 import { substituteMachinePathImports } from './machine-paths.js';
 import { installedPackageSpecifier, typesPackageOf, withInstalledPackages } from './installed-package.js';
-import { selfCheckStub } from './self-check.js';
+import { selfCheckStub, type SelfCheckArgs } from './self-check.js';
+import { backfillRerun, sharingHost, type BackfillPlan } from './backfill.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
 import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
@@ -171,7 +173,10 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // Under CARRICK_UNTRUSTED_TREE every compiler read below is held to the
   // checkout, the sidecar's own install and this stub; otherwise undefined
   // and nothing here changes (carrick#2230).
-  const bound = untrustedReadBound(repoRoot, [stubDir]);
+  // The backfilled stub (carrick#2041) is written beside the first.
+  const backfillDir = plannedBackfill(opts) ? path.resolve(opts.backfillOutDir!) : undefined;
+  const stubDirs = backfillDir ? [stubDir, backfillDir] : [stubDir];
+  const bound = untrustedReadBound(repoRoot, stubDirs);
 
   // The named config, else the one the init'd project reads too
   // (carrick#1776). A service with neither is typed under defaults below.
@@ -198,7 +203,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   let guard: WriteGuard;
   try {
     const protect = opts.scanRoot === undefined ? [repoRoot] : [repoRoot, path.resolve(opts.scanRoot)];
-    guard = WriteGuard.of({ dirs: [stubDir], protect });
+    guard = WriteGuard.of({ dirs: stubDirs, protect });
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
@@ -300,7 +305,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   }
 
   // ---- Phase A: analysis program over placeholder entry + anchor sources ----
-  let resolved: ResolvedAnchor[];
+  let analysis: Analysis | undefined;
   const progress = opts.onProgress ?? (() => {});
   // The files of a project that declare a module or global augmentation are
   // roots of both programs below: the one its anchors are read in and the one
@@ -323,8 +328,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     readsReferences: graphForRedirect?.hasReferences ?? false,
   };
   try {
-    resolved = ownerGroups && emitProject
-      ? resolveAnchorsByOwner(opts, ownerGroups, emitProject, analysisCtx, errors)
+    analysis = ownerGroups && emitProject
+      ? resolveAnchorsByOwner(opts, ownerGroups, emitProject, analysisCtx)
       : resolveAnchors(opts, parsed, analysisCtx, deno, emitProject);
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
@@ -334,6 +339,206 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const augmentationSources = [...new Set([...augmentations(parsed), ...(deno?.globals ?? [])])];
 
   // ---- Phase B: declaration emit of the final entry ----
+  const scratch = WriteGuard.scratch('carrick-capture-v2-');
+  const staging = scratch.dir;
+  const emitOptions: ts.CompilerOptions = sidecarCompilerOptions({
+    ...parsed.options,
+    // The load-bearing trio: emit declarations without checking, so
+    // type-error-laden and bare (no node_modules) checkouts still emit.
+    noCheck: true,
+    declaration: true,
+    emitDeclarationOnly: true,
+    noEmit: false,
+    declarationMap: false,
+    composite: false,
+    incremental: false,
+    outDir: staging,
+    rootDir: entryDir,
+  });
+  const emitCtx: EmitContext = {
+    entryPath,
+    entryDir,
+    surfaceDeclaration,
+    guard,
+    progress,
+    rootNames: [entryPath, ...augmentationSources],
+    options: emitOptions,
+    // A backfill's emit differs from the first only in the entry: every other
+    // file it reads is answered with the one the first emit parsed.
+    host: plannedBackfill(opts)
+      ? sharingHost(programHost(emitOptions, deno, bound) ?? ts.createCompilerHost(emitOptions), (file) => path.resolve(file) === entryPath)
+      : programHost(emitOptions, deno, bound),
+    staging,
+  };
+  let first: SurfaceEmit;
+  const analysisErrors = analysis.errors;
+  let backfill: { plan: BackfillPlan; surface: SurfaceEmit; errors: string[] } | undefined;
+  try {
+    try {
+      first = emitSurface(analysis.resolved, emitCtx);
+    } catch (err) {
+      return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
+    }
+    // ---- Literal backfill (carrick#2041): the demoted aliases the scanner
+    // holds a text for, re-anchored on it, read in the same anchor program
+    // and emitted on the files the first emit parsed.
+    const plan = plannedBackfill(opts) ? backfillRerun(opts.anchors, first.resolved, opts.backfillTexts) : undefined;
+    if (plan) {
+      try {
+        const again = analysis.resolveAgain(plan.anchors, new Set(plan.backfilled));
+        progress('emit', 'emitting the backfilled surface');
+        backfill = { plan, surface: emitSurface(again.resolved, emitCtx), errors: again.errors };
+      } catch (err) {
+        console.error(`[sidecar] capture ${packageName}: backfill surface not written: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } finally {
+    // The anchor programs, and the files the emits parsed, are held only
+    // until the backfill has read them.
+    analysis = undefined;
+    emitCtx.host = undefined;
+    scratch.guard.remove(staging);
+  }
+
+  // ---- What the checkout installs (shared by both stubs) ----
+  const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
+  const nodeModulesPresent = fs.existsSync(path.join(dependencyRoot, 'node_modules'));
+  const declared =
+    deno || !nodeModulesPresent
+      ? { unresolved: [], runtimeDeclared: 0, runtimeResolved: 0 }
+      : declaredDependencyResolution(dependencyRoot);
+  const unresolvedDependencies = declared.unresolved;
+  // Bare: no node_modules, or every declared runtime dependency dangles (a
+  // missing pnpm store). One missing package, or missing devDependencies,
+  // leaves the installed ones usable (carrick#2999).
+  const bareCheckout =
+    !deno &&
+    (!nodeModulesPresent || (declared.runtimeDeclared > 0 && declared.runtimeResolved === 0));
+  if (unresolvedDependencies.length > 0) {
+    console.error(
+      `[sidecar] capture ${packageName}: declared dependencies do not resolve` +
+        `${bareCheckout ? ' (bare checkout)' : ''}: ${unresolvedDependencies.join(', ')}`
+    );
+  }
+
+  const stubCtx: StubContext = {
+    guard,
+    packageName,
+    staging,
+    entryDir,
+    surfaceDeclaration,
+    augmentationSources,
+    parsed,
+    projectConfigPath,
+    deno,
+    repoRoot,
+    labelRoot: opts.scanRoot ?? repoRoot,
+  };
+  let stub: WrittenStub;
+  try {
+    stub = writeStub(first, stubDir, stubCtx);
+  } catch (err) {
+    if (err instanceof StubFailure) return fail(stubDir, packageName, [err.message]);
+    throw err;
+  }
+  let second: WrittenStub | undefined;
+  if (backfill) {
+    try {
+      second = writeStub(backfill.surface, backfillDir!, stubCtx);
+    } catch (err) {
+      console.error(`[sidecar] capture ${packageName}: backfill stub not written: ${err instanceof Error ? err.message : String(err)}`);
+      guard.remove(backfillDir!);
+    }
+  }
+
+  // ---- Capture-time self-check (per-alias closure attribution) ----
+  progress('self-check', 'checking the stub');
+  const hostFor = (installs: Record<string, string>) =>
+    deno || bound || Object.keys(installs).length > 0
+      ? (options: ts.CompilerOptions) =>
+          boundedCompilerHost(
+            withInstalledPackages(options, installs, deno ? deno.host(options) : undefined),
+            bound
+          )
+      : undefined;
+  const checkArgs = (written: WrittenStub, compilerHost: SelfCheckArgs['compilerHost']): SelfCheckArgs => ({
+    guard: written.guard,
+    stubDir: written.stubDir,
+    surfaces: [{ surfaceAbsPath: written.surfaceAbsPath, resolved: written.resolved }],
+    pinned: written.pinned,
+    bareCheckout,
+    repoRoot: dependencyRoot,
+    compilerHost,
+  });
+  let aliases: CaptureAliasRecord[];
+  let secondAliases: CaptureAliasRecord[] | undefined;
+  if (!second) {
+    [aliases] = selfCheckStub(checkArgs(stub, hostFor(stub.installs)));
+  } else {
+    ({ first: aliases, second: secondAliases } = selfCheckBoth(stub, second, checkArgs, hostFor));
+  }
+
+  const result = finishStub(stub, aliases, {
+    packageName,
+    bareCheckout,
+    unresolvedDependencies,
+    errors: [...errors, ...analysisErrors, ...first.errors],
+  });
+  if (!second || !secondAliases || !backfill) {
+    if (second) guard.remove(second.stubDir);
+    return result;
+  }
+  return {
+    ...result,
+    backfill: {
+      backfilled: backfill.plan.backfilled,
+      result: finishStub(second, secondAliases, {
+        packageName,
+        bareCheckout,
+        unresolvedDependencies,
+        errors: [...errors, ...backfill.errors, ...backfill.surface.errors],
+      }),
+    },
+  };
+}
+
+/** Whether this capture may write a backfilled second stub (carrick#2041). */
+function plannedBackfill(opts: CaptureStubOptions): boolean {
+  return (
+    opts.backfillOutDir !== undefined &&
+    opts.backfillTexts !== undefined &&
+    Object.keys(opts.backfillTexts).length > 0
+  );
+}
+
+/** What Phase B reads beside the resolved anchors: one per capture. */
+interface EmitContext {
+  entryPath: string;
+  entryDir: string;
+  /** The emitted name of this capture's surface entry (carrick#1046). */
+  surfaceDeclaration: string;
+  guard: WriteGuard;
+  progress: (phase: CapturePhase, message: string) => void;
+  rootNames: string[];
+  options: ts.CompilerOptions;
+  /** Released (set undefined) once every surface is emitted. */
+  host: ts.CompilerHost | undefined;
+  staging: string;
+}
+
+/** One surface's declaration emit, after the partial-emit demotion. */
+interface SurfaceEmit extends Omit<DeclarationEmit, 'partial' | 'diagnostics'> {
+  resolved: ResolvedAnchor[];
+  /** The emit's diagnostics, then the partial-emit note when there is one. */
+  errors: string[];
+}
+
+/**
+ * Phase B for one surface: write the entry that aliases each resolved anchor,
+ * emit its declarations, and demote the aliases a partial emit leaves
+ * dangling. Throws when the emit wrote nothing.
+ */
+function emitSurface(resolved: ResolvedAnchor[], ctx: EmitContext): SurfaceEmit {
   const entryLines = ['// Generated by Carrick capture v2. Deleted after emit.'];
   for (const anchor of resolved) {
     const comment = anchor.failureReason
@@ -344,42 +549,22 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     );
   }
 
-  const scratch = WriteGuard.scratch('carrick-capture-v2-');
-  const staging = scratch.dir;
   let written: DeclarationEmit;
   try {
-    progress('emit', 'emitting declarations');
-    guard.writeFile(entryPath, entryLines.join('\n') + '\n');
-    const emitOptions: ts.CompilerOptions = sidecarCompilerOptions({
-      ...parsed.options,
-      // The load-bearing trio: emit declarations without checking, so
-      // type-error-laden and bare (no node_modules) checkouts still emit.
-      noCheck: true,
-      declaration: true,
-      emitDeclarationOnly: true,
-      noEmit: false,
-      declarationMap: false,
-      composite: false,
-      incremental: false,
-      outDir: staging,
-      rootDir: entryDir,
-    });
+    ctx.progress('emit', 'emitting declarations');
+    ctx.guard.writeFile(ctx.entryPath, entryLines.join('\n') + '\n');
     written = emitDeclarations({
-      rootNames: [entryPath, ...augmentationSources],
-      options: emitOptions,
-      host: programHost(emitOptions, deno, bound),
-      staging,
-      entryDir,
+      rootNames: ctx.rootNames,
+      options: ctx.options,
+      host: ctx.host,
+      staging: ctx.staging,
+      entryDir: ctx.entryDir,
     });
-  } catch (err) {
-    return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   } finally {
-    if (fs.existsSync(entryPath)) guard.unlink(entryPath);
-    scratch.guard.remove(staging);
+    if (fs.existsSync(ctx.entryPath)) ctx.guard.unlink(ctx.entryPath);
   }
   const { emitted, declarationSources, sourceByEmitted } = written;
-  const emitPartial = written.partial;
-  errors.push(...written.diagnostics);
+  const errors = [...written.diagnostics];
 
   // ---- Partial-emit recovery ----
   // The corpus-2 notifications-svc shape: one file's declaration emit was
@@ -391,7 +576,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // `unknown` at the surface, so the check phase's IsUnknown probe gate (or
   // the poison rule, for unemitted modules still referenced by kept files)
   // decays it to unverifiable — it can never read compatible.
-  if (emitPartial) {
+  if (written.partial) {
     errors.push(
       `declaration emit was partial: kept ${emitted.size} emitted file(s); ` +
         'aliases referencing unemitted modules are demoted to structural_fallback'
@@ -400,11 +585,61 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       resolved,
       emitted,
       declarationSources,
-      staging,
-      entryDir,
-      surfaceDeclaration,
+      staging: ctx.staging,
+      entryDir: ctx.entryDir,
+      surfaceDeclaration: ctx.surfaceDeclaration,
     });
   }
+  return { resolved, emitted, declarationSources, sourceByEmitted, errors };
+}
+
+/** What writing a stub package reads beside its surface: one per capture. */
+interface StubContext {
+  guard: WriteGuard;
+  packageName: string;
+  staging: string;
+  entryDir: string;
+  surfaceDeclaration: string;
+  augmentationSources: string[];
+  parsed: ts.ParsedCommandLine;
+  projectConfigPath: string;
+  deno: DenoProject | undefined;
+  repoRoot: string;
+  /** The root machine paths are named from (carrick#2943). */
+  labelRoot: string;
+}
+
+/** A stub package written up to its self-check. */
+interface WrittenStub {
+  stubDir: string;
+  /** Writes held to this stub. */
+  guard: WriteGuard;
+  surfaceAbsPath: string;
+  /** The surface's anchors, with what the machine-path pass found. */
+  resolved: ResolvedAnchor[];
+  /** Paths relative to `types/`. */
+  emittedFiles: string[];
+  augmentationFiles: string[];
+  specifierRewrites: number;
+  pinned: Record<string, string>;
+  unpinned: string[];
+  /** Package -> installed directory, for specifiers rewritten into one. */
+  installs: Record<string, string>;
+}
+
+/** A stub that cannot be written: the capture fails with this message alone. */
+class StubFailure extends Error {}
+
+/**
+ * Write one surface's stub package into `stubDir`: the emitted tree with its
+ * specifiers rewritten, the pins, the recorded dependency edges,
+ * `package.json` and the tsconfig snapshot. The self-check and the manifest
+ * follow.
+ */
+function writeStub(surface: SurfaceEmit, stubDir: string, ctx: StubContext): WrittenStub {
+  const { emitted, declarationSources, sourceByEmitted } = surface;
+  let resolved = surface.resolved;
+  const { guard, deno, parsed } = ctx;
 
   // ---- Relocate the emitted tree into the stub package ----
   const typesDir = path.join(stubDir, 'types');
@@ -415,11 +650,16 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   // A declaration for a source outside rootDir arrives at the source's own
   // path; it is placed under the tree too (carrick#1770).
-  const placed = placeEmittedTree({ emitted, staging, entryDir, surfaceDeclaration });
+  const placed = placeEmittedTree({
+    emitted,
+    staging: ctx.staging,
+    entryDir: ctx.entryDir,
+    surfaceDeclaration: ctx.surfaceDeclaration,
+  });
   const emittedFiles: string[] = [];
   let surfaceAbsPath = '';
   for (const fileName of emitted.keys()) {
-    const stagingRel = path.relative(staging, fileName).split(path.sep).join('/');
+    const stagingRel = path.relative(ctx.staging, fileName).split(path.sep).join('/');
     const rel = placed.relOf.get(fileName)!;
     const text = placed.textOf.get(fileName)!;
     if (rel !== stagingRel) {
@@ -434,7 +674,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     if (rel === 'surface.d.ts') surfaceAbsPath = dest;
   }
   if (!surfaceAbsPath) {
-    return fail(stubDir, packageName, ['no surface.d.ts produced by emit']);
+    throw new StubFailure('no surface.d.ts produced by emit');
   }
   // Verbatim copies of in-repo declaration sources (see declarationSources).
   for (const [rel, text] of declarationSources) {
@@ -447,13 +687,13 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   // Tree-relative names of augmentation files that made it into the tree
   // (.ts augmentations arrive via declaration emit, .d.ts ones verbatim).
-  const augmentationFiles = augmentationSources
+  const augmentationFiles = ctx.augmentationSources
     .map((abs) => {
       const noDts = abs.replace(/\.d\.ts$/, '');
       const noExt = noDts === abs ? abs.replace(/\.(ts|tsx|mts|cts)$/, '') : noDts;
       const outside = placed.outside.get(path.resolve(noExt));
       if (outside !== undefined) return outside;
-      const rel = path.relative(entryDir, noExt).split(path.sep).join('/');
+      const rel = path.relative(ctx.entryDir, noExt).split(path.sep).join('/');
       return `${rel}.d.ts`;
     })
     .filter((rel) => emittedFiles.includes(rel))
@@ -464,7 +704,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   try {
     denoRewrites = deno?.rewrite(stubGuard, typesDir, emittedFiles, sourceByEmitted) ?? 0;
   } catch (err) {
-    return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
+    throw new StubFailure(err instanceof Error ? err.message : String(err));
   }
   const rewritten = rewriteEmittedSpecifiers({
     guard: stubGuard,
@@ -472,8 +712,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     typesDir,
     files: emittedFiles,
     options: parsed.options,
-    configPath: projectConfigPath,
-    entryDir,
+    configPath: ctx.projectConfigPath,
+    entryDir: ctx.entryDir,
   });
   const specifierRewrites = denoRewrites + placed.rewrites + rewritten.rewrites;
   // What the rewrite could not map still names a machine path (carrick#2943).
@@ -481,7 +721,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     files: emittedFiles.map((rel) => path.join(typesDir, rel)),
     surfaceAbsPath,
     tree: stubGuard.narrow(typesDir),
-    labelRoot: opts.scanRoot ?? repoRoot,
+    labelRoot: ctx.labelRoot,
   });
   if (machinePaths.size > 0) {
     resolved = resolved.map((anchor) => {
@@ -512,8 +752,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // remains the bare-checkout fallback. Both paths pin only
   // the directly-referenced externals; what those depend on is recorded
   // from the installed tree below (RESOLUTION_FILE).
-  const installed = installedVersions(repoRoot, externalSpecs);
-  const lockVersions = lockfileVersions(repoRoot);
+  const installed = installedVersions(ctx.repoRoot, externalSpecs);
+  const lockVersions = lockfileVersions(ctx.repoRoot);
   for (const name of Object.keys(deno?.pinned ?? {})) externalSpecs.add(name);
   // A package an absolute specifier was rewritten into carries the version
   // installed at that path (#1174); it may be a transitive the repo root
@@ -535,7 +775,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // installed rather than the newest version in range (carrick#2091).
   const resolution = deno
     ? { edges: {}, unrecorded: 0 }
-    : installedResolutionEdges(repoRoot, pinned);
+    : installedResolutionEdges(ctx.repoRoot, pinned);
   const edgeCount = Object.values(resolution.edges).reduce(
     (n, children) => n + Object.keys(children).length,
     0
@@ -547,35 +787,15 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     );
   }
   console.error(
-    `[sidecar] capture ${packageName}: ${edgeCount} dependency edge(s) recorded from the installed tree, ` +
+    `[sidecar] capture ${ctx.packageName}: ${edgeCount} dependency edge(s) recorded from the installed tree, ` +
       `${resolution.unrecorded} left to the registry`
   );
-
-  const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
-  const nodeModulesPresent = fs.existsSync(path.join(dependencyRoot, 'node_modules'));
-  const declared =
-    deno || !nodeModulesPresent
-      ? { unresolved: [], runtimeDeclared: 0, runtimeResolved: 0 }
-      : declaredDependencyResolution(dependencyRoot);
-  const unresolvedDependencies = declared.unresolved;
-  // Bare: no node_modules, or every declared runtime dependency dangles (a
-  // missing pnpm store). One missing package, or missing devDependencies,
-  // leaves the installed ones usable (carrick#2999).
-  const bareCheckout =
-    !deno &&
-    (!nodeModulesPresent || (declared.runtimeDeclared > 0 && declared.runtimeResolved === 0));
-  if (unresolvedDependencies.length > 0) {
-    console.error(
-      `[sidecar] capture ${packageName}: declared dependencies do not resolve` +
-        `${bareCheckout ? ' (bare checkout)' : ''}: ${unresolvedDependencies.join(', ')}`
-    );
-  }
 
   stubGuard.writeFile(
     path.join(stubDir, 'package.json'),
     JSON.stringify(
       {
-        name: packageName,
+        name: ctx.packageName,
         version: '0.0.0-carrick',
         private: true,
         types: './types/surface.d.ts',
@@ -603,34 +823,129 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     ) + '\n'
   );
 
-  // ---- Capture-time self-check (per-alias closure attribution) ----
-  progress('self-check', 'checking the stub');
-  const aliases = selfCheckStub({
-    guard: stubGuard,
+  return {
     stubDir,
+    guard: stubGuard,
     surfaceAbsPath,
     resolved,
+    emittedFiles,
+    augmentationFiles,
+    specifierRewrites,
     pinned,
-    bareCheckout,
-    repoRoot: dependencyRoot,
-    compilerHost:
-      deno || bound || Object.keys(rewritten.installs).length > 0
-        ? (options) =>
-            boundedCompilerHost(
-              withInstalledPackages(options, rewritten.installs, deno ? deno.host(options) : undefined),
-              bound
-            )
-        : undefined,
-  });
-  const fidelity = computeFidelity(aliases);
+    unpinned,
+    installs: rewritten.installs,
+  };
+}
 
-  stubGuard.writeFile(
-    path.join(stubDir, 'carrick-manifest.json'),
+/**
+ * The name the backfilled surface is checked under, beside the first, when
+ * both stubs hold the same tree. No emitted declaration is named so: an
+ * emitted name keeps its source's extension stem, and this one has two dots
+ * no source file name would end with.
+ */
+const JOINT_SURFACE = 'surface.carrick-backfill.d.ts';
+
+/**
+ * Self-check both stubs of a backfill (carrick#2041).
+ *
+ * When the two stubs hold the same tree beside their surfaces, both surfaces
+ * are checked in one program over the first stub's tree, which is what the
+ * check costs: every declaration of the tree and of the installed packages it
+ * reaches. Each surface is a module of its own and nothing imports either, so
+ * neither changes what the other's aliases read, and each alias's closure is
+ * walked from its own surface. What the repair pass rewrote in the shared
+ * tree is copied into the second stub, which holds the same files.
+ *
+ * Otherwise (the backfilled aliases were the only route to some module, so
+ * the trees differ) each stub is checked in a program of its own, which is
+ * what the stub would be checked in alone; the two programs share the files
+ * they parse outside the stubs.
+ */
+function selfCheckBoth(
+  first: WrittenStub,
+  second: WrittenStub,
+  checkArgs: (written: WrittenStub, compilerHost: SelfCheckArgs['compilerHost']) => SelfCheckArgs,
+  hostFor: (installs: Record<string, string>) => SelfCheckArgs['compilerHost']
+): { first: CaptureAliasRecord[]; second: CaptureAliasRecord[] | undefined } {
+  const typesOf = (written: WrittenStub) => path.join(written.stubDir, 'types');
+  if (sameTreeBesideSurface(first, second)) {
+    const joint = path.join(typesOf(first), JOINT_SURFACE);
+    first.guard.writeFile(joint, fs.readFileSync(second.surfaceAbsPath, 'utf8'));
+    let records: CaptureAliasRecord[][];
+    try {
+      const installs = { ...second.installs, ...first.installs };
+      records = selfCheckStub({
+        ...checkArgs(first, hostFor(installs)),
+        surfaces: [
+          { surfaceAbsPath: first.surfaceAbsPath, resolved: first.resolved },
+          { surfaceAbsPath: joint, resolved: second.resolved },
+        ],
+        pinned: { ...second.pinned, ...first.pinned },
+      });
+    } catch (err) {
+      // The first stub is checked alone, as it would be with no backfill.
+      console.error(`[sidecar] backfill self-check failed, first stub checked alone: ${err instanceof Error ? err.message : String(err)}`);
+      if (fs.existsSync(joint)) first.guard.unlink(joint);
+      return { first: selfCheckStub(checkArgs(first, hostFor(first.installs)))[0], second: undefined };
+    } finally {
+      if (fs.existsSync(joint)) first.guard.unlink(joint);
+    }
+    for (const rel of second.emittedFiles) {
+      if (rel === 'surface.d.ts') continue;
+      const text = fs.readFileSync(path.join(typesOf(first), rel), 'utf8');
+      const dest = path.join(typesOf(second), rel);
+      if (fs.readFileSync(dest, 'utf8') !== text) second.guard.writeFile(dest, text);
+    }
+    return { first: records[0], second: records[1] };
+  }
+
+  const inStubs = (file: string) => {
+    const abs = path.resolve(file);
+    return [first.stubDir, second.stubDir].some((dir) => abs === dir || abs.startsWith(dir + path.sep));
+  };
+  const parsedOnce = new Map<string, ts.SourceFile | undefined>();
+  const sharing = (installs: Record<string, string>): SelfCheckArgs['compilerHost'] => {
+    const host = hostFor(installs);
+    return (options) => sharingHost(host?.(options) ?? ts.createCompilerHost(options), inStubs, parsedOnce);
+  };
+  const [firstRecords] = selfCheckStub(checkArgs(first, sharing(first.installs)));
+  let secondRecords: CaptureAliasRecord[] | undefined;
+  try {
+    [secondRecords] = selfCheckStub(checkArgs(second, sharing(second.installs)));
+  } catch (err) {
+    console.error(`[sidecar] backfill self-check failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return { first: firstRecords, second: secondRecords };
+}
+
+/** Whether two stubs hold the same files, byte for byte, beside `surface.d.ts`. */
+function sameTreeBesideSurface(first: WrittenStub, second: WrittenStub): boolean {
+  const besides = (written: WrittenStub) => written.emittedFiles.filter((rel) => rel !== 'surface.d.ts').sort();
+  const a = besides(first);
+  const b = besides(second);
+  if (a.length !== b.length || a.some((rel, i) => rel !== b[i])) return false;
+  if (a.includes(JOINT_SURFACE)) return false;
+  return a.every(
+    (rel) =>
+      fs.readFileSync(path.join(first.stubDir, 'types', rel), 'utf8') ===
+      fs.readFileSync(path.join(second.stubDir, 'types', rel), 'utf8')
+  );
+}
+
+/** Write a stub's manifest and answer it. */
+function finishStub(
+  written: WrittenStub,
+  aliases: CaptureAliasRecord[],
+  args: { packageName: string; bareCheckout: boolean; unresolvedDependencies: string[]; errors: string[] }
+): CaptureStubResult {
+  const fidelity = computeFidelity(aliases);
+  written.guard.writeFile(
+    path.join(written.stubDir, 'carrick-manifest.json'),
     JSON.stringify(
       {
-        package_name: packageName,
+        package_name: args.packageName,
         ts_version: ts.version,
-        bare_checkout: bareCheckout,
+        bare_checkout: args.bareCheckout,
         aliases,
         fidelity,
       },
@@ -641,19 +956,19 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   return {
     success: true,
-    stub_dir: stubDir,
-    package_name: packageName,
-    emitted_files: emittedFiles.map((rel) => `types/${rel}`).sort(),
-    pinned_dependencies: pinned,
-    unpinned_externals: unpinned,
+    stub_dir: written.stubDir,
+    package_name: args.packageName,
+    emitted_files: written.emittedFiles.map((rel) => `types/${rel}`).sort(),
+    pinned_dependencies: written.pinned,
+    unpinned_externals: written.unpinned,
     aliases,
     fidelity,
-    augmentation_files: augmentationFiles.sort(),
-    specifier_rewrites: specifierRewrites,
-    bare_checkout: bareCheckout,
-    unresolved_dependencies: unresolvedDependencies,
+    augmentation_files: written.augmentationFiles.sort(),
+    specifier_rewrites: written.specifierRewrites,
+    bare_checkout: args.bareCheckout,
+    unresolved_dependencies: args.unresolvedDependencies,
     ts_version: ts.version,
-    errors,
+    errors: args.errors,
   };
 }
 
@@ -908,42 +1223,55 @@ function resolveAnchorsByOwner(
   opts: CaptureStubOptions,
   groups: Map<ServiceProject, number[]>,
   emit: ServiceProject,
-  ctx: AnalysisContext,
-  errors: string[]
-): ResolvedAnchor[] {
-  const resolved = new Array<ResolvedAnchor>(opts.anchors.length);
+  ctx: AnalysisContext
+): Analysis {
+  const analyses = new Map<ServiceProject, Analysis>();
   for (const [owner, indexes] of groups) {
     const anchors = indexes.map((index) => opts.anchors[index]);
-    const group = resolveAnchors({ ...opts, anchors }, owner.parsed, ctx, undefined, owner);
-    let demoted = 0;
-    group.forEach((anchor, position) => {
-      const index = indexes[position];
-      const namesModule =
-        anchor.request.kind === 'symbol' ||
-        anchor.request.kind === 'handler_return' ||
-        collectSpecifiers(anchor.aliasText).size > 0;
-      if (owner === emit || anchor.failureReason !== undefined || !namesModule || emitsAlike(owner, emit)) {
-        resolved[index] = anchor;
-        return;
-      }
-      demoted += 1;
-      resolved[index] = {
-        request: anchor.request,
-        aliasText: 'unknown',
-        serialization: 'structural_fallback',
-        failureReason:
-          `typed under ${owner.configPath}, the project that owns its file, whose options differ ` +
-          `from ${emit.configPath}, which emits the surface; the module it names would be declared under the wrong options`,
-      };
-    });
-    if (owner !== emit) {
-      errors.push(
-        `${indexes.length} anchor(s) typed under ${owner.configPath}, the project that owns their files` +
-          (demoted > 0 ? `; ${demoted} demoted because the surface is emitted under ${emit.configPath}` : '')
-      );
-    }
+    analyses.set(owner, resolveAnchors({ ...opts, anchors }, owner.parsed, ctx, undefined, owner));
   }
-  return resolved;
+  // Each owner's anchors as its program read them, under the one emit.
+  const underEmit = (read: (owner: ServiceProject, analysis: Analysis, indexes: number[]) => ResolvedAnchor[]) => {
+    const resolved = new Array<ResolvedAnchor>(opts.anchors.length);
+    const errors: string[] = [];
+    for (const [owner, indexes] of groups) {
+      let demoted = 0;
+      read(owner, analyses.get(owner)!, indexes).forEach((anchor, position) => {
+        const index = indexes[position];
+        const namesModule =
+          anchor.request.kind === 'symbol' ||
+          anchor.request.kind === 'handler_return' ||
+          collectSpecifiers(anchor.aliasText).size > 0;
+        if (owner === emit || anchor.failureReason !== undefined || !namesModule || emitsAlike(owner, emit)) {
+          resolved[index] = anchor;
+          return;
+        }
+        demoted += 1;
+        resolved[index] = {
+          request: anchor.request,
+          aliasText: 'unknown',
+          serialization: 'structural_fallback',
+          failureReason:
+            `typed under ${owner.configPath}, the project that owns its file, whose options differ ` +
+            `from ${emit.configPath}, which emits the surface; the module it names would be declared under the wrong options`,
+        };
+      });
+      if (owner !== emit) {
+        errors.push(
+          `${indexes.length} anchor(s) typed under ${owner.configPath}, the project that owns their files` +
+            (demoted > 0 ? `; ${demoted} demoted because the surface is emitted under ${emit.configPath}` : '')
+        );
+      }
+    }
+    return { resolved, errors };
+  };
+  return {
+    ...underEmit((_owner, analysis) => analysis.resolved),
+    resolveAgain: (anchors, backfilled) =>
+      underEmit((_owner, analysis, indexes) =>
+        analysis.resolveAgain(indexes.map((index) => anchors[index]), backfilled).resolved
+      ),
+  };
 }
 
 /**
@@ -957,6 +1285,27 @@ function programHost(
 ): ts.CompilerHost | undefined {
   if (!bound) return deno?.host(options);
   return boundedCompilerHost(deno ? deno.host(options) : ts.createCompilerHost(options), bound);
+}
+
+/**
+ * Phase A's answer: every anchor resolved, and the program(s) it was read in,
+ * held for a literal backfill (carrick#2041).
+ */
+interface Analysis {
+  resolved: ResolvedAnchor[];
+  /** What the surface records of how the anchors' projects were read. */
+  errors: string[];
+  /**
+   * The anchors of a backfilled surface (`anchors`, one per anchor, in the
+   * same order), read in the same program(s) as a capture of them would read
+   * them: the `backfilled` aliases and any literal whose bare name now
+   * resolves through another sibling anchor are read again, the rest are
+   * answered as before.
+   */
+  resolveAgain(
+    anchors: readonly CaptureAnchorRequest[],
+    backfilled: ReadonlySet<string>
+  ): { resolved: ResolvedAnchor[]; errors: string[] };
 }
 
 /** What Phase A reads beside the anchors and the options they are typed under. */
@@ -1040,7 +1389,7 @@ function resolveAnchors(
   ctx: AnalysisContext,
   deno?: DenoProject,
   owner?: ServiceProject,
-): ResolvedAnchor[] {
+): Analysis {
   const placeholderLines = ['// Carrick capture v2 analysis placeholder.'];
   for (const anchor of opts.anchors) {
     placeholderLines.push(`export type ${anchor.alias} = unknown;`);
@@ -1102,27 +1451,54 @@ function resolveAnchors(
     };
     // A literal anchor whose text is a bare identifier resolves through a
     // sibling symbol anchor's module when one names the same symbol.
-    const siblingSymbolSpecs = new Map<string, string>();
-    for (const anchor of opts.anchors) {
-      if (anchor.kind !== 'symbol') continue;
-      if (!siblingSymbolSpecs.has(anchor.symbol_name)) {
-        siblingSymbolSpecs.set(
-          anchor.symbol_name,
-          entryRelativeSpecifier(ctx.entryDir, ctx.repoRoot, anchor.source_file, resolveFromEntry)
-        );
+    const siblingSymbolSpecsOf = (anchors: readonly CaptureAnchorRequest[]): Map<string, string> => {
+      const specs = new Map<string, string>();
+      for (const anchor of anchors) {
+        if (anchor.kind !== 'symbol') continue;
+        if (!specs.has(anchor.symbol_name)) {
+          specs.set(
+            anchor.symbol_name,
+            entryRelativeSpecifier(ctx.entryDir, ctx.repoRoot, anchor.source_file, resolveFromEntry)
+          );
+        }
       }
-    }
-    return opts.anchors.map((request, index) => {
-      const anchor = resolveAnchor(program, request, {
+      return specs;
+    };
+    const siblingSymbolSpecs = siblingSymbolSpecsOf(opts.anchors);
+    const resolveIn = (request: CaptureAnchorRequest, specs: Map<string, string>) =>
+      resolveAnchor(program, request, {
         repoRoot: ctx.repoRoot,
         entryDir: ctx.entryDir,
         placeholder: placeholders.get(request.alias),
-        siblingSymbolSpecs,
+        siblingSymbolSpecs: specs,
         resolveFromEntry,
       });
+    const resolved = opts.anchors.map((request, index) => {
+      const anchor = resolveIn(request, siblingSymbolSpecs);
       ctx.progress('anchors', `${index + 1} of ${opts.anchors.length}`);
       return anchor;
     });
+    return {
+      resolved,
+      errors: [],
+      // The program is held by this closure until the capture drops it.
+      resolveAgain: (anchors, backfilled) => {
+        const specs = siblingSymbolSpecsOf(anchors);
+        return {
+          resolved: anchors.map((request, index) => {
+            // A backfilled alias is a literal now, and a literal whose bare
+            // name a backfilled symbol anchor resolved reads through another
+            // sibling, or none. Every other anchor reads as it did.
+            const text = request.kind === 'literal' ? request.type_text.trim() : undefined;
+            const reread =
+              backfilled.has(request.alias) ||
+              (text !== undefined && siblingSymbolSpecs.get(text) !== specs.get(text));
+            return reread ? resolveIn(request, specs) : resolved[index];
+          }),
+          errors: [],
+        };
+      },
+    };
   } finally {
     if (fs.existsSync(ctx.entryPath)) ctx.guard.unlink(ctx.entryPath);
   }

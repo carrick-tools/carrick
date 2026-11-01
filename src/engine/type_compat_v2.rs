@@ -28,10 +28,11 @@ use crate::cloud_storage::{
 use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
-    AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureV2Result, CheckPairEndpoint,
-    CheckPairSpec, CheckStubInput, CheckV2Result, InferKind, InferRequestItem, ManifestEntry,
-    MemoryDeath, OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem,
-    RetypeOutcome, RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
+    AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureBackfillRequest, CaptureV2Result,
+    CheckPairEndpoint, CheckPairSpec, CheckStubInput, CheckV2Result, InferKind, InferRequestItem,
+    ManifestEntry, MemoryDeath, OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd,
+    RetypeItem, RetypeOutcome, RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket,
+    VerdictSide,
 };
 
 // ===========================================================================
@@ -850,17 +851,17 @@ impl std::fmt::Display for CaptureFailure {
 /// why; the service ships without a surface and its pairs verdict
 /// unverifiable.
 ///
-/// When the first capture DEMOTES an alias (a `capture_failure_reason` on its
-/// record — e.g. TS4023 skipped its file's declaration emit, so its surface
-/// line was rewritten to `unknown`) and the scanner holds a usable literal
-/// type text for that alias in `backfill_texts`, ONE backfill re-capture runs
-/// with those anchors replaced by literal anchors (`anchor_origin:
-/// anchor-backfill`). The re-captured artifact is adopted only when every
-/// backfilled alias passes its self-check clean AND no sibling alias degraded
-/// relative to the first run; otherwise the demoted (honest-unknown) artifact
-/// is kept. The backfill is strictly post-hoc — it never enters the capture's
-/// anchor arbitration, it only replaces an anchor whose capture already
-/// demoted.
+/// When the capture DEMOTES an alias (a `capture_failure_reason` on its record
+/// — e.g. TS4023 skipped its file's declaration emit, so its surface line was
+/// rewritten to `unknown`) and the scanner holds a usable literal type text
+/// for that alias in `backfill_texts`, the same request also writes a second
+/// stub with those anchors replaced by literal anchors (`anchor_origin:
+/// anchor-backfill`), in the same process and on the same programs
+/// (carrick#2041). The second stub is adopted only when every backfilled alias
+/// passes its self-check clean AND no sibling alias degraded relative to the
+/// first; otherwise the demoted (honest-unknown) stub is kept. The backfill is
+/// strictly post-hoc — it never enters the capture's anchor arbitration, it
+/// only replaces an anchor whose capture already demoted.
 pub(crate) fn run_capture(
     sidecar: &TypeSidecar,
     repo_path: &str,
@@ -876,28 +877,53 @@ pub(crate) fn run_capture(
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
 
-    let (stub_dir, artifact, records) =
-        capture_once(sidecar, &repo_root, service_id, anchors, tsconfig_path)?;
+    // A literal anchor is never re-anchored, so its text is not sent.
+    let texts: HashMap<String, String> = anchors
+        .iter()
+        .filter(|anchor| !matches!(anchor, CaptureAnchor::Literal { .. }))
+        .filter_map(|anchor| {
+            let text = backfill_texts.get(anchor.alias())?;
+            Some((anchor.alias().to_string(), text.clone()))
+        })
+        .collect();
 
-    let Some((rerun_anchors, backfilled)) = backfill_anchors(anchors, &records, backfill_texts)
-    else {
+    let (stub_dir, artifact, records, backfill) = capture_once(
+        sidecar,
+        &repo_root,
+        service_id,
+        anchors,
+        &texts,
+        tsconfig_path,
+    )?;
+
+    let Some(backfill) = backfill else {
         return Ok((stub_dir, artifact));
     };
+    let backfilled: HashSet<String> = backfill.backfilled.iter().cloned().collect();
     debug!(
         "v2 capture for {}: literal backfill attempt for {} demoted alias(es)",
         service_id,
         backfilled.len()
     );
-    match capture_once(
-        sidecar,
-        &repo_root,
-        service_id,
-        &rerun_anchors,
-        tsconfig_path,
+    let rerun_dir = PathBuf::from(&backfill.result.stub_dir);
+    if !backfill_accepted(&backfilled, &records, &backfill.result.aliases) {
+        // Fail-closed: the backfill result failed its self-check or
+        // degraded a sibling alias — keep the demoted/unknown surface
+        // (honest unverifiable), never a backfill that didn't verify.
+        debug!(
+            "v2 capture for {}: backfill rejected by self-check; keeping demoted surface",
+            service_id
+        );
+        let _ = std::fs::remove_dir_all(&rerun_dir);
+        return Ok((stub_dir, artifact));
+    }
+    match CaptureStubArtifact::from_stub_dir(
+        &rerun_dir,
+        &backfill.result.package_name,
+        &backfill.result.ts_version,
+        backfill.result.bare_checkout,
     ) {
-        Ok((rerun_dir, rerun_artifact, rerun_records))
-            if backfill_accepted(&backfilled, &records, &rerun_records) =>
-        {
+        Ok(rerun_artifact) => {
             debug!(
                 "v2 capture for {}: backfill adopted ({} alias(es) re-anchored)",
                 service_id,
@@ -906,38 +932,45 @@ pub(crate) fn run_capture(
             let _ = std::fs::remove_dir_all(&stub_dir);
             Ok((rerun_dir, rerun_artifact))
         }
-        Ok((rerun_dir, _, _)) => {
-            // Fail-closed: the backfill result failed its self-check or
-            // degraded a sibling alias — keep the demoted/unknown surface
-            // (honest unverifiable), never a backfill that didn't verify.
-            debug!(
-                "v2 capture for {}: backfill rejected by self-check; keeping demoted surface",
-                service_id
+        // The first capture stands: the backfill is an extra, and its own
+        // failure is in the log.
+        Err(e) => {
+            warn!(
+                "failed to read the backfilled capture stub for {}: {}",
+                service_id, e
             );
             let _ = std::fs::remove_dir_all(&rerun_dir);
             Ok((stub_dir, artifact))
         }
-        // The first capture stands: the backfill is an extra, and its own
-        // failure is in the log.
-        Err(_) => Ok((stub_dir, artifact)),
     }
 }
 
+/// The artifact of one capture, with its per-alias records (the demotion
+/// signal the backfill decision needs) and the backfilled stub it answered
+/// beside it, if any.
+type CaptureOnce = (
+    PathBuf,
+    CaptureStubArtifact,
+    Vec<CaptureAliasRecord>,
+    Option<crate::services::type_sidecar::CaptureV2Backfill>,
+);
+
 /// One capture: ask it of a fresh sidecar process, and read the stub package
-/// it wrote into the wire artifact, keeping the per-alias records (the
-/// demotion signal the backfill decision needs).
+/// it wrote into the wire artifact.
 fn capture_once(
     sidecar: &TypeSidecar,
     repo_root: &Path,
     service_id: &str,
     anchors: &[CaptureAnchor],
+    backfill_texts: &HashMap<String, String>,
     tsconfig_path: Option<&str>,
-) -> Result<(PathBuf, CaptureStubArtifact, Vec<CaptureAliasRecord>), CaptureFailure> {
+) -> Result<CaptureOnce, CaptureFailure> {
     let result = capture_in_a_fresh_process(
         sidecar,
         repo_root,
         service_id,
         anchors,
+        backfill_texts,
         tsconfig_path,
         crate::scan_health::fail_on_type_memory_from_env(),
     )
@@ -959,10 +992,13 @@ fn capture_once(
         &result.ts_version,
         result.bare_checkout,
     ) {
-        Ok(artifact) => Ok((stub_dir, artifact, result.aliases)),
+        Ok(artifact) => Ok((stub_dir, artifact, result.aliases, result.backfill)),
         Err(e) => {
             warn!("failed to read capture stub for {}: {}", service_id, e);
             let _ = std::fs::remove_dir_all(&stub_dir);
+            if let Some(backfill) = &result.backfill {
+                let _ = std::fs::remove_dir_all(&backfill.result.stub_dir);
+            }
             Err(CaptureFailure::Failed(format!(
                 "the stub package the capture wrote could not be read: {e}"
             )))
@@ -980,8 +1016,8 @@ fn capture_once(
 /// heap under a capture that added 3.4 GB, against an 8 GB cap; the same
 /// request alone in a fresh process answered at 2.8 GB. So the sidecar is
 /// replaced first, by the restart a timed-out operation already uses, scoped
-/// as it was. Every capture gets one, the backfill re-capture included: a
-/// process that has just captured still holds part of that capture.
+/// as it was. The literal backfill runs inside the same request
+/// (carrick#2041), on the programs the capture already built.
 ///
 /// **One retry.** A process that dies with the capture in hand (out of heap,
 /// killed by the OS) takes nothing of the service with it, so the capture is
@@ -1012,6 +1048,7 @@ fn capture_in_a_fresh_process(
     repo_root: &Path,
     service_id: &str,
     anchors: &[CaptureAnchor],
+    backfill_texts: &HashMap<String, String>,
     tsconfig_path: Option<&str>,
     fail_on_memory: bool,
 ) -> Result<CaptureV2Result, CaptureFailure> {
@@ -1036,17 +1073,28 @@ fn capture_in_a_fresh_process(
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        // The backfilled stub, when the capture writes one, goes beside it.
+        let mut backfill_dir = out_dir.clone().into_os_string();
+        backfill_dir.push("-backfill");
+        let backfill_dir = PathBuf::from(backfill_dir);
+        let backfill_out = backfill_dir.to_string_lossy();
+        let backfill = (!backfill_texts.is_empty()).then_some(CaptureBackfillRequest {
+            texts: backfill_texts,
+            out_dir: &backfill_out,
+        });
         let error = match sidecar.capture_v2(
             &repo_root.to_string_lossy(),
             service_id,
             anchors,
             &out_dir.to_string_lossy(),
             tsconfig_path,
+            backfill,
         ) {
             Ok(result) => return Ok(result),
             Err(error) => error,
         };
         let _ = std::fs::remove_dir_all(&out_dir);
+        let _ = std::fs::remove_dir_all(&backfill_dir);
 
         if !error.is_process_death() {
             return Err(match error {
@@ -1331,52 +1379,6 @@ pub(crate) fn derive_backfill_texts(
         }
     }
     texts
-}
-
-/// Decide the backfill re-run's anchor set: every alias whose first-run
-/// record shows a capture demotion (`capture_failure_reason` is present
-/// exactly for demoted anchors) and for which a usable literal text exists
-/// has its anchor replaced by a literal anchor at `anchor-backfill` origin.
-/// Already-literal anchors are never re-anchored (the literal tier IS the
-/// text tier — there is nothing better to fall back to). `None` = no
-/// backfillable alias, skip the re-run entirely.
-pub(crate) fn backfill_anchors(
-    anchors: &[CaptureAnchor],
-    records: &[CaptureAliasRecord],
-    texts: &HashMap<String, String>,
-) -> Option<(Vec<CaptureAnchor>, HashSet<String>)> {
-    let mut backfilled: HashSet<String> = HashSet::new();
-    for record in records {
-        if record.capture_failure_reason.is_none() || record.anchor_kind == "literal" {
-            continue;
-        }
-        if texts.contains_key(&record.alias) {
-            backfilled.insert(record.alias.clone());
-        }
-    }
-    if backfilled.is_empty() {
-        return None;
-    }
-    let rerun = anchors
-        .iter()
-        .map(|anchor| {
-            let alias = anchor.alias();
-            if backfilled.contains(alias) {
-                CaptureAnchor::Literal {
-                    alias: alias.to_string(),
-                    type_text: texts[alias].clone(),
-                    anchor_origin: AnchorOrigin::AnchorBackfill,
-                    source_file: anchor.source_file().map(str::to_string),
-                    printed_names: Vec::new(),
-                    raw_text_read: false,
-                    absent_body_tolerated: false,
-                }
-            } else {
-                anchor.clone()
-            }
-        })
-        .collect();
-    Some((rerun, backfilled))
 }
 
 /// Fail-closed acceptance for a backfill re-capture. Adopt only when:
@@ -6703,120 +6705,6 @@ mod tests {
         }
     }
 
-    fn symbol_anchor(alias: &str) -> CaptureAnchor {
-        CaptureAnchor::Symbol {
-            alias: alias.to_string(),
-            symbol_name: "Notification".to_string(),
-            source_file: "src/routes.ts".to_string(),
-            anchor_origin: AnchorOrigin::LlmSymbol,
-            array_depth: None,
-            consumer_response: false,
-            absent_body_tolerated: false,
-        }
-    }
-
-    /// Only a DEMOTED alias (capture_failure_reason present) with an
-    /// available literal text is re-anchored, as a literal at
-    /// `anchor-backfill` origin; healthy siblings, demoted aliases without
-    /// text, and already-literal anchors pass through untouched.
-    #[test]
-    fn backfill_anchors_replaces_only_demoted_with_text() {
-        let anchors = vec![
-            symbol_anchor("A_demoted"),
-            symbol_anchor("B_healthy"),
-            symbol_anchor("C_demoted_no_text"),
-            CaptureAnchor::Literal {
-                alias: "D_literal_demoted".to_string(),
-                type_text: "{ ok: boolean }".to_string(),
-                anchor_origin: AnchorOrigin::DeterministicInfer,
-                source_file: None,
-                printed_names: Vec::new(),
-                raw_text_read: false,
-                absent_body_tolerated: false,
-            },
-        ];
-        let records = vec![
-            record(
-                "A_demoted",
-                "symbol",
-                "decayed_internal",
-                Some("emit skipped"),
-            ),
-            record("B_healthy", "symbol", "ok", None),
-            record(
-                "C_demoted_no_text",
-                "symbol",
-                "decayed_internal",
-                Some("emit skipped"),
-            ),
-            record(
-                "D_literal_demoted",
-                "literal",
-                "decayed_internal",
-                Some("bad text"),
-            ),
-        ];
-        let mut texts = HashMap::new();
-        texts.insert(
-            "A_demoted".to_string(),
-            "{ id: string; read: boolean; }".to_string(),
-        );
-        texts.insert(
-            "B_healthy".to_string(),
-            "{ never: string }".to_string(), // healthy alias: text must be ignored
-        );
-        texts.insert(
-            "D_literal_demoted".to_string(),
-            "{ ok: boolean }".to_string(), // literal anchors are never re-anchored
-        );
-
-        let (rerun, backfilled) =
-            backfill_anchors(&anchors, &records, &texts).expect("one backfillable alias");
-        assert_eq!(backfilled.len(), 1);
-        assert!(backfilled.contains("A_demoted"));
-        assert_eq!(rerun.len(), anchors.len());
-        match &rerun[0] {
-            CaptureAnchor::Literal {
-                alias,
-                type_text,
-                anchor_origin,
-                source_file,
-                ..
-            } => {
-                assert_eq!(alias, "A_demoted");
-                assert_eq!(type_text, "{ id: string; read: boolean; }");
-                assert_eq!(*anchor_origin, AnchorOrigin::AnchorBackfill);
-                assert_eq!(
-                    source_file.as_deref(),
-                    Some("src/routes.ts"),
-                    "the backfill keeps the replaced anchor's file"
-                );
-            }
-            other => panic!("demoted alias must become a backfill literal, got {other:?}"),
-        }
-        assert_eq!(rerun[1], anchors[1], "healthy anchor untouched");
-        assert_eq!(rerun[2], anchors[2], "no-text demotion keeps its anchor");
-        assert_eq!(rerun[3], anchors[3], "literal anchor never re-anchored");
-    }
-
-    /// No demoted alias with text -> no re-run at all.
-    #[test]
-    fn backfill_anchors_none_without_candidates() {
-        let anchors = vec![symbol_anchor("A")];
-        let healthy = vec![record("A", "symbol", "ok", None)];
-        let mut texts = HashMap::new();
-        texts.insert("A".to_string(), "{ ok: boolean }".to_string());
-        assert!(backfill_anchors(&anchors, &healthy, &texts).is_none());
-
-        let demoted = vec![record(
-            "A",
-            "symbol",
-            "decayed_internal",
-            Some("emit skipped"),
-        )];
-        assert!(backfill_anchors(&anchors, &demoted, &HashMap::new()).is_none());
-    }
-
     fn death(phase: Option<(&str, &str)>, end: Option<ProcessEnd>) -> CaptureDeath {
         CaptureDeath {
             error: "Sidecar process died unexpectedly".to_string(),
@@ -7128,8 +7016,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 .count()
         };
 
-        let failure = capture_in_a_fresh_process(&sidecar, &root, "fixture", &anchors, None, true)
-            .expect_err("a capture whose process dies produces no stub");
+        let failure = capture_in_a_fresh_process(
+            &sidecar,
+            &root,
+            "fixture",
+            &anchors,
+            &HashMap::new(),
+            None,
+            true,
+        )
+        .expect_err("a capture whose process dies produces no stub");
         let CaptureFailure::SidecarDied { detail, deaths } = failure else {
             panic!("expected a death, got {failure:?}");
         };
@@ -7147,8 +7043,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
 
         std::fs::remove_file(&attempts).unwrap();
-        let failure = capture_in_a_fresh_process(&sidecar, &root, "fixture", &anchors, None, false)
-            .expect_err("a capture whose process dies twice produces no stub");
+        let failure = capture_in_a_fresh_process(
+            &sidecar,
+            &root,
+            "fixture",
+            &anchors,
+            &HashMap::new(),
+            None,
+            false,
+        )
+        .expect_err("a capture whose process dies twice produces no stub");
         let CaptureFailure::SidecarDied { detail, deaths } = failure else {
             panic!("expected the two deaths, got {failure:?}");
         };
@@ -7355,23 +7259,10 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         offered.sort_unstable();
         assert_eq!(offered, ["Listed", "Named", "Unasked"]);
 
-        // And nothing is re-anchored for an alias with no text: its infer
-        // anchor demoted, and it stays the honest unknown it was.
-        let anchors = derive_capture_anchors(
-            &[order_explicit("Untyped")],
-            &[response_body_infer("Untyped")],
-            &[],
-            &[inferred("Untyped", "unknown", Some("Response"), None)],
-            &[],
-            "/repo",
-        );
-        let demoted = vec![record(
-            "Untyped",
-            "infer",
-            "decayed_internal",
-            Some("locator resolved a top type"),
-        )];
-        assert!(backfill_anchors(&anchors, &demoted, &texts).is_none());
+        // And nothing is re-anchored for an alias with no text: the capture
+        // is sent no text for it, and its demoted anchor stays the honest
+        // unknown it was.
+        assert!(!texts.contains_key("Untyped"));
     }
 
     #[test]

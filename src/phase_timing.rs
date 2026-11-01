@@ -58,7 +58,7 @@ pub enum Phase {
     /// Sidecar type resolution: the inference and bundle round trips, and the
     /// scanner-side collection of the requests they carry.
     Types,
-    /// The v2 capture round trip (and the backfill re-run when it fires).
+    /// The v2 capture round trip, the literal backfill included (carrick#2041).
     Capture,
     /// Per-endpoint definition resolution from the capture stub.
     Definitions,

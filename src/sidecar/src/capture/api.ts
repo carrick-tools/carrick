@@ -432,6 +432,21 @@ export interface CaptureStubResult {
   unresolved_dependencies: string[];
   ts_version: string;
   errors: string[];
+  /**
+   * carrick#2041: the stub captured again with the demoted aliases the
+   * scanner holds a literal text for re-anchored on that text, written to
+   * `backfillOutDir`. Absent when no alias qualified or the second surface
+   * could not be written. The scanner keeps one of the two stubs.
+   */
+  backfill?: CaptureBackfillResult;
+}
+
+/** The second stub of a capture with a literal backfill (carrick#2041). */
+export interface CaptureBackfillResult {
+  /** The aliases re-anchored as literals at `anchor-backfill` origin, in anchor order. */
+  backfilled: string[];
+  /** The second stub, as a capture of the re-anchored set would answer it. */
+  result: CaptureStubResult;
 }
 
 /**
@@ -464,6 +479,15 @@ export interface CaptureStubOptions {
    * reporting. It changes nothing the capture writes.
    */
   onProgress?: (phase: CapturePhase, message: string) => void;
+  /**
+   * carrick#2041: alias -> literal type text the scanner can stand behind.
+   * An alias the capture demotes that has a text here is captured a second
+   * time, in the same request, re-anchored on the text, into
+   * `backfillOutDir`.
+   */
+  backfillTexts?: Record<string, string>;
+  /** Where the backfilled stub is written; required with `backfillTexts`. */
+  backfillOutDir?: string;
 }
 
 // ===========================================================================
