@@ -187,5 +187,10 @@ export function isNativeLibFile(compiler: NativeCompiler, file: string): boolean
 export const typescript6Steps = {
   preEmitDiagnostics: (program: ts.Program): readonly ts.Diagnostic[] => ts.getPreEmitDiagnostics(program),
   emit: (program: ts.Program, writeFile: ts.WriteFileCallback): ts.EmitResult =>
-    program.emit(undefined, writeFile, undefined, /* emitOnlyDtsFiles */ true),
+    program.emit(
+      undefined,
+      (fileName, text, bom, onError, sources, data) => writeFile(fileName, text, bom, onError, sources, data),
+      undefined,
+      /* emitOnlyDtsFiles */ true
+    ),
 };
