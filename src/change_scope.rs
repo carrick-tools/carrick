@@ -91,7 +91,25 @@ pub enum Scope {
     /// Its stored generation, written at `commit`, stands in for it.
     Carried { commit: String },
     /// It is analysed as a full scan would, for `reason`.
-    Analysed { reason: Reason, detail: String },
+    Analysed {
+        reason: Reason,
+        detail: String,
+        /// What the plan judged to move nothing this service reads
+        /// (carrick#3126): a pull request's type-reach decision keeps reach
+        /// through exactly these changes.
+        ruled_out: RuledOut,
+    },
+}
+
+/// The repo-input changes the plan ruled out for one service, so type reach
+/// does not judge them a second time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuledOut {
+    /// The service loads nothing the dependency-only change moved.
+    pub dependencies: bool,
+    /// Top-relative paths of changed `.gitignore` files that move no
+    /// untracked path the service reads.
+    pub gitignores: BTreeSet<String>,
 }
 
 impl Scope {
@@ -103,6 +121,15 @@ impl Scope {
         Scope::Analysed {
             reason,
             detail: detail.into(),
+            ruled_out: RuledOut::default(),
+        }
+    }
+
+    fn analysed_ruling(reason: Reason, detail: impl Into<String>, ruled_out: RuledOut) -> Self {
+        Scope::Analysed {
+            reason,
+            detail: detail.into(),
+            ruled_out,
         }
     }
 }
@@ -666,6 +693,21 @@ pub fn decide(
         .iter()
         .map(|change| is_repo_input(&change.path) && version_only(change))
         .collect();
+    // Each changed `.gitignore` is judged once: the verdict decides this
+    // plan, and the ones that move nothing are kept for type reach.
+    let moving_gitignores: Vec<(&str, bool)> = changed
+        .iter()
+        .filter(|change| is_gitignore(&change.path))
+        .map(|change| (change.path.as_str(), gitignore_moves(&change.path, &inputs)))
+        .collect();
+    let ruled_out = |dependencies: bool| RuledOut {
+        dependencies,
+        gitignores: moving_gitignores
+            .iter()
+            .filter(|(_, moves)| !moves)
+            .map(|(path, _)| path.to_string())
+            .collect(),
+    };
     let mut moved_dependencies = false;
     if let Some((change, _)) = others
         .iter()
@@ -677,7 +719,11 @@ pub fn decide(
                 return Scope::analysed(Reason::RepoInputChanged, change.path.clone());
             }
             DependencyReach::Reaches { file, package } => {
-                return Scope::analysed(Reason::InputsChanged, format!("{file}: {package}"));
+                return Scope::analysed_ruling(
+                    Reason::InputsChanged,
+                    format!("{file}: {package}"),
+                    ruled_out(false),
+                );
             }
             DependencyReach::Nothing => moved_dependencies = true,
         }
@@ -689,13 +735,18 @@ pub fn decide(
             inputs.reads(change, &mut keeps_imports)
         }
     }) {
-        return Scope::analysed(Reason::InputsChanged, change.path.clone());
+        return Scope::analysed_ruling(
+            Reason::InputsChanged,
+            change.path.clone(),
+            ruled_out(moved_dependencies),
+        );
     }
-    if let Some(change) = changed
-        .iter()
-        .find(|change| is_gitignore(&change.path) && gitignore_moves(&change.path, &inputs))
-    {
-        return Scope::analysed(Reason::InputsChanged, change.path.clone());
+    if let Some((path, _)) = moving_gitignores.iter().find(|(_, moves)| *moves) {
+        return Scope::analysed_ruling(
+            Reason::InputsChanged,
+            path.to_string(),
+            ruled_out(moved_dependencies),
+        );
     }
     Scope::Carried {
         commit: stored.commit_hash.clone(),
@@ -782,6 +833,7 @@ pub struct ChangedSince {
     repo_path: String,
     scaffold_config: Option<String>,
     listed: std::sync::Mutex<HashMap<String, Result<Vec<ChangedPath>, String>>>,
+    moved: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<DependencyMove>>>>,
 }
 
 impl ChangedSince {
@@ -794,7 +846,28 @@ impl ChangedSince {
                 .then(|| crate::git_state::untracked_root_config(repo_path))
                 .flatten(),
             listed: Default::default(),
+            moved: Default::default(),
         }
+    }
+
+    /// What the manifests and lockfiles changed since `commit` moved, read
+    /// once per commit and shared by [`plan`] and a pull request's
+    /// type-reach decision (carrick#3126). `None` when the change is not
+    /// dependency-only or git could not compare.
+    pub fn dependency_move(
+        &self,
+        commit: &str,
+        top: &Path,
+    ) -> Option<std::sync::Arc<DependencyMove>> {
+        let mut moved = self.moved.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(held) = moved.get(commit) {
+            return held.clone();
+        }
+        let paths = self.since(commit).ok()?;
+        let read =
+            dependency_move(&self.repo_path, top, commit, None, &paths).map(std::sync::Arc::new);
+        moved.insert(commit.to_string(), read.clone());
+        read
     }
 
     /// Every path that differs between `commit` and the working tree,
@@ -833,7 +906,6 @@ pub fn plan<'a>(
     let untracked: std::cell::OnceCell<Option<Vec<String>>> = std::cell::OnceCell::new();
     let mut stops: HashMap<PathBuf, bool> = HashMap::new();
     let mut keeps_imports_of: HashMap<(String, String), bool> = HashMap::new();
-    let mut moved_by_commit: HashMap<String, Option<DependencyMove>> = HashMap::new();
     let mut closure_took = std::time::Duration::ZERO;
     let mut walked = 0usize;
     // Services in one repository share files (a contracts package every
@@ -880,15 +952,10 @@ pub fn plan<'a>(
                     })
             };
             let dependencies = |inputs: &ServiceInputs| {
-                let (Some(blob), Some(top), Ok(paths)) = (stored, &top, changed) else {
+                let (Some(blob), Some(top), Ok(_)) = (stored, &top, changed) else {
                     return DependencyReach::Unread;
                 };
-                let moved = moved_by_commit
-                    .entry(blob.commit_hash.clone())
-                    .or_insert_with(|| {
-                        dependency_move(repo_path, top, &blob.commit_hash, None, paths)
-                    });
-                match moved {
+                match changes.dependency_move(&blob.commit_hash, top) {
                     Some(moved) => moved.reach(inputs, |moved| {
                         loaded_packages(repo_path, top, service, inputs, &reads, moved)
                     }),
@@ -944,6 +1011,7 @@ pub fn plan<'a>(
                 Scope::Analysed {
                     reason: Reason::StoredIncomplete,
                     detail,
+                    ..
                 } => {
                     info!("scope: {label} analysed");
                     debug!(
@@ -951,7 +1019,7 @@ pub fn plan<'a>(
                         Reason::StoredIncomplete.as_str()
                     );
                 }
-                Scope::Analysed { reason, detail } => {
+                Scope::Analysed { reason, detail, .. } => {
                     info!("scope: {label} analysed ({}: {detail})", reason.as_str())
                 }
             }
@@ -1006,20 +1074,28 @@ fn manifest_moves_only_version(
     only_version_differs(&stored, &head)
 }
 
+/// A manifest's text split into its top-level `version` and every other key,
+/// or `None` unless it parses as an object that states `version`. A version
+/// is no type input (carrick#3126), so what a manifest means for the scan is
+/// the rest.
+pub(crate) fn split_version(
+    text: &str,
+) -> Option<(
+    serde_json::Value,
+    serde_json::Map<String, serde_json::Value>,
+)> {
+    let serde_json::Value::Object(mut object) = serde_json::from_str(text).ok()? else {
+        return None;
+    };
+    let version = object.remove("version")?;
+    Some((version, object))
+}
+
 /// Whether two manifests parse as objects that both state a top-level
 /// `version`, differ in it, and are equal in every other key.
 pub(crate) fn only_version_differs(stored: &str, head: &str) -> bool {
-    let (Ok(mut stored), Ok(mut head)) = (
-        serde_json::from_str::<serde_json::Value>(stored),
-        serde_json::from_str::<serde_json::Value>(head),
-    ) else {
-        return false;
-    };
-    let (Some(stored), Some(head)) = (stored.as_object_mut(), head.as_object_mut()) else {
-        return false;
-    };
-    match (stored.remove("version"), head.remove("version")) {
-        (Some(before), Some(after)) => before != after && stored == head,
+    match (split_version(stored), split_version(head)) {
+        (Some((before, stored)), Some((after, head))) => before != after && stored == head,
         _ => false,
     }
 }
@@ -3429,6 +3505,104 @@ mod tests {
             unreachable!()
         };
         assert_eq!(detail, "package-lock.json: lib-c");
+    }
+
+    /// [`scopes_after`] with `edit` also written before the commit.
+    fn scopes_after_editing(
+        manager: Manager,
+        declared: &BTreeMap<String, String>,
+        installed: &BTreeMap<String, String>,
+        edit: impl FnOnce(&Path),
+    ) -> Vec<Scope> {
+        let (repo, a, services) = dependency_workspace(manager);
+        let blobs = stored_at(&services, &a);
+        write_dependencies(repo.path(), manager, declared, installed);
+        edit(repo.path());
+        commit_all(repo.path(), "move");
+        scopes_of(repo.path(), &services, &blobs, &names_of(&services))
+    }
+
+    fn edit_api_source(repo: &Path) {
+        std::fs::write(
+            repo.join("apps/api/src/server.ts"),
+            "import { a } from \"lib-a\";\nexport const server = a + 1;\n",
+        )
+        .unwrap();
+    }
+
+    fn ruled_out_dependencies(scope: &Scope) -> bool {
+        match scope {
+            Scope::Analysed { ruled_out, .. } => ruled_out.dependencies,
+            Scope::Carried { .. } => panic!("carried: {scope:?}"),
+        }
+    }
+
+    /// carrick#3126: the plan records that a dependency-only move touched
+    /// nothing the service loads, so type reach need not judge it again.
+    #[test]
+    fn a_bump_a_service_does_not_load_is_ruled_out_for_that_service_alone() {
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let scopes = scopes_after_editing(manager, &bumped, &bumped, edit_api_source);
+            assert_eq!(
+                reasons(&scopes),
+                [
+                    Some(Reason::InputsChanged),
+                    None,
+                    Some(Reason::InputsChanged)
+                ],
+                "{scopes:?}"
+            );
+            assert!(ruled_out_dependencies(&scopes[0]), "api: {scopes:?}");
+            assert!(!ruled_out_dependencies(&scopes[2]), "worker: {scopes:?}");
+        }
+    }
+
+    #[test]
+    fn a_bump_of_the_compilers_own_types_is_ruled_out_for_no_service() {
+        let bumped = moved(&first_versions(), "@types/node", "20.1.0");
+        let scopes = scopes_after_editing(Manager::Npm, &bumped, &bumped, edit_api_source);
+        assert!(!ruled_out_dependencies(&scopes[0]), "{scopes:?}");
+    }
+
+    fn ignored_by(scopes: &[Scope], index: usize) -> BTreeSet<String> {
+        match &scopes[index] {
+            Scope::Analysed { ruled_out, .. } => ruled_out.gitignores.clone(),
+            Scope::Carried { .. } => panic!("carried: {scopes:?}"),
+        }
+    }
+
+    fn edit_ignore_and_api(repo: &Path) {
+        edit_file(
+            ".gitignore",
+            "coverage/\ngen/\nnode_modules/\ndist/\n.cache/\n# edited\n",
+        )(repo);
+        edit_api_source(repo);
+    }
+
+    #[test]
+    fn a_gitignore_edit_that_moves_no_file_a_service_reads_is_ruled_out() {
+        let (repo, a, services) = ignoring_workspace();
+        let blobs = stored_at(&services, &a);
+        edit_ignore_and_api(repo.path());
+        commit_all(repo.path(), "edit");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(
+            ignored_by(&scopes, 0),
+            BTreeSet::from([".gitignore".to_string()]),
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_gitignore_edit_that_moves_an_untracked_file_the_service_reads_is_not_ruled_out() {
+        let (repo, a, services) = ignoring_workspace();
+        let blobs = stored_at(&services, &a);
+        edit_ignore_and_api(repo.path());
+        commit_all(repo.path(), "edit");
+        write_untracked(repo.path(), "apps/api/gen/out.ts");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert!(ignored_by(&scopes, 0).is_empty(), "{scopes:?}");
     }
 
     #[test]

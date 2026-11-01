@@ -1390,6 +1390,32 @@ pub(crate) mod tests {
         }
     }
 
+    /// carrick#2568: a release bump of the manifest's own `version` leaves
+    /// its hash alone, so the stored setup is replayed.
+    #[test]
+    fn a_stored_setup_is_replayed_under_a_version_bump() {
+        let hash_of = |version: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("package.json"),
+                format!(r#"{{ "name": "cli", "version": "{version}" }}"#),
+            )
+            .unwrap();
+            let packages =
+                crate::packages::Packages::new(vec![dir.path().join("package.json")]).unwrap();
+            crate::engine::hash_workspace_package_jsons(&packages, dir.path().to_str().unwrap())
+                .unwrap()
+        };
+        let stored = StoredSetup {
+            package_json_hash: Some(hash_of("1.0.0")),
+            ..complete()
+        };
+        assert!(matches!(
+            stored.decide(&hash_of("1.0.1")),
+            SetupAsk::Reuse { .. }
+        ));
+    }
+
     /// What `stored` is asked under [`MANIFESTS`]: `None` when its setup is
     /// replayed, otherwise whether a kept detection goes with the ask.
     fn asked(stored: StoredSetup) -> Option<Option<DetectionResult>> {
