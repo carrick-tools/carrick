@@ -1203,11 +1203,28 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // in declared order (carrick#1066). A failure in one stops none of the
     // others, and each result is kept at its service's index. A carried
     // service is no job: it is never handed to a worker.
-    let width = service_workers::width(analysed.len(), crate::analysis_channel::dispatching());
-    info!(
-        "Analysing services {} at a time: {}",
-        width.count, width.why
-    );
+    //
+    // Each is admitted while its reservation fits the run's memory budget,
+    // read once here, and its sidecar is capped by the peak its previous
+    // generation stored (carrick#3084). A dispatched run analyses one at a
+    // time, every service at the run's cap.
+    let dispatching = crate::analysis_channel::dispatching();
+    let run_cap_mb = crate::services::type_sidecar::heap_cap_mb();
+    let plan = service_workers::Plan::for_run(dispatching);
+    let memories: Vec<service_workers::ServiceMemory> = analysed
+        .iter()
+        .map(|service| {
+            let stored_peak = (!no_cache && !dispatching)
+                .then(|| previous_generation(previous_generations, &repo_name, service))
+                .flatten()
+                .and_then(|generation| generation.memory_peaks.as_ref()?.analysis_mb);
+            service_workers::ServiceMemory::sized(stored_peak, run_cap_mb)
+        })
+        .collect();
+    info!("{}", plan.line(&memories, run_cap_mb));
+    // The walk lane is not sized by peaks yet (carrick#3085): every walk is
+    // counted at the run's cap, as every service was.
+    let width = service_workers::walk_width(analysed.len(), dispatching);
     // The pass is timed from here: the walks are part of it, as they were
     // when each ran inside the loop.
     let pass_started = Instant::now();
@@ -1307,9 +1324,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 previous_generation(previous_generations, &repo_name, service).cloned()
             },
             generation: PreviousGeneration::Stored,
+            memory: memories[at],
         })
         .collect();
-    let outcomes = scan.analyze_all(jobs, width.count).await;
+    let mut outcomes = scan.analyze_all(jobs, &plan).await;
+    // A service whose type checker died of memory beside another service,
+    // or under a cap below the run's, in a run told to stop on such a death,
+    // is analysed again alone at the run's cap (carrick#3084). From this
+    // run's own blob, so nothing is asked of the model again. If it dies
+    // again, that death stops the run below, as one alone always has.
+    for (at, outcome) in outcomes.iter_mut().enumerate() {
+        scan.analyse_again_alone(at, outcome, run_cap_mb).await;
+    }
     crate::scan_timing::pass_ended(pass_started.elapsed().as_secs_f64());
     let mut runs: Vec<ServiceRun> = Vec::with_capacity(services.len());
     // Back in declared order: a carried service's stored generation in its
@@ -1532,8 +1558,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             })
             .await;
         }
-        // Through the same workers, as wide as the loop and no wider than
-        // what is retried. Only an analysed service owes work.
+        // Through the same workers and the same budget as the loop. Only an
+        // analysed service owes work. Each is sized by the peak its analysis
+        // just measured.
         let retrying: Vec<(usize, usize)> = retrying
             .into_iter()
             .filter_map(|index| scan_index[index].map(|at| (index, at)))
@@ -1551,13 +1578,22 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     // what it lacks is asked for.
                     previous: Some(runs[index].data.clone()),
                     generation: PreviousGeneration::ThisRun,
+                    memory: service_workers::ServiceMemory::sized(
+                        runs[index]
+                            .data
+                            .memory_peaks
+                            .as_ref()
+                            .and_then(|peaks| peaks.analysis_mb),
+                        run_cap_mb,
+                    ),
                 }
             })
             .collect();
         let pass_started = Instant::now();
-        let outcomes = scan
-            .analyze_all(jobs, width.count.min(retrying.len()))
-            .await;
+        let mut outcomes = scan.analyze_all(jobs, &plan).await;
+        for (&(_, at), outcome) in retrying.iter().zip(outcomes.iter_mut()) {
+            scan.analyse_again_alone(at, outcome, run_cap_mb).await;
+        }
         crate::scan_timing::pass_ended(pass_started.elapsed().as_secs_f64());
         for ((index, _), outcome) in retrying.into_iter().zip(outcomes) {
             match outcome {
@@ -2599,31 +2635,54 @@ struct ServiceJob {
     index: usize,
     previous: Option<CloudRepoData>,
     generation: PreviousGeneration,
+    /// Its sidecar's heap cap and its reservation of the run's budget
+    /// (carrick#3084).
+    memory: service_workers::ServiceMemory,
 }
 
 type ServiceOutcome = Result<ServiceRun, Box<dyn std::error::Error + Send + Sync>>;
 
 impl ServiceScan {
-    /// Analyse `jobs`, `width` at a time, each on a thread of its own and
-    /// each started in the order given. Every outcome comes back at its job's
-    /// position, whichever finished first; none stops another.
+    /// Analyse `jobs`, each on a thread of its own and each started in the
+    /// order given while `plan` and the run's ledger let it start
+    /// (carrick#3084). Every outcome comes back at its job's position,
+    /// whichever finished first; none stops another.
     ///
-    /// Except a type checker's memory death in a run told to stop on one
-    /// (carrick#2208): the run is already lost, so a job not yet started is
-    /// not started, and fails with the same stop. The ones running finish,
+    /// Except a type checker's memory death that stops a run told to stop on
+    /// one (carrick#2208): the run is already lost, so a job not yet started
+    /// is not started, and fails with the same stop. The ones running finish,
     /// and land unless their own checker died.
     async fn analyze_all(
         self: &std::sync::Arc<Self>,
         jobs: Vec<ServiceJob>,
-        width: usize,
+        plan: &service_workers::Plan,
     ) -> Vec<ServiceOutcome> {
+        let reservations: Vec<u64> = jobs.iter().map(|job| job.memory.reservation_mb).collect();
         let mut jobs: Vec<Option<ServiceJob>> = jobs.into_iter().map(Some).collect();
-        service_workers::in_declared_order(jobs.len(), width, |position| {
+        let ledger = service_workers::run_ledger();
+        service_workers::in_declared_order(ledger, plan, &reservations, |position| {
             let job = jobs[position].take().expect("each job is started once");
             if let Err(stop) = crate::scan_health::type_memory_stop() {
                 let stopped: ServiceOutcome = Err(stop.to_string().into());
                 return futures::future::Either::Left(std::future::ready(stopped));
             }
+            let memory = job.memory;
+            info!(
+                "Service {} started: heap cap {} ({}), reservation {} MB, {} in flight",
+                self.services[job.index]
+                    .service_name
+                    .as_deref()
+                    .unwrap_or("(root)"),
+                memory
+                    .heap_cap_mb
+                    .map_or_else(|| "V8's default".to_string(), |mb| format!("{mb} MB")),
+                memory.stored_peak_mb.map_or_else(
+                    || "no stored peak".to_string(),
+                    |mb| format!("stored peak {mb} MB")
+                ),
+                memory.reservation_mb,
+                ledger.in_flight(),
+            );
             let scan = std::sync::Arc::clone(self);
             futures::future::Either::Right(service_workers::on_a_thread(
                 format!("carrick-service-{}", job.index + 1),
@@ -2636,13 +2695,85 @@ impl ServiceScan {
                     // the service; the terminal's lines do not change for it.
                     let span = tracing::info_span!("service", name = %label);
                     runtime.block_on(tracing::Instrument::instrument(
-                        scan.analyze(job.index, job.previous.as_ref(), job.generation),
+                        scan.analyze(
+                            job.index,
+                            job.previous.as_ref(),
+                            job.generation,
+                            memory.heap_cap_mb,
+                        ),
                         span,
                     ))
                 },
             ))
         })
         .await
+    }
+
+    /// Analyse the service at `at` again, alone, at the run's cap
+    /// `run_cap_mb`, when `outcome` finished but its type checker died of
+    /// memory in a way that does not stop a run told to stop on one: beside
+    /// another service, or under a cap below the run's (carrick#3084).
+    ///
+    /// It starts from this run's own blob, after its memory death and type
+    /// loss are forgotten, so nothing is asked of the model again. If it dies
+    /// again, that death is alone at the run's cap: `outcome` becomes the
+    /// stop, and the run ends with it as one alone always has.
+    async fn analyse_again_alone(
+        self: &std::sync::Arc<Self>,
+        at: usize,
+        outcome: &mut ServiceOutcome,
+        run_cap_mb: Option<u64>,
+    ) {
+        let name = self.services[at].service_name.as_deref();
+        let Ok(run) = outcome else {
+            return;
+        };
+        if crate::scan_health::type_memory_stop().is_err()
+            || !crate::scan_health::to_analyse_again_alone(name)
+        {
+            return;
+        }
+        let alone = service_workers::ServiceMemory::at_run_cap(run_cap_mb);
+        let cap = |cap: Option<u64>| {
+            cap.map_or_else(|| "V8's default".to_string(), |mb| format!("{mb} MB"))
+        };
+        let why = match crate::scan_health::first_type_memory_death_of(name) {
+            Some(death) if !death.beside => {
+                format!("under its heap cap of {}", cap(death.heap_cap_mb))
+            }
+            _ => "beside another service".to_string(),
+        };
+        info!(
+            "Service {} died of memory {why}; analysing it again alone at {}",
+            run.label,
+            cap(alone.heap_cap_mb)
+        );
+        crate::scan_health::forget_service_losses(name);
+        crate::scan_health::forget_type_memory_loss(name);
+        // The files this scan sent to the analyzer for it: the ones the first
+        // analysis sent and was answered for, which the second replays, and
+        // whatever the second sends. A file asked twice is one file.
+        let answered_first = run.data.boundary.as_ref().map_or(0, |boundary| {
+            boundary
+                .files_attempted
+                .saturating_sub(boundary.files_lost.total)
+        });
+        let job = ServiceJob {
+            index: at,
+            previous: Some(run.data.clone()),
+            generation: PreviousGeneration::ThisRun,
+            memory: alone,
+        };
+        *outcome = self
+            .analyze_all(vec![job], &service_workers::Plan::alone())
+            .await
+            .pop()
+            .expect("one job, one outcome");
+        if let Ok(again) = outcome
+            && let Some(boundary) = again.data.boundary.as_mut()
+        {
+            boundary.files_attempted += answered_first;
+        }
     }
 
     /// Analyse one service and read back what it owes the model.
@@ -2655,6 +2786,7 @@ impl ServiceScan {
         index: usize,
         previous_data: Option<&CloudRepoData>,
         generation: PreviousGeneration,
+        heap_cap_mb: Option<u64>,
     ) -> Result<ServiceRun, Box<dyn std::error::Error + Send + Sync>> {
         let service = &self.services[index];
         // Every prompt-lambda call a service makes happens inside its
@@ -2668,7 +2800,7 @@ impl ServiceScan {
             service.service_name.clone(),
             // Boxed: the analysis future is large, and a wrapper that holds
             // it inline is another copy of it on a debug build's stack.
-            Box::pin(self.analyze_in_scope(index, service, previous_data, generation)),
+            Box::pin(self.analyze_in_scope(index, service, previous_data, generation, heap_cap_mb)),
         )
         .await
         // The one place the error is flattened: what is not the model's to
@@ -2688,6 +2820,7 @@ impl ServiceScan {
         service: &Config,
         previous_data: Option<&CloudRepoData>,
         generation: PreviousGeneration,
+        heap_cap_mb: Option<u64>,
     ) -> Result<ServiceRun, Box<dyn std::error::Error>> {
         let total = self.services.len();
         // One line per service, at info, before the work starts. A scan of a
@@ -2730,13 +2863,12 @@ impl ServiceScan {
             .and_then(walk_lane::Walked::peak_mb);
 
         // A sidecar process of the service's own, scoped to its directory and
-        // tsconfig, at the full heap cap. It is dropped, and its process
-        // stopped, when this analysis ends.
+        // tsconfig, at the heap cap the run's ledger gave it (carrick#3084).
+        // It is dropped, and its process stopped, when this analysis ends.
         let sidecar_started = Instant::now();
-        let sidecar = self
-            .sidecar
-            .as_ref()
-            .and_then(|recipe| start_service_sidecar(recipe, &self.repo_path, service));
+        let sidecar = self.sidecar.as_ref().and_then(|recipe| {
+            start_service_sidecar(recipe, &self.repo_path, service, heap_cap_mb)
+        });
         let sidecar_took = sidecar_started.elapsed();
 
         let analysis_started = Instant::now();
@@ -2821,7 +2953,7 @@ impl ServiceScan {
         data.memory_peaks = Some(crate::cloud_storage::MemoryPeaks {
             analysis_mb: analysis_peak_mb,
             walk_mb: walk_peak_mb,
-            heap_cap_mb: crate::services::type_sidecar::heap_cap_mb(),
+            heap_cap_mb,
         });
         if data.bundled_types.is_some() {
             debug!(
@@ -8681,13 +8813,16 @@ fn service_sidecar_root(repo_path: &str, service: &Config) -> std::path::PathBuf
 ///
 /// Every service gets one, whatever the width: a service's program is built
 /// by a process nothing else has asked, so its types do not depend on which
-/// services ran before it or beside it, and each process keeps the full heap
-/// cap.
+/// services ran before it or beside it. Each process starts with
+/// `heap_cap_mb`, the cap the run's ledger gave the service (carrick#3084),
+/// and a restart of it keeps that cap.
 fn start_service_sidecar(
     recipe: &crate::services::type_sidecar::SidecarRecipe,
     repo_path: &str,
     service: &Config,
+    heap_cap_mb: Option<u64>,
 ) -> Option<TypeSidecar> {
+    let recipe = recipe.clone().with_heap_cap_mb(heap_cap_mb);
     let service_root = service_sidecar_root(repo_path, service);
     let label = service.service_name.as_deref().unwrap_or("(root)");
     debug!(

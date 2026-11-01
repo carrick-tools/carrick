@@ -139,6 +139,22 @@ pub struct TypeMemoryDeath {
     /// The heap cap the process was started with, in MB; `None` for V8's
     /// default.
     pub heap_cap_mb: Option<u64>,
+    /// It died while a service's analysis was running: `service` names that
+    /// service (or is `None` for an unnamed one). `false` in the
+    /// cross-service check and anywhere else after the loop.
+    pub in_analysis: bool,
+    /// Another service's analysis was in flight as it died (carrick#3084).
+    pub beside: bool,
+}
+
+impl TypeMemoryDeath {
+    /// Whether this death stops a run told to stop on one: a death outside
+    /// any service's analysis always does; one in a service's analysis only
+    /// when the service ran alone at the run's cap (carrick#3084). Any other
+    /// is the service's to analyse again, alone, at the run's cap.
+    pub fn stops_the_run(&self, run_cap_mb: Option<u64>) -> bool {
+        !self.in_analysis || (!self.beside && self.heap_cap_mb == run_cap_mb)
+    }
 }
 
 /// The run stopped at a type-checker memory death, because it was asked to
@@ -176,16 +192,23 @@ impl std::fmt::Display for TypesOutOfMemory {
 
 impl std::error::Error for TypesOutOfMemory {}
 
-/// Whether the run stops at a memory death: when `fail_on_memory` is set and
-/// one was recorded, the first. Pure, so the policy is testable without the
-/// process environment.
+/// Whether the run stops at a memory death: when `fail_on_memory` is set, at
+/// the first recorded that [`TypeMemoryDeath::stops_the_run`] under
+/// `run_cap_mb`. A death beside another service, or under a cap below the
+/// run's, does not stop it: that service is analysed again alone
+/// (carrick#3084). Pure, so the policy is testable without the process
+/// environment.
 pub fn stop_for_type_memory(
     fail_on_memory: bool,
     deaths: &[TypeMemoryDeath],
+    run_cap_mb: Option<u64>,
 ) -> Result<(), TypesOutOfMemory> {
-    match deaths.first() {
-        Some(first) if fail_on_memory => Err(TypesOutOfMemory(first.clone())),
-        _ => Ok(()),
+    if !fail_on_memory {
+        return Ok(());
+    }
+    match deaths.iter().find(|death| death.stops_the_run(run_cap_mb)) {
+        Some(first) => Err(TypesOutOfMemory(first.clone())),
+        None => Ok(()),
     }
 }
 
@@ -879,11 +902,15 @@ pub fn record_type_memory_death(
     kind: crate::services::type_sidecar::MemoryDeath,
     heap_cap_mb: Option<u64>,
 ) {
+    let in_analysis = crate::current_service::in_scope();
     let death = TypeMemoryDeath {
         service: crate::current_service::name(),
         stage: crate::scan_stage::current(),
         kind,
         heap_cap_mb,
+        in_analysis,
+        // The run's ledger counts this service's own analysis too.
+        beside: in_analysis && crate::engine::service_workers::run_ledger().in_flight() > 1,
     };
     registry()
         .lock()
@@ -899,7 +926,56 @@ pub fn record_type_memory_death(
 pub fn type_memory_stop() -> Result<(), TypesOutOfMemory> {
     let fail_on_memory = fail_on_type_memory_from_env();
     let registry = registry().lock().expect("scan health lock");
-    stop_for_type_memory(fail_on_memory, &registry.type_memory_deaths)
+    stop_for_type_memory(
+        fail_on_memory,
+        &registry.type_memory_deaths,
+        crate::services::type_sidecar::heap_cap_mb(),
+    )
+}
+
+/// Whether `service` is to be analysed again, alone, at the run's cap: the
+/// run was told to stop on a memory death, and its checker died of memory
+/// in a way that does not stop the run (beside another service, or under a
+/// cap below the run's; carrick#3084).
+pub fn to_analyse_again_alone(service: Option<&str>) -> bool {
+    if !fail_on_type_memory_from_env() {
+        return false;
+    }
+    let run_cap = crate::services::type_sidecar::heap_cap_mb();
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .type_memory_deaths
+        .iter()
+        .any(|death| {
+            death.in_analysis
+                && death.service.as_deref() == service
+                && !death.stops_the_run(run_cap)
+        })
+}
+
+/// The first memory death recorded in `service`'s analysis, for the line
+/// that says why it is analysed again.
+pub fn first_type_memory_death_of(service: Option<&str>) -> Option<TypeMemoryDeath> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .type_memory_deaths
+        .iter()
+        .find(|death| death.in_analysis && death.service.as_deref() == service)
+        .cloned()
+}
+
+/// Forget `service`'s memory deaths and the type loss they cost it, ahead
+/// of analysing it again alone (carrick#3084): whatever it loses then is
+/// recorded again.
+pub fn forget_type_memory_loss(service: Option<&str>) {
+    let mut registry = registry().lock().expect("scan health lock");
+    registry
+        .type_memory_deaths
+        .retain(|death| !(death.in_analysis && death.service.as_deref() == service));
+    let scope = service.unwrap_or("(root)");
+    registry.types_unavailable.retain(|(s, _)| s != scope);
 }
 
 /// [`type_memory_stop`] for one service's analysis: `Err` when this run
@@ -915,7 +991,11 @@ pub fn type_memory_stop_of(service: Option<&str>) -> Result<(), TypesOutOfMemory
         .filter(|death| death.service.as_deref() == service)
         .cloned()
         .collect();
-    stop_for_type_memory(fail_on_memory, &deaths)
+    stop_for_type_memory(
+        fail_on_memory,
+        &deaths,
+        crate::services::type_sidecar::heap_cap_mb(),
+    )
 }
 
 fn env_flag(name: &str) -> bool {
@@ -1715,21 +1795,26 @@ mod tests {
             stage: Stage::TypeCapture,
             kind: MemoryDeath::HeapLimit,
             heap_cap_mb: Some(6144),
+            in_analysis: true,
+            beside: false,
         };
         let check = TypeMemoryDeath {
             service: None,
             stage: Stage::CrossRepoCheck,
             kind: MemoryDeath::OomKilled,
             heap_cap_mb: None,
+            in_analysis: false,
+            beside: false,
         };
-        assert_eq!(stop_for_type_memory(true, &[]), Ok(()));
+        let run_cap = Some(6144);
+        assert_eq!(stop_for_type_memory(true, &[], run_cap), Ok(()));
         assert_eq!(
-            stop_for_type_memory(false, std::slice::from_ref(&capture)),
+            stop_for_type_memory(false, std::slice::from_ref(&capture), run_cap),
             Ok(())
         );
         let deaths = [capture.clone(), check.clone()];
         assert_eq!(
-            stop_for_type_memory(true, &deaths),
+            stop_for_type_memory(true, &deaths, run_cap),
             Err(TypesOutOfMemory(capture.clone()))
         );
         assert_eq!(
@@ -1743,6 +1828,46 @@ mod tests {
             "types_out_of_memory: the type checker was killed by the kernel for memory \
              (oom_killed) during cross_repo_check, under a heap cap of V8's default; the run \
              stopped so it can run again on a larger machine"
+        );
+    }
+
+    /// carrick#3084: in a service's analysis, only a death alone at the run's
+    /// cap stops the run. One beside another service, or under a lower cap,
+    /// is that service's to analyse again alone. A death outside any
+    /// service's analysis stops it whatever cap it records.
+    #[test]
+    fn only_a_death_alone_at_the_run_cap_stops_the_run() {
+        use crate::scan_stage::Stage;
+        use crate::services::type_sidecar::MemoryDeath;
+        let run_cap = Some(12_288);
+        let death = |heap_cap_mb, in_analysis, beside| TypeMemoryDeath {
+            service: Some("beta".to_string()),
+            stage: Stage::TypeCapture,
+            kind: MemoryDeath::HeapLimit,
+            heap_cap_mb,
+            in_analysis,
+            beside,
+        };
+        let beside = death(run_cap, true, true);
+        let under_its_own_cap = death(Some(2_048), true, false);
+        let alone = death(run_cap, true, false);
+        let after_the_loop = death(Some(2_048), false, false);
+        assert_eq!(
+            stop_for_type_memory(true, &[beside.clone(), under_its_own_cap.clone()], run_cap),
+            Ok(())
+        );
+        assert_eq!(
+            stop_for_type_memory(true, &[beside.clone(), alone.clone()], run_cap),
+            Err(TypesOutOfMemory(alone.clone()))
+        );
+        assert_eq!(
+            stop_for_type_memory(true, &[beside, after_the_loop.clone()], run_cap),
+            Err(TypesOutOfMemory(after_the_loop))
+        );
+        // The run's cap turned off: a death at V8's default, alone, stops it.
+        assert_eq!(
+            stop_for_type_memory(true, &[death(None, true, false)], None),
+            Err(TypesOutOfMemory(death(None, true, false)))
         );
     }
 }

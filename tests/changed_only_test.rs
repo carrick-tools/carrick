@@ -1012,7 +1012,10 @@ fn analysed_side_by_side_a_carried_service_is_never_analysed() {
             .count()
     };
     assert_eq!(
-        said("Analysing services 2 at a time: "),
+        said(
+            "Analysing services by memory: at most 4 at once: asked for by \
+             CARRICK_SERVICE_CONCURRENCY"
+        ),
         1,
         "{}",
         side_by_side.output

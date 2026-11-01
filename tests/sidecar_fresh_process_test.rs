@@ -294,6 +294,38 @@ fn a_restart_gives_a_fresh_process_scoped_as_the_old_one_was() {
     assert_eq!(scope["scan_root"], dir.path().to_string_lossy().as_ref());
 }
 
+/// carrick#3084: a service's sidecar starts with the heap cap its recipe was
+/// given, not the run's, and keeps it across a restart and in a process
+/// started like it (a pool's).
+#[test]
+fn a_restart_keeps_the_heap_cap_its_recipe_gave() {
+    if !node_available() {
+        eprintln!("Skipping: node is not on PATH");
+        return;
+    }
+    let (dir, _script, base) = ready_stand_in(
+        "fs.appendFileSync(path.join(here, 'argv'), process.execArgv.join(' ') + '\\n');",
+    );
+    let capped = base
+        .recipe()
+        .with_heap_cap_mb(Some(2048))
+        .spawn_scoped(dir.path(), None)
+        .expect("a capped process starts");
+    let (capped, restarted, _) = restart(capped);
+    restarted.expect("the restart");
+    let like = capped
+        .spawn_scoped_like(dir.path(), None)
+        .expect("a process like it starts");
+    drop((base, capped, like));
+    let argv = notes(dir.path(), "argv");
+    assert_eq!(argv.len(), 4, "{argv:?}");
+    assert_eq!(
+        argv[1..],
+        ["--max-old-space-size=2048"; 3],
+        "the run's cap, not the recipe's: {argv:?}"
+    );
+}
+
 /// A process that died with a request in hand leaves two things to say about
 /// it (carrick#1916): the last stage the request reported, and how the
 /// process ended. With them a capture's failure says whether the heap ran
