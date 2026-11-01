@@ -229,14 +229,16 @@ fn a_pool_of_three_processes_judges_every_call_as_one_process_does() {
             .map(str::to_string)
     };
     assert!(
-        pool_line(&three_log)
-            .is_some_and(|line| line.contains("; 3 process(es) for the 3 after the first")),
+        pool_line(&three_log).is_some_and(
+            |line| line.contains("; 3 process(es) for the 3 request(s) after the first")
+        ),
         "three processes took the files after the first: {:?}",
         pool_line(&three_log)
     );
     assert!(
-        pool_line(&one_log)
-            .is_some_and(|line| line.contains("; 1 process(es) for the 3 after the first")),
+        pool_line(&one_log).is_some_and(
+            |line| line.contains("; 1 process(es) for the 3 request(s) after the first")
+        ),
         "one process took them all: {:?}",
         pool_line(&one_log)
     );

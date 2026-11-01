@@ -3006,10 +3006,13 @@ fn retype_consumer_calls(
 /// Retype one service's items, one request per file, until the scan's
 /// retype `ceiling` passes (carrick#1945, carrick#1996, carrick#2021).
 ///
-/// A request holds one file's calls, never part of a file: the process that
-/// takes it reads that file's diagnostics before any rewrite once, for all
-/// of them. One file a request also lets a pool share the work evenly, and a
-/// failure costs only that file's calls.
+/// A request holds the calls of one file only, and the process that takes it
+/// reads that file's diagnostics before any rewrite once, for all of them.
+/// A file with at least two calls for each process that would share it is cut
+/// into one request per process, so one file with many calls does not keep the
+/// rest of the pool idle (a file below that floor stays one request: each
+/// extra request pays the file's diagnostics again). A failure costs only its
+/// own request's calls.
 ///
 /// Every file the calls are in first joins `sidecar`'s program, sorted, so
 /// that no request adds one. The first request goes to `sidecar`, scoped to
@@ -3056,9 +3059,13 @@ fn retype_service(
     };
     let gone = |answer: &Result<Vec<RetypeOutcome>, SidecarError>| matches!(answer, Err(e) if e.leaves_no_process());
 
-    let Some((first, rest)) = jobs.split_first() else {
+    let Some((first_job, rest_jobs)) = jobs.split_first() else {
         return HashMap::new();
     };
+    // The first request is the first chunk of a large first file.
+    let (first, first_tail) = cut_first_request(first_job);
+    let mut rest: Vec<Vec<RetypeItem>> = first_tail.into_iter().collect();
+    rest.extend(rest_jobs.iter().cloned());
     if spent() {
         // Nothing will be sent, so the service's program is not loaded or
         // built for it.
@@ -3109,7 +3116,7 @@ fn retype_service(
             true
         }
     };
-    let first_answer = ask(sidecar, first);
+    let first_answer = ask(sidecar, &first);
     let first_gone = gone(&first_answer);
     let mut answers: Vec<Option<Result<Vec<RetypeOutcome>, SidecarError>>> =
         Vec::with_capacity(jobs.len());
@@ -3125,9 +3132,11 @@ fn retype_service(
         );
     } else {
         let wanted = size(sidecar);
-        let processes = wanted.processes.min(rest.len()).max(1);
+        let left: usize = rest.iter().map(Vec::len).sum();
+        let processes = wanted.processes.min(left).max(1);
+        rest = cut_for_pool(rest, processes);
         info!(
-            "Retyping {service}'s consumer calls: {} call(s) in {} file(s); {processes} process(es) for the {} after the first ({})",
+            "Retyping {service}'s consumer calls: {} call(s) in {} file(s); {processes} process(es) for the {} request(s) after the first ({})",
             items.len(),
             jobs.len(),
             rest.len(),
@@ -3147,7 +3156,7 @@ fn retype_service(
                     );
                 }
                 ran_on = pool.processes();
-                answers.extend(pool.run(rest, gone, ask));
+                answers.extend(pool.run(&rest, gone, ask));
             }
             Err(e) => {
                 warn!("Retyping {service}'s consumer calls stopped: {e}");
@@ -3162,7 +3171,8 @@ fn retype_service(
         started.elapsed().as_secs_f64()
     );
 
-    jobs.iter()
+    std::iter::once(&first)
+        .chain(rest.iter())
         .zip(answers)
         .flat_map(|(job, answer)| match answer {
             Some(Ok(outcomes)) => outcomes,
@@ -3171,6 +3181,40 @@ fn retype_service(
         })
         .map(|answer| (answer.item_id.clone(), answer))
         .collect()
+}
+
+/// The first request of a retype and what is left of its file. A first file
+/// of at least two calls for each of the most processes a pool runs gives
+/// `ceil(n / most)` calls first, so the others can start while the pool is
+/// sized; any other first file goes whole.
+fn cut_first_request(job: &[RetypeItem]) -> (Vec<RetypeItem>, Option<Vec<RetypeItem>>) {
+    let most = crate::services::sidecar_pool::MAX_PROCESSES;
+    if job.len() < 2 * most {
+        return (job.to_vec(), None);
+    }
+    let (head, tail) = job.split_at(job.len().div_ceil(most));
+    (head.to_vec(), Some(tail.to_vec()))
+}
+
+/// `groups` (one file's calls each) cut for a pool of `processes`: a group
+/// of `n >= 2 * processes` calls becomes consecutive chunks of
+/// `ceil(n / processes)`, a smaller one stays whole. The longest requests
+/// come first, ties in their original order.
+fn cut_for_pool(groups: Vec<Vec<RetypeItem>>, processes: usize) -> Vec<Vec<RetypeItem>> {
+    let mut cut: Vec<Vec<RetypeItem>> = Vec::new();
+    for group in groups {
+        if processes > 1 && group.len() >= 2 * processes {
+            cut.extend(
+                group
+                    .chunks(group.len().div_ceil(processes))
+                    .map(<[RetypeItem]>::to_vec),
+            );
+        } else {
+            cut.push(group);
+        }
+    }
+    cut.sort_by_key(|job| std::cmp::Reverse(job.len()));
+    cut
 }
 
 /// Every item of `job` abstaining for `reason`.
@@ -3797,7 +3841,8 @@ mod tests {
     /// request, and a request that fails costs only its own items. The
     /// stand-in fails the request that holds `fail-1`. The other files keep
     /// their answers, whether one process or three take them, and the
-    /// failed file's two calls abstain and say why. A file is never split:
+    /// failed file's two calls abstain and say why. A file below the split
+    /// floor is never split:
     /// `x-4` shares the failed request with `fail-1`.
     ///
     /// Sending every item in one request again fails this: all five come
@@ -3922,6 +3967,83 @@ mod tests {
         let pids = answered_by(&pooled);
         assert_eq!(pids.len(), 3, "three processes answered: {pooled:?}");
         assert!(pids.contains(&sidecar.pid().to_string()));
+    }
+
+    /// A file's calls are shared by the pool: 8 calls in one file, three
+    /// processes. The stand-in names the process that answered; more than
+    /// one did, and the verdicts equal one process's.
+    #[test]
+    fn one_files_calls_are_shared_by_the_pool() {
+        use crate::services::sidecar_pool::test_support::{base_at, retype_item};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sidecar = base_at(&root);
+        let consumer = consumer_at(&root);
+        let file = root.join("src/a.ts").display().to_string();
+        let items: Vec<RetypeItem> = (0..8)
+            .map(|n| retype_item(&file, &format!("item-{n}")))
+            .collect();
+        let judge = |n: usize| {
+            read_answers(&retype_service(
+                &sidecar,
+                "cli",
+                &consumer,
+                &items,
+                &RetypeCeiling::starting_now(std::time::Duration::from_secs(600)),
+                processes(n),
+            ))
+        };
+        let verdicts = |answers: &BTreeMap<String, (RetypeVerdict, Option<String>)>| {
+            answers
+                .iter()
+                .map(|(id, (verdict, _))| (id.clone(), *verdict))
+                .collect::<Vec<_>>()
+        };
+        let answered_by = |answers: &BTreeMap<String, (RetypeVerdict, Option<String>)>| {
+            answers
+                .values()
+                .filter_map(|(_, pid)| pid.clone())
+                .collect::<std::collections::BTreeSet<String>>()
+        };
+        let one = judge(1);
+        let pooled = judge(3);
+        assert_eq!(one.len(), 8);
+        assert_eq!(verdicts(&pooled), verdicts(&one));
+        assert_eq!(answered_by(&one), [sidecar.pid().to_string()].into());
+        assert!(
+            answered_by(&pooled).len() >= 2,
+            "more than one process answered: {pooled:?}"
+        );
+    }
+
+    /// The split floor: a file with fewer than two calls for each process is
+    /// not cut, so three calls on three processes are one request, answered
+    /// by the scan's own process.
+    #[test]
+    fn a_small_file_is_not_split() {
+        use crate::services::sidecar_pool::test_support::{base_at, retype_item};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sidecar = base_at(&root);
+        let consumer = consumer_at(&root);
+        let file = root.join("src/a.ts").display().to_string();
+        let items: Vec<RetypeItem> = (0..3)
+            .map(|n| retype_item(&file, &format!("item-{n}")))
+            .collect();
+        let answers = read_answers(&retype_service(
+            &sidecar,
+            "cli",
+            &consumer,
+            &items,
+            &RetypeCeiling::starting_now(std::time::Duration::from_secs(600)),
+            processes(3),
+        ));
+        let pids: std::collections::BTreeSet<String> = answers
+            .values()
+            .filter_map(|(_, pid)| pid.clone())
+            .collect();
+        assert_eq!(answers.len(), 3);
+        assert_eq!(pids, [sidecar.pid().to_string()].into());
     }
 
     /// carrick#1996: a process that is gone takes no more requests, and a
