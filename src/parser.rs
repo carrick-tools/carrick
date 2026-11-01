@@ -112,15 +112,40 @@ impl ModuleReader {
     /// position ([`type_reads`], [`reference_directives`]), from one parse:
     /// the reach walk's reads of a file.
     pub fn reach_specifiers(&mut self, file: &Path) -> Vec<String> {
-        let Some(module) = parse_file(file, &self.source_map, &self.handler) else {
+        let Some(source) = read_source(file) else {
             return Vec::new();
         };
-        let mut found = module_loads(&module);
-        found.extend(type_reads(&module));
-        if let Some(source) = read_source(file) {
-            found.extend(reference_directives(&source));
-        }
-        found
+        let name = FileName::Real(file.to_path_buf());
+        let Some(module) =
+            parse_source(file, name, source.clone(), &self.source_map, &self.handler)
+        else {
+            return Vec::new();
+        };
+        reach_of(&module, &source)
+    }
+
+    /// What a copy of `file` held as text (the one a commit holds, say) reads
+    /// and declares, for a reader that asks whether an edit moved the
+    /// module's edges (carrick#3114). `label` keeps two copies of one path
+    /// apart in the source map. `None` when the text does not parse.
+    pub fn module_shape_of_text(
+        &mut self,
+        file: &Path,
+        label: &str,
+        text: String,
+    ) -> Option<ModuleShape> {
+        let module = parse_source(
+            file,
+            FileName::Custom(label.to_string()),
+            text.clone(),
+            &self.source_map,
+            &self.handler,
+        )?;
+        Some(ModuleShape {
+            reach: reach_of(&module, &text).into_iter().collect(),
+            is_module: is_module(&module, is_javascript(file)),
+            augments_types: augments_types(&module),
+        })
     }
 
     /// Every module specifier `file` imports from, in source order.
@@ -134,6 +159,89 @@ impl ModuleReader {
         };
         static_specifiers(&module)
     }
+}
+
+/// What one copy of a source file says about the edges it adds to a program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleShape {
+    /// What the file loads, as the reach walk reads it
+    /// ([`ModuleReader::reach_specifiers`]), as a set.
+    pub reach: std::collections::BTreeSet<String>,
+    /// An import, an export, or in JavaScript a CommonJS `require`,
+    /// `module.exports` or `exports.`; any other file is a script, whose
+    /// top-level declarations are globals.
+    pub is_module: bool,
+    /// A `declare global`, a `declare module` or a `declare namespace`, which
+    /// change types program-wide.
+    pub augments_types: bool,
+}
+
+/// [`ModuleReader::reach_specifiers`] over a parsed module and its text.
+fn reach_of(module: &Module, source: &str) -> Vec<String> {
+    let mut found = module_loads(module);
+    found.extend(type_reads(module));
+    found.extend(reference_directives(source));
+    found
+}
+
+fn is_javascript(file: &Path) -> bool {
+    file.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "js" | "jsx" | "mjs" | "cjs"))
+}
+
+fn is_module(module: &Module, javascript: bool) -> bool {
+    use swc_ecma_ast::{Callee, Expr, MemberExpr, ModuleItem};
+    use swc_ecma_visit::{Visit, VisitWith};
+    if module
+        .body
+        .iter()
+        .any(|item| matches!(item, ModuleItem::ModuleDecl(_)))
+    {
+        return true;
+    }
+    if !javascript {
+        return false;
+    }
+    struct CommonJs(bool);
+    impl Visit for CommonJs {
+        fn visit_call_expr(&mut self, call: &swc_ecma_ast::CallExpr) {
+            if let Callee::Expr(callee) = &call.callee
+                && matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
+            {
+                self.0 = true;
+            }
+            call.visit_children_with(self);
+        }
+        fn visit_member_expr(&mut self, member: &MemberExpr) {
+            if let Expr::Ident(object) = &*member.obj
+                && (object.sym == *"exports" || object.sym == *"module")
+            {
+                self.0 = true;
+            }
+            member.visit_children_with(self);
+        }
+    }
+    let mut found = CommonJs(false);
+    module.visit_with(&mut found);
+    found.0
+}
+
+fn augments_types(module: &Module) -> bool {
+    use swc_ecma_ast::TsModuleDecl;
+    use swc_ecma_visit::{Visit, VisitWith};
+    struct Augments(bool);
+    impl Visit for Augments {
+        fn visit_ts_module_decl(&mut self, decl: &TsModuleDecl) {
+            if decl.global || decl.declare {
+                self.0 = true;
+            }
+            decl.visit_children_with(self);
+        }
+    }
+    let mut found = Augments(false);
+    module.visit_with(&mut found);
+    found.0
 }
 
 /// Every module specifier `module` loads a module by, as
