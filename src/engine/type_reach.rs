@@ -51,6 +51,26 @@ pub(crate) enum ReachDecision {
 }
 
 impl ReachDecision {
+    /// Whether no alias of the service is reached and at least one is
+    /// unreached: the case where main's types stand in for the service's
+    /// type stage (carrick#3103). An unreached alias has a twin in main's
+    /// manifest with the same row key.
+    pub fn keeps_main_types(&self) -> bool {
+        matches!(
+            self,
+            ReachDecision::Partial { reached, unreached }
+                if reached.is_empty() && !unreached.is_empty()
+        )
+    }
+
+    /// The aliases a [`Self::keeps_main_types`] decision keeps.
+    pub fn kept_aliases(&self) -> usize {
+        match self {
+            ReachDecision::Partial { unreached, .. } => unreached.len(),
+            ReachDecision::Whole { .. } => 0,
+        }
+    }
+
     fn whole(reason: impl Into<String>) -> Self {
         ReachDecision::Whole {
             reason: reason.into(),
@@ -591,6 +611,7 @@ fn gate_of<'a>(
 /// manifest it built. `request_files` is every request the type stage will
 /// send, by alias. `started` is when the run began collecting those
 /// requests: the line and the dump carry the time the decision took.
+/// Returns the decision, which the caller acts on (carrick#3103).
 pub(crate) fn decide_service(
     started: std::time::Instant,
     context: ReachContext<'_>,
@@ -598,7 +619,7 @@ pub(crate) fn decide_service(
     this_run: &CloudRepoData,
     request_files: &BTreeMap<String, BTreeSet<String>>,
     sidecar: Option<&crate::services::type_sidecar::TypeSidecar>,
-) {
+) -> ReachDecision {
     let config_json = serde_json::to_string(facts.config).ok();
     let commit = facts
         .stored
@@ -620,7 +641,7 @@ pub(crate) fn decide_service(
         commit,
     };
     let decided = decide(&inputs, &walker);
-    report(facts, decided, Some(started.elapsed()));
+    report(facts, decided, Some(started.elapsed()))
 }
 
 /// The decision of a service whose analysis does not reach the point
@@ -633,7 +654,70 @@ pub(crate) fn decide_service_whole(context: ReachContext<'_>, facts: &ServiceFac
     report(facts, Decided::whole(reason), None);
 }
 
-fn report(facts: &ServiceFacts<'_>, decided: Decided, took: Option<std::time::Duration>) {
+/// Put main's stored types in for a service no change reaches
+/// (carrick#3103): its bundle, capture stub and extraction status as
+/// stored, and each manifest row replaced by main's row of the same key,
+/// every field. Called before the payload's paths are made repo-relative:
+/// row keys read both sides through `repo_relative`, and main's rows are
+/// stored repo-relative, so that sweep leaves them as they are. Returns how
+/// many rows had no twin in
+/// main's manifest and kept this run's row (the decision guarantees none).
+pub(crate) fn keep_main_types(
+    cloud_data: &mut CloudRepoData,
+    stored: &CloudRepoData,
+    repo_path: &str,
+) -> usize {
+    cloud_data.bundled_types = stored.bundled_types.clone();
+    cloud_data.capture_stub = stored.capture_stub.clone();
+    cloud_data.type_extraction_status = stored.type_extraction_status.clone();
+    cloud_data.types_degraded = None;
+    let main_rows: BTreeMap<String, &TypeManifestEntry> = stored
+        .type_manifest
+        .iter()
+        .flatten()
+        .map(|entry| (row_key(entry, repo_path), entry))
+        .collect();
+    let mut without_twin = 0;
+    for entry in cloud_data.type_manifest.iter_mut().flatten() {
+        match main_rows.get(&row_key(entry, repo_path)) {
+            Some(twin) => *entry = (*twin).clone(),
+            None => without_twin += 1,
+        }
+    }
+    without_twin
+}
+
+/// Say that a service took main's types for `aliases` unreached aliases:
+/// one info line, and `kept_main_types` in the service's dump when the run
+/// dumps. The dump is written by [`report`] before the type stage, so this
+/// one reads what the stage actually did, not what was decided.
+pub(crate) fn note_kept(id: &str, label: &str, aliases: usize) {
+    tracing::info!("type_reach: {label} kept main's types (0 of {aliases} aliases reached)");
+    let Some(dir) = std::env::var_os(TYPE_REACH_DUMP_ENV) else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join(format!("{}.json", id.replace(['/', '\\'], "_")));
+    let updated = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|mut body| {
+            body["kept_main_types"] = serde_json::json!(aliases);
+            serde_json::to_vec_pretty(&body).ok()
+        })
+        .map(|bytes| std::fs::write(&path, bytes));
+    if !matches!(updated, Some(Ok(()))) {
+        tracing::warn!(
+            "Could not add the kept-types count to the type-reach dump of service {label} at {}",
+            path.display()
+        );
+    }
+}
+
+fn report(
+    facts: &ServiceFacts<'_>,
+    decided: Decided,
+    took: Option<std::time::Duration>,
+) -> ReachDecision {
     let took_ms = took.map(|took| took.as_millis());
     match took_ms {
         Some(ms) => tracing::info!("{} in {ms} ms", decided.line(facts.label)),
@@ -655,7 +739,8 @@ fn report(facts: &ServiceFacts<'_>, decided: Decided, took: Option<std::time::Du
             );
         }
     }
-    super::type_compat_v2::record_type_reach(facts.id, decided.decision);
+    super::type_compat_v2::record_type_reach(facts.id, decided.decision.clone());
+    decided.decision
 }
 
 /// The run's one total line over every decision kept, or `None` when the
@@ -1336,6 +1421,96 @@ mod tests {
             "type_reach: 2 service(s), 1 whole, 1 partial with 1 of 3 aliases reached"
         );
         assert_eq!(total_line(&HashMap::new()), None);
+    }
+
+    // ---- Main's types stand in (carrick#3103) -------------------------
+
+    #[test]
+    fn a_service_no_change_reaches_keeps_mains_types() {
+        let decided = Case::clean().decide(&Fake::reaching(&[]));
+        assert!(decided.decision.keeps_main_types());
+        assert_eq!(decided.decision.kept_aliases(), 2);
+    }
+
+    #[test]
+    fn a_service_with_one_reached_alias_is_retyped() {
+        let case = Case::changing(vec![change('M', "src/a.ts")]);
+        let decided = case.decide(&Fake::reaching(&["src/a.ts"]));
+        assert_eq!(reached_of(&decided), vec!["A"]);
+        assert!(!decided.decision.keeps_main_types());
+    }
+
+    #[test]
+    fn a_whole_decision_keeps_nothing() {
+        assert!(!ReachDecision::whole("off").keeps_main_types());
+    }
+
+    #[test]
+    fn a_service_with_no_alias_keeps_nothing() {
+        let case = Case {
+            manifest: Vec::new(),
+            ..Case::clean()
+        };
+        let decided = case.decide(&Fake::reaching(&[]));
+        assert!(!decided.decision.keeps_main_types());
+    }
+
+    #[test]
+    fn a_degraded_stored_generation_with_nothing_reached_is_retyped_whole() {
+        let mut blob = stored();
+        blob.types_degraded = Some(crate::cloud_storage::TypeDegradation {
+            stage: "capture".to_string(),
+            detail: "out of memory".to_string(),
+        });
+        let case = Case {
+            stored: Some(blob),
+            ..Case::clean()
+        };
+        let decided = case.decide(&Fake::reaching(&[]));
+        assert!(!decided.decision.keeps_main_types());
+        assert_eq!(case.reason(&Fake::reaching(&[])), "types_degraded");
+    }
+
+    #[test]
+    fn keeping_mains_types_takes_its_rows_bundle_and_stub_whole() {
+        let mut main = stored();
+        main.bundled_types = Some("declare type A = string;".to_string());
+        main.type_extraction_status = Some("main's status".to_string());
+        for row in main.type_manifest.as_mut().unwrap() {
+            row.resolved_definition = Some(format!("main's {}", row.type_alias));
+        }
+        // This run's rows: the same keys, typed differently (here, not at
+        // all), with paths still under the scan root.
+        let mut this_run = stored();
+        this_run.capture_stub = None;
+        this_run.types_degraded = Some(crate::cloud_storage::TypeDegradation {
+            stage: "capture".to_string(),
+            detail: "this run's".to_string(),
+        });
+        for row in this_run.type_manifest.as_mut().unwrap() {
+            row.file_path = format!("/repo/{}", row.file_path);
+            row.evidence.file_path = row.file_path.clone();
+        }
+        let without_twin = keep_main_types(&mut this_run, &main, "/repo");
+        assert_eq!(without_twin, 0);
+        assert_eq!(json(&this_run.type_manifest), json(&main.type_manifest));
+        assert_eq!(this_run.bundled_types, main.bundled_types);
+        assert_eq!(json(&this_run.capture_stub), json(&main.capture_stub));
+        assert_eq!(this_run.type_extraction_status, main.type_extraction_status);
+        assert!(this_run.types_degraded.is_none());
+    }
+
+    #[test]
+    fn a_row_main_lacks_keeps_this_runs_row_and_is_counted() {
+        let main = stored();
+        let mut this_run = stored();
+        this_run
+            .type_manifest
+            .as_mut()
+            .unwrap()
+            .push(entry("C", "src/c.ts", 9));
+        assert_eq!(keep_main_types(&mut this_run, &main, "/repo"), 1);
+        assert_eq!(this_run.type_manifest.as_ref().unwrap().len(), 3);
     }
 
     #[test]

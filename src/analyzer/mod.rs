@@ -127,23 +127,27 @@ fn conflict_tier_of(severity: &ConflictSeverity) -> &'static str {
 
 /// Project a [`DependencyConflict`] into its wire finding.
 fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
+    let mut versions: Vec<PackageVersionRef> = conflict
+        .repos
+        .iter()
+        .map(|repo| PackageVersionRef {
+            repo: repo.repo_name.clone(),
+            version: repo.version.clone(),
+            spec: repo.spec.clone(),
+            // A blob uploaded before paths were relativized at the
+            // source carries the runner checkout here; strip it so the
+            // conflict row cites `package.json`, not a runner path.
+            source: strip_ci_workspace_prefix(&repo.source_path.display().to_string()).to_string(),
+        })
+        .collect();
+    // The repos arrive in map order, which moves between runs of one scan;
+    // the posted row must not (carrick#3103's A/B compares whole results).
+    versions
+        .sort_by(|a, b| (&a.repo, &a.source, &a.version).cmp(&(&b.repo, &b.source, &b.version)));
     Finding::dependency_conflict(
         conflict.package_name.clone(),
         conflict_tier_of(&conflict.severity),
-        conflict
-            .repos
-            .iter()
-            .map(|repo| PackageVersionRef {
-                repo: repo.repo_name.clone(),
-                version: repo.version.clone(),
-                spec: repo.spec.clone(),
-                // A blob uploaded before paths were relativized at the
-                // source carries the runner checkout here; strip it so the
-                // conflict row cites `package.json`, not a runner path.
-                source: strip_ci_workspace_prefix(&repo.source_path.display().to_string())
-                    .to_string(),
-            })
-            .collect(),
+        versions,
     )
 }
 
@@ -4038,6 +4042,27 @@ mod tests {
             text: Some(text.to_string()),
             display: "Endpoint_x_Response".to_string(),
         }
+    }
+
+    #[test]
+    fn a_dependency_conflict_lists_its_repos_in_one_order() {
+        let repo = |name: &str, version: &str| RepoPackageInfo {
+            repo_name: name.to_string(),
+            version: version.to_string(),
+            spec: format!("^{version}"),
+            source_path: PathBuf::from("package.json"),
+        };
+        let conflict = |repos| DependencyConflict {
+            package_name: "zod".to_string(),
+            repos,
+            severity: ConflictSeverity::Critical,
+        };
+        let one = conflict(vec![repo("orders", "4.0.0"), repo("storefront", "3.22.0")]);
+        let other = conflict(vec![repo("storefront", "3.22.0"), repo("orders", "4.0.0")]);
+        assert_eq!(
+            serde_json::to_value(dependency_conflict_finding(&one)).unwrap(),
+            serde_json::to_value(dependency_conflict_finding(&other)).unwrap()
+        );
     }
 
     /// Two sides anchored at one name print their type text, so the finding

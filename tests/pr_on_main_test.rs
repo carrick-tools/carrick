@@ -2076,7 +2076,29 @@ async fn main_snapshot() -> &'static MainSnapshot {
 
 /// The result of scanning `repo_name` of the fixture as a PR that applies
 /// `change` on top of main.
-async fn seed_payload(repo_name: &str, change: impl FnOnce(&Path)) -> serde_json::Value {
+///
+/// Every seed is also the A/B of carrick#3103: the PR is scanned with the
+/// type-reach decision off (every service re-typed whole) and then on, and
+/// the two posted results must be the same. The on run is last, so a dump
+/// (`CARRICK_TYPE_REACH_DUMP`) reads its decision. A run that turned the
+/// decision off itself is scanned once.
+async fn seed_payload(repo_name: &str, change: impl Fn(&Path)) -> serde_json::Value {
+    if std::env::var("CARRICK_TYPE_REACH").is_ok_and(|value| value.trim() == "off") {
+        return seed_payload_once(repo_name, &change).await;
+    }
+    let off = {
+        let _off = EnvVar::set("CARRICK_TYPE_REACH", "off");
+        seed_payload_once(repo_name, &change).await
+    };
+    let on = seed_payload_once(repo_name, &change).await;
+    assert_eq!(
+        on, off,
+        "the PR result of {repo_name} moved with the type-reach decision on"
+    );
+    on
+}
+
+async fn seed_payload_once(repo_name: &str, change: &dyn Fn(&Path)) -> serde_json::Value {
     let main = main_snapshot().await;
     seed_env();
     let _fact_layer = FactLayer::on();
@@ -3066,8 +3088,10 @@ async fn a_pull_request_scan_stores_no_type_reach_record() {
 // ---- Type reach (carrick#3102) -------------------------------------------
 //
 // A PR run decides, per service, which manifest aliases its change can reach
-// and dumps the decision (`CARRICK_TYPE_REACH_DUMP`). It changes nothing
-// else yet: the payload is the same with the decision off.
+// and dumps the decision (`CARRICK_TYPE_REACH_DUMP`). A service no alias of
+// which is reached takes main's types and sends the sidecar no type request
+// (carrick#3103); the payload is the same with the decision off, which
+// `seed_payload` asserts for every seed.
 
 /// Sets one environment variable for its lifetime.
 struct EnvVar(&'static str, Option<String>);
@@ -3094,7 +3118,7 @@ impl Drop for EnvVar {
 }
 
 /// The PR run's payload and `orders-api`'s dumped decision, for `change`.
-async fn reach_of(change: impl FnOnce(&Path)) -> (serde_json::Value, serde_json::Value) {
+async fn reach_of(change: impl Fn(&Path)) -> (serde_json::Value, serde_json::Value) {
     let dump = tempfile::tempdir().unwrap();
     let _dump = EnvVar::set("CARRICK_TYPE_REACH_DUMP", &dump.path().to_string_lossy());
     let payload = seed_payload("orders-api", change).await;
@@ -3269,4 +3293,43 @@ async fn reach_off_is_whole_and_changes_no_payload() {
     let (off, dump) = reach_of(edit_contract).await;
     assert_eq!(whole_reason(&dump), "off");
     assert_eq!(on, off);
+}
+
+/// An edit no alias's types read: `src/legacy.js` is outside the program.
+fn edit_legacy(repo: &Path) {
+    edit(
+        repo,
+        "src/legacy.js",
+        &[("\"order \" + id", "\"order #\" + id")],
+    );
+}
+
+/// carrick#3103: a service no alias of which is reached takes main's types.
+/// The dump's `kept_main_types` is written by the engine where it skips the
+/// type stage, so it reads what the run did; `seed_payload` has already
+/// asserted the posted result equals the one with the decision off.
+#[tokio::test]
+async fn reach_a_service_no_change_reaches_takes_mains_types() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(edit_legacy).await;
+    let (reached, unreached) = reached_protocols(&dump);
+    assert!(reached.is_empty(), "{dump:#}");
+    assert!(!unreached.is_empty(), "{dump:#}");
+    let aliases = dump["decided"]["aliases"].as_array().unwrap().len();
+    assert_eq!(dump["kept_main_types"], aliases, "{dump:#}");
+}
+
+#[tokio::test]
+async fn reach_a_service_with_a_reached_alias_is_retyped() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(edit_contract).await;
+    assert!(dump.get("kept_main_types").is_none(), "{dump:#}");
+}
+
+#[tokio::test]
+async fn reach_off_takes_no_types_from_main() {
+    let _serial = SERIAL.lock().await;
+    let _off = EnvVar::set("CARRICK_TYPE_REACH", "off");
+    let (_, dump) = reach_of(edit_legacy).await;
+    assert!(dump.get("kept_main_types").is_none(), "{dump:#}");
 }
