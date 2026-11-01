@@ -122,6 +122,12 @@ export async function j(): Promise<string> {
   const r = await overloaded('/x');
   return String(r);
 }
+
+// The same call as a, inside a generic function: a producer type may name Q.
+export async function k<Q>(q: Q): Promise<number> {
+  const r = await getThing({});
+  return r.data ? r.data.n : q ? 1 : 0;
+}
 `;
 
 const CALLS = {
@@ -135,13 +141,16 @@ const CALLS = {
   h: "awaitedOf('/x')",
   i: "indexed('/x')",
   j: "overloaded('/x')",
+  k: "getThing({})",
 } as const;
 type Name = keyof typeof CALLS;
 const NAMES = Object.keys(CALLS) as Name[];
 
 /** The 1-based line of the one CONSUMER line that holds `text`. */
-const lineOf = (text: string): number =>
-  CONSUMER.split('\n').findIndex((line) => line.includes(text)) + 1;
+const lineOf = (text: string, nth = 0): number =>
+  CONSUMER.split('\n')
+    .map((line, index) => (line.includes(text) ? index + 1 : 0))
+    .filter(Boolean)[nth];
 
 interface Outcome {
   item_id: string;
@@ -187,9 +196,9 @@ describe('carrick#3158: the retype decides "does not reach" before the rewrite',
 
   const locator = (name: Name) => ({
     file_path: consumerPath,
-    line_number: lineOf(CALLS[name]),
+    line_number: lineOf(CALLS[name], name === 'k' ? 1 : 0),
     expression_text: CALLS[name],
-    expression_line: lineOf(CALLS[name]),
+    expression_line: lineOf(CALLS[name], name === 'k' ? 1 : 0),
   });
 
   async function prescreen(
@@ -234,7 +243,7 @@ describe('carrick#3158: the retype decides "does not reach" before the rewrite',
     // f: a default that names a type parameter. g: a free type parameter
     // among the written arguments keeps the conditional deferred. h: a
     // library alias that returns its argument. i: an indexed access.
-    // j: two signatures.
+    // j: two signatures. k: inside a generic function.
   });
 
   it('words the reason as the full retype does, quoting the call\'s own result', async () => {

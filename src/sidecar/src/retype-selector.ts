@@ -16,12 +16,14 @@
  *      stated type breaks the first parameter's constraint, TypeScript fills
  *      unwritten arguments with their raw defaults, so a default that names
  *      a type parameter would change the result.
+ *  C3  the call sits in no generic declaration: a producer type naming a
+ *      type parameter in scope would defer the conditional.
  *  C2  the first parameter appears in the return type only in the check or
  *      extends type of a conditional that resolves (extends type without
  *      `infer`, only tracked type parameters named in either type).
  */
 
-import { ts } from 'ts-morph';
+import { Node, ts } from 'ts-morph';
 import type { CallExpression } from 'ts-morph';
 
 type Role = 'D' | 'closed';
@@ -30,6 +32,12 @@ type Roles = Map<ts.Symbol, Role>;
 const MAX_DEPTH = 64;
 
 export function typeArgumentOnlySelects(call: CallExpression): boolean {
+  // A producer type may name a type parameter in scope at the call. The
+  // conditional then defers and the stated type reaches the result, so the
+  // full retype must judge it.
+  if (call.getAncestors().some((a) => Node.isTypeParametered(a) && a.getTypeParameters().length > 0)) {
+    return false;
+  }
   const typeArgs = call.getTypeArguments();
   const checker = call.getProject().getTypeChecker().compilerObject;
   const declaration = checker.getResolvedSignature(call.compilerNode)?.getDeclaration() as
