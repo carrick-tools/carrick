@@ -3321,6 +3321,29 @@ impl ServiceScan {
         if self.walking && walked.is_none() {
             return;
         }
+        let Ok(unchanged) = reusable_paths(repo_path, &previous.commit_hash) else {
+            return;
+        };
+        let no_answers = HashMap::new();
+        // Only a service with a file changed since its stored generation is
+        // asked for ahead. Read from the file walk alone, before the parse
+        // and the store's ask, so a service with nothing changed costs the
+        // lane no more than the walk. A file left unchanged with no stored
+        // answer is almost always one the reader is never sent (it holds no
+        // call or route), so it does not count; the rarer one whose last ask
+        // failed is asked in the service's own turn, as before.
+        let walk = crate::file_finder::walk_service_quietly(
+            repo_path,
+            service,
+            &service_ignore_patterns(service),
+        );
+        if walk
+            .files
+            .iter()
+            .all(|file| unchanged.contains(&repo_relative_key(repo_path, file)))
+        {
+            return;
+        }
         let Ok(FileDiscovery {
             files,
             import_facts,
@@ -3337,10 +3360,6 @@ impl ServiceScan {
         else {
             return;
         };
-        let Ok(unchanged) = reusable_paths(repo_path, &previous.commit_hash) else {
-            return;
-        };
-        let no_answers = HashMap::new();
         let cached = replayable_answers(
             repo_path,
             &files,
@@ -3387,6 +3406,9 @@ impl ServiceScan {
             service_root,
             declared_dependencies,
         } = prompt_inputs(repo_path, service, &packages, &files);
+        // Whether the run has a type checker to start. The analysis reads
+        // whether its own started, and refuses everything built here when
+        // the two differ.
         let typed = self.sidecar.is_some();
         let siblings = reached_siblings(
             own.map(|own| siblings::Neighbours {
@@ -3409,7 +3431,7 @@ impl ServiceScan {
         // The service's library ask is the lane's from here, unless its
         // analysis came first: the analysis takes both answers from it.
         let mut first = None;
-        let began = place.begin_library(|| {
+        let began = place.begin_library(typed, || {
             let ask = std::sync::Arc::clone(library_ask.as_ref()?);
             let asked = ask.asked.clone();
             let (early, first_answer) = tokio::sync::oneshot::channel();
@@ -3421,7 +3443,7 @@ impl ServiceScan {
             first = Some(handed.first());
             Some(handed)
         });
-        if !began || board.is_stopped() {
+        if !began || place.stop.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         let (early, first_answer) = tokio::sync::oneshot::channel();
@@ -3433,7 +3455,7 @@ impl ServiceScan {
             ))
             .with_answers_ahead(crate::agents::asked_ahead::AheadRole::Lane {
                 slot: place.answers.clone(),
-                stop: board.stop.clone(),
+                stop: place.stop.clone(),
                 log,
             });
         let _ = tokio::join!(
@@ -5015,15 +5037,32 @@ async fn analyze_current_repo_incremental(
                 ask_turns.clone(),
             );
             // What a lane asked the library store ahead for this service
-            // (carrick#3131), taken when it asked what this analysis asks.
-            let library_handed =
-                ahead
-                    .and_then(answers_ahead::Place::claim_library)
-                    .filter(|handed| {
-                        library_ask
-                            .as_ref()
-                            .is_some_and(|ask| ask.asked == handed.asked)
-                    });
+            // (carrick#3131), taken when it read the service as this analysis
+            // does (a type checker running or not) and asked what this
+            // analysis asks. Otherwise its prompts were built on another
+            // store answer, so none of them is taken: the lane asks nothing
+            // more for the service, its store ask stops, and this analysis
+            // asks for itself.
+            let library_handed = match ahead.map(|place| (place, place.claim_library())) {
+                Some((place, Some(lane))) => {
+                    if lane.agrees(
+                        sidecar.is_some(),
+                        library_ask.as_ref().map(|ask| &ask.asked),
+                    ) {
+                        lane.handed
+                    } else {
+                        drop(lane);
+                        let asked = place.refuse().map_or(0, |held| held.asked());
+                        info!(
+                            "Answers ahead for {}: refused, built on another library answer; \
+                             asked {asked} file(s)",
+                            config.service_name.as_deref().unwrap_or("(root)")
+                        );
+                        None
+                    }
+                }
+                _ => None,
+            };
             let (early_answer, first_answer) = tokio::sync::oneshot::channel();
             let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
             let file_orchestrator = file_orchestrator
@@ -5552,11 +5591,10 @@ async fn analyze_current_repo_incremental(
 
     // Fallback: full analysis (analyze_current_repo now populates cache fields)
     debug!("Running full analysis...");
-    // Which asks nothing ahead (carrick#3131): a lane that has not asked yet
-    // asks nothing now.
+    // Which takes nothing asked ahead (carrick#3131): the lane asks nothing
+    // more for the service, and its store ask stops.
     if let Some(place) = ahead {
-        drop(place.claim_library());
-        drop(place.answers.claim());
+        place.refuse();
     }
     if let Some(context) = reach {
         type_reach::decide_service_whole(

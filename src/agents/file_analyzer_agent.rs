@@ -794,6 +794,21 @@ impl FileAnalyzerAgent {
         Self { agent_service }
     }
 
+    /// The same agent, sending each request once: no retry, no re-send
+    /// after a lease wait or a refusal ([`crate::agent_service::RetryPolicy::ONCE`]).
+    pub fn once(&self) -> Self {
+        Self::new(
+            self.agent_service
+                .clone()
+                .with_retry_policy(crate::agent_service::RetryPolicy::ONCE),
+        )
+    }
+
+    /// The policy this agent's requests retry under.
+    pub fn retry_policy(&self) -> crate::agent_service::RetryPolicy {
+        self.agent_service.retry_policy()
+    }
+
     /// Eval-harness diagnostics (off in normal runs). When `CARRICK_EVAL_DUMP_DIR`
     /// is set, write the file-analyzer's input (`request_user_message` — which
     /// embeds the framework guidance + candidates the model received) and its

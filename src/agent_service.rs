@@ -1110,6 +1110,11 @@ impl AgentService {
         self
     }
 
+    /// The policy this service's calls retry under.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry
+    }
+
     /// Per-task lambda call where the lambda just needs a user_message +
     /// schema (e.g. file-analyzer). The lambda owns the system prompt.
     /// `task_path` is the API Gateway route, e.g. "/analyze-file".

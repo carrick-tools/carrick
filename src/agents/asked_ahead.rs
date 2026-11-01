@@ -43,6 +43,8 @@ pub struct AskedAhead {
     held: Mutex<HashMap<AheadKey, Held>>,
     asked: AtomicUsize,
     taken: AtomicUsize,
+    /// Whether the analysis has said it waits for an answer in flight.
+    said_waiting: AtomicBool,
 }
 
 /// The lane's end of one held answer.
@@ -92,13 +94,31 @@ impl AskedAhead {
     /// The answer held under `key`, once it has arrived. `None` when none is
     /// held there or the lane's ask failed: the analysis asks for itself.
     /// Each key is taken once.
+    ///
+    /// The first time the analysis has to wait for an answer still in
+    /// flight, it says so once on the run's log: a long wait here is a stall
+    /// a reader of the log can then place (carrick#748).
     pub async fn take(&self, key: &AheadKey) -> Option<FileAnalysisResult> {
-        let held = self
+        let mut held = self
             .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(key)?;
-        let answer = held.answer.await.ok().flatten()?;
+        let answer = match held.answer.try_recv() {
+            Ok(answer) => answer,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                if !self.said_waiting.swap(true, Ordering::SeqCst) {
+                    tracing::info!(
+                        "Waiting for the file reader's answers asked ahead for {}",
+                        crate::current_service::name()
+                            .as_deref()
+                            .unwrap_or("(root)")
+                    );
+                }
+                held.answer.await.ok().flatten()
+            }
+        }?;
         self.taken.fetch_add(1, Ordering::SeqCst);
         Some(answer)
     }
@@ -203,8 +223,9 @@ pub enum AheadRole {
     /// The service's analysis: it claims the slot before it asks.
     Analysis(Arc<AheadSlot>),
     /// The lane: it builds the prompts, publishes, asks, and stops there.
-    /// `stop` is set when the scan no longer wants anything asked. The lane
-    /// builds quietly, and says on `log` what it asks once it publishes.
+    /// `stop` is set when nothing more is wanted for this service: its
+    /// analysis refused the lane, or the scan stopped it. The lane builds
+    /// quietly, and says on `log` what it asks and what its asks say.
     Lane {
         slot: Arc<AheadSlot>,
         stop: Arc<AtomicBool>,

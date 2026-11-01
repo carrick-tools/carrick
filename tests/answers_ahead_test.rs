@@ -72,28 +72,43 @@ fn offline() {
     carrick::scan_health::forget_service_losses(None);
 }
 
-/// Two route files of one service, under a fresh root.
+/// Files of one service under a fresh root (two route files unless built
+/// otherwise), and the setup they are read under.
 struct Routes {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     files: Vec<PathBuf>,
+    guidance: FrameworkGuidance,
+    detection: DetectionResult,
 }
 
 impl Routes {
     fn new(tag: &str) -> Self {
+        Self::of(
+            ["a", "b"]
+                .into_iter()
+                .map(|name| (name.to_string(), Self::source(tag, name)))
+                .collect(),
+        )
+    }
+
+    /// `src/<name>.ts` holding each source, read under [`guidance`].
+    fn of(sources: Vec<(String, String)>) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let mut files = Vec::new();
-        for name in ["a", "b"] {
+        for (name, source) in sources {
             let path = root.join(format!("src/{name}.ts"));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, Self::source(tag, name)).unwrap();
+            std::fs::write(&path, source).unwrap();
             files.push(path);
         }
         Self {
             _tmp: tmp,
             root,
             files,
+            guidance: guidance(),
+            detection: DetectionResult::default(),
         }
     }
 
@@ -122,8 +137,8 @@ impl Routes {
             .analyze_files(
                 &self.files,
                 &HashMap::new(),
-                &ProtocolGuidance::from([(Protocol::Http, guidance())]),
-                &DetectionResult::default(),
+                &ProtocolGuidance::from([(Protocol::Http, self.guidance.clone())]),
+                &self.detection,
                 &self.root,
                 &self.root,
                 &[],
@@ -280,10 +295,206 @@ async fn a_failed_ask_ahead_is_asked_again_by_the_loop() {
     );
 }
 
+/// The review of carrick#3131: an answer the lane asked under other inputs
+/// than the analysis builds with (here the setup's guidance, which every
+/// prompt carries) is never taken. The analysis asks every file again, and
+/// each of the lane's asks is counted unused.
+#[tokio::test]
+#[serial]
+async fn an_answer_asked_ahead_under_other_guidance_is_never_taken() {
+    offline();
+    let mut routes = Routes::new("stale");
+    let slot = Arc::new(AheadSlot::default());
+    let (_, lane_asks) = routes.analyze_counting(lane(&slot)).await;
+    let held = slot.held().expect("the lane published");
+    routes.guidance.endpoint_patterns[0].description =
+        "a route registration, as the analysis was told".to_string();
+    let (analysed, analysis_asks) = routes
+        .analyze_counting(AheadRole::Analysis(slot.clone()))
+        .await;
+
+    assert_eq!(lane_asks, 2);
+    assert_eq!(analysis_asks, 2, "the analysis asks both files itself");
+    assert_eq!((held.asked(), held.taken(), held.unused()), (2, 0, 2));
+    assert_eq!(analysed.stats.files_model_dispatched, 2);
+}
+
+/// What the cloud says when a file's answer does not fit one response: the
+/// analysis then asks the file again in parts.
+fn cut() -> String {
+    serde_json::json!({
+        "success": false,
+        "error": {
+            "code": "output_truncated",
+            "message": "stated by the test",
+            "retriable": false,
+        },
+    })
+    .to_string()
+}
+
+/// The review of carrick#3131: a lane ask is one request, sent once. The
+/// lane asks through a reader that retries nothing, and a file whose answer
+/// does not fit one response is not cut and asked again by the lane: the
+/// analysis asks it with its own retries and cuts, so the lane costs at most
+/// one request more per file than a run with nothing asked ahead.
+#[tokio::test]
+#[serial]
+async fn a_lane_ask_is_one_request_and_never_cut_or_retried() {
+    offline();
+    let routes = Routes::new("once");
+    let slot = Arc::new(AheadSlot::default());
+    let as_lane = FileOrchestrator::new(AgentService::new()).with_answers_ahead(lane(&slot));
+    assert_eq!(
+        as_lane.ahead_retry_policy(),
+        Some(agent_service::RetryPolicy::ONCE),
+        "the lane's requests are never retried"
+    );
+    assert_eq!(
+        FileOrchestrator::new(AgentService::new()).ahead_retry_policy(),
+        None
+    );
+
+    agent_service::inject_mock_envelope(ROUTE, &Routes::marker("a"), 1, &cut());
+    let (_, lane_asks) = routes.analyze_counting(lane(&slot)).await;
+    assert_eq!(lane_asks, 2, "one request per file, the cut one included");
+    let held = slot.held().expect("the lane published");
+    let (analysed, analysis_asks) = routes
+        .analyze_counting(AheadRole::Analysis(slot.clone()))
+        .await;
+    assert_eq!((held.asked(), held.taken(), held.unused()), (2, 1, 0));
+    assert_eq!(analysis_asks, 1, "the analysis asks the cut file itself");
+    assert!(
+        analysed
+            .raw_model_results
+            .keys()
+            .any(|file| file.ends_with("src/a.ts"))
+    );
+}
+
+/// The review of carrick#3131: the lane makes none of the analysis's side
+/// effects. It counts no file attempted, records no loss and no file read
+/// for the service's timing line, even when an ask fails. The analysis, in
+/// the same scope, does each.
+#[tokio::test]
+#[serial]
+async fn the_lane_makes_none_of_the_analysis_s_side_effects() {
+    offline();
+    let routes = Routes::new("quiet");
+    let service = Some("side-effects".to_string());
+    let attempted = carrick::scan_health::attempted_count();
+    let lost = carrick::scan_health::lost_file_count();
+    let slot = Arc::new(AheadSlot::default());
+    agent_service::inject_mock_failure(ROUTE, &Routes::marker("a"), 1);
+    let read = carrick::current_service::asked_for(service.clone(), async {
+        routes.analyze(lane(&slot)).await;
+        carrick::scan_timing::files_of_current_service()
+    })
+    .await;
+    assert_eq!(slot.held().expect("the lane published").asked(), 2);
+    assert_eq!(read, None, "no files read for the service's timing");
+    assert_eq!(
+        carrick::scan_health::attempted_count(),
+        attempted,
+        "no file attempted"
+    );
+    assert_eq!(
+        carrick::scan_health::lost_file_count(),
+        lost,
+        "no loss recorded"
+    );
+
+    let read = carrick::current_service::asked_for(service, async {
+        routes
+            .analyze(AheadRole::Analysis(Arc::new(AheadSlot::default())))
+            .await;
+        carrick::scan_timing::files_of_current_service()
+    })
+    .await;
+    assert_eq!(read, Some(2), "the analysis counts the files it reads");
+    assert_eq!(carrick::scan_health::attempted_count(), attempted + 2);
+}
+
+/// The review of carrick#3131: the lane is not for HTTP alone. A pub/sub
+/// publisher, sent to the reader because it imports a messaging client the
+/// setup names, is asked ahead and its answer taken.
+#[tokio::test]
+#[serial]
+async fn a_pub_sub_publisher_asked_ahead_is_taken() {
+    offline();
+    let mut routes = Routes::of(vec![(
+        "publisher".to_string(),
+        "import { connect } from \"nats\";\n\
+         const nc = await connect();\n\
+         nc.publish(\"orders.created\", JSON.stringify({ id: 1 }));\n"
+            .to_string(),
+    )]);
+    routes.detection.messaging_clients = vec!["nats".to_string()];
+    let (main, main_asks) = routes.analyze_counting(AheadRole::None).await;
+    assert_eq!(main_asks, 1, "the publisher is sent to the reader");
+
+    let slot = Arc::new(AheadSlot::default());
+    let (_, lane_asks) = routes.analyze_counting(lane(&slot)).await;
+    let held = slot.held().expect("the lane published");
+    let (analysed, analysis_asks) = routes
+        .analyze_counting(AheadRole::Analysis(slot.clone()))
+        .await;
+    assert_eq!((lane_asks, analysis_asks), (1, 0));
+    assert_eq!((held.asked(), held.taken(), held.unused()), (1, 1, 0));
+    assert_eq!(
+        analysed.stats.files_model_dispatched,
+        main.stats.files_model_dispatched
+    );
+}
+
+/// The review of carrick#3131: once nothing more is wanted for a service
+/// (its analysis refused the lane), the lane sends no ask it has not sent
+/// yet. One more file than the lane asks at once, each ask held a second:
+/// the stop set while the first asks are in flight keeps the last unsent.
+#[tokio::test]
+#[serial]
+async fn a_stopped_lane_sends_no_further_ask() {
+    offline();
+    let depth = carrick::agents::file_orchestrator::FILE_ANALYSIS_QUEUE_DEPTH;
+    let routes = Routes::of(
+        (0..=depth)
+            .map(|at| {
+                let name = format!("f{at}");
+                let source = Routes::source("stopped", &name);
+                (name, source)
+            })
+            .collect(),
+    );
+    let slot = Arc::new(AheadSlot::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let role = AheadRole::Lane {
+        slot: slot.clone(),
+        stop: stop.clone(),
+        log: tracing::Dispatch::none(),
+    };
+    agent_service::set_mock_latency(ROUTE, Some(Duration::from_secs(1)));
+    let before = requests_to(ROUTE);
+    let stopping = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    let (_, ()) = tokio::join!(routes.analyze(role), stopping);
+    agent_service::set_mock_latency(ROUTE, None);
+    assert_eq!(
+        requests_to(ROUTE) - before,
+        depth,
+        "the last ask is not sent"
+    );
+    assert_eq!(slot.held().expect("the lane published").asked(), depth);
+}
+
 // T3, the whole scan.
 
 const FIXTURE: &str = "parallel-services";
-const LATENCY: Duration = Duration::from_millis(400);
+/// How long each reader ask is held. Long beside a debug build's analysis
+/// on a shared CI machine, so a phase that waited out an ask cannot pass for
+/// one that did not.
+const LATENCY: Duration = Duration::from_secs(2);
 
 /// In-memory storage that hands each scan every blob uploaded before it, as
 /// the cloud's download does.
@@ -421,8 +632,9 @@ fn real_sidecar(repo: &Path) -> carrick::services::type_sidecar::TypeSidecar {
     sidecar
 }
 
-/// Every line the scan logged, with when it was written. One subscriber for
-/// the process, so the services' own threads write to it too.
+/// Every line the scan logged, with when it was written: info, and each
+/// reader prompt's fingerprint, as the run's log keeps them. One subscriber
+/// for the process, so the services' own threads write to it too.
 fn log() -> &'static Mutex<Vec<(Instant, String)>> {
     static LOG: OnceLock<Mutex<Vec<(Instant, String)>>> = OnceLock::new();
     LOG.get_or_init(|| {
@@ -431,7 +643,10 @@ fn log() -> &'static Mutex<Vec<(Instant, String)>> {
                 .with_ansi(false)
                 .without_time()
                 .with_target(false)
-                .with_max_level(tracing::Level::INFO)
+                .with_env_filter(tracing_subscriber::EnvFilter::new(format!(
+                    "info,{}=debug",
+                    carrick::agents::file_analyzer_agent::PROMPT_FINGERPRINT_TARGET
+                )))
                 .with_writer(Logged)
                 .finish(),
         );
@@ -470,6 +685,9 @@ struct Rescanned {
     /// The reader's requests of the second scan: the service each was made
     /// for, and when it was sent.
     reader: Vec<(String, Instant)>,
+    /// Every request of the second scan: its route, the service it was made
+    /// for, and when it was counted.
+    all: Vec<(String, String, Instant)>,
     lines: Vec<(Instant, String)>,
 }
 
@@ -493,6 +711,23 @@ impl Rescanned {
             .1;
         let rest = &line[line.find(" model ").expect("a model phase") + " model ".len()..];
         rest[..rest.find('s').unwrap()].parse().unwrap()
+    }
+
+    /// Each reader prompt's fingerprint line, with the service its line
+    /// names, sorted: one per request sent.
+    fn fingerprints(&self) -> Vec<(String, String)> {
+        let mut prints: Vec<(String, String)> = self
+            .lines
+            .iter()
+            .filter_map(|(_, line)| {
+                let print = &line[line.find("analyze-file prompt ")?..];
+                let named = line.find("service{name=")? + "service{name=".len();
+                let service = &line[named..named + line[named..].find('}')?];
+                Some((service.to_string(), print.to_string()))
+            })
+            .collect();
+        prints.sort();
+        prints
     }
 
     fn answers_line(&self, service: &str) -> Option<&str> {
@@ -624,9 +859,13 @@ async fn main_then_change(tmp: &Path, ahead: bool) -> Rescanned {
         uploaded: store.uploaded_text(uploaded_before),
         requests,
         reader: request_log
-            .into_iter()
+            .iter()
             .filter(|(route, ..)| route == ROUTE)
-            .map(|(_, service, at)| (service.unwrap_or_default(), at - LATENCY))
+            .map(|(_, service, at)| (service.clone().unwrap_or_default(), *at - LATENCY))
+            .collect(),
+        all: request_log
+            .into_iter()
+            .map(|(route, service, at)| (route, service.unwrap_or_default(), at))
             .collect(),
         lines: std::mem::take(&mut *log().lock().unwrap()),
     }
@@ -657,6 +896,17 @@ async fn the_next_service_s_answers_are_asked_while_the_scan_analyses() {
     assert_eq!(
         on.requests, off.requests,
         "the same requests, route for route"
+    );
+    // The run log keeps a fingerprint line per prompt sent, under the
+    // service it was sent for, whether the lane or the analysis sent it.
+    assert_eq!(
+        on.fingerprints().len(),
+        off.requests.get(ROUTE).copied().unwrap_or(0)
+    );
+    assert_eq!(
+        on.fingerprints(),
+        off.fingerprints(),
+        "the same prompts on the run log, each under its service"
     );
     assert_eq!(
         on.uploaded.keys().collect::<Vec<_>>(),
@@ -700,4 +950,19 @@ async fn the_next_service_s_answers_are_asked_while_the_scan_analyses() {
         );
         assert!(off.model_secs(service) >= LATENCY.as_secs_f64());
     }
+
+    // A service none of whose files changed has nothing to ask the reader,
+    // so the lane leaves it alone: it asks nothing for it, the library store
+    // included, before its own analysis starts.
+    let started = on.at("Analyzing service notifier");
+    let early: Vec<&(String, String, Instant)> = on
+        .all
+        .iter()
+        .filter(|(_, service, at)| service == "notifier" && *at < started)
+        .collect();
+    assert!(
+        early.is_empty(),
+        "notifier changed nothing, yet was asked for ahead: {early:?}"
+    );
+    assert!(on.answers_line("notifier").is_none());
 }

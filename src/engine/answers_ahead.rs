@@ -46,7 +46,7 @@ use futures::FutureExt;
 use futures::future::Shared;
 use tokio::sync::{oneshot, watch};
 
-use crate::agents::asked_ahead::AheadSlot;
+use crate::agents::asked_ahead::{AheadSlot, AskedAhead};
 use crate::library_store::{Asked, FirstAnswer, Settled};
 
 /// Set to `0` to ask nothing ahead: each service's files are asked when its
@@ -63,12 +63,22 @@ pub(super) fn requested() -> bool {
 }
 
 /// The library store's answers for one service, asked by the lane and handed
-/// to its analysis.
+/// to its analysis. Dropped unsettled (the analysis refused it, or never
+/// asks), it stops the ask: the store is polled for nobody.
 pub(super) struct LibraryHanded {
     /// What was asked: the analysis takes the answers only for the same ask.
     pub(super) asked: Asked,
     first: Shared<oneshot::Receiver<FirstAnswer>>,
-    settled: tokio::task::JoinHandle<Settled>,
+    /// `None` once [`Self::settle`] has it.
+    settled: Option<tokio::task::JoinHandle<Settled>>,
+}
+
+impl Drop for LibraryHanded {
+    fn drop(&mut self) {
+        if let Some(settled) = self.settled.take() {
+            settled.abort();
+        }
+    }
 }
 
 impl LibraryHanded {
@@ -82,7 +92,7 @@ impl LibraryHanded {
         Self {
             asked,
             first: first.shared(),
-            settled,
+            settled: Some(settled),
         }
     }
 
@@ -95,11 +105,31 @@ impl LibraryHanded {
     /// The settled answer, with the first sent on `early` the moment it is
     /// in hand: what [`super::settled_library_answer`] gives the analysis
     /// when it asks for itself.
-    pub(super) async fn settle(self, early: oneshot::Sender<FirstAnswer>) -> Settled {
-        if let Ok(first) = self.first.await {
+    pub(super) async fn settle(mut self, early: oneshot::Sender<FirstAnswer>) -> Settled {
+        if let Ok(first) = self.first.clone().await {
             let _ = early.send(first);
         }
-        self.settled.await.unwrap_or_default()
+        match self.settled.take() {
+            Some(settled) => settled.await.unwrap_or_default(),
+            None => Settled::default(),
+        }
+    }
+}
+
+/// What the lane built a service's prompts on, besides the setup: whether it
+/// read the service as typed (a type checker to verify the store's answers,
+/// so the store is asked), and the store's ask it started.
+pub(super) struct LaneLibrary {
+    typed: bool,
+    pub(super) handed: Option<LibraryHanded>,
+}
+
+impl LaneLibrary {
+    /// Whether the analysis, `typed` or not and asking the store `asked`,
+    /// builds its prompts on what the lane built them on. When it does not,
+    /// the lane's prompts are in other bytes and none of them can be taken.
+    pub(super) fn agrees(&self, typed: bool, asked: Option<&Asked>) -> bool {
+        self.typed == typed && self.handed.as_ref().map(|handed| &handed.asked) == asked
     }
 }
 
@@ -107,9 +137,8 @@ impl LibraryHanded {
 enum LibraryState {
     /// Neither the lane nor the analysis has come.
     Open,
-    /// The lane came first, and asked this (`None`: the service asks the
-    /// store nothing).
-    Lane(Option<LibraryHanded>),
+    /// The lane came first, and built on this.
+    Lane(LaneLibrary),
     /// The analysis came.
     Claimed,
 }
@@ -121,6 +150,10 @@ pub(super) struct Place {
     /// The file reader's answers asked ahead.
     pub(super) answers: Arc<AheadSlot>,
     library: Mutex<LibraryState>,
+    /// Set when nothing more is to be asked ahead for this service: its
+    /// analysis refused the lane ([`Self::refuse`]), or the scan stopped the
+    /// lane ([`Board::halt`]). The lane reads it before each ask.
+    pub(super) stop: Arc<AtomicBool>,
 }
 
 impl Place {
@@ -130,32 +163,50 @@ impl Place {
             gate: watch::Sender::new(false),
             answers: Arc::new(AheadSlot::default()),
             library: Mutex::new(LibraryState::Open),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// The lane starts the service's library ask with `start`, unless the
-    /// analysis came first. `false` then: the lane asks nothing for the
-    /// service. `start` runs under the place's lock, so the analysis sees
-    /// either no ask or the one started.
-    pub(super) fn begin_library(&self, start: impl FnOnce() -> Option<LibraryHanded>) -> bool {
+    /// The lane starts the service's library ask with `start`, read as
+    /// `typed` or not, unless the analysis came first. `false` then: the lane
+    /// asks nothing for the service. `start` runs under the place's lock, so
+    /// the analysis sees either no ask or the one started.
+    pub(super) fn begin_library(
+        &self,
+        typed: bool,
+        start: impl FnOnce() -> Option<LibraryHanded>,
+    ) -> bool {
         let mut state = self.library.lock().unwrap_or_else(PoisonError::into_inner);
         match *state {
             LibraryState::Open => {
-                *state = LibraryState::Lane(start());
+                *state = LibraryState::Lane(LaneLibrary {
+                    typed,
+                    handed: start(),
+                });
                 true
             }
             _ => false,
         }
     }
 
-    /// What the lane asked the library store, taken once by the analysis.
-    /// Closes the place either way.
-    pub(super) fn claim_library(&self) -> Option<LibraryHanded> {
+    /// What the lane built on, taken once by the analysis: `None` when the
+    /// lane had not come. Closes the place either way.
+    pub(super) fn claim_library(&self) -> Option<LaneLibrary> {
         let mut state = self.library.lock().unwrap_or_else(PoisonError::into_inner);
         match std::mem::replace(&mut *state, LibraryState::Claimed) {
-            LibraryState::Lane(handed) => handed,
+            LibraryState::Lane(lane) => Some(lane),
             _ => None,
         }
+    }
+
+    /// The analysis will take nothing the lane asked for this service: the
+    /// lane asks nothing more for it, its store ask stops, and its answers
+    /// are closed to the analysis. What the lane had published, for the
+    /// line that says so.
+    pub(super) fn refuse(&self) -> Option<Arc<AskedAhead>> {
+        self.stop.store(true, Ordering::SeqCst);
+        drop(self.claim_library());
+        self.answers.claim()
     }
 
     /// Whether the service's analysis has started.
@@ -175,8 +226,9 @@ impl Place {
 /// The lane's and the loop's shared view of one pass's analysed services.
 pub(super) struct Board {
     places: Vec<Place>,
-    /// Set when the scan no longer wants anything asked ahead.
-    pub(super) stop: Arc<AtomicBool>,
+    /// Set when the scan no longer wants anything asked ahead. Each place's
+    /// own stop is set with it.
+    stop: AtomicBool,
     /// The same, for a wait to hear.
     stopped: watch::Sender<bool>,
 }
@@ -193,7 +245,7 @@ impl Board {
         }
         Self {
             places,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: AtomicBool::new(false),
             stopped: watch::Sender::new(false),
         }
     }
@@ -201,6 +253,9 @@ impl Board {
     /// Ask nothing more ahead.
     fn halt(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        for place in &self.places {
+            place.stop.store(true, Ordering::SeqCst);
+        }
         self.stopped.send_replace(true);
     }
 
@@ -293,7 +348,6 @@ impl Drop for LaneTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::asked_ahead::AskedAhead;
     use std::time::Duration;
     use tokio::time::{Instant, sleep, sleep_until};
 
@@ -551,15 +605,105 @@ mod tests {
         let place = Place::new();
         assert!(place.claim_library().is_none());
         let mut started = false;
-        assert!(!place.begin_library(|| {
+        assert!(!place.begin_library(true, || {
             started = true;
             None
         }));
         assert!(!started, "the lane starts nothing once the analysis came");
 
         let place = Place::new();
-        assert!(place.begin_library(|| None));
-        assert!(place.claim_library().is_none(), "the lane asked nothing");
-        assert!(!place.begin_library(|| None), "and the place is claimed");
+        assert!(place.begin_library(true, || None));
+        let lane = place.claim_library().expect("the lane came");
+        assert!(lane.handed.is_none(), "the lane asked nothing");
+        assert!(
+            !place.begin_library(true, || None),
+            "and the place is claimed"
+        );
+    }
+
+    /// Set when dropped: whether a task's future was dropped, as an aborted
+    /// task's is.
+    struct DroppedFlag(Arc<AtomicBool>);
+
+    impl Drop for DroppedFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A store ask the lane started that never settles, and the flag its
+    /// task sets when it is stopped.
+    fn unsettled_ask() -> (LibraryHanded, Arc<AtomicBool>) {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = DroppedFlag(stopped.clone());
+        let (_early, first) = oneshot::channel();
+        let settled = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<Settled>().await
+        });
+        (
+            LibraryHanded::new(Asked::naming(&["pkg"]), first, settled),
+            stopped,
+        )
+    }
+
+    /// carrick#3131 review: a store ask the analysis does not take is
+    /// stopped, wherever it is dropped: refused for another ask, or left by
+    /// an analysis that falls back to the whole service.
+    #[tokio::test]
+    async fn a_store_ask_the_analysis_does_not_take_is_stopped() {
+        let (handed, stopped) = unsettled_ask();
+        tokio::task::yield_now().await;
+        assert!(!stopped.load(Ordering::SeqCst), "it runs while held");
+        drop(handed);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(stopped.load(Ordering::SeqCst), "dropped, it is stopped");
+
+        let place = Place::new();
+        let (handed, stopped) = unsettled_ask();
+        assert!(place.begin_library(true, || Some(handed)));
+        assert!(place.refuse().is_none(), "nothing was published");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(stopped.load(Ordering::SeqCst), "refused, it is stopped");
+    }
+
+    /// carrick#3131 review: the analysis takes the lane's store answers only
+    /// when it reads the service as the lane did and asks the same.
+    #[test]
+    fn the_analysis_takes_the_lane_s_store_ask_only_when_it_agrees() {
+        let lane = LaneLibrary {
+            typed: true,
+            handed: None,
+        };
+        assert!(lane.agrees(true, None));
+        assert!(!lane.agrees(false, None), "a type checker the lane assumed");
+        assert!(
+            !lane.agrees(true, Some(&Asked::naming(&["pkg"]))),
+            "an ask it did not make"
+        );
+    }
+
+    /// carrick#3131 review: one service's analysis refusing the lane stops
+    /// the lane for that service only, and closes its answers to it; the
+    /// scan stopping the lane stops every service.
+    #[test]
+    fn a_refusal_stops_the_lane_for_its_own_service_only() {
+        let board = Board::new(2, false);
+        let (first, second) = (board.place(0).unwrap(), board.place(1).unwrap());
+        assert!(second.answers.publish(Arc::new(AskedAhead::default())));
+        assert!(second.refuse().is_some(), "what was published");
+        assert!(second.stop.load(Ordering::SeqCst));
+        assert!(second.answers.claim().is_none(), "closed to the analysis");
+        assert!(
+            !first.stop.load(Ordering::SeqCst),
+            "the other service asks on"
+        );
+        assert!(!board.is_stopped());
+        board.halt();
+        assert!(first.stop.load(Ordering::SeqCst), "the scan stops them all");
     }
 }
