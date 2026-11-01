@@ -9816,8 +9816,8 @@ fn type_reach_object(
         Ok(graph) => graph,
         Err(e) => {
             warn!(
-                "Could not read the import graph of service {service} ({e}); its type-reach \
-                 record is not stored, so a pull request scan types it whole"
+                "Could not read import graph for service {service} ({e}). Type-reach record \
+                 not saved; future pull request scans will fall back to a full type check."
             );
             return None;
         }
@@ -9854,16 +9854,17 @@ fn type_reach_object(
         Ok(object) => object,
         Err(e) => {
             warn!(
-                "Could not encode the type-reach record of service {service} ({e}); it is not \
-                 stored, so a pull request scan types it whole"
+                "Could not encode type-reach record for service {service} ({e}). Type-reach \
+                 record not saved; future pull request scans will fall back to a full type check."
             );
             return None;
         }
     };
     if object.gz().len() > TYPE_REACH_CAP_BYTES {
         warn!(
-            "The type-reach record of service {service} is {} bytes gzipped, over the {} byte \
-             cap; it is not stored, so a pull request scan types it whole",
+            "Type-reach record for service {service} ({} bytes gzipped) exceeds the {}-byte \
+             limit and was not saved; future pull request scans will fall back to a full type \
+             check.",
             object.gz().len(),
             TYPE_REACH_CAP_BYTES
         );
