@@ -3082,7 +3082,7 @@ fn states_new_object_type(text: &str) -> bool {
     }
     let rest: String = body[close + 1..].iter().collect();
     let rest = rest.trim();
-    rest.len() % 2 == 0 && rest.as_bytes().chunks(2).all(|pair| pair == b"[]")
+    rest.len().is_multiple_of(2) && rest.as_bytes().chunks(2).all(|pair| pair == b"[]")
 }
 
 /// The index of the bracket closing the one at `open`, skipping quoted
