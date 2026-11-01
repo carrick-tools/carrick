@@ -49,7 +49,7 @@ import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
 import { substituteMachinePathImports } from './machine-paths.js';
 import { installedPackageSpecifier, typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub } from './self-check.js';
-import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
+import { collectSpecifiers, isDeclarationFileName, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
 import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
 import { redirectingCompilerHost, referenceRedirect, type ReferenceRedirect } from './reference-redirect.js';
@@ -58,6 +58,16 @@ import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
+import { nativeTscPath } from './check.js';
+import {
+  isNativeLibFile,
+  nativeLabel,
+  runNativeTsc,
+  tsconfigCompilerOptions,
+  tsconfigText,
+  typescript6Steps,
+  type NativeCompiler,
+} from './native-tsc.js';
 import { boundedCompilerHost, boundedSys, isInsideCheckout, untrustedReadBound, type ReadBound } from './checkout.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
@@ -172,6 +182,10 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // checkout, the sidecar's own install and this stub; otherwise undefined
   // and nothing here changes (carrick#2230).
   const bound = untrustedReadBound(repoRoot, [stubDir]);
+  // TypeScript 7's native tsc, for the declaration emit and the self-check's
+  // diagnostics (carrick#3133). `null` from a caller keeps both on TypeScript 6.
+  const nativePath = opts.nativeTscPath === undefined ? nativeTscPath() : (opts.nativeTscPath ?? undefined);
+  const native: NativeCompiler | undefined = nativePath ? { tscPath: nativePath, bound } : undefined;
 
   // The named config, else the one the init'd project reads too
   // (carrick#1776). A service with neither is typed under defaults below.
@@ -364,13 +378,20 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       outDir: staging,
       rootDir: entryDir,
     });
-    written = emitDeclarations({
-      rootNames: [entryPath, ...augmentationSources],
-      options: emitOptions,
-      host: programHost(emitOptions, deno, bound),
-      staging,
-      entryDir,
-    });
+    const rootNames = [entryPath, ...augmentationSources];
+    // TypeScript 7's native tsc where it can stand in (carrick#3133); a Deno
+    // graph resolves through a host a command line cannot take.
+    written =
+      (native && !deno
+        ? nativeEmitDeclarations({ rootNames, options: emitOptions, staging, entryDir, compiler: native, label: packageName })
+        : undefined) ??
+      emitDeclarations({
+        rootNames,
+        options: emitOptions,
+        host: programHost(emitOptions, deno, bound),
+        staging,
+        entryDir,
+      });
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   } finally {
@@ -613,6 +634,10 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     pinned,
     bareCheckout,
     repoRoot: dependencyRoot,
+    // A Deno graph or a package installed at another path resolves through a
+    // host; a command line cannot take one, so those stay on TypeScript 6.
+    native: deno || Object.keys(rewritten.installs).length > 0 ? undefined : native,
+    label: packageName,
     compilerHost:
       deno || bound || Object.keys(rewritten.installs).length > 0
         ? (options) =>
@@ -759,15 +784,10 @@ function emitDeclarations(args: {
   const declarationSources = new Map<string, string>();
   const sourceByEmitted = new Map<string, string>();
   const program = ts.createProgram(args.rootNames, sidecarCompilerOptions(args.options), args.host);
-  const emitResult = program.emit(
-    undefined,
-    (fileName, text, _bom, _error, sources) => {
-      emitted.set(fileName, text);
-      if (sources?.[0]) sourceByEmitted.set(path.relative(args.staging, fileName).split(path.sep).join('/'), sources[0].fileName);
-    },
-    undefined,
-    /* emitOnlyDtsFiles */ true
-  );
+  const emitResult = typescript6Steps.emit(program, (fileName, text, _bom, _error, sources) => {
+    emitted.set(fileName, text);
+    if (sources?.[0]) sourceByEmitted.set(path.relative(args.staging, fileName).split(path.sep).join('/'), sources[0].fileName);
+  });
   // emitSkipped is PER-PROGRAM even when only one file's declaration emit
   // failed (e.g. TS4023 from a hand-rolled ambient stub shadowing a real
   // package): every other file's .d.ts was still written to the callback.
@@ -791,6 +811,121 @@ function emitDeclarations(args: {
     partial: emitResult.emitSkipped,
     diagnostics: emitResult.diagnostics.map((d) => ts.flattenDiagnosticMessageText(d.messageText, '\n')),
   };
+}
+
+/** The declaration file the emit writes for a source, by extension. */
+const DECLARATION_EXTENSION: Record<string, string> = {
+  '.ts': '.d.ts',
+  '.tsx': '.d.ts',
+  '.js': '.d.ts',
+  '.jsx': '.d.ts',
+  '.mts': '.d.mts',
+  '.mjs': '.d.mts',
+  '.cts': '.d.cts',
+  '.cjs': '.d.cts',
+};
+
+/**
+ * Phase B on TypeScript 7's native tsc (carrick#3133): the same roots and
+ * options, written as a tsconfig, emitted to `staging` on disk and read back
+ * into the shape {@link emitDeclarations} returns.
+ *
+ * Returns `undefined`, logged with the reason, wherever the answer could
+ * differ from TypeScript 6's or the run could write outside `staging`; the
+ * caller then runs {@link emitDeclarations}:
+ * - an option with no tsconfig form, `baseUrl`, `declarationDir` or
+ *   `outFile`, or an option the native compiler refuses;
+ * - a program file outside the read bound, or a source outside `entryDir`
+ *   (its declaration would be written beside the source, carrick#1770);
+ * - a partial emit (a source without its declaration, or a declaration
+ *   without its source): TypeScript 6 names what it skipped.
+ * A whole emit has no emit diagnostics, as on TypeScript 6.
+ */
+function nativeEmitDeclarations(args: {
+  rootNames: string[];
+  options: ts.CompilerOptions;
+  staging: string;
+  entryDir: string;
+  compiler: NativeCompiler;
+  label: string;
+}): DeclarationEmit | undefined {
+  const fallBack = (reason: string): undefined => {
+    console.error(`[sidecar] capture ${args.label}: declaration emit on TypeScript ${ts.version}: ${reason}`);
+    return undefined;
+  };
+  const options = sidecarCompilerOptions(args.options);
+  for (const name of ['baseUrl', 'declarationDir', 'outFile'] as const) {
+    if (options[name] !== undefined) return fallBack(`the options set ${name}`);
+  }
+  const { compilerOptions, unconverted } = tsconfigCompilerOptions(options);
+  if (unconverted.length > 0) return fallBack(`options ${unconverted.join(', ')} have no tsconfig form`);
+  // The in-process program finds `@types` from the project's config; this
+  // tsconfig sits elsewhere, so the roots it would read are stated.
+  if (options.typeRoots === undefined) {
+    compilerOptions.typeRoots =
+      ts.getEffectiveTypeRoots(options, { getCurrentDirectory: () => ts.sys.getCurrentDirectory() }) ?? [];
+  }
+  const configDir = WriteGuard.scratch('carrick-capture-v2-native-');
+  try {
+    const configPath = path.join(configDir.dir, 'tsconfig.json');
+    configDir.guard.writeFile(configPath, tsconfigText(compilerOptions, args.rootNames));
+
+    // The program's files before anything is written: the bound, and where
+    // each declaration would go.
+    const listed = runNativeTsc(args.compiler, configPath, configDir.dir, ['--listFilesOnly']);
+    if (!listed.ok) return fallBack(listed.reason);
+    const inEntryDir = (file: string) => {
+      const rel = path.relative(args.entryDir, file);
+      return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+    };
+    const projectFiles = listed.files.filter(
+      (file) => !isNativeLibFile(args.compiler, file) && !file.split(/[\\/]/).includes('node_modules')
+    );
+    const sources = projectFiles.filter(
+      (file) => !isDeclarationFileName(path.basename(file)) && DECLARATION_EXTENSION[path.extname(file)] !== undefined
+    );
+    const outside = sources.find((file) => !inEntryDir(file));
+    if (outside) return fallBack(`source ${outside} sits outside the emit's rootDir`);
+
+    const emittedRun = runNativeTsc(args.compiler, configPath, configDir.dir);
+    if (!emittedRun.ok) return fallBack(emittedRun.reason);
+
+    const emitted = new Map<string, string>();
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(p);
+        else if (isDeclarationFileName(entry.name)) emitted.set(p, fs.readFileSync(p, 'utf8'));
+      }
+    };
+    walk(args.staging);
+
+    const sourceByEmitted = new Map<string, string>();
+    for (const source of sources) {
+      const rel = path.relative(args.entryDir, source);
+      const ext = path.extname(rel);
+      const out = path.join(args.staging, rel.slice(0, -ext.length) + DECLARATION_EXTENSION[ext]);
+      if (!emitted.has(out)) return fallBack(`no declaration was written for ${source}`);
+      sourceByEmitted.set(path.relative(args.staging, out).split(path.sep).join('/'), source);
+    }
+    if (sourceByEmitted.size !== emitted.size) return fallBack('a declaration was written for no listed source');
+
+    const declarationSources = new Map<string, string>();
+    for (const file of projectFiles) {
+      if (!isDeclarationFileName(path.basename(file))) continue;
+      const abs = path.resolve(file);
+      const rel = path.relative(args.entryDir, abs).split(path.sep).join('/');
+      if (rel.startsWith('..') || rel.includes('node_modules/')) continue;
+      const text = ts.sys.readFile(abs);
+      if (text === undefined) return fallBack(`declaration source ${abs} could not be read`);
+      declarationSources.set(rel, text);
+      sourceByEmitted.set(rel, abs);
+    }
+    console.error(`[sidecar] capture ${args.label}: declaration emit on ${nativeLabel(args.compiler)}`);
+    return { emitted, declarationSources, sourceByEmitted, partial: false, diagnostics: [] };
+  } finally {
+    configDir.guard.remove(configDir.dir);
+  }
 }
 
 /**
