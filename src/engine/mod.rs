@@ -4862,6 +4862,7 @@ async fn analyze_current_repo_incremental(
             // collected as it collects them, which is deterministic over the
             // same inputs. Logged and kept; nothing reads it yet.
             if let Some(context) = reach {
+                let reach_started = Instant::now();
                 let (mut explicit, mut infer, _) = file_orchestrator.collect_type_requests(
                     &merged_results,
                     repo_path,
@@ -4873,6 +4874,7 @@ async fn analyze_current_repo_incremental(
                 infer.extend_from_slice(&protocol_infer);
                 crate::site_payloads::take_over(&mut infer, &payload_infer);
                 type_reach::decide_service(
+                    reach_started,
                     context,
                     &type_reach::ServiceFacts {
                         id: prev.service_name.as_deref().unwrap_or(&prev.repo_name),

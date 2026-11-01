@@ -589,8 +589,10 @@ fn gate_of<'a>(
 /// Decide, log, dump and keep one service's decision, just before its type
 /// stage. `this_run` is its payload so far: the setup it stamped and the
 /// manifest it built. `request_files` is every request the type stage will
-/// send, by alias.
+/// send, by alias. `started` is when the run began collecting those
+/// requests: the line and the dump carry the time the decision took.
 pub(crate) fn decide_service(
+    started: std::time::Instant,
     context: ReachContext<'_>,
     facts: &ServiceFacts<'_>,
     this_run: &CloudRepoData,
@@ -617,7 +619,8 @@ pub(crate) fn decide_service(
         repo_path: facts.repo_path,
         commit,
     };
-    report(facts, decide(&inputs, &walker));
+    let decided = decide(&inputs, &walker);
+    report(facts, decided, Some(started.elapsed()));
 }
 
 /// The decision of a service whose analysis does not reach the point
@@ -627,15 +630,20 @@ pub(crate) fn decide_service_whole(context: ReachContext<'_>, facts: &ServiceFac
     let config_json = serde_json::to_string(facts.config).ok();
     let reason = gate_reason(&gate_of(context, facts, config_json.as_deref()))
         .unwrap_or_else(|| "changes_unread".to_string());
-    report(facts, Decided::whole(reason));
+    report(facts, Decided::whole(reason), None);
 }
 
-fn report(facts: &ServiceFacts<'_>, decided: Decided) {
-    tracing::info!("{}", decided.line(facts.label));
+fn report(facts: &ServiceFacts<'_>, decided: Decided, took: Option<std::time::Duration>) {
+    let took_ms = took.map(|took| took.as_millis());
+    match took_ms {
+        Some(ms) => tracing::info!("{} in {ms} ms", decided.line(facts.label)),
+        None => tracing::info!("{}", decided.line(facts.label)),
+    }
     if let Some(dir) = std::env::var_os(TYPE_REACH_DUMP_ENV) {
         let path =
             std::path::Path::new(&dir).join(format!("{}.json", facts.id.replace(['/', '\\'], "_")));
-        let body = serde_json::json!({ "service": facts.id, "decided": &decided });
+        let body =
+            serde_json::json!({ "service": facts.id, "decided": &decided, "took_ms": took_ms });
         let written = std::fs::create_dir_all(&dir).and_then(|()| {
             std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap_or_default())
         });
