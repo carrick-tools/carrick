@@ -629,8 +629,9 @@ bound of an untrusted tree, a source lies outside the emit's `rootDir`, the
 emit is partial, or a Deno graph or a package installed at another path needs
 a compiler host. The self-check's options moved to `target: ES2015` with the
 library set ES5 loaded by default, named, so both compilers read the same
-files. TypeScript 7 keeps a source's string-literal quote style in emitted
-declarations, so stub texts changed once on the release that shipped this.
+files. Where the emit runs on TypeScript 7, it may print some string literals
+in the declarations with other quotes than TypeScript 6 (the probe: 31 of 389
+files), so those stub texts change once on the release that ships this.
 The native compiler runs as a second process with `GOMEMLIMIT` set to what is
 left of the sidecar's heap cap, so the two stay inside the memory the scanner
 reserved for the service.

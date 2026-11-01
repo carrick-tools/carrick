@@ -626,6 +626,13 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   // ---- Capture-time self-check (per-alias closure attribution) ----
   progress('self-check', 'checking the stub');
+  const installCount = Object.keys(rewritten.installs).length;
+  if (native && (deno || installCount > 0)) {
+    console.error(
+      `[sidecar] capture ${packageName}: self-check on TypeScript ${ts.version}: ` +
+        (deno ? 'a Deno graph resolves through a compiler host' : `${installCount} package(s) resolve from other install paths`)
+    );
+  }
   const aliases = selfCheckStub({
     guard: stubGuard,
     stubDir,
