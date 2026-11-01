@@ -1118,6 +1118,19 @@ pub fn main_side_runs() -> usize {
     MAIN_SIDE_RUNS.load(Ordering::SeqCst)
 }
 
+/// How many `check_v2` requests main's side sent in this process. Read by the
+/// tests that prove main's side took main's stored outcomes (carrick#3127).
+static MAIN_SIDE_CHECKS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn record_main_side_checks(n: usize) {
+    MAIN_SIDE_CHECKS.fetch_add(n, Ordering::SeqCst);
+}
+
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn main_side_checks() -> usize {
+    MAIN_SIDE_CHECKS.load(Ordering::SeqCst)
+}
+
 /// A way for main's side of the comparison to fail, injected by a test.
 #[allow(dead_code)] // Constructed by tests/ through the library, never by the binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

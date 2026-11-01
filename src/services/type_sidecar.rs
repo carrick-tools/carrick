@@ -2890,6 +2890,8 @@ pub struct TypeSidecar {
     spawn_time: Instant,
     /// Request ID counter
     request_counter: Mutex<u64>,
+    /// `check_v2` requests sent, read around main's side (carrick#3127).
+    check_v2_sent: AtomicUsize,
     /// The root and tsconfig the last `init` scoped the sidecar to. A request
     /// that reads the init'd project for one service checks this before
     /// re-initialising, because a re-init drops the built program.
@@ -3093,6 +3095,7 @@ impl TypeSidecar {
             state: Arc::new(Mutex::new(SidecarState::Spawning)),
             spawn_time,
             request_counter: Mutex::new(0),
+            check_v2_sent: AtomicUsize::new(0),
             scope: Mutex::new(None),
             scan_root: Mutex::new(None),
             operation_timeout: OPERATION_TIMEOUT,
@@ -4188,6 +4191,10 @@ impl TypeSidecar {
         format!("{:x}", h.finalize())
     }
 
+    pub(crate) fn check_v2_sent(&self) -> usize {
+        self.check_v2_sent.load(Ordering::SeqCst)
+    }
+
     /// Run the v2 "tsc as the judge" check over assembled capture stubs.
     ///
     /// The sidecar runs this async (spawned pnpm install + tsc) and emits
@@ -4206,6 +4213,7 @@ impl TypeSidecar {
         stubs: &[CheckStubInput],
         pairs: &[CheckPairSpec],
     ) -> Result<CheckV2Result, SidecarError> {
+        self.check_v2_sent.fetch_add(1, Ordering::SeqCst);
         self.ensure_ready()?;
 
         if stubs.is_empty() || pairs.is_empty() {

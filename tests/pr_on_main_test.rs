@@ -15,7 +15,9 @@ use carrick::cloud_storage::{
 };
 use carrick::engine::run_analysis_engine_with_sidecar;
 use carrick::findings::PrResultPayload;
-use carrick::pr_baseline::{MainSideFault, inject_mock_main_side_fault, main_side_runs};
+use carrick::pr_baseline::{
+    MainSideFault, inject_mock_main_side_fault, main_side_checks, main_side_runs,
+};
 use carrick::services::type_sidecar::TypeSidecar;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -1323,6 +1325,75 @@ async fn a_break_main_stored_from_its_own_retype_is_on_main() {
     assert_eq!(main_side_runs(), runs + 1, "main's side ran");
     for line in [6, 11] {
         let finding = call_at(&findings, line);
+        assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+    }
+}
+
+/// carrick#3127. Main's side takes main's stored outcome for each pair of
+/// main's own copy and sends no check for it, and the PR's result is the one
+/// it posts when main's side judges every pair again (the off arm).
+#[tokio::test]
+async fn main_side_takes_mains_stored_outcomes_and_sends_no_check() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let (repo, cassettes) = retype_repo(tmp.path());
+    let _cassettes = Cassettes::from(&cassettes);
+
+    let store = Store::default();
+    scan_with(&store, &repo, true).await;
+    {
+        let repos = store.repos.lock().unwrap();
+        let web = repos
+            .iter()
+            .find(|repo| repo.service_name.as_deref() == Some("web"))
+            .expect("main stored web");
+        let record = web
+            .pair_outcomes
+            .as_ref()
+            .expect("main stored web's pair outcomes");
+        assert!(record.outcomes.len() >= 2, "{:?}", record.outcomes);
+        assert!(
+            record.outcomes.iter().all(|outcome| outcome.judged),
+            "{:?}",
+            record.outcomes
+        );
+    }
+
+    let checkout = repo.join("web/src/checkout.ts");
+    let mut source = std::fs::read_to_string(&checkout).unwrap();
+    source.push_str(
+        "\nexport function checkoutPath(orderId: string): string {\n  return `/checkout/${orderId}`;\n}\n",
+    );
+    std::fs::write(&checkout, source).unwrap();
+    commit(&repo, "pr: a function after the calls");
+
+    let (runs, checks) = (main_side_runs(), main_side_checks());
+    let on = pr_payload_with(&store, &repo, true).await;
+    assert_eq!(main_side_runs(), runs + 1, "main's side ran");
+    assert_eq!(
+        main_side_checks(),
+        checks,
+        "main's side sent no check: every pair took main's outcome"
+    );
+
+    let (runs, checks) = (main_side_runs(), main_side_checks());
+    let off = {
+        let _off = EnvVar::set("CARRICK_TYPE_REACH", "off");
+        pr_payload_with(&store, &repo, true).await
+    };
+    assert_eq!(main_side_runs(), runs + 1, "main's side ran");
+    assert_eq!(
+        main_side_checks(),
+        checks + 1,
+        "with the decision off, main's side judges its pairs"
+    );
+
+    for field in ["findings", "delta", "verified", "checked", "baseline"] {
+        assert_eq!(on[field], off[field], "{field}");
+    }
+    assert!(!findings_of(&on).is_empty());
+    for line in [6, 11] {
+        let finding = call_at(&findings_of(&on), line);
         assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
     }
 }

@@ -2332,10 +2332,16 @@ pub(crate) fn run_check(
                     None => pairs.push(pair),
                 }
             }
-            info!(
-                "type_reach: {} of {total} pairs settled from main",
-                settled.len()
-            );
+            match settle.side() {
+                super::pair_settle::SettleSide::PullRequest => info!(
+                    "type_reach: {} of {total} pairs settled from main",
+                    settled.len()
+                ),
+                super::pair_settle::SettleSide::MainSide => info!(
+                    "main side: {} of {total} pairs taken from main's stored outcomes",
+                    settled.len()
+                ),
+            }
             pairs
         }
         None => all_pairs,
@@ -11310,6 +11316,49 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let pr = run_check(&sidecar, &repos, &local, Some(&settle));
         assert_eq!(asked(&log), Vec::<String>::new(), "every pair settles");
         assert_eq!(format!("{pr:?}"), format!("{main:?}"));
+    }
+
+    /// carrick#3127: main's side settles the pairs of main's own copy from
+    /// main's stored outcomes and judges a pair whose other side is a peer, or
+    /// whose stored outcome was not judged.
+    #[test]
+    fn main_side_settles_mains_own_pairs_and_judges_a_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let log = root.join("asked.log");
+        let sidecar = recording_sidecar(&root, &log);
+        let local = settle_consumers(&root);
+        let repos = settle_repos();
+        let main = run_check(&sidecar, &repos, &local, None);
+        let mut blobs = main_blobs(&main);
+        asked(&log);
+        let build = crate::cloud_storage::ScannerBuild::current();
+        let settle_main = |blobs: &[CloudRepoData], held: &[CloudRepoData]| {
+            let settle = super::super::pair_settle::SettleFrom::main_side(
+                held,
+                build.as_ref(),
+                crate::engine::CACHE_VERSION,
+            );
+            run_check(&sidecar, blobs, &LocalConsumers::new(), Some(&settle))
+        };
+
+        let out = settle_main(&blobs, &blobs);
+        assert_eq!(asked(&log), Vec::<String>::new(), "every pair settles");
+        assert_eq!(format!("{out:?}"), format!("{main:?}"));
+
+        // `api` is a peer: main's copy holds `web` alone.
+        settle_main(&blobs, &blobs[1..]);
+        assert_eq!(asked(&log), ["check api/P~web/C8", "check api/P~web/C9"]);
+
+        // A stored outcome that was not judged is judged again.
+        let record = blobs[1].pair_outcomes.as_mut().unwrap();
+        for outcome in &mut record.outcomes {
+            if outcome.pair_key.contains("C8") {
+                outcome.judged = false;
+            }
+        }
+        settle_main(&blobs, &blobs);
+        assert_eq!(asked(&log), ["check api/P~web/C8"]);
     }
 
     /// carrick#3104: what keeps a pair from settling. Each is judged.
