@@ -200,6 +200,14 @@ export interface CaptureV2Request extends BaseRequest {
   tsconfig_path?: string;
   /** The scanned repo's root, as on `init` (carrick#1776). */
   scan_root?: string;
+  /**
+   * carrick#2041: alias -> literal type text the scanner can stand behind. A
+   * demoted alias with a text here is captured again in this request,
+   * re-anchored on the text, into `backfill_out_dir`.
+   */
+  backfill_texts?: Record<string, string>;
+  /** Where the backfilled stub is written; sent with `backfill_texts`. */
+  backfill_out_dir?: string;
 }
 
 /**

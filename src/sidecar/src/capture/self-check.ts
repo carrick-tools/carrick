@@ -57,12 +57,23 @@ import {
   type DeepTopType,
 } from './deep-walk.js';
 
+/** One surface entry of the tree and the anchors its aliases came from. */
+export interface SelfCheckSurface {
+  surfaceAbsPath: string;
+  resolved: ResolvedAnchor[];
+}
+
 export interface SelfCheckArgs {
   /** Writes are held to the stub (carrick#1748). */
   guard: WriteGuard;
   stubDir: string;
-  surfaceAbsPath: string;
-  resolved: ResolvedAnchor[];
+  /**
+   * The surfaces checked over the tree, each with records of its own. Two when
+   * a capture's literal backfill holds the same tree as its first surface
+   * (carrick#2041): the second sits beside the first, a module nothing
+   * imports, so neither changes what the other's aliases read.
+   */
+  surfaces: SelfCheckSurface[];
   pinned: Record<string, string>;
   bareCheckout: boolean;
   /** Producer repo root; its node_modules (if any) backs resolution. */
@@ -79,7 +90,8 @@ interface FileFailures {
   unfoundNames: Set<string>;
 }
 
-export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
+/** The records of each surface, in `args.surfaces` order. */
+export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[][] {
   const typesDir = path.join(args.stubDir, 'types');
   const treeFiles: string[] = [];
   const walk = (dir: string) => {
@@ -121,11 +133,12 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
 
 /** One self-check pass: its records, and what each file could not resolve. */
 interface SelfCheckPass {
-  records: CaptureAliasRecord[];
+  /** Per surface, in `args.surfaces` order. */
+  records: CaptureAliasRecord[][];
   /**
    * Absolute file -> internal specifiers that failed in it, for the repair
-   * pass. The surface file is excluded: its failures are the pasted text of a
-   * literal anchor (carrick#1361), not a declaration to repair.
+   * pass. The surface files are excluded: their failures are the pasted text
+   * of a literal anchor (carrick#1361), not a declaration to repair.
    */
   internalFailuresByFile: Map<string, Set<string>>;
 }
@@ -166,18 +179,27 @@ function runSelfCheck(
   const checker = program.getTypeChecker();
   const diagnostics = ts.getPreEmitDiagnostics(program);
 
-  const surfaceAbs = path.resolve(args.surfaceAbsPath);
-  const surfaceSource = program.getSourceFile(surfaceAbs);
-  // The surface holds EVERY alias, and every alias's closure starts there, so
+  // A surface holds EVERY alias, and every alias's closure starts there, so
   // a file-granular failure bucket on it blames the whole service for one
   // alias's dangling specifier (cloud#1184). Attribute by `export type`
   // statement span, exactly as check-poison.ts contains poison.
-  const aliasAtSurfacePosition = buildSurfaceSpanIndex(surfaceSource);
+  const surfaces = args.surfaces.map((surface) => {
+    const surfaceAbs = path.resolve(surface.surfaceAbsPath);
+    const surfaceSource = program.getSourceFile(surfaceAbs);
+    return {
+      surfaceAbs,
+      surfaceSource,
+      resolved: surface.resolved,
+      aliasAtSurfacePosition: buildSurfaceSpanIndex(surfaceSource),
+      // Failed module specifiers on the surface, per ALIAS.
+      surfaceFailuresByAlias: new Map<string, FileFailures>(),
+    };
+  });
+  const surfaceAt = new Map(surfaces.map((surface) => [surface.surfaceAbs, surface]));
 
   // Failed module specifiers, split external-pinned vs internal, per FILE —
-  // except on the surface, where they are per ALIAS.
+  // except on a surface, where they are per ALIAS.
   const failuresByFile = new Map<string, FileFailures>();
-  const surfaceFailuresByAlias = new Map<string, FileFailures>();
   const emptyFailures = (): FileFailures => ({
     externalPinned: new Set(),
     internal: new Set(),
@@ -196,8 +218,9 @@ function runSelfCheck(
   // service-wide file bucket: soundness over precision, the same fallback
   // check-poison.ts makes.
   const bucketFor = (abs: string, start: number | undefined): FileFailures => {
-    const owner = abs === surfaceAbs ? aliasAtSurfacePosition(start) : undefined;
-    return owner ? bucketIn(surfaceFailuresByAlias, owner) : bucketIn(failuresByFile, abs);
+    const surface = surfaceAt.get(abs);
+    const owner = surface?.aliasAtSurfacePosition(start);
+    return surface && owner ? bucketIn(surface.surfaceFailuresByAlias, owner) : bucketIn(failuresByFile, abs);
   };
   for (const d of diagnostics) {
     if (!d.file) continue;
@@ -242,33 +265,32 @@ function runSelfCheck(
     adjacency.set(abs, neighbors);
   }
 
-  const records: CaptureAliasRecord[] = [];
-  for (const anchor of args.resolved) {
-    // Demotions (failureReason present) never reached the surface with a
-    // real type; everything else — including successful literal anchors,
-    // which sit at the structural_fallback TIER but did produce text — is
-    // classified by the real self-check.
-    records.push(
+  // Demotions (failureReason present) never reached the surface with a real
+  // type; everything else — including successful literal anchors, which sit
+  // at the structural_fallback TIER but did produce text — is classified by
+  // the real self-check.
+  const records = surfaces.map((surface) =>
+    surface.resolved.map((anchor) =>
       anchor.failureReason !== undefined
         ? demotedRecord(anchor)
         : checkedRecord(anchor, {
             args,
             program,
             checker,
-            surfaceAbs,
-            surfaceSource,
+            surfaceAbs: surface.surfaceAbs,
+            surfaceSource: surface.surfaceSource,
             adjacency,
             failuresByFile,
-            surfaceFailuresByAlias,
+            surfaceFailuresByAlias: surface.surfaceFailuresByAlias,
           })
-    );
-  }
+    )
+  );
 
   const internalFailuresByFile = new Map<string, Set<string>>();
   for (const [file, failures] of failuresByFile) {
-    // The surface's own failures are a literal anchor's pasted text
+    // A surface's own failures are a literal anchor's pasted text
     // (carrick#1361), not a declaration with an import to drop.
-    if (file === surfaceAbs || failures.internal.size === 0) continue;
+    if (surfaceAt.has(file) || failures.internal.size === 0) continue;
     // A file already repaired has had its turn: repairing it again would chase
     // its own leftover diagnostics.
     if (repaired?.has(file)) continue;

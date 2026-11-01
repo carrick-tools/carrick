@@ -608,6 +608,26 @@ pub struct CaptureV2Result {
     pub ts_version: String,
     #[serde(default)]
     pub errors: Vec<String>,
+    /// carrick#2041: the second stub of a literal backfill, when the capture
+    /// demoted an alias it was given a text for.
+    #[serde(default)]
+    pub backfill: Option<CaptureV2Backfill>,
+}
+
+/// The literal backfill a `capture_v2` request asks for (carrick#2041): the
+/// texts the scanner can stand behind, and where the second stub goes.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureBackfillRequest<'a> {
+    pub texts: &'a std::collections::HashMap<String, String>,
+    pub out_dir: &'a str,
+}
+
+/// The backfilled stub a `capture_v2` answered beside the first: the aliases
+/// it re-anchored as literals, and the stub as a capture of them answers it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaptureV2Backfill {
+    pub backfilled: Vec<String>,
+    pub result: Box<CaptureV2Result>,
 }
 
 /// Four-bucket verdict classifier output (pinned decision 7), plus the
@@ -1589,6 +1609,13 @@ enum SidecarRequest {
         tsconfig_path: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         scan_root: Option<String>,
+        /// carrick#2041: alias -> literal text for the backfill the capture
+        /// runs itself when it demotes one of these aliases.
+        #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        backfill_texts: std::collections::BTreeMap<String, String>,
+        /// Where that backfilled stub is written.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        backfill_out_dir: Option<String>,
     },
     #[serde(rename = "check_v2")]
     CheckV2 {
@@ -3933,6 +3960,7 @@ impl TypeSidecar {
         anchors: &[CaptureAnchor],
         out_dir: &str,
         tsconfig_path: Option<&str>,
+        backfill: Option<CaptureBackfillRequest<'_>>,
     ) -> Result<CaptureV2Result, SidecarError> {
         self.ensure_ready()?;
 
@@ -3951,6 +3979,15 @@ impl TypeSidecar {
             out_dir: out_dir.to_string(),
             tsconfig_path: tsconfig_path.map(str::to_owned),
             scan_root: self.scan_root_arg(),
+            backfill_texts: backfill
+                .map(|b| {
+                    b.texts
+                        .iter()
+                        .map(|(alias, text)| (alias.clone(), text.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            backfill_out_dir: backfill.map(|b| b.out_dir.to_string()),
         };
 
         self.send_request(&request)?;
@@ -5866,6 +5903,8 @@ mod tests {
                 out_dir: "/tmp/stub".into(),
                 tsconfig_path: Some("tsconfig.json".into()),
                 scan_root: Some("/repo".into()),
+                backfill_texts: BTreeMap::from([("A".to_string(), "{ id: string }".to_string())]),
+                backfill_out_dir: Some("/tmp/stub-backfill".into()),
             },
             SidecarRequest::CheckV2 {
                 request_id: id(),

@@ -262,6 +262,8 @@ export const CaptureV2RequestSchema = BaseRequestSchema.extend({
   out_dir: z.string().min(1, 'Output dir cannot be empty'),
   tsconfig_path: z.string().optional(),
   scan_root: z.string().min(1).optional(),
+  backfill_texts: z.record(z.string()).optional(),
+  backfill_out_dir: z.string().min(1).optional(),
 });
 
 const CheckStubInputSchema = z.object({
