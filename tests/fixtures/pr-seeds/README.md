@@ -13,7 +13,7 @@ five fact-layer switches the cloud runner sets.
   also holds a contracts barrel (`src/contracts/`): the route's `Order` and
   the listener's `OrderUpdate` each intersect one of its two types, imported
   on line 2 so no other line moves. `src/augment.ts` augments
-  `@fixture/queue`, and `src/legacy.js` is a CommonJS helper outside the
+  an interface of the contracts module, and `src/legacy.js` is a CommonJS helper outside the
   tsconfig's program. Each has an empty answer.
 - `storefront` is the other side of each. Seeds never edit it, so every break
   is a consumer the PR did not update.

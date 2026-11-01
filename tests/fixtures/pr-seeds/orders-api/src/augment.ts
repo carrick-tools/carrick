@@ -1,7 +1,7 @@
-import "@fixture/queue";
+import "./contracts/order-ref";
 
-declare module "@fixture/queue" {
-  interface Bus {
-    drain(): Promise<void>;
+declare module "./contracts/order-ref" {
+  interface OrderMeta {
+    channel?: string;
   }
 }

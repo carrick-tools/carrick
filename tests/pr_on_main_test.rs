@@ -3225,7 +3225,7 @@ async fn reach_an_augmentation_edit_is_whole() {
         edit(
             repo,
             "src/augment.ts",
-            &[("drain(): Promise<void>;", "drain(): Promise<boolean>;")],
+            &[("channel?: string;", "channel?: number;")],
         )
     })
     .await;
