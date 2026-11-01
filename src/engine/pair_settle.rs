@@ -14,6 +14,12 @@
 //!   and holds an outcome under the pair's key with an equal hash that came
 //!   from the two types (`judged`).
 //!
+//! A pair with a reached side settles on the same terms when the judge would
+//! read the same input as main's did (carrick#3135): each side's
+//! [`stamp_surface_hashes`] hash equals the one stored with main's outcome,
+//! and main's judge did not leave the pair to the consumer's own code, which
+//! the retype reads and no hash covers.
+//!
 //! Anything else is judged as before. Only a pull request run settles: a run
 //! that uploads never builds a [`SettleFrom`].
 
@@ -214,19 +220,127 @@ impl SettleFrom {
             })
     }
 
-    /// Main's outcome for `pair`, when the pair settles.
-    pub(crate) fn settled(&self, pair: &BuiltPair) -> Option<&StoredPairOutcome> {
-        if !self.unreached(&pair.producer_service, &pair.producer_alias)
-            || !self.unreached(&pair.consumer_service, &pair.consumer_alias)
-        {
-            return None;
-        }
+    /// Main's outcome for `pair`, when the pair settles, and whether it
+    /// settled with a reached side (carrick#3135).
+    pub(crate) fn settled(&self, pair: &BuiltPair) -> Option<(&StoredPairOutcome, Settled)> {
         let producer = self.main.get(&pair.producer_service)?;
         let consumer = self.main.get(&pair.consumer_service)?;
         if !producer.usable || !consumer.usable || producer.commit != consumer.commit {
             return None;
         }
         let stored = consumer.outcomes.as_ref()?.get(&pair.spec.pair_key)?;
-        (stored.judged && stored.spec_hash == spec_hash(pair)).then_some(stored)
+        if !stored.judged || stored.spec_hash != spec_hash(pair) {
+            return None;
+        }
+        if self.unreached(&pair.producer_service, &pair.producer_alias)
+            && self.unreached(&pair.consumer_service, &pair.consumer_alias)
+        {
+            Some((stored, Settled::Unreached))
+        } else if same_judge_input(pair, stored) {
+            Some((stored, Settled::SameJudgeInput))
+        } else {
+            None
+        }
     }
+}
+
+/// How a pair settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// Neither side is reached (carrick#3104).
+    Unreached,
+    /// A side is reached, and the judge would read main's input (carrick#3135).
+    SameJudgeInput,
+}
+
+/// Whether the judge would read for `pair` what it read for main's `stored`
+/// outcome: both sides hashed alike, and nothing left to the consumer's code.
+fn same_judge_input(pair: &BuiltPair, stored: &StoredPairOutcome) -> bool {
+    let equal = |ours: &Option<String>, main: &Option<String>| ours.is_some() && ours == main;
+    !stored.left_to_consumer
+        && equal(&pair.producer_surface_hash, &stored.producer_surface_hash)
+        && equal(&pair.consumer_surface_hash, &stored.consumer_surface_hash)
+}
+
+/// Set each pair's per-side hash of what the judge reads (carrick#3135).
+///
+/// A side's hash covers, in this order: the capture's `surface_hash` for the
+/// alias the probe reads, the one for its unwidened reading (the probe reads
+/// it on a sending side, `check.ts`), and the dependencies of every stub the
+/// judge's workspace holds, since one stub's pins move the version another
+/// stub installs (`computeDedupeOverrides`). A side whose alias has no
+/// recorded hash, or whose service id names two stubs, gets `None` and never
+/// settles that way.
+pub(crate) fn stamp_surface_hashes(pairs: &mut [BuiltPair], all_repo_data: &[CloudRepoData]) {
+    let mut records: HashMap<&str, Option<HashMap<String, Option<String>>>> = HashMap::new();
+    let mut workspace = Sha256::new();
+    workspace.update(format!("carrick-workspace/{PAIR_OUTCOMES_VERSION}\n").as_bytes());
+    let mut stubs: Vec<(&str, &crate::cloud_storage::CaptureStubArtifact)> = all_repo_data
+        .iter()
+        .filter_map(|repo| {
+            let stub = repo.capture_stub.as_ref()?;
+            (stub.artifact_version == crate::cloud_storage::CAPTURE_ARTIFACT_VERSION).then(|| {
+                let id = repo.service_name.as_deref().unwrap_or(&repo.repo_name);
+                (id, stub)
+            })
+        })
+        .collect();
+    stubs.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, stub) in &stubs {
+        let parsed = stub
+            .files
+            .get(CAPTURE_MANIFEST_FILE)
+            .and_then(|text| serde_json::from_str::<StubManifest>(text).ok())
+            .map(|manifest| {
+                manifest
+                    .aliases
+                    .into_iter()
+                    .map(|record| (record.alias, record.surface_hash))
+                    .collect()
+            });
+        // A service id that names two stubs: which one the judge reads is
+        // not known, so neither side hashes.
+        records
+            .entry(id)
+            .and_modify(|seen| *seen = None)
+            .or_insert(parsed);
+        workspace.update(
+            serde_json::to_vec(&(
+                id,
+                stub.files.get("package.json"),
+                stub.files.get(RESOLUTION_FILE),
+            ))
+            .unwrap_or_default(),
+        );
+    }
+    let workspace = format!("{:x}", workspace.finalize());
+    let side = |service: &str, alias: &str| -> Option<String> {
+        let aliases = records.get(service)?.as_ref()?;
+        let own = aliases.get(alias)?.as_ref()?;
+        let unwidened = super::type_compat_v2::unwidened_alias(alias);
+        let unwidened = match aliases.get(&unwidened) {
+            None => None,
+            Some(hash) => Some(hash.as_ref()?),
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(&(own, unwidened, &workspace)).unwrap_or_default());
+        Some(format!("{:x}", hasher.finalize()))
+    };
+    for pair in pairs.iter_mut() {
+        pair.producer_surface_hash =
+            side(&pair.spec.producer.service_name, &pair.spec.producer.alias);
+        pair.consumer_surface_hash =
+            side(&pair.spec.consumer.service_name, &pair.spec.consumer.alias);
+    }
+}
+
+/// The capture's per-alias records file inside a stub.
+const CAPTURE_MANIFEST_FILE: &str = "carrick-manifest.json";
+/// The stub's recorded dependency edges (the sidecar's `RESOLUTION_FILE`).
+const RESOLUTION_FILE: &str = "carrick-resolution.json";
+
+#[derive(serde::Deserialize)]
+struct StubManifest {
+    #[serde(default)]
+    aliases: Vec<crate::services::type_sidecar::CaptureAliasRecord>,
 }

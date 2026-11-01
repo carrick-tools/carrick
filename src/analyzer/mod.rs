@@ -1682,6 +1682,14 @@ pub struct PairCheckOutcome {
     /// that did not run, a compiler that died of memory, a time limit), not
     /// from the two types (carrick#3104). Such an outcome is never settled.
     pub judged: bool,
+    /// What the judge read for each side from its stub (carrick#3135):
+    /// `BuiltPair`'s hashes, stored so a pull request run can settle a pair
+    /// it reaches whose judge input is main's.
+    pub producer_surface_hash: Option<String>,
+    pub consumer_surface_hash: Option<String>,
+    /// The judge left the pair to the consumer's own code (its retype), whose
+    /// file no hash covers (carrick#3135).
+    pub left_to_consumer: bool,
 }
 
 /// The pairing a type-mismatch outcome is about (carrick-cloud#1369): the
@@ -7609,6 +7617,9 @@ mod tests {
             consumer_reads: Vec::new(),
             spec_hash: String::new(),
             judged: true,
+            producer_surface_hash: None,
+            consumer_surface_hash: None,
+            left_to_consumer: false,
         }
     }
 

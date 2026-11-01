@@ -535,9 +535,218 @@ fn a_pr_that_reaches_no_pair_posts_mains_stored_outcomes() {
     assert_eq!(settled["checked"], judged["checked"]);
 }
 
+/// Every stored pair outcome under `store`, by pair key, as main's scan
+/// wrote them: `(left_to_consumer, judged)`.
+fn stored_outcomes(store: &Path) -> std::collections::BTreeMap<String, (bool, bool)> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut dirs = vec![store.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read the store") {
+            let path = entry.expect("store entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(blob) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            for outcome in blob["pair_outcomes"]["outcomes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                out.insert(
+                    outcome["pair_key"].as_str().unwrap_or_default().to_string(),
+                    (
+                        outcome["left_to_consumer"].as_bool().unwrap_or(false),
+                        outcome["judged"].as_bool().unwrap_or(false),
+                    ),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// The pair keys every `check_v2` request of a run named.
+fn checked_keys(events: &str) -> std::collections::BTreeSet<String> {
+    events
+        .lines()
+        .filter_map(|line| line.strip_prefix("check_v2 "))
+        .flat_map(|rest| rest.split_whitespace().map(str::to_string))
+        .collect()
+}
+
+/// A fourth call in `web` whose response the call names by a declared
+/// type, so the capture states it cleanly and the judge decides the pair
+/// without leaving it to the consumer's code (carrick#3135).
+fn add_named_call(root: &Path) {
+    let checkout = root.join("web/src/checkout.ts");
+    let mut source = std::fs::read_to_string(&checkout).expect("read checkout");
+    source.push_str(
+        "\nexport interface CheckoutReply {\n  y: number;\n}\n\nexport async function namedCheckout(): Promise<number> {\n  const response = await api.post<CheckoutReply>(\"/checkout\");\n  return response.data.y;\n}\n",
+    );
+    std::fs::write(&checkout, &source).expect("write checkout");
+    let line = source
+        .lines()
+        .position(|line| line.contains("api.post<CheckoutReply>"))
+        .expect("the named call")
+        + 1;
+    let cassette = root.join("__llm__/analyze-file/checkout.json");
+    let mut answer: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cassette).expect("read cassette"))
+            .expect("parse cassette");
+    answer["data_calls"]
+        .as_array_mut()
+        .expect("calls")
+        .push(serde_json::json!({
+            "candidate_id": format!("@line:{line}"),
+            "line_number": line,
+            "target": "/checkout",
+            "method": "POST",
+            "pattern_matched": "api.post(",
+            "call_expression_text": "api.post<CheckoutReply>(\"/checkout\")",
+            "call_expression_line": line,
+            "payload_expression_text": null,
+            "payload_expression_line": null,
+            "primary_type_symbol": "CheckoutReply",
+            "type_import_source": null
+        }));
+    std::fs::write(&cassette, answer.to_string()).expect("write cassette");
+}
+
+/// carrick#3135: a PR that edits the producer's handler without changing
+/// any declaration its stub holds reaches the producer, yet the judge would
+/// read for each pair what main's did. A pair main judged settles from
+/// main's stored outcome and is not sent to the check; a pair main's judge
+/// left to the consumer's own code is judged again; and the PR posts what
+/// the same run posts with the reach decision off.
+///
+/// The second seed documents a member of the producer's response type. The
+/// published text stays the same, so the pair's spec does too; the stub's
+/// declaration moves, and every pair on it is judged.
+#[test]
+fn a_reached_pair_settles_only_when_its_judge_input_is_mains() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = carriable_fixture(dir.path());
+    add_named_call(&root);
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-q", "-m", "A"]);
+    let a = git_in(&root, &["rev-parse", "HEAD"]);
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(&store).expect("create the store");
+    scan_stored(&root, &store, &[], &[]);
+    let main = stored_outcomes(&store);
+    let to_consumer: Vec<&String> = main
+        .iter()
+        .filter(|(_, (left, _))| *left)
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        !to_consumer.is_empty(),
+        "main left a call to the retype: {main:#?}"
+    );
+    assert!(main.values().all(|(_, judged)| *judged), "{main:#?}");
+
+    let routes = root.join("api/src/routes.ts");
+    let pr = |edit: (&str, &str), name: &str| -> (serde_json::Value, String, String) {
+        git_in(&root, &["checkout", "-q", &a]);
+        let source = std::fs::read_to_string(&routes).expect("read routes");
+        assert!(source.contains(edit.0), "{source}");
+        std::fs::write(&routes, source.replace(edit.0, edit.1)).expect("edit routes");
+        git_in(&root, &["commit", "-q", "-am", name]);
+        let head = git_in(&root, &["rev-parse", "HEAD"]);
+        let mut runs = Vec::new();
+        for off in [false, true] {
+            let notes = tempfile::tempdir().expect("notes dir");
+            let shim = counting_shim(notes.path(), false);
+            let out = dir.path().join(format!("{name}-{off}.json"));
+            let flags = [
+                "--pr",
+                "7",
+                "--pr-head",
+                &head,
+                "--pr-base",
+                &a,
+                "--changed-only",
+            ];
+            let mut env: Vec<(&str, &Path)> = vec![
+                ("CARRICK_PR_RESULT_OUT", &out),
+                ("CARRICK_SIDECAR_DIR", &shim),
+            ];
+            if off {
+                env.push(("CARRICK_TYPE_REACH", Path::new("off")));
+            }
+            let log = scan_stored(&root, &store, &flags, &env);
+            let posted = std::fs::read_to_string(&out)
+                .unwrap_or_else(|error| panic!("the PR run posted no result ({error}):\n{log}"));
+            let events = std::fs::read_to_string(notes.path().join("events")).expect("read events");
+            runs.push((
+                serde_json::from_str::<serde_json::Value>(&posted).expect("parse"),
+                log,
+                events,
+            ));
+        }
+        let (off, _, off_events) = runs.pop().unwrap();
+        let (on, on_log, on_events) = runs.pop().unwrap();
+        assert_eq!(on["findings"], off["findings"], "{name}");
+        assert_eq!(on["checked"], off["checked"], "{name}");
+        assert!(
+            checked_keys(&on_events).is_subset(&checked_keys(&off_events)),
+            "{name}: {on_events}\n{off_events}"
+        );
+        (on, on_log, on_events)
+    };
+    let reached_line = |log: &str| -> usize {
+        log.lines()
+            .find(|line| line.contains("settled with a reached side"))
+            .and_then(|line| line.split_whitespace().find_map(|word| word.parse().ok()))
+            .unwrap_or_else(|| panic!("no reached-side settle line:\n{log}"))
+    };
+
+    // Seed 1: the handler's value changes, no declaration does.
+    let (_, log, events) = pr(("{ y: 1 }", "{ y: 2 }"), "body");
+    let checked = checked_keys(&events);
+    let settled: Vec<&String> = main
+        .iter()
+        .filter(|(key, (left, _))| !*left && !checked.contains(*key))
+        .map(|(key, _)| key)
+        .collect();
+    assert!(reached_line(&log) > 0, "{log}");
+    for key in &to_consumer {
+        assert!(
+            checked.contains(*key),
+            "a call left to the consumer is judged: {key}\n{events}"
+        );
+    }
+    assert!(!settled.is_empty(), "{events}");
+
+    // Seed 2: a member of the response type gains a doc comment.
+    let (_, log, events) = pr(
+        ("  y: number;\n", "  /** Units sold. */ y: number;\n"),
+        "member",
+    );
+    assert_eq!(reached_line(&log), 0, "{log}");
+    let checked = checked_keys(&events);
+    for key in &settled {
+        assert!(
+            checked.contains(*key),
+            "the moved pair is judged: {key}\n{events}"
+        );
+    }
+}
+
 /// The shim a scan is pointed at with `CARRICK_SIDECAR_DIR`: it runs the real
 /// sidecar behind it and notes each request's action with the files it
-/// names. With `prescreen_off` it answers `retype_prescreen` itself, leaving
+/// names, and a check's pair keys. With `prescreen_off` it answers `retype_prescreen` itself, leaving
 /// every call to the retype, so one binary scans with the prescreen and
 /// without it.
 fn counting_shim(notes: &Path, prescreen_off: bool) -> PathBuf {
@@ -559,6 +768,7 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
   const files = [
     ...(request.files ?? []),
     ...(request.items ?? []).map((item) => item.file_path),
+    ...(request.pairs ?? []).map((pair) => pair.pair_key),
   ];
   fs.appendFileSync(events, `${{request.action}} ${{files.join(' ')}}\n`);
   if (request.action === 'retype_prescreen' && {prescreen_off}) {{
