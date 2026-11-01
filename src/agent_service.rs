@@ -99,9 +99,41 @@ fn request_counts_map() -> &'static Mutex<RequestCounts> {
     REQUEST_COUNTS.get_or_init(|| Mutex::new(RequestCounts::default()))
 }
 
+/// Every request recorded while a test asks for them ([`log_requests`]):
+/// its route, the service it was made for, and when it was counted.
+type RequestLog = Vec<(String, Option<String>, std::time::Instant)>;
+static REQUEST_LOG: Mutex<Option<RequestLog>> = Mutex::new(None);
+
+/// Start (`true`) or stop keeping [`take_request_log`]'s record of each
+/// request. For tests that order a scan's requests in time; off in a scan.
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn log_requests(on: bool) {
+    *REQUEST_LOG.lock().unwrap() = on.then(Vec::new);
+}
+
+/// The requests kept since [`log_requests`] was turned on, taken. Under
+/// `CARRICK_MOCK_ALL` a request is counted once its mock latency
+/// ([`set_mock_latency`]) has passed.
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn take_request_log() -> RequestLog {
+    REQUEST_LOG
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map(std::mem::take)
+        .unwrap_or_default()
+}
+
 fn record_request(path: &str) {
     // Read before the lock: it is the running task's own.
     let service = crate::current_service::working_for();
+    if let Some(log) = REQUEST_LOG.lock().unwrap().as_mut() {
+        log.push((
+            path.to_string(),
+            service.clone().flatten(),
+            std::time::Instant::now(),
+        ));
+    }
     let mut counts = request_counts_map().lock().unwrap();
     *counts.issued.entry(path.to_string()).or_insert(0) += 1;
     if let Some(service) = service {

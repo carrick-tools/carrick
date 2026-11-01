@@ -547,6 +547,10 @@ where
 
 /// What the queue asks for one service.
 struct AskAhead {
+    /// The service's place in the queue.
+    position: usize,
+    /// What it asks ([`ask_identity`]).
+    identity: String,
     service: Option<String>,
     packages: Packages,
     import_facts: ImportSample,
@@ -555,6 +559,8 @@ struct AskAhead {
 
 /// One service as the queue starts with it.
 struct ServiceAhead {
+    /// Its place in the scan's order.
+    position: usize,
     config: Config,
     stored: Option<StoredSetup>,
     /// Heard once the service's walk has ended, when the run walks
@@ -622,8 +628,10 @@ fn read_ask(repo_path: &str, service: ServiceAhead) -> Option<(String, AskAhead)
     };
     let identity = ask_identity(&packages, &import_facts, settled.as_ref());
     Some((
-        identity,
+        identity.clone(),
         AskAhead {
+            position: service.position,
+            identity,
             service: service.config.service_name.clone(),
             packages,
             import_facts,
@@ -646,8 +654,24 @@ impl Drop for QueueTask {
 pub(super) struct SetupsAhead {
     /// One per service, in the scan's order, taken when the loop reaches it.
     slots: Mutex<Vec<Option<Slot<SetupAnswer>>>>,
+    /// One per service, in the scan's order: its setup once the queue's ask
+    /// for it answered ready, for the lane that asks the file reader ahead
+    /// (carrick#3131) to read without taking. Empty when the queue is off.
+    ready: Arc<[tokio::sync::watch::Sender<Option<ReadySetup>>]>,
     turns: AskTurns,
     _queue: Option<QueueTask>,
+}
+
+/// A setup the queue asked that answered ready, as the lane that asks the
+/// file reader ahead reads it (carrick#3131): what was asked, and what the
+/// prompts are built from. The loop takes the same answer from its slot
+/// only when it asks the same ([`answer_asked_ahead`]), so the lane builds
+/// on it only then too.
+#[derive(Debug, Clone)]
+pub(super) struct ReadySetup {
+    pub(super) identity: String,
+    pub(super) detection: DetectionResult,
+    pub(super) guidance: ProtocolGuidance,
 }
 
 impl SetupsAhead {
@@ -670,16 +694,23 @@ impl SetupsAhead {
             _ => {
                 return Self {
                     slots: Mutex::new(Vec::new()),
+                    ready: Arc::new([]),
                     turns,
                     _queue: None,
                 };
             }
         };
+        let ready: Arc<[tokio::sync::watch::Sender<Option<ReadySetup>>]> = services
+            .iter()
+            .map(|_| tokio::sync::watch::Sender::new(None))
+            .collect();
         let mut walked = walked.into_iter();
         let (queue, slots): (Vec<_>, Vec<_>) = services
             .iter()
-            .map(|config| {
+            .enumerate()
+            .map(|(position, config)| {
                 let (queued, slot) = queue_place(ServiceAhead {
+                    position,
                     config: config.clone(),
                     stored: stored(config),
                     walked: walked.next(),
@@ -691,6 +722,7 @@ impl SetupsAhead {
         let ask_turns = turns.clone();
         let started = std::time::Instant::now();
         let total = services.len();
+        let readying = ready.clone();
         let task = tokio::spawn(async move {
             let drained = drain(
                 queue,
@@ -704,14 +736,28 @@ impl SetupsAhead {
                 },
                 move |ask: AskAhead| {
                     let turns = ask_turns.clone();
+                    let ready = readying.clone();
                     crate::current_service::asked_for(ask.service.clone(), async move {
-                        super::ask_model_setup(
+                        let answer = super::ask_model_setup(
                             &ask.packages,
                             &ask.import_facts,
                             ask.settled,
                             &turns,
                         )
-                        .await
+                        .await;
+                        if let SetupAnswer::Ready {
+                            detection,
+                            guidance,
+                            ..
+                        } = &answer
+                        {
+                            ready[ask.position].send_replace(Some(ReadySetup {
+                                identity: ask.identity,
+                                detection: detection.clone(),
+                                guidance: guidance.clone(),
+                            }));
+                        }
+                        answer
                     })
                 },
             )
@@ -728,9 +774,27 @@ impl SetupsAhead {
         });
         Self {
             slots: Mutex::new(slots),
+            ready,
             turns,
             _queue: Some(QueueTask(task)),
         }
+    }
+
+    /// The setup the queue asked for the service at `index`, once it
+    /// answered ready, read without taking it (carrick#3131). `None` when the
+    /// queue is off.
+    pub(super) fn ready(
+        &self,
+        index: usize,
+    ) -> Option<tokio::sync::watch::Receiver<Option<ReadySetup>>> {
+        self.ready
+            .get(index)
+            .map(tokio::sync::watch::Sender::subscribe)
+    }
+
+    /// The run's turns, shared by every ask the run makes.
+    pub(super) fn turns(&self) -> AskTurns {
+        self.turns.clone()
     }
 
     /// Where the service at `index` gets its model setup on this pass.
@@ -1425,6 +1489,7 @@ pub(crate) mod tests {
 
     fn ahead(stored: Option<StoredSetup>) -> ServiceAhead {
         ServiceAhead {
+            position: 0,
             config: Config::default(),
             stored,
             walked: None,

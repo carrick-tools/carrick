@@ -471,6 +471,10 @@ pub(super) trait WalkedPass {
     fn walk_ended(&mut self, service: usize, again: bool, walk: Self::Walk) -> WalkEnd;
     /// `service` was first reached, by the rows of `by`.
     fn reached(&mut self, service: usize, by: usize) -> Reached;
+    /// The gate of the pass's analysis at `position` opened: every walk it
+    /// reads has ended. Heard once per position, before it is admitted, and
+    /// only heard: admission is decided as it was (carrick#3131).
+    fn gate_opened(&mut self, _position: usize) {}
     /// Start the pass's analysis at `position`, whose gate opened on the
     /// walks of `reads` (its own among them).
     fn start_analysis(
@@ -559,7 +563,17 @@ pub(super) async fn walks_and_analyses<P: WalkedPass>(
     };
     let mut analyses_in_flight = 0usize;
     let mut running = FuturesUnordered::new();
+    // The analyses whose open gate the pass has been told of.
+    let mut heard_open: BTreeSet<usize> = BTreeSet::new();
     loop {
+        for &position in &waiting {
+            if !heard_open.contains(&position)
+                && gate_open(analyses[position].0, &state, &reaches).is_some()
+            {
+                heard_open.insert(position);
+                pass.gate_opened(position);
+            }
+        }
         loop {
             if let Some(head) = queue.front().copied() {
                 let alone = running.is_empty();
@@ -829,6 +843,8 @@ mod tests {
         again_mb: u64,
         ran: std::sync::Arc<Mutex<Vec<Ran>>>,
         reached_by: Vec<(usize, usize)>,
+        /// Each analysis whose gate was heard open, and when.
+        gates: Vec<(usize, Duration)>,
     }
 
     impl StandIn {
@@ -899,6 +915,10 @@ mod tests {
             }
         }
 
+        fn gate_opened(&mut self, position: usize) {
+            self.gates.push((position, self.began.elapsed()));
+        }
+
         fn start_analysis(
             &mut self,
             position: usize,
@@ -928,7 +948,34 @@ mod tests {
             again_mb: 0,
             ran: Default::default(),
             reached_by: Vec::new(),
+            gates: Vec::new(),
         }
+    }
+
+    /// carrick#3131: a pass says when each analysis's gate opens, once, as
+    /// its last walk ends, and admits it when the budget lets it, as before.
+    /// One at a time, the walks run first, so each gate opens long before
+    /// its analysis starts.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_is_heard_open_once_as_its_walks_end_and_before_admission() {
+        take_schedules();
+        let mut pass = stand_in(3);
+        pass.analysis_secs = vec![5, 5, 5];
+        let plan = Plan::count(1, "the test's");
+        walks_and_analyses(
+            &Ledger::new(),
+            &plan,
+            &[(0, 0), (1, 0), (2, 0)],
+            &[(0, 0), (1, 0), (2, 0)],
+            &mut pass,
+        )
+        .await;
+        let secs = Duration::from_secs;
+        assert_eq!(pass.gates, vec![(0, secs(1)), (1, secs(2)), (2, secs(3))]);
+        assert_eq!(pass.one("analysis 0").started, secs(3));
+        assert_eq!(pass.one("analysis 1").started, secs(8));
+        assert_eq!(pass.one("analysis 2").started, secs(13));
+        take_schedules();
     }
 
     /// carrick#3085, the gate: the first service's rows reach the second,

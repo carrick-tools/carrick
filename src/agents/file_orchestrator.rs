@@ -1424,6 +1424,9 @@ pub struct FileOrchestrator {
     /// the labelled call (carrick#2819). Empty unless the engine hands one
     /// over.
     result_index: crate::result_shapes::ResultIndex,
+    /// Whether this service's answers were asked ahead of its analysis, and
+    /// which side of that this orchestrator is (carrick#3131).
+    ahead: crate::agents::asked_ahead::AheadRole,
 }
 
 /// The fact layer's file set for one analysis (carrick#2613): not recorded,
@@ -1766,7 +1769,18 @@ impl FileOrchestrator {
             request_summaries: RequestSummaryIndex::default().into(),
             fact_files: FactFileSource::None,
             result_index: crate::result_shapes::ResultIndex::default(),
+            ahead: crate::agents::asked_ahead::AheadRole::None,
         }
+    }
+
+    /// Which side of a service's answers asked ahead this orchestrator works
+    /// for (carrick#3131). As [`AheadRole::Lane`] it builds the prompts,
+    /// publishes them to the slot, asks them, and returns an empty result.
+    ///
+    /// [`AheadRole::Lane`]: crate::agents::asked_ahead::AheadRole::Lane
+    pub fn with_answers_ahead(mut self, ahead: crate::agents::asked_ahead::AheadRole) -> Self {
+        self.ahead = ahead;
+        self
     }
 
     /// The fact layer's files for this service (carrick#2613), arriving
@@ -1838,6 +1852,67 @@ impl FileOrchestrator {
         );
         self.plan_parts(file, guidance, WHOLE_PROMPT_MAX_BYTES)
             .map(|plan| Asking::Parts(Box::new(plan)))
+    }
+
+    /// Ask the reader about `file`, as one file's asks always run.
+    ///
+    /// A file at or under the line is asked whole, and only the cloud's
+    /// final verdict that its answer does not fit one response
+    /// (carrick#1898) or that the request is too large to ask (carrick#2310)
+    /// asks it again, in parts. A file over the line is asked in parts from
+    /// its first request, and one that cannot be cut under it is not asked
+    /// (carrick#2309). Every other outcome is what it was: an answer is the
+    /// file's answer, and any other failure is the file's failure. Records
+    /// nothing: what a failure costs the index is the caller's to say.
+    async fn ask_file(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        match self.asking(file, guidance) {
+            Ok(Asking::Nothing) => Ok(FileAnalysisResult::default()),
+            Ok(Asking::Parts(plan)) => self.ask_parts(file, guidance, *plan).await,
+            Err(too_large) => Err(Box::new(too_large)),
+            Ok(Asking::Whole(prompt)) => {
+                match self
+                    .file_analyzer
+                    .analyze_prompt(file.prompt_path, &prompt, guidance)
+                    .await
+                {
+                    Err(error) => {
+                        if let Some(verdict) = cut_verdict(error.as_ref()).cloned() {
+                            self.ask_in_parts(file, guidance, verdict).await
+                        } else if let Some(verdict) = size_verdict(error.as_ref()).cloned() {
+                            self.ask_smaller(file, guidance, &verdict, prompt.text.len())
+                                .await
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    answered => answered,
+                }
+            }
+        }
+    }
+
+    /// What `file`'s answer asked ahead is held under (carrick#3131): every
+    /// byte of its first request, or of each of its parts, guidance included.
+    /// `None` for a file that is asked nothing or cannot be asked.
+    fn ahead_key(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+    ) -> Option<crate::agents::asked_ahead::AheadKey> {
+        let sent: Vec<AnalysisPrompt> = match self.asking(file, guidance) {
+            Ok(Asking::Whole(prompt)) => vec![prompt],
+            Ok(Asking::Parts(plan)) => plan.parts.into_iter().map(|(_, prompt)| prompt).collect(),
+            Ok(Asking::Nothing) | Err(_) => return None,
+        };
+        let texts: Vec<&str> = sent.iter().map(|prompt| prompt.text.as_str()).collect();
+        Some(crate::agents::asked_ahead::AheadKey {
+            prompt_path: file.prompt_path.to_string(),
+            prompt_id: crate::analysis_job::body_id(&texts.join("\u{0}")),
+        })
     }
 
     /// The parts `file` is asked in so that no request carries more than
@@ -2817,11 +2892,17 @@ impl FileOrchestrator {
         // The deterministic pass over the files is the long phase of a scan
         // with no model in it, and the only one that can state how far through
         // it is; it ticks for a parent that renders a line (carrick#955).
-        let mut reading = crate::progress::Ticker::new(crate::progress::Phase::Files, files.len());
+        // A lane asking ahead (carrick#3131) reads the service's files before
+        // its analysis does, and says neither: the analysis reads them again.
+        let lane = self.ahead.is_lane();
+        let mut reading = (!lane)
+            .then(|| crate::progress::Ticker::new(crate::progress::Phase::Files, files.len()));
         // And how big this service turned out to be, for the record the next
         // build opens with: "N files across M services" is this count, summed
         // (carrick#1452).
-        crate::scan_timing::files_read(files.len());
+        if !lane {
+            crate::scan_timing::files_read(files.len());
+        }
         for file_path in files {
             // The one place a long CPU-bound pass can hear a signal: nothing
             // in the loop below awaits, so on a large repo this is minutes in
@@ -2829,7 +2910,9 @@ impl FileOrchestrator {
             // files, because a file half-read leaves nothing to keep and an
             // atomic load per file is not a cost.
             crate::shutdown::check()?;
-            reading.item();
+            if let Some(reading) = reading.as_mut() {
+                reading.item();
+            }
             let path_str = file_path.to_string_lossy().to_string();
 
             // Read file content
@@ -4126,6 +4209,59 @@ impl FileOrchestrator {
             });
         }
 
+        // A lane asking ahead (carrick#3131) stops here, as a dispatched
+        // service does: it holds a place for each file's answer under the
+        // bytes it built, publishes them for the service's analysis, and asks
+        // them, at most a queue's depth at a time. An ask that fails, or one
+        // never sent because the run's patience is spent or the scan no
+        // longer wants it, is a miss the analysis asks for itself. Nothing is
+        // recorded here: the analysis states every file it attempts and
+        // every file it loses.
+        if let crate::agents::asked_ahead::AheadRole::Lane { slot, stop, log } = &self.ahead {
+            let ahead = std::sync::Arc::new(crate::agents::asked_ahead::AskedAhead::default());
+            let held: Vec<(&PendingFile, crate::agents::asked_ahead::Hold)> = to_dispatch
+                .iter()
+                .filter_map(|pf| {
+                    let key = self.ahead_key(&pf.parted(), guidance)?;
+                    ahead.hold(key).map(|hold| (pf, hold))
+                })
+                .collect();
+            if !held.is_empty() && slot.publish(ahead.clone()) {
+                tracing::dispatcher::with_default(log, || {
+                    tracing::info!(
+                        "Asking the file reader ahead for {}: {} file(s)",
+                        crate::current_service::name()
+                            .as_deref()
+                            .unwrap_or("(root)"),
+                        held.len()
+                    )
+                });
+                let ahead = &ahead;
+                futures::stream::iter(held.into_iter().map(|(pf, hold)| async move {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst)
+                        || crate::retry_budget::remaining().is_zero()
+                    {
+                        return;
+                    }
+                    hold.asking(ahead);
+                    let answer = self.ask_file(&pf.parted(), guidance).await.ok();
+                    hold.answer(answer);
+                }))
+                .buffer_unordered(concurrency)
+                .collect::<Vec<()>>()
+                .await;
+            }
+            return Ok(FileCentricAnalysisResult {
+                file_results: HashMap::new(),
+                raw_model_results: HashMap::new(),
+                mount_graph: MountGraph::new(),
+                stats,
+                unread_mount_prefixes: Vec::new(),
+                bundled_types: None,
+                type_resolution: None,
+            });
+        }
+
         stats.files_model_reused = reused.len() + collected.len();
         stats.files_model_dispatched = to_dispatch.len();
         stats.files_model_not_asked = not_asked.len();
@@ -4159,43 +4295,30 @@ impl FileOrchestrator {
         // registered as it happens (#461). A file replaying a cached answer is
         // not dispatched and so is not attempted.
         crate::scan_health::record_files_attempted(to_dispatch.len());
+        // The answers a lane asked ahead for this service (carrick#3131),
+        // claimed once: a lane that has not published by now asks nothing.
+        let ahead = match &self.ahead {
+            crate::agents::asked_ahead::AheadRole::Analysis(slot) => slot.claim(),
+            _ => None,
+        };
+        let ahead = ahead.as_deref();
         let dispatched: Vec<(PendingFile, Result<FileAnalysisResult, ModelAnswer>)> =
             futures::stream::iter(to_dispatch.into_iter().map(|pf| async move {
                 let file = pf.parted();
-                // A file at or under the line is asked whole, and only the
-                // cloud's final verdict that its answer does not fit one
-                // response (carrick#1898) or that the request is too large to
-                // ask (carrick#2310) asks it again, in parts. A file over the
-                // line is asked in parts from its first request, and one that
-                // cannot be cut under it is not asked (carrick#2309). Every
-                // other outcome is what it was: an answer is the file's
-                // answer, and any other failure is the file's failure.
-                let asked: Result<FileAnalysisResult, Box<dyn std::error::Error>> = match self
-                    .asking(&file, guidance)
-                {
-                    Ok(Asking::Nothing) => Ok(FileAnalysisResult::default()),
-                    Ok(Asking::Parts(plan)) => self.ask_parts(&file, guidance, *plan).await,
-                    Err(too_large) => Err(Box::new(too_large)),
-                    Ok(Asking::Whole(prompt)) => {
-                        match self
-                            .file_analyzer
-                            .analyze_prompt(&pf.prompt_path, &prompt, guidance)
-                            .await
-                        {
-                            Err(error) => {
-                                if let Some(verdict) = cut_verdict(error.as_ref()).cloned() {
-                                    self.ask_in_parts(&file, guidance, verdict).await
-                                } else if let Some(verdict) = size_verdict(error.as_ref()).cloned()
-                                {
-                                    self.ask_smaller(&file, guidance, &verdict, prompt.text.len())
-                                        .await
-                                } else {
-                                    Err(error)
-                                }
-                            }
-                            answered => answered,
-                        }
-                    }
+                // The answer asked ahead for the same bytes, waited for while
+                // it is in flight, is the file's answer: it was asked as this
+                // file is asked below. It is counted as dispatched, because
+                // this scan sent it. Any other bytes are asked here.
+                let held = match ahead {
+                    Some(ahead) => match self.ahead_key(&file, guidance) {
+                        Some(key) => ahead.take(&key).await,
+                        None => None,
+                    },
+                    None => None,
+                };
+                let asked: Result<FileAnalysisResult, Box<dyn std::error::Error>> = match held {
+                    Some(answer) => Ok(answer),
+                    None => self.ask_file(&file, guidance).await,
                 };
                 let result = asked.map_err(|e| {
                     // Recorded here, where the error is still typed: this
@@ -4236,6 +4359,16 @@ impl FileOrchestrator {
             .buffer_unordered(concurrency)
             .collect()
             .await;
+        if let Some(ahead) = ahead {
+            tracing::info!(
+                "{}",
+                ahead.line(
+                    crate::current_service::name()
+                        .as_deref()
+                        .unwrap_or("(root)")
+                )
+            );
+        }
 
         // A cached answer enters phase 3 as the model's answer, because that is
         // what it is. Everything downstream — the join, every pass over it, the
