@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.3.139](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.138...carrick-v0.3.139) (2026-11-01)
+
+
+### Features
+
+* **check:** a pair whose sides no change reaches takes main's stored outcome ([#3104](https://github.com/carrick-tools/carrick/issues/3104)) ([#3129](https://github.com/carrick-tools/carrick/issues/3129)) ([f892e84](https://github.com/carrick-tools/carrick/commit/f892e8433a1e99a308dded60fb089b8a8de5fd4e))
+* **check:** main's side of a PR scan takes main's stored pair outcomes ([#3127](https://github.com/carrick-tools/carrick/issues/3127)) ([#3144](https://github.com/carrick-tools/carrick/issues/3144)) ([c40cc5a](https://github.com/carrick-tools/carrick/commit/c40cc5a6a0f930dc99c71ed4cd106e9a504e2b6f))
+* **scan:** a pull request scan decides which aliases its change can reach, per service ([#3102](https://github.com/carrick-tools/carrick/issues/3102)) ([#3125](https://github.com/carrick-tools/carrick/issues/3125)) ([1b5ff38](https://github.com/carrick-tools/carrick/commit/1b5ff38b6b6cf7133b585e0addcb419ba7235161))
+* **scan:** a service no change reaches keeps main's types in a PR scan ([#3103](https://github.com/carrick-tools/carrick/issues/3103)) ([#3128](https://github.com/carrick-tools/carrick/issues/3128)) ([23b978a](https://github.com/carrick-tools/carrick/commit/23b978adb81bf6b9486e26c64aab26133ffc7aea))
+* **scan:** ask each service's file-reader answers while the service before it is analysed ([#3131](https://github.com/carrick-tools/carrick/issues/3131)) ([#3145](https://github.com/carrick-tools/carrick/issues/3145)) ([ad7ac30](https://github.com/carrick-tools/carrick/commit/ad7ac300cb01d14004f71c25c374fafbe0d6ca4d))
+* **scan:** size the analysis width from each service's stored memory peak ([#3110](https://github.com/carrick-tools/carrick/issues/3110)) ([a423f3f](https://github.com/carrick-tools/carrick/commit/a423f3f7baaacbc926e3d59af26aac375d03923b))
+* **scan:** start each service's analysis once the walks it reads have ended ([#3085](https://github.com/carrick-tools/carrick/issues/3085)) ([#3136](https://github.com/carrick-tools/carrick/issues/3136)) ([59972c2](https://github.com/carrick-tools/carrick/commit/59972c211c4b2dc42123b94c935827c5aa593ee7))
+* **scan:** store each service's measured memory peaks in its blob ([#3099](https://github.com/carrick-tools/carrick/issues/3099)) ([5c5d9ae](https://github.com/carrick-tools/carrick/commit/5c5d9ae8241361737e5c8d61c1799f49bcf36bea))
+* **scan:** store each service's type-reach record beside its index ([#3101](https://github.com/carrick-tools/carrick/issues/3101)) ([#3111](https://github.com/carrick-tools/carrick/issues/3111)) ([e02fb43](https://github.com/carrick-tools/carrick/commit/e02fb43676ac7d6298bcb99cc92ad78defe00f89))
+* **sidecar:** decide the retype's pre-rewrite abstentions in the consumer's own analysis ([#3132](https://github.com/carrick-tools/carrick/issues/3132)) ([#3138](https://github.com/carrick-tools/carrick/issues/3138)) ([1bc2956](https://github.com/carrick-tools/carrick/commit/1bc2956bf728a12414d2df01ba9fed4e08c06591))
+* **sidecar:** reach_graph and reach actions, the affected-set walk with four fixes and stems ([#3100](https://github.com/carrick-tools/carrick/issues/3100)) ([#3107](https://github.com/carrick-tools/carrick/issues/3107)) ([a53f537](https://github.com/carrick-tools/carrick/commit/a53f537aa70e54357da2a659384e77d722458a4c))
+
+
+### Bug Fixes
+
+* **scan:** owner-approved wording for the type-reach warnings; document CARRICK_ANSWERS_AHEAD ([#3161](https://github.com/carrick-tools/carrick/issues/3161)) ([910c97c](https://github.com/carrick-tools/carrick/commit/910c97c6687e1881381bdfa818640dc98c4e8b4c))
+* **sidecar:** one program per declaration file when naming a renamed export ([#3117](https://github.com/carrick-tools/carrick/issues/3117)) ([#3119](https://github.com/carrick-tools/carrick/issues/3119)) ([463a1ed](https://github.com/carrick-tools/carrick/commit/463a1edb15c64e9eba640429c90a941af02aad60))
+* **type-reach:** a service with nothing to type reads no_types, not types_degraded ([#3156](https://github.com/carrick-tools/carrick/issues/3156)) ([836a5eb](https://github.com/carrick-tools/carrick/commit/836a5eb2705a0c952c07683cd357801683451410))
+
+
+### Performance
+
+* **capture:** run the literal backfill inside the first capture request ([#2041](https://github.com/carrick-tools/carrick/issues/2041)) ([#3142](https://github.com/carrick-tools/carrick/issues/3142)) ([18c5e9b](https://github.com/carrick-tools/carrick/commit/18c5e9b4cf1ac4fe03077e09c232b0eba3e00480))
+* **retype:** split one file's calls across the pool's idle processes ([#3147](https://github.com/carrick-tools/carrick/issues/3147)) ([#3150](https://github.com/carrick-tools/carrick/issues/3150)) ([3e23881](https://github.com/carrick-tools/carrick/commit/3e2388131b04f38ab4b5b1971af73df1424aa437))
+* **scope:** a .gitignore edit re-analyses only services an untracked file could move ([#3113](https://github.com/carrick-tools/carrick/issues/3113)) ([#3118](https://github.com/carrick-tools/carrick/issues/3118)) ([6cd6566](https://github.com/carrick-tools/carrick/commit/6cd656631b650d8184bf49098a5c3892c913c025))
+* **scope:** a dependency-only manifest or lockfile move re-analyses only services that load a moved package ([#3121](https://github.com/carrick-tools/carrick/issues/3121)) ([fefc1f9](https://github.com/carrick-tools/carrick/commit/fefc1f973c660205338ce6dbc94887e5b806462f))
+* **scope:** docs, data and same-import test edits no longer re-analyse a service ([#3120](https://github.com/carrick-tools/carrick/issues/3120)) ([e062ce6](https://github.com/carrick-tools/carrick/commit/e062ce62b6eff5bb02ea9d7b2c3e5fba8a6c01ea))
+* **sidecar:** keep a tsconfig project's package.json reads across program rebuilds ([#3149](https://github.com/carrick-tools/carrick/issues/3149)) ([df6c1b7](https://github.com/carrick-tools/carrick/commit/df6c1b7f34e5091eb40315719db8536406b8b2e3))
+
 ## [0.3.138](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.137...carrick-v0.3.138) (2026-10-31)
 
 
