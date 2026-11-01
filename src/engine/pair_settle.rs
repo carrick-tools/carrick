@@ -93,11 +93,20 @@ struct MainGeneration {
     outcomes: Option<HashMap<String, StoredPairOutcome>>,
 }
 
+/// Whose run is settling: the pull request's own check, or main's side of
+/// the comparison (carrick#3127).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettleSide {
+    PullRequest,
+    MainSide,
+}
+
 /// What a pull request run settles pairs from.
 pub(crate) struct SettleFrom {
     main: HashMap<String, MainGeneration>,
     carried: HashSet<String>,
     reach: HashMap<String, ReachDecision>,
+    side: SettleSide,
 }
 
 /// A build that names tracked changes its commit does not hold is no build
@@ -162,7 +171,33 @@ impl SettleFrom {
             main,
             carried: carried.into_iter().collect(),
             reach,
+            side: SettleSide::PullRequest,
         }
+    }
+
+    /// What main's side of a pull request run settles from (carrick#3127).
+    /// Every service of main's copy is main's by definition, so none is
+    /// reached: a pair settles when `settled` accepts main's record for it.
+    /// Peers are never in `main`, so a pair with a side in another repo never
+    /// settles and is judged as before.
+    pub(crate) fn main_side(
+        main: &[CloudRepoData],
+        this_build: Option<&ScannerBuild>,
+        cache_version: u32,
+    ) -> Self {
+        let carried = main.iter().map(|blob| {
+            blob.service_name
+                .clone()
+                .unwrap_or_else(|| blob.repo_name.clone())
+        });
+        Self {
+            side: SettleSide::MainSide,
+            ..Self::new(main, carried, HashMap::new(), this_build, cache_version)
+        }
+    }
+
+    pub(crate) fn side(&self) -> SettleSide {
+        self.side
     }
 
     /// Whether this run's change cannot reach `alias` of `service`. A service

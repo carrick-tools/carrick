@@ -12650,6 +12650,7 @@ async fn mark_findings_on_main(
     let copy = input.copy;
     let sp = logging::spinner("Comparing findings with main...");
     let timeout = main_side_timeout();
+    let started = std::time::Instant::now();
     let outcome = {
         let _caught = crate::panic_report::CaughtPanics::begin();
         tokio::time::timeout(
@@ -12660,6 +12661,10 @@ async fn mark_findings_on_main(
         )
         .await
     };
+    info!(
+        "main side: finished in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     let failure = match outcome {
         Ok(Ok(Ok(main))) => {
             crate::pr_baseline::mark_on_main(findings, &main, copy);
@@ -12707,7 +12712,22 @@ async fn main_side_findings(
         peers.iter().chain(main_self.iter()),
         main_self.iter(),
     );
-    let (analyzer, type_check) = build_cross_repo_analyzer(peers, main_self, sidecar, None).await?;
+    // Main's side takes main's stored outcome for each pair of main's own
+    // copy (carrick#3127). It writes nothing, and runs only on a PR run, so
+    // the reach decision's off switch is the only gate.
+    let settle = (!type_reach::turned_off()).then(|| {
+        pair_settle::SettleFrom::main_side(
+            &main_self,
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+            CACHE_VERSION,
+        )
+    });
+    let sent = sidecar.map(|s| s.check_v2_sent());
+    let built = build_cross_repo_analyzer(peers, main_self, sidecar, settle).await;
+    if let (Some(sidecar), Some(sent)) = (sidecar, sent) {
+        crate::pr_baseline::record_main_side_checks(sidecar.check_v2_sent() - sent);
+    }
+    let (analyzer, type_check) = built?;
     let main_results = analyzer.get_results();
     let sdk_join = crate::sdk_edges::join(
         &sdk_input,
