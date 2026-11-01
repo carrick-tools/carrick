@@ -253,6 +253,9 @@ mod tests {
             consumer_reads: Vec::new(),
             spec_hash: String::new(),
             judged: true,
+            producer_surface_hash: None,
+            consumer_surface_hash: None,
+            left_to_consumer: false,
         }
     }
 

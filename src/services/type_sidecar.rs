@@ -470,6 +470,11 @@ pub struct CaptureAliasRecord {
     /// joins the manifest entry beside the entry's other provenance.
     #[serde(default)]
     pub unresolved_in_tree: Vec<TypeProvenance>,
+    /// Hash of everything the judge reads for this alias from its stub
+    /// (carrick#3135), as the capture's self-check writes it. Absent on a
+    /// demoted alias and on a stub an earlier build captured.
+    #[serde(default)]
+    pub surface_hash: Option<String>,
 }
 
 impl CaptureAliasRecord {

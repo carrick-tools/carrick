@@ -393,6 +393,17 @@ export interface CaptureAliasRecord {
    * type alone.
    */
   absent_body_tolerated?: true;
+  /**
+   * carrick#3135: lowercase hex SHA-256 of everything the judge reads for
+   * this alias from its own stub: the alias's `export type` statement, every
+   * tree file its closure reaches, every tree file in global scope (a script,
+   * an augmentation, a reference directive), the stub's pinned externals and
+   * recorded dependency edges, and the record fields the check reads. Equal
+   * hashes on one build mean the judge reads the same input for this alias.
+   * Absent on a demoted alias, whose surface line is `unknown` by
+   * construction.
+   */
+  surface_hash?: string;
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */

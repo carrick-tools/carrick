@@ -1598,6 +1598,11 @@ pub(crate) struct BuiltPair {
     /// judged on the widened type alone, and only an incompatible verdict is
     /// published unverifiable ([`abstain_on_unwidened_out_of_budget`]).
     pub unwidened_out_of_budget: bool,
+    /// What the judge reads for each side from its stub (carrick#3135):
+    /// [`super::pair_settle::stamp_surface_hashes`] sets them, `None` when a
+    /// side's stub records no hash for an alias the probe reads.
+    pub producer_surface_hash: Option<String>,
+    pub consumer_surface_hash: Option<String>,
 }
 
 /// What a call's stated message picks from a producer response's modes
@@ -1966,6 +1971,7 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
     // Deterministic order regardless of repo download order.
     pairs.sort_by(|a, b| a.spec.pair_key.cmp(&b.spec.pair_key));
     pairs.dedup_by(|a, b| a.spec.pair_key == b.spec.pair_key);
+    super::pair_settle::stamp_surface_hashes(&mut pairs, all_repo_data);
     pairs
 }
 
@@ -2097,6 +2103,8 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         consumer_expanded: consumer.entry.expanded_definition.clone(),
         unstated_mode,
         unwidened_out_of_budget,
+        producer_surface_hash: None,
+        consumer_surface_hash: None,
     })
 }
 
@@ -2323,9 +2331,13 @@ pub(crate) fn run_check(
         Some(settle) => {
             let total = all_pairs.len();
             let mut pairs = Vec::with_capacity(total);
+            let mut reached = 0usize;
             for pair in all_pairs {
                 match settle.settled(&pair) {
-                    Some(stored) => {
+                    Some((stored, how)) => {
+                        if how == super::pair_settle::Settled::SameJudgeInput {
+                            reached += 1;
+                        }
                         settled.push(stored_outcome(&pair, stored));
                         settled_pairs.push(pair);
                     }
@@ -2333,10 +2345,15 @@ pub(crate) fn run_check(
                 }
             }
             match settle.side() {
-                super::pair_settle::SettleSide::PullRequest => info!(
-                    "type_reach: {} of {total} pairs settled from main",
-                    settled.len()
-                ),
+                super::pair_settle::SettleSide::PullRequest => {
+                    info!(
+                        "type_reach: {} of {total} pairs settled from main",
+                        settled.len()
+                    );
+                    info!(
+                        "type_reach: {reached} settled with a reached side whose judge input is main's"
+                    );
+                }
                 super::pair_settle::SettleSide::MainSide => info!(
                     "main side: {} of {total} pairs taken from main's stored outcomes",
                     settled.len()
@@ -2490,6 +2507,11 @@ pub(crate) fn run_check(
         let _ = std::fs::remove_dir_all(&workspace_parent);
     }
 
+    // carrick#3135: a pair the judge leaves to the consumer may be retyped,
+    // which reads the consumer's own file: no hash covers that.
+    for outcome in &mut outcomes {
+        outcome.left_to_consumer = consumer_blamed.contains(&outcome.pair_key);
+    }
     retype_consumer_calls(
         sidecar,
         &pairs,
@@ -3614,6 +3636,7 @@ fn stored_outcome(
         stored.notes.clone(),
     );
     outcome.consumer_reads = stored.consumer_reads.clone();
+    outcome.left_to_consumer = stored.left_to_consumer;
     outcome
 }
 
@@ -3653,6 +3676,9 @@ fn outcome_for(
         consumer_reads: Vec::new(),
         spec_hash: super::pair_settle::spec_hash(pair),
         judged: true,
+        producer_surface_hash: pair.producer_surface_hash.clone(),
+        consumer_surface_hash: pair.consumer_surface_hash.clone(),
+        left_to_consumer: false,
     }
 }
 
@@ -4358,6 +4384,9 @@ mod tests {
             consumer_reads: Vec::new(),
             spec_hash: String::new(),
             judged: true,
+            producer_surface_hash: None,
+            consumer_surface_hash: None,
+            left_to_consumer: false,
         };
         apply_retype(&mut outcome, answer);
         outcome
@@ -7002,6 +7031,7 @@ mod tests {
             dangling_specifiers: Vec::new(),
             undeclared_names: Vec::new(),
             unresolved_in_tree: Vec::new(),
+            surface_hash: None,
         }
     }
 
@@ -7771,6 +7801,9 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             },
             spec_hash: String::new(),
             judged: true,
+            producer_surface_hash: None,
+            consumer_surface_hash: None,
+            left_to_consumer: false,
         };
         let before = vec![
             outcome("app", "app", VerdictBucket::Incompatible),
@@ -11406,6 +11439,10 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             main.iter()
                 .all(|o| o.judged && o.bucket == VerdictBucket::Compatible)
         );
+        assert!(
+            main.iter().all(|o| o.left_to_consumer),
+            "the check left both calls to the retype (carrick#3135)"
+        );
         assert_eq!(
             asked(&log),
             [
@@ -11599,6 +11636,151 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             !settles(&twice, &both, HashMap::new()),
             "a key stored twice"
         );
+    }
+
+    /// [`settle_repos`] with each stub's capture records carrying `hashes`
+    /// (alias -> surface hash) and `package` as its `package.json`.
+    fn hashed_repos(hashes: &[(&str, &str)], package: &str) -> Vec<CloudRepoData> {
+        let manifest = serde_json::json!({
+            "aliases": hashes.iter().map(|(alias, hash)| serde_json::json!({
+                "alias": alias,
+                "anchor_kind": "symbol",
+                "source_file": "src/x.ts",
+                "anchor_origin": "llm-symbol",
+                "serialization": "node_builder",
+                "self_check": "ok",
+                "top_type_at_self_check": false,
+                "surface_hash": hash,
+            })).collect::<Vec<_>>()
+        })
+        .to_string();
+        let mut repos = settle_repos();
+        for blob in &mut repos {
+            let stub = blob.capture_stub.as_mut().unwrap();
+            stub.files
+                .insert("carrick-manifest.json".to_string(), manifest.clone());
+            stub.files
+                .insert("package.json".to_string(), package.to_string());
+        }
+        repos
+    }
+
+    /// carrick#3135: a pair with a reached side settles when the judge would
+    /// read main's input for it, and is judged when any of that input moved.
+    #[test]
+    fn a_reached_pair_settles_only_when_its_judge_input_is_mains() {
+        let base = [("P", "p1"), ("C8", "c8"), ("C9", "c9")];
+        let repos = hashed_repos(&base, "{}");
+        let main_pairs = build_check_pairs(&repos);
+        let outcomes: Vec<PairCheckOutcome> = main_pairs
+            .iter()
+            .map(|pair| {
+                outcome_for(
+                    pair,
+                    VerdictBucket::Compatible,
+                    None,
+                    None,
+                    true,
+                    None,
+                    Vec::new(),
+                )
+            })
+            .collect();
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.producer_surface_hash.is_some() && o.consumer_surface_hash.is_some()),
+            "{outcomes:#?}"
+        );
+        let mut blobs = repos.clone();
+        crate::cloud_storage::attach_pair_outcomes(
+            &mut blobs,
+            &outcomes,
+            "test",
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+        );
+        // `api` analysed and reached whole; `web` with the call on line 8
+        // reached. No pair has an unreached pair of sides.
+        let reach = || {
+            let mut reach = web_partial(&["C9"]);
+            reach.insert(
+                "api".to_string(),
+                super::super::type_reach::ReachDecision::Partial {
+                    reached: ["P".to_string()].into(),
+                    unreached: Default::default(),
+                },
+            );
+            reach
+        };
+        let settles = |blobs: &[CloudRepoData],
+                       pr: &[CloudRepoData]|
+         -> Option<super::super::pair_settle::Settled> {
+            let pairs = build_check_pairs(pr);
+            let c8 = pairs
+                .iter()
+                .find(|pair| pair.consumer_alias == "C8")
+                .unwrap();
+            settle_from(blobs, &[], reach())
+                .settled(c8)
+                .map(|(_, how)| how)
+        };
+
+        assert_eq!(
+            settles(&blobs, &repos),
+            Some(super::super::pair_settle::Settled::SameJudgeInput),
+            "same hashes on both sides"
+        );
+        assert_eq!(
+            settles(
+                &blobs,
+                &hashed_repos(&[("P", "p1"), ("C8", "c8"), ("C9", "moved")], "{}")
+            ),
+            Some(super::super::pair_settle::Settled::SameJudgeInput),
+            "another call's hash moved"
+        );
+        assert_eq!(
+            settles(
+                &blobs,
+                &hashed_repos(&[("P", "moved"), ("C8", "c8"), ("C9", "c9")], "{}")
+            ),
+            None,
+            "the producer's hash moved"
+        );
+        assert_eq!(
+            settles(
+                &blobs,
+                &hashed_repos(&[("P", "p1"), ("C8", "moved"), ("C9", "c9")], "{}")
+            ),
+            None,
+            "the consumer's hash moved"
+        );
+        let unwidened = super::unwidened_alias("P");
+        assert_eq!(
+            settles(
+                &blobs,
+                &hashed_repos(
+                    &[("P", "p1"), (&unwidened, "u"), ("C8", "c8"), ("C9", "c9")],
+                    "{}"
+                )
+            ),
+            None,
+            "the producer gained an unwidened reading"
+        );
+        assert_eq!(
+            settles(
+                &blobs,
+                &hashed_repos(&base, r#"{"dependencies":{"zod":"3.0.0"}}"#)
+            ),
+            None,
+            "a stub's pins moved"
+        );
+        assert_eq!(settles(&blobs, &settle_repos()), None, "no hash recorded");
+
+        let mut left = blobs.clone();
+        for outcome in &mut left[1].pair_outcomes.as_mut().unwrap().outcomes {
+            outcome.left_to_consumer = true;
+        }
+        assert_eq!(settles(&left, &repos), None, "main left it to the consumer");
     }
 
     /// carrick#3104: a consumer stores the outcomes of pairs with a producer

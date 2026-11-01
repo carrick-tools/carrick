@@ -17452,6 +17452,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             consumer_reads: Vec::new(),
             spec_hash: String::new(),
             judged: true,
+            producer_surface_hash: None,
+            consumer_surface_hash: None,
+            left_to_consumer: false,
         }];
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,

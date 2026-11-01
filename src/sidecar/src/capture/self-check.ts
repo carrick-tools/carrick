@@ -33,8 +33,10 @@
  */
 
 import ts from 'typescript';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { findAugmentationFiles } from './augmentations.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import type { CaptureAliasRecord, CaptureAnchorRequest, SelfCheckOutcome } from './api.js';
 import type { ResolvedAnchor } from './anchors.js';
@@ -46,6 +48,7 @@ import {
   packageNameOf,
 } from './specifiers.js';
 import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
+import { RESOLUTION_FILE } from './resolution-edges.js';
 import type { WriteGuard } from './guarded-fs.js';
 import {
   findDisqualifyingTopTypes,
@@ -253,17 +256,34 @@ function runSelfCheck(
 
   // Per-file relative-import adjacency for closure walks.
   const adjacency = new Map<string, string[]>();
+  const textOf = new Map<string, string>();
+  const hashAdjacency = new Map<string, string[]>();
   const treeSet = new Set(treeFiles.map((f) => path.resolve(f)));
   for (const file of treeFiles) {
     const abs = path.resolve(file);
     const text = fs.readFileSync(abs, 'utf8');
+    textOf.set(abs, text);
     const neighbors: string[] = [];
     for (const spec of collectSpecifiers(text)) {
       const resolved = resolveTreeSpecifier(abs, spec, treeSet);
       if (resolved) neighbors.push(resolved);
     }
     adjacency.set(abs, neighbors);
+    // The hash's closure (carrick#3135) also follows what `collectSpecifiers`
+    // does not read: `import x = require("./y")` and reference paths. It
+    // must hold every file the judge loads for the alias.
+    const more: string[] = [];
+    for (const re of [/require\s*\(\s*["']([^"']+)["']/g, /<reference\s+path\s*=\s*["']([^"']+)["']/g]) {
+      for (const m of text.matchAll(re)) {
+        const resolved =
+          resolveTreeSpecifier(abs, m[1], treeSet) ??
+          (treeSet.has(path.resolve(path.dirname(abs), m[1])) ? path.resolve(path.dirname(abs), m[1]) : undefined);
+        if (resolved) more.push(resolved);
+      }
+    }
+    hashAdjacency.set(abs, [...neighbors, ...more]);
   }
+  const judgeInputs = stubJudgeInputs(args, program, textOf, [...surfaceAt.keys()]);
 
   // Demotions (failureReason present) never reached the surface with a real
   // type; everything else — including successful literal anchors, which sit
@@ -282,6 +302,9 @@ function runSelfCheck(
             adjacency,
             failuresByFile,
             surfaceFailuresByAlias: surface.surfaceFailuresByAlias,
+            textOf,
+            hashAdjacency,
+            judgeInputs,
           })
     )
   );
@@ -413,6 +436,9 @@ function checkedRecord(
     adjacency: Map<string, string[]>;
     failuresByFile: Map<string, FileFailures>;
     surfaceFailuresByAlias: Map<string, FileFailures>;
+    textOf: Map<string, string>;
+    hashAdjacency: Map<string, string[]>;
+    judgeInputs: StubJudgeInputs;
   }
 ): CaptureAliasRecord {
   const alias = anchor.request.alias;
@@ -424,10 +450,12 @@ function checkedRecord(
   // publishes is this tree, so the record says where it does not resolve.
   let unresolvedPaths: string[] = [];
   const seeds: string[] = [];
+  let statementText: string | undefined;
 
   if (ctx.surfaceSource) {
     for (const stmt of ctx.surfaceSource.statements) {
       if (!ts.isTypeAliasDeclaration(stmt) || stmt.name.text !== alias) continue;
+      statementText = stmt.getText(ctx.surfaceSource);
       const type = ctx.checker.getTypeAtLocation(stmt.name);
       topType =
         (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0;
@@ -560,7 +588,7 @@ function checkedRecord(
     }
   }
 
-  return {
+  const record: CaptureAliasRecord = {
     alias,
     anchor_kind: anchor.request.kind,
     symbol_name: 'symbol_name' in anchor.request ? anchor.request.symbol_name : undefined,
@@ -595,6 +623,143 @@ function checkedRecord(
       : {}),
     ...literalMarks(anchor.request),
   };
+  return statementText === undefined
+    ? record
+    : {
+        ...record,
+        surface_hash: surfaceHash(record, statementText, closure, ctx),
+      };
+}
+
+/**
+ * What every alias of one stub hashes beside its own closure (carrick#3135):
+ * the surface's statements that declare no alias, the tree files in global
+ * scope, and the stub's pinned externals and recorded dependency edges.
+ */
+interface StubJudgeInputs {
+  /** Per surface: the text of its statements that are not type aliases. */
+  surfaceRest: Map<string, string[]>;
+  /** Stub-relative path and text of each global-scope tree file, sorted. */
+  globals: Array<[string, string]>;
+  pinned: Array<[string, string]>;
+  resolution: string | null;
+  bareCheckout: boolean;
+}
+
+/**
+ * A tree file in global scope reaches every alias the judge loads beside
+ * it, closure or not: a script (no import or export), a file that declares
+ * a global or module augmentation, and a file with a reference directive.
+ */
+function stubJudgeInputs(
+  args: SelfCheckArgs,
+  program: ts.Program,
+  textOf: Map<string, string>,
+  surfaces: string[]
+): StubJudgeInputs {
+  const augmenting = new Set(findAugmentationFiles([...textOf.keys()]).map((f) => path.resolve(f)));
+  const globals: Array<[string, string]> = [];
+  for (const [abs, text] of textOf) {
+    if (surfaces.includes(abs)) continue;
+    const source = program.getSourceFile(abs);
+    const global =
+      augmenting.has(abs) ||
+      /^\s*\/\/\/\s*<reference\b/m.test(text) ||
+      (source !== undefined && !ts.isExternalModule(source));
+    if (global) globals.push([stubRelative(args.stubDir, abs), text]);
+  }
+  globals.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const surfaceRest = new Map<string, string[]>();
+  for (const surface of surfaces) {
+    const source = program.getSourceFile(surface);
+    surfaceRest.set(
+      surface,
+      [
+        ...(source?.statements ?? [])
+          .filter((stmt) => !ts.isTypeAliasDeclaration(stmt))
+          .map((stmt) => stmt.getText(source)),
+        ...(source?.referencedFiles ?? []).map((ref) => `path:${ref.fileName}`),
+        ...(source?.typeReferenceDirectives ?? []).map((ref) => `types:${ref.fileName}`),
+        ...(source?.libReferenceDirectives ?? []).map((ref) => `lib:${ref.fileName}`),
+      ]
+    );
+  }
+  let resolution: string | null = null;
+  try {
+    resolution = fs.readFileSync(path.join(args.stubDir, RESOLUTION_FILE), 'utf8');
+  } catch {
+    // No recorded edges: the check resolves every transitive from the registry.
+  }
+  return {
+    surfaceRest,
+    globals,
+    pinned: Object.entries(args.pinned).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    resolution,
+    bareCheckout: args.bareCheckout,
+  };
+}
+
+function stubRelative(stubDir: string, abs: string): string {
+  return path.relative(stubDir, abs).split(path.sep).join('/');
+}
+
+/**
+ * carrick#3135: the hash of everything the judge reads for one alias from its
+ * stub. No machine path enters it, so two scans of one tree at different
+ * checkout paths hash alike. File-granular: the closure's files are hashed
+ * whole, so an unrelated declaration in a reached file moves the hash (fails
+ * toward judging). A closure file that imports the surface itself reaches
+ * every alias, so the whole surface is hashed then.
+ */
+function surfaceHash(
+  record: CaptureAliasRecord,
+  statementText: string,
+  closure: Set<string>,
+  ctx: {
+    args: SelfCheckArgs;
+    surfaceAbs: string;
+    textOf: Map<string, string>;
+    hashAdjacency: Map<string, string[]>;
+    judgeInputs: StubJudgeInputs;
+  }
+): string {
+  const reached = new Set(closure);
+  const queue = [...closure].filter((file) => file !== ctx.surfaceAbs);
+  while (queue.length > 0) {
+    for (const next of ctx.hashAdjacency.get(queue.pop()!) ?? []) {
+      if (reached.has(next)) continue;
+      reached.add(next);
+      queue.push(next);
+    }
+  }
+  const files: Array<[string, string]> = [];
+  let surfaceReached = false;
+  for (const file of reached) {
+    if (file === ctx.surfaceAbs) continue;
+    if ((ctx.hashAdjacency.get(file) ?? []).includes(ctx.surfaceAbs)) surfaceReached = true;
+    files.push([stubRelative(ctx.args.stubDir, file), ctx.textOf.get(file) ?? '']);
+  }
+  files.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const inputs = ctx.judgeInputs;
+  const preimage = {
+    statement: statementText,
+    surface_rest: inputs.surfaceRest.get(ctx.surfaceAbs) ?? [],
+    whole_surface: surfaceReached ? (ctx.textOf.get(ctx.surfaceAbs) ?? '') : null,
+    files,
+    globals: inputs.globals,
+    pinned: inputs.pinned,
+    resolution: inputs.resolution,
+    bare_checkout: inputs.bareCheckout,
+    // The record fields the check reads (`check.ts`): the pre-gate's
+    // findings, and the two marks a probe is built from.
+    any_provenance: (record.any_provenance ?? []).map((p) => [p.path, p.kind, p.reason]),
+    raw_text_read: record.raw_text_read === true,
+    absent_body_tolerated: record.absent_body_tolerated === true,
+  };
+  return createHash('sha256')
+    .update('carrick-surface/1\n')
+    .update(JSON.stringify(preimage))
+    .digest('hex');
 }
 
 /** Resolve a relative specifier from `fromAbs` to a tree file, if present. */

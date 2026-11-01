@@ -2150,6 +2150,9 @@ mod tests {
             unresolved_reason: None,
             notes: Vec::new(),
             consumer_reads: Vec::new(),
+            producer_surface_hash: None,
+            consumer_surface_hash: None,
+            left_to_consumer: false,
         };
         let record = |commit: &str, hash: &str| StoredPairOutcomes {
             version: crate::cloud_storage::PAIR_OUTCOMES_VERSION,

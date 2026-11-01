@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 /// The record's own format and the `spec_hash` preimage's. Bump it when
 /// either changes: a record of another version settles nothing.
-pub const PAIR_OUTCOMES_VERSION: u32 = 1;
+pub const PAIR_OUTCOMES_VERSION: u32 = 2;
 
 /// The largest serialised record a main scan stores. Over it the consumer
 /// stores none, and a pull request scan judges each of its pairs.
@@ -58,6 +58,18 @@ pub struct StoredPairOutcome {
     pub notes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumer_reads: Vec<u32>,
+    /// What the judge read for each side from its stub
+    /// (`pair_settle::stamp_surface_hashes`, carrick#3135). A pull request
+    /// run settles a pair it reaches only when both equal its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_surface_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_surface_hash: Option<String>,
+    /// The judge left the pair to the consumer's own code, which the retype
+    /// reads and no hash covers: such an outcome settles only when neither
+    /// side is reached (carrick#3135).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub left_to_consumer: bool,
 }
 
 /// Read the field leniently: a record this build cannot read (a later
@@ -112,6 +124,9 @@ pub fn attach_pair_outcomes(
                 unresolved_reason: outcome.unresolved_reason.clone(),
                 notes: outcome.notes.clone(),
                 consumer_reads: outcome.consumer_reads.clone(),
+                producer_surface_hash: outcome.producer_surface_hash.clone(),
+                consumer_surface_hash: outcome.consumer_surface_hash.clone(),
+                left_to_consumer: outcome.left_to_consumer,
             })
             .collect();
         rows.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
@@ -154,7 +169,7 @@ mod tests {
 
     #[test]
     fn a_record_this_build_cannot_read_is_no_record() {
-        let good = r#"{"pair_outcomes":{"version":1,"commit":"c","outcomes":[
+        let good = r#"{"pair_outcomes":{"version":2,"commit":"c","outcomes":[
             {"pair_key":"k","spec_hash":"h","judged":true,"bucket":"compatible","resolved":true}]}}"#;
         let record = read(good).expect("a record of known shape reads");
         assert_eq!(record.outcomes[0].bucket, VerdictBucket::Compatible);
