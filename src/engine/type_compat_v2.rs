@@ -2301,15 +2301,43 @@ fn judge_once_in(
 /// keep that verdict. Only when the sidecar returns no verdicts at all does
 /// every probing pair degrade to unverifiable with the failure as the reason.
 /// Never fatal to the scan, and never read as compatible.
+///
+/// A pull request run passes `settle` (carrick#3104): a pair it settles takes
+/// main's stored outcome, and is neither judged, retyped nor passed through
+/// the post-passes, which main's outcome has already been through.
 pub(crate) fn run_check(
     sidecar: &TypeSidecar,
     all_repo_data: &[CloudRepoData],
     local_consumers: &LocalConsumers,
+    settle: Option<&super::pair_settle::SettleFrom>,
 ) -> Vec<PairCheckOutcome> {
-    let pairs = build_check_pairs(all_repo_data);
-    if pairs.is_empty() {
+    let all_pairs = build_check_pairs(all_repo_data);
+    if all_pairs.is_empty() {
         return Vec::new();
     }
+    let mut settled: Vec<PairCheckOutcome> = Vec::new();
+    let mut settled_pairs: Vec<BuiltPair> = Vec::new();
+    let pairs: Vec<BuiltPair> = match settle {
+        Some(settle) => {
+            let total = all_pairs.len();
+            let mut pairs = Vec::with_capacity(total);
+            for pair in all_pairs {
+                match settle.settled(&pair) {
+                    Some(stored) => {
+                        settled.push(stored_outcome(&pair, stored));
+                        settled_pairs.push(pair);
+                    }
+                    None => pairs.push(pair),
+                }
+            }
+            info!(
+                "type_reach: {} of {total} pairs settled from main",
+                settled.len()
+            );
+            pairs
+        }
+        None => all_pairs,
+    };
 
     let mut outcomes: Vec<PairCheckOutcome> = Vec::new();
     // Pairs whose CONSUMER side left the verdict unresolved: the ones the
@@ -2367,9 +2395,12 @@ pub(crate) fn run_check(
                 }
                 // The check's compiler died of memory: recorded for the run,
                 // as a sidecar process's death is (carrick#2208).
-                if let Some(end) = result.compiler_end.as_ref()
-                    && let Some(kind) = end.memory_death(oom_kills_rose)
-                {
+                let memory_death = result
+                    .compiler_end
+                    .as_ref()
+                    .and_then(|end| Some((end, end.memory_death(oom_kills_rose)?)));
+                let memory_died = memory_death.is_some();
+                if let Some((end, kind)) = memory_death {
                     warn!(
                         "the check's type checker died of memory ({:?}, heap-limit line on stderr)",
                         end.signal
@@ -2381,13 +2412,14 @@ pub(crate) fn run_check(
                     .iter()
                     .map(|v| (v.pair_key.as_str(), v))
                     .collect();
+                let probed_from = outcomes.len();
                 for pair in &probing {
                     match by_key.get(pair.spec.pair_key.as_str()) {
                         Some(verdict) => {
                             if consumer_to_blame(verdict) {
                                 consumer_blamed.insert(pair.spec.pair_key.clone());
                             }
-                            outcomes.push(outcome_for(
+                            let outcome = outcome_for(
                                 pair,
                                 verdict.bucket,
                                 verdict.gate.clone(),
@@ -2395,9 +2427,14 @@ pub(crate) fn run_check(
                                 verdict.resolved,
                                 verdict.unresolved_reason.clone(),
                                 verdict.notes.clone(),
-                            ))
+                            );
+                            outcomes.push(if run_caused(result.success, verdict.gate.as_deref()) {
+                                not_judged(outcome)
+                            } else {
+                                outcome
+                            })
                         }
-                        None => outcomes.push(outcome_for(
+                        None => outcomes.push(not_judged(outcome_for(
                             pair,
                             VerdictBucket::Unverifiable,
                             None,
@@ -2405,7 +2442,14 @@ pub(crate) fn run_check(
                             false,
                             Some("the check returned no verdict for this pair".to_string()),
                             Vec::new(),
-                        )),
+                        ))),
+                    }
+                }
+                // Every verdict of a check whose compiler died of memory says
+                // how the run went as much as what the types are.
+                if memory_died {
+                    for outcome in &mut outcomes[probed_from..] {
+                        outcome.judged = false;
                     }
                 }
                 debug!(
@@ -2422,7 +2466,7 @@ pub(crate) fn run_check(
                 );
                 let reason = format!("type check did not run: {}", e);
                 for pair in &probing {
-                    outcomes.push(outcome_for(
+                    outcomes.push(not_judged(outcome_for(
                         pair,
                         VerdictBucket::Unverifiable,
                         None,
@@ -2430,7 +2474,7 @@ pub(crate) fn run_check(
                         false,
                         Some(reason.clone()),
                         Vec::new(),
-                    ));
+                    )));
                 }
             }
         }
@@ -2448,10 +2492,15 @@ pub(crate) fn run_check(
     abstain_on_unstated_modes(&pairs, &mut outcomes);
     abstain_on_unwidened_out_of_budget(&pairs, &mut outcomes);
     hold_back_same_service_mismatches(&mut outcomes);
+    outcomes.append(&mut settled);
 
     // Deterministic order for every downstream consumer.
     outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
-    log_unresolved_pairs(&outcomes, &pairs, local_consumers);
+    log_unresolved_pairs(
+        &outcomes,
+        pairs.iter().chain(&settled_pairs),
+        local_consumers,
+    );
     outcomes
 }
 
@@ -3130,6 +3179,7 @@ fn abstained(job: &[RetypeItem], reason: &str) -> Vec<RetypeOutcome> {
             outcome: RetypeVerdict::Abstain,
             diagnostics: Vec::new(),
             reason: Some(reason.to_string()),
+            run_failed: true,
         })
         .collect()
 }
@@ -3224,6 +3274,11 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
             outcome.notes.push(RETYPE_NOTE.to_string());
         }
         RetypeVerdict::Abstain => {
+            // An item the retype never judged (out of time, no process, a
+            // request that failed) is judged again by the next run.
+            if answer.run_failed {
+                outcome.judged = false;
+            }
             let why = answer.reason.as_deref().unwrap_or("no reason given");
             outcome.unresolved_reason = Some(match outcome.unresolved_reason.take() {
                 Some(reason) => {
@@ -3238,13 +3293,13 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
 /// One log line per pair the check could not establish as a fact, with the
 /// reason, so a CI run says why a pair is unverified without a second tool
 /// (carrick#1491). Only the pairs this run is answerable for are logged.
-fn log_unresolved_pairs(
+fn log_unresolved_pairs<'a>(
     outcomes: &[PairCheckOutcome],
-    pairs: &[BuiltPair],
+    pairs: impl IntoIterator<Item = &'a BuiltPair>,
     local_consumers: &LocalConsumers,
 ) {
     let worth: HashSet<&str> = pairs
-        .iter()
+        .into_iter()
         .filter(|pair| worth_logging(pair, local_consumers))
         .map(|pair| pair.spec.pair_key.as_str())
         .collect();
@@ -3341,6 +3396,60 @@ fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckO
     }
 }
 
+/// The check's gates that say how the run went, not what the two types are
+/// (carrick#3104): the install did not finish (`install:timeout`,
+/// `install:registry-unreachable`, `install:failed`), no isolated install was
+/// possible (`isolation:unavailable`), the compiler ended abnormally
+/// (`tsc:abnormal-termination`), or the run had no stub for a side
+/// (`missing:stub`). The next run may answer differently on the same types.
+///
+/// Every other gate comes from the two types and settles: the capture's
+/// pre-gate (`capture:<side>:<kind>`), the probe gates (`<side>:any`,
+/// `:unknown`, `:never`, `:void`, `:form`, `:bytes`, `:text`, `:envelope`,
+/// `:union`), `poison:<side>`, `import:<side>`, `assignment:other`, and the
+/// gates this module sets (`producer:mode`, `same_service`, `retype:consumer`,
+/// `producer:` and `consumer:unwidened_out_of_budget`, whose mark is stored
+/// in the blob and so read alike by every run of it).
+fn gate_from_run(gate: &str) -> bool {
+    gate.starts_with("install:")
+        || matches!(
+            gate,
+            "isolation:unavailable" | "tsc:abnormal-termination" | "missing:stub"
+        )
+}
+
+/// Whether a check verdict comes from how the run went: the check run itself
+/// failed (every verdict it returned, whatever its gate), or the verdict's
+/// gate is one [`gate_from_run`] names (carrick#3104).
+fn run_caused(check_succeeded: bool, gate: Option<&str>) -> bool {
+    !check_succeeded || gate.is_some_and(gate_from_run)
+}
+
+/// `outcome`, marked as coming from how the run went rather than from the
+/// two types (carrick#3104).
+fn not_judged(mut outcome: PairCheckOutcome) -> PairCheckOutcome {
+    outcome.judged = false;
+    outcome
+}
+
+/// A settled pair's outcome: this run's pair, main's verdict (carrick#3104).
+fn stored_outcome(
+    pair: &BuiltPair,
+    stored: &crate::cloud_storage::StoredPairOutcome,
+) -> PairCheckOutcome {
+    let mut outcome = outcome_for(
+        pair,
+        stored.bucket,
+        stored.gate.clone(),
+        stored.diagnostic.clone(),
+        stored.resolved,
+        stored.unresolved_reason.clone(),
+        stored.notes.clone(),
+    );
+    outcome.consumer_reads = stored.consumer_reads.clone();
+    outcome
+}
+
 fn outcome_for(
     pair: &BuiltPair,
     bucket: VerdictBucket,
@@ -3375,6 +3484,8 @@ fn outcome_for(
         unresolved_reason,
         notes,
         consumer_reads: Vec::new(),
+        spec_hash: super::pair_settle::spec_hash(pair),
+        judged: true,
     }
 }
 
@@ -3484,6 +3595,7 @@ mod tests {
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }
     }
 
@@ -3943,6 +4055,8 @@ mod tests {
             unresolved_reason: None,
             notes: Vec::new(),
             consumer_reads: Vec::new(),
+            spec_hash: String::new(),
+            judged: true,
         };
         apply_retype(&mut outcome, answer);
         outcome
@@ -4086,6 +4200,7 @@ mod tests {
             outcome: RetypeVerdict::Abstain,
             diagnostics: Vec::new(),
             reason: Some(reason),
+            run_failed: false,
         };
         let counted = crate::time_limits::from_check_outcomes(&[retyped_outcome("web", &answer)]);
         assert!(counted.is_empty(), "{counted:?}");
@@ -4410,6 +4525,7 @@ mod tests {
                 message: "Property 'x' does not exist on type '{ y: number; }'.".to_string(),
             }],
             reason: reason.map(str::to_string),
+            run_failed: false,
         };
 
         let mut mismatch = unresolved();
@@ -4522,6 +4638,7 @@ mod tests {
                 outcome: RetypeVerdict::Agrees,
                 diagnostics: Vec::new(),
                 reason: None,
+                run_failed: false,
             },
         );
         assert_eq!(outcome.bucket, VerdictBucket::Incompatible);
@@ -7461,6 +7578,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             } else {
                 Vec::new()
             },
+            spec_hash: String::new(),
+            judged: true,
         };
         let before = vec![
             outcome("app", "app", VerdictBucket::Incompatible),
@@ -7638,6 +7757,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                     },
                 ],
                 reason: None,
+                run_failed: false,
             },
         );
         assert_eq!(outcome.consumer_reads, vec![9, 14]);
@@ -8500,7 +8620,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             return;
         };
 
-        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new(), None);
         assert_eq!(outcomes.len(), 1, "exactly one matched pair");
         let outcome = &outcomes[0];
         assert_eq!(
@@ -8541,7 +8661,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
 
         // Determinism: a second independent check run yields the same
         // outcomes (pair keys, buckets, diagnostics).
-        let outcomes_again = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        let outcomes_again = run_check(&sidecar, &all_repo_data, &LocalConsumers::new(), None);
         let flat = |v: &[PairCheckOutcome]| {
             v.iter()
                 .map(|o| {
@@ -8832,7 +8952,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let _ = std::fs::remove_dir_all(&stub);
         let all_repo_data = vec![repo("app", None, manifest, Some(artifact))];
 
-        let mut outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        let mut outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new(), None);
         outcomes.sort_by_key(|outcome| outcome.consumer_line);
         // A gate that caught the `any` is stored as unverifiable too.
         let stored = |bucket: VerdictBucket| match bucket {
@@ -8909,7 +9029,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         };
         break_the_install(&mut all_repo_data);
 
-        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new(), None);
         assert_eq!(outcomes.len(), 1, "exactly one matched pair");
         assert_reads_the_installers_words(&outcomes[0]);
     }
@@ -8932,7 +9052,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         };
         break_the_install(&mut all_repo_data);
 
-        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new(), None);
         assert_eq!(outcomes.len(), 2, "two matched pairs: {outcomes:?}");
         let outcome_of = |path: &str| {
             outcomes
@@ -9165,7 +9285,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let returns_y = producer("{ y: number }");
 
         // Control: no retype. Neither pair is established, which is the miss.
-        let control = by_line(&run_check(&sidecar, &returns_y, &LocalConsumers::new()));
+        let control = by_line(&run_check(
+            &sidecar,
+            &returns_y,
+            &LocalConsumers::new(),
+            None,
+        ));
         assert_eq!(control.len(), 2, "{control:#?}");
         for (line, outcome) in &control {
             assert!(
@@ -9192,7 +9317,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             .wait_ready(crate::services::type_sidecar::ready_budget())
             .expect("re-init");
 
-        let flagged = by_line(&run_check(&sidecar, &returns_y, &local));
+        let flagged = by_line(&run_check(&sidecar, &returns_y, &local, None));
         for line in [6, 11] {
             let outcome = &flagged[&line];
             assert_eq!(outcome.bucket, VerdictBucket::Incompatible, "{outcome:#?}");
@@ -9216,7 +9341,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         // retype still reads it.
         let mut no_surface = returns_y.clone();
         no_surface[1].capture_stub = None;
-        let degraded = by_line(&run_check(&sidecar, &no_surface, &local));
+        let degraded = by_line(&run_check(&sidecar, &no_surface, &local, None));
         for line in [6, 11] {
             assert_eq!(
                 degraded[&line].bucket,
@@ -9227,7 +9352,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         }
 
         let returns_x = producer("{ x: number }");
-        let agreed = by_line(&run_check(&sidecar, &returns_x, &local));
+        let agreed = by_line(&run_check(&sidecar, &returns_x, &local, None));
         for line in [6, 11] {
             let outcome = &agreed[&line];
             assert_eq!(outcome.bucket, VerdictBucket::Compatible, "{outcome:#?}");
@@ -9431,7 +9556,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             },
         )]);
 
-        let outcomes = run_check(&sidecar, &[api.clone(), web.clone()], &local);
+        let outcomes = run_check(&sidecar, &[api.clone(), web.clone()], &local, None);
         assert_eq!(outcomes.len(), 1, "{outcomes:#?}");
         let outcome = &outcomes[0];
         assert_eq!(outcome.bucket, VerdictBucket::ProducerWider, "{outcome:#?}");
@@ -9450,7 +9575,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         // Control: the same pair with no reading published is a mismatch.
         let mut widened_only = api.clone();
         widened_only.type_manifest.as_mut().unwrap()[0].unwidened_definition = None;
-        let control = run_check(&sidecar, &[widened_only, web], &local);
+        let control = run_check(&sidecar, &[widened_only, web], &local, None);
         assert_eq!(
             control[0].bucket,
             VerdictBucket::Incompatible,
@@ -9629,13 +9754,18 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let returns_y = producer("{ y: number }");
 
         // Control: no retype. The body read is `any`, so nothing is compared.
-        let control = only(run_check(&sidecar, &returns_y, &LocalConsumers::new()));
+        let control = only(run_check(
+            &sidecar,
+            &returns_y,
+            &LocalConsumers::new(),
+            None,
+        ));
         assert!(
             !control.resolved && control.bucket != VerdictBucket::Incompatible,
             "unverified without the retype: {control:#?}"
         );
 
-        let flagged = only(run_check(&sidecar, &returns_y, &local));
+        let flagged = only(run_check(&sidecar, &returns_y, &local, None));
         assert_eq!(flagged.bucket, VerdictBucket::Incompatible, "{flagged:#?}");
         assert!(flagged.resolved, "{flagged:#?}");
         assert_eq!(flagged.gate.as_deref(), Some("retype:consumer"));
@@ -9646,7 +9776,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             "the read of the missing field is named at its line: {diagnostic}"
         );
 
-        let agreed = only(run_check(&sidecar, &producer("{ x: number }"), &local));
+        let agreed = only(run_check(
+            &sidecar,
+            &producer("{ x: number }"),
+            &local,
+            None,
+        ));
         assert_eq!(agreed.bucket, VerdictBucket::Compatible, "{agreed:#?}");
         assert!(agreed.resolved, "{agreed:#?}");
         assert_eq!(agreed.diagnostic, None);
@@ -9813,7 +9948,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             outcomes.into_iter().next().unwrap()
         };
 
-        let text = only(run_check(&sidecar, &[api.clone(), web(&inferred)], &local));
+        let text = only(run_check(
+            &sidecar,
+            &[api.clone(), web(&inferred)],
+            &local,
+            None,
+        ));
         assert_eq!(text.bucket, VerdictBucket::Unverifiable, "{text:#?}");
         assert_eq!(text.gate.as_deref(), Some("consumer:text"), "{text:#?}");
         assert!(!text.resolved, "{text:#?}");
@@ -9822,7 +9962,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         // false incompatible the ticket reports.
         let mut unmarked = inferred.clone();
         unmarked[0].raw_text_read = false;
-        let control = only(run_check(&sidecar, &[api, web(&unmarked)], &local));
+        let control = only(run_check(&sidecar, &[api, web(&unmarked)], &local, None));
         assert_eq!(control.bucket, VerdictBucket::Incompatible, "{control:#?}");
     }
 
@@ -10138,7 +10278,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             repo("api", None, api_manifest, Some(api_artifact)),
             repo("web", None, web_manifest, Some(web_artifact)),
         ];
-        let outcomes = run_check(&web_sidecar, &repos, &local);
+        let outcomes = run_check(&web_sidecar, &repos, &local, None);
         let at = |line: u32| -> &PairCheckOutcome {
             outcomes
                 .iter()
@@ -10552,6 +10692,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 consumer_repo_data.clone(),
             ],
             &LocalConsumers::new(),
+            None,
         );
         assert_eq!(outcomes.len(), 1, "exactly one matched pair");
         assert_eq!(
@@ -10575,6 +10716,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 consumer_repo_data,
             ],
             &LocalConsumers::new(),
+            None,
         );
         assert_eq!(control_outcomes.len(), 1);
         assert_eq!(
@@ -10737,6 +10879,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 ),
             ],
             &LocalConsumers::new(),
+            None,
         );
         assert_eq!(outcomes.len(), 1, "exactly one matched pair");
         assert_eq!(
@@ -10850,7 +10993,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             repo("web", None, calls, None),
         ];
         let scanned = |sidecar: &TypeSidecar| {
-            let outcomes = run_check(sidecar, &all_repo_data, &local);
+            let outcomes = run_check(sidecar, &all_repo_data, &local, None);
             let mut boundaries = vec![(
                 "web".to_string(),
                 crate::boundary::ServiceBoundary::default(),
@@ -10874,5 +11017,512 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
 
         let finished = stand_in("finished.cjs", "outcome: 'agrees'");
         assert_eq!(scanned(&finished), (Vec::new(), serde_json::json!({})));
+    }
+
+    // ---- settling from main's stored outcomes (carrick#3104) ---------------
+
+    /// `api` publishes `POST /p` and `web` calls it on lines 8 and 9, each
+    /// call its own pair: `web/C8` and `web/C9`.
+    fn settle_repos() -> Vec<CloudRepoData> {
+        let key = OperationKey::http("POST", "/p");
+        let mut producer = entry(
+            key.clone(),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            "P",
+            "src/routes.ts",
+            3,
+            ManifestTypeState::Explicit,
+        );
+        producer.expanded_definition = Some("{ id: string; }".to_string());
+        let consumer = |alias: &str, line: u32| {
+            entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                alias,
+                "src/client.ts",
+                line,
+                ManifestTypeState::Unknown,
+            )
+        };
+        let mut repos = vec![
+            repo("mono", Some("api"), vec![producer], Some(fake_artifact())),
+            repo(
+                "mono",
+                Some("web"),
+                vec![consumer("C8", 8), consumer("C9", 9)],
+                Some(fake_artifact()),
+            ),
+        ];
+        for blob in &mut repos {
+            blob.cache_version = Some(crate::engine::CACHE_VERSION);
+            blob.scanner_build = crate::cloud_storage::ScannerBuild::current();
+        }
+        repos
+    }
+
+    /// Both calls of [`settle_repos`] as the retype finds them.
+    fn settle_consumers(root: &Path) -> LocalConsumers {
+        let call = |line: u32| CallLocator {
+            file_path: root.join("src/client.ts").to_string_lossy().into_owned(),
+            line_number: line,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("api.post('/p')".to_string()),
+            expression_line: Some(line),
+        };
+        LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: root.to_path_buf(),
+                tsconfig: None,
+                calls: HashMap::from([("C8".to_string(), call(8)), ("C9".to_string(), call(9))]),
+            },
+        )])
+    }
+
+    /// A stand-in sidecar that writes each pair key the check and the retype
+    /// are asked about to `log`, one `check <key>` or `retype <key>` line
+    /// each. The check leaves every pair to the consumer, and the retype
+    /// finds every call agrees.
+    fn recording_sidecar(root: &Path, log: &Path) -> TypeSidecar {
+        recording_sidecar_with(root, log, true, None)
+    }
+
+    /// [`recording_sidecar`] whose check run reports `success` and stamps
+    /// every verdict with `gate`.
+    fn recording_sidecar_with(
+        root: &Path,
+        log: &Path,
+        success: bool,
+        gate: Option<&str>,
+    ) -> TypeSidecar {
+        let gate = serde_json::to_string(&gate).unwrap();
+        let script = root.join("recording-sidecar.cjs");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+const fs = require('fs');
+const log = {log:?};
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  if (request.action === 'check_v2') {{
+    for (const pair of request.pairs) fs.appendFileSync(log, 'check ' + pair.pair_key + '\n');
+    return write({{ request_id, status: 'success', result: {{
+      success: {success}, isolation: 'pnpm', install_ok: {success}, ts_version: '5.9.0',
+      verdicts: request.pairs.map((pair) => ({{
+        pair_id: pair.pair_key, pair_key: pair.pair_key, bucket: 'unverifiable', gate: {gate},
+        resolved: false, unresolved_reason: "the consumer type is 'unknown'",
+        unresolved_side: 'consumer' }})) }} }});
+  }}
+  if (request.action === 'add_program_files') return write({{ request_id, status: 'success', added: request.files.length }});
+  if (request.action === 'retype_check') {{
+    for (const item of request.items) fs.appendFileSync(log, 'retype ' + item.item_id + '\n');
+    return write({{ request_id, status: 'success',
+      outcomes: request.items.map((item) => ({{ item_id: item.item_id, outcome: 'agrees', diagnostics: [] }})) }});
+  }}
+  write({{ request_id, status: 'error', errors: ['unexpected ' + request.action] }});
+}});
+"#
+            ),
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        sidecar.start_init(root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        sidecar
+    }
+
+    fn asked(log: &Path) -> Vec<String> {
+        let mut lines: Vec<String> = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.to_string())
+            .collect();
+        lines.sort();
+        let _ = std::fs::remove_file(log);
+        lines
+    }
+
+    /// Main's blobs of [`settle_repos`] with the outcomes of `outcomes` stored
+    /// as a main scan stores them.
+    fn main_blobs(outcomes: &[PairCheckOutcome]) -> Vec<CloudRepoData> {
+        let mut blobs = settle_repos();
+        crate::cloud_storage::attach_pair_outcomes(
+            &mut blobs,
+            outcomes,
+            "test",
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+        );
+        blobs
+    }
+
+    fn settle_from(
+        blobs: &[CloudRepoData],
+        carried: &[&str],
+        reach: HashMap<String, super::super::type_reach::ReachDecision>,
+    ) -> super::super::pair_settle::SettleFrom {
+        super::super::pair_settle::SettleFrom::new(
+            blobs,
+            carried.iter().map(|id| id.to_string()),
+            reach,
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+            crate::engine::CACHE_VERSION,
+        )
+    }
+
+    fn web_partial(unreached: &[&str]) -> HashMap<String, super::super::type_reach::ReachDecision> {
+        let all = ["C8", "C9"];
+        HashMap::from([(
+            "web".to_string(),
+            super::super::type_reach::ReachDecision::Partial {
+                reached: all
+                    .iter()
+                    .filter(|alias| !unreached.contains(alias))
+                    .map(|alias| alias.to_string())
+                    .collect(),
+                unreached: unreached.iter().map(|alias| alias.to_string()).collect(),
+            },
+        )])
+    }
+
+    /// carrick#3104 end to end through a stand-in sidecar: the pair whose two
+    /// sides no change reaches takes main's stored outcome and is never sent
+    /// to the check or the retype; the pair whose call the change reaches is
+    /// judged and retyped as before, and both come out as the unsettled run's.
+    #[test]
+    fn a_settled_pair_is_neither_judged_nor_retyped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let log = root.join("asked.log");
+        let sidecar = recording_sidecar(&root, &log);
+        let local = settle_consumers(&root);
+        let repos = settle_repos();
+
+        let main = run_check(&sidecar, &repos, &local, None);
+        assert_eq!(main.len(), 2, "{main:#?}");
+        assert!(
+            main.iter()
+                .all(|o| o.judged && o.bucket == VerdictBucket::Compatible)
+        );
+        assert_eq!(
+            asked(&log),
+            [
+                "check api/P~web/C8",
+                "check api/P~web/C9",
+                "retype api/P~web/C8",
+                "retype api/P~web/C9"
+            ]
+        );
+        let blobs = main_blobs(&main);
+        let record = blobs[1]
+            .pair_outcomes
+            .as_ref()
+            .expect("web stores its outcomes");
+        assert_eq!(record.outcomes.len(), 2);
+        assert!(blobs[0].pair_outcomes.is_none(), "api consumes nothing");
+
+        // `api` carried, `web` analysed with the call on line 9 reached.
+        let settle = settle_from(&blobs, &["api"], web_partial(&["C8"]));
+        let pr = run_check(&sidecar, &repos, &local, Some(&settle));
+        assert_eq!(
+            asked(&log),
+            ["check api/P~web/C9", "retype api/P~web/C9"],
+            "only the reached pair is judged and retyped"
+        );
+        assert_eq!(format!("{pr:?}"), format!("{main:?}"));
+
+        // Both services carried: nothing is asked at all.
+        let settle = settle_from(&blobs, &["api", "web"], HashMap::new());
+        let pr = run_check(&sidecar, &repos, &local, Some(&settle));
+        assert_eq!(asked(&log), Vec::<String>::new(), "every pair settles");
+        assert_eq!(format!("{pr:?}"), format!("{main:?}"));
+    }
+
+    /// carrick#3104: what keeps a pair from settling. Each is judged.
+    #[test]
+    fn a_pair_settles_only_on_mains_own_judged_outcome_for_the_same_spec() {
+        let pairs = build_check_pairs(&settle_repos());
+        let c8 = pairs
+            .iter()
+            .find(|pair| pair.consumer_alias == "C8")
+            .unwrap();
+        let outcome = |judged: bool| PairCheckOutcome {
+            judged,
+            ..outcome_for(
+                c8,
+                VerdictBucket::Compatible,
+                None,
+                None,
+                true,
+                None,
+                Vec::new(),
+            )
+        };
+        let settles = |blobs: &[CloudRepoData], carried: &[&str], reach| {
+            settle_from(blobs, carried, reach).settled(c8).is_some()
+        };
+        let both = ["api", "web"];
+
+        let blobs = main_blobs(&[outcome(true)]);
+        assert!(
+            settles(&blobs, &both, HashMap::new()),
+            "two carried services"
+        );
+        assert!(
+            settles(&blobs, &["api"], web_partial(&["C8"])),
+            "unreached alias"
+        );
+        assert!(
+            !settles(&blobs, &["api"], web_partial(&["C9"])),
+            "the call is reached"
+        );
+        assert!(
+            !settles(&blobs, &["web"], HashMap::new()),
+            "api has no decision"
+        );
+        // A service that kept main's types (carrick#3103) has main's rows,
+        // whose aliases need not be the ones its decision named: it settles
+        // as a carried service does.
+        let kept = HashMap::from([(
+            "web".to_string(),
+            super::super::type_reach::ReachDecision::Partial {
+                reached: Default::default(),
+                unreached: ["C8 as this run spelled it".to_string()].into(),
+            },
+        )]);
+        assert!(settles(&blobs, &["api"], kept), "web kept main's types");
+        assert!(
+            !settles(&main_blobs(&[outcome(false)]), &both, HashMap::new()),
+            "an outcome the run caused"
+        );
+
+        let mut moved = outcome(true);
+        moved.spec_hash = super::super::pair_settle::spec_hash(&retype_pair(
+            ManifestTypeKind::Response,
+            Some("{ id: number; }"),
+        ));
+        assert!(
+            !settles(&main_blobs(&[moved]), &both, HashMap::new()),
+            "spec_hash"
+        );
+
+        let mut other_commit = main_blobs(&[outcome(true)]);
+        other_commit[0].commit_hash = "older".to_string();
+        assert!(
+            !settles(&other_commit, &both, HashMap::new()),
+            "sides at two commits"
+        );
+
+        let mut restamped = main_blobs(&[outcome(true)]);
+        for blob in &mut restamped {
+            blob.commit_hash = "newer".to_string();
+        }
+        assert!(
+            !settles(&restamped, &both, HashMap::new()),
+            "record of another commit"
+        );
+
+        let mut other_build = main_blobs(&[outcome(true)]);
+        other_build[1].pair_outcomes.as_mut().unwrap().scanner_build =
+            Some(crate::cloud_storage::ScannerBuild {
+                commit: "another".to_string(),
+                dirty: false,
+            });
+        assert!(
+            !settles(&other_build, &both, HashMap::new()),
+            "record of another build"
+        );
+
+        let mut old_format = main_blobs(&[outcome(true)]);
+        old_format[1].cache_version = Some(0);
+        assert!(
+            !settles(&old_format, &both, HashMap::new()),
+            "blob of another format"
+        );
+
+        let mut dirty = main_blobs(&[outcome(true)]);
+        dirty[0].dirty = Some(true);
+        assert!(
+            !settles(&dirty, &both, HashMap::new()),
+            "blob of a dirty tree"
+        );
+
+        let mut twice = main_blobs(&[outcome(true)]);
+        let record = twice[1].pair_outcomes.as_mut().unwrap();
+        record.outcomes.push(record.outcomes[0].clone());
+        assert!(
+            !settles(&twice, &both, HashMap::new()),
+            "a key stored twice"
+        );
+    }
+
+    /// carrick#3104: a consumer stores the outcomes of pairs with a producer
+    /// written in the same run, and a stored clone's record never survives a
+    /// run that has none for it.
+    #[test]
+    fn a_main_scan_stores_same_run_pairs_and_replaces_every_record() {
+        let pairs = build_check_pairs(&settle_repos());
+        let outcomes: Vec<PairCheckOutcome> = pairs
+            .iter()
+            .map(|pair| {
+                outcome_for(
+                    pair,
+                    VerdictBucket::Compatible,
+                    None,
+                    None,
+                    true,
+                    None,
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let blobs = main_blobs(&outcomes);
+        let record = blobs[1].pair_outcomes.clone().expect("web's record");
+        assert_eq!(
+            record
+                .outcomes
+                .iter()
+                .map(|row| row.pair_key.as_str())
+                .collect::<Vec<_>>(),
+            ["api/P~web/C8", "api/P~web/C9"]
+        );
+        assert_eq!(record.commit, "test");
+        assert_eq!(record.outcomes[0].spec_hash, outcomes[0].spec_hash);
+        assert_eq!(record.outcomes[0].spec_hash.len(), 64);
+
+        // `api` written by another repo's run: no pair of web's is stored.
+        let mut web_alone = vec![blobs[1].clone()];
+        crate::cloud_storage::attach_pair_outcomes(&mut web_alone, &outcomes, "next", None);
+        assert_eq!(web_alone[0].pair_outcomes, None);
+    }
+
+    /// carrick#3104: an outcome from how the run went is marked so; one
+    /// from the types is not.
+    #[test]
+    fn outcomes_the_run_caused_are_not_judged() {
+        let mut outcome = outcome_for(
+            &retype_pair(ManifestTypeKind::Response, Some("{ id: string; }")),
+            VerdictBucket::Unverifiable,
+            None,
+            None,
+            false,
+            Some("the consumer type is 'unknown'".to_string()),
+            Vec::new(),
+        );
+        assert!(outcome.judged);
+        let item = RetypeItem {
+            item_id: outcome.pair_key.clone(),
+            file_path: "/repo/web/src/client.ts".to_string(),
+            line_number: 8,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            producer_type: "{ id: string; }".to_string(),
+            producer_unwidened_type: None,
+            wire: true,
+        };
+        let mut decided = outcome.clone();
+        apply_retype(
+            &mut decided,
+            &RetypeOutcome {
+                item_id: item.item_id.clone(),
+                outcome: RetypeVerdict::Abstain,
+                diagnostics: Vec::new(),
+                reason: Some("the consumer never reads the response".to_string()),
+                run_failed: false,
+            },
+        );
+        assert!(decided.judged, "the call decided it");
+        apply_retype(&mut outcome, &abstained(&[item], RETYPE_UNSENT)[0]);
+        assert!(!outcome.judged, "no process was left to judge it");
+    }
+
+    /// carrick#3104: main's check returned `success`, every verdict stamped
+    /// `gate`; each stored outcome is `judged: false`, and a pull request
+    /// run with both services carried judges the pairs again rather than
+    /// settling them.
+    fn a_run_caused_check_is_judged_again(success: bool, gate: Option<&str>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let log = root.join("asked.log");
+        let sidecar = recording_sidecar_with(&root, &log, success, gate);
+        let local = settle_consumers(&root);
+        let repos = settle_repos();
+
+        let main = run_check(&sidecar, &repos, &local, None);
+        assert_eq!(main.len(), 2, "{main:#?}");
+        assert!(
+            main.iter().all(|o| !o.judged),
+            "a verdict the run caused is not judged: {main:#?}"
+        );
+        let blobs = main_blobs(&main);
+        let record = blobs[1].pair_outcomes.as_ref().expect("web's record");
+        assert!(record.outcomes.iter().all(|row| !row.judged));
+        let _ = asked(&log);
+
+        let settle = settle_from(&blobs, &["api", "web"], HashMap::new());
+        let _pr = run_check(&sidecar, &repos, &local, Some(&settle));
+        let pr_asked = asked(&log);
+        assert!(
+            pr_asked.contains(&"check api/P~web/C8".to_string())
+                && pr_asked.contains(&"check api/P~web/C9".to_string()),
+            "both pairs are judged again: {pr_asked:?}"
+        );
+    }
+
+    /// carrick#3104: a check run that failed (its compiler ended abnormally,
+    /// say) says how the run went, whatever gate a verdict carries.
+    #[test]
+    fn a_failed_check_run_stores_no_judged_outcome() {
+        a_run_caused_check_is_judged_again(false, None);
+    }
+
+    /// carrick#3104: an install the registry could not serve says how the
+    /// run went, not what the types are, even on a run that reports success.
+    #[test]
+    fn an_install_gate_stores_no_judged_outcome() {
+        a_run_caused_check_is_judged_again(true, Some("install:registry-unreachable"));
+    }
+
+    /// carrick#3104: the gates from the two types settle; the run's do not.
+    #[test]
+    fn only_the_runs_gates_are_run_caused() {
+        for gate in [
+            "install:timeout",
+            "install:registry-unreachable",
+            "install:failed",
+            "isolation:unavailable",
+            "tsc:abnormal-termination",
+            "missing:stub",
+        ] {
+            assert!(run_caused(true, Some(gate)), "{gate}");
+        }
+        for gate in [
+            "capture:consumer:unknown",
+            "capture:producer:any",
+            "consumer:any",
+            "producer:unknown",
+            "poison:producer",
+            "import:consumer",
+            "assignment:other",
+            "producer:mode",
+            "same_service",
+            "retype:consumer",
+            "producer:unwidened_out_of_budget",
+        ] {
+            assert!(!run_caused(true, Some(gate)), "{gate}");
+        }
+        assert!(!run_caused(true, None));
+        assert!(run_caused(false, Some("capture:consumer:unknown")));
     }
 }

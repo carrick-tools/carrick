@@ -3366,6 +3366,7 @@ mod tests {
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }
     }
 

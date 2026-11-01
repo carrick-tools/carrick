@@ -2525,6 +2525,7 @@ impl CloudStorage for AwsStorage {
                     route_boundaries: None,
                     memory_peaks: None,
                     type_reach: None,
+                    pair_outcomes: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);

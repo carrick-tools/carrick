@@ -193,6 +193,7 @@ interface Outcome {
   outcome: 'mismatch' | 'agrees' | 'abstain';
   diagnostics: Array<{ line: number; code: number; message: string }>;
   reason?: string;
+  run_failed?: boolean;
 }
 
 describe('carrick#1491: retype an untyped consumer call with the producer response', () => {
@@ -418,6 +419,14 @@ describe('carrick#1491: retype an untyped consumer call with the producer respon
     assert.strictEqual(res.status, 'success');
     assert.strictEqual(res.outcomes?.[0]?.outcome, 'abstain');
     assert.match(res.outcomes?.[0]?.reason ?? '', /ran out of its 0ms budget/);
+    // carrick#3104: the run cut it off, so the next run judges it again.
+    assert.strictEqual(res.outcomes?.[0]?.run_failed, true);
+  });
+
+  it('marks no abstention the call itself decided as one the run caused', async () => {
+    const out = await retype('untyped', '{ x: ProducerOnlyName; }');
+    assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+    assert.strictEqual(out.run_failed, undefined, JSON.stringify(out));
   });
 
   it('leaves the program as it found it', async () => {

@@ -745,6 +745,10 @@ pub struct RetypeOutcome {
     pub diagnostics: Vec<RetypeDiagnostic>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// The item abstained because of how the run went (a time budget, a
+    /// request that failed), not because of the call (carrick#3104).
+    #[serde(default)]
+    pub run_failed: bool,
 }
 
 /// One library-semantics claim to check against the package's own type

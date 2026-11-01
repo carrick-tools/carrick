@@ -757,6 +757,7 @@ mod tests {
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }
     }
 
@@ -1508,6 +1509,8 @@ mod tests {
             unresolved_reason: reason.map(str::to_string),
             notes: Vec::new(),
             consumer_reads: Vec::new(),
+            spec_hash: String::new(),
+            judged: true,
         }
     }
 

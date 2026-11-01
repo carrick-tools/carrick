@@ -31,6 +31,11 @@ mod tee_storage;
 pub(crate) use local_dir_storage::blob_stem;
 pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage, PEERS_ENV};
 pub use tee_storage::{LAPTOP_SCAN_ENV, TeeStorage, laptop_scan_requested};
+mod pair_outcomes;
+pub use pair_outcomes::{
+    PAIR_OUTCOMES_CAP_BYTES, PAIR_OUTCOMES_VERSION, StoredPairOutcome, StoredPairOutcomes,
+    attach_pair_outcomes,
+};
 mod type_reach;
 pub use type_reach::{
     TYPE_REACH_CAP_BYTES, TYPE_REACH_RECORD_VERSION, TypeReachObject, TypeReachRecord,
@@ -930,6 +935,19 @@ pub struct CloudRepoData {
     /// a blob without it makes a PR scan re-type the service whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_reach: Option<TypeReachRef>,
+    /// The service's final pair outcomes as a consumer, written by a main
+    /// scan (carrick#3104): a pull request scan takes main's outcome for a
+    /// pair its change cannot reach. Set from the run on every payload a
+    /// main scan writes, carried ones included; never on a PR run's.
+    ///
+    /// Read leniently: a record this build cannot read is no record, and
+    /// settles nothing. Not part of `CACHE_VERSION`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "pair_outcomes::lenient_pair_outcomes"
+    )]
+    pub pair_outcomes: Option<StoredPairOutcomes>,
 }
 
 /// The measured memory peaks of one service's analysis (carrick#3083), in MB.
@@ -1145,6 +1163,7 @@ impl CloudRepoData {
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }
     }
 }
@@ -2813,6 +2832,7 @@ mod tests {
             route_boundaries: None,
             memory_peaks: None,
             type_reach: None,
+            pair_outcomes: None,
         }
     }
 
@@ -2916,6 +2936,8 @@ mod tests {
             // thing under test; every other fixture states none.
             notes: Vec::new(),
             consumer_reads: Vec::new(),
+            spec_hash: String::new(),
+            judged: true,
         }
     }
 
