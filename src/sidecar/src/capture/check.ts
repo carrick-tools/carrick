@@ -260,13 +260,7 @@ export function childHeap(
   existing: string | undefined,
   rssMb: number
 ): ChildHeap {
-  let cap: number | undefined;
-  for (let i = 0; i < execArgv.length; i++) {
-    const match = /^--max[-_]old[-_]space[-_]size(?:=(.*))?$/.exec(execArgv[i]);
-    if (!match) continue;
-    const value = match[1] ?? execArgv[i + 1];
-    if (value !== undefined && /^\d+$/.test(value)) cap = Number(value);
-  }
+  const cap = heapCapOf(execArgv);
   const budget = cap === undefined ? 0 : Math.floor(cap - rssMb);
   if (budget <= V8_DEFAULT_HEAP_CEILING_MB) return { nodeOptions: existing, heapCapMb: null };
   const flag = `--max-old-space-size=${budget}`;
@@ -274,6 +268,37 @@ export function childHeap(
     nodeOptions: existing && existing.trim() ? `${existing} ${flag}` : flag,
     heapCapMb: budget,
   };
+}
+
+/** The heap cap the scanner started this process with
+ * (`--max-old-space-size`), in MB, or `undefined` when it gave none. */
+export function heapCapOf(execArgv: readonly string[]): number | undefined {
+  let cap: number | undefined;
+  for (let i = 0; i < execArgv.length; i++) {
+    const match = /^--max[-_]old[-_]space[-_]size(?:=(.*))?$/.exec(execArgv[i]);
+    if (!match) continue;
+    const value = match[1] ?? execArgv[i + 1];
+    if (value !== undefined && /^\d+$/.test(value)) cap = Number(value);
+  }
+  return cap;
+}
+
+/** The least memory limit handed to a native compiler, in MiB: below it the
+ * Go collector would run without pause for no gain. */
+export const NATIVE_MEMORY_FLOOR_MB = 512;
+
+/**
+ * The Go memory limit (`GOMEMLIMIT`) for a native compiler the capture starts
+ * (carrick#3133): what is left of this process's heap cap after what it holds
+ * now, so that the sidecar and its compiler together stay inside the cap the
+ * scanner reserved memory for (carrick#3084). `undefined` when the process
+ * has no cap. The limit is soft: the Go runtime collects harder as it nears
+ * the limit, and does not fail at it.
+ */
+export function nativeMemoryLimit(execArgv: readonly string[], rssMb: number): string | undefined {
+  const cap = heapCapOf(execArgv);
+  if (cap === undefined) return undefined;
+  return `${Math.max(NATIVE_MEMORY_FLOOR_MB, Math.floor(cap - rssMb))}MiB`;
 }
 
 /** Resolve the sidecar root (where the vendored pnpm/tsc live) from this bundle. */
@@ -345,11 +370,25 @@ export function judgeTscPath(
   platform: string = process.platform,
   arch: string = process.arch
 ): string {
+  return nativeTscPath(from, platform, arch) ?? resolveVendored(path.join('typescript', 'bin', 'tsc'), from);
+}
+
+/**
+ * TypeScript 7's native tsc for this host (`@typescript/typescript-<platform>-
+ * <arch>/lib/tsc`, found by the same walk as the bins), or `undefined` where
+ * that optional package is not installed. The judge falls back to TypeScript
+ * 6's tsc; the capture's emit and self-check fall back to their in-process
+ * TypeScript 6 path (carrick#3133).
+ */
+export function nativeTscPath(
+  from: string = sidecarRoot(),
+  platform: string = process.platform,
+  arch: string = process.arch
+): string | undefined {
   const exe = platform === 'win32' ? 'tsc.exe' : 'tsc';
   const native = path.join('@typescript', `typescript-${platform}-${arch}`, 'lib', exe);
   const found = resolveVendored(native, from);
-  if (fs.existsSync(found)) return found;
-  return resolveVendored(path.join('typescript', 'bin', 'tsc'), from);
+  return fs.existsSync(found) ? found : undefined;
 }
 
 /** Which compiler a tsc path is, in words, for the run log and the result. */
@@ -367,7 +406,7 @@ export function judgeLabel(tscPath: string): string {
 
 /** The version of the compiler a tsc path belongs to, read from the package
  * that holds it; the compiler-API version for a stand-in with no package. */
-function compilerVersion(tscPath: string): string {
+export function compilerVersion(tscPath: string): string {
   try {
     const manifest = JSON.parse(
       fs.readFileSync(path.join(path.dirname(tscPath), '..', 'package.json'), 'utf8')

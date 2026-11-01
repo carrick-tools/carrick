@@ -616,6 +616,26 @@ guards came with the switch:
   `fatal error: runtime: out of memory`. That counts as a heap death, beside
   V8's line.
 
+**Two capture steps run on TypeScript 7 (carrick#3133).** The capture's
+declaration emit and the self-check's diagnostics ask the compiler no
+question, so they run on the same native executable; the anchors and the
+self-check's deep walk stay on TypeScript 6. Each step writes its options as a
+tsconfig and falls back to TypeScript 6, unchanged, wherever the native answer
+could differ or the run could write outside its scratch: the executable is not
+installed, the options carry a value TypeScript 7 removed (`target: ES5`,
+`moduleResolution: node10`, `esModuleInterop: false`, `baseUrl`, all common
+through the TypeScript 5 option fill), a program file lies outside the read
+bound of an untrusted tree, a source lies outside the emit's `rootDir`, the
+emit is partial, or a Deno graph or a package installed at another path needs
+a compiler host. The self-check's options moved to `target: ES2015` with the
+library set ES5 loaded by default, named, so both compilers read the same
+files. Where the emit runs on TypeScript 7, it may print some string literals
+in the declarations with other quotes than TypeScript 6 (the probe: 31 of 389
+files), so those stub texts change once on the release that ships this.
+The native compiler runs as a second process with `GOMEMLIMIT` set to what is
+left of the sidecar's heap cap, so the two stay inside the memory the scanner
+reserved for the service.
+
 ## Future hook: wire-truth vs type-truth
 
 TS assignability is a proxy for what Carrick actually claims: **wire

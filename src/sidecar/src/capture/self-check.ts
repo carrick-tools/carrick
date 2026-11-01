@@ -46,6 +46,15 @@ import {
   packageNameOf,
 } from './specifiers.js';
 import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
+import { realOf } from './checkout.js';
+import {
+  nativeLabel,
+  runNativeTsc,
+  tsconfigCompilerOptions,
+  tsconfigText,
+  typescript6Steps,
+  type NativeCompiler,
+} from './native-tsc.js';
 import type { WriteGuard } from './guarded-fs.js';
 import {
   findDisqualifyingTopTypes,
@@ -68,6 +77,15 @@ export interface SelfCheckArgs {
   /** Producer repo root; its node_modules (if any) backs resolution. */
   repoRoot: string;
   compilerHost?: (options: ts.CompilerOptions) => ts.CompilerHost;
+  /**
+   * TypeScript 7's native tsc, when the diagnostics may come from it
+   * (carrick#3133). The caller leaves it unset where a compiler host changes
+   * resolution in a way a command line cannot (a Deno graph, packages
+   * installed at other paths); the bound alone is checked here.
+   */
+  native?: NativeCompiler;
+  /** Names the service in the run log. */
+  label?: string;
 }
 
 interface FileFailures {
@@ -155,16 +173,105 @@ export const SELF_CHECK_OPTIONS: Readonly<ts.CompilerOptions> = sidecarCompilerO
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,
   types: [],
+  // Every option is stated in a form TypeScript 7 accepts, so that the native
+  // compiler can read the same set (carrick#3133): it removed `target: ES5`
+  // and `esModuleInterop: false`. The library set is the one ES5 loaded by
+  // default, named, so the move to ES2015 loads no other library file.
+  target: ts.ScriptTarget.ES2015,
+  lib: ['lib.es5.d.ts', 'lib.dom.d.ts', 'lib.webworker.importscripts.d.ts', 'lib.scripthost.d.ts'],
+  esModuleInterop: true,
 });
+
+/** The self-check's tsconfig file in the stub, written for the native
+ * compiler and removed after it ran. */
+const SELF_CHECK_TSCONFIG = 'tsconfig.self-check.json';
+
+/** One diagnostic the self-check reads, from either compiler. */
+interface SelfCheckDiagnostic {
+  /** Absolute file. */
+  file: string;
+  /** Character offset in the file; read only on the surface. */
+  start: number | undefined;
+  code: number;
+  message: string;
+}
+
+/**
+ * The stub's diagnostics from TypeScript 7's native tsc (carrick#3133), as
+ * positions in `program`'s files, or `undefined` when the native compiler is
+ * not to be used or its answer cannot be (logged with the reason).
+ */
+function nativeDiagnostics(args: SelfCheckArgs, treeFiles: string[]): NativeDiagnostics | undefined {
+  const compiler = args.native;
+  if (!compiler) return undefined;
+  const label = args.label ?? path.basename(args.stubDir);
+  const { compilerOptions, unconverted } = tsconfigCompilerOptions(SELF_CHECK_OPTIONS);
+  if (unconverted.length > 0) {
+    console.error(`[sidecar] capture ${label}: self-check on TypeScript ${ts.version}: options ${unconverted.join(', ')} have no tsconfig form`);
+    return undefined;
+  }
+  const configPath = path.join(args.stubDir, SELF_CHECK_TSCONFIG);
+  args.guard.writeFile(configPath, tsconfigText(compilerOptions, treeFiles));
+  let run: ReturnType<typeof runNativeTsc>;
+  try {
+    run = runNativeTsc(compiler, configPath, args.stubDir, ['--listFiles']);
+  } finally {
+    args.guard.unlink(configPath);
+  }
+  const surfaceReal = realOf(args.surfaceAbsPath);
+  if (run.ok && !run.files.some((file) => realOf(file) === surfaceReal)) {
+    run = { ok: false, reason: 'the native program did not read the surface' };
+  }
+  if (!run.ok) {
+    console.error(`[sidecar] capture ${label}: self-check on TypeScript ${ts.version}: ${run.reason}`);
+    return undefined;
+  }
+  console.error(`[sidecar] capture ${label}: self-check diagnostics on ${nativeLabel(compiler)}`);
+  return run.diagnostics;
+}
+
+type NativeDiagnostics = Extract<ReturnType<typeof runNativeTsc>, { ok: true }>['diagnostics'];
+
+/** TypeScript 6's diagnostics of `program`, in the shape the self-check reads. */
+function programDiagnostics(program: ts.Program): SelfCheckDiagnostic[] {
+  const out: SelfCheckDiagnostic[] = [];
+  for (const d of typescript6Steps.preEmitDiagnostics(program)) {
+    if (!d.file) continue;
+    out.push({
+      file: path.resolve(d.file.fileName),
+      start: d.start,
+      code: d.code,
+      message: ts.flattenDiagnosticMessageText(d.messageText, ' '),
+    });
+  }
+  return out;
+}
+
+/** The native compiler's diagnostics, placed in `program`'s files: a
+ * (line, column) becomes the offset TypeScript 6 would have given. */
+function placedDiagnostics(native: NativeDiagnostics, program: ts.Program): SelfCheckDiagnostic[] {
+  return native.map((d) => {
+    const source = program.getSourceFile(d.abs);
+    let start: number | undefined;
+    if (source && d.line >= 1 && d.line <= source.getLineStarts().length) {
+      start = source.getPositionOfLineAndCharacter(d.line - 1, d.col - 1);
+    }
+    return { file: d.abs, start, code: d.code, message: d.message.split('\n').map((l) => l.trim()).join(' ') };
+  });
+}
 
 function runSelfCheck(
   args: SelfCheckArgs,
   treeFiles: string[],
   repaired?: Map<string, RepairedFile>
 ): SelfCheckPass {
+  // The native compiler runs first and ends before the TypeScript 6 program
+  // is built, so the two never hold their memory at once.
+  const native = nativeDiagnostics(args, treeFiles);
+  // The TypeScript 6 program stays: the deep walk asks its checker.
   const program = ts.createProgram(treeFiles, SELF_CHECK_OPTIONS, args.compilerHost?.(SELF_CHECK_OPTIONS));
   const checker = program.getTypeChecker();
-  const diagnostics = ts.getPreEmitDiagnostics(program);
+  const diagnostics = native ? placedDiagnostics(native, program) : programDiagnostics(program);
 
   const surfaceAbs = path.resolve(args.surfaceAbsPath);
   const surfaceSource = program.getSourceFile(surfaceAbs);
@@ -200,9 +307,8 @@ function runSelfCheck(
     return owner ? bucketIn(surfaceFailuresByAlias, owner) : bucketIn(failuresByFile, abs);
   };
   for (const d of diagnostics) {
-    if (!d.file) continue;
-    const abs = path.resolve(d.file.fileName);
-    const msg = ts.flattenDiagnosticMessageText(d.messageText, ' ');
+    const abs = d.file;
+    const msg = d.message;
     // A name the compiler cannot find is the placeholder's cause wherever a
     // type uses it; the record names it beside those positions (carrick#1446).
     const unfound = /Cannot find (?:name|namespace) '([^']+)'/.exec(msg);
@@ -302,7 +408,7 @@ function unresolvedExternalDetail(spec: string): string {
 function repairedNameFailure(
   repaired: Map<string, RepairedFile> | undefined,
   file: string,
-  diagnostic: ts.Diagnostic,
+  diagnostic: SelfCheckDiagnostic,
   message: string
 ): string | undefined {
   if (!repaired || diagnostic.code !== 2304) return undefined;

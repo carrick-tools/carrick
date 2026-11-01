@@ -464,6 +464,13 @@ export interface CaptureStubOptions {
    * reporting. It changes nothing the capture writes.
    */
   onProgress?: (phase: CapturePhase, message: string) => void;
+  /**
+   * TypeScript 7's native tsc for the declaration emit and the self-check's
+   * diagnostics (carrick#3133). Defaults to the host's native executable when
+   * its optional package is installed (`nativeTscPath`); `null` keeps both
+   * steps on TypeScript 6, as where it is not installed. Tests pin either.
+   */
+  nativeTscPath?: string | null;
 }
 
 // ===========================================================================
