@@ -2419,7 +2419,7 @@ pub(crate) fn run_check(
                             if consumer_to_blame(verdict) {
                                 consumer_blamed.insert(pair.spec.pair_key.clone());
                             }
-                            outcomes.push(outcome_for(
+                            let outcome = outcome_for(
                                 pair,
                                 verdict.bucket,
                                 verdict.gate.clone(),
@@ -2427,7 +2427,12 @@ pub(crate) fn run_check(
                                 verdict.resolved,
                                 verdict.unresolved_reason.clone(),
                                 verdict.notes.clone(),
-                            ))
+                            );
+                            outcomes.push(if run_caused(result.success, verdict.gate.as_deref()) {
+                                not_judged(outcome)
+                            } else {
+                                outcome
+                            })
                         }
                         None => outcomes.push(not_judged(outcome_for(
                             pair,
@@ -3389,6 +3394,35 @@ fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckO
             vec![NO_BODY_EITHER_SIDE_NOTE.to_string()],
         ),
     }
+}
+
+/// The check's gates that say how the run went, not what the two types are
+/// (carrick#3104): the install did not finish (`install:timeout`,
+/// `install:registry-unreachable`, `install:failed`), no isolated install was
+/// possible (`isolation:unavailable`), the compiler ended abnormally
+/// (`tsc:abnormal-termination`), or the run had no stub for a side
+/// (`missing:stub`). The next run may answer differently on the same types.
+///
+/// Every other gate comes from the two types and settles: the capture's
+/// pre-gate (`capture:<side>:<kind>`), the probe gates (`<side>:any`,
+/// `:unknown`, `:never`, `:void`, `:form`, `:bytes`, `:text`, `:envelope`,
+/// `:union`), `poison:<side>`, `import:<side>`, `assignment:other`, and the
+/// gates this module sets (`producer:mode`, `same_service`, `retype:consumer`,
+/// `producer:` and `consumer:unwidened_out_of_budget`, whose mark is stored
+/// in the blob and so read alike by every run of it).
+fn gate_from_run(gate: &str) -> bool {
+    gate.starts_with("install:")
+        || matches!(
+            gate,
+            "isolation:unavailable" | "tsc:abnormal-termination" | "missing:stub"
+        )
+}
+
+/// Whether a check verdict comes from how the run went: the check run itself
+/// failed (every verdict it returned, whatever its gate), or the verdict's
+/// gate is one [`gate_from_run`] names (carrick#3104).
+fn run_caused(check_succeeded: bool, gate: Option<&str>) -> bool {
+    !check_succeeded || gate.is_some_and(gate_from_run)
 }
 
 /// `outcome`, marked as coming from how the run went rather than from the
@@ -11053,6 +11087,18 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     /// each. The check leaves every pair to the consumer, and the retype
     /// finds every call agrees.
     fn recording_sidecar(root: &Path, log: &Path) -> TypeSidecar {
+        recording_sidecar_with(root, log, true, None)
+    }
+
+    /// [`recording_sidecar`] whose check run reports `success` and stamps
+    /// every verdict with `gate`.
+    fn recording_sidecar_with(
+        root: &Path,
+        log: &Path,
+        success: bool,
+        gate: Option<&str>,
+    ) -> TypeSidecar {
+        let gate = serde_json::to_string(&gate).unwrap();
         let script = root.join("recording-sidecar.cjs");
         std::fs::write(
             &script,
@@ -11069,9 +11115,9 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
   if (request.action === 'check_v2') {{
     for (const pair of request.pairs) fs.appendFileSync(log, 'check ' + pair.pair_key + '\n');
     return write({{ request_id, status: 'success', result: {{
-      success: true, isolation: 'pnpm', install_ok: true, ts_version: '5.9.0',
+      success: {success}, isolation: 'pnpm', install_ok: {success}, ts_version: '5.9.0',
       verdicts: request.pairs.map((pair) => ({{
-        pair_id: pair.pair_key, pair_key: pair.pair_key, bucket: 'unverifiable',
+        pair_id: pair.pair_key, pair_key: pair.pair_key, bucket: 'unverifiable', gate: {gate},
         resolved: false, unresolved_reason: "the consumer type is 'unknown'",
         unresolved_side: 'consumer' }})) }} }});
   }}
@@ -11388,5 +11434,84 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         assert!(decided.judged, "the call decided it");
         apply_retype(&mut outcome, &abstained(&[item], RETYPE_UNSENT)[0]);
         assert!(!outcome.judged, "no process was left to judge it");
+    }
+
+    /// carrick#3104: main's check returned `success`, every verdict stamped
+    /// `gate`; each stored outcome is `judged: false`, and a pull request
+    /// run with both services carried judges the pairs again rather than
+    /// settling them.
+    fn a_run_caused_check_is_judged_again(success: bool, gate: Option<&str>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let log = root.join("asked.log");
+        let sidecar = recording_sidecar_with(&root, &log, success, gate);
+        let local = settle_consumers(&root);
+        let repos = settle_repos();
+
+        let main = run_check(&sidecar, &repos, &local, None);
+        assert_eq!(main.len(), 2, "{main:#?}");
+        assert!(
+            main.iter().all(|o| !o.judged),
+            "a verdict the run caused is not judged: {main:#?}"
+        );
+        let blobs = main_blobs(&main);
+        let record = blobs[1].pair_outcomes.as_ref().expect("web's record");
+        assert!(record.outcomes.iter().all(|row| !row.judged));
+        let _ = asked(&log);
+
+        let settle = settle_from(&blobs, &["api", "web"], HashMap::new());
+        let _pr = run_check(&sidecar, &repos, &local, Some(&settle));
+        let pr_asked = asked(&log);
+        assert!(
+            pr_asked.contains(&"check api/P~web/C8".to_string())
+                && pr_asked.contains(&"check api/P~web/C9".to_string()),
+            "both pairs are judged again: {pr_asked:?}"
+        );
+    }
+
+    /// carrick#3104: a check run that failed (its compiler ended abnormally,
+    /// say) says how the run went, whatever gate a verdict carries.
+    #[test]
+    fn a_failed_check_run_stores_no_judged_outcome() {
+        a_run_caused_check_is_judged_again(false, None);
+    }
+
+    /// carrick#3104: an install the registry could not serve says how the
+    /// run went, not what the types are, even on a run that reports success.
+    #[test]
+    fn an_install_gate_stores_no_judged_outcome() {
+        a_run_caused_check_is_judged_again(true, Some("install:registry-unreachable"));
+    }
+
+    /// carrick#3104: the gates from the two types settle; the run's do not.
+    #[test]
+    fn only_the_runs_gates_are_run_caused() {
+        for gate in [
+            "install:timeout",
+            "install:registry-unreachable",
+            "install:failed",
+            "isolation:unavailable",
+            "tsc:abnormal-termination",
+            "missing:stub",
+        ] {
+            assert!(run_caused(true, Some(gate)), "{gate}");
+        }
+        for gate in [
+            "capture:consumer:unknown",
+            "capture:producer:any",
+            "consumer:any",
+            "producer:unknown",
+            "poison:producer",
+            "import:consumer",
+            "assignment:other",
+            "producer:mode",
+            "same_service",
+            "retype:consumer",
+            "producer:unwidened_out_of_budget",
+        ] {
+            assert!(!run_caused(true, Some(gate)), "{gate}");
+        }
+        assert!(!run_caused(true, None));
+        assert!(run_caused(false, Some("capture:consumer:unknown")));
     }
 }
