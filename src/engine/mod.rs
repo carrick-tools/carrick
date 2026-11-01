@@ -46,6 +46,7 @@ use swc_common::{
 };
 use swc_ecma_visit::VisitWith;
 
+mod answers_ahead;
 pub mod durability;
 mod pair_settle;
 mod route_boundaries;
@@ -1310,6 +1311,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         workspace: workspace_scan,
         walking,
         reach,
+        ahead: answers_ahead::requested()
+            .then(|| std::sync::Arc::new(answers_ahead::Board::new(analysed_count, walking))),
     });
     let upload_blocked = multi_service && !storage.supports_multi_service();
     let jobs: Vec<ServiceJob> = services
@@ -1323,12 +1326,27 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             previous: if no_cache {
                 None
             } else {
-                previous_generation(previous_generations, &repo_name, service).cloned()
+                previous_generation(previous_generations, &repo_name, service)
+                    .cloned()
+                    .map(std::sync::Arc::new)
             },
             generation: PreviousGeneration::Stored,
             memory: memories[at],
         })
         .collect();
+    // Each service's file-reader answers, asked while the service before it
+    // is analysed (carrick#3131). Stopped when this pass ends.
+    let answers_lane = scan.ahead.as_ref().map(|board| {
+        let previous: Vec<Option<std::sync::Arc<CloudRepoData>>> =
+            jobs.iter().map(|job| job.previous.clone()).collect();
+        let lane_scan = std::sync::Arc::clone(&scan);
+        answers_ahead::LaneTask::spawn(
+            board,
+            answers_ahead::run(std::sync::Arc::clone(board), move |at| {
+                std::sync::Arc::clone(&lane_scan).ask_ahead(at, previous[at].clone())
+            }),
+        )
+    });
     let mut outcomes = match &walk_slots {
         Some(slots) => {
             let clean_commit = (!git_state.dirty && !git_state.commit.is_empty())
@@ -1397,6 +1415,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         }
         None => scan.analyze_all(jobs, &plan).await,
     };
+    drop(answers_lane);
     // A service whose type checker died of memory beside another service,
     // or under a cap below the run's, in a run told to stop on such a death,
     // is analysed again alone at the run's cap (carrick#3084). From this
@@ -1648,7 +1667,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     // Its own blob from a minute ago is the previous
                     // generation: every answer it holds replays, and only
                     // what it lacks is asked for.
-                    previous: Some(runs[index].data.clone()),
+                    previous: Some(std::sync::Arc::new(runs[index].data.clone())),
                     generation: PreviousGeneration::ThisRun,
                     memory: service_workers::ServiceMemory::sized(
                         runs[index]
@@ -2638,6 +2657,10 @@ struct ServiceScan {
     /// What a pull request run reads to decide each service's type reach
     /// (carrick#3102); `None` on any other run.
     reach: Option<type_reach::ReachRun>,
+    /// Where the lane that asks each service's file-reader answers ahead and
+    /// the services' analyses meet (carrick#3131); `None` when the run asks
+    /// nothing ahead.
+    ahead: Option<std::sync::Arc<answers_ahead::Board>>,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -2741,7 +2764,8 @@ fn record_carried_consumer(repo_path: &str, service: &Config, stored: &CloudRepo
 struct ServiceJob {
     /// Into [`ServiceScan::services`], the analysed services.
     index: usize,
-    previous: Option<CloudRepoData>,
+    /// Shared with the lane that asks ahead for it (carrick#3131).
+    previous: Option<std::sync::Arc<CloudRepoData>>,
     generation: PreviousGeneration,
     /// Its sidecar's heap cap and its reservation of the run's budget
     /// (carrick#3084).
@@ -2781,6 +2805,12 @@ impl service_workers::WalkedPass for WalkThenAnalyze {
 
     fn reached(&mut self, service: usize, by: usize) -> service_workers::Reached {
         self.lane.reached(service, by)
+    }
+
+    fn gate_opened(&mut self, position: usize) {
+        if let Some(board) = &self.scan.ahead {
+            board.mark_gate_open(position);
+        }
     }
 
     fn start_analysis(
@@ -2880,6 +2910,11 @@ impl ServiceScan {
         self: &std::sync::Arc<Self>,
         job: ServiceJob,
     ) -> futures::future::BoxFuture<'static, ServiceOutcome> {
+        if let Some(board) = &self.ahead
+            && job.generation == PreviousGeneration::Stored
+        {
+            board.mark_started(job.index);
+        }
         if let Err(stop) = crate::scan_health::type_memory_stop() {
             let stopped: ServiceOutcome = Err(stop.to_string().into());
             return Box::pin(std::future::ready(stopped));
@@ -2915,7 +2950,7 @@ impl ServiceScan {
                 runtime.block_on(tracing::Instrument::instrument(
                     scan.analyze(
                         job.index,
-                        job.previous.as_ref(),
+                        job.previous.as_deref(),
                         job.generation,
                         memory.heap_cap_mb,
                     ),
@@ -2976,7 +3011,7 @@ impl ServiceScan {
         });
         let job = ServiceJob {
             index: at,
-            previous: Some(run.data.clone()),
+            previous: Some(std::sync::Arc::new(run.data.clone())),
             generation: PreviousGeneration::ThisRun,
             memory: alone,
         };
@@ -3116,6 +3151,12 @@ impl ServiceScan {
                         run,
                         scope: run.scopes.get(index).and_then(Option::as_ref),
                     }),
+                // What was asked ahead is for the pass that reads the stored
+                // generation (carrick#3131).
+                self.ahead
+                    .as_deref()
+                    .filter(|_| generation == PreviousGeneration::Stored)
+                    .and_then(|board| board.place(index)),
             )))
             .await;
         let analysis = analysis?;
@@ -3211,6 +3252,241 @@ impl ServiceScan {
             fallbacks: analysis.fallbacks,
             type_reach: analysis.type_reach,
         })
+    }
+
+    /// Ask the file reader ahead for the analysed service at `at`
+    /// (carrick#3131): build its prompts as its analysis will from
+    /// `previous`, its stored generation, publish them for the analysis and
+    /// ask them. On a thread of its own, since it reads and parses the
+    /// service's files, and quietly: the analysis says what it finds.
+    async fn ask_ahead(
+        self: std::sync::Arc<Self>,
+        at: usize,
+        previous: Option<std::sync::Arc<CloudRepoData>>,
+    ) {
+        let Some(board) = self.ahead.clone() else {
+            return;
+        };
+        // A first index asks nothing ahead (`analyze_current_repo`).
+        let Some(previous) =
+            previous.filter(|previous| previous.cache_version == Some(CACHE_VERSION))
+        else {
+            return;
+        };
+        let name = self.services[at].service_name.clone();
+        // Where the run's log is written: the lane says there what it
+        // asks, and nothing else.
+        let log = tracing::dispatcher::get_default(Clone::clone);
+        // A panic in the lane is a miss: quiet, so the run is not
+        // reported dead, and caught here, so the lane goes on to the next
+        // service. The analysis asks for whatever was not handed to it.
+        let asked =
+            service_workers::on_a_thread(format!("carrick-ahead-{}", at + 1), move |runtime| {
+                runtime.block_on(crate::panic_report::quiet(
+                    tracing::instrument::WithSubscriber::with_subscriber(
+                        crate::current_service::asked_for(
+                            name,
+                            self.build_and_ask_ahead(at, &previous, &board, log),
+                        ),
+                        tracing::subscriber::NoSubscriber::default(),
+                    ),
+                ))
+            });
+        let _ = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(asked)).await;
+    }
+
+    /// [`Self::ask_ahead`] on its thread. Returns, asking nothing, wherever
+    /// the analysis would build other bytes or asks for itself: the tree
+    /// cannot be compared with the stored generation, the setup it will take
+    /// is not in hand, or the analysis has claimed the service's place.
+    async fn build_and_ask_ahead(
+        &self,
+        at: usize,
+        previous: &CloudRepoData,
+        board: &answers_ahead::Board,
+        log: tracing::Dispatch,
+    ) {
+        let (Some(place), Some(service)) = (board.place(at), self.services.get(at)) else {
+            return;
+        };
+        let canonical = canonical_repo_path(&self.repo_path);
+        let repo_path = canonical.as_str();
+        let Ok(packages) = load_packages_for_service(&self.repo_path, service) else {
+            return;
+        };
+        let own = self.siblings.declared(at);
+        let walked = own
+            .filter(|_| self.walking)
+            .and_then(|own| self.siblings.walked(own));
+        if self.walking && walked.is_none() {
+            return;
+        }
+        let Ok(unchanged) = reusable_paths(repo_path, &previous.commit_hash) else {
+            return;
+        };
+        let no_answers = HashMap::new();
+        // Only a service with a file changed since its stored generation is
+        // asked for ahead. Read from the file walk alone, before the parse
+        // and the store's ask, so a service with nothing changed costs the
+        // lane no more than the walk. A file left unchanged with no stored
+        // answer is almost always one the reader is never sent (it holds no
+        // call or route), so it does not count; the rarer one whose last ask
+        // failed is asked in the service's own turn, as before.
+        let walk = crate::file_finder::walk_service_quietly(
+            repo_path,
+            service,
+            &service_ignore_patterns(service),
+        );
+        if walk
+            .files
+            .iter()
+            .all(|file| unchanged.contains(&repo_relative_key(repo_path, file)))
+        {
+            return;
+        }
+        let Ok(FileDiscovery {
+            files,
+            import_facts,
+            request_inputs,
+            ..
+        }) = discover_service(
+            repo_path,
+            service,
+            Default::default(),
+            walked.map(walk_lane::Walked::index),
+            &self.workspace,
+            Read::Sibling,
+        )
+        else {
+            return;
+        };
+        let cached = replayable_answers(
+            repo_path,
+            &files,
+            previous.file_results.as_ref().unwrap_or(&no_answers),
+            &unchanged,
+        );
+        let Ok(package_json_hash) = hash_workspace_package_jsons(&packages, repo_path) else {
+            return;
+        };
+        // The setup the analysis will take: the one its stored generation
+        // replays, or the one the setup queue asked, when the analysis would
+        // ask the same. Never asked here.
+        let (detection, guidance) = match setup_ahead::StoredSetup::of(previous)
+            .decide(&package_json_hash)
+        {
+            setup_ahead::SetupAsk::Reuse {
+                detection,
+                guidance,
+                ..
+            } => (detection, guidance),
+            setup_ahead::SetupAsk::Ask(settled) => {
+                let wanted = setup_ahead::ask_identity(&packages, &import_facts, settled.as_ref());
+                let Some(mut ready) = self.setups.ready(at) else {
+                    return;
+                };
+                let ready = tokio::select! {
+                    biased;
+                    ready = ready.wait_for(Option::is_some) => {
+                        ready.ok().and_then(|ready| ready.clone())
+                    }
+                    _ = place.started() => None,
+                    _ = board.stopped() => None,
+                };
+                match ready {
+                    Some(ready) if ready.identity == wanted => (ready.detection, ready.guidance),
+                    _ => return,
+                }
+            }
+        };
+        let PromptInputs {
+            graphql_producer_hints,
+            graphql_consumer_hints,
+            normalizer,
+            service_root,
+            declared_dependencies,
+        } = prompt_inputs(repo_path, service, &packages, &files);
+        // Whether the run has a type checker to start. The analysis reads
+        // whether its own started, and refuses everything built here when
+        // the two differ.
+        let typed = self.sidecar.is_some();
+        let siblings = reached_siblings(
+            own.map(|own| siblings::Neighbours {
+                registry: &self.siblings,
+                own,
+            }),
+            typed,
+            &request_inputs,
+        );
+        let semantics_root = service_scan_root(repo_path, service);
+        let library_ask = LibraryAsk::start(
+            &request_inputs,
+            &siblings,
+            typed,
+            &semantics_root,
+            Path::new(repo_path),
+            self.setups.turns(),
+        )
+        .map(std::sync::Arc::new);
+        // The service's library ask is the lane's from here, unless its
+        // analysis came first: the analysis takes both answers from it.
+        let mut first = None;
+        let began = place.begin_library(typed, || {
+            let ask = std::sync::Arc::clone(library_ask.as_ref()?);
+            let asked = ask.asked.clone();
+            let (early, first_answer) = tokio::sync::oneshot::channel();
+            let settled = tokio::spawn(crate::current_service::asked_for(
+                service.service_name.clone(),
+                async move { settled_library_answer(Some(&ask), early).await },
+            ));
+            let handed = answers_ahead::LibraryHanded::new(asked, first_answer, settled);
+            first = Some(handed.first());
+            Some(handed)
+        });
+        if !began || place.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let (early, first_answer) = tokio::sync::oneshot::channel();
+        let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
+        let sibling_inputs = siblings.inputs();
+        let orchestrator = FileOrchestrator::new(AgentService::new())
+            .with_fact_files(crate::agents::file_orchestrator::FactFileSource::later(
+                fact_files,
+            ))
+            .with_answers_ahead(crate::agents::asked_ahead::AheadRole::Lane {
+                slot: place.answers.clone(),
+                stop: place.stop.clone(),
+                log,
+            });
+        let _ = tokio::join!(
+            orchestrator.analyze_files(
+                &files,
+                &cached,
+                &guidance,
+                &detection,
+                &service_root,
+                Path::new(repo_path),
+                &declared_dependencies,
+                &graphql_producer_hints,
+                &graphql_consumer_hints,
+                &normalizer,
+            ),
+            async move {
+                if let Some(first) = first
+                    && let Some(answer) = first.await
+                {
+                    let _ = early.send(answer);
+                }
+            },
+            fact_files_of(
+                library_ask.as_deref(),
+                first_answer,
+                &request_inputs,
+                &sibling_inputs,
+                Path::new(repo_path),
+                fact_sender,
+            ),
+        );
     }
 }
 
@@ -4326,6 +4602,125 @@ fn reusable_model_answers(
         .collect()
 }
 
+// What a service's prompts are built from, read by its analysis and by the
+// lane that asks the file reader ahead of it (carrick#3131) through the same
+// functions, so the two build the same bytes.
+
+/// The service's files and what discovery reads of them. `Read::Sibling`
+/// reads them quietly, as the lane does: the analysis reports what it finds.
+fn discover_service(
+    repo_path: &str,
+    config: &Config,
+    cm: Lrc<SourceMap>,
+    positions: Option<crate::position_rows::PositionIndex>,
+    workspace: &crate::external_call_candidates::WorkspaceScan,
+    read: Read,
+) -> FileDiscoveryResult {
+    discover_with_positions(
+        repo_path,
+        config,
+        cm,
+        positions,
+        crate::request_summary::ROWS_JOIN_BUDGET,
+        crate::request_summary::discovery::receiver_trace_enabled(),
+        &workspace.test_only,
+        read,
+    )
+}
+
+/// The services this one's calls are declared in, read for the walks that
+/// enter them (carrick#2618), only where the store is asked
+/// ([`LibraryAsk::start`]: a `typed` run).
+fn reached_siblings(
+    neighbours: Option<siblings::Neighbours<'_>>,
+    typed: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+) -> siblings::Siblings {
+    neighbours
+        .filter(|_| typed)
+        .map(|neighbours| neighbours.reached(inputs))
+        .unwrap_or_default()
+}
+
+/// `file` as a generation's answers key it: relative to `repo_path`.
+fn repo_relative_key(repo_path: &str, file: &Path) -> String {
+    let text = file.to_string_lossy();
+    match text
+        .strip_prefix(repo_path)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        Some(relative) => relative.to_string(),
+        None => text.strip_prefix("./").unwrap_or(&text).to_string(),
+    }
+}
+
+/// The previous generation's answers this tree replays
+/// ([`reusable_model_answers`]), keyed as `files` name them.
+fn replayable_answers(
+    repo_path: &str,
+    files: &[PathBuf],
+    previous: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    unchanged: &HashSet<String>,
+) -> HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult> {
+    reusable_model_answers(
+        files.iter().map(|file| {
+            (
+                file.to_string_lossy().to_string(),
+                repo_relative_key(repo_path, file),
+            )
+        }),
+        previous,
+        unchanged,
+    )
+}
+
+/// What the file reader's prompts read beside the files, their cached
+/// answers and the service's setup.
+struct PromptInputs {
+    graphql_producer_hints: crate::graphql::GraphqlProducerHints,
+    graphql_consumer_hints: crate::graphql::GraphqlConsumerHints,
+    normalizer: UrlNormalizer,
+    /// Where file-based routes are derived from.
+    service_root: PathBuf,
+    declared_dependencies: Vec<String>,
+}
+
+fn prompt_inputs(
+    repo_path: &str,
+    service: &Config,
+    packages: &Packages,
+    files: &[PathBuf],
+) -> PromptInputs {
+    PromptInputs {
+        // Stage B2: GraphQL producer field-list from the service's SDL,
+        // derived deterministically so the file-analyzer can emit
+        // `graphql_operations` linking resolvers to schema fields. Scanned
+        // over the full service `files` (not just `files_to_analyze`) so the
+        // producer list is complete; empty for non-GraphQL services.
+        graphql_producer_hints: crate::graphql::GraphqlProducerHints::collect(
+            service_graphql_roots(repo_path, service),
+            &crate::graphql::resolve_declared_schemas(
+                Path::new(repo_path),
+                &service.graphql_schemas,
+            )
+            .files,
+            files,
+        ),
+        // #268: the consumer mirror — document consumers with no
+        // deterministic call-site anchor, so the file-analyzer can locate
+        // their co-located result type. Same scan-root/files inputs as the
+        // producer hints; empty for services with no unanchored consumers.
+        graphql_consumer_hints: crate::graphql::GraphqlConsumerHints::collect(
+            service_graphql_roots(repo_path, service),
+            files,
+            repo_path,
+        ),
+        normalizer: UrlNormalizer::new(service),
+        service_root: service_scan_root(repo_path, service),
+        declared_dependencies: packages.declared_dependency_names(),
+    }
+}
+
 /// Where a service's previous generation comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreviousGeneration {
@@ -4353,6 +4748,7 @@ async fn analyze_current_repo_incremental(
     positions: Option<crate::position_rows::PositionIndex>,
     neighbours: Option<siblings::Neighbours<'_>>,
     reach: Option<type_reach::ReachContext<'_>>,
+    ahead: Option<&answers_ahead::Place>,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -4370,23 +4766,15 @@ async fn analyze_current_repo_incremental(
         function_definitions,
         repo_name,
         request_inputs,
-    } = discover_with_positions(
+    } = discover_service(
         repo_path,
         config,
         cm.clone(),
         positions,
-        crate::request_summary::ROWS_JOIN_BUDGET,
-        crate::request_summary::discovery::receiver_trace_enabled(),
-        &workspace.test_only,
+        workspace,
         Read::Own,
     )?;
-    // The services this one's calls are declared in, read for the walks that
-    // enter them (carrick#2618), only where the store is asked
-    // (`LibraryAsk::start`).
-    let siblings = neighbours
-        .filter(|_| sidecar.is_some())
-        .map(|neighbours| neighbours.reached(&request_inputs))
-        .unwrap_or_default();
+    let siblings = reached_siblings(neighbours, sidecar.is_some(), &request_inputs);
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // 3. Check if we can use incremental mode. The cache version is the whole
@@ -4446,27 +4834,8 @@ async fn analyze_current_repo_incremental(
 
             let no_answers = HashMap::new();
             let prev_file_results = prev.file_results.as_ref().unwrap_or(&no_answers);
-            let repo_prefix = format!("{}/", repo_path);
-
-            // Helper to normalize a file path to repo-relative
-            let normalize_path = |f: &PathBuf| -> String {
-                let s = f.to_string_lossy();
-                if let Some(stripped) = s.strip_prefix(&repo_prefix) {
-                    stripped.to_string()
-                } else if let Some(stripped) = s.strip_prefix("./") {
-                    stripped.to_string()
-                } else {
-                    s.to_string()
-                }
-            };
-
-            let mut cached_model_results = reusable_model_answers(
-                files
-                    .iter()
-                    .map(|f| (f.to_string_lossy().to_string(), normalize_path(f))),
-                prev_file_results,
-                &unchanged,
-            );
+            let mut cached_model_results =
+                replayable_answers(repo_path, &files, prev_file_results, &unchanged);
 
             let total_files = files.len();
             let reused_count = cached_model_results.len();
@@ -4610,32 +4979,13 @@ async fn analyze_current_repo_incremental(
                     summaries,
                 ));
 
-            // Stage B2: GraphQL producer field-list from the service's SDL,
-            // derived deterministically so the file-analyzer can emit
-            // `graphql_operations` linking resolvers to schema fields. Scanned
-            // over the full service `files` (not just `files_to_analyze`) so the
-            // producer list is complete; empty for non-GraphQL services.
-            let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
-                service_graphql_roots(repo_path, service),
-                &crate::graphql::resolve_declared_schemas(
-                    Path::new(repo_path),
-                    &service.graphql_schemas,
-                )
-                .files,
-                &files,
-            );
-            // #268: the consumer mirror — document consumers with no
-            // deterministic call-site anchor, so the file-analyzer can locate
-            // their co-located result type. Same scan-root/files inputs as the
-            // producer hints; empty for services with no unanchored consumers.
-            let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
-                service_graphql_roots(repo_path, service),
-                &files,
-                repo_path,
-            );
-
-            let normalizer = UrlNormalizer::new(config);
-            let service_root = service_scan_root(repo_path, config);
+            let PromptInputs {
+                graphql_producer_hints,
+                graphql_consumer_hints,
+                normalizer,
+                service_root,
+                declared_dependencies,
+            } = prompt_inputs(repo_path, service, packages, &files);
             crate::phase_timing::mark(crate::phase_timing::Phase::Cache);
             // One index for this service, built before the analysis and shared
             // with the type requests below (carrick#1416): the join passes that
@@ -4657,9 +5007,12 @@ async fn analyze_current_repo_incremental(
                 crate::model_carry::carry_edited_files(
                     repo_path,
                     prev_commit,
-                    files
-                        .iter()
-                        .map(|f| (f.to_string_lossy().to_string(), normalize_path(f))),
+                    files.iter().map(|f| {
+                        (
+                            f.to_string_lossy().to_string(),
+                            repo_relative_key(repo_path, f),
+                        )
+                    }),
                     prev_file_results,
                     &unchanged,
                     &setup.detection.data_fetchers,
@@ -4673,22 +5026,55 @@ async fn analyze_current_repo_incremental(
             // The summaries are composed once the schedule started above has
             // settled; the analysis reads them only once the model has been
             // asked (carrick#1564).
-            let declared_dependencies = packages.declared_dependency_names();
             let semantics_root = service_scan_root(repo_path, config);
             let sibling_inputs = siblings.inputs();
             let library_ask = LibraryAsk::start(
                 &request_inputs,
                 &siblings,
-                sidecar,
+                sidecar.is_some(),
                 &semantics_root,
                 Path::new(repo_path),
                 ask_turns.clone(),
             );
+            // What a lane asked the library store ahead for this service
+            // (carrick#3131), taken when it read the service as this analysis
+            // does (a type checker running or not) and asked what this
+            // analysis asks. Otherwise its prompts were built on another
+            // store answer, so none of them is taken: the lane asks nothing
+            // more for the service, its store ask stops, and this analysis
+            // asks for itself.
+            let library_handed = match ahead.map(|place| (place, place.claim_library())) {
+                Some((place, Some(lane))) => {
+                    if lane.agrees(
+                        sidecar.is_some(),
+                        library_ask.as_ref().map(|ask| &ask.asked),
+                    ) {
+                        lane.handed
+                    } else {
+                        drop(lane);
+                        let asked = place.refuse().map_or(0, |held| held.asked());
+                        info!(
+                            "Answers ahead for {}: refused, built on another library answer; \
+                             asked {asked} file(s)",
+                            config.service_name.as_deref().unwrap_or("(root)")
+                        );
+                        None
+                    }
+                }
+                _ => None,
+            };
             let (early_answer, first_answer) = tokio::sync::oneshot::channel();
             let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
-            let file_orchestrator = file_orchestrator.with_fact_files(
-                crate::agents::file_orchestrator::FactFileSource::later(fact_files),
-            );
+            let file_orchestrator = file_orchestrator
+                .with_fact_files(crate::agents::file_orchestrator::FactFileSource::later(
+                    fact_files,
+                ))
+                .with_answers_ahead(match ahead {
+                    Some(place) => {
+                        crate::agents::asked_ahead::AheadRole::Analysis(place.answers.clone())
+                    }
+                    None => crate::agents::asked_ahead::AheadRole::None,
+                });
             let (analysis, (settled, placements, fallbacks), library_answer, first_discovery) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
@@ -4709,7 +5095,12 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
-                settled_library_answer(library_ask.as_ref(), early_answer),
+                async {
+                    match library_handed {
+                        Some(handed) => handed.settle(early_answer).await,
+                        None => settled_library_answer(library_ask.as_ref(), early_answer).await,
+                    }
+                },
                 fact_files_of(
                     library_ask.as_ref(),
                     first_answer,
@@ -5200,6 +5591,11 @@ async fn analyze_current_repo_incremental(
 
     // Fallback: full analysis (analyze_current_repo now populates cache fields)
     debug!("Running full analysis...");
+    // Which takes nothing asked ahead (carrick#3131): the lane asks nothing
+    // more for the service, and its store ask stops.
+    if let Some(place) = ahead {
+        place.refuse();
+    }
     if let Some(context) = reach {
         type_reach::decide_service_whole(
             context,
@@ -5678,19 +6074,21 @@ struct LibraryAsk {
 
 impl LibraryAsk {
     /// What the service asks, or `None` when it asks nothing: a scan with no
-    /// sidecar could verify no answer, and a service whose library calls go
-    /// through no public registry package has nothing to ask about. A run
-    /// with no model reads the store's settled answers and starts no build
-    /// (carrick#2907): a package with no label stays unknown.
+    /// sidecar (`typed` false) could verify no answer, and a service whose
+    /// library calls go through no public registry package has nothing to
+    /// ask about. A run with no model reads the store's settled answers and
+    /// starts no build (carrick#2907): a package with no label stays unknown.
     fn start(
         inputs: &crate::request_summary::RequestSummaryInputs,
         siblings: &siblings::Siblings,
-        sidecar: Option<&TypeSidecar>,
+        typed: bool,
         service_root: &Path,
         repo_root: &Path,
         turns: setup_ahead::AskTurns,
     ) -> Option<Self> {
-        sidecar?;
+        if !typed {
+            return None;
+        }
         let site_questions = crate::site_questions::enabled();
         Self::of_with(
             inputs,
@@ -12185,7 +12583,7 @@ async fn analyze_current_repo(
     let library_ask = LibraryAsk::start(
         &request_inputs,
         siblings,
-        sidecar,
+        sidecar.is_some(),
         &service_root,
         Path::new(repo_path),
         ask_turns.clone(),
