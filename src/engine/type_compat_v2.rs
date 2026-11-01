@@ -2675,6 +2675,14 @@ pub(crate) struct CallLocator {
     /// decide the call, when the prescreen was not asked, and on a carried
     /// consumer's stored locator.
     pub prescreen: Option<String>,
+    /// The retype's "does not reach" reason for ANY stated type that is a new
+    /// object type, as the consumer's analysis read it (carrick#3158): the
+    /// type argument the rewrite fills appears in the result only as a
+    /// conditional's selector. It is applied only when the producer's type is
+    /// one new object type ([`states_new_object_type`]); for any other type
+    /// the same call can reach a slot, so the rewrite decides it. `None` on a
+    /// carried consumer's stored locator.
+    pub prescreen_fresh_type: Option<String>,
 }
 
 /// A service scanned in THIS run, whose sources are on disk: the only kind of
@@ -2769,6 +2777,7 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
                 expression_text: request.expression_text.clone(),
                 expression_line: request.expression_line,
                 prescreen: None,
+                prescreen_fresh_type: None,
             });
     }
     calls
@@ -2829,14 +2838,17 @@ pub(crate) fn prescreen_calls(
         }
     };
     let mut decided = 0;
+    let mut object_literal = 0;
     for answer in answers {
         if let Some(call) = calls.get_mut(&answer.item_id) {
             decided += usize::from(answer.reason.is_some());
+            object_literal += usize::from(answer.fresh_type_reason.is_some());
             call.prescreen = answer.reason;
+            call.prescreen_fresh_type = answer.fresh_type_reason;
         }
     }
     info!(
-        "Prescreened {service_id}'s consumer calls: {decided} of {} abstain before any rewrite, took {:.1}s",
+        "Prescreened {service_id}'s consumer calls: {decided} of {} abstain before any rewrite, {object_literal} more when the producer's type is an object literal, took {:.1}s",
         items.len(),
         started.elapsed().as_secs_f64()
     );
@@ -2899,6 +2911,7 @@ pub(crate) fn stored_call_locators(
                 expression_text: evidence.expression_text.clone(),
                 expression_line: evidence.expression_line,
                 prescreen: None,
+                prescreen_fresh_type: None,
             });
     }
     calls
@@ -2985,6 +2998,18 @@ fn retype_items<'a>(
             });
             continue;
         }
+        if let Some(reason) = call.prescreen_fresh_type.as_deref().filter(|_| {
+            retype_reads_producer_text(producer_type) && states_new_object_type(producer_type)
+        }) {
+            decided.push(RetypeOutcome {
+                item_id: pair.spec.pair_key.clone(),
+                outcome: RetypeVerdict::Abstain,
+                diagnostics: Vec::new(),
+                reason: Some(reason.to_string()),
+                run_failed: false,
+            });
+            continue;
+        }
         by_service
             .entry(pair.consumer_service.as_str())
             .or_default()
@@ -3018,6 +3043,103 @@ fn retype_reads_producer_text(text: &str) -> bool {
     let one_line = text.trim();
     let one_line = one_line.strip_suffix(';').unwrap_or(one_line).trim();
     !one_line.is_empty() && !text.contains("//") && !text.contains("/*")
+}
+
+/// Whether the producer's text is one new, non-empty object type literal, or
+/// an array of one (carrick#3158): the only producer types for which a call
+/// whose type argument only selects (`prescreen_fresh_type`) is known not to
+/// reach its result. A non-empty literal makes a type no other type is
+/// identical to, so the retype's identity test fails at every slot it reads.
+/// `{}` is refused (one shared type), and so is `toJSON` (the wire form maps
+/// to a type that already exists). Anything else the scan sends to the retype.
+fn states_new_object_type(text: &str) -> bool {
+    if text.contains("toJSON") {
+        return false;
+    }
+    let trimmed = text.trim();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    // One pair of wrapping parentheses.
+    let body: &[char] =
+        if chars.first() == Some(&'(') && matching_close(&chars, 0) == Some(chars.len() - 1) {
+            &chars[1..chars.len() - 1]
+        } else {
+            &chars
+        };
+    let start = body.iter().position(|c| !c.is_whitespace());
+    let Some(start) = start.filter(|&i| body[i] == '{') else {
+        return false;
+    };
+    let Some(close) = matching_close(body, start) else {
+        return false;
+    };
+    let members = &body[start + 1..close];
+    if !members
+        .iter()
+        .any(|c| !c.is_whitespace() && *c != ';' && *c != ',')
+    {
+        return false;
+    }
+    let rest: String = body[close + 1..].iter().collect();
+    let rest = rest.trim();
+    rest.len() % 2 == 0 && rest.as_bytes().chunks(2).all(|pair| pair == b"[]")
+}
+
+/// The index of the bracket closing the one at `open`, skipping quoted
+/// strings and template literals (whose `${ ... }` nest).
+fn matching_close(chars: &[char], open: usize) -> Option<usize> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut i = open;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' | '"' => i = skip_quoted(chars, i)?,
+            '`' => i = skip_template(chars, i)?,
+            '(' => stack.push(')'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            c @ (')' | ']' | '}') => {
+                if stack.pop() != Some(c) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the quote closing the string opened at `open`.
+fn skip_quoted(chars: &[char], open: usize) -> Option<usize> {
+    let quote = chars[open];
+    let mut i = open + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            c if c == quote => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the backtick closing the template opened at `open`.
+fn skip_template(chars: &[char], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '`' => return Some(i),
+            '$' if chars.get(i + 1) == Some(&'{') => i = matching_close(chars, i + 1)?,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The longest the retype check may run in one scan, across every service
@@ -3878,6 +4000,7 @@ mod tests {
                         expression_text: Some("api.post('/p')".to_string()),
                         expression_line: Some(8),
                         prescreen: None,
+                        prescreen_fresh_type: None,
                     },
                 )]),
             },
@@ -3979,6 +4102,121 @@ mod tests {
             let (items, decided) = retype_items(&pairs, &blamed, &local);
             assert!(decided.is_empty(), "{refused:?} keeps the retype's reason");
             assert_eq!(items["web"].len(), 1, "{refused:?} is sent");
+        }
+    }
+
+    /// carrick#3158: which producer texts are one new object type.
+    #[test]
+    fn states_new_object_type_accepts_only_a_non_empty_object_literal() {
+        for yes in [
+            "{ a: string }",
+            "{ a: string; }",
+            "{ a: string }[]",
+            "{ a: string }[][]",
+            "({ a: string })",
+            "{ a: string };",
+            "{ a: '}' }",
+            "{ a: \"}\" }",
+            "{ a: `${string}}` }",
+            "{ a: `x${ { b: 1 }['b'] }y` }",
+            "{\n  a: string;\n  b: number;\n}",
+            "{ a: { b: string } }",
+        ] {
+            assert!(states_new_object_type(yes), "{yes:?}");
+        }
+        for no in [
+            "{}",
+            "{ }",
+            "{ ; }",
+            "{ a: string } | null",
+            "{ a: 1 } | { b: 2 }",
+            "string",
+            "true",
+            "string | undefined",
+            "Response | undefined",
+            "{ a: string }[\"a\"]",
+            "{ toJSON(): string }",
+            "{ a: string; toJSON(): string }",
+            "Foo",
+            "{ a: string } & Bar",
+            "Array<{ a: string }>",
+            "({ a: string })[]",
+            "{ a: string",
+            "never",
+            "",
+            "   ",
+        ] {
+            assert!(!states_new_object_type(no), "{no:?}");
+        }
+    }
+
+    /// carrick#3158: a call the consumer's analysis found to state no type at
+    /// its result is decided without being sent, with the same reason the
+    /// retype gives, when the producer's type is one new object type.
+    #[test]
+    fn retype_items_decide_a_fresh_type_call_without_sending_it() {
+        const WHY: &str = "the call's type argument does not reach its result ('X'), so it does not state the response";
+        let mut local = web_consumer();
+        local
+            .get_mut("web")
+            .unwrap()
+            .calls
+            .get_mut("C")
+            .unwrap()
+            .prescreen_fresh_type = Some(WHY.to_string());
+
+        for literal in ["{ id: string; }", "{ id: string; }[]", "({ id: string })"] {
+            let pairs = [retype_pair(ManifestTypeKind::Response, Some(literal))];
+            let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
+            let (items, decided) = retype_items(&pairs, &blamed, &local);
+            assert!(items.is_empty(), "{literal:?}: nothing is sent: {items:?}");
+            assert_eq!(
+                decided,
+                vec![RetypeOutcome {
+                    item_id: pairs[0].spec.pair_key.clone(),
+                    outcome: RetypeVerdict::Abstain,
+                    diagnostics: Vec::new(),
+                    reason: Some(WHY.to_string()),
+                    run_failed: false,
+                }]
+            );
+        }
+
+        // Not the consumer's to settle: no reason is written on it.
+        let pairs = [retype_pair(
+            ManifestTypeKind::Response,
+            Some("{ id: string; }"),
+        )];
+        let (items, decided) = retype_items(&pairs, &HashSet::new(), &local);
+        assert!(items.is_empty() && decided.is_empty());
+    }
+
+    /// carrick#3158: the same call with a producer type that is not one new
+    /// object type can reach a slot, so it is sent to the retype as before.
+    #[test]
+    fn retype_items_send_a_fresh_type_call_whose_producer_type_is_not_an_object_literal() {
+        let mut local = web_consumer();
+        local
+            .get_mut("web")
+            .unwrap()
+            .calls
+            .get_mut("C")
+            .unwrap()
+            .prescreen_fresh_type = Some("does not reach".to_string());
+
+        for producer in [
+            "true",
+            "string | undefined",
+            "{}",
+            "{ a: string } | null",
+            "{ toJSON(): string }",
+            "{ id: string; // note\n }",
+        ] {
+            let pairs = [retype_pair(ManifestTypeKind::Response, Some(producer))];
+            let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
+            let (items, decided) = retype_items(&pairs, &blamed, &local);
+            assert!(decided.is_empty(), "{producer:?} is not decided");
+            assert_eq!(items["web"].len(), 1, "{producer:?} is sent");
         }
     }
 
@@ -5082,6 +5320,7 @@ mod tests {
             expression_text: None,
             expression_line: None,
             prescreen: None,
+            prescreen_fresh_type: None,
         };
         let calls = HashMap::from([
             (
@@ -11172,6 +11411,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                                 expression_text: None,
                                 expression_line: None,
                                 prescreen: None,
+                                prescreen_fresh_type: None,
                             },
                         )
                     })
@@ -11264,6 +11504,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             expression_text: Some("api.post('/p')".to_string()),
             expression_line: Some(line),
             prescreen: None,
+            prescreen_fresh_type: None,
         };
         LocalConsumers::from([(
             "web".to_string(),

@@ -512,10 +512,18 @@ export interface RetypePrescreenRequest extends BaseRequest {
   items: RetypeLocatorItem[];
 }
 
-/** One call's prescreen: `reason` when the retype abstains before any rewrite. */
+/**
+ * One call's prescreen: `reason` when the retype abstains before any rewrite.
+ * `fresh_type_reason` (carrick#3158) is the retype's "does not reach" reason
+ * for any stated type that is a new object type: the type argument it fills
+ * appears in the result only as a conditional's selector. The caller applies
+ * it only when the producer's type is such a type; it is never set beside
+ * `reason`.
+ */
 export interface RetypePrescreen {
   item_id: string;
   reason?: string;
+  fresh_type_reason?: string;
 }
 
 export interface RetypePrescreenResponse extends BaseResponse {

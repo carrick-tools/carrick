@@ -755,6 +755,10 @@ pub struct RetypePrescreen {
     pub item_id: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// The "does not reach" reason for any stated type that is a new object
+    /// type (carrick#3158); the caller applies it only for such a producer type.
+    #[serde(default)]
+    pub fresh_type_reason: Option<String>,
 }
 
 /// What the consumer file's type-check said once the call stated the
