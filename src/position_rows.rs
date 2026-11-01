@@ -1,14 +1,14 @@
 //! Per-position compiler rows (carrick#2405, move 2 of the fact layer).
 //!
-//! Before the scan's analysis loop starts any sidecar, a fresh record-only
-//! sidecar walks each service's source files and writes, for every call,
+//! Before a service's analysis starts its sidecar, a fresh record-only
+//! sidecar walks the service's source files and writes, for every call,
 //! member access, comparison and expression identifier, what the compiler
 //! knows there: the symbol, the declaration's file and line, the declaring
 //! package and the type text. The walk is the sidecar's
-//! (`src/sidecar/src/position-rows.ts`); the walks run in a lane of their own
-//! (`crate::engine::walk_lane`). Every walk process exits before the first
-//! analysis sidecar spawns, so the two programs never share a heap
-//! (carrick#2413).
+//! (`src/sidecar/src/position-rows.ts`); the walks are admitted beside the
+//! analyses, on the run's one memory budget (`crate::engine::walk_lane`,
+//! carrick#3085), and a service's walk process exits before its own analysis
+//! starts.
 //!
 //! The walk runs only with [`POSITION_ROWS_ENV`] set to `1`. With a local
 //! store directory ([`CACHE_DIR_ENV`]) it writes

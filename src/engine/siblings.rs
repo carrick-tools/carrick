@@ -17,13 +17,16 @@
 //!   any service is read: a sibling's own discovery may not exist yet when a
 //!   service asks.
 //! - A sibling with no compiler rows is no sibling: its code cannot be walked.
+//! - **Read from its walk's slot** ([`walk_lane::Slots`]), filled as the walk
+//!   ends. A service's analysis starts once the walks its rows reach have
+//!   ended ([`SiblingRegistry::declared_in`], carrick#3085).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::{Read, canonical_repo_path, discover_with_positions, service_ignore_patterns};
 use super::{service_scan_root, walk_lane};
@@ -93,8 +96,6 @@ pub(super) struct Neighbours<'a> {
     pub(super) registry: &'a SiblingRegistry,
     /// The service's declared position.
     pub(super) own: usize,
-    /// The analysed services' compiler walks, when the run walks.
-    pub(super) walks: Option<&'a [walk_lane::Walked]>,
 }
 
 impl Neighbours<'_> {
@@ -104,7 +105,7 @@ impl Neighbours<'_> {
         if !crate::site_questions::enabled() {
             return Siblings::default();
         }
-        self.registry.reached(self.own, inputs, self.walks)
+        self.registry.reached(self.own, inputs)
     }
 }
 
@@ -120,14 +121,10 @@ pub(super) struct SiblingRegistry {
     /// (as the walk's list of siblings is ordered).
     owners: OnceLock<HashMap<PathBuf, usize>>,
     slots: Vec<OnceLock<Option<Arc<Sibling>>>>,
-    /// The compiler walks of the services this run carries (`--changed-only`)
-    /// that an analysed service's calls enter, by declared position
-    /// ([`walk_carried`]).
-    carried: Vec<Option<walk_lane::Walked>>,
-    /// The commit each carried service is carried at (`None` for an analysed
-    /// one): the commit whose inputs its rows must be a walk of to be used
-    /// again instead of walked ([`walk_lane::reuse`], carrick#3027).
-    carried_commit: Vec<Option<String>>,
+    /// Every declared service's compiler walk, analysed or carried, once it
+    /// has ended (carrick#3085), when the run walks. A carried service has
+    /// one only when some walked service's rows reach it.
+    walks: Option<Arc<walk_lane::Slots>>,
 }
 
 impl SiblingRegistry {
@@ -135,7 +132,7 @@ impl SiblingRegistry {
         repo_path: &str,
         services: &[Config],
         analysed_at: Vec<Option<usize>>,
-        carried_commit: Vec<Option<String>>,
+        walks: Option<Arc<walk_lane::Slots>>,
     ) -> Self {
         Self {
             repo_path: canonical_repo_path(repo_path),
@@ -143,14 +140,23 @@ impl SiblingRegistry {
             analysed_at,
             owners: OnceLock::new(),
             slots: services.iter().map(|_| OnceLock::new()).collect(),
-            carried: services.iter().map(|_| None).collect(),
-            carried_commit,
+            walks,
         }
     }
 
+    /// The walk of the declared service `service`, once it has ended, when
+    /// the run walks.
+    pub(super) fn walked(&self, service: usize) -> Option<&walk_lane::Walked> {
+        self.walks.as_ref()?.get(service)
+    }
+
     /// The declared services whose files the calls the rows `positions` hold
-    /// are declared in.
-    fn declared_in(&self, positions: &crate::position_rows::PositionIndex) -> BTreeSet<usize> {
+    /// are declared in: the services a walk's rows reach, which its
+    /// analysis waits for (carrick#3085).
+    pub(super) fn declared_in(
+        &self,
+        positions: &crate::position_rows::PositionIndex,
+    ) -> BTreeSet<usize> {
         let owners = self.owners();
         positions
             .call_rows()
@@ -160,107 +166,6 @@ impl SiblingRegistry {
             .into_iter()
             .filter_map(|file| owners.get(&positions.path_of(file)).copied())
             .collect()
-    }
-
-    /// Walk the services this run carries that the analysed services' calls
-    /// enter (`--changed-only`, carrick#2618): a carried service has no walk
-    /// yet, and a scan that stopped at it would report the cross-service rows
-    /// of a change to the consumer alone as removed. Run in a lane round of
-    /// its own after the analysed services' walks and before any analysis, so
-    /// no walk process is alive beside an analysis sidecar. Rows only: the
-    /// service is neither analysed nor uploaded. A carried service one of
-    /// those reaches in turn is walked in the next round.
-    pub(super) async fn walk_carried(
-        &mut self,
-        walks: &[walk_lane::Walked],
-        recipe: Option<crate::services::type_sidecar::SidecarRecipe>,
-        width: usize,
-    ) {
-        if self.analysed_at.iter().all(Option::is_some) || !crate::site_questions::enabled() {
-            return;
-        }
-        let mut wanted: BTreeSet<usize> = walks
-            .iter()
-            .flat_map(|walked| self.declared_in(&walked.index()))
-            .collect();
-        loop {
-            let next: Vec<usize> = wanted
-                .iter()
-                .copied()
-                .filter(|index| {
-                    self.analysed_at[*index].is_none() && self.carried[*index].is_none()
-                })
-                .collect();
-            if next.is_empty() {
-                return;
-            }
-            // Rows an earlier pass kept stand in for a walk when they are
-            // exactly what the walk would write (carrick#3027).
-            let mut kept: Vec<(usize, walk_lane::Walked)> = Vec::new();
-            let mut to_walk: Vec<usize> = Vec::new();
-            for index in next {
-                let reused = match &self.carried_commit[index] {
-                    Some(commit) => {
-                        walk_lane::reuse(&self.repo_path, &self.services[index], commit)
-                    }
-                    None => Err(crate::position_rows::Miss::NotKept),
-                };
-                match reused {
-                    Ok(walked) => {
-                        debug!(
-                            "Position rows for service {} reused from the last pass",
-                            label_of(&self.services[index])
-                        );
-                        kept.push((index, walked));
-                    }
-                    Err(miss) => {
-                        debug!(
-                            "Position rows for service {} not reused: {miss:?}",
-                            label_of(&self.services[index])
-                        );
-                        to_walk.push(index);
-                    }
-                }
-            }
-            let configs: Vec<Config> = to_walk
-                .iter()
-                .map(|index| self.services[*index].clone())
-                .collect();
-            if !configs.is_empty() {
-                debug!(
-                    "Walking {} carried service(s) the analysed services call into",
-                    configs.len()
-                );
-            }
-            // Walked from the inputs of the commit the service is carried at.
-            let at = to_walk
-                .iter()
-                .map(|index| self.carried_commit[*index].clone())
-                .collect();
-            let done = walk_lane::walk_all(
-                recipe.clone(),
-                &self.repo_path,
-                &configs,
-                width,
-                Vec::new(),
-                at,
-            )
-            .await;
-            let next: Vec<usize> = kept
-                .iter()
-                .map(|(index, _)| *index)
-                .chain(to_walk)
-                .collect();
-            let done: Vec<walk_lane::Walked> = kept
-                .into_iter()
-                .map(|(_, walked)| walked)
-                .chain(done)
-                .collect();
-            for (index, walked) in next.into_iter().zip(done) {
-                wanted.extend(self.declared_in(&walked.index()));
-                self.carried[index] = Some(walked);
-            }
-        }
     }
 
     /// The declared position of the analysed service `analysed`.
@@ -296,15 +201,9 @@ impl SiblingRegistry {
 
     /// The siblings of the declared service `own`, whose read is `inputs`:
     /// every service its calls are declared in, and those theirs are in turn.
-    /// `walks` are the analysed services' compiler walks; without them (a run
-    /// that does not walk) no service can be walked into.
-    pub(super) fn reached(
-        &self,
-        own: usize,
-        inputs: &RequestSummaryInputs,
-        walks: Option<&[walk_lane::Walked]>,
-    ) -> Siblings {
-        let Some(walks) = walks else {
+    /// A run that does not walk can walk into no service.
+    pub(super) fn reached(&self, own: usize, inputs: &RequestSummaryInputs) -> Siblings {
+        let Some(walks) = self.walks.as_deref() else {
             return Siblings::default();
         };
         let declared_in = inputs.outside_declarations();
@@ -318,7 +217,7 @@ impl SiblingRegistry {
             if !passed.insert(index) {
                 continue;
             }
-            if let Some(sibling) = self.sibling(index, walks) {
+            if let Some(sibling) = self.sibling(own, index, walks) {
                 pending.extend(sibling.outside.iter().copied());
                 reached.insert(index, sibling);
             }
@@ -328,19 +227,40 @@ impl SiblingRegistry {
         }
     }
 
-    /// The declared service `index` read for a walk, once for the run.
-    fn sibling(&self, index: usize, walks: &[walk_lane::Walked]) -> Option<Arc<Sibling>> {
+    /// The declared service `index` read for a walk of `own`, once for the
+    /// run, from its walk.
+    ///
+    /// The analysis of `own` waits for the walks its rows reach (carrick#3085),
+    /// so a walk it reads has ended. A call whose rows hold an unresolved
+    /// import is followed on the call graph instead (carrick#2557), into a
+    /// service the rows did not name and the gate did not wait for: when that
+    /// service's walk has not ended yet, it is read as not walked, this once,
+    /// and the next read tries again.
+    fn sibling(&self, own: usize, index: usize, walks: &walk_lane::Slots) -> Option<Arc<Sibling>> {
+        let Some(walked) = walks.get(index) else {
+            if self.analysed_at[index].is_some() || walks.is_walking(index) {
+                info!(
+                    "Service {} read service {} before its walk ended; {} is read as not \
+                     walked",
+                    label_of(&self.services[own]),
+                    label_of(&self.services[index]),
+                    label_of(&self.services[index]),
+                );
+                debug_assert!(
+                    false,
+                    "{} was read before its walk ended: the gate missed it",
+                    label_of(&self.services[index])
+                );
+            }
+            return None;
+        };
         self.slots[index]
-            .get_or_init(|| self.read(index, walks))
+            .get_or_init(|| self.read(index, walked))
             .clone()
     }
 
-    fn read(&self, index: usize, walks: &[walk_lane::Walked]) -> Option<Arc<Sibling>> {
+    fn read(&self, index: usize, walked: &walk_lane::Walked) -> Option<Arc<Sibling>> {
         let service = &self.services[index];
-        let walked = match self.analysed_at[index] {
-            Some(analysed) => walks.get(analysed)?,
-            None => self.carried[index].as_ref()?,
-        };
         let label = service.service_name.as_deref().unwrap_or("(root)");
         let started = Instant::now();
         let discovery = discover_with_positions(

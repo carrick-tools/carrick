@@ -84,6 +84,17 @@ fn scan(
     flags: &[&str],
     isolated: bool,
 ) -> Vec<(String, serde_json::Value)> {
+    scan_with(repo, store, flags, isolated, &[]).0
+}
+
+/// [`scan`] with `env` set too; the blobs and what the scan printed.
+fn scan_with(
+    repo: &Path,
+    store: &Path,
+    flags: &[&str],
+    isolated: bool,
+    env: &[(&str, &str)],
+) -> (Vec<(String, serde_json::Value)>, String) {
     let cache = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
@@ -126,18 +137,25 @@ fn scan(
         "CARRICK_ALLOW_MISSING_TYPES",
         "CARRICK_FACT_FILES",
         "CARRICK_OUTPUT_JSON",
+        "CARRICK_SERVICE_CONCURRENCY",
+        "RUST_LOG",
     ] {
         cmd.env_remove(var);
     }
+    cmd.envs(env.iter().copied());
     let output = cmd.output().expect("spawn carrick");
-    assert!(
-        output.status.success(),
-        "scan exited non-zero:\n{}{}",
+    let printed = format!(
+        "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    blobs(store)
+    assert!(output.status.success(), "scan exited non-zero:\n{printed}");
+    (blobs(store), printed)
 }
+
+/// No width asked for, and two services at once: the gate holds whichever
+/// order the walks end in (carrick#3085).
+const WIDTHS: [&[(&str, &str)]; 2] = [&[], &[("CARRICK_SERVICE_CONCURRENCY", "2")]];
 
 fn blobs(store: &Path) -> Vec<(String, serde_json::Value)> {
     let mut blobs: Vec<(String, serde_json::Value)> = fs::read_dir(store)
@@ -206,11 +224,60 @@ fn a_service_states_the_requests_a_sibling_s_code_makes_at_its_own_calls() {
     if !sidecar_built() {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = committed_copy(tmp.path());
-    let store = tempfile::tempdir().unwrap();
-    let blobs = scan(&repo, store.path(), &[], true);
-    assert_app_rows(&blobs);
+    for env in WIDTHS {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = committed_copy(tmp.path());
+        let store = tempfile::tempdir().unwrap();
+        let (blobs, _) = scan_with(&repo, store.path(), &[], true, env);
+        assert_app_rows(&blobs);
+    }
+}
+
+/// carrick#3085, the closure: the app's rows reach the client, so the app's
+/// analysis waits for the client's walk, at any width. A scan of a change
+/// to the app alone, with no rows kept for the client, walks the carried
+/// client on demand, once, for the app.
+#[test]
+fn an_analysis_waits_for_the_walk_of_the_sibling_its_rows_reach() {
+    if !sidecar_built() {
+        return;
+    }
+    let said =
+        |printed: &str, needle: &str| printed.lines().filter(|line| line.contains(needle)).count();
+    for env in WIDTHS {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = committed_copy(tmp.path());
+        let store = tempfile::tempdir().unwrap();
+        let env: Vec<(&str, &str)> = env.iter().copied().chain([("RUST_LOG", "info")]).collect();
+        let (full, printed) = scan_with(&repo, store.path(), &[], false, &env);
+        assert_app_rows(&full);
+        assert_eq!(
+            said(&printed, "Analysis of app reads the walks of: client"),
+            1,
+            "{env:?}:\n{printed}"
+        );
+        assert_eq!(said(&printed, "Analysis of client reads"), 0, "{printed}");
+        let client_walked = printed
+            .lines()
+            .position(|line| line.contains("Walk client ended: "))
+            .expect("the client was walked");
+        let app_analysed = printed
+            .lines()
+            .position(|line| line.contains("Analyzing service app "))
+            .expect("the app was analysed");
+        assert!(client_walked < app_analysed, "{printed}");
+
+        fs::remove_file(kept_client_rows(store.path())).unwrap();
+        change_the_app(&repo);
+        let (scoped, printed) = scan_with(&repo, store.path(), &["--changed-only"], false, &env);
+        assert_app_rows(&scoped);
+        assert_eq!(
+            said(&printed, "Walked carried service client for app in "),
+            1,
+            "{env:?}:\n{printed}"
+        );
+        assert_eq!(said(&printed, "Walk client started: "), 1, "{printed}");
+    }
 }
 
 /// carrick#3083: a walked service states what its compiler walk held.
@@ -239,31 +306,33 @@ fn a_changed_only_scan_reads_a_carried_sibling_for_the_same_rows() {
     if !sidecar_built() {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = committed_copy(tmp.path());
-    let store = tempfile::tempdir().unwrap();
-    let full = scan(&repo, store.path(), &[], false);
-    assert_app_rows(&full);
-    let before = blob_of(&full, "client")["commit_hash"].clone();
-    // A change to the app alone, after every line the rows sit on.
-    let main = repo.join("services/app/src/main.ts");
-    let mut text = fs::read_to_string(&main).unwrap();
-    text.push_str("\nexport function more(): number {\n  return 1;\n}\n");
-    fs::write(&main, text).unwrap();
-    run_git(&repo, &["add", "-A"]);
-    run_git(&repo, &["commit", "-q", "-m", "app only"]);
-    let scoped = scan(&repo, store.path(), &["--changed-only"], false);
-    assert_eq!(
-        blob_of(&scoped, "client")["commit_hash"],
-        before,
-        "the client is carried"
-    );
-    assert_ne!(
-        blob_of(&scoped, "app")["commit_hash"],
-        blob_of(&full, "app")["commit_hash"],
-        "the app is analysed"
-    );
-    assert_app_rows(&scoped);
+    for env in WIDTHS {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = committed_copy(tmp.path());
+        let store = tempfile::tempdir().unwrap();
+        let (full, _) = scan_with(&repo, store.path(), &[], false, env);
+        assert_app_rows(&full);
+        let before = blob_of(&full, "client")["commit_hash"].clone();
+        // A change to the app alone, after every line the rows sit on.
+        let main = repo.join("services/app/src/main.ts");
+        let mut text = fs::read_to_string(&main).unwrap();
+        text.push_str("\nexport function more(): number {\n  return 1;\n}\n");
+        fs::write(&main, text).unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "app only"]);
+        let (scoped, _) = scan_with(&repo, store.path(), &["--changed-only"], false, env);
+        assert_eq!(
+            blob_of(&scoped, "client")["commit_hash"],
+            before,
+            "the client is carried"
+        );
+        assert_ne!(
+            blob_of(&scoped, "app")["commit_hash"],
+            blob_of(&full, "app")["commit_hash"],
+            "the app is analysed"
+        );
+        assert_app_rows(&scoped);
+    }
 }
 
 /// The client's kept rows file in `store`, and its record of what it was

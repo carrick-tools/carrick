@@ -423,6 +423,29 @@ async fn every_width_uploads_the_same_bytes_with_types() {
     widths_upload_the_same_bytes(true).await;
 }
 
+/// carrick#3085: with every service's compiler rows walked, each analysis
+/// admitted once the walks it reads have ended, on the budget the walks
+/// share, the blobs at every width are still the same bytes.
+#[tokio::test]
+#[serial]
+async fn every_width_uploads_the_same_bytes_with_walked_rows() {
+    // SAFETY: `#[serial]`, as in `mock_env`.
+    unsafe {
+        std::env::set_var("CARRICK_POSITION_ROWS", "1");
+    }
+    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        widths_upload_the_same_bytes(true),
+    ))
+    .await;
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var("CARRICK_POSITION_ROWS");
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// (c) A service that fails, declared second, stops none of the others: the
 /// other three land and the run returns that service's error, at width 1 as
 /// at width 4.

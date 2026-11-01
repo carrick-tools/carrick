@@ -1017,7 +1017,7 @@ mod tests {
         // What that cap buys on a laptop with 12 GB free: two services at
         // once where the default cap allows one.
         assert_eq!(
-            crate::engine::service_workers::width_with(5, Some(12_452), 12, Some(3072)),
+            crate::engine::service_workers::at_once_with(12_452, 12, Some(3072)),
             2
         );
     }
