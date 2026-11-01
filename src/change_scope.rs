@@ -771,30 +771,69 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
-/// Each service's scope, index for index with `services`, logged one line
-/// per service with a summary and the closure walk's wall time.
+/// The paths changed since each stored commit, listed once per commit for the
+/// whole run: [`plan`] reads them, and so does a pull request scan's type-reach
+/// decision (carrick#3102), so git is asked once.
 ///
-/// `stored_services` names every service this repository has a stored index
-/// for. An untracked `carrick.json` the runner wrote is no changed input only
-/// when it names exactly those services ([`scaffold_config_is_the_stored_one`]).
+/// An untracked `carrick.json` the runner wrote is no changed path when it
+/// names exactly the services this repository has a stored index for
+/// ([`scaffold_config_is_the_stored_one`]).
+pub struct ChangedSince {
+    repo_path: String,
+    scaffold_config: Option<String>,
+    listed: std::sync::Mutex<HashMap<String, Result<Vec<ChangedPath>, String>>>,
+}
+
+impl ChangedSince {
+    /// `stored_services` names every service this repository has a stored
+    /// index for.
+    pub fn new(repo_path: &str, services: &[Config], stored_services: &[Option<String>]) -> Self {
+        Self {
+            repo_path: repo_path.to_string(),
+            scaffold_config: scaffold_config_is_the_stored_one(services, stored_services)
+                .then(|| crate::git_state::untracked_root_config(repo_path))
+                .flatten(),
+            listed: Default::default(),
+        }
+    }
+
+    /// Every path that differs between `commit` and the working tree,
+    /// relative to the repository's top level ([`crate::git_state::changed_paths`]),
+    /// without the runner's own `carrick.json`. `Err` when git could not
+    /// compare.
+    pub fn since(&self, commit: &str) -> Result<Vec<ChangedPath>, String> {
+        self.listed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(commit.to_string())
+            .or_insert_with(|| {
+                let mut paths = crate::git_state::changed_paths(&self.repo_path, commit, None);
+                if let (Ok(paths), Some(config)) = (&mut paths, &self.scaffold_config) {
+                    paths.retain(|change| !(change.status == 'A' && &change.path == config));
+                }
+                paths
+            })
+            .clone()
+    }
+}
+
+/// Each service's scope, index for index with `services`, logged one line
+/// per service with a summary and the closure walk's wall time. `changes`
+/// lists what changed since each stored commit.
 pub fn plan<'a>(
     repo_path: &str,
     services: &[Config],
-    stored_services: &[Option<String>],
+    changes: &ChangedSince,
     stored: impl Fn(&Config) -> Option<&'a CloudRepoData>,
     this_run: ThisRun<'_>,
 ) -> Vec<Scope> {
     let top = crate::git_state::toplevel(repo_path).ok();
-    let scaffold_config = scaffold_config_is_the_stored_one(services, stored_services)
-        .then(|| crate::git_state::untracked_root_config(repo_path))
-        .flatten();
     let mut version_only: HashMap<(String, String), bool> = HashMap::new();
     // Listed once, and only when a `.gitignore` changed (carrick#3113).
     let untracked: std::cell::OnceCell<Option<Vec<String>>> = std::cell::OnceCell::new();
     let mut stops: HashMap<PathBuf, bool> = HashMap::new();
     let mut keeps_imports_of: HashMap<(String, String), bool> = HashMap::new();
     let mut moved_by_commit: HashMap<String, Option<DependencyMove>> = HashMap::new();
-    let mut changed_by_commit: HashMap<String, Result<Vec<ChangedPath>, String>> = HashMap::new();
     let mut closure_took = std::time::Duration::ZERO;
     let mut walked = 0usize;
     // Services in one repository share files (a contracts package every
@@ -805,20 +844,7 @@ pub fn plan<'a>(
         .map(|service| {
             let stored = stored(service);
             let config_json = serde_json::to_string(service).ok();
-            let changed = stored.map(|blob| {
-                changed_by_commit
-                    .entry(blob.commit_hash.clone())
-                    .or_insert_with(|| {
-                        let mut paths =
-                            crate::git_state::changed_paths(repo_path, &blob.commit_hash, None);
-                        if let (Ok(paths), Some(config)) = (&mut paths, &scaffold_config) {
-                            paths
-                                .retain(|change| !(change.status == 'A' && &change.path == config));
-                        }
-                        paths
-                    })
-                    .clone()
-            });
+            let changed = stored.map(|blob| changes.since(&blob.commit_hash));
             let changed = match &changed {
                 Some(Ok(paths)) => Ok(paths.as_slice()),
                 Some(Err(reason)) => Err(reason.as_str()),
@@ -2436,10 +2462,11 @@ mod tests {
         blobs: &[CloudRepoData],
         stored_names: &[Option<String>],
     ) -> Vec<Scope> {
+        let repo = repo.to_string_lossy();
         plan(
-            &repo.to_string_lossy(),
+            &repo,
             services,
-            stored_names,
+            &ChangedSince::new(&repo, services, stored_names),
             |service| {
                 blobs
                     .iter()

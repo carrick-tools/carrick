@@ -1,6 +1,6 @@
 // GET /api/v1/orders/:orderId, from the file name and the exported loader.
-
-export type Order = {
+import type { OrderRef } from "../../src/contracts";
+export type Order = OrderRef & {
   id: string;
   total: number;
   currency: string;

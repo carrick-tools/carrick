@@ -2643,6 +2643,39 @@ pub(crate) fn record_local_consumer(service_id: &str, consumer: LocalConsumer) {
         .insert(service_id.to_string(), consumer);
 }
 
+/// Each service's type-reach decision in this pull request run, by service
+/// id (carrick#3102), for the type stage's readers (carrick#3103 to
+/// carrick#3105). Filled as each service reaches its type stage.
+static TYPE_REACH: std::sync::Mutex<Option<HashMap<String, super::type_reach::ReachDecision>>> =
+    std::sync::Mutex::new(None);
+
+/// Keep a service's type-reach decision for the run.
+pub(super) fn record_type_reach(service_id: &str, decision: super::type_reach::ReachDecision) {
+    TYPE_REACH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(service_id.to_string(), decision);
+}
+
+/// Forget every kept type-reach decision: a run starts with none, so no
+/// decision of an earlier run in the process is read.
+pub(super) fn clear_type_reach() {
+    TYPE_REACH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+}
+
+/// Every type-reach decision this run has kept.
+pub(super) fn type_reach_decisions() -> HashMap<String, super::type_reach::ReachDecision> {
+    TYPE_REACH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
 /// Take every recorded local consumer, leaving none.
 pub(crate) fn take_local_consumers() -> LocalConsumers {
     LOCAL_CONSUMERS
