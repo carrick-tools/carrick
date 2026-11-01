@@ -116,7 +116,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `add_program_files`, `position_rows` and `implementations` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
+`init` resolves a project; `bundle`, `infer`, `retype_check`, `retype_prescreen`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `add_program_files`, `position_rows` and `implementations` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
 
 `capture_v2`, `check_v2`, `resolve_definitions`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -131,6 +131,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `check_v2` | no | Typecheck matched pairs across captured stubs |
 | `infer` | yes | Resolve the type at a set of locators |
 | `retype_check` | yes | Judge untyped consumer calls by retyping them with the producer's response |
+| `retype_prescreen` | yes | Say which consumer calls `retype_check` abstains for before any rewrite, without a producer type |
 | `verify_client_semantics` | yes | Check claims about an HTTP client library against its type declarations |
 | `verify_library_claims` | yes | Check library claims of every role against the package's own declarations |
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
@@ -443,6 +444,10 @@ Response:
 ```
 
 `budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. The scanner sends a service's items one file a request, so a request that fails costs only its own file's calls (carrick#1945). The first request goes to the scan's own process; the rest go to a pool of processes scoped to the same service, each request to whichever is free next (carrick#1996). A service has no time limit of its own: its requests go on while they keep finishing. The scan's whole retype has one ceiling (`RETYPE_SCAN_CEILING`, carrick#2021); once it passes, no request is sent, and the items of a request it did not send abstain in the same words, followed by "for the whole scan". `outcome` is `mismatch`, `agrees`, `wider` or `abstain`. `wider` answers an item that also carries `producer_unwidened_type`, the producer's response as its handler returns it with no literal widened (an `infer` response's `unwidened_type_string`): the published type added diagnostics and this one added none, so the producer's type is wider than what it sends (carrick#1516). Its `diagnostics` are the published type's. An abstention carries a `reason`: the call was not found, nothing reads its result, its result escapes to readers outside the file's own type-check (returned from a function with no declared return type, or bound to an exported name), the type parameter it would fill does not carry the response, the call takes no type parameter, the producer's type names something the consumer's program cannot resolve, or the producer's type, as the consumer's program reads it, is `unknown` as a whole or at a member, or is `any` there and the rewrite added no diagnostic (the reason names the member, e.g. `'unknown' at 'session'`). An `any` member can hide a diagnostic but never add one, so the diagnostics found beside it still make a `mismatch`. Diagnostics the file had before the rewrite never count.
+
+#### `retype_prescreen` - Decide a retype's abstentions before any rewrite
+
+Takes `retype_check`'s items without `producer_type`, `producer_unwidened_type` or `wire`, and answers one `prescreens` entry per item, in order: `{ item_id, reason }` when `retype_check` would abstain for that call before any rewrite (the call is not found, nothing reads its result, its result escapes the file, or no type can be stated at it), and `{ item_id }` when only the rewrite can decide it. The reasons are `retype_check`'s own, read by the same code; none depends on the producer's type. The scanner asks it in each service's own analysis, after adding the calls' files to the program, so a consumer whose calls all abstain here builds no retype program (carrick#3132). A call the prescreen throws on is left to `retype_check`.
 
 #### `verify_client_semantics` - Check a client library's claimed call shapes
 

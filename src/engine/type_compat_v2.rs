@@ -2663,6 +2663,12 @@ pub(crate) struct CallLocator {
     pub span_end: Option<u32>,
     pub expression_text: Option<String>,
     pub expression_line: Option<u32>,
+    /// Why the retype abstains for this call before any rewrite, whatever the
+    /// producer's type, as the consumer's own analysis read it
+    /// ([`prescreen_calls`], carrick#3132). `None` when only the rewrite can
+    /// decide the call, when the prescreen was not asked, and on a carried
+    /// consumer's stored locator.
+    pub prescreen: Option<String>,
 }
 
 /// A service scanned in THIS run, whose sources are on disk: the only kind of
@@ -2756,9 +2762,78 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
                 span_end: request.span_end,
                 expression_text: request.expression_text.clone(),
                 expression_line: request.expression_line,
+                prescreen: None,
             });
     }
     calls
+}
+
+/// Ask the consumer's own analysis which of its calls the retype abstains
+/// for before any rewrite, and keep each reason on its locator (carrick#3132).
+///
+/// None of those reasons reads the producer's type: the call cannot be
+/// located, nothing reads its result, the result escapes the file, or no
+/// type can be stated at it. Decided here, a call is never sent to the
+/// retype, and a consumer with no call left builds no retype program.
+///
+/// `sidecar` is the analysis process, scoped to the service. Every call's
+/// file joins its program first, sorted, as [`retype_service`] adds them. A
+/// prescreen that fails leaves every call to the retype.
+pub(crate) fn prescreen_calls(
+    sidecar: &TypeSidecar,
+    service_id: &str,
+    calls: &mut HashMap<String, CallLocator>,
+) {
+    use crate::services::type_sidecar::RetypePrescreenItem;
+    if calls.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut aliases: Vec<&String> = calls.keys().collect();
+    aliases.sort();
+    let items: Vec<RetypePrescreenItem> = aliases
+        .iter()
+        .map(|alias| {
+            let call = &calls[*alias];
+            RetypePrescreenItem {
+                item_id: (*alias).clone(),
+                file_path: call.file_path.clone(),
+                line_number: call.line_number,
+                span_start: call.span_start,
+                span_end: call.span_end,
+                expression_text: call.expression_text.clone(),
+                expression_line: call.expression_line,
+            }
+        })
+        .collect();
+    let mut files: Vec<PathBuf> = items
+        .iter()
+        .map(|item| PathBuf::from(&item.file_path))
+        .collect();
+    files.sort();
+    files.dedup();
+    let answers = sidecar
+        .add_program_files(&files)
+        .and_then(|_| sidecar.retype_prescreen(&items));
+    let answers = match answers {
+        Ok(answers) => answers,
+        Err(e) => {
+            warn!("Prescreening {service_id}'s consumer calls for the retype failed: {e}");
+            return;
+        }
+    };
+    let mut decided = 0;
+    for answer in answers {
+        if let Some(call) = calls.get_mut(&answer.item_id) {
+            decided += usize::from(answer.reason.is_some());
+            call.prescreen = answer.reason;
+        }
+    }
+    info!(
+        "Prescreened {service_id}'s consumer calls: {decided} of {} abstain before any rewrite, took {:.1}s",
+        items.len(),
+        started.elapsed().as_secs_f64()
+    );
 }
 
 /// The manifest entries a consumer call locator belongs to: consumer
@@ -2817,6 +2892,7 @@ pub(crate) fn stored_call_locators(
                 span_end: evidence.span_end,
                 expression_text: evidence.expression_text.clone(),
                 expression_line: evidence.expression_line,
+                prescreen: None,
             });
     }
     calls
@@ -2852,16 +2928,23 @@ const PRODUCER_WIDER_NOTE: &str = "the producer's declared response is wider tha
      accepts every value the handler sends";
 
 /// The retype items to send, grouped by consumer service so each service's
-/// program is built once. A pair qualifies when it is an HTTP response pair,
-/// its CONSUMER left the verdict unresolved, the consumer was scanned in this
-/// run (its file is on disk), and the producer published a response type with
-/// no `any`/`unknown` in it.
+/// program is built once, and the abstentions already decided. A pair
+/// qualifies when it is an HTTP response pair, its CONSUMER left the verdict
+/// unresolved, the consumer was scanned in this run (its file is on disk),
+/// and the producer published a response type with no `any`/`unknown` in it.
+///
+/// A qualifying pair whose call the consumer's analysis prescreened
+/// ([`prescreen_calls`]) is not sent: it abstains with that reason, as the
+/// retype would have before any rewrite (carrick#3132). A producer type the
+/// retype would refuse first (empty once on one line, or carrying a comment)
+/// is still sent, so its reason stays the retype's own.
 fn retype_items<'a>(
     pairs: &'a [BuiltPair],
     consumer_blamed: &HashSet<String>,
     local_consumers: &LocalConsumers,
-) -> BTreeMap<&'a str, Vec<RetypeItem>> {
+) -> (BTreeMap<&'a str, Vec<RetypeItem>>, Vec<RetypeOutcome>) {
     let mut by_service: BTreeMap<&str, Vec<RetypeItem>> = BTreeMap::new();
+    let mut decided = Vec::new();
     for pair in pairs {
         if !consumer_blamed.contains(&pair.spec.pair_key)
             || pair.spec.protocol != ProbeProtocol::Http
@@ -2882,6 +2965,19 @@ fn retype_items<'a>(
         else {
             continue;
         };
+        if let Some(reason) = call
+            .prescreen
+            .as_deref()
+            .filter(|_| retype_reads_producer_text(producer_type))
+        {
+            decided.push(RetypeOutcome {
+                item_id: pair.spec.pair_key.clone(),
+                outcome: RetypeVerdict::Abstain,
+                diagnostics: Vec::new(),
+                reason: Some(reason.to_string()),
+            });
+            continue;
+        }
         by_service
             .entry(pair.consumer_service.as_str())
             .or_default()
@@ -2905,7 +3001,16 @@ fn retype_items<'a>(
             });
     }
 
-    by_service
+    (by_service, decided)
+}
+
+/// Whether the retype reads past the producer's text to the call: the text
+/// is not empty once on one line and carries no comment, the two checks the
+/// sidecar makes before it locates the call (`Retyper.runOne`).
+fn retype_reads_producer_text(text: &str) -> bool {
+    let one_line = text.trim();
+    let one_line = one_line.strip_suffix(';').unwrap_or(one_line).trim();
+    !one_line.is_empty() && !text.contains("//") && !text.contains("/*")
 }
 
 /// The longest the retype check may run in one scan, across every service
@@ -2978,7 +3083,16 @@ fn retype_consumer_calls(
     local_consumers: &LocalConsumers,
     outcomes: &mut [PairCheckOutcome],
 ) {
-    let by_service = retype_items(pairs, consumer_blamed, local_consumers);
+    let (by_service, decided) = retype_items(pairs, consumer_blamed, local_consumers);
+    let decided: HashMap<&str, &RetypeOutcome> = decided
+        .iter()
+        .map(|answer| (answer.item_id.as_str(), answer))
+        .collect();
+    for outcome in outcomes.iter_mut() {
+        if let Some(answer) = decided.get(outcome.pair_key.as_str()) {
+            apply_retype(outcome, answer);
+        }
+    }
     let ceiling = RetypeCeiling::starting_now(RETYPE_SCAN_CEILING);
     for (service, items) in by_service {
         let answers = retype_service(
@@ -3712,6 +3826,7 @@ mod tests {
                         span_end: None,
                         expression_text: Some("api.post('/p')".to_string()),
                         expression_line: Some(8),
+                        prescreen: None,
                     },
                 )]),
             },
@@ -3725,7 +3840,7 @@ mod tests {
         let blamed = HashSet::from([pair.spec.pair_key.clone()]);
 
         let pairs = [pair];
-        let items = retype_items(&pairs, &blamed, &local);
+        let (items, _) = retype_items(&pairs, &blamed, &local);
         let web = &items["web"];
         assert_eq!(web.len(), 1);
         assert_eq!(web[0].item_id, pairs[0].spec.pair_key);
@@ -3735,9 +3850,13 @@ mod tests {
         assert!(web[0].wire, "an http response is judged in its wire form");
 
         // The producer, not the consumer, left it unresolved.
-        assert!(retype_items(&pairs, &HashSet::new(), &local).is_empty());
+        assert!(retype_items(&pairs, &HashSet::new(), &local).0.is_empty());
         // The consumer is a peer: its file is not on this machine.
-        assert!(retype_items(&pairs, &blamed, &LocalConsumers::new()).is_empty());
+        assert!(
+            retype_items(&pairs, &blamed, &LocalConsumers::new())
+                .0
+                .is_empty()
+        );
 
         // A producer type with a top type in it would let any read agree.
         let loose = [retype_pair(
@@ -3745,11 +3864,11 @@ mod tests {
             Some("{ id: string; meta: any; }"),
         )];
         let blamed_loose = HashSet::from([loose[0].spec.pair_key.clone()]);
-        assert!(retype_items(&loose, &blamed_loose, &local).is_empty());
+        assert!(retype_items(&loose, &blamed_loose, &local).0.is_empty());
         // No published producer type at all.
         let absent = [retype_pair(ManifestTypeKind::Response, None)];
         let blamed_absent = HashSet::from([absent[0].spec.pair_key.clone()]);
-        assert!(retype_items(&absent, &blamed_absent, &local).is_empty());
+        assert!(retype_items(&absent, &blamed_absent, &local).0.is_empty());
 
         // A request body is what the consumer SENDS; retyping its call says
         // nothing about it.
@@ -3758,7 +3877,57 @@ mod tests {
             Some("{ id: string; }"),
         )];
         let blamed_request = HashSet::from([request[0].spec.pair_key.clone()]);
-        assert!(retype_items(&request, &blamed_request, &local).is_empty());
+        assert!(retype_items(&request, &blamed_request, &local).0.is_empty());
+    }
+
+    /// carrick#3132: a call the consumer's analysis prescreened is not sent;
+    /// it abstains with the prescreen's reason. A pair that would not have
+    /// been sent takes no reason, and a producer text the retype refuses
+    /// before it reads the call is still sent, so its own reason stands.
+    #[test]
+    fn retype_items_decide_a_prescreened_call_without_sending_it() {
+        const WHY: &str = "the consumer never reads the response";
+        let mut local = web_consumer();
+        local
+            .get_mut("web")
+            .unwrap()
+            .calls
+            .get_mut("C")
+            .unwrap()
+            .prescreen = Some(WHY.to_string());
+
+        let pairs = [retype_pair(
+            ManifestTypeKind::Response,
+            Some("{ id: string; }"),
+        )];
+        let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
+        let (items, decided) = retype_items(&pairs, &blamed, &local);
+        assert!(items.is_empty(), "nothing is sent: {items:?}");
+        assert_eq!(
+            decided,
+            vec![RetypeOutcome {
+                item_id: pairs[0].spec.pair_key.clone(),
+                outcome: RetypeVerdict::Abstain,
+                diagnostics: Vec::new(),
+                reason: Some(WHY.to_string()),
+            }]
+        );
+
+        // Not the consumer's to settle: no reason is written on it.
+        let (items, decided) = retype_items(&pairs, &HashSet::new(), &local);
+        assert!(items.is_empty() && decided.is_empty());
+
+        for refused in [
+            "{ id: string; // note\n }",
+            "{ /* c */ id: string; }",
+            " ; ",
+        ] {
+            let pairs = [retype_pair(ManifestTypeKind::Response, Some(refused))];
+            let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
+            let (items, decided) = retype_items(&pairs, &blamed, &local);
+            assert!(decided.is_empty(), "{refused:?} keeps the retype's reason");
+            assert_eq!(items["web"].len(), 1, "{refused:?} is sent");
+        }
     }
 
     /// A pool size of `n` processes, for [`retype_service`].
@@ -4217,7 +4386,7 @@ mod tests {
         pair.producer_unwidened = Some("{ scope: \"all\" | \"specific\"; }".to_string());
         let blamed = HashSet::from([pair.spec.pair_key.clone()]);
         let pairs = [pair];
-        let items = retype_items(&pairs, &blamed, &local);
+        let (items, _) = retype_items(&pairs, &blamed, &local);
         assert_eq!(
             items["web"][0].producer_unwidened_type.as_deref(),
             Some("{ scope: \"all\" | \"specific\"; }")
@@ -4227,7 +4396,7 @@ mod tests {
         loose.producer_unwidened = Some("{ scope: \"all\"; meta: any; }".to_string());
         let blamed = HashSet::from([loose.spec.pair_key.clone()]);
         let loose = [loose];
-        let items = retype_items(&loose, &blamed, &local);
+        let (items, _) = retype_items(&loose, &blamed, &local);
         assert_eq!(
             items["web"][0].producer_unwidened_type, None,
             "a reading with a top type in it could agree with anything"
@@ -4782,6 +4951,7 @@ mod tests {
             span_end: None,
             expression_text: None,
             expression_line: None,
+            prescreen: None,
         };
         let calls = HashMap::from([
             (
@@ -10871,6 +11041,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                                 span_end: None,
                                 expression_text: None,
                                 expression_line: None,
+                                prescreen: None,
                             },
                         )
                     })

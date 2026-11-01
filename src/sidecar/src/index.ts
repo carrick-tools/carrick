@@ -64,6 +64,7 @@ import type {
   InferResponse,
   ResolveDefinitionsResponse,
   RetypeCheckResponse,
+  RetypePrescreenResponse,
   VerifyClientSemanticsResponse,
   VerifyLibraryClaimsResponse,
   ListLibrarySurfaceResponse,
@@ -714,6 +715,43 @@ function handleRetypeCheck(
 }
 
 /**
+ * Handle the 'retype_prescreen' action - say, per consumer call, the reason
+ * the retype abstains for before any rewrite, read in the program the scan
+ * analysed (carrick#3132)
+ */
+function handleRetypePrescreen(
+  request: SidecarRequest & { action: 'retype_prescreen' }
+): RetypePrescreenResponse {
+  try {
+    const groups = byProject(
+      request.items.map((item, index) => ({ item, index })),
+      ({ item }) => item.file_path
+    );
+    const reasons = new Array<string | undefined>(request.items.length);
+    for (const [key, entries] of groups) {
+      projectComponents(key)
+        .retyper.prescreen(entries.map(({ item }) => item))
+        .forEach((reason, position) => {
+          reasons[entries[position].index] = reason;
+        });
+    }
+    return {
+      request_id: request.request_id,
+      status: 'success',
+      prescreens: request.items.map((item, index) =>
+        reasons[index] === undefined
+          ? { item_id: item.item_id }
+          : { item_id: item.item_id, reason: reasons[index] }
+      ),
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Retype prescreen failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * How long one verify_client_semantics or verify_library_claims request may
  * spend before the checks it has not reached come back `unchecked` with reason
  * `budget`. The first request on a service may pay the program build, which
@@ -1073,6 +1111,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleResolveDefinitions(request);
     case 'retype_check':
       return handleRetypeCheck(request);
+    case 'retype_prescreen':
+      return handleRetypePrescreen(request);
     case 'verify_client_semantics':
       return handleVerifyClientSemantics(request);
     case 'verify_library_claims':

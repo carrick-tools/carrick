@@ -477,7 +477,7 @@ export interface ResolveDefinitionsRequest extends BaseRequest {
  * The locator is the one the consumer's `call_result` inference used: a span,
  * or expression text near a line.
  */
-export interface RetypeItem {
+export interface RetypeLocatorItem {
   /** Caller key, echoed on the outcome. */
   item_id: string;
   /** Absolute path, or relative to the init'd root. */
@@ -487,6 +487,9 @@ export interface RetypeItem {
   span_end?: number;
   expression_text?: string;
   expression_line?: number;
+}
+
+export interface RetypeItem extends RetypeLocatorItem {
   /** The producer's response type as TypeScript text, fully inlined. */
   producer_type: string;
   /**
@@ -497,6 +500,28 @@ export interface RetypeItem {
   producer_unwidened_type?: string;
   /** Judge the form JSON puts on the wire (an `http` response). */
   wire: boolean;
+}
+
+/**
+ * Ask, without a producer type, which consumer calls the retype abstains for
+ * before any rewrite (carrick#3132). Needs `init`: it reads the consumer's
+ * real program, as `retype_check` does.
+ */
+export interface RetypePrescreenRequest extends BaseRequest {
+  action: 'retype_prescreen';
+  items: RetypeLocatorItem[];
+}
+
+/** One call's prescreen: `reason` when the retype abstains before any rewrite. */
+export interface RetypePrescreen {
+  item_id: string;
+  reason?: string;
+}
+
+export interface RetypePrescreenResponse extends BaseResponse {
+  /** One per item, in request order. */
+  prescreens?: RetypePrescreen[];
+  errors?: string[];
 }
 
 /**
@@ -879,6 +904,7 @@ export interface ListLibrarySurfaceRequest extends BaseRequest {
  */
 export type SidecarRequest =
   | RetypeCheckRequest
+  | RetypePrescreenRequest
   | VerifyClientSemanticsRequest
   | VerifyLibraryClaimsRequest
   | ListLibrarySurfaceRequest
@@ -1494,6 +1520,7 @@ export interface ListLibrarySurfaceResponse extends BaseResponse {
  */
 export type SidecarResponse =
   | RetypeCheckResponse
+  | RetypePrescreenResponse
   | VerifyClientSemanticsResponse
   | VerifyLibraryClaimsResponse
   | ListLibrarySurfaceResponse

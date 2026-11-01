@@ -9563,7 +9563,11 @@ fn run_capture_for_service(
         .service_name
         .clone()
         .unwrap_or_else(|| cloud_data.repo_name.clone());
-    let calls = type_compat_v2::consumer_call_locators(&infer);
+    let mut calls = type_compat_v2::consumer_call_locators(&infer);
+    // The calls the retype abstains for before any rewrite are decided here,
+    // in the program this analysis built, before the capture restarts the
+    // process (carrick#3132).
+    type_compat_v2::prescreen_calls(sidecar, &service_id, &mut calls);
     // Stored with the blob, so a run that carries this service retypes the
     // same calls (carrick#2567).
     if let Some(manifest) = cloud_data.type_manifest.as_mut() {
