@@ -157,6 +157,10 @@ struct Scope {
     /// call()`), with the value they are read from: each is a part of it, not
     /// the value itself.
     parts: HashMap<String, Vec<Expr>>,
+    /// For a name in `parts`, the one member of the value it is read from
+    /// (`{ data }` and `{ data: d }` name `data`); `None` for a name taken by
+    /// a rest element, a computed key, a nested or an array pattern.
+    part_members: HashMap<String, Option<String>>,
 }
 
 impl Visit for Scope {
@@ -167,8 +171,11 @@ impl Visit for Scope {
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
         if let Some(init) = &declarator.init {
             let whole = matches!(declarator.name, Pat::Ident(_));
+            let members = destructured_members(&declarator.name);
             for name in pattern_names(&declarator.name) {
                 if !whole {
+                    self.part_members
+                        .insert(name.clone(), members.get(&name).cloned());
                     self.parts
                         .entry(name.clone())
                         .or_default()
@@ -191,6 +198,61 @@ impl Visit for Scope {
     fn visit_function(&mut self, _: &Function) {}
     fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
     fn visit_class(&mut self, _: &Class) {}
+}
+
+/// The member of the destructured value each name of a top-level object
+/// pattern reads: `{ data }` and `{ data: d }`. A name taken any other way (a
+/// rest element, a computed key, a nested pattern, an array pattern) is not
+/// listed.
+fn destructured_members(pat: &Pat) -> HashMap<String, String> {
+    let mut members = HashMap::new();
+    let Pat::Object(object) = pat else {
+        return members;
+    };
+    for prop in &object.props {
+        match prop {
+            swc_ecma_ast::ObjectPatProp::Assign(assign) => {
+                let name = assign.key.id.sym.to_string();
+                members.insert(name.clone(), name);
+            }
+            swc_ecma_ast::ObjectPatProp::KeyValue(kv) => {
+                let key = match &kv.key {
+                    swc_ecma_ast::PropName::Ident(ident) => Some(ident.sym.to_string()),
+                    swc_ecma_ast::PropName::Str(text) => {
+                        Some(text.value.to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                };
+                let value = match &*kv.value {
+                    Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+                    Pat::Assign(assign) => match &*assign.left {
+                        Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((key, value)) = key.zip(value) {
+                    members.insert(value, key);
+                }
+            }
+            swc_ecma_ast::ObjectPatProp::Rest(_) => {}
+        }
+    }
+    members
+}
+
+/// The one member a property names in the source: `.data` or `["data"]`.
+fn member_name(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(ident) => Some(ident.sym.to_string()),
+        MemberProp::Computed(computed) => match &*computed.expr {
+            Expr::Lit(swc_ecma_ast::Lit::Str(text)) => {
+                Some(text.value.to_string_lossy().into_owned())
+            }
+            _ => None,
+        },
+        MemberProp::PrivateName(_) => None,
+    }
 }
 
 fn pattern_names(pat: &Pat) -> Vec<String> {
@@ -348,11 +410,18 @@ pub enum ShapeKind {
 }
 
 /// What a function returns, when that is one call's value read one way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReturnShape {
     pub kind: ShapeKind,
     /// The call whose value is read.
     pub base: Span,
+    /// For [`ShapeKind::Member`], the member read (`.data`, `["data"]`,
+    /// `?.data`, `{ data }`, `{ data: d }`); `None` for a rest element, a
+    /// computed key or any other way of taking the value apart.
+    pub member: Option<String>,
+    /// The call's value goes through `.then`, `.catch` or `.finally` before
+    /// it is returned, so what is returned is not that value (carrick#2820).
+    pub derived: bool,
 }
 
 /// Every function of `module`, by the span of its node, with what it returns:
@@ -426,7 +495,7 @@ fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {
         }
     }
     match shapes.as_slice() {
-        [one] => Some(*one),
+        [one] => Some(one.clone()),
         _ => None,
     }
 }
@@ -443,6 +512,9 @@ struct Resolved<'a> {
     expr: &'a Expr,
     /// Read off a bigger value by taking it apart.
     part: bool,
+    /// The one member that was taken, when the value was taken apart once and
+    /// the pattern names it.
+    member: Option<String>,
 }
 
 /// Names followed at most this far.
@@ -451,6 +523,8 @@ const MAX_NAME_HOPS: usize = 8;
 fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
     let mut expr = expr;
     let mut part = false;
+    let mut member: Option<String> = None;
+    let mut parts_met = 0;
     for _ in 0..MAX_NAME_HOPS {
         expr = match expr {
             Expr::Await(awaited) => &awaited.arg,
@@ -464,7 +538,11 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
                 let name: &str = &ident.sym;
                 match scope.given.get(name).map(Vec::as_slice) {
                     Some([only]) => {
-                        part |= scope.parts.contains_key(name);
+                        if scope.parts.contains_key(name) {
+                            part = true;
+                            parts_met += 1;
+                            member = scope.part_members.get(name).cloned().flatten();
+                        }
                         only
                     }
                     _ => break,
@@ -473,48 +551,91 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
             _ => break,
         };
     }
-    Resolved { expr, part }
+    Resolved {
+        expr,
+        part,
+        member: member.filter(|_| parts_met == 1),
+    }
 }
 
 fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
     let value = resolve(returned, scope);
-    let base_of = |obj: &Expr| -> Option<Span> {
+    // The call a value is read off, and whether its value is run through
+    // `.then`, `.catch` or `.finally` first.
+    let base_of = |obj: &Expr| -> Option<(Span, bool)> {
         let obj = resolve(obj, scope);
         match obj.expr {
             // A parse or a member of a value already read once is two reads.
-            Expr::Call(call) if !obj.part && !is_parse(call) => Some(call.span),
+            Expr::Call(call) if !obj.part && !is_parse(call) => Some((call.span, derives(call))),
             _ => None,
         }
     };
-    let shape = |kind, base| Some(Returned::Shape(ReturnShape { kind, base }));
+    let shape = |kind, base: (Span, bool), member| {
+        Some(Returned::Shape(ReturnShape {
+            kind,
+            base: base.0,
+            member,
+            derived: base.1,
+        }))
+    };
     match value.expr {
         Expr::Ident(ident) if &*ident.sym == "undefined" => Some(Returned::NoBody),
         Expr::Lit(swc_ecma_ast::Lit::Null(_)) => Some(Returned::NoBody),
         Expr::Unary(unary) if unary.op == swc_ecma_ast::UnaryOp::Void => Some(Returned::NoBody),
         // `const { data } = await call(); return data`
-        Expr::Call(call) if value.part => shape(ShapeKind::Member, call.span),
+        Expr::Call(call) if value.part => shape(
+            ShapeKind::Member,
+            (call.span, derives(call)),
+            value.member.clone(),
+        ),
         _ if value.part => None,
         Expr::Call(call) => match &call.callee {
             Callee::Expr(callee) if is_parse(call) => {
                 let Expr::Member(member) = &**callee else {
                     return None;
                 };
-                shape(ShapeKind::Parsed, base_of(&member.obj)?)
+                shape(ShapeKind::Parsed, base_of(&member.obj)?, None)
             }
-            _ => shape(ShapeKind::Value, call.span),
+            _ => shape(ShapeKind::Value, (call.span, derives(call)), None),
         },
         Expr::OptChain(chain) => match &*chain.base {
-            OptChainBase::Member(member) if reads_one_member(&member.prop) => {
-                shape(ShapeKind::Member, base_of(&member.obj)?)
-            }
-            OptChainBase::Call(_) => shape(ShapeKind::Value, chain.span),
+            OptChainBase::Member(member) if member_name(&member.prop).is_some() => shape(
+                ShapeKind::Member,
+                base_of(&member.obj)?,
+                member_name(&member.prop),
+            ),
+            OptChainBase::Call(call) => shape(
+                ShapeKind::Value,
+                (chain.span, call_derives(&call.callee)),
+                None,
+            ),
             _ => None,
         },
-        Expr::Member(member) if reads_one_member(&member.prop) => {
-            shape(ShapeKind::Member, base_of(&member.obj)?)
-        }
+        Expr::Member(member) if member_name(&member.prop).is_some() => shape(
+            ShapeKind::Member,
+            base_of(&member.obj)?,
+            member_name(&member.prop),
+        ),
         _ => None,
     }
+}
+
+/// Whether a call hands back its receiver's value run through a callback:
+/// `<value>.then(f)`, `.catch(f)`, `.finally(f)`.
+fn derives(call: &CallExpr) -> bool {
+    match &call.callee {
+        Callee::Expr(callee) => call_derives(callee),
+        _ => false,
+    }
+}
+
+fn call_derives(callee: &Expr) -> bool {
+    matches!(
+        callee,
+        Expr::Member(member)
+            if matches!(&member.prop, MemberProp::Ident(name)
+                if matches!(&*name.sym, "then" | "catch" | "finally"))
+    )
 }
 
 /// `<value>.json()`: the platform's parse of a response.
@@ -528,17 +649,6 @@ fn is_parse(call: &CallExpr) -> bool {
                     if matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "json")
             )
         )
-}
-
-/// A property named in the source: `.data` or `["data"]`.
-fn reads_one_member(prop: &MemberProp) -> bool {
-    match prop {
-        MemberProp::Ident(_) => true,
-        MemberProp::Computed(computed) => {
-            matches!(&*computed.expr, Expr::Lit(swc_ecma_ast::Lit::Str(_)))
-        }
-        MemberProp::PrivateName(_) => false,
-    }
 }
 
 #[cfg(test)]
@@ -663,7 +773,9 @@ mod tests {
         .expect("parses");
         let shapes = return_shapes(&module);
         let (_, shape) = shapes.first().expect("a function");
-        shape.map(|shape| (shape.kind, cm.span_to_snippet(shape.base).unwrap()))
+        shape
+            .clone()
+            .map(|shape| (shape.kind, cm.span_to_snippet(shape.base).unwrap()))
     }
 
     fn of(kind: ShapeKind, base: &str) -> Option<(ShapeKind, String)> {
@@ -705,6 +817,120 @@ mod tests {
             "async function f(o) { const { data: body } = await call(o); return body; }",
         ] {
             assert_eq!(shape(source), of(ShapeKind::Member, "call(o)"), "{source}");
+        }
+    }
+
+    /// The member and the derived flag of the first function's shape.
+    fn read(source: &str) -> Option<(ShapeKind, Option<String>, bool)> {
+        let cm: Lrc<SourceMap> = Default::default();
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("t.ts".into())),
+            source.to_string(),
+        );
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("parses");
+        let shapes = return_shapes(&module);
+        let (_, shape) = shapes.first().expect("a function");
+        shape
+            .clone()
+            .map(|shape| (shape.kind, shape.member, shape.derived))
+    }
+
+    /// carrick#2820: a member read names its member whichever way it is
+    /// written; a name taken by a rest element, a computed key or a nested
+    /// pattern names none.
+    #[test]
+    fn a_member_read_names_its_member() {
+        for (source, member) in [
+            (
+                "async function f(o) { return (await call(o)).data; }",
+                Some("data"),
+            ),
+            (
+                "async function f(o) { return (await call(o)).status; }",
+                Some("status"),
+            ),
+            (
+                "async function f(o) { const r = await call(o); return r?.data; }",
+                Some("data"),
+            ),
+            (
+                "async function f(o) { const r = await call(o); return r[\"data\"]; }",
+                Some("data"),
+            ),
+            (
+                "async function f(o) { const { data } = await call(o); return data; }",
+                Some("data"),
+            ),
+            (
+                "async function f(o) { const { data: d } = await call(o); return d; }",
+                Some("data"),
+            ),
+            (
+                "async function f(o) { const { data = 1 } = await call(o); return data; }",
+                Some("data"),
+            ),
+            (
+                "async function f(o) { const { ...rest } = await call(o); return rest; }",
+                None,
+            ),
+            (
+                "async function f(o) { const { [o.key]: v } = await call(o); return v; }",
+                None,
+            ),
+            (
+                "async function f(o) { const { a: { data } } = await call(o); return data; }",
+                None,
+            ),
+            (
+                "async function f(o) { const [first] = await call(o); return first; }",
+                None,
+            ),
+        ] {
+            assert_eq!(
+                read(source),
+                Some((ShapeKind::Member, member.map(str::to_string), false)),
+                "{source}"
+            );
+        }
+        // A key that is no literal is no member read at all.
+        assert_eq!(
+            read("async function f(o) { const r = await call(o); return r[o.key]; }"),
+            None
+        );
+    }
+
+    /// carrick#2820: a call whose value goes through `.then`, `.catch` or
+    /// `.finally` before it is returned is marked, so no label stands for it.
+    #[test]
+    fn a_value_run_through_a_promise_callback_is_derived() {
+        for source in [
+            "function f(o) { return call(o).then((r) => r.x); }",
+            "function f(o) { return call(o).catch(() => null); }",
+            "function f(o) { return call(o).finally(() => done()); }",
+            "async function f(o) { return (await call(o).catch(() => null)).data; }",
+            "async function f(o) { const { data } = await call(o).catch(() => null); return data; }",
+        ] {
+            assert!(
+                read(source).is_some_and(|(_, _, derived)| derived),
+                "{source}"
+            );
+        }
+        for source in [
+            "function f(o) { return call(o); }",
+            "function f(o) { return client.get(o); }",
+            "async function f(o) { return (await call(o)).data; }",
+        ] {
+            assert!(
+                read(source).is_some_and(|(_, _, derived)| !derived),
+                "{source}"
+            );
         }
     }
 
