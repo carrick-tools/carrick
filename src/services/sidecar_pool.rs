@@ -39,7 +39,7 @@ pub const POOL_ENV: &str = "CARRICK_SIDECAR_POOL";
 
 /// The most processes one pool runs, whatever the machine holds: past a few,
 /// the processes compete for the same memory bandwidth and disk.
-const MAX_PROCESSES: usize = 4;
+pub(crate) const MAX_PROCESSES: usize = 4;
 
 /// How many processes a pool runs, and why, for the scan's log.
 #[derive(Debug, Clone, PartialEq, Eq)]
