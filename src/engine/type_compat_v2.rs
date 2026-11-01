@@ -11289,6 +11289,17 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             !settles(&blobs, &["web"], HashMap::new()),
             "api has no decision"
         );
+        // A service that kept main's types (carrick#3103) has main's rows,
+        // whose aliases need not be the ones its decision named: it settles
+        // as a carried service does.
+        let kept = HashMap::from([(
+            "web".to_string(),
+            super::super::type_reach::ReachDecision::Partial {
+                reached: Default::default(),
+                unreached: ["C8 as this run spelled it".to_string()].into(),
+            },
+        )]);
+        assert!(settles(&blobs, &["api"], kept), "web kept main's types");
         assert!(
             !settles(&main_blobs(&[outcome(false)]), &both, HashMap::new()),
             "an outcome the run caused"

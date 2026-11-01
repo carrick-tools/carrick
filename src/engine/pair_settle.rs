@@ -5,8 +5,9 @@
 //! (`CloudRepoData::pair_outcomes`), each with the hash of everything the
 //! pair was judged on. A pull request run settles a pair, instead of judging
 //! and retyping it, when:
-//! - each side is a service the run carries, or an alias its type-reach
-//!   decision left unreached (carrick#3102);
+//! - each side is a service the run carries or that kept main's types
+//!   (carrick#3103), or an alias its type-reach decision left unreached
+//!   (carrick#3102);
 //! - both services' stored generations are at one commit, written by this
 //!   run's build, from a clean tree;
 //! - the consumer's stored record was written at that commit by this build,
@@ -164,13 +165,18 @@ impl SettleFrom {
         }
     }
 
-    /// Whether this run's change cannot reach `alias` of `service`.
+    /// Whether this run's change cannot reach `alias` of `service`. A service
+    /// that kept main's types (carrick#3103) counts as carried: its rows are
+    /// main's, so its pairs' aliases need not be the ones its decision named.
     fn unreached(&self, service: &str, alias: &str) -> bool {
         self.carried.contains(service)
-            || matches!(
-                self.reach.get(service),
-                Some(ReachDecision::Partial { unreached, .. }) if unreached.contains(alias)
-            )
+            || self.reach.get(service).is_some_and(|decision| {
+                decision.keeps_main_types()
+                    || matches!(
+                        decision,
+                        ReachDecision::Partial { unreached, .. } if unreached.contains(alias)
+                    )
+            })
     }
 
     /// Main's outcome for `pair`, when the pair settles.
