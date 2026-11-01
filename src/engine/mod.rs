@@ -3259,42 +3259,40 @@ impl ServiceScan {
     /// `previous`, its stored generation, publish them for the analysis and
     /// ask them. On a thread of its own, since it reads and parses the
     /// service's files, and quietly: the analysis says what it finds.
-    fn ask_ahead(
+    async fn ask_ahead(
         self: std::sync::Arc<Self>,
         at: usize,
         previous: Option<std::sync::Arc<CloudRepoData>>,
-    ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        async move {
-            let Some(board) = self.ahead.clone() else {
-                return;
-            };
-            // A first index asks nothing ahead (`analyze_current_repo`).
-            let Some(previous) =
-                previous.filter(|previous| previous.cache_version == Some(CACHE_VERSION))
-            else {
-                return;
-            };
-            let name = self.services[at].service_name.clone();
-            // Where the run's log is written: the lane says there what it
-            // asks, and nothing else.
-            let log = tracing::dispatcher::get_default(Clone::clone);
-            // A panic in the lane is a miss: quiet, so the run is not
-            // reported dead, and caught here, so the lane goes on to the next
-            // service. The analysis asks for whatever was not handed to it.
-            let asked =
-                service_workers::on_a_thread(format!("carrick-ahead-{}", at + 1), move |runtime| {
-                    runtime.block_on(crate::panic_report::quiet(
-                        tracing::instrument::WithSubscriber::with_subscriber(
-                            crate::current_service::asked_for(
-                                name,
-                                self.build_and_ask_ahead(at, &previous, &board, log),
-                            ),
-                            tracing::subscriber::NoSubscriber::default(),
+    ) {
+        let Some(board) = self.ahead.clone() else {
+            return;
+        };
+        // A first index asks nothing ahead (`analyze_current_repo`).
+        let Some(previous) =
+            previous.filter(|previous| previous.cache_version == Some(CACHE_VERSION))
+        else {
+            return;
+        };
+        let name = self.services[at].service_name.clone();
+        // Where the run's log is written: the lane says there what it
+        // asks, and nothing else.
+        let log = tracing::dispatcher::get_default(Clone::clone);
+        // A panic in the lane is a miss: quiet, so the run is not
+        // reported dead, and caught here, so the lane goes on to the next
+        // service. The analysis asks for whatever was not handed to it.
+        let asked =
+            service_workers::on_a_thread(format!("carrick-ahead-{}", at + 1), move |runtime| {
+                runtime.block_on(crate::panic_report::quiet(
+                    tracing::instrument::WithSubscriber::with_subscriber(
+                        crate::current_service::asked_for(
+                            name,
+                            self.build_and_ask_ahead(at, &previous, &board, log),
                         ),
-                    ))
-                });
-            let _ = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(asked)).await;
-        }
+                        tracing::subscriber::NoSubscriber::default(),
+                    ),
+                ))
+            });
+        let _ = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(asked)).await;
     }
 
     /// [`Self::ask_ahead`] on its thread. Returns, asking nothing, wherever
