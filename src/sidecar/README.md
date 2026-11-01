@@ -449,6 +449,33 @@ Response:
 
 Takes `retype_check`'s items without `producer_type`, `producer_unwidened_type` or `wire`, and answers one `prescreens` entry per item, in order: `{ item_id, reason }` when `retype_check` would abstain for that call before any rewrite (the call is not found, nothing reads its result, its result escapes the file, or no type can be stated at it), and `{ item_id }` when only the rewrite can decide it. The reasons are `retype_check`'s own, read by the same code; none depends on the producer's type. The scanner asks it in each service's own analysis, after adding the calls' files to the program, so a consumer whose calls all abstain here builds no retype program (carrick#3132). A call the prescreen throws on is left to `retype_check`.
 
+```json
+{
+  "request_id": "6",
+  "action": "retype_prescreen",
+  "items": [
+    {
+      "item_id": "web/Endpoint_9f8e_Response",
+      "file_path": "/abs/web/src/orders.ts",
+      "line_number": 12,
+      "expression_text": "api.post('/orders')",
+      "expression_line": 12
+    }
+  ]
+}
+```
+
+Response:
+```json
+{
+  "request_id": "6",
+  "status": "success",
+  "prescreens": [
+    { "item_id": "web/Endpoint_9f8e_Response", "reason": "the consumer never reads the response" }
+  ]
+}
+```
+
 #### `verify_client_semantics` - Check a client library's claimed call shapes
 
 The scanner reads a call through an HTTP client library (its base-URL factory, its verbs, its request call) only after this action has checked each claim about that library against the package's own type declarations (carrick#1564). A claim is checked on a receiver: `export`, the export itself, or `instance:<factory>`, what that factory member of the export returns. Module resolution starts at `from_dir`, the absolute service root, under the compiler options `init` resolved: a probe file there imports the export, inside the service's program, and is removed before the action answers.
