@@ -18,8 +18,8 @@
 //!   service asks.
 //! - A sibling with no compiler rows is no sibling: its code cannot be walked.
 //! - **Read from its walk's slot** ([`walk_lane::Slots`]), filled as the walk
-//!   ends. A service's analysis starts once the walks its rows reach have
-//!   ended ([`SiblingRegistry::declared_in`], carrick#3085).
+//!   ends. A service's analysis starts once the walks it may read have
+//!   ended ([`SiblingRegistry::walks_read_by`], carrick#3085).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -150,13 +150,43 @@ impl SiblingRegistry {
         self.walks.as_ref()?.get(service)
     }
 
-    /// The declared services whose files the calls the rows `positions` hold
-    /// are declared in: the services a walk's rows reach, which its
-    /// analysis waits for (carrick#3085).
-    pub(super) fn declared_in(
+    /// The declared services whose walks a read of the declared service
+    /// `service`, whose rows are `positions`, may enter: the walks its
+    /// analysis waits for, and those of every service that reads it
+    /// (carrick#3085). The services its rows' calls are declared in, closed
+    /// over theirs by the gate.
+    ///
+    /// A call through an import the compiler did not resolve is followed on
+    /// the call graph instead (carrick#2557), into any service, named by no
+    /// row. Rows that may hold one read every analysed service's walk, as
+    /// every analysis did before the gate, and through those walks' rows the
+    /// carried services they reach.
+    pub(super) fn walks_read_by(
         &self,
+        service: usize,
         positions: &crate::position_rows::PositionIndex,
     ) -> BTreeSet<usize> {
+        let mut reads = self.declared_in(positions);
+        if positions.may_call_through_an_unresolved_import() {
+            info!(
+                "The rows of {} may call through an unresolved import; a read of it waits for \
+                 every service's walk",
+                label_of(&self.services[service])
+            );
+            reads.extend(
+                self.analysed_at
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, at)| *index != service && at.is_some())
+                    .map(|(index, _)| index),
+            );
+        }
+        reads
+    }
+
+    /// The declared services whose files the calls the rows `positions` hold
+    /// are declared in.
+    fn declared_in(&self, positions: &crate::position_rows::PositionIndex) -> BTreeSet<usize> {
         let owners = self.owners();
         positions
             .call_rows()
@@ -210,15 +240,23 @@ impl SiblingRegistry {
         if declared_in.is_empty() {
             return Siblings::default();
         }
-        let mut pending: Vec<usize> = self.owners_of(&declared_in).into_iter().collect();
+        // Each service to read, and whether the rows that named it were
+        // joined: without them every call was read from the call graph.
+        let joined = inputs.row_calls.is_some();
+        let mut pending: Vec<(usize, bool)> = self
+            .owners_of(&declared_in)
+            .into_iter()
+            .map(|index| (index, joined))
+            .collect();
         let mut reached: BTreeMap<usize, Arc<Sibling>> = BTreeMap::new();
         let mut passed: BTreeSet<usize> = BTreeSet::from([own]);
-        while let Some(index) = pending.pop() {
+        while let Some((index, joined)) = pending.pop() {
             if !passed.insert(index) {
                 continue;
             }
-            if let Some(sibling) = self.sibling(own, index, walks) {
-                pending.extend(sibling.outside.iter().copied());
+            if let Some(sibling) = self.sibling(own, index, joined, walks) {
+                let joined = sibling.inputs.row_calls.is_some();
+                pending.extend(sibling.outside.iter().map(|next| (*next, joined)));
                 reached.insert(index, sibling);
             }
         }
@@ -230,13 +268,20 @@ impl SiblingRegistry {
     /// The declared service `index` read for a walk of `own`, once for the
     /// run, from its walk.
     ///
-    /// The analysis of `own` waits for the walks its rows reach (carrick#3085),
-    /// so a walk it reads has ended. A call whose rows hold an unresolved
-    /// import is followed on the call graph instead (carrick#2557), into a
-    /// service the rows did not name and the gate did not wait for: when that
-    /// service's walk has not ended yet, it is read as not walked, this once,
-    /// and the next read tries again.
-    fn sibling(&self, own: usize, index: usize, walks: &walk_lane::Slots) -> Option<Arc<Sibling>> {
+    /// The analysis of `own` waits for every walk it may read
+    /// ([`Self::walks_read_by`], carrick#3085), so with the rows that named
+    /// `index` `joined`, its walk has ended. Rows whose join missed its
+    /// deadline (carrick#2574) read every call from the call graph, which the
+    /// gate, decided at the walk's end, cannot foresee: then a walk that has
+    /// not ended is read as not walked, this once, and the next read tries
+    /// again.
+    fn sibling(
+        &self,
+        own: usize,
+        index: usize,
+        joined: bool,
+        walks: &walk_lane::Slots,
+    ) -> Option<Arc<Sibling>> {
         let Some(walked) = walks.get(index) else {
             if self.analysed_at[index].is_some() || walks.is_walking(index) {
                 info!(
@@ -247,7 +292,7 @@ impl SiblingRegistry {
                     label_of(&self.services[index]),
                 );
                 debug_assert!(
-                    false,
+                    !joined,
                     "{} was read before its walk ended: the gate missed it",
                     label_of(&self.services[index])
                 );

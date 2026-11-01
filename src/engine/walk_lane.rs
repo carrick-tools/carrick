@@ -14,9 +14,11 @@
 //!   the loop instead, after that service's walk, undoes carrick#1895: the
 //!   loop would wait for every setup again.
 //! * **Each analysis waits for the walks it reads, and no other.** Its own,
-//!   and those of every service its rows reach, closed over theirs. A
-//!   carried service those rows reach is walked once, on demand, or filled
-//!   with the rows an earlier pass kept ([`reuse`], carrick#3027).
+//!   and those of every service its rows reach, closed over theirs; every
+//!   analysed service's when its rows may call through an unresolved import
+//!   ([`ReachesOf`]). A carried service those rows reach is walked once, on
+//!   demand, or filled with the rows an earlier pass kept ([`reuse`],
+//!   carrick#3027).
 //! * **A walk is sized by a walk's memory** ([`ServiceMemory::for_walk`]),
 //!   and one that dies of memory below the run's cap is walked once more,
 //!   alone, at the run's cap; its setup and its analysis wait for that walk.
@@ -48,10 +50,10 @@ pub(super) type WalkEnded = oneshot::Receiver<()>;
 /// name: [`crate::position_rows::destination`] in a scan.
 pub(super) type Place = Arc<dyn Fn(&str, Option<&str>) -> Option<Destination> + Send + Sync>;
 
-/// The services a walk's rows reach, by declared position
-/// ([`super::siblings::SiblingRegistry::declared_in`]); none when no sibling
-/// is ever read.
-pub(super) type ReachesOf = Arc<dyn Fn(&Walked) -> BTreeSet<usize> + Send + Sync>;
+/// The services the walk of a declared service reaches, by declared
+/// position ([`super::siblings::SiblingRegistry::walks_read_by`]); none when
+/// no sibling is ever read.
+pub(super) type ReachesOf = Arc<dyn Fn(usize, &Walked) -> BTreeSet<usize> + Send + Sync>;
 
 /// One service's walk, as the run keeps it until it ends.
 #[derive(Debug)]
@@ -261,7 +263,7 @@ impl Lane {
                 let reaches = if died || walked.rows.is_none() {
                     BTreeSet::new()
                 } else {
-                    reaches_of(&walked)
+                    reaches_of(service, &walked)
                 };
                 WalkDone {
                     walked,
@@ -322,7 +324,7 @@ impl Lane {
             match reuse(&self.repo_path, &self.services[service], commit) {
                 Ok(walked) => {
                     debug!("Position rows for service {label} reused from the last pass");
-                    let reaches = (self.reaches_of)(&walked);
+                    let reaches = (self.reaches_of)(service, &walked);
                     self.slots.fill(service, walked);
                     return Reached::Filled { reaches };
                 }
@@ -645,7 +647,7 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
             run_cap,
             ends.into_iter().map(Some).collect(),
             Arc::clone(&slots),
-            Arc::new(|_| BTreeSet::new()),
+            Arc::new(|_, _| BTreeSet::new()),
             into(store),
         ));
         let walks: Vec<(usize, u64)> = (0..services.len())

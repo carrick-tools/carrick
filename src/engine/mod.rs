@@ -1369,16 +1369,16 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     service_workers::ServiceMemory::for_walk(stored_peak, run_cap_mb)
                 })
                 .collect();
-            // The services a walk's rows reach, which its analysis waits for.
-            // Nothing reads a sibling unless the site questions run, so then
-            // an analysis waits for its own walk alone.
+            // The walks a read of a walked service may enter, which its
+            // analysis waits for. Nothing reads a sibling unless the site
+            // questions run, so then an analysis waits for its own walk alone.
             let reaches_of: walk_lane::ReachesOf = if crate::site_questions::enabled() {
                 let scan = std::sync::Arc::clone(&scan);
-                std::sync::Arc::new(move |walked: &walk_lane::Walked| {
-                    scan.siblings.declared_in(&walked.index())
+                std::sync::Arc::new(move |service: usize, walked: &walk_lane::Walked| {
+                    scan.siblings.walks_read_by(service, &walked.index())
                 })
             } else {
-                std::sync::Arc::new(|_: &walk_lane::Walked| Default::default())
+                std::sync::Arc::new(|_: usize, _: &walk_lane::Walked| Default::default())
             };
             let lane = walk_lane::Lane::new(
                 recipe,
