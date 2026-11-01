@@ -553,6 +553,7 @@ pub fn is_repo_input(path: &str) -> bool {
 /// with: such a run uploads nothing, and the release CI scanned with is
 /// rarely the CLI on a laptop (carrick#2840). A run that asks the model
 /// analyses it, so what it writes is its own release's.
+#[allow(clippy::too_many_arguments)]
 pub fn decide(
     stored: Option<&CloudRepoData>,
     this_run: ThisRun<'_>,
