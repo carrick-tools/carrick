@@ -447,6 +447,69 @@ describe('carrick#1491: retype an untyped consumer call with the producer respon
     });
     assert.match(res.inferred_types?.[0]?.type_string ?? '', /\{ x: number; \}/);
   });
+
+  // carrick#3132: the prescreen answers, without a producer type, the reason
+  // the retype would abstain for before any rewrite, and nothing for a call
+  // the rewrite has to judge.
+  async function prescreen(
+    items: Array<{ item_id: string; line: number; text: string }>
+  ): Promise<Map<string, string | undefined>> {
+    const res = await client.send<{
+      status: string;
+      prescreens?: Array<{ item_id: string; reason?: string }>;
+      errors?: string[];
+    }>({
+      action: 'retype_prescreen',
+      request_id: `prescreen-${items.length}`,
+      items: items.map((c) => ({
+        item_id: c.item_id,
+        file_path: consumerPath,
+        line_number: c.line,
+        expression_text: c.text,
+        expression_line: c.line,
+      })),
+    });
+    assert.strictEqual(res.status, 'success', JSON.stringify(res));
+    assert.strictEqual(res.prescreens?.length, items.length, JSON.stringify(res));
+    return new Map(res.prescreens!.map((p) => [p.item_id, p.reason]));
+  }
+
+  it('prescreens each call with the reason the retype abstains for before any rewrite', async () => {
+    const names = Object.keys(CASES) as Array<keyof typeof CASES>;
+    const reasons = await prescreen(
+      names.map((name) => ({ item_id: name, line: CASES[name].line, text: CASES[name].text }))
+    );
+    for (const name of names) {
+      const reason = reasons.get(name);
+      const out = await retype(name, '{ y: number; }');
+      if (reason === undefined) continue;
+      assert.strictEqual(out.outcome, 'abstain', `${name}: ${JSON.stringify(out)}`);
+      assert.strictEqual(out.reason, reason, name);
+    }
+    // The pre-rewrite reasons: never read, escapes, no type parameter, an
+    // unresolved callee.
+    for (const name of [
+      'discarded',
+      'helper',
+      'unresolvedUntyped',
+      'returnedCall',
+      'exportedBinding',
+    ] as const) {
+      assert.ok(reasons.get(name), `${name} is decided before any rewrite`);
+    }
+    // A call the rewrite decides is left to it.
+    for (const name of ['typed', 'untyped', 'wrapper', 'broken'] as const) {
+      assert.strictEqual(reasons.get(name), undefined, `${name} is left to the rewrite`);
+    }
+  });
+
+  it('prescreens a call it cannot locate with the retype reason for it', async () => {
+    const reasons = await prescreen([{ item_id: 'nowhere', line: 400, text: "api.post('/q')" }]);
+    assert.strictEqual(
+      reasons.get('nowhere'),
+      'the consumer call could not be located in its file'
+    );
+  });
 });
 
 describe('carrick#1491: the retype under noUnusedLocals', () => {

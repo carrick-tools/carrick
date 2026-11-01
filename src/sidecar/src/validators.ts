@@ -400,7 +400,7 @@ export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
   aliases: z.array(z.string().min(1)).min(1, 'At least one alias is required'),
 });
 
-const RetypeItemSchema = z.object({
+const RetypeLocatorItemSchema = z.object({
   item_id: z.string().min(1),
   file_path: z.string().min(1),
   line_number: z.number().int().positive(),
@@ -408,6 +408,14 @@ const RetypeItemSchema = z.object({
   span_end: z.number().int().nonnegative().optional(),
   expression_text: z.string().optional(),
   expression_line: z.number().int().positive().optional(),
+});
+
+export const RetypePrescreenRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('retype_prescreen'),
+  items: z.array(RetypeLocatorItemSchema).min(1, 'At least one item is required'),
+});
+
+const RetypeItemSchema = RetypeLocatorItemSchema.extend({
   producer_type: z.string().min(1),
   producer_unwidened_type: z.string().min(1).optional(),
   wire: z.boolean(),
@@ -749,6 +757,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   InferRequestSchema,
   ResolveDefinitionsRequestSchema,
   RetypeCheckRequestSchema,
+  RetypePrescreenRequestSchema,
   VerifyClientSemanticsRequestSchema,
   VerifyLibraryClaimsRequestSchema,
   ListLibrarySurfaceRequestSchema,

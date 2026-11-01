@@ -731,6 +731,32 @@ pub struct RetypeItem {
     pub wire: bool,
 }
 
+/// One consumer call to prescreen for the retype (carrick#3132): the call's
+/// locator, without a producer type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetypePrescreenItem {
+    pub item_id: String,
+    pub file_path: String,
+    pub line_number: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_start: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_end: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression_line: Option<u32>,
+}
+
+/// One call's prescreen: the reason the retype abstains for before any
+/// rewrite, or none when only the rewrite can decide it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetypePrescreen {
+    pub item_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// What the consumer file's type-check said once the call stated the
 /// producer's response type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1640,6 +1666,11 @@ enum SidecarRequest {
         request_id: String,
         items: Vec<RetypeItem>,
     },
+    #[serde(rename = "retype_prescreen")]
+    RetypePrescreen {
+        request_id: String,
+        items: Vec<RetypePrescreenItem>,
+    },
     #[serde(rename = "verify_client_semantics")]
     VerifyClientSemantics {
         request_id: String,
@@ -1711,6 +1742,7 @@ impl SidecarRequest {
             SidecarRequest::CheckV2 { pairs, .. } => pairs.len(),
             SidecarRequest::ResolveDefinitions { aliases, .. } => aliases.len(),
             SidecarRequest::RetypeCheck { items, .. } => items.len(),
+            SidecarRequest::RetypePrescreen { items, .. } => items.len(),
             SidecarRequest::Implementations { queries, .. } => queries.len(),
             SidecarRequest::VerifyClientSemantics { checks, .. } => checks.len(),
             SidecarRequest::VerifyLibraryClaims { checks, .. } => checks.len(),
@@ -2076,6 +2108,9 @@ pub struct SidecarResponse {
     /// Retype outcomes (for retype_check)
     #[serde(default)]
     pub outcomes: Option<Vec<RetypeOutcome>>,
+    /// Prescreen answers (for retype_prescreen), one per item in order
+    #[serde(default)]
+    pub prescreens: Option<Vec<RetypePrescreen>>,
     /// Claim verdicts (for verify_client_semantics), one per check in order
     #[serde(default)]
     pub semantics: Option<Vec<SemanticsResult>>,
@@ -3604,6 +3639,7 @@ impl TypeSidecar {
                 infer_timing: None,
                 definitions: None,
                 outcomes: None,
+                prescreens: None,
                 semantics: None,
                 semantics_modules: None,
                 verdicts: None,
@@ -3668,6 +3704,7 @@ impl TypeSidecar {
                 infer_timing: None,
                 definitions: None,
                 outcomes: None,
+                prescreens: None,
                 semantics: None,
                 semantics_modules: None,
                 verdicts: None,
@@ -3888,6 +3925,38 @@ impl TypeSidecar {
             return Err(SidecarError::CheckFailed(errors.join("; ")));
         }
         Ok(response.outcomes.unwrap_or_default())
+    }
+
+    /// The reason the retype abstains for before any rewrite, per call, read
+    /// in the init'd project with no producer type (carrick#3132). One answer
+    /// per item, in order.
+    pub fn retype_prescreen(
+        &self,
+        items: &[RetypePrescreenItem],
+    ) -> Result<Vec<RetypePrescreen>, SidecarError> {
+        self.ensure_ready()?;
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = SidecarRequest::RetypePrescreen {
+            request_id: self.next_request_id(),
+            items: items.to_vec(),
+        };
+        self.send_request(&request)?;
+        let response = self.operation_response()?;
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::CheckFailed(errors.join("; ")));
+        }
+        let prescreens = response.prescreens.unwrap_or_default();
+        if prescreens.len() != items.len() {
+            return Err(SidecarError::DeserializationError(format!(
+                "retype_prescreen answered {} of {} call(s)",
+                prescreens.len(),
+                items.len()
+            )));
+        }
+        Ok(prescreens)
     }
 
     /// Check library-semantics claims against each package's own type
@@ -5942,6 +6011,18 @@ mod tests {
                     producer_type: "{ id: string }".into(),
                     producer_unwidened_type: Some("{ id: \"a\" }".into()),
                     wire: true,
+                }],
+            },
+            SidecarRequest::RetypePrescreen {
+                request_id: id(),
+                items: vec![RetypePrescreenItem {
+                    item_id: "i".into(),
+                    file_path: "/repo/src/checkout.ts".into(),
+                    line_number: 2,
+                    span_start: Some(10),
+                    span_end: Some(20),
+                    expression_text: Some("fetch(url)".into()),
+                    expression_line: Some(2),
                 }],
             },
             SidecarRequest::VerifyClientSemantics {

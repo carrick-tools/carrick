@@ -43,6 +43,7 @@ import type {
   InferRequestItem,
   RetypeDiagnostic,
   RetypeItem,
+  RetypeLocatorItem,
   RetypeOutcome,
 } from './types.js';
 
@@ -74,6 +75,12 @@ type Diag = FileDiagnostic;
 
 /** Where a position in the rewritten text came from. */
 type Origin = { kind: 'original'; pos: number } | { kind: 'inserted' };
+
+/**
+ * How to state a producer's type at one call: given the type and whether its
+ * wire form applies, the rewrite for either form.
+ */
+type PlanShape = (producer: string, wire: boolean) => (useWire: boolean) => Rewrite;
 
 interface Rewrite {
   edits: Edit[];
@@ -146,24 +153,10 @@ export class Retyper {
       return abstain(item, "the producer's response type carries a comment");
     }
 
-    const located = this.inferrer.locateCall(asLocator(item));
-    if (!located) return abstain(item, 'the consumer call could not be located in its file');
-    const { sourceFile, call } = located;
-
-    if (resultIsDiscarded(call)) {
-      // Nothing reads the response, so nothing can disagree with it: an
-      // "agrees" here would be a verdict about no comparison at all.
-      return abstain(item, 'the consumer never reads the response');
-    }
-    const escape = resultEscapes(call);
-    if (escape) {
-      // Only this file's diagnostics are compared, so reads made where the
-      // value escapes to are invisible and an "agrees" would claim them.
-      return abstain(item, escape);
-    }
-
-    const plan = this.plan(call, producer, item.wire);
-    if (typeof plan === 'string') return abstain(item, plan);
+    const found = this.beforeRewrite(item);
+    if (typeof found === 'string') return abstain(item, found);
+    const { sourceFile, call } = found;
+    const plan = found.plan(producer, item.wire);
     // Planned now: a check forgets every node of the file, `call` included.
     const unwidened = this.unwidenedPlan(call, item);
 
@@ -218,6 +211,56 @@ export class Retyper {
   }
 
   /**
+   * Per item, the reason `run` abstains for before any rewrite, which no
+   * producer type changes, or `undefined` when only the rewrite can decide
+   * the call (carrick#3132). The scan asks this in the consumer's own
+   * analysis, so a consumer whose calls all abstain here builds no retype
+   * program. A call that throws here is left to the retype, which reports
+   * the failure itself.
+   */
+  prescreen(items: RetypeLocatorItem[]): Array<string | undefined> {
+    return items.map((item) => {
+      try {
+        const found = this.beforeRewrite(item);
+        return typeof found === 'string' ? found : undefined;
+      } catch {
+        return undefined;
+      }
+    });
+  }
+
+  /**
+   * The call and how to state a type at it, or why the retype abstains
+   * before any rewrite. Reads only the consumer's own code: the producer's
+   * type is stated by the returned plan.
+   */
+  private beforeRewrite(
+    item: RetypeLocatorItem
+  ):
+    | { sourceFile: SourceFile; call: CallExpression; plan: PlanShape }
+    | string {
+    const located = this.inferrer.locateCall(asLocator(item));
+    if (!located) return 'the consumer call could not be located in its file';
+    const { sourceFile, call } = located;
+
+    if (resultIsDiscarded(call)) {
+      // Nothing reads the response, so nothing can disagree with it: an
+      // "agrees" here would be a verdict about no comparison at all.
+      return 'the consumer never reads the response';
+    }
+    const escape = resultEscapes(call);
+    if (escape) {
+      // Only this file's diagnostics are compared, so reads made where the
+      // value escapes to are invisible and an "agrees" would claim them.
+      return escape;
+    }
+
+    const plan = this.plan(call);
+    if (typeof plan === 'string') return plan;
+    return { sourceFile, call, plan };
+  }
+
+  /**
    * The rewrite that states the producer's UNWIDENED return (carrick#1516),
    * when the item carries one that can be stated at this call.
    */
@@ -227,20 +270,17 @@ export class Retyper {
   ): ((useWire: boolean) => Rewrite) | undefined {
     const text = oneLine(item.producer_unwidened_type ?? '');
     if (!text || text.includes('//') || text.includes('/*')) return undefined;
-    const plan = this.plan(call, text, item.wire);
-    return typeof plan === 'string' ? undefined : plan;
+    const plan = this.plan(call);
+    return typeof plan === 'string' ? undefined : plan(text, item.wire);
   }
 
   /**
-   * How to state the producer's type at this call, or why it cannot be done.
-   * Returns a builder so the wire and the declared form share one decision.
+   * How to state a producer's type at this call, or why it cannot be done
+   * whatever that type is. The builder it returns takes the type, and then
+   * builds the wire and the declared form from one decision.
    */
-  private plan(
-    call: CallExpression,
-    producer: string,
-    wire: boolean
-  ): ((useWire: boolean) => Rewrite) | string {
-    const stated = (useWire: boolean) =>
+  private plan(call: CallExpression): PlanShape | string {
+    const statedAs = (producer: string, wire: boolean) => (useWire: boolean) =>
       useWire && wire ? `${WIRE}<(${producer})>` : `(${producer})`;
     const callStart = call.getStart();
     const callEnd = call.getEnd();
@@ -253,7 +293,8 @@ export class Retyper {
       // Positions are read now: the rewrite forgets every node of the file.
       const argStart = typeArgs[0].getStart();
       const argEnd = typeArgs[0].getEnd();
-      return (useWire) => {
+      return (producer, wire) => (useWire) => {
+        const stated = statedAs(producer, wire);
         const text = stated(useWire);
         const delta = text.length - (argEnd - argStart);
         return {
@@ -277,7 +318,8 @@ export class Retyper {
       const open = call.getFirstChildByKind(SyntaxKind.OpenParenToken);
       if (!open) return 'the consumer call has no argument list to retype';
       const at = open.getStart();
-      return (useWire) => {
+      return (producer, wire) => (useWire) => {
+        const stated = statedAs(producer, wire);
         const text = `<${stated(useWire)}>`;
         return {
           edits: [{ start: at, end: at, text, statedAt: 1 }],
@@ -303,7 +345,8 @@ export class Retyper {
     if (typeof reads === 'string') return reads;
     if (reads.length > 0) {
       const edits = reads.map(bodyReadEdit);
-      return (useWire) => {
+      return (producer, wire) => (useWire) => {
+        const stated = statedAs(producer, wire);
         const text = stated(useWire);
         return {
           edits: edits.flatMap((edit) => edit(text)),
@@ -520,7 +563,7 @@ function runFailed(outcome: RetypeOutcome): RetypeOutcome {
   return { ...outcome, run_failed: true };
 }
 
-function asLocator(item: RetypeItem): InferRequestItem {
+function asLocator(item: RetypeLocatorItem): InferRequestItem {
   return {
     file_path: item.file_path,
     line_number: item.line_number,

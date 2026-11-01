@@ -225,7 +225,9 @@ fn a_pool_of_three_processes_judges_every_call_as_one_process_does() {
 
     let pool_line = |log: &str| {
         log.lines()
-            .find(|line| line.contains("Retyping web's consumer calls: 12 call(s) in 4 file(s)"))
+            // Each file's discarded call is decided before any rewrite
+            // (carrick#3132), so eight of the twelve are sent.
+            .find(|line| line.contains("Retyping web's consumer calls: 8 call(s) in 4 file(s)"))
             .map(str::to_string)
     };
     assert!(
@@ -529,4 +531,200 @@ fn a_pr_that_reaches_no_pair_posts_mains_stored_outcomes() {
     );
     assert_eq!(settled["findings"], judged["findings"]);
     assert_eq!(settled["checked"], judged["checked"]);
+}
+
+/// The shim a scan is pointed at with `CARRICK_SIDECAR_DIR`: it runs the real
+/// sidecar behind it and notes each request's action with the files it
+/// names. With `prescreen_off` it answers `retype_prescreen` itself, leaving
+/// every call to the retype, so one binary scans with the prescreen and
+/// without it.
+fn counting_shim(notes: &Path, prescreen_off: bool) -> PathBuf {
+    let shim = notes.join("shim");
+    std::fs::create_dir_all(shim.join("dist/src")).expect("shim dir");
+    let real = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    std::fs::write(
+        shim.join("dist/src/index.js"),
+        format!(
+            r#"
+const fs = require('fs');
+const readline = require('readline');
+const {{ spawn }} = require('child_process');
+const events = {events:?};
+const child = spawn(process.execPath, [...process.execArgv, {real:?}], {{ stdio: ['pipe', 'inherit', 'inherit'] }});
+child.on('exit', (code) => process.exit(code ?? 1));
+readline.createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const files = [
+    ...(request.files ?? []),
+    ...(request.items ?? []).map((item) => item.file_path),
+  ];
+  fs.appendFileSync(events, `${{request.action}} ${{files.join(' ')}}\n`);
+  if (request.action === 'retype_prescreen' && {prescreen_off}) {{
+    const prescreens = request.items.map((item) => ({{ item_id: item.item_id }}));
+    process.stdout.write(JSON.stringify({{ request_id: request.request_id, status: 'success', prescreens }}) + '\n');
+    return;
+  }}
+  child.stdin.write(line + '\n');
+}}).on('close', () => child.stdin.end());
+"#,
+            events = notes.join("events").display().to_string(),
+            real = real.display().to_string(),
+        ),
+    )
+    .expect("write the shim");
+    std::fs::write(shim.join("package.json"), r#"{ "type": "commonjs" }"#).expect("shim package");
+    shim
+}
+
+/// carrick#3132: a consumer whose response calls all abstain before any
+/// rewrite is decided in its own analysis, and the retype builds nothing for
+/// it. `admin` returns one call's result from a function that declares no
+/// return type, discards another, and reads a third through a helper that
+/// takes no type argument; `web` keeps a call the retype decides. With the
+/// prescreen, no program is built and no retype is asked for `admin`, and
+/// every match is what the scan publishes without it.
+#[test]
+fn a_consumer_whose_calls_all_abstain_before_the_rewrite_builds_no_retype_program() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("retype-http-client");
+    copy_tree(&fixture_dir(), &root);
+    std::fs::write(
+        root.join("carrick.json"),
+        r#"{
+  "services": [
+    { "name": "api", "directory": "api" },
+    { "name": "web", "directory": "web" },
+    { "name": "admin", "directory": "admin" }
+  ]
+}
+"#,
+    )
+    .expect("write carrick.json");
+    let admin = root.join("admin");
+    std::fs::create_dir_all(admin.join("src")).expect("admin dir");
+    std::fs::write(
+        admin.join("package.json"),
+        r#"{ "name": "retype-admin", "version": "0.0.0", "private": true }"#,
+    )
+    .expect("admin package");
+    std::fs::copy(root.join("web/tsconfig.json"), admin.join("tsconfig.json")).expect("tsconfig");
+    std::fs::copy(
+        root.join("web/src/http-client.d.ts"),
+        admin.join("src/http-client.d.ts"),
+    )
+    .expect("client declaration");
+    let audit = r#"import { create } from "http-client";
+
+const api = create({ baseURL: "http://localhost:3000" });
+
+export async function audit() {
+  return api.post("/checkout");
+}
+
+export async function ping(): Promise<void> {
+  await api.post("/checkout");
+}
+
+declare function send(url: string): Promise<{ data: any }>;
+
+export async function viaHelper(): Promise<number> {
+  const sent = await send("/checkout");
+  return sent.data.x;
+}
+"#;
+    std::fs::write(admin.join("src/audit.ts"), audit).expect("admin calls");
+    let call = |line: usize, pattern: &str, text: &str| {
+        serde_json::json!({
+            "candidate_id": format!("@line:{line}"),
+            "line_number": line,
+            "target": "/checkout",
+            "method": "POST",
+            "pattern_matched": pattern,
+            "call_expression_text": text,
+            "call_expression_line": line,
+            "payload_expression_text": null,
+            "payload_expression_line": null,
+            "primary_type_symbol": null,
+            "type_import_source": null
+        })
+    };
+    std::fs::write(
+        root.join("__llm__/analyze-file/audit.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": [
+                call(6, "api.post(", "api.post(\"/checkout\")"),
+                call(10, "api.post(", "api.post(\"/checkout\")"),
+                call(16, "send(", "send(\"/checkout\")"),
+            ]
+        }))
+        .expect("cassette json"),
+    )
+    .expect("write the cassette");
+
+    let run = |prescreen_off: bool| {
+        let notes = tempfile::tempdir().expect("notes dir");
+        let shim = counting_shim(notes.path(), prescreen_off);
+        let shim = shim.to_string_lossy().into_owned();
+        let (projection, log) = scan_with(&root, &[("CARRICK_SIDECAR_DIR", shim.as_str())]);
+        let events = std::fs::read_to_string(notes.path().join("events")).expect("read events");
+        let mut rows: Vec<String> = checkout_matches(&projection)
+            .into_iter()
+            .map(|m| m.to_string())
+            .collect();
+        rows.sort();
+        (rows, log, events)
+    };
+    // What the retype asked for a service once every capture was done.
+    let retype_asks = |events: &str, service: &str| -> Vec<String> {
+        let lines: Vec<&str> = events.lines().collect();
+        let last_capture = lines
+            .iter()
+            .rposition(|line| line.starts_with("capture_v2 "))
+            .expect("the scan captured");
+        lines[last_capture + 1..]
+            .iter()
+            .filter(|line| {
+                (line.starts_with("add_program_files ") || line.starts_with("retype_check "))
+                    && line.contains(&format!("/{service}/src/"))
+            })
+            .map(|line| line.to_string())
+            .collect()
+    };
+
+    let (on_rows, on_log, on_events) = run(false);
+    let (off_rows, _, off_events) = run(true);
+
+    assert_eq!(
+        on_rows.len(),
+        6,
+        "every call matches the route: {on_rows:#?}"
+    );
+    assert_eq!(on_rows, off_rows, "the prescreen changes no match");
+    assert!(
+        !retype_asks(&off_events, "admin").is_empty(),
+        "without the prescreen the retype is asked for admin:\n{off_events}"
+    );
+    assert_eq!(
+        retype_asks(&on_events, "admin"),
+        Vec::<String>::new(),
+        "admin's calls are all decided before any rewrite"
+    );
+    assert!(
+        !retype_asks(&on_events, "web").is_empty(),
+        "web keeps a call the retype decides:\n{on_events}"
+    );
+    assert!(
+        !on_log.contains("Retyped admin's consumer calls"),
+        "no retype ran for admin:\n{on_log}"
+    );
+    assert!(
+        on_log.contains("Prescreened admin's consumer calls: 3 of 3 abstain before any rewrite"),
+        "{on_log}"
+    );
 }
