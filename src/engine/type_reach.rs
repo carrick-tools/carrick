@@ -657,8 +657,10 @@ pub(crate) fn decide_service_whole(context: ReachContext<'_>, facts: &ServiceFac
 /// Put main's stored types in for a service no change reaches
 /// (carrick#3103): its bundle, capture stub and extraction status as
 /// stored, and each manifest row replaced by main's row of the same key,
-/// every field. Called after the payload's paths are repo-relative, so
-/// the two sides name files alike. Returns how many rows had no twin in
+/// every field. Called before the payload's paths are made repo-relative:
+/// row keys read both sides through `repo_relative`, and main's rows are
+/// stored repo-relative, so that sweep leaves them as they are. Returns how
+/// many rows had no twin in
 /// main's manifest and kept this run's row (the decision guarantees none).
 pub(crate) fn keep_main_types(
     cloud_data: &mut CloudRepoData,
