@@ -165,7 +165,9 @@ pub(crate) fn written_by_this_build(
 }
 
 /// The first whole-service reason that holds before the change is read,
-/// in the order carrick#3102 lists them.
+/// in the order carrick#3102 lists them. `no_types` means main stored no
+/// type rows (no stub, no manifest rows, a reach record that asked about no
+/// alias), so there is nothing of main's to keep (carrick#3140).
 pub(crate) fn gate_reason(gate: &Gate<'_>) -> Option<String> {
     if gate.off {
         return Some("off".to_string());
@@ -182,8 +184,24 @@ pub(crate) fn gate_reason(gate: &Gate<'_>) -> Option<String> {
     if stored.config_json.as_deref() != gate.config_json {
         return Some("config_changed".to_string());
     }
-    if stored.types_degraded.is_some() || stored.capture_stub.is_none() {
+    if stored.types_degraded.is_some() {
         return Some("types_degraded".to_string());
+    }
+    if stored.capture_stub.is_none() {
+        let no_rows = stored
+            .type_manifest
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty();
+        let asked_no_alias = gate.record.is_some_and(|record| record.aliases.is_empty());
+        return Some(
+            if no_rows && asked_no_alias {
+                "no_types"
+            } else {
+                "types_degraded"
+            }
+            .to_string(),
+        );
     }
     let record_usable = gate.record.is_some_and(|record| {
         record.version == TYPE_REACH_RECORD_VERSION
@@ -1091,6 +1109,53 @@ mod tests {
             stored: Some(blob),
             ..Case::clean()
         };
+        assert_eq!(case.reason(&Fake::reaching(&[])), "types_degraded");
+    }
+
+    /// Main stored nothing to type: no stub, `manifest` rows as given, and a
+    /// reach record that asked about no alias.
+    fn nothing_to_type(manifest: Option<Vec<TypeManifestEntry>>) -> Case {
+        let mut blob = stored();
+        blob.capture_stub = None;
+        blob.type_manifest = manifest;
+        Case {
+            stored: Some(blob),
+            record: Some(TypeReachRecord {
+                aliases: BTreeMap::new(),
+                ..record()
+            }),
+            manifest: Vec::new(),
+            ..Case::clean()
+        }
+    }
+
+    #[test]
+    fn a_service_with_nothing_to_type_reads_no_types() {
+        let case = nothing_to_type(Some(Vec::new()));
+        assert_eq!(case.reason(&Fake::reaching(&[])), "no_types");
+    }
+
+    #[test]
+    fn a_service_with_no_manifest_and_no_aliases_reads_no_types() {
+        let case = nothing_to_type(None);
+        assert_eq!(case.reason(&Fake::reaching(&[])), "no_types");
+    }
+
+    #[test]
+    fn a_missing_stub_with_asked_aliases_stays_types_degraded() {
+        let mut case = nothing_to_type(Some(Vec::new()));
+        case.record = Some(record());
+        assert_eq!(case.reason(&Fake::reaching(&[])), "types_degraded");
+    }
+
+    #[test]
+    fn a_degraded_stamp_wins_over_nothing_to_type() {
+        let mut case = nothing_to_type(Some(Vec::new()));
+        case.stored.as_mut().unwrap().types_degraded =
+            Some(crate::cloud_storage::TypeDegradation {
+                stage: "capture".to_string(),
+                detail: "out of memory".to_string(),
+            });
         assert_eq!(case.reason(&Fake::reaching(&[])), "types_degraded");
     }
 
