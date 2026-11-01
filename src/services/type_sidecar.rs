@@ -2861,6 +2861,30 @@ pub struct TypeSidecar {
     /// ([`SidecarRecipe::with_heap_cap_mb`]). A restart keeps it, and a
     /// memory death records it. `None` starts them with V8's own.
     heap_cap_mb: Option<u64>,
+    /// Where a record-only process's memory death is noted for the caller
+    /// ([`SidecarRecipe::noting_memory_deaths`]).
+    memory_death_note: Option<MemoryDeathNote>,
+}
+
+/// What a record-only process's death was, when it was memory: set when the
+/// sidecar classifies the death ([`TypeSidecar::note_death`]), for the caller
+/// that started the process to read once the work failed (carrick#3085: a
+/// walk that died of memory is walked again at the run's cap). A
+/// record-only death is recorded nowhere else.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryDeathNote(Arc<Mutex<Option<MemoryDeath>>>);
+
+impl MemoryDeathNote {
+    /// The memory death noted since the last take, if any.
+    pub fn take(&self) -> Option<MemoryDeath> {
+        self.0.lock().ok().and_then(|mut death| death.take())
+    }
+
+    fn set(&self, death: MemoryDeath) {
+        if let Ok(mut noted) = self.0.lock() {
+            *noted = Some(death);
+        }
+    }
 }
 
 /// How a sidecar process that is gone came to an end, with what it left to
@@ -2891,9 +2915,17 @@ pub struct SidecarRecipe {
     operation_timeout: Duration,
     scan_root: Option<PathBuf>,
     heap_cap_mb: Option<u64>,
+    memory_death_note: Option<MemoryDeathNote>,
 }
 
 impl SidecarRecipe {
+    /// This recipe, noting a record-only process's memory death in `note`
+    /// (carrick#3085).
+    pub fn noting_memory_deaths(mut self, note: &MemoryDeathNote) -> Self {
+        self.memory_death_note = Some(note.clone());
+        self
+    }
+
     /// This recipe, starting its processes with `heap_cap_mb` as their V8
     /// old-space cap (V8's own when `None`) instead of the one it was taken
     /// with (carrick#3084: a service's sidecar is capped by its stored peak).
@@ -2936,6 +2968,7 @@ impl SidecarRecipe {
     ) -> Result<TypeSidecar, SidecarError> {
         let mut sidecar = TypeSidecar::spawn_with_heap_cap(&self.sidecar_path, self.heap_cap_mb)?
             .with_operation_timeout(self.operation_timeout);
+        sidecar.memory_death_note = self.memory_death_note.clone();
         if record_only {
             sidecar = sidecar.record_only();
         }
@@ -3004,6 +3037,7 @@ impl TypeSidecar {
             replaced_peak: AtomicU64::new(0),
             record_only: false,
             heap_cap_mb,
+            memory_death_note: None,
         })
     }
 
@@ -3090,6 +3124,9 @@ impl TypeSidecar {
                  kills rose: {}); nothing is recorded for the run",
                 death.end, death.heap_line, death.oom_kills_rose
             );
+            if let (Some(note), Some(kind)) = (&self.memory_death_note, death.memory_death()) {
+                note.set(kind);
+            }
             return;
         }
         match death.memory_death() {
@@ -3161,6 +3198,7 @@ impl TypeSidecar {
             operation_timeout: self.operation_timeout,
             scan_root: self.scan_root.lock().unwrap().clone(),
             heap_cap_mb: self.heap_cap_mb,
+            memory_death_note: None,
         }
     }
 

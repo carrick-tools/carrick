@@ -1,0 +1,7 @@
+{
+  "services": [
+    { "name": "app", "directory": "services/app", "tsconfig": "tsconfig.json" },
+    { "name": "client", "directory": "packages/client", "tsconfig": "tsconfig.json" },
+    { "name": "worker", "directory": "services/worker", "tsconfig": "tsconfig.json" }
+  ]
+}

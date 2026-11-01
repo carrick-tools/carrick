@@ -84,6 +84,17 @@ fn scan(
     flags: &[&str],
     isolated: bool,
 ) -> Vec<(String, serde_json::Value)> {
+    scan_with(repo, store, flags, isolated, &[]).0
+}
+
+/// [`scan`] with `env` set too; the blobs and what the scan printed.
+fn scan_with(
+    repo: &Path,
+    store: &Path,
+    flags: &[&str],
+    isolated: bool,
+    env: &[(&str, &str)],
+) -> (Vec<(String, serde_json::Value)>, String) {
     let cache = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
@@ -126,18 +137,25 @@ fn scan(
         "CARRICK_ALLOW_MISSING_TYPES",
         "CARRICK_FACT_FILES",
         "CARRICK_OUTPUT_JSON",
+        "CARRICK_SERVICE_CONCURRENCY",
+        "RUST_LOG",
     ] {
         cmd.env_remove(var);
     }
+    cmd.envs(env.iter().copied());
     let output = cmd.output().expect("spawn carrick");
-    assert!(
-        output.status.success(),
-        "scan exited non-zero:\n{}{}",
+    let printed = format!(
+        "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    blobs(store)
+    assert!(output.status.success(), "scan exited non-zero:\n{printed}");
+    (blobs(store), printed)
 }
+
+/// No width asked for, and two services at once: the gate holds whichever
+/// order the walks end in (carrick#3085).
+const WIDTHS: [&[(&str, &str)]; 2] = [&[], &[("CARRICK_SERVICE_CONCURRENCY", "2")]];
 
 fn blobs(store: &Path) -> Vec<(String, serde_json::Value)> {
     let mut blobs: Vec<(String, serde_json::Value)> = fs::read_dir(store)
@@ -206,11 +224,60 @@ fn a_service_states_the_requests_a_sibling_s_code_makes_at_its_own_calls() {
     if !sidecar_built() {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = committed_copy(tmp.path());
-    let store = tempfile::tempdir().unwrap();
-    let blobs = scan(&repo, store.path(), &[], true);
-    assert_app_rows(&blobs);
+    for env in WIDTHS {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = committed_copy(tmp.path());
+        let store = tempfile::tempdir().unwrap();
+        let (blobs, _) = scan_with(&repo, store.path(), &[], true, env);
+        assert_app_rows(&blobs);
+    }
+}
+
+/// carrick#3085, the closure: the app's rows reach the client, so the app's
+/// analysis waits for the client's walk, at any width. A scan of a change
+/// to the app alone, with no rows kept for the client, walks the carried
+/// client on demand, once, for the app.
+#[test]
+fn an_analysis_waits_for_the_walk_of_the_sibling_its_rows_reach() {
+    if !sidecar_built() {
+        return;
+    }
+    let said =
+        |printed: &str, needle: &str| printed.lines().filter(|line| line.contains(needle)).count();
+    for env in WIDTHS {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = committed_copy(tmp.path());
+        let store = tempfile::tempdir().unwrap();
+        let env: Vec<(&str, &str)> = env.iter().copied().chain([("RUST_LOG", "info")]).collect();
+        let (full, printed) = scan_with(&repo, store.path(), &[], false, &env);
+        assert_app_rows(&full);
+        assert_eq!(
+            said(&printed, "Analysis of app reads the walks of: client"),
+            1,
+            "{env:?}:\n{printed}"
+        );
+        assert_eq!(said(&printed, "Analysis of client reads"), 0, "{printed}");
+        let client_walked = printed
+            .lines()
+            .position(|line| line.contains("Walk client ended: "))
+            .expect("the client was walked");
+        let app_analysed = printed
+            .lines()
+            .position(|line| line.contains("Analyzing service app "))
+            .expect("the app was analysed");
+        assert!(client_walked < app_analysed, "{printed}");
+
+        fs::remove_file(kept_client_rows(store.path())).unwrap();
+        change_the_app(&repo);
+        let (scoped, printed) = scan_with(&repo, store.path(), &["--changed-only"], false, &env);
+        assert_app_rows(&scoped);
+        assert_eq!(
+            said(&printed, "Walked carried service client for app in "),
+            1,
+            "{env:?}:\n{printed}"
+        );
+        assert_eq!(said(&printed, "Walk client started: "), 1, "{printed}");
+    }
 }
 
 /// carrick#3083: a walked service states what its compiler walk held.
@@ -239,31 +306,33 @@ fn a_changed_only_scan_reads_a_carried_sibling_for_the_same_rows() {
     if !sidecar_built() {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = committed_copy(tmp.path());
-    let store = tempfile::tempdir().unwrap();
-    let full = scan(&repo, store.path(), &[], false);
-    assert_app_rows(&full);
-    let before = blob_of(&full, "client")["commit_hash"].clone();
-    // A change to the app alone, after every line the rows sit on.
-    let main = repo.join("services/app/src/main.ts");
-    let mut text = fs::read_to_string(&main).unwrap();
-    text.push_str("\nexport function more(): number {\n  return 1;\n}\n");
-    fs::write(&main, text).unwrap();
-    run_git(&repo, &["add", "-A"]);
-    run_git(&repo, &["commit", "-q", "-m", "app only"]);
-    let scoped = scan(&repo, store.path(), &["--changed-only"], false);
-    assert_eq!(
-        blob_of(&scoped, "client")["commit_hash"],
-        before,
-        "the client is carried"
-    );
-    assert_ne!(
-        blob_of(&scoped, "app")["commit_hash"],
-        blob_of(&full, "app")["commit_hash"],
-        "the app is analysed"
-    );
-    assert_app_rows(&scoped);
+    for env in WIDTHS {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = committed_copy(tmp.path());
+        let store = tempfile::tempdir().unwrap();
+        let (full, _) = scan_with(&repo, store.path(), &[], false, env);
+        assert_app_rows(&full);
+        let before = blob_of(&full, "client")["commit_hash"].clone();
+        // A change to the app alone, after every line the rows sit on.
+        let main = repo.join("services/app/src/main.ts");
+        let mut text = fs::read_to_string(&main).unwrap();
+        text.push_str("\nexport function more(): number {\n  return 1;\n}\n");
+        fs::write(&main, text).unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "app only"]);
+        let (scoped, _) = scan_with(&repo, store.path(), &["--changed-only"], false, env);
+        assert_eq!(
+            blob_of(&scoped, "client")["commit_hash"],
+            before,
+            "the client is carried"
+        );
+        assert_ne!(
+            blob_of(&scoped, "app")["commit_hash"],
+            blob_of(&full, "app")["commit_hash"],
+            "the app is analysed"
+        );
+        assert_app_rows(&scoped);
+    }
 }
 
 /// The client's kept rows file in `store`, and its record of what it was
@@ -444,4 +513,185 @@ fn each_operation_through_a_client_wrapper_keeps_one_fact_row() {
             "reader answer for api.ts: {answered}"
         );
     }
+}
+
+/// A sidecar directory whose `dist/src/index.js` runs the built sidecar and
+/// passes it every request as it comes, except a `position_rows` walk of a
+/// service named in `delays` (milliseconds), which it holds that long
+/// first: that service's walk ends late, whatever the machine.
+fn late_walks(dir: &Path, delays: &str) -> PathBuf {
+    let real = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    let entry = dir.join("dist/src/index.js");
+    fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    fs::write(
+        &entry,
+        format!(
+            r#"
+const {{ spawn }} = require('child_process');
+const readline = require('readline');
+const delays = {delays};
+const child = spawn(process.execPath, [...process.execArgv, {real:?}], {{
+  stdio: ['pipe', 'inherit', 'inherit'],
+}});
+child.on('exit', (code) => process.exit(code ?? 1));
+readline.createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  let delay = 0;
+  try {{
+    const request = JSON.parse(line);
+    if (request.action === 'position_rows') delay = delays[request.service] ?? 0;
+  }} catch {{}}
+  setTimeout(() => child.stdin.write(line + '\n'), delay);
+}});
+process.stdin.on('end', () => child.stdin.end());
+"#
+        ),
+    )
+    .unwrap();
+    dir.to_path_buf()
+}
+
+/// The fixture whose app calls the client through an import its compiler
+/// does not resolve (`tests/fixtures/discovery-siblings-unresolved/`).
+fn unresolved_copy(tmp: &Path) -> PathBuf {
+    committed_copy_of(tmp, "discovery-siblings-unresolved", |_| {})
+}
+
+/// What the app states at its own calls into the client, read through the
+/// call graph (the fixture's answer key).
+const UNRESOLVED_APP_ROWS: [&str; 2] = [
+    "services/app/src/main.ts:4 GET /v1/api/items/:id",
+    "services/app/src/main.ts:8 POST /v1/api/events",
+];
+
+/// The lines of `printed` that contain `needle`, by position.
+fn line_of(printed: &str, needle: &str) -> Option<usize> {
+    printed.lines().position(|line| line.contains(needle))
+}
+
+/// carrick#3085: the app's call into the client goes through an import the
+/// compiler does not resolve, so the call graph follows it (carrick#2557)
+/// and no row of the app names the client. The app's analysis still waits
+/// for every analysed service's walk, the client's among them, though the
+/// client's walk ends long after the app's, and states what the old order
+/// (every walk before any analysis) states.
+#[test]
+fn an_analysis_whose_rows_hold_an_unresolved_import_waits_for_every_walk() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // The old order: one at a time, so every walk ends before any analysis.
+    let repo = unresolved_copy(&tmp.path().join("old"));
+    let store = tempfile::tempdir().unwrap();
+    let (old, _) = scan_with(
+        &repo,
+        store.path(),
+        &[],
+        true,
+        &[("CARRICK_SERVICE_CONCURRENCY", "1")],
+    );
+    assert_eq!(call_rows(blob_of(&old, "app")), UNRESOLVED_APP_ROWS);
+
+    let repo = unresolved_copy(&tmp.path().join("late"));
+    let store = tempfile::tempdir().unwrap();
+    let sidecar = late_walks(&tmp.path().join("sidecar"), r#"{ client: 15000 }"#);
+    let sidecar = sidecar.to_string_lossy();
+    let (late, printed) = scan_with(
+        &repo,
+        store.path(),
+        &[],
+        true,
+        &[
+            ("CARRICK_SERVICE_CONCURRENCY", "2"),
+            ("CARRICK_SIDECAR_DIR", &sidecar),
+            ("RUST_LOG", "info"),
+        ],
+    );
+    assert!(
+        line_of(
+            &printed,
+            "The rows of app may call through an unresolved import"
+        )
+        .is_some(),
+        "{printed}"
+    );
+    let client_walked = line_of(&printed, "Walk client ended: ").expect("the client was walked");
+    let app_analysed = line_of(&printed, "Analyzing service app ").expect("the app was analysed");
+    assert!(client_walked < app_analysed, "{printed}");
+    assert!(
+        line_of(&printed, "before its walk ended").is_none(),
+        "{printed}"
+    );
+    assert_eq!(
+        sourced_call_rows(blob_of(&late, "app")),
+        sourced_call_rows(blob_of(&old, "app")),
+        "{printed}"
+    );
+}
+
+/// carrick#3085, carried: a scan of a change to the app and the worker
+/// carries the client, and the worker's rows name it, so it is filled with
+/// the rows the last pass kept once the worker's walk ends. The app reaches
+/// the client only through the call graph. Its analysis waits for the
+/// worker's walk, though that ends long after the app's, and reads the
+/// client's kept rows, as the full scan read its walk; the client is never
+/// walked.
+#[test]
+fn a_carried_service_reached_through_an_unresolved_import_reads_its_kept_rows() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = unresolved_copy(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let (full, _) = scan_with(&repo, store.path(), &[], false, &[]);
+    assert_eq!(call_rows(blob_of(&full, "app")), UNRESOLVED_APP_ROWS);
+    let before = blob_of(&full, "client")["commit_hash"].clone();
+    for main in ["services/app/src/main.ts", "services/worker/src/main.ts"] {
+        let main = repo.join(main);
+        let mut text = fs::read_to_string(&main).unwrap();
+        text.push_str("\nexport function more(): number {\n  return 1;\n}\n");
+        fs::write(&main, text).unwrap();
+    }
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "app and worker"]);
+
+    let sidecar = late_walks(&tmp.path().join("sidecar"), r#"{ worker: 15000 }"#);
+    let sidecar = sidecar.to_string_lossy();
+    let (scoped, printed) = scan_with(
+        &repo,
+        store.path(),
+        &["--changed-only"],
+        false,
+        &[
+            ("CARRICK_SERVICE_CONCURRENCY", "2"),
+            ("CARRICK_SIDECAR_DIR", &sidecar),
+            ("RUST_LOG", "info"),
+        ],
+    );
+    assert_eq!(
+        blob_of(&scoped, "client")["commit_hash"],
+        before,
+        "the client is carried"
+    );
+    assert!(
+        line_of(&printed, "Walk client started: ").is_none(),
+        "{printed}"
+    );
+    assert_eq!(
+        sourced_call_rows(blob_of(&scoped, "app")),
+        sourced_call_rows(blob_of(&full, "app")),
+        "{printed}"
+    );
+    assert!(
+        line_of(
+            &printed,
+            "The rows of app may call through an unresolved import"
+        )
+        .is_some(),
+        "{printed}"
+    );
+    let worker_walked = line_of(&printed, "Walk worker ended: ").expect("the worker was walked");
+    let app_analysed = line_of(&printed, "Analyzing service app ").expect("the app was analysed");
+    assert!(worker_walked < app_analysed, "{printed}");
 }

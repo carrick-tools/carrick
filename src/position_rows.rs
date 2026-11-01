@@ -1,14 +1,14 @@
 //! Per-position compiler rows (carrick#2405, move 2 of the fact layer).
 //!
-//! Before the scan's analysis loop starts any sidecar, a fresh record-only
-//! sidecar walks each service's source files and writes, for every call,
+//! Before a service's analysis starts its sidecar, a fresh record-only
+//! sidecar walks the service's source files and writes, for every call,
 //! member access, comparison and expression identifier, what the compiler
 //! knows there: the symbol, the declaration's file and line, the declaring
 //! package and the type text. The walk is the sidecar's
-//! (`src/sidecar/src/position-rows.ts`); the walks run in a lane of their own
-//! (`crate::engine::walk_lane`). Every walk process exits before the first
-//! analysis sidecar spawns, so the two programs never share a heap
-//! (carrick#2413).
+//! (`src/sidecar/src/position-rows.ts`); the walks are admitted beside the
+//! analyses, on the run's one memory budget (`crate::engine::walk_lane`,
+//! carrick#3085), and a service's walk process exits before its own analysis
+//! starts.
 //!
 //! The walk runs only with [`POSITION_ROWS_ENV`] set to `1`. With a local
 //! store directory ([`CACHE_DIR_ENV`]) it writes
@@ -627,6 +627,25 @@ impl PositionIndex {
             .filter(|row| row.kind() == Kind::Call)
     }
 
+    /// Whether any call the rows hold may go through an import that did not
+    /// resolve: a `call` row of the error type that names a symbol declared
+    /// in the call's own file. That is the row an unresolved import's call
+    /// reads as (`RequestSummaryInputs::row_names`), whose callee the scan
+    /// then reads from the call graph instead (carrick#2557), into any
+    /// service. Without the file's IR the row cannot tell an import from a
+    /// definition, so a call to a definition of the same file whose type
+    /// did not resolve answers yes too.
+    pub fn may_call_through_an_unresolved_import(&self) -> bool {
+        self.files.iter().any(|(file, indexed)| {
+            indexed.rows.values().any(|row| {
+                row.kind() == Kind::Call
+                    && row.flags() & FLAG_ERROR_TYPE != 0
+                    && row.symbol().is_some()
+                    && row.decl_file() == Some(file.as_str())
+            })
+        })
+    }
+
     /// How many files the rows name.
     pub fn file_count(&self) -> usize {
         self.files.len()
@@ -1012,6 +1031,43 @@ mod tests {
             skip,
             r,
         }
+    }
+
+    /// carrick#3085: an error-typed call row declared in its own file is a
+    /// call that may go through an unresolved import; one declared in
+    /// another file, or one that resolved, is not.
+    #[test]
+    fn an_error_typed_call_declared_in_its_own_file_may_be_an_unresolved_import() {
+        let rows_of = |file: &str, row: Row| {
+            PositionIndex::of(
+                Path::new("/repo"),
+                RowsFile {
+                    header: Header {
+                        v: FORMAT_VERSION,
+                        typescript: "6.0.2".to_string(),
+                        service: "api".to_string(),
+                        files: 1,
+                    },
+                    files: vec![file_rows(file, Some("f();\n"), None, vec![row])],
+                },
+            )
+        };
+        let call = |flags: u8| row(Kind::Call, 0, 3, Some("f"), flags);
+        assert!(rows_of("src/a.ts", call(FLAG_ERROR_TYPE)).may_call_through_an_unresolved_import());
+        assert!(!rows_of("src/a.ts", call(0)).may_call_through_an_unresolved_import());
+        assert!(
+            !rows_of("src/b.ts", call(FLAG_ERROR_TYPE)).may_call_through_an_unresolved_import()
+        );
+        assert!(
+            !rows_of(
+                "src/a.ts",
+                row(Kind::Ident, 0, 1, Some("f"), FLAG_ERROR_TYPE)
+            )
+            .may_call_through_an_unresolved_import()
+        );
+        assert!(
+            !PositionIndex::missing(Path::new("/repo")).may_call_through_an_unresolved_import()
+        );
     }
 
     /// Every case of carrick#2413 §3 reads its reason, and a usable row

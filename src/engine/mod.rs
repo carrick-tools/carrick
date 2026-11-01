@@ -1261,41 +1261,21 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         })
         .collect();
     info!("{}", plan.line(&memories, run_cap_mb));
-    // The walk lane is not sized by peaks yet (carrick#3085): every walk is
-    // counted at the run's cap, as every service was.
-    let width = service_workers::walk_width(analysed.len(), dispatching);
     // The pass is timed from here: the walks are part of it, as they were
     // when each ran inside the loop.
     let pass_started = Instant::now();
-    // Every analysed service's compiler walk, when the run walks, in a lane
-    // of its own that ends before the loop starts (carrick#2413 slice G1).
+    // Every analysed service's compiler walk, when the run walks, admitted
+    // beside the analyses on the same budget (carrick#3085): each analysis
+    // starts once the walks it reads have ended.
     let walking = walk_lane::requested();
-    if walking {
-        info!(
-            "Walking {} service(s) {} at a time before the analysis loop",
-            analysed.len(),
-            width.count
-        );
-    } else {
+    if !walking {
         info!("Walk lane off: no per-position rows are walked");
     }
-    let clean_commit =
-        (!git_state.dirty && !git_state.commit.is_empty()).then(|| git_state.commit.clone());
     let (walk_ends, walked) = if walking {
         walk_lane::signals(analysed.len())
     } else {
         (Vec::new(), Vec::new())
     };
-    let lane = walk_lane::walk_all(
-        recipe.clone(),
-        repo_path,
-        if walking { &analysed } else { &[] },
-        width.count,
-        walk_ends,
-        // Recorded beside each service's rows: a clean tree's commit, whose
-        // inputs they are a walk of (carrick#3027).
-        vec![clean_commit.clone(); analysed.len()],
-    );
     // Every service's detection and guidance, asked for from here on beside
     // the loop below instead of one service at a time inside it
     // (carrick#1895), each once its own walk has ended. Dropped with this
@@ -1312,41 +1292,22 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         },
         walked,
     );
-    // The loop starts once every walk has ended: no walk process is alive
-    // beside an analysis sidecar.
-    let walks = lane.await;
-    // The services the run carries that an analysed one calls into are
-    // walked in a lane round of their own, so a scan of a change to the
-    // consumer alone reads the same chains as a full scan (carrick#2618).
-    let mut sibling_registry = siblings::SiblingRegistry::new(
-        repo_path,
-        &services,
-        scan_index.clone(),
-        scopes
-            .iter()
-            .map(|scope| match scope {
-                crate::change_scope::Scope::Carried { commit } => Some(commit.clone()),
-                crate::change_scope::Scope::Analysed { .. } => None,
-            })
-            .chain(std::iter::repeat(None))
-            .take(services.len())
-            .collect(),
-    );
-    if walking {
-        sibling_registry
-            .walk_carried(&walks, recipe.clone(), width.count)
-            .await;
-    }
+    let walk_slots = walking.then(|| std::sync::Arc::new(walk_lane::Slots::new(services.len())));
     let scan = std::sync::Arc::new(ServiceScan {
         repo_path: repo_path.to_string(),
-        siblings: sibling_registry,
+        siblings: siblings::SiblingRegistry::new(
+            repo_path,
+            &services,
+            scan_index.clone(),
+            walk_slots.clone(),
+        ),
         services: analysed.into(),
-        sidecar: recipe,
+        sidecar: recipe.clone(),
         run_intents,
         graphql_schemas,
         setups: std::sync::Arc::new(setups),
         workspace: workspace_scan,
-        walks: walking.then_some(walks),
+        walking,
         reach,
     });
     let upload_blocked = multi_service && !storage.supports_multi_service();
@@ -1367,7 +1328,74 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             memory: memories[at],
         })
         .collect();
-    let mut outcomes = scan.analyze_all(jobs, &plan).await;
+    let mut outcomes = match &walk_slots {
+        Some(slots) => {
+            let clean_commit = (!git_state.dirty && !git_state.commit.is_empty())
+                .then(|| git_state.commit.clone());
+            // Per declared service: an analysed one's walk ends for its
+            // setup, and its rows are recorded at a clean tree's commit,
+            // whose inputs they are a walk of; a carried one's are walked
+            // from, and kept rows must be a walk of, the commit it is carried
+            // at (carrick#3027).
+            let mut walk_ends = walk_ends.into_iter();
+            let mut ended = Vec::with_capacity(services.len());
+            let mut at = Vec::with_capacity(services.len());
+            for (index, analysed_at) in scan_index.iter().enumerate() {
+                match analysed_at {
+                    Some(_) => {
+                        ended.push(walk_ends.next());
+                        at.push(clean_commit.clone());
+                    }
+                    None => {
+                        ended.push(None);
+                        at.push(match scopes.get(index) {
+                            Some(crate::change_scope::Scope::Carried { commit }) => {
+                                Some(commit.clone())
+                            }
+                            _ => None,
+                        });
+                    }
+                }
+            }
+            // Each walk sized by the walk peak its previous generation stored
+            // (carrick#3085).
+            let walk_memories = services
+                .iter()
+                .map(|service| {
+                    let stored_peak = (!no_cache)
+                        .then(|| previous_generation(previous_generations, &repo_name, service))
+                        .flatten()
+                        .and_then(|generation| generation.memory_peaks.as_ref()?.walk_mb);
+                    service_workers::ServiceMemory::for_walk(stored_peak, run_cap_mb)
+                })
+                .collect();
+            // The walks a read of a walked service may enter, which its
+            // analysis waits for. Nothing reads a sibling unless the site
+            // questions run, so then an analysis waits for its own walk alone.
+            let reaches_of: walk_lane::ReachesOf = if crate::site_questions::enabled() {
+                let scan = std::sync::Arc::clone(&scan);
+                std::sync::Arc::new(move |service: usize, walked: &walk_lane::Walked| {
+                    scan.siblings.walks_read_by(service, &walked.index())
+                })
+            } else {
+                std::sync::Arc::new(|_: usize, _: &walk_lane::Walked| Default::default())
+            };
+            let lane = walk_lane::Lane::new(
+                recipe,
+                repo_path,
+                &services,
+                at,
+                walk_memories,
+                run_cap_mb,
+                ended,
+                std::sync::Arc::clone(slots),
+                reaches_of,
+                std::sync::Arc::new(crate::position_rows::destination),
+            );
+            scan.walk_and_analyze(jobs, &plan, lane).await
+        }
+        None => scan.analyze_all(jobs, &plan).await,
+    };
     // A service whose type checker died of memory beside another service,
     // or under a cap below the run's, in a run told to stop on such a death,
     // is analysed again alone at the run's cap (carrick#3084). From this
@@ -2566,10 +2594,11 @@ struct ServiceScan {
     /// The repo-wide external-call pass, built by the first service to ask
     /// and read by the rest.
     workspace: std::sync::Arc<crate::external_call_candidates::WorkspaceScan>,
-    /// Each analysed service's walk, by its index, when the run walks
-    /// (carrick#2413): read by its analysis and by the owed-work retry, and
-    /// kept until the run ends.
-    walks: Option<Vec<walk_lane::Walked>>,
+    /// Whether the run walks each service's compiler rows (carrick#2413).
+    /// Each walk is kept in its slot in [`Self::siblings`] until the run
+    /// ends: read by its service's analysis, by the services that reach it,
+    /// and by the owed-work retry.
+    walking: bool,
     /// The other services of the run, read for the walks that enter them
     /// (carrick#2618).
     siblings: siblings::SiblingRegistry,
@@ -2688,6 +2717,64 @@ struct ServiceJob {
 
 type ServiceOutcome = Result<ServiceRun, Box<dyn std::error::Error + Send + Sync>>;
 
+/// A pass of walks and analyses on one budget (carrick#3085): the walks are
+/// the lane's, the analyses the scan's.
+struct WalkThenAnalyze {
+    lane: walk_lane::Lane,
+    scan: std::sync::Arc<ServiceScan>,
+    jobs: Vec<Option<ServiceJob>>,
+}
+
+impl service_workers::WalkedPass for WalkThenAnalyze {
+    type Walk = walk_lane::WalkDone;
+    type Analysed = ServiceOutcome;
+
+    fn start_walk(
+        &mut self,
+        service: usize,
+        again: bool,
+    ) -> futures::future::BoxFuture<'static, walk_lane::WalkDone> {
+        self.lane.start_walk(service, again)
+    }
+
+    fn walk_ended(
+        &mut self,
+        service: usize,
+        again: bool,
+        walk: walk_lane::WalkDone,
+    ) -> service_workers::WalkEnd {
+        self.lane.walk_ended(service, again, walk)
+    }
+
+    fn reached(&mut self, service: usize, by: usize) -> service_workers::Reached {
+        self.lane.reached(service, by)
+    }
+
+    fn start_analysis(
+        &mut self,
+        position: usize,
+        reads: &std::collections::BTreeSet<usize>,
+    ) -> futures::future::BoxFuture<'static, ServiceOutcome> {
+        let job = self.jobs[position]
+            .take()
+            .expect("each job is started once");
+        let own = self.scan.siblings.declared(job.index);
+        let others: Vec<&str> = reads
+            .iter()
+            .filter(|service| Some(**service) != own)
+            .map(|service| self.lane.label(*service))
+            .collect();
+        if let (Some(own), false) = (own, others.is_empty()) {
+            info!(
+                "Analysis of {} reads the walks of: {}",
+                self.lane.label(own),
+                others.join(", ")
+            );
+        }
+        self.scan.start(job)
+    }
+}
+
 impl ServiceScan {
     /// Analyse `jobs`, each on a thread of its own and each started in the
     /// order given while `plan` and the run's ledger let it start
@@ -2707,52 +2794,102 @@ impl ServiceScan {
         let mut jobs: Vec<Option<ServiceJob>> = jobs.into_iter().map(Some).collect();
         let ledger = service_workers::run_ledger();
         service_workers::in_declared_order(ledger, plan, &reservations, |position| {
-            let job = jobs[position].take().expect("each job is started once");
-            if let Err(stop) = crate::scan_health::type_memory_stop() {
-                let stopped: ServiceOutcome = Err(stop.to_string().into());
-                return futures::future::Either::Left(std::future::ready(stopped));
-            }
-            let memory = job.memory;
-            info!(
-                "Service {} started: heap cap {} ({}), reservation {} MB, {} in flight",
-                self.services[job.index]
-                    .service_name
-                    .as_deref()
-                    .unwrap_or("(root)"),
-                memory
-                    .heap_cap_mb
-                    .map_or_else(|| "V8's default".to_string(), |mb| format!("{mb} MB")),
-                memory.stored_peak_mb.map_or_else(
-                    || "no stored peak".to_string(),
-                    |mb| format!("stored peak {mb} MB")
-                ),
-                memory.reservation_mb,
-                ledger.in_flight(),
-            );
-            let scan = std::sync::Arc::clone(self);
-            futures::future::Either::Right(service_workers::on_a_thread(
-                format!("carrick-service-{}", job.index + 1),
-                move |runtime| {
-                    let label = scan.services[job.index]
-                        .service_name
-                        .clone()
-                        .unwrap_or_else(|| "(root)".to_string());
-                    // Every line the run log gets from inside the analysis names
-                    // the service; the terminal's lines do not change for it.
-                    let span = tracing::info_span!("service", name = %label);
-                    runtime.block_on(tracing::Instrument::instrument(
-                        scan.analyze(
-                            job.index,
-                            job.previous.as_ref(),
-                            job.generation,
-                            memory.heap_cap_mb,
-                        ),
-                        span,
-                    ))
-                },
-            ))
+            self.start(jobs[position].take().expect("each job is started once"))
         })
         .await
+    }
+
+    /// [`Self::analyze_all`] with each job's service walked first: its walk
+    /// and the analyses are admitted together against the run's ledger, and
+    /// each analysis starts once the walks it reads have ended (carrick#3085).
+    async fn walk_and_analyze(
+        self: &std::sync::Arc<Self>,
+        jobs: Vec<ServiceJob>,
+        plan: &service_workers::Plan,
+        lane: walk_lane::Lane,
+    ) -> Vec<ServiceOutcome> {
+        let declared: Vec<usize> = jobs
+            .iter()
+            .map(|job| {
+                self.siblings
+                    .declared(job.index)
+                    .expect("an analysed service is declared")
+            })
+            .collect();
+        let walks: Vec<(usize, u64)> = declared
+            .iter()
+            .map(|service| (*service, lane.reservation_mb(*service)))
+            .collect();
+        let analyses: Vec<(usize, u64)> = declared
+            .iter()
+            .zip(&jobs)
+            .map(|(service, job)| (*service, job.memory.reservation_mb))
+            .collect();
+        let mut pass = WalkThenAnalyze {
+            lane,
+            scan: std::sync::Arc::clone(self),
+            jobs: jobs.into_iter().map(Some).collect(),
+        };
+        service_workers::walks_and_analyses(
+            service_workers::run_ledger(),
+            plan,
+            &walks,
+            &analyses,
+            &mut pass,
+        )
+        .await
+    }
+
+    /// Start `job`'s analysis on a thread of its own, once its reservation
+    /// is taken; or fail it with the stop a type checker's memory death made,
+    /// when the run was told to stop on one.
+    fn start(
+        self: &std::sync::Arc<Self>,
+        job: ServiceJob,
+    ) -> futures::future::BoxFuture<'static, ServiceOutcome> {
+        if let Err(stop) = crate::scan_health::type_memory_stop() {
+            let stopped: ServiceOutcome = Err(stop.to_string().into());
+            return Box::pin(std::future::ready(stopped));
+        }
+        let memory = job.memory;
+        info!(
+            "Service {} started: heap cap {} ({}), reservation {} MB, {} in flight",
+            self.services[job.index]
+                .service_name
+                .as_deref()
+                .unwrap_or("(root)"),
+            memory
+                .heap_cap_mb
+                .map_or_else(|| "V8's default".to_string(), |mb| format!("{mb} MB")),
+            memory.stored_peak_mb.map_or_else(
+                || "no stored peak".to_string(),
+                |mb| format!("stored peak {mb} MB")
+            ),
+            memory.reservation_mb,
+            service_workers::run_ledger().in_flight(),
+        );
+        let scan = std::sync::Arc::clone(self);
+        Box::pin(service_workers::on_a_thread(
+            format!("carrick-service-{}", job.index + 1),
+            move |runtime| {
+                let label = scan.services[job.index]
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| "(root)".to_string());
+                // Every line the run log gets from inside the analysis names
+                // the service; the terminal's lines do not change for it.
+                let span = tracing::info_span!("service", name = %label);
+                runtime.block_on(tracing::Instrument::instrument(
+                    scan.analyze(
+                        job.index,
+                        job.previous.as_ref(),
+                        job.generation,
+                        memory.heap_cap_mb,
+                    ),
+                    span,
+                ))
+            },
+        ))
     }
 
     /// Analyse the service at `at` again, alone, at the run's cap
@@ -2893,20 +3030,20 @@ impl ServiceScan {
 
         // The compiler's rows for every position of the service's files
         // (carrick#2405), when asked for, read before discovery
-        // (carrick#2413). Walked in the lane before the loop, in a process
-        // that exited before any analysis sidecar started, so the two
-        // programs never share a heap. Outside the local and model split:
-        // the walk is neither the analysis nor its wait.
-        let positions = self
-            .walks
-            .as_ref()
-            .and_then(|walks| walks.get(index))
-            .map(walk_lane::Walked::index);
-        let walk_peak_mb = self
-            .walks
-            .as_ref()
-            .and_then(|walks| walks.get(index))
-            .and_then(walk_lane::Walked::peak_mb);
+        // (carrick#2413). Walked in a process of its own that exited before
+        // this analysis started (carrick#3085). Outside the local and model
+        // split: the walk is neither the analysis nor its wait.
+        let walked = self
+            .siblings
+            .declared(index)
+            .filter(|_| self.walking)
+            .and_then(|own| self.siblings.walked(own));
+        debug_assert!(
+            !self.walking || walked.is_some(),
+            "{label} was analysed before its walk ended"
+        );
+        let positions = walked.map(walk_lane::Walked::index);
+        let walk_peak_mb = walked.and_then(walk_lane::Walked::peak_mb);
 
         // A sidecar process of the service's own, scoped to its directory and
         // tsconfig, at the heap cap the run's ledger gave it (carrick#3084).
@@ -2936,7 +3073,6 @@ impl ServiceScan {
                     .map(|own| siblings::Neighbours {
                         registry: &self.siblings,
                         own,
-                        walks: self.walks.as_deref(),
                     }),
                 // A retry re-enters this run's own blob: the decision made
                 // against main's stands.
