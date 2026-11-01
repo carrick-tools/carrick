@@ -254,11 +254,12 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         "hosted guidance marker"
     );
     assert_eq!(replayed["cached_extraction_config"], json!({"rules":[]}));
-    // Manifest changes invalidate all three cached model configurations even
-    // though the source file itself still matches the hosted commit.
+    // A manifest change other than its own `version` (carrick#2568)
+    // invalidates all three cached model configurations even though the
+    // source file itself still matches the hosted commit.
     std::fs::write(
         repo.join("package.json"),
-        r#"{"name":"orders","version":"2.0.0","dependencies":{"@remix-run/node":"^2.0.0"}}"#,
+        r#"{"name":"orders","version":"1.0.0","dependencies":{"@remix-run/node":"^2.0.0","express":"^4.18.0"}}"#,
     )
     .unwrap();
     run(root, &["refresh", "--workspace", "."], Some(TOKEN));
