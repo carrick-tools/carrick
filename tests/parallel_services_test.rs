@@ -317,6 +317,14 @@ fn assert_all_landed(storage: &StubStorage, what: &str, with_types: bool) {
             blob.service_name
         );
         assert_eq!(peaks.heap_cap_mb, cap, "{what}: {:?}", blob.service_name);
+        // The known positive for walked rows: every service's walk ran.
+        if with_types && std::env::var("CARRICK_POSITION_ROWS").as_deref() == Ok("1") {
+            assert!(
+                peaks.walk_mb.unwrap_or(0) > 0,
+                "{what}: {:?} was not walked: {peaks:?}",
+                blob.service_name
+            );
+        }
     }
     if with_types {
         for blob in &blobs {
