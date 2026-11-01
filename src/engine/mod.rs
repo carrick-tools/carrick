@@ -4860,8 +4860,9 @@ async fn analyze_current_repo_incremental(
             // A pull request run decides which aliases its change can reach
             // (carrick#3102), over the requests the type stage below sends:
             // collected as it collects them, which is deterministic over the
-            // same inputs. Logged and kept; nothing reads it yet.
-            if let Some(context) = reach {
+            // same inputs. A service with no reached alias keeps main's
+            // types below (carrick#3103).
+            let decision = if let Some(context) = reach {
                 let reach_started = Instant::now();
                 let (mut explicit, mut infer, _) = file_orchestrator.collect_type_requests(
                     &merged_results,
@@ -4886,37 +4887,67 @@ async fn analyze_current_repo_incremental(
                     &cloud_data,
                     &crate::services::type_sidecar::request_files(&explicit, &infer),
                     sidecar,
-                );
-            }
+                )
+            } else {
+                type_reach::ReachDecision::Whole {
+                    reason: "not_a_pull_request_run".to_string(),
+                }
+            };
+            let kept_main = decision.keeps_main_types().then(|| decision.kept_aliases());
 
-            // Type resolution via sidecar (+ v2 capture stub for this service)
+            // Type resolution via sidecar (+ v2 capture stub for this service).
+            // A service no change reaches sends no request: main's types are
+            // put in below (carrick#3103).
             let TypesOutcome {
                 stub_dir,
                 type_reach,
-            } = resolve_types_if_available(
-                sidecar,
-                &file_orchestrator,
-                &merged_results,
-                repo_path,
-                setup.extraction_config.as_ref(),
-                &mount_graph,
-                config,
-                &service_modules,
-                &protocol_requests,
-                &protocol_infer,
-                &payload_infer,
-                server_claims.as_ref(),
-                &mut cloud_data,
-            );
+            } = if let Some(kept) = kept_main {
+                let without_twin = type_reach::keep_main_types(&mut cloud_data, prev, repo_path);
+                if without_twin > 0 {
+                    warn!(
+                        "type_reach: {} kept main's types with {without_twin} row(s) \
+                         that have no twin in main's manifest",
+                        config.service_name.as_deref().unwrap_or("(root)")
+                    );
+                }
+                // The check retypes this service's calls from main's stored
+                // locators, as it does for a service `--changed-only` carries.
+                record_carried_consumer(repo_path, config, &cloud_data);
+                type_reach::note_kept(
+                    prev.service_name.as_deref().unwrap_or(&prev.repo_name),
+                    config.service_name.as_deref().unwrap_or("(root)"),
+                    kept,
+                );
+                TypesOutcome::default()
+            } else {
+                resolve_types_if_available(
+                    sidecar,
+                    &file_orchestrator,
+                    &merged_results,
+                    repo_path,
+                    setup.extraction_config.as_ref(),
+                    &mount_graph,
+                    config,
+                    &service_modules,
+                    &protocol_requests,
+                    &protocol_infer,
+                    &payload_infer,
+                    server_claims.as_ref(),
+                    &mut cloud_data,
+                )
+            };
             crate::phase_timing::mark(crate::phase_timing::Phase::Types);
 
-            if let Some(bundled_types) = cloud_data.bundled_types.take() {
+            if kept_main.is_none()
+                && let Some(bundled_types) = cloud_data.bundled_types.take()
+            {
                 let updated =
                     append_missing_aliases(bundled_types, cloud_data.type_manifest.as_ref());
                 cloud_data.bundled_types = Some(updated);
             }
 
             // Resolve per-endpoint definitions from the capture stub tree
+            // (a kept service has no stub dir: its definitions are main's)
             if let (Some(sidecar), Some(stub_dir)) = (sidecar, stub_dir.as_deref()) {
                 resolve_per_endpoint_definitions(sidecar, &mut cloud_data, stub_dir);
             }
