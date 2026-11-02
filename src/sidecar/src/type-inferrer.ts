@@ -850,6 +850,12 @@ export class TypeInferrer {
     const bodies: Array<{ request: InferRequestItem; result: InferredType }> = [];
     /** How long each request took, in the order they were done (carrick#1985). */
     const timings: InferSlotTiming[] = [];
+    /**
+     * Requests for a route registered once per loop element (carrick#1029),
+     * read after everything else, with where each answer goes in the answer
+     * order.
+     */
+    const loopRows: Array<{ request: InferRequestItem; at: number }> = [];
 
     for (const request of requests) {
       const slotStarted = performance.now();
@@ -878,18 +884,17 @@ export class TypeInferrer {
         // while the program the prints were made in is still the project's.
         // The unwidened re-read below records nothing: it prints the same
         // node, and its reading has a budget.
-        const pick = this.loopPickFor(request);
-        const result = pick
-          ? this.inferForLoopElement(request, pick, extractionConfig)
-          : this.inferRecordingNames(request, extractionConfig);
+        // carrick#1029: a route registered once per loop element is read
+        // last. Its reading rewrites its file, and a rewrite forgets every
+        // node of the file that the readings below still hold.
+        if (this.loopPickFor(request)) {
+          loopRows.push({ request, at: inferredTypes.length });
+          continue;
+        }
+        const result = this.inferRecordingNames(request, extractionConfig);
         if (result) {
           printedLength = result.type_string.length;
           inferredTypes.push(result);
-          // A reading typed for one loop element is not re-read unwidened: the
-          // re-read rewrites the original file, where the element is not fixed.
-          if (pick) {
-            continue;
-          }
           if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
             responses.push({ request, result });
           } else if (request.infer_kind === 'request_body') {
@@ -980,6 +985,30 @@ export class TypeInferrer {
         `Unwidened reading failed: ${err instanceof Error ? err.message : String(err)}`
       );
     }
+
+    // The loop rows, each typed for its own element. Not re-read unwidened:
+    // that re-read rewrites the original file, where the element is not
+    // fixed. Placed back in request order, last first so earlier places hold.
+    const loopAnswers: Array<{ at: number; result: InferredType }> = [];
+    // Each was counted done, and timed, where it was deferred.
+    for (const { request, at } of loopRows) {
+      const loc = this.formatRequestLocation(request);
+      try {
+        const pick = this.loopPickFor(request);
+        const result = pick
+          ? this.inferForLoopElement(request, pick, extractionConfig)
+          : this.inferRecordingNames(request, extractionConfig);
+        if (result) {
+          loopAnswers.push({ at, result });
+        } else {
+          errors.push(`Could not infer type at ${request.file_path}:${loc} (${request.infer_kind})`);
+        }
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        errors.push(`Error inferring type at ${request.file_path}:${loc}: ${error}`);
+      }
+    }
+    for (const { at, result } of loopAnswers.reverse()) inferredTypes.splice(at, 0, result);
 
     return {
       success: errors.length === 0 || inferredTypes.length > 0,

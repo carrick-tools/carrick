@@ -46,6 +46,8 @@ KINDS.forEach((kind) => {
 for (const kind of listKinds()) {
   app.get(\`/listed/\${kind}\`, async () => ({ items: rows()[kind] }));
 }
+
+app.get('/status', async () => ({ state: rows().alpha.length > 0 ? 'up' : 'down' }));
 `;
 
 function lineOf(text: string, needle: string): number {
@@ -84,7 +86,9 @@ describe('carrick#1029: a loop-registered route is typed for its own element', (
     const text = project.getSourceFileOrThrow(routesPath).getFullText();
     return {
       text,
+      order: (res.inferred_types ?? []).map((t) => t.alias),
       byAlias: new Map((res.inferred_types ?? []).map((t) => [t.alias, collapse(t.type_string)])),
+      unwidened: new Map((res.inferred_types ?? []).map((t) => [t.alias, collapse(t.unwidened_type_string)])),
     };
   };
   const route = (alias: string, needle: string, routePath?: string): InferRequestItem => ({
@@ -134,6 +138,19 @@ describe('carrick#1029: a loop-registered route is typed for its own element', (
         alias
       );
     }
+  });
+
+  it("leaves the file's other readings whole, and answers in request order", () => {
+    // The status route is read unwidened in the same file the loop rows rewrite.
+    const { byAlias, unwidened, order } = read([
+      route('alpha', 'app.get(`/items/', '/items/alpha-rows'),
+      route('status', "app.get('/status'"),
+      route('beta', 'app.get(`/items/', '/items/beta-rows'),
+    ]);
+    assert.deepStrictEqual(order, ['alpha', 'status', 'beta']);
+    assert.strictEqual(byAlias.get('status'), '{ state: string; }');
+    assert.strictEqual(unwidened.get('status'), '{ state: "up" | "down"; }');
+    assert.strictEqual(byAlias.get('beta'), '{ items: { betaName: string; }[]; total: number; }');
   });
 
   it('keeps the union for a list the code does not state', () => {
