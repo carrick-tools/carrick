@@ -39,7 +39,8 @@ import {
 import { statesNoBody } from './capture/index.js';
 import { lineIndex } from './line-index.js';
 import { typeToStringAsDeclared } from './print-type.js';
-import { typeArgumentOnlySelects } from './retype-selector.js';
+import { deferredResultNeedsUndefined } from './retype-deferred.js';
+import { resolvedDeclaration, typeArgumentOnlySelects } from './retype-selector.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
 import type {
   InferRequestItem,
@@ -229,8 +230,15 @@ export class Retyper {
         // carrick#3158: no producer type is read here, so this is only the
         // reason the retype would give for ANY object type literal; the
         // scanner applies it when the producer's type is one.
-        return typeArgumentOnlySelects(found.call)
-          ? { fresh_type_reason: this.notReachedReason(found.call) }
+        if (typeArgumentOnlySelects(found.call)) {
+          return { fresh_type_reason: this.notReachedReason(found.call) };
+        }
+        // carrick#3165: a deferred result whose every member holds an
+        // `undefined` the stated type does not reach. The scanner applies it
+        // when the producer's type has no top-level `undefined`. The quoted
+        // type is the call's own result, as no producer type is read here.
+        return deferredResultNeedsUndefined(found.call)
+          ? { undefined_free_reason: this.notReachedReason(found.call) }
           : {};
       } catch {
         return {};
@@ -621,14 +629,6 @@ function resultIsDiscarded(call: CallExpression): boolean {
     parent = node.getParent();
   }
   return !!parent && Node.isExpressionStatement(parent);
-}
-
-function resolvedDeclaration(call: CallExpression): ts.SignatureDeclaration | undefined {
-  const signature = call
-    .getProject()
-    .getTypeChecker()
-    .compilerObject.getResolvedSignature(call.compilerNode);
-  return signature?.getDeclaration() as ts.SignatureDeclaration | undefined;
 }
 
 /**

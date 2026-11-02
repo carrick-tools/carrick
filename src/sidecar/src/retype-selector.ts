@@ -40,15 +40,9 @@ export function typeArgumentOnlySelects(call: CallExpression): boolean {
   }
   const typeArgs = call.getTypeArguments();
   const checker = call.getProject().getTypeChecker().compilerObject;
-  const declaration = checker.getResolvedSignature(call.compilerNode)?.getDeclaration() as
-    | ts.SignatureDeclaration
-    | undefined;
+  const declaration = singleSignatureDeclaration(call);
   const parameters = declaration?.typeParameters;
-  if (!declaration || !parameters || parameters.length === 0 || !declaration.type) return false;
-
-  // C0: one signature on a callee that is not a union.
-  const callee = call.getExpression().getType();
-  if (callee.isUnion() || callee.getCallSignatures().length !== 1) return false;
+  if (!declaration || !parameters) return false;
 
   const explicit = typeArgs.length > 0;
   if (typeArgs.length > parameters.length) return false;
@@ -72,19 +66,43 @@ export function typeArgumentOnlySelects(call: CallExpression): boolean {
   return selectsOnly(declaration.type, roles, checker, new Set(), 0);
 }
 
+export function resolvedDeclaration(call: CallExpression): ts.SignatureDeclaration | undefined {
+  const signature = call
+    .getProject()
+    .getTypeChecker()
+    .compilerObject.getResolvedSignature(call.compilerNode);
+  return signature?.getDeclaration() as ts.SignatureDeclaration | undefined;
+}
+
+/**
+ * C0: the declaration the call resolves to, when the callee has one call
+ * signature (not a union), that signature has type parameters, and its
+ * return type is written.
+ */
+export function singleSignatureDeclaration(
+  call: CallExpression
+): (ts.SignatureDeclaration & { type: ts.TypeNode }) | undefined {
+  const declaration = resolvedDeclaration(call);
+  const parameters = declaration?.typeParameters;
+  if (!declaration || !parameters || parameters.length === 0 || !declaration.type) return undefined;
+  const callee = call.getExpression().getType();
+  if (callee.isUnion() || callee.getCallSignatures().length !== 1) return undefined;
+  return declaration as ts.SignatureDeclaration & { type: ts.TypeNode };
+}
+
 /** Whether `test` holds for any direct child (`forEachChild` stops only on a truthy return). */
-function anyChild(node: ts.Node, test: (child: ts.Node) => boolean): boolean {
+export function anyChild(node: ts.Node, test: (child: ts.Node) => boolean): boolean {
   return ts.forEachChild(node, (child) => (test(child) ? true : undefined)) ?? false;
 }
 
 /** Names no type parameter, no `this` and no `typeof`. */
-function isClosedType(node: ts.Node, checker: ts.TypeChecker): boolean {
+export function isClosedType(node: ts.Node, checker: ts.TypeChecker): boolean {
   if (ts.isTypeQueryNode(node) || ts.isThisTypeNode(node)) return false;
   if (ts.isTypeReferenceNode(node) && isTypeParameter(node, checker)) return false;
   return !anyChild(node, (child) => !isClosedType(child, checker));
 }
 
-function referencedSymbol(
+export function referencedSymbol(
   node: ts.TypeReferenceNode,
   checker: ts.TypeChecker
 ): ts.Symbol | undefined {
@@ -100,7 +118,7 @@ function referencedSymbol(
   return symbol;
 }
 
-function isTypeParameter(node: ts.TypeReferenceNode, checker: ts.TypeChecker): boolean {
+export function isTypeParameter(node: ts.TypeReferenceNode, checker: ts.TypeChecker): boolean {
   const symbol = referencedSymbol(node, checker);
   return !!symbol && (symbol.flags & ts.SymbolFlags.TypeParameter) !== 0;
 }
@@ -124,7 +142,7 @@ function namesOnlyTracked(node: ts.Node, roles: Roles, checker: ts.TypeChecker):
   return !anyChild(node, (child) => !namesOnlyTracked(child, roles, checker));
 }
 
-function holdsInfer(node: ts.Node): boolean {
+export function holdsInfer(node: ts.Node): boolean {
   if (ts.isInferTypeNode(node)) return true;
   return anyChild(node, holdsInfer);
 }
