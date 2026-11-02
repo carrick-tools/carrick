@@ -1624,6 +1624,29 @@ fn slot_alternatives<'p>(
     (!ways.is_empty()).then_some(ways)
 }
 
+/// The paths a route's own path slot `name` states where the source writes
+/// it through a conditional or a default (carrick#2386): each way the code
+/// writes whole. `apiPrefix + "/x"` with `apiPrefix = base ? \`${base}api\` :
+/// "/api"` is served at `/api/x` when `base` is unset; the way led by `base`
+/// is a path the scan cannot read and adds nothing. Empty where no way is
+/// written whole, or where more than [`MAX_PREFIX_VALUES`] are. Unlike a
+/// prefix ([`InstanceWalk::prefix_of`]), one unread way does not unread the
+/// rest: each value returned is a path the route is served at.
+pub(super) fn whole_ways(placed: &Placed<'_>, name: &(usize, Option<String>)) -> Vec<String> {
+    let Some(ways) = slot_alternatives(placed, name) else {
+        return Vec::new();
+    };
+    let values: BTreeSet<String> = ways
+        .iter()
+        .filter_map(|way| literal(&way.pieces))
+        .filter(|text| !text.is_empty())
+        .collect();
+    if values.len() > MAX_PREFIX_VALUES {
+        return Vec::new();
+    }
+    values.into_iter().collect()
+}
+
 /// The most values one prefix slot states: beyond it the slot reads as
 /// unread.
 const MAX_PREFIX_VALUES: usize = 16;

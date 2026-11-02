@@ -5187,7 +5187,12 @@ async fn analyze_current_repo_incremental(
                     fact_sender,
                 ),
             );
-            let fallbacks = analysis_fallbacks(fallbacks, &analysis, |done| &done.stats);
+            let mut fallbacks = analysis_fallbacks(fallbacks, &analysis, |done| &done.stats);
+            fallbacks.counts().extend(library_ask_health(
+                &request_inputs,
+                &semantics_root,
+                Path::new(repo_path),
+            ));
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
             crate::phase_timing::mark(crate::phase_timing::Phase::Model);
@@ -6249,12 +6254,14 @@ impl LibraryAsk {
         let home = dirs::home_dir();
         let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
         let npm_registry_env = std::env::var("NPM_CONFIG_REGISTRY").ok();
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
         let install = crate::library_store::Install {
             service_root,
             repo_root,
             home: home.as_deref(),
             yarn_registry_env: yarn_registry_env.as_deref(),
             npm_registry_env: npm_registry_env.as_deref(),
+            xdg_config_home: xdg_config_home.as_deref(),
         };
         let asked = crate::library_store::request(&specifiers, &install);
         // The language's own library (carrick#2504): the default-library
@@ -10963,6 +10970,48 @@ fn analysis_fallbacks<T, E>(
     pending
 }
 
+/// Whether the service's library store ask left out what it installed
+/// (carrick#2386: a pnpm 12 lockfile read as unreadable kept every npm
+/// package from the store for twelve days, with no line saying so). The
+/// counts join the service's fallbacks, which the cloud runner logs one row
+/// per count; a blind ask is also warned in the run log, not on the terminal.
+fn library_ask_health(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    service_root: &Path,
+    repo_root: &Path,
+) -> Vec<(String, usize)> {
+    let specifiers: BTreeSet<String> = crate::request_summary::library_sites(inputs)
+        .packages()
+        .into_values()
+        .flatten()
+        .collect();
+    let home = dirs::home_dir();
+    let npm_registry_env = std::env::var("NPM_CONFIG_REGISTRY").ok();
+    let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
+    let health = crate::library_store::ask_health(
+        &specifiers,
+        &crate::library_store::Install {
+            service_root,
+            repo_root,
+            home: home.as_deref(),
+            yarn_registry_env: yarn_registry_env.as_deref(),
+            npm_registry_env: npm_registry_env.as_deref(),
+            xdg_config_home: xdg_config_home.as_deref(),
+        },
+    );
+    if health.is_blind() {
+        warn!(
+            target: crate::logging::PREAMBLE_TARGET,
+            installed = health.installed,
+            sent = health.sent,
+            unreadable = ?health.unreadable_lockfiles,
+            "Library store ask is blind: installed packages the service's library calls go through were not asked about"
+        );
+    }
+    health.counts()
+}
+
 /// The tally's counts out of one service's file analysis. Keys are lowercase
 /// (`^[a-z][a-z0-9_]{0,63}$`): the cloud parsers skip any other key. The two
 /// model-only counts are stated only when the model passes ran (answered or
@@ -12722,7 +12771,12 @@ async fn analyze_current_repo(
             fact_sender,
         ),
     );
-    let fallbacks = analysis_fallbacks(fallbacks, &analysis_result, |done| &done.stats);
+    let mut fallbacks = analysis_fallbacks(fallbacks, &analysis_result, |done| &done.stats);
+    fallbacks.counts().extend(library_ask_health(
+        &request_inputs,
+        &service_root,
+        Path::new(repo_path),
+    ));
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
     crate::phase_timing::mark(crate::phase_timing::Phase::Model);

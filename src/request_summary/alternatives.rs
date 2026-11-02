@@ -161,6 +161,21 @@ impl Alternatives {
         }
     }
 
+    /// Each reading's text, where a conditional is in it and the source
+    /// states which ways can be taken together: the ways a receiver trace
+    /// slot reads (carrick#2386). Empty otherwise. A reading that holds a
+    /// value nothing read (`poisoned`) is still returned: a reader of these
+    /// ways takes only the readings written whole.
+    pub(super) fn chosen_texts(&self) -> Vec<Vec<Piece>> {
+        if !self.chooses() || self.entangled {
+            return Vec::new();
+        }
+        self.readings
+            .iter()
+            .map(|reading| reading.pieces.clone())
+            .collect()
+    }
+
     /// Whether a conditional is in it.
     fn chooses(&self) -> bool {
         self.readings.len() > 1 || self.poisoned

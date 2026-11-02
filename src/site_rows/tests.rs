@@ -1706,6 +1706,7 @@ fn traced_site(file: &str, start: u32, ends: &[(&str, Option<&str>)]) -> Decided
                 path: path.map(str::to_string),
                 edges: Vec::new(),
                 end: end.to_string(),
+                own: None,
             },
         )
         .collect();

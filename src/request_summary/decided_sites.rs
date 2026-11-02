@@ -2437,8 +2437,14 @@ fn decide(
         (Some(makers), Some(index)) => {
             let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
             for site in &mut out.sites {
-                (site.composed, site.composed_trimmed) =
-                    composed::compose(&site.instances, site.name_text().as_deref(), &mounts);
+                (site.composed, site.composed_trimmed) = match site.name_text() {
+                    Some(own) => composed::compose(&site.instances, Some(&own), &mounts),
+                    None => composed::compose_ways(
+                        &site.instances,
+                        &route_ways(site, labels, &calls, root),
+                        &mounts,
+                    ),
+                };
             }
             procedures::Pass {
                 calls: &calls,
@@ -2489,6 +2495,37 @@ fn decide(
         .of(&out, labels);
     }
     out
+}
+
+/// The paths a site's own call writes for its name slot through a
+/// conditional or a default, each way written whole
+/// ([`instances::whole_ways`], carrick#2386), for a site whose name is not
+/// text. Only where the site is the labelled call itself: a name composed
+/// down a chain of calls is read as it was.
+fn route_ways(
+    site: &DecidedSite,
+    labels: &[SiteLabel],
+    calls: &Calls<'_>,
+    root: &Path,
+) -> Vec<String> {
+    let at_end = site.file == site.end.file
+        && site.span_start == site.end.span_start
+        && site.span_end == site.end.span_end;
+    if !at_end || site.key.is_some() {
+        return Vec::new();
+    }
+    let Some(slot) = SiteLabel::find(labels, &site.end).and_then(|label| label.name.as_ref())
+    else {
+        return Vec::new();
+    };
+    let Some(placed) = calls.at_span(
+        &root.join(&site.end.file),
+        site.end.span_start,
+        site.end.span_end,
+    ) else {
+        return Vec::new();
+    };
+    instances::whole_ways(&placed, &(slot.arg, slot.key.clone()))
 }
 
 /// Where the request summaries state each request's rows

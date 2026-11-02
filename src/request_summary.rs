@@ -4476,7 +4476,16 @@ impl Reader<'_> {
             _ => false,
         };
         if !branching {
-            return Vec::new();
+            // A conditional reached through a local or joined with text
+            // (`apiPrefix + "/x"`, `apiPrefix = base ? … : "/api"`): each
+            // reading the send side reads it as (carrick#2386).
+            return self
+                .alternatives(expr, scope)
+                .map(|alts| alts.chosen_texts())
+                .unwrap_or_default()
+                .into_iter()
+                .map(Way::stated)
+                .collect();
         }
         let ways = self.ways(expr, scope);
         if ways.len() > 1 { ways } else { Vec::new() }
