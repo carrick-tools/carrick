@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.141](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.140...carrick-v0.3.141) (2026-11-02)
+
+
+### Features
+
+* **findings:** mark pairings a PR removed that another service still uses (part of [#3092](https://github.com/carrick-tools/carrick/issues/3092), S-A) ([#3193](https://github.com/carrick-tools/carrick/issues/3193)) ([d81bca9](https://github.com/carrick-tools/carrick/commit/d81bca97c0894030285c3df7eaf0db7c0e3a0390))
+
+
+### Bug Fixes
+
+* **change-scope:** a copy carried across a version-only bump is current for a PR that edits a manifest ([#3176](https://github.com/carrick-tools/carrick/issues/3176)) ([#3194](https://github.com/carrick-tools/carrick/issues/3194)) ([d6ae308](https://github.com/carrick-tools/carrick/commit/d6ae308a2326b1a466c11e588ac717da5dc478eb))
+* display labels and stated sources for GraphQL, socket and bus rows ([#3090](https://github.com/carrick-tools/carrick/issues/3090), [#3091](https://github.com/carrick-tools/carrick/issues/3091)) ([#3179](https://github.com/carrick-tools/carrick/issues/3179)) ([4ac2ad4](https://github.com/carrick-tools/carrick/commit/4ac2ad4f91c869942cc40d0d7c68a9e2feca98e8))
+* **library-store,trace:** read pnpm 11+ installs and route paths written through a conditional ([#2386](https://github.com/carrick-tools/carrick/issues/2386)) ([#3182](https://github.com/carrick-tools/carrick/issues/3182)) ([0b90359](https://github.com/carrick-tools/carrick/commit/0b90359841ce87e2ffe9c92326c0b53ae94aeed7))
+* **pr-baseline:** a risk sited only in files the PR did not change is on main ([#3178](https://github.com/carrick-tools/carrick/issues/3178)) ([52a62c0](https://github.com/carrick-tools/carrick/commit/52a62c093ecaef941c216a6908b0e882a561a0d0))
+* **sidecar:** narrow a shared executor's response by the arguments each route passes it ([#2372](https://github.com/carrick-tools/carrick/issues/2372)) ([#3175](https://github.com/carrick-tools/carrick/issues/3175)) ([af2f628](https://github.com/carrick-tools/carrick/commit/af2f6288413f13443b77a7d2a3b7c0332281b569))
+* **skills:** the reuse skill's audit call passes audit: true ([#3202](https://github.com/carrick-tools/carrick/issues/3202)) ([6f50133](https://github.com/carrick-tools/carrick/commit/6f501332ccc717903000b3b546dc77638345ddef))
+* **trace:** guessed route paths drop to possible calls; trace wins over a disagreeing model row ([#3195](https://github.com/carrick-tools/carrick/issues/3195)) ([aa06d1f](https://github.com/carrick-tools/carrick/commit/aa06d1f05c297ac48e552357cc952750a5623268))
+* **trace:** read plugin routes when a package's factory is labelled under two names ([#3185](https://github.com/carrick-tools/carrick/issues/3185)) ([#3189](https://github.com/carrick-tools/carrick/issues/3189)) ([161cd70](https://github.com/carrick-tools/carrick/commit/161cd70ff855313c4d316b0f10511b9d95d8de97))
+* **types:** type a loop-registered route for its own element ([#1029](https://github.com/carrick-tools/carrick/issues/1029)) ([#3187](https://github.com/carrick-tools/carrick/issues/3187)) ([80b7d60](https://github.com/carrick-tools/carrick/commit/80b7d607e8505e33dcfce7e76b7e3c5adf27ca50))
+
 ## [0.3.140](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.139...carrick-v0.3.140) (2026-11-02)
 
 
