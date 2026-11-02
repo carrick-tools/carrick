@@ -63,7 +63,7 @@ fn line_of(needle: &str) -> i32 {
     let at = ROUTES_TS
         .find(needle)
         .expect("the fixture holds the needle");
-    ROUTES_TS[..at].lines().count() as i32 + 1
+    ROUTES_TS[..at].matches('\n').count() as i32 + 1
 }
 
 /// A model row at `needle`'s line, its response located as the expression
