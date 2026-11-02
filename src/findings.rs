@@ -168,6 +168,51 @@ pub enum OnMainUnknown {
     /// cannot be reached again from main's stored index, so main's stored
     /// verdict is the only answer, and it is missing or unresolved.
     MainTypesUnjudged,
+    /// A pairing main had was lost here, but the run cannot show that this
+    /// PR's diff removed the side that is gone (carrick#3092): the removal is
+    /// not placed in the diff and the removed side's service is not provably
+    /// untouched, or the two contradict each other. Doubt lands here, never on
+    /// `on_main: false`.
+    RemovalUnplaced,
+}
+
+/// The operation a PR removed or renamed away that another service still uses
+/// (carrick#3092): main's spelling of it and where main had it. `service` is
+/// the service that served (or sent) it; `place` is `file:line` on main.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RemovedSide {
+    pub method: String,
+    pub path: String,
+    pub service: Option<String>,
+    pub place: String,
+}
+
+/// A `missing_endpoint` or `orphaned_endpoint` row that records a pairing main
+/// had and this PR run lost (carrick#3092). Present only on a PR run and only
+/// on a row that lost a pairing; its presence makes the row a `risk`. Every
+/// other row of both kinds serializes exactly as before.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Removal {
+    pub removed: RemovedSide,
+    /// Whether every row behind the pairing is one the source states.
+    pub edge_source: Option<EdgeSource>,
+    /// `NotChecked`: a lost pairing is a routing fact, not a type verdict.
+    pub verdict_state: Option<VerdictState>,
+    pub on_main: Option<bool>,
+    /// Why `on_main` is `None`. Never set alongside `on_main`.
+    pub on_main_unknown: Option<OnMainUnknown>,
+}
+
+/// Write a removal's fields beside the row's own (carrick#3092).
+fn serialize_removal<M: SerializeMap>(map: &mut M, removal: &Removal) -> Result<(), M::Error> {
+    map.serialize_entry("removed", &removal.removed)?;
+    if let Some(edge_source) = &removal.edge_source {
+        map.serialize_entry("edge_source", edge_source)?;
+    }
+    if let Some(verdict_state) = &removal.verdict_state {
+        map.serialize_entry("verdict_state", verdict_state)?;
+    }
+    serialize_on_main(map, &removal.on_main, &removal.on_main_unknown)
 }
 
 /// One repo's pinned version of a conflicting package.
@@ -311,6 +356,9 @@ pub enum Finding {
         path: String,
         service: Option<String>,
         call_sites: Vec<String>,
+        /// Set when this row records a pairing main had and this PR lost
+        /// (carrick#3092).
+        removal: Option<Removal>,
     },
     /// A producer endpoint with no consumer in the index.
     OrphanedEndpoint {
@@ -326,6 +374,12 @@ pub enum Finding {
         /// own by design, so "nothing calls it" is not an observation about it
         /// and the unconsumed section leaves it out (cloud#599).
         view_module: bool,
+        /// The receiver's registration places, written only on a row that lost
+        /// a pairing (carrick#3092); empty on every other row.
+        sites: Vec<String>,
+        /// Set when this row records a pairing main had and this PR lost
+        /// (carrick#3092).
+        removal: Option<Removal>,
     },
     /// A call whose URL is built from an env var not classified in
     /// carrick.json (`internalEnvVars` / `externalEnvVars`).
@@ -467,6 +521,7 @@ impl Finding {
             path: path.into(),
             service,
             call_sites,
+            removal: None,
         }
     }
 
@@ -481,6 +536,32 @@ impl Finding {
             service,
             provenance: EndpointProvenance::default(),
             view_module: false,
+            sites: Vec::new(),
+            removal: None,
+        }
+    }
+
+    /// Record that this row is a pairing main had and this PR lost
+    /// (carrick#3092), with the receiver's registration `sites` on an orphaned
+    /// endpoint. No-op for every kind but the two endpoint rows.
+    pub fn with_removal(mut self, marked: Removal, receiver_sites: Vec<String>) -> Self {
+        match &mut self {
+            Finding::MissingEndpoint { removal, .. } => *removal = Some(marked),
+            Finding::OrphanedEndpoint { removal, sites, .. } => {
+                *removal = Some(marked);
+                *sites = receiver_sites;
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// The removal an endpoint row carries, when it lost a pairing.
+    pub fn removal(&self) -> Option<&Removal> {
+        match self {
+            Finding::MissingEndpoint { removal, .. }
+            | Finding::OrphanedEndpoint { removal, .. } => removal.as_ref(),
+            _ => None,
         }
     }
 
@@ -722,7 +803,15 @@ impl Finding {
             Finding::TypeMismatch { .. }
             | Finding::MethodMismatch { .. }
             | Finding::DegradedTypes { .. } => Severity::Risk,
-            Finding::MissingEndpoint { .. } | Finding::OrphanedEndpoint { .. } => Severity::Gap,
+            // A row that lost a pairing main had is a break (carrick#3092).
+            Finding::MissingEndpoint { removal, .. }
+            | Finding::OrphanedEndpoint { removal, .. } => {
+                if removal.is_some() {
+                    Severity::Risk
+                } else {
+                    Severity::Gap
+                }
+            }
             Finding::EnvVarCall { .. }
             | Finding::SharedExternalContract { .. }
             | Finding::DispatchOperations { .. } => Severity::Advisory,
@@ -817,11 +906,15 @@ impl Serialize for Finding {
                 path,
                 service,
                 call_sites,
+                removal,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("service", service)?;
                 map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
+                if let Some(removal) = removal {
+                    serialize_removal(&mut map, removal)?;
+                }
             }
             Finding::OrphanedEndpoint {
                 method,
@@ -829,6 +922,8 @@ impl Serialize for Finding {
                 service,
                 provenance,
                 view_module,
+                sites,
+                removal,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
@@ -837,6 +932,10 @@ impl Serialize for Finding {
                 // Skipped when false, so the common row is unchanged.
                 if *view_module {
                     map.serialize_entry("view_module", view_module)?;
+                }
+                if let Some(removal) = removal {
+                    map.serialize_entry("sites", wire_call_sites(sites))?;
+                    serialize_removal(&mut map, removal)?;
                 }
             }
             Finding::EnvVarCall {
@@ -1359,6 +1458,7 @@ mod tests {
             (MainIndexOtherScanner, "main_index_other_scanner"),
             (MainSideFailed, "main_side_failed"),
             (MainTypesUnjudged, "main_types_unjudged"),
+            (RemovalUnplaced, "removal_unplaced"),
         ] {
             let mut mismatch = Finding::type_mismatch("GET", "/x", None, vec![], "A", "B", "boom")
                 .with_pair(Some("api|GET|/x~web|src/a.ts|response".to_string()));

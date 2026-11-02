@@ -1742,13 +1742,36 @@ fn pair_key_of(
         crate::cloud_storage::ManifestTypeKind::Response => "response",
     };
     format!(
-        "{}|{}|{}~{}|{}|{}",
+        "{}|{}",
+        pairing_key_of(
+            producer_service,
+            pseudo_method,
+            identity,
+            consumer_service,
+            consumer_file
+        ),
+        direction
+    )
+}
+
+/// The pairing of one producer operation and one consumer file, without a
+/// direction (carrick#3092): [`pair_key_of`] minus its trailing `|direction`.
+/// A pairing is one thing whichever of its request and response halves a
+/// verdict is about, and a lost pairing has no type half at all.
+pub(crate) fn pairing_key_of(
+    producer_service: &str,
+    pseudo_method: &str,
+    identity: &str,
+    consumer_service: &str,
+    consumer_file: &str,
+) -> String {
+    format!(
+        "{}|{}|{}~{}|{}",
         producer_service,
         pseudo_method,
         normalize_compat_path(identity),
         consumer_service,
         consumer_file,
-        direction
     )
 }
 
@@ -8567,6 +8590,23 @@ mod tests {
             pair_key_services("orders-api|GET|/x~web|src/a.ts|both"),
             None
         );
+    }
+
+    /// carrick#3092: the pairing key is the type pairing's spelling without its
+    /// direction, so the type pair keeps the spelling it always had.
+    #[test]
+    fn pairing_key_is_the_type_pair_key_without_its_direction() {
+        let pairing = pairing_key_of("orders-api", "GET", "/orders/{id}", "web", "src/a.ts");
+        assert_eq!(pairing, "orders-api|GET|/orders/:param~web|src/a.ts");
+        for (kind, direction) in [
+            (crate::cloud_storage::ManifestTypeKind::Request, "request"),
+            (crate::cloud_storage::ManifestTypeKind::Response, "response"),
+        ] {
+            assert_eq!(
+                pair_key_of("orders-api", "GET", "/orders/{id}", "web", "src/a.ts", kind),
+                format!("{pairing}|{direction}")
+            );
+        }
     }
 
     /// THE #260 regression. One producer endpoint (`GET /orders/:id`) with TWO
