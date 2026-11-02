@@ -11598,7 +11598,6 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 line_number: Some(27),
                 expression_text: None,
                 param_name: None,
-                route_path: None,
                 result: None,
             }],
             &HashMap::new(),

@@ -1435,6 +1435,7 @@ export function onOrderPlaced(evt: OrderPlaced): void {
         infer_kind: InferKind::FunctionParam,
         alias: Some(alias.to_string()),
         param_name: Some("evt".to_string()),
+        route_path: None,
     };
     let infer = vec![infer_item(demoted_alias), infer_item(kept_alias)];
 

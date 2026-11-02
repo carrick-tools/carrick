@@ -5769,7 +5769,6 @@ mod tests {
             line_number: None,
             expression_text: None,
             param_name: None,
-            route_path: None,
             result: None,
         };
         let json = serde_json::to_string(&infer).unwrap();
@@ -8438,7 +8437,6 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             line_number: Some(3),
             expression_text: None,
             param_name: None,
-            route_path: None,
             result: Some(ResultShape::Member(["data".into()])),
         };
         let wire = serde_json::to_string(&anchor).unwrap();
