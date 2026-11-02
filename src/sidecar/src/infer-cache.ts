@@ -245,20 +245,6 @@ export function changedSource(kept: ProgramRecord): string | undefined {
 }
 
 /**
- * Build `project`'s program again with nothing in it changed. ts-morph builds
- * a program only after a change, and roots it at every file the project has
- * loaded, the ones earlier builds reached among them: a program built again
- * after its first build has more roots than the first. Setting one file's
- * text to the text it has is the change.
- */
-export function rebuildProgram(project: Project): void {
-  const file = project.getSourceFiles()[0];
-  if (!file) return;
-  file.replaceWithText(file.getFullText());
-  project.getProgram().compilerObject;
-}
-
-/**
  * Keep `answer` for `key`, read in `programs`. Written to a temporary file
  * and renamed, so a reader never sees half an entry. Entries not written to
  * for `ENTRY_MAX_AGE_MS` are deleted on the way.

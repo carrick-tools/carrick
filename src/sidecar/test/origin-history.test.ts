@@ -2,10 +2,11 @@
  * carrick#1731, outside Deno: a dependency linked from a directory outside
  * the checkout keeps reading as library origin after the project is edited.
  *
- * ts-morph rebuilds the program after any edit to the project with every file
- * it has loaded as a root file, and the compiler marks no root file as an
- * external-library import. A dependency installed under `node_modules` is
- * still recognised by its path. One linked from outside the checkout (`npm
+ * ts-morph rebuilt the program after any edit to the project with every file
+ * it had loaded as a root file, and the compiler marks no root file as an
+ * external-library import. The loader now pins the roots (carrick#3146), so the
+ * flag survives on the compiler's own record as well as on the resolver's.
+ * A dependency installed under `node_modules` is still recognised by its path. One linked from outside the checkout (`npm
  * link`, a `link:` or `file:` dependency) resolves to its real path, which has
  * no `node_modules` segment, so the compiler's flag was the only thing that
  * said it was a library, and the first edit made the printer inline it.
@@ -63,8 +64,8 @@ describe('carrick#1731 library origin survives an edit to the project', () => {
       project.removeSourceFile(project.createSourceFile(path.join(root, 'src', '__probe.ts'), 'export {};\n'));
       assert.strictEqual(
         project.getProgram().compilerObject.isSourceFileFromExternalLibrary(declaring.compilerNode),
-        false,
-        'the fixture must reproduce the compiler forgetting the flag, or this test proves nothing'
+        true,
+        'the rebuilt program does not name the linked package as a root, so the flag stays (carrick#3146)'
       );
       assert.strictEqual(bundle(), fresh, 'the bundle after an edit');
     } finally {

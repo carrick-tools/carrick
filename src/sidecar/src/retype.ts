@@ -28,6 +28,7 @@
 import { Node, SyntaxKind, ts } from 'ts-morph';
 import type { CallExpression, Identifier, Project, PropertyAccessExpression, SourceFile, Type } from 'ts-morph';
 import type { TypeInferrer } from './type-inferrer.js';
+import { replaceFileText } from './program-files.js';
 import {
   readsResponseStatus,
   statusesIn,
@@ -398,7 +399,7 @@ export class Retyper {
     const originOf = (pos: number): Origin =>
       pos >= bodyEnd ? { kind: 'inserted' } : mapBack(pos, rewrite.edits);
 
-    sourceFile.replaceWithText(rewritten);
+    replaceFileText(sourceFile, rewritten);
     try {
       if (rewrite.typeArgumentCall) {
         const reached = this.typeArgumentReachesResult(sourceFile, rewrite.typeArgumentCall);
@@ -444,7 +445,7 @@ export class Retyper {
       if (unresolved) return { kind: 'abstain', reason: unresolved };
       return { kind: 'checked', added };
     } finally {
-      sourceFile.replaceWithText(original);
+      replaceFileText(sourceFile, original);
     }
   }
 
