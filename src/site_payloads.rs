@@ -188,6 +188,7 @@ impl SitePayloads {
                 param_name,
                 member,
                 result: None,
+                route_path: None,
             });
         }
         requests

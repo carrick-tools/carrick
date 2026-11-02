@@ -267,6 +267,7 @@ fn item(alias: &str, line: u32) -> InferRequestItem {
         infer_kind: InferKind::CallResult,
         alias: Some(alias.to_string()),
         param_name: None,
+        route_path: None,
     }
 }
 

@@ -181,6 +181,7 @@ fn infer(
                 infer_kind: InferKind::Expression,
                 alias: Some(alias.to_string()),
                 param_name: None,
+                route_path: None,
             }],
             None,
         )

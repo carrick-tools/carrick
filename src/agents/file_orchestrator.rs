@@ -5130,6 +5130,7 @@ impl FileOrchestrator {
                         expression_line: None,
                         alias: Some(alias),
                         param_name: None,
+                        route_path: None,
                     });
                     true
                 }
@@ -5156,6 +5157,7 @@ impl FileOrchestrator {
                             .map(|l| if l > 0 { l as u32 } else { line_number }),
                         alias: Some(alias),
                         param_name: None,
+                        route_path: None,
                     });
                     true
                 }
@@ -5172,6 +5174,7 @@ impl FileOrchestrator {
                         expression_line: None,
                         alias: Some(alias),
                         param_name: None,
+                        route_path: None,
                     });
                     true
                 }
@@ -6260,6 +6263,7 @@ impl FileOrchestrator {
                         infer_kind: InferKind::Expression,
                         alias: Some(alias),
                         param_name: None,
+                        route_path: None,
                     },
                     ManifestRole::Producer => InferRequestItem {
                         member: None,
@@ -6280,6 +6284,7 @@ impl FileOrchestrator {
                         infer_kind: InferKind::FunctionParam,
                         alias: Some(alias),
                         param_name: Some(text.clone()),
+                        route_path: None,
                     },
                 };
                 requests.push(request);
@@ -6534,6 +6539,7 @@ impl FileOrchestrator {
                 infer_kind: InferKind::Expression,
                 alias: Some(alias),
                 param_name: None,
+                route_path: None,
             });
         }
         debug!(
@@ -6704,6 +6710,7 @@ impl FileOrchestrator {
                     infer_kind: InferKind::FunctionReturn,
                     alias: Some(alias),
                     param_name: None,
+                    route_path: None,
                 });
             }
         }

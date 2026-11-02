@@ -5681,6 +5681,7 @@ mod tests {
             infer_kind: InferKind::ResponseBody,
             alias: None,
             param_name: None,
+            route_path: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));
@@ -5768,6 +5769,7 @@ mod tests {
             line_number: None,
             expression_text: None,
             param_name: None,
+            route_path: None,
             result: None,
         };
         let json = serde_json::to_string(&infer).unwrap();
@@ -5921,6 +5923,7 @@ mod tests {
                         infer_kind,
                         alias: Some("A".into()),
                         param_name: Some("event".into()),
+                        route_path: None,
                     })
                     .collect(),
                 extraction_config: Some(ExtractionConfig {
@@ -6376,6 +6379,7 @@ mod tests {
             infer_kind,
             alias: None,
             param_name: None,
+            route_path: None,
         };
         let others = [item(InferKind::CallResult), item(InferKind::FunctionReturn)];
         assert_eq!(claims_for_route_rows(&others, Some(&claims)), None);
@@ -8135,6 +8139,7 @@ mod tests {
             infer_kind,
             alias: Some(alias.into()),
             param_name: None,
+            route_path: None,
         };
         let explicit = vec![
             symbol_request("ItemDto", "Returned", None),
@@ -8362,6 +8367,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 infer_kind: InferKind::Expression,
                 alias: Some(format!("A{line}")),
                 param_name: None,
+                route_path: None,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
@@ -8408,6 +8414,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             infer_kind: InferKind::CallResult,
             alias: None,
             param_name: None,
+            route_path: None,
             member: None,
             result,
         };
@@ -8431,6 +8438,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             line_number: Some(3),
             expression_text: None,
             param_name: None,
+            route_path: None,
             result: Some(ResultShape::Member(["data".into()])),
         };
         let wire = serde_json::to_string(&anchor).unwrap();
