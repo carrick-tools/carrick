@@ -523,6 +523,23 @@ fn exact_key_protocol(pseudo_method: &str) -> Option<crate::operation::Protocol>
     }
 }
 
+/// The display `(method_or_label, path_or_name)` of a pair outcome's join form
+/// (`pseudo_method`, `identity`), the labels every other finding carries
+/// (carrick#3090): `("GRAPHQL", "query|order")` -> `("QUERY", "order")`,
+/// `("SOCKET", "CLIENT->SERVER|order:update")` -> `("CLIENT->SERVER",
+/// "order:update")`. An HTTP verb and a pub/sub topic are already display
+/// form and pass through.
+fn display_labels_for_pseudo(pseudo_method: &str, identity: &str) -> (String, String) {
+    let canonical = match pseudo_method {
+        "GRAPHQL" => format!("graphql|{identity}"),
+        "SOCKET" => format!("socket|{identity}"),
+        "PUBSUB" => format!("pubsub|{identity}"),
+        _ => return (pseudo_method.to_string(), identity.to_string()),
+    };
+    producer_display_from_canonical(&canonical)
+        .unwrap_or_else(|| (pseudo_method.to_string(), identity.to_string()))
+}
+
 /// A consumer row as a verdict names it (carrick#1626): its protocol, its
 /// service (`service_name ?? repo_name`), its operation's join identity, and
 /// its call site. Two rows on one line are told apart by protocol (an HTTP
@@ -3772,9 +3789,13 @@ impl Analyzer {
                     side_label(&outcome.producer_alias),
                     side_label(&outcome.consumer_alias),
                 );
+                // The finding carries the operation's display labels, as every
+                // other finding and the delta do (carrick#3090); the join form
+                // above stays on the outcome for the lookups.
+                let (display_method, display_path) = display_labels_for_pseudo(&method, &path);
                 Finding::type_mismatch(
-                    method,
-                    path,
+                    display_method,
+                    display_path,
                     None,
                     call_sites,
                     self.clean_type_string(&producer_label, &display_names),
@@ -7964,6 +7985,39 @@ mod tests {
         };
         assert_eq!(call_sites, &vec!["server.ts:66".to_string()]);
         assert_eq!(detail, "NotificationStatus not assignable to StatusView");
+    }
+
+    /// carrick#3090: a type mismatch on a GraphQL, socket or pub/sub pair names
+    /// its operation by the display labels every other finding carries, not
+    /// the join form the outcome keeps; an HTTP one is unchanged.
+    #[test]
+    fn a_type_mismatch_is_labelled_with_the_operations_display_labels() {
+        let cases = [
+            ("GRAPHQL", "query|order", "QUERY", "order"),
+            ("GRAPHQL", "mutation|cancelOrder", "MUTATION", "cancelOrder"),
+            (
+                "SOCKET",
+                "CLIENT->SERVER|order:update",
+                "CLIENT->SERVER",
+                "order:update",
+            ),
+            ("PUBSUB", "orders.shipped", "PUBSUB", "orders.shipped"),
+            ("GET", "/orders/:id", "GET", "/orders/:id"),
+        ];
+        for (pseudo, identity, want_method, want_path) in cases {
+            let analyzer = analyzer_with_outcomes(vec![outcome(
+                pseudo,
+                identity,
+                "client/src/call.ts:9",
+                VerdictBucket::Incompatible,
+                Some("not assignable"),
+            )]);
+            let findings = analyzer.get_type_mismatch_findings();
+            let Finding::TypeMismatch { method, path, .. } = &findings[0] else {
+                panic!("expected a TypeMismatch finding, got {:?}", findings[0]);
+            };
+            assert_eq!((method.as_str(), path.as_str()), (want_method, want_path));
+        }
     }
 
     /// carrick#1517: a pair the retype check decided has a consumer that states

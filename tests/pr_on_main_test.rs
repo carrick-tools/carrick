@@ -2471,7 +2471,6 @@ async fn seed_graphql_field_rename() {
 }
 
 #[tokio::test]
-#[ignore = "carrick#3090: the label is a join pseudo-label (GRAPHQL query|order); carrick#3091: no edge_source"]
 async fn seed_graphql_field_rename_marking() {
     let _serial = SERIAL.lock().await;
     assert_graphql_marked(&seed_payload("orders-api", graphql_field_rename).await);
@@ -2484,7 +2483,6 @@ async fn seed_graphql_field_removal() {
 }
 
 #[tokio::test]
-#[ignore = "carrick#3090: the label is a join pseudo-label (GRAPHQL query|order); carrick#3091: no edge_source"]
 async fn seed_graphql_field_removal_marking() {
     let _serial = SERIAL.lock().await;
     assert_graphql_marked(&seed_payload("orders-api", graphql_field_removal).await);
@@ -2558,7 +2556,6 @@ async fn seed_socket_field_rename() {
 }
 
 #[tokio::test]
-#[ignore = "carrick#3090: the label is a join pseudo-label (SOCKET CLIENT->SERVER|order:update); carrick#3091: no edge_source"]
 async fn seed_socket_field_rename_marking() {
     let _serial = SERIAL.lock().await;
     let payload = socket_field_rename().await;
@@ -2575,7 +2572,7 @@ async fn seed_socket_field_rename_marking() {
 /// The emit's payload is an inline object literal the emitter's own file
 /// states; dropping `carrier` from it breaks the listener in `storefront`.
 #[tokio::test]
-#[ignore = "carrick#3094: the emitter's inline payload reads unknown, so the pair is unverifiable; then carrick#3090 (labels) and carrick#3091 (edge_source)"]
+#[ignore = "carrick#3094: the emitter's inline payload reads unknown, so the pair is unverifiable"]
 async fn seed_socket_field_removal() {
     let _serial = SERIAL.lock().await;
     let payload = seed_payload("orders-api", |repo| {

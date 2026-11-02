@@ -7642,8 +7642,9 @@ fn append_deterministic_protocol_operations(
         provenance: Default::default(),
         // These ops come from the deterministic protocol extractions, not from
         // the HTTP emit/join phase, so no pass stated them in the sense
-        // `resolution_source` records (carrick#660). The model's pub/sub rows
-        // say `model` (`append_pubsub_operations`, carrick#1626).
+        // `resolution_source` records (carrick#660). Each caller states the
+        // pass that read its row (carrick#3091); the model's pub/sub rows say
+        // `model` (`append_pubsub_operations`, carrick#1626).
         resolution_source: None,
         // A file-router module is an HTTP concept; non-HTTP ops carry the
         // default.
@@ -7682,15 +7683,26 @@ fn append_deterministic_protocol_operations(
         cloud_data
             .endpoints
             .extend(graphql.producers.iter().map(|op| {
-                match (&op.resolver_file, op.resolver_line) {
+                // The schema states the field, the model only places the
+                // resolver, so the row is the schema's either way (carrick#3091).
+                let row = match (&op.resolver_file, op.resolver_line) {
                     (Some(file), Some(line)) => to_producer(op.key.clone(), file, line),
                     _ => to_producer(op.key.clone(), &op.file_path, op.line),
+                };
+                ApiEndpointDetails {
+                    resolution_source: Some(
+                        crate::agents::file_analyzer_agent::ResolutionSource::GraphqlSchema,
+                    ),
+                    ..row
                 }
             }));
         cloud_data
             .calls
             .extend(graphql.consumers.iter().map(|op| ApiEndpointDetails {
                 schema_binding: op.schema_binding,
+                resolution_source: Some(
+                    crate::agents::file_analyzer_agent::ResolutionSource::GraphqlDocument,
+                ),
                 ..to_call(op.key.clone(), &op.file_path, op.line)
             }));
     }
@@ -7726,16 +7738,22 @@ fn append_deterministic_protocol_operations(
                 sockets.listeners.len() + sockets.emitters.len() - listeners.len() - emitters.len(),
             "Indexing Socket.IO operations"
         );
-        cloud_data.endpoints.extend(
-            listeners
-                .iter()
-                .map(|op| to_producer(op.key.clone(), &op.file_path, op.line)),
-        );
-        cloud_data.calls.extend(
-            emitters
-                .iter()
-                .map(|op| to_call(op.key.clone(), &op.file_path, op.line)),
-        );
+        cloud_data
+            .endpoints
+            .extend(listeners.iter().map(|op| ApiEndpointDetails {
+                resolution_source: Some(
+                    crate::agents::file_analyzer_agent::ResolutionSource::SocketCall,
+                ),
+                ..to_producer(op.key.clone(), &op.file_path, op.line)
+            }));
+        cloud_data
+            .calls
+            .extend(emitters.iter().map(|op| ApiEndpointDetails {
+                resolution_source: Some(
+                    crate::agents::file_analyzer_agent::ResolutionSource::SocketCall,
+                ),
+                ..to_call(op.key.clone(), &op.file_path, op.line)
+            }));
     }
     append_event_bus_operations(
         cloud_data,
@@ -8118,7 +8136,12 @@ fn append_event_bus_operations(
                 deferred += 1;
                 continue;
             }
-            into.push(to_details(op.key.clone(), &op.file_path, op.line));
+            into.push(ApiEndpointDetails {
+                resolution_source: Some(
+                    crate::agents::file_analyzer_agent::ResolutionSource::EventBus,
+                ),
+                ..to_details(op.key.clone(), &op.file_path, op.line)
+            });
             *counter += 1;
         }
     };
@@ -24803,6 +24826,100 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(blob(off), before);
         assert_eq!(blob(stray), before);
         assert!(!before.contains("possible_calls") && !before.contains("inference"));
+    }
+
+    /// carrick#3091: a GraphQL, socket or in-process bus row states the pass
+    /// that read it, so a mismatch on it folds to a fact at the PR check. A
+    /// GraphQL producer whose resolver line was located is still the schema's
+    /// row (the model places it, the SDL states it).
+    #[test]
+    fn graphql_socket_and_bus_rows_state_their_pass() {
+        use crate::agents::file_analyzer_agent::ResolutionSource as Source;
+        use crate::operation::{GraphqlOperationKind, SocketDirection};
+        let mut located = graphql_op(GraphqlOperationKind::Query, "order", None);
+        located.resolver_file = Some(PathBuf::from("src/resolvers.ts"));
+        located.resolver_line = Some(11);
+        let bus = |event: &str| crate::event_emitter::BusOp {
+            key: OperationKey::pubsub(event),
+            event: event.to_string(),
+            file_path: PathBuf::from("src/bus.ts"),
+            line: 4,
+        };
+        let extractions = ProtocolExtractions {
+            graphql: crate::graphql::GraphqlExtraction {
+                producers: vec![
+                    located,
+                    graphql_op(GraphqlOperationKind::Query, "orders", None),
+                ],
+                consumers: vec![graphql_consumer_op("order", None, None)],
+                ..Default::default()
+            },
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![socket_op(
+                    "order:update",
+                    SocketDirection::ClientToServer,
+                    None,
+                    None,
+                )],
+                emitters: vec![socket_op(
+                    "order:update",
+                    SocketDirection::ClientToServer,
+                    None,
+                    None,
+                )],
+            },
+            event_bus: crate::event_emitter::BusExtraction {
+                subscribers: vec![bus("tick")],
+                publishers: vec![bus("tock")],
+            },
+            ..ProtocolExtractions::default()
+        };
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &HashMap::new(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
+        );
+        let sources = |rows: &[ApiEndpointDetails]| -> Vec<(String, Option<Source>)> {
+            rows.iter()
+                .map(|row| (row.key.canonical(), row.resolution_source))
+                .collect()
+        };
+        assert_eq!(
+            sources(&cloud_data.endpoints),
+            vec![
+                (
+                    "graphql|query|order".to_string(),
+                    Some(Source::GraphqlSchema)
+                ),
+                (
+                    "graphql|query|orders".to_string(),
+                    Some(Source::GraphqlSchema)
+                ),
+                (
+                    "socket|CLIENT->SERVER|order:update".to_string(),
+                    Some(Source::SocketCall)
+                ),
+                ("pubsub|tick".to_string(), Some(Source::EventBus)),
+            ]
+        );
+        assert_eq!(
+            sources(&cloud_data.calls),
+            vec![
+                (
+                    "graphql|query|order".to_string(),
+                    Some(Source::GraphqlDocument)
+                ),
+                (
+                    "socket|CLIENT->SERVER|order:update".to_string(),
+                    Some(Source::SocketCall)
+                ),
+                ("pubsub|tock".to_string(), Some(Source::EventBus)),
+            ]
+        );
     }
 
     /// carrick#2436: a service's library ask names every network role with

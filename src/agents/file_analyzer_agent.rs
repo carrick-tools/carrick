@@ -294,6 +294,20 @@ pub enum ResolutionSource {
     /// source does not contain, and it is a fact for the same reason a
     /// declared internal domain is: the repo said so.
     DeclaredOperation,
+    /// A GraphQL field the schema states (carrick#3091): a root field of the
+    /// SDL the `graphqlSchemas` setting names, or a code-first schema read as
+    /// printed SDL. The source names who stated the key, so a producer whose
+    /// resolver line the model located is still the schema's row.
+    GraphqlSchema,
+    /// A GraphQL operation a client document states (carrick#3091): the
+    /// consumer side of [`Self::GraphqlSchema`].
+    GraphqlDocument,
+    /// A socket listener or emitter the socket pass reads (carrick#3091),
+    /// with no library row stating the same call.
+    SocketCall,
+    /// A publish or subscribe on an in-process event bus the bus pass reads
+    /// (carrick#3091).
+    EventBus,
 }
 
 impl ResolutionSource {
