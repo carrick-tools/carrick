@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.140](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.139...carrick-v0.3.140) (2026-11-02)
+
+
+### Features
+
+* **settle:** settle a reached pair whose judge input is main's ([#3135](https://github.com/carrick-tools/carrick/issues/3135)) ([#3157](https://github.com/carrick-tools/carrick/issues/3157)) ([0690790](https://github.com/carrick-tools/carrick/commit/06907906f6db2cb65be2bf49a44ba531625cff86))
+* **type-reach:** keep reach through version bumps and plan rulings ([#3126](https://github.com/carrick-tools/carrick/issues/3126), [#2568](https://github.com/carrick-tools/carrick/issues/2568)) ([#3160](https://github.com/carrick-tools/carrick/issues/3160)) ([778f59b](https://github.com/carrick-tools/carrick/commit/778f59b1b380f96ac4c3822b49d6d5666b5dfd14))
+
+
+### Bug Fixes
+
+* **sidecar:** pin each program's roots and keep an edited file's module format ([#3146](https://github.com/carrick-tools/carrick/issues/3146)) ([#3162](https://github.com/carrick-tools/carrick/issues/3162)) ([4251db7](https://github.com/carrick-tools/carrick/commit/4251db72389ea86ebd91a6b7d6a9616418e6bc24))
+
+
+### Performance
+
+* **retype:** decide "does not reach" before the rewrite for a selector-only type argument ([#3164](https://github.com/carrick-tools/carrick/issues/3164)) ([f995066](https://github.com/carrick-tools/carrick/commit/f9950663edec6cb81a34a281bce16b10555cb25e))
+* **retype:** decide a deferred result's "does not reach" before the rewrite when the producer text has no top-level undefined ([#3165](https://github.com/carrick-tools/carrick/issues/3165)) ([#3168](https://github.com/carrick-tools/carrick/issues/3168)) ([b86dec2](https://github.com/carrick-tools/carrick/commit/b86dec2e66ea50648b1587f47aa952b1e59d2b1a))
+
 ## [0.3.139](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.138...carrick-v0.3.139) (2026-11-01)
 
 
