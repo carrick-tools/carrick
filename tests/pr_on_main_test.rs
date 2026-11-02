@@ -2192,7 +2192,9 @@ fn every_manifest_seed_applies_to_its_repo() {
                 .any(|repos| repos.as_array().unwrap().iter().any(|r| r == repo_name)),
             "{name}: no store scans {repo_name}"
         );
-        let repo = seed_repo(&tmp.path().join(name), repo_name);
+        let root = tmp.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = seed_repo(&root, repo_name);
         apply_seed(&repo, name);
     }
 }
