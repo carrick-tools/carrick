@@ -159,7 +159,7 @@ describe('carrick#1029: a loop-registered route is typed for its own element', (
   });
 
   it('matches a path by its last segments, a parameter matching a parameter of any name', () => {
-    assert.ok(endsWithPath('/api/v1/projects/{name}/seo/a', '/projects/:name/seo/a'));
+    assert.ok(endsWithPath('/api/v1/teams/{name}/reports/a', '/teams/:name/reports/a'));
     assert.ok(endsWithPath('/x/a', '/x/a'));
     assert.ok(!endsWithPath('/x/a', '/x/b'));
     assert.ok(!endsWithPath('/a', '/x/a'));

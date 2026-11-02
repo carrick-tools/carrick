@@ -237,38 +237,12 @@ pub struct InferRequestItem {
     /// carrick#1029: the route row's own full path, set on a producer's
     /// `ResponseBody`, `FunctionReturn` or `RequestBody` request only where
     /// the row's line serves more than one operation
-    /// ([`mark_shared_route_lines`]). The
-    /// sidecar types a handler registered once per element of a constant
-    /// list for the element this path names. Absent from every other request,
-    /// so those serialise as they did.
+    /// (`FileOrchestrator::mark_shared_route_lines`). The sidecar types a
+    /// handler registered once per element of a constant list for the element
+    /// this path names (`src/sidecar/src/loop-element.ts`). Absent from every
+    /// other request, so those serialise as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_path: Option<String>,
-}
-
-/// carrick#1029: set `route_path` on each producer route-row request for a
-/// row whose file and line hold more than one producer operation. `shared`
-/// names, by alias, the full path of each such row; a request for a row with
-/// a site of its own is not in it and is left as it is. A route's response is
-/// asked as `FunctionReturn` where the model states that the handler's return
-/// value is the payload.
-pub fn mark_shared_route_lines(
-    requests: &mut [InferRequestItem],
-    shared: &std::collections::HashMap<String, String>,
-) -> usize {
-    let mut marked = 0;
-    for request in requests.iter_mut() {
-        if !matches!(
-            request.infer_kind,
-            InferKind::ResponseBody | InferKind::FunctionReturn | InferKind::RequestBody
-        ) {
-            continue;
-        }
-        if let Some(path) = request.alias.as_ref().and_then(|alias| shared.get(alias)) {
-            request.route_path = Some(path.clone());
-            marked += 1;
-        }
-    }
-    marked
 }
 
 // ============================================================================

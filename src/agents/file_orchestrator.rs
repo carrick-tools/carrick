@@ -5005,7 +5005,21 @@ impl FileOrchestrator {
                 }
             }
         }
-        crate::services::type_sidecar::mark_shared_route_lines(requests, &shared)
+        // A route's response is asked as `FunctionReturn` where the model
+        // states that the handler's return value is the payload.
+        let mut marked = 0;
+        for request in requests.iter_mut().filter(|request| {
+            matches!(
+                request.infer_kind,
+                InferKind::ResponseBody | InferKind::FunctionReturn | InferKind::RequestBody
+            )
+        }) {
+            if let Some(path) = request.alias.as_ref().and_then(|alias| shared.get(alias)) {
+                request.route_path = Some(path.clone());
+                marked += 1;
+            }
+        }
+        marked
     }
 
     /// Collect type requests from analysis results for sidecar processing.
