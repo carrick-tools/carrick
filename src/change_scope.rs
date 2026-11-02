@@ -594,9 +594,9 @@ pub fn decide(
     this_run: ThisRun<'_>,
     config_json: Option<&str>,
     changed: Result<&[ChangedPath], &str>,
-    mut version_only: impl FnMut(&ChangedPath) -> bool,
-    mut gitignore_moves: impl FnMut(&str, &ServiceInputs) -> bool,
-    mut keeps_imports: impl FnMut(&ChangedPath) -> bool,
+    version_only: impl FnMut(&ChangedPath) -> bool,
+    gitignore_moves: impl FnMut(&str, &ServiceInputs) -> bool,
+    keeps_imports: impl FnMut(&ChangedPath) -> bool,
     dependencies: impl FnOnce(&ServiceInputs) -> DependencyReach,
     inputs: impl FnOnce() -> ServiceInputs,
 ) -> Scope {
@@ -637,16 +637,36 @@ pub fn decide(
             "its carrick.json entry differs from the stored one",
         );
     }
+    decide_change(
+        &stored.commit_hash,
+        changed,
+        version_only,
+        gitignore_moves,
+        keeps_imports,
+        dependencies,
+        inputs,
+    )
+}
+
+/// The part of [`decide`] that reads the change since `commit`: carried at
+/// `commit` when nothing the service reads changed, else analysed and why.
+/// A pull request asks it against its base, with no stored blob to gate on
+/// ([`untouched_since`], carrick#3170).
+fn decide_change(
+    commit: &str,
+    changed: Result<&[ChangedPath], &str>,
+    mut version_only: impl FnMut(&ChangedPath) -> bool,
+    mut gitignore_moves: impl FnMut(&str, &ServiceInputs) -> bool,
+    mut keeps_imports: impl FnMut(&ChangedPath) -> bool,
+    dependencies: impl FnOnce(&ServiceInputs) -> DependencyReach,
+    inputs: impl FnOnce() -> ServiceInputs,
+) -> Scope {
     let changed = match changed {
         Ok(changed) => changed,
         Err(reason) => {
             return Scope::analysed(
                 Reason::CommitMissing,
-                format!(
-                    "git could not compare {}: {}",
-                    short(&stored.commit_hash),
-                    reason.trim()
-                ),
+                format!("git could not compare {}: {}", short(commit), reason.trim()),
             );
         }
     };
@@ -749,7 +769,7 @@ pub fn decide(
         );
     }
     Scope::Carried {
-        commit: stored.commit_hash.clone(),
+        commit: commit.to_string(),
     }
 }
 
@@ -890,6 +910,214 @@ impl ChangedSince {
     }
 }
 
+/// What a service's inputs are compared against.
+#[derive(Clone, Copy)]
+enum Against<'a> {
+    /// Its stored generation, gated by [`decide`], with the paths changed
+    /// since that blob's commit.
+    Stored(Option<&'a CloudRepoData>, ThisRun<'a>),
+    /// A commit, with no blob to gate on: a pull request's base
+    /// ([`untouched_since`]).
+    Base(&'a str),
+}
+
+/// What the closure walks over one tree share across its services. Services
+/// in one repository share files (a contracts package every service imports),
+/// so what a file reads is read once for all of them.
+struct Walks<'r> {
+    repo_path: &'r str,
+    changes: &'r ChangedSince,
+    top: Option<PathBuf>,
+    version_only: HashMap<(String, String), bool>,
+    /// Listed once, and only when a `.gitignore` changed (carrick#3113).
+    untracked: std::cell::OnceCell<Option<Vec<String>>>,
+    stops: HashMap<PathBuf, bool>,
+    keeps_imports_of: HashMap<(String, String), bool>,
+    reads: ClosureReads,
+    closure_took: std::time::Duration,
+    walked: usize,
+}
+
+impl<'r> Walks<'r> {
+    fn new(repo_path: &'r str, changes: &'r ChangedSince) -> Self {
+        Self {
+            repo_path,
+            changes,
+            top: crate::git_state::toplevel(repo_path).ok(),
+            version_only: HashMap::new(),
+            untracked: std::cell::OnceCell::new(),
+            stops: HashMap::new(),
+            keeps_imports_of: HashMap::new(),
+            reads: ClosureReads::default(),
+            closure_took: std::time::Duration::ZERO,
+            walked: 0,
+        }
+    }
+
+    /// `service`'s scope against `against`.
+    fn scope(&mut self, service: &Config, against: Against<'_>) -> Scope {
+        let Walks {
+            repo_path,
+            changes,
+            top,
+            version_only,
+            untracked,
+            stops,
+            keeps_imports_of,
+            reads,
+            closure_took,
+            walked,
+        } = self;
+        let repo_path: &str = repo_path;
+        let top: &Option<PathBuf> = top;
+        let reads: &ClosureReads = reads;
+        let untracked: &std::cell::OnceCell<_> = untracked;
+        let commit: Option<&str> = match against {
+            Against::Stored(stored, _) => stored.map(|blob| blob.commit_hash.as_str()),
+            Against::Base(commit) => Some(commit),
+        };
+        let changed = commit.map(|commit| changes.since(commit));
+        let changed = match &changed {
+            Some(Ok(paths)) => Ok(paths.as_slice()),
+            Some(Err(reason)) => Err(reason.as_str()),
+            None => Ok(&[][..]),
+        };
+        let version_only = |change: &ChangedPath| {
+            let (Some(commit), Some(top)) = (commit, top) else {
+                return false;
+            };
+            *version_only
+                .entry((commit.to_string(), change.path.clone()))
+                .or_insert_with(|| manifest_moves_only_version(repo_path, top, commit, change))
+        };
+        let keeps_imports = |change: &ChangedPath| {
+            let (Some(commit), Some(top)) = (commit, top) else {
+                return false;
+            };
+            *keeps_imports_of
+                .entry((commit.to_string(), change.path.clone()))
+                .or_insert_with(|| {
+                    test_edit_keeps_imports(
+                        reads,
+                        &change.path,
+                        crate::git_state::file_at_commit(repo_path, commit, &change.path),
+                        std::fs::read_to_string(top.join(&change.path)).ok(),
+                    )
+                })
+        };
+        let dependencies = |inputs: &ServiceInputs| {
+            let (Some(commit), Some(top), Ok(_)) = (commit, top, changed) else {
+                return DependencyReach::Unread;
+            };
+            match changes.dependency_move(commit, top) {
+                Some(moved) => moved.reach(inputs, |moved| {
+                    loaded_packages(repo_path, top, service, inputs, reads, moved)
+                }),
+                None => DependencyReach::Unread,
+            }
+        };
+        let gitignore_edit_moves = |gitignore: &str, inputs: &ServiceInputs| {
+            let untracked = untracked
+                .get_or_init(|| crate::git_state::untracked_paths(repo_path).ok())
+                .as_deref();
+            let Some(top) = top else {
+                return true;
+            };
+            let skip = crate::engine::service_ignore_patterns(service);
+            gitignore_moves(gitignore, inputs, untracked, |base, path, is_dir| {
+                walk_could_enter(top, &skip, base, path, is_dir, stops)
+            })
+        };
+        let inputs = || {
+            let started = Instant::now();
+            *walked += 1;
+            let inputs = match top {
+                Some(top) => service_inputs(repo_path, top, service, reads),
+                // No top level, no paths to compare: nothing vouches.
+                None => ServiceInputs {
+                    unresolved: vec![UnresolvedImport {
+                        at: "git named no top level for this checkout".to_string(),
+                        could_be: CouldBe::Anything,
+                    }],
+                    ..ServiceInputs::default()
+                },
+            };
+            *closure_took += started.elapsed();
+            inputs
+        };
+        match against {
+            Against::Stored(stored, this_run) => decide(
+                stored,
+                this_run,
+                serde_json::to_string(service).ok().as_deref(),
+                changed,
+                version_only,
+                gitignore_edit_moves,
+                keeps_imports,
+                dependencies,
+                inputs,
+            ),
+            Against::Base(commit) => decide_change(
+                commit,
+                changed,
+                version_only,
+                gitignore_edit_moves,
+                keeps_imports,
+                dependencies,
+                inputs,
+            ),
+        }
+    }
+}
+
+/// For each of `services`, index for index, whether the change since `base`
+/// touches nothing the service reads, by the rule that carries a service
+/// under `--changed-only` once its stored blob passes the gate
+/// ([`decide`]): its roots and import closure, the workspace packages and
+/// tsconfig chain it reads, its manifest and schemas, and, when the change
+/// is a dependency-only move, the packages it loads
+/// ([`crate::dependency_move`]). `false` whenever git cannot compare. A pull
+/// request's finding whose two sides read nothing it changed is main's
+/// (carrick#3170).
+pub fn untouched_since(
+    repo_path: &str,
+    services: &[Config],
+    changes: &ChangedSince,
+    base: &str,
+) -> Vec<bool> {
+    let mut walks = Walks::new(repo_path, changes);
+    let untouched: Vec<bool> = services
+        .iter()
+        .map(|service| {
+            let scope = walks.scope(service, Against::Base(base));
+            let label = service.service_name.as_deref().unwrap_or("(root)");
+            match &scope {
+                Scope::Carried { .. } => {
+                    debug!(
+                        "pr base: {label} reads nothing changed since {}",
+                        short(base)
+                    )
+                }
+                Scope::Analysed { reason, detail, .. } => debug!(
+                    "pr base: {label} reads a change since {} ({}: {detail})",
+                    short(base),
+                    reason.as_str()
+                ),
+            }
+            scope.is_carried()
+        })
+        .collect();
+    info!(
+        "pr base: {} of {} service(s) read nothing changed since {}; the closure walk took {:.2}s over {} service(s)",
+        untouched.iter().filter(|untouched| **untouched).count(),
+        untouched.len(),
+        short(base),
+        walks.closure_took.as_secs_f64(),
+        walks.walked
+    );
+    untouched
+}
+
 /// Each service's scope, index for index with `services`, logged one line
 /// per service with a summary and the closure walk's wall time. `changes`
 /// lists what changed since each stored commit.
@@ -900,106 +1128,11 @@ pub fn plan<'a>(
     stored: impl Fn(&Config) -> Option<&'a CloudRepoData>,
     this_run: ThisRun<'_>,
 ) -> Vec<Scope> {
-    let top = crate::git_state::toplevel(repo_path).ok();
-    let mut version_only: HashMap<(String, String), bool> = HashMap::new();
-    // Listed once, and only when a `.gitignore` changed (carrick#3113).
-    let untracked: std::cell::OnceCell<Option<Vec<String>>> = std::cell::OnceCell::new();
-    let mut stops: HashMap<PathBuf, bool> = HashMap::new();
-    let mut keeps_imports_of: HashMap<(String, String), bool> = HashMap::new();
-    let mut closure_took = std::time::Duration::ZERO;
-    let mut walked = 0usize;
-    // Services in one repository share files (a contracts package every
-    // service imports), so what a file reads is read once for all of them.
-    let reads = ClosureReads::default();
+    let mut walks = Walks::new(repo_path, changes);
     let scopes: Vec<Scope> = services
         .iter()
         .map(|service| {
-            let stored = stored(service);
-            let config_json = serde_json::to_string(service).ok();
-            let changed = stored.map(|blob| changes.since(&blob.commit_hash));
-            let changed = match &changed {
-                Some(Ok(paths)) => Ok(paths.as_slice()),
-                Some(Err(reason)) => Err(reason.as_str()),
-                None => Ok(&[][..]),
-            };
-            let version_only = |change: &ChangedPath| {
-                let (Some(blob), Some(top)) = (stored, &top) else {
-                    return false;
-                };
-                *version_only
-                    .entry((blob.commit_hash.clone(), change.path.clone()))
-                    .or_insert_with(|| {
-                        manifest_moves_only_version(repo_path, top, &blob.commit_hash, change)
-                    })
-            };
-            let keeps_imports = |change: &ChangedPath| {
-                let (Some(blob), Some(top)) = (stored, &top) else {
-                    return false;
-                };
-                *keeps_imports_of
-                    .entry((blob.commit_hash.clone(), change.path.clone()))
-                    .or_insert_with(|| {
-                        test_edit_keeps_imports(
-                            &reads,
-                            &change.path,
-                            crate::git_state::file_at_commit(
-                                repo_path,
-                                &blob.commit_hash,
-                                &change.path,
-                            ),
-                            std::fs::read_to_string(top.join(&change.path)).ok(),
-                        )
-                    })
-            };
-            let dependencies = |inputs: &ServiceInputs| {
-                let (Some(blob), Some(top), Ok(_)) = (stored, &top, changed) else {
-                    return DependencyReach::Unread;
-                };
-                match changes.dependency_move(&blob.commit_hash, top) {
-                    Some(moved) => moved.reach(inputs, |moved| {
-                        loaded_packages(repo_path, top, service, inputs, &reads, moved)
-                    }),
-                    None => DependencyReach::Unread,
-                }
-            };
-            let scope = decide(
-                stored,
-                this_run,
-                config_json.as_deref(),
-                changed,
-                version_only,
-                |gitignore, inputs| {
-                    let untracked = untracked
-                        .get_or_init(|| crate::git_state::untracked_paths(repo_path).ok())
-                        .as_deref();
-                    let Some(top) = &top else {
-                        return true;
-                    };
-                    let skip = crate::engine::service_ignore_patterns(service);
-                    gitignore_moves(gitignore, inputs, untracked, |base, path, is_dir| {
-                        walk_could_enter(top, &skip, base, path, is_dir, &mut stops)
-                    })
-                },
-                keeps_imports,
-                dependencies,
-                || {
-                    let started = Instant::now();
-                    walked += 1;
-                    let inputs = match &top {
-                        Some(top) => service_inputs(repo_path, top, service, &reads),
-                        // No top level, no paths to compare: nothing vouches.
-                        None => ServiceInputs {
-                            unresolved: vec![UnresolvedImport {
-                                at: "git named no top level for this checkout".to_string(),
-                                could_be: CouldBe::Anything,
-                            }],
-                            ..ServiceInputs::default()
-                        },
-                    };
-                    closure_took += started.elapsed();
-                    inputs
-                },
-            );
+            let scope = walks.scope(service, Against::Stored(stored(service), this_run));
             let label = service.service_name.as_deref().unwrap_or("(root)");
             match &scope {
                 Scope::Carried { commit } => info!(
@@ -1033,8 +1166,9 @@ pub fn plan<'a>(
         scopes.len()
     );
     info!(
-        "scope: the closure walk took {:.2}s over {walked} service(s)",
-        closure_took.as_secs_f64()
+        "scope: the closure walk took {:.2}s over {} service(s)",
+        walks.closure_took.as_secs_f64(),
+        walks.walked
     );
     scopes
 }
@@ -3491,6 +3625,41 @@ mod tests {
                 "{scopes:?}"
             );
         }
+    }
+
+    /// carrick#3170: a pull request's base is read by the same rule, with no
+    /// stored blob to gate on. A bump of a package only `worker` loads leaves
+    /// `api` and `web` untouched; a source edit touches the service that
+    /// reads it.
+    #[test]
+    fn untouched_since_a_base_reads_the_carry_rule_without_a_blob() {
+        let (repo, base, services) = dependency_workspace(Manager::Npm);
+        let path = repo.path().to_string_lossy().to_string();
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        write_dependencies(repo.path(), Manager::Npm, &bumped, &bumped);
+        commit_all(repo.path(), "move");
+        let changes = ChangedSince::new(&path, &services, &[]);
+        assert_eq!(
+            untouched_since(&path, &services, &changes, &base),
+            [true, true, false]
+        );
+
+        std::fs::write(
+            repo.path().join("apps/api/src/server.ts"),
+            "import { a } from \"lib-a\";\nexport const server = [a];\n",
+        )
+        .unwrap();
+        let changes = ChangedSince::new(&path, &services, &[]);
+        assert_eq!(
+            untouched_since(&path, &services, &changes, &base),
+            [false, true, false]
+        );
+        let changes = ChangedSince::new(&path, &services, &[]);
+        assert_eq!(
+            untouched_since(&path, &services, &changes, "0000000"),
+            [false, false, false],
+            "git cannot compare with a commit it does not hold"
+        );
     }
 
     /// `lib-c` moved in the lockfile alone: no manifest names it, and `api`

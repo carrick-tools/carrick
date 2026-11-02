@@ -1735,6 +1735,19 @@ fn pair_key_of(
     )
 }
 
+/// The producer and consumer services a [`pair_key_of`] spelling names, or
+/// `None` when `pair` is not one (carrick#3170).
+pub(crate) fn pair_key_services(pair: &str) -> Option<(&str, &str)> {
+    let (rest, direction) = pair.rsplit_once('|')?;
+    if direction != "request" && direction != "response" {
+        return None;
+    }
+    let (rest, _consumer_file) = rest.rsplit_once('|')?;
+    let (producer_side, consumer) = rest.rsplit_once('~')?;
+    let (producer, _operation) = producer_side.split_once('|')?;
+    Some((producer, consumer))
+}
+
 /// The pairing a stored compat verdict's site is about, spelled as
 /// [`type_pair_key`] spells an outcome's, or `None` for a producer key the
 /// type check never pairs on.
@@ -8480,6 +8493,26 @@ mod tests {
         assert_eq!(normalize_compat_path("/orders/[id]"), "/orders/:param");
         assert_eq!(normalize_compat_path("/payments"), "/payments");
         assert_eq!(normalize_compat_path("/"), "/");
+    }
+
+    /// carrick#3170: the services read back out of a type pairing are the
+    /// ones it was spelled from, and no other spelling reads as one.
+    #[test]
+    fn pair_key_services_reads_back_the_two_services() {
+        let pair = pair_key_of(
+            "orders-api",
+            "GRAPHQL",
+            "Query.order",
+            "web",
+            "src/a~b.ts",
+            crate::cloud_storage::ManifestTypeKind::Response,
+        );
+        assert_eq!(pair_key_services(&pair), Some(("orders-api", "web")));
+        assert_eq!(pair_key_services("POST /orders/:id~PUT"), None);
+        assert_eq!(
+            pair_key_services("orders-api|GET|/x~web|src/a.ts|both"),
+            None
+        );
     }
 
     /// THE #260 regression. One producer endpoint (`GET /orders/:id`) with TWO

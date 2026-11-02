@@ -143,6 +143,53 @@ pub struct MainSide {
     pub stored: Vec<MainTypeSite>,
     /// Main's recomputed type check ran.
     pub types_judged: bool,
+    /// What the PR changed of what each service reads, `None` when there is
+    /// no base to compare with (carrick#3170).
+    pub untouched: Option<Untouched>,
+}
+
+/// Which services the PR changed nothing of (carrick#3170): a finding both
+/// of whose sides read nothing the PR changed is main's, whatever main's
+/// recomputation says, because the PR did not write anything it rests on.
+#[derive(Clone, Debug, Default)]
+pub struct Untouched {
+    /// Each service of this repo, by id (`service_name`, else the repo),
+    /// with whether the PR changed nothing it reads
+    /// ([`crate::change_scope::untouched_since`]).
+    pub ours: BTreeMap<String, bool>,
+    /// Every peer service, by id. A PR changes nothing of another repo.
+    pub peers: BTreeSet<String>,
+}
+
+impl Untouched {
+    /// Whether the PR changed nothing either side of `finding` reads.
+    ///
+    /// A type mismatch names its producer and consumer services in its
+    /// pairing ([`crate::analyzer::pair_key_services`]): a peer is untouched,
+    /// and a service of this repo is as its inputs say. A side the finding
+    /// does not name (a method mismatch's pairing, a published package's)
+    /// or names as no known service could be any service of this repo, so it
+    /// is untouched only when every one of them is.
+    fn holds_for(&self, finding: &Finding) -> bool {
+        let every_ours = !self.ours.is_empty() && self.ours.values().all(|untouched| *untouched);
+        let side = |service: Option<&str>| match service {
+            Some(id) if self.ours.contains_key(id) => self.ours[id],
+            Some(id) if self.peers.contains(id) => true,
+            _ => every_ours,
+        };
+        let (producer, consumer) = match finding {
+            Finding::TypeMismatch {
+                pair: Some(pair),
+                direction: Some(_),
+                ..
+            } => crate::analyzer::pair_key_services(pair)
+                .map_or((None, None), |(producer, consumer)| {
+                    (Some(producer), Some(consumer))
+                }),
+            _ => (None, None),
+        };
+        side(producer) && side(consumer)
+    }
 }
 
 /// Whether main's copy is main as this PR's base has it.
@@ -164,6 +211,10 @@ pub enum MainCopy {
 /// and main's side judged at least one group the PR has more sites in; else
 /// the run could not tell, and the finding carries why. A finding with no
 /// pairing is left as it is.
+///
+/// A finding both of whose sides read nothing the PR changed
+/// ([`Untouched::holds_for`]) is main's, whatever main's recomputation says:
+/// the PR did not write anything it rests on (carrick#3170).
 ///
 /// Main's sites are its recomputed findings, plus each stored mismatch at a
 /// site the recomputation reached no resolved answer for. Where the
@@ -194,6 +245,14 @@ pub fn mark_on_main(pr: &mut [Finding], main: &MainSide, copy: MainCopy) {
     for finding in pr.iter_mut() {
         let groups: Vec<SiteGroup> = groups(finding).into_iter().map(|(g, _)| g).collect();
         if groups.is_empty() {
+            continue;
+        }
+        if main
+            .untouched
+            .as_ref()
+            .is_some_and(|untouched| untouched.holds_for(finding))
+        {
+            finding.set_on_main(Some(true));
             continue;
         }
         let short: Vec<&SiteGroup> = groups
@@ -1243,6 +1302,115 @@ mod tests {
         assert_eq!(on_main(&pr[0]), Some(true));
     }
 
+    /// Main's side with this repo's services, each marked whether the PR
+    /// changed nothing it reads, beside the peer services.
+    fn services_untouched(ours: &[(&str, bool)], peers: &[&str]) -> MainSide {
+        MainSide {
+            untouched: Some(Untouched {
+                ours: ours
+                    .iter()
+                    .map(|(service, untouched)| (service.to_string(), *untouched))
+                    .collect(),
+                peers: peers.iter().map(|peer| peer.to_string()).collect(),
+            }),
+            ..main_side(Vec::new())
+        }
+    }
+
+    fn marked(finding: Finding, main: &MainSide) -> Option<bool> {
+        let mut pr = vec![finding];
+        mark_on_main(&mut pr, main, MainCopy::Current);
+        on_main(&pr[0])
+    }
+
+    /// carrick#3170. A finding both of whose services read nothing the PR
+    /// changed is main's, though main's recomputation lacks it. A service of
+    /// this repo the PR changed on either side leaves the question to the
+    /// comparison, whichever side's file the finding is sited in.
+    #[test]
+    fn a_finding_whose_sides_read_nothing_the_pr_changed_is_on_main() {
+        let finding = || type_mismatch(ORDERS, "src/checkout.ts:40");
+        let both_ours = |producer: bool, consumer: bool| {
+            services_untouched(&[("orders-api", producer), ("web", consumer)], &[])
+        };
+        assert_eq!(marked(finding(), &both_ours(true, true)), Some(true));
+        assert_eq!(
+            marked(finding(), &both_ours(false, true)),
+            Some(false),
+            "the PR changed the producer"
+        );
+        assert_eq!(
+            marked(finding(), &both_ours(true, false)),
+            Some(false),
+            "the PR changed the consumer"
+        );
+        // A peer is another repo, which the PR does not change.
+        assert_eq!(
+            marked(
+                finding(),
+                &services_untouched(&[("web", true)], &["orders-api"])
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            marked(
+                finding(),
+                &services_untouched(&[("orders-api", true)], &["web"])
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            marked(
+                finding(),
+                &services_untouched(&[("orders-api", false)], &["web"])
+            ),
+            Some(false),
+            "the consumer is a peer, and the PR changed this repo's producer"
+        );
+        assert_eq!(
+            marked(finding(), &main_side(Vec::new())),
+            Some(false),
+            "no base to compare with"
+        );
+    }
+
+    /// A side the finding does not name, or names as no known service, could
+    /// be any service of this repo: untouched only when all of them are.
+    #[test]
+    fn an_unnamed_side_needs_every_service_of_this_repo_untouched() {
+        let verb = || method_mismatch("POST /orders/:id~PUT", &["src/checkout.ts:3"]);
+        assert_eq!(
+            marked(
+                verb(),
+                &services_untouched(&[("web", true), ("api", true)], &[])
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            marked(
+                verb(),
+                &services_untouched(&[("web", true), ("api", false)], &[])
+            ),
+            Some(false)
+        );
+        let unknown = || type_mismatch("billing|POST|/orders~web|src/a.ts|request", "src/a.ts:1");
+        assert_eq!(
+            marked(
+                unknown(),
+                &services_untouched(&[("web", true), ("api", false)], &[])
+            ),
+            Some(false),
+            "billing is neither this repo's nor a known peer"
+        );
+        assert_eq!(
+            marked(
+                unknown(),
+                &services_untouched(&[("web", true), ("api", true)], &[])
+            ),
+            Some(true)
+        );
+    }
+
     #[test]
     fn a_pairing_main_does_not_have_is_introduced() {
         let main = main_side(vec![type_mismatch(ORDERS, "src/checkout.ts:40")]);
@@ -1396,6 +1564,7 @@ mod tests {
             recomputed: vec![recomputed_unresolved(site)],
             stored: stored_type_sites(std::slice::from_ref(copy)),
             types_judged: true,
+            untouched: None,
         }
     }
 

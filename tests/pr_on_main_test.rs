@@ -3478,3 +3478,179 @@ async fn reach_a_lockfile_move_of_a_loaded_package_stays_whole() {
     assert_eq!(whole_reason(&dump), "repo_input");
     assert_eq!(dump["decided"]["whole_by"], "package-lock.json", "{dump:#}");
 }
+
+/// carrick#3170. A risk whose sides read nothing the PR changed is on main,
+/// whatever main's recomputation says. Main's copy is rewritten so its
+/// recomputation does not reach the wrong verb the base commit sends (the way
+/// a type that main's stored text resolves differently from the PR's read
+/// would), which is what read the risk as introduced. `on_main_branch`
+/// edits the consumer before main's commit.
+async fn main_copy_hiding_the_wrong_verb(
+    on_main_branch: impl Fn(&Path),
+) -> (tempfile::TempDir, PathBuf, Store) {
+    let (tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan(&store, &producer).await;
+    set_consumer_verb(&consumer, "PUT", 1);
+    on_main_branch(&consumer);
+    commit(&consumer, "main: sends the wrong verb");
+    let base = head(&consumer);
+    scan(&store, &consumer).await;
+    rewrite_main_copy(&store, "inventory-svc", |copy| {
+        for call in &mut copy.calls {
+            if let carrick::operation::OperationKey::Http { method, .. } = &mut call.key {
+                *method = "GET".to_string();
+            }
+        }
+        if let Some(graph) = copy.mount_graph.as_mut() {
+            for call in &mut graph.data_calls {
+                call.method = "GET".to_string();
+            }
+        }
+    });
+    event_with_base(tmp.path(), &base);
+    (tmp, consumer, store)
+}
+
+/// Set the manifest's own `version`.
+fn set_own_version(repo: &Path, version: &str) {
+    let manifest = repo.join("package.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    json["version"] = serde_json::json!(version);
+    std::fs::write(&manifest, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+}
+
+/// A source file of the consumer that loads `left-pad`, declared in its
+/// manifest and installed at `version` in its lockfile.
+fn load_left_pad(repo: &Path, version: &str) {
+    std::fs::write(
+        repo.join("src/pad.ts"),
+        "import leftPad from \"left-pad\";\nexport const pad = leftPad;\n",
+    )
+    .unwrap();
+    set_dependency(repo, "left-pad", "^1.3.0");
+    lock_left_pad(repo, version);
+}
+
+/// The consumer's npm lockfile, with `left-pad` installed at `version`.
+fn lock_left_pad(repo: &Path, version: &str) {
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.join("package.json")).unwrap()).unwrap();
+    let installed = |name: &str, version: &str| {
+        serde_json::json!({
+            "version": version,
+            "resolved": format!("https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"),
+            "integrity": format!("sha512-{name}-{version}"),
+        })
+    };
+    let lock = serde_json::json!({
+        "name": "inventory-svc",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": { "name": "inventory-svc", "dependencies": manifest["dependencies"] },
+            "node_modules/left-pad": installed("left-pad", version),
+            "node_modules/undici": installed("undici", "6.0.0"),
+        },
+    });
+    std::fs::write(
+        repo.join("package-lock.json"),
+        serde_json::to_string_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+}
+
+/// #3170's own case: a manifest-only PR that moves no package
+/// (`DependencyMove::moves_nothing`).
+#[tokio::test]
+async fn a_risk_in_a_file_the_pr_did_not_change_is_on_main() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, consumer, store) =
+        main_copy_hiding_the_wrong_verb(|repo| set_own_version(repo, "1.0.0")).await;
+    set_own_version(&consumer, "1.0.1");
+    commit(&consumer, "pr: a manifest bump and nothing else");
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+}
+
+/// A manifest-only PR that moves a package the consumer loads changed what
+/// the consumer's side rests on: the comparison with main decides, though no
+/// file holding the risk changed.
+#[tokio::test]
+async fn a_dependency_move_the_consumer_loads_leaves_the_risk_to_the_comparison() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, consumer, store) =
+        main_copy_hiding_the_wrong_verb(|repo| load_left_pad(repo, "1.3.0")).await;
+    lock_left_pad(&consumer, "1.3.1");
+    commit(
+        &consumer,
+        "pr: a lockfile bump of a package the consumer loads",
+    );
+    let runs = main_side_runs();
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert_eq!(main_side_runs(), runs + 1, "main's side ran");
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}
+
+/// One repo holding both fixture services, `catalog-web` (the producer) and
+/// `inventory-svc` (the consumer), each in its own directory.
+fn two_service_repo(root: &Path) -> PathBuf {
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/local-mode-workspace");
+    let repo = unlinked(root).join("widgets-mono");
+    for service in ["catalog-web", "inventory-svc"] {
+        copy_dir(&fixtures.join(service), &repo.join(service));
+    }
+    let config = serde_json::json!({
+        "services": [
+            { "name": "catalog-web", "directory": "catalog-web" },
+            { "name": "inventory-svc", "directory": "inventory-svc" },
+        ]
+    });
+    std::fs::write(repo.join("carrick.json"), config.to_string()).unwrap();
+    git(&repo, &["init", "-q"]);
+    commit(&repo, "init");
+    repo
+}
+
+/// The one repo holds both sides, which agree on main. The PR edits only the
+/// producer's response type, so the consumer's file is untouched and the
+/// break is the PR's.
+#[tokio::test]
+async fn a_pr_that_edits_the_producers_response_type_introduces_the_break() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let repo = two_service_repo(tmp.path());
+    let base = head(&repo);
+    let store = Store::default();
+    scan_with(&store, &repo, true).await;
+
+    edit(
+        &repo,
+        "catalog-web/app/routes/api.v1.widgets.$widgetId.ts",
+        &[
+            ("activeCount: number;", "activeCount: string;"),
+            ("activeCount: 3", "activeCount: \"3\""),
+        ],
+    );
+    commit(&repo, "pr: the producer answers the count as a string");
+    event_with_base(tmp.path(), &base);
+    let findings = pr_scan_with(&store, &repo, true).await;
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    let finding = type_mismatch(&findings);
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}
+
+#[tokio::test]
+async fn a_risk_in_a_file_the_pr_changed_is_still_introduced() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, consumer, store) = main_copy_hiding_the_wrong_verb(|_| {}).await;
+    set_consumer_verb(&consumer, "PUT", 2);
+    commit(&consumer, "pr: edits the file that holds the risk");
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}
