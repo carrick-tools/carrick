@@ -347,6 +347,32 @@ pub fn mark_lost_pairings(
         );
         written += 1;
     }
+    // The (service, label) of every receiver a lost pairing marks. A GraphQL,
+    // socket or pub/sub orphan names no service (the exact-key matcher keys
+    // its orphans by label alone), so such a row stands for every receiver
+    // of its label, and is replaced only when each of them is marked here.
+    let marked: BTreeSet<(String, String, String)> = sender_lost
+        .values()
+        .map(|group| {
+            (
+                group.service.clone(),
+                group.method.clone(),
+                group.path.clone(),
+            )
+        })
+        .collect();
+    let all_marked = |method: &str, path: &str| {
+        run.receivers
+            .iter()
+            .filter(|receiver| receiver.method == method && receiver.path == path)
+            .all(|receiver| {
+                marked.contains(&(
+                    receiver.service.clone(),
+                    receiver.method.clone(),
+                    receiver.path.clone(),
+                ))
+            })
+    };
     for group in sender_lost.values() {
         let mut provenance = None;
         let mut view_module = false;
@@ -354,12 +380,18 @@ pub fn mark_lost_pairings(
             Finding::OrphanedEndpoint {
                 method,
                 path,
-                service: Some(service),
+                service,
                 provenance: row_provenance,
                 view_module: row_view_module,
                 removal: None,
                 ..
-            } if *method == group.method && *path == group.path && *service == group.service => {
+            } if *method == group.method
+                && *path == group.path
+                && match service {
+                    Some(service) => *service == group.service,
+                    None => all_marked(method, path),
+                } =>
+            {
                 provenance = Some(*row_provenance);
                 view_module = *row_view_module;
                 false
@@ -813,6 +845,44 @@ mod tests {
         mark_lost_pairings(&mut pr, &main, &run, MainCopy::Current, None);
         assert_eq!(pr.len(), 2);
         assert_eq!(pr[0], other);
+    }
+
+    /// A socket or pub/sub orphan names no service: the exact-key matcher
+    /// keys it by label. It is replaced when every receiver of its label is
+    /// marked, and kept when one is not, since it still stands for that one.
+    #[test]
+    fn an_orphan_with_no_service_is_replaced_only_when_every_receiver_is_marked() {
+        let main = MainRemovals {
+            pairings: vec![message_pairing(Protocol::Websocket)],
+            operations: vec![],
+            sends: vec![removed_send(true)],
+        };
+        let unnamed = Finding::orphaned_endpoint("SERVER->CLIENT", "order:shipped", None);
+
+        let run = RunUnpaired {
+            calls: vec![],
+            receivers: vec![receiver()],
+        };
+        let mut pr = vec![unnamed.clone()];
+        assert_eq!(
+            mark_lost_pairings(&mut pr, &main, &run, MainCopy::Current, None),
+            1
+        );
+        assert_eq!(pr.len(), 1, "replaced, not added to: {pr:#?}");
+        assert_eq!(on_main(&pr[0]), (Some(false), None));
+
+        // A second service listens for the event and lost nothing: the
+        // unnamed row still stands for it.
+        let mut other = receiver();
+        other.service = "dashboard".into();
+        let run = RunUnpaired {
+            calls: vec![],
+            receivers: vec![receiver(), other],
+        };
+        let mut pr = vec![unnamed.clone()];
+        mark_lost_pairings(&mut pr, &main, &run, MainCopy::Current, None);
+        assert_eq!(pr.len(), 2, "{pr:#?}");
+        assert_eq!(pr[0], unnamed);
     }
 
     /// The edge source folds the surviving and the removed rows: a model row

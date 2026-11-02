@@ -381,6 +381,44 @@ impl OperationKey {
             OperationKey::Pubsub { topic } => format!("pubsub|{}", topic),
         }
     }
+
+    /// The key a [`Self::canonical`] string spells, `None` for a string no
+    /// key spells. A cross-repo match names its sides only by this string, so
+    /// a reader that compares them with other rows by key (carrick#3092)
+    /// reads it back here.
+    pub fn from_canonical(canonical: &str) -> Option<Self> {
+        let (protocol, rest) = canonical.split_once('|')?;
+        match protocol {
+            "http" => {
+                let (method, path) = rest.split_once('|')?;
+                Some(OperationKey::http(method, path))
+            }
+            "graphql" => {
+                let (kind, field) = rest.split_once('|')?;
+                let kind = [
+                    GraphqlOperationKind::Query,
+                    GraphqlOperationKind::Mutation,
+                    GraphqlOperationKind::Subscription,
+                ]
+                .into_iter()
+                .find(|known| known.as_str() == kind)?;
+                Some(OperationKey::graphql(kind, field))
+            }
+            "socket" => {
+                let (label, event) = rest.split_once('|')?;
+                let direction = [
+                    SocketDirection::ClientToServer,
+                    SocketDirection::ServerToClient,
+                    SocketDirection::Unknown,
+                ]
+                .into_iter()
+                .find(|known| known.label() == label)?;
+                Some(OperationKey::socket(event, direction))
+            }
+            "pubsub" => Some(OperationKey::pubsub(rest)),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for OperationKey {
@@ -406,6 +444,31 @@ mod tests {
         assert_eq!(key.as_http(), Some(("GET", "/users")));
         assert_eq!(key.canonical(), "http|GET|/users");
         assert_eq!(key.to_string(), "GET /users");
+    }
+
+    #[test]
+    fn from_canonical_reads_back_every_protocols_key() {
+        for key in [
+            OperationKey::http("GET", "/api/v1/orders/:orderId"),
+            OperationKey::graphql(GraphqlOperationKind::Query, "order"),
+            OperationKey::graphql(GraphqlOperationKind::Subscription, "orderUpdated"),
+            OperationKey::socket("order:update", SocketDirection::ClientToServer),
+            OperationKey::socket("order:shipped", SocketDirection::ServerToClient),
+            OperationKey::socket("tick", SocketDirection::Unknown),
+            OperationKey::pubsub("payments.settled"),
+        ] {
+            assert_eq!(OperationKey::from_canonical(&key.canonical()), Some(key));
+        }
+        for junk in [
+            "",
+            "http",
+            "http|GET",
+            "graphql|fragment|x",
+            "socket|SIDEWAYS|x",
+            "rpc|x",
+        ] {
+            assert_eq!(OperationKey::from_canonical(junk), None, "{junk}");
+        }
     }
 
     #[test]

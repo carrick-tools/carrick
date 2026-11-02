@@ -444,6 +444,23 @@ pub struct ApiAnalysisResult {
     /// per-edge type-compat verdicts. Populated by `get_results`; consumed by
     /// the eval projection (it has no effect on the human Markdown report).
     pub cross_repo_matches: Vec<CrossRepoMatch>,
+    /// Every consumer call this run holds that no producer answers, keyed as
+    /// [`Analyzer::build_cross_repo_match`] keys a matched call's side, so a
+    /// PR run can tell which of them lost a pairing main had (carrick#3092).
+    /// Scan-local: never uploaded. A protocol with no producer at all still
+    /// lists its calls here, though it reports no `missing_endpoint`.
+    pub unpaired_calls: Vec<crate::pr_baseline::UnpairedCall>,
+    /// Every GraphQL, socket and pub/sub producer row no call reaches, one
+    /// per row (carrick#3092). An HTTP route is not listed: a removed HTTP
+    /// caller is never a break.
+    pub unpaired_producers: Vec<crate::pr_baseline::UnpairedReceiver>,
+}
+
+/// The file of a call or registration location, as a lost pairing compares
+/// it on both sides (carrick#3092): the runner checkout and the line dropped,
+/// so a call that moved within its file is the same call.
+pub(crate) fn location_file(location: &str) -> String {
+    parse_file_location(strip_ci_workspace_prefix(location)).0
 }
 
 /// Return the subset of `data_fetchers` that are GraphQL libraries.
@@ -575,28 +592,7 @@ struct ConsumerRow<'a> {
 /// here we produce the human display form (`("QUERY", "field")`,
 /// `("dir", "event")`) instead. Returns `None` for any unrecognized key.
 fn producer_display_from_canonical(key: &str) -> Option<(String, String)> {
-    let mut parts = key.splitn(3, '|');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("http"), Some(method), Some(path)) if !method.is_empty() && !path.is_empty() => {
-            Some((method.to_string(), path.to_string()))
-        }
-        // `display_labels` uppercases the GraphQL KIND; the canonical keeps it
-        // lowercase, so uppercase here to match the verified row.
-        (Some("graphql"), Some(kind), Some(field)) if !kind.is_empty() && !field.is_empty() => {
-            Some((kind.to_uppercase(), field.to_string()))
-        }
-        // The canonical's first socket segment IS `direction.label()`, the same
-        // value `display_labels` uses — pass it through verbatim.
-        (Some("socket"), Some(direction), Some(event))
-            if !direction.is_empty() && !event.is_empty() =>
-        {
-            Some((direction.to_string(), event.to_string()))
-        }
-        (Some("pubsub"), Some(topic), None) if !topic.is_empty() => {
-            Some(("PUBSUB".to_string(), topic.to_string()))
-        }
-        _ => None,
-    }
+    OperationKey::from_canonical(key).map(|key| key.display_labels())
 }
 
 /// Canonicalize a consumer source location (`"<file>:<line>[:<col>]"`) to the
@@ -2495,7 +2491,17 @@ impl Analyzer {
     /// one consumer call successfully matched (positive signal for the PR
     /// comment), and the third captures the structured producer→consumer
     /// edges (consumed only by the eval projection).
+    #[cfg(test)]
     fn analyze_matches_with_mount_graph(&self, mount_graph: &MountGraph) -> MatcherOutput {
+        self.http_matches(mount_graph).0
+    }
+
+    /// [`Self::analyze_matches_with_mount_graph`], with every call that
+    /// lands in a `missing_endpoint` listed as unpaired (carrick#3092).
+    fn http_matches(
+        &self,
+        mount_graph: &MountGraph,
+    ) -> (MatcherOutput, crate::pr_baseline::RunUnpaired) {
         /// A wrong-verb call group awaiting resolution. Producers hold
         /// `(EXPECTED_METHOD, suppression key, declared full_path)` for every
         /// exact-path producer; resolution is deferred to after the call loop
@@ -2603,6 +2609,9 @@ impl Analyzer {
 
         // Track which endpoints have been matched
         let mut matched_endpoints: HashSet<String> = HashSet::new();
+        // Each call that lands in `missing`, keyed as a matched call's edge
+        // would key it (carrick#3092).
+        let mut unpaired_calls: Vec<crate::pr_baseline::UnpairedCall> = Vec::new();
 
         // Deduplicate calls
         let mut unique_calls = Vec::new();
@@ -2675,6 +2684,33 @@ impl Analyzer {
                 lookup_url = target.to_string();
                 miss_path = normalizer.extract_path(target);
             }
+            // This call as a `missing_endpoint` holds it: the consumer side a
+            // matched edge names (`build_cross_repo_match`), and the label
+            // and site the row carries.
+            let unpaired = || {
+                let normalized_path = if is_env_route {
+                    miss_path.clone()
+                } else {
+                    normalizer.normalize(&lookup_url).path
+                };
+                let service = consumer_repo_by_call.get(&(
+                    method.to_uppercase(),
+                    target.to_string(),
+                    call.file_path.display().to_string(),
+                ))?;
+                Some(crate::pr_baseline::UnpairedCall {
+                    service: service.clone(),
+                    key: OperationKey::http(method, normalized_path).canonical(),
+                    file: location_file(&call_site),
+                    method: method.to_string(),
+                    path: miss_path.clone(),
+                    sites: vec![call_site.clone()],
+                    source: consumer_source_by_call
+                        .get(&consumer_identity(&call.file_path.display().to_string()))
+                        .copied()
+                        .flatten(),
+                })
+            };
 
             match mount_graph.find_matching_endpoints_with_normalizer(
                 &lookup_url,
@@ -2704,6 +2740,7 @@ impl Analyzer {
                     // the extraction gap on this side, not the absence of a
                     // producer.
                     if carrick_match::is_unknown_call_path(&normalized_path) {
+                        unpaired_calls.extend(unpaired());
                         missing
                             .entry((method.to_string(), miss_path))
                             .or_default()
@@ -2813,6 +2850,7 @@ impl Analyzer {
                         // alternative is a call that matched nothing and is
                         // reported nowhere.
                         carrick_match::DispatchOutcome::NoCaseAnswers => {
+                            unpaired_calls.extend(unpaired());
                             missing
                                 .entry((method.to_string(), miss_path))
                                 .or_default()
@@ -2897,6 +2935,7 @@ impl Analyzer {
                         endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
                     });
                     if path_matches.is_empty() {
+                        unpaired_calls.extend(unpaired());
                         missing
                             .entry((method.to_string(), miss_path))
                             .or_default()
@@ -3109,7 +3148,13 @@ impl Analyzer {
         // combined set, so this is the HTTP-only first pass.
         sort_dedup_cross_repo_matches(&mut cross_repo_matches);
 
-        (findings, verified, cross_repo_matches)
+        (
+            (findings, verified, cross_repo_matches),
+            crate::pr_baseline::RunUnpaired {
+                calls: unpaired_calls,
+                receivers: Vec::new(),
+            },
+        )
     }
 
     /// Build a [`CrossRepoMatch`] from a matched consumer call + producer
@@ -3186,15 +3231,28 @@ impl Analyzer {
     /// and guessing would create false "missing endpoint" noise. Unconsumed
     /// producers are reported as orphans, the same soft signal REST orphans
     /// get.
+    ///
+    #[cfg(test)]
     fn analyze_exact_key_matches(&self, protocol: crate::operation::Protocol) -> MatcherOutput {
+        self.exact_key_matches(protocol).0
+    }
+
+    /// [`Self::analyze_exact_key_matches`], with every call no producer row
+    /// pairs with and every producer row no call pairs with listed as
+    /// unpaired (carrick#3092). The calls of a protocol with no producer at
+    /// all are listed too: a PR that removes the last one leaves calls a
+    /// pairing on main answered.
+    fn exact_key_matches(
+        &self,
+        protocol: crate::operation::Protocol,
+    ) -> (MatcherOutput, crate::pr_baseline::RunUnpaired) {
         let producers: Vec<&ApiEndpointDetails> = self
             .endpoints
             .iter()
             .filter(|endpoint| endpoint.key.protocol() == protocol)
             .collect();
-        if producers.is_empty() {
-            return (Vec::new(), Vec::new(), Vec::new());
-        }
+        let no_producer = producers.is_empty();
+        let mut unpaired = crate::pr_baseline::RunUnpaired::default();
         // The producer rows under each exact key, by their index in
         // `producers`. Several rows can legitimately share one key — two
         // services exposing the same GraphQL field, several listeners for one
@@ -3242,9 +3300,20 @@ impl Analyzer {
                 .collect();
             if pairs_with.is_empty() {
                 let (label, name) = call.key.display_labels();
-                missing.entry((label, name)).or_default().insert(
-                    strip_ci_workspace_prefix(&call.file_path.display().to_string()).to_string(),
-                );
+                let site =
+                    strip_ci_workspace_prefix(&call.file_path.display().to_string()).to_string();
+                if let Some(service) = call.service_id() {
+                    unpaired.calls.push(crate::pr_baseline::UnpairedCall {
+                        service: service.to_string(),
+                        key: call.key.canonical(),
+                        file: location_file(&site),
+                        method: label.clone(),
+                        path: name.clone(),
+                        sites: vec![site.clone()],
+                        source: call.resolution_source,
+                    });
+                }
+                missing.entry((label, name)).or_default().insert(site);
                 continue;
             }
             // Producer repo ids (service_name ?? repo_name) of the rows this
@@ -3317,6 +3386,9 @@ impl Analyzer {
                 });
             }
         }
+        if no_producer {
+            return ((Vec::new(), Vec::new(), Vec::new()), unpaired);
+        }
 
         let mut findings: Vec<Finding> = missing
             .into_iter()
@@ -3333,6 +3405,24 @@ impl Analyzer {
         let mut seen_verified = HashSet::new();
         let mut seen_orphans = HashSet::new();
         for (index, endpoint) in producers.iter().enumerate() {
+            if !paired[index]
+                && let Some(service) = endpoint.service_id()
+            {
+                let (label, name) = endpoint.key.display_labels();
+                unpaired
+                    .receivers
+                    .push(crate::pr_baseline::UnpairedReceiver {
+                        service: service.to_string(),
+                        key: endpoint.key.canonical(),
+                        method: label,
+                        path: name,
+                        sites: vec![
+                            strip_ci_workspace_prefix(&endpoint.file_path.display().to_string())
+                                .to_string(),
+                        ],
+                        source: endpoint.resolution_source,
+                    });
+            }
             let first = if paired[index] {
                 seen_verified.insert(&endpoint.key)
             } else {
@@ -3355,7 +3445,7 @@ impl Analyzer {
         }
         sort_dedup_verified(&mut verified);
 
-        (findings, verified, cross_repo_matches)
+        ((findings, verified, cross_repo_matches), unpaired)
     }
 
     pub fn compute_full_paths_for_endpoint(
@@ -3472,8 +3562,8 @@ impl Analyzer {
         let mount_graph = self.mount_graph.as_ref()
             .expect("Mount graph must be set before calling get_results(). This is a framework-agnostic requirement.");
 
-        let (matcher_findings, mut verified_endpoints, mut cross_repo_matches) =
-            self.analyze_matches_with_mount_graph(mount_graph);
+        let ((matcher_findings, mut verified_endpoints, mut cross_repo_matches), mut unpaired) =
+            self.http_matches(mount_graph);
         // Findings order mirrors the report: contract risks first (type
         // mismatches, then the matchers' method mismatches), then gaps, then
         // advisories.
@@ -3484,11 +3574,15 @@ impl Analyzer {
             crate::operation::Protocol::Websocket,
             crate::operation::Protocol::Pubsub,
         ] {
-            let (protocol_findings, protocol_verified, protocol_cross_repo_matches) =
-                self.analyze_exact_key_matches(protocol);
+            let (
+                (protocol_findings, protocol_verified, protocol_cross_repo_matches),
+                protocol_unpaired,
+            ) = self.exact_key_matches(protocol);
             findings.extend(protocol_findings);
             verified_endpoints.extend(protocol_verified);
             cross_repo_matches.extend(protocol_cross_repo_matches);
+            unpaired.calls.extend(protocol_unpaired.calls);
+            unpaired.receivers.extend(protocol_unpaired.receivers);
         }
         // Route-wins per (method, path) over the combined HTTP + non-HTTP set.
         sort_dedup_verified(&mut verified_endpoints);
@@ -3569,6 +3663,8 @@ impl Analyzer {
             detected_graphql_libraries,
             graphql_operations_indexed,
             cross_repo_matches,
+            unpaired_calls: unpaired.calls,
+            unpaired_producers: unpaired.receivers,
         }
     }
 

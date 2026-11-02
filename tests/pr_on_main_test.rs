@@ -2159,10 +2159,17 @@ fn apply_seed(repo: &Path, name: &str) {
     }
 }
 
-/// The PR result of seed `name`, its edits applied to its repo.
+/// The PR result of seed `name`, its edits applied to its repo. A seed whose
+/// correct check succeeds (a quiet seed) must mark no lost pairing
+/// (carrick#3092), so every test of one asserts that here.
 async fn manifest_seed_payload(name: &str) -> serde_json::Value {
-    let repo = seed_entry(name)["repo"].as_str().unwrap().to_string();
-    seed_payload(&repo, |dir| apply_seed(dir, name)).await
+    let entry = seed_entry(name);
+    let repo = entry["repo"].as_str().unwrap().to_string();
+    let payload = seed_payload(&repo, |dir| apply_seed(dir, name)).await;
+    if entry["expect"]["conclusion"] == "success" {
+        assert_no_lost_pairing(&payload);
+    }
+    payload
 }
 
 /// The delta rows the manifest says seed `name`'s correct check carries.
@@ -2494,10 +2501,117 @@ async fn seed_http_route_rename() {
     );
 }
 
-#[test]
-#[ignore = "carrick#3092: the rename marking shape is not pinned"]
-fn seed_http_route_rename_marking() {
-    panic!("carrick#3092: shape not pinned");
+/// The row of `kind` for `method path` that records a pairing main had and
+/// this PR lost (carrick#3092): the one carrying `removed`.
+fn lost_pairing_row(
+    payload: &serde_json::Value,
+    kind: &str,
+    method: &str,
+    path: &str,
+) -> serde_json::Value {
+    let findings = findings_of(payload);
+    let rows: Vec<&serde_json::Value> = findings
+        .iter()
+        .filter(|f| {
+            f["kind"] == kind
+                && f["method"] == method
+                && f["path"] == path
+                && f.get("removed").is_some()
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one {kind} {method} {path} with removed: {findings:#?}"
+    );
+    rows[0].clone()
+}
+
+/// What a lost pairing's row says: the surviving service and its places, the
+/// operation the PR removed as main had it, and that the PR introduced it,
+/// read from fact rows on both sides as a routing fact.
+fn assert_lost_pairing(
+    row: &serde_json::Value,
+    service: &str,
+    places: (&str, &[&str]),
+    removed: [&str; 3],
+) {
+    let [method, path, place] = removed;
+    assert_eq!(row["severity"], "risk", "{row:#}");
+    assert_eq!(row["service"], service, "{row:#}");
+    assert_eq!(row[places.0], serde_json::json!(places.1), "{row:#}");
+    assert_eq!(
+        row["removed"],
+        serde_json::json!({ "method": method, "path": path, "service": null, "place": place }),
+        "{row:#}"
+    );
+    assert_marks(row, Some(false), Some("fact"), Some("not_checked"));
+}
+
+/// No call site of a lost pairing is also left on an unmarked row.
+fn assert_no_unmarked_row_holds(payload: &serde_json::Value, kind: &str, path: &str) {
+    for finding in findings_of(payload) {
+        assert!(
+            !(finding["kind"] == kind
+                && finding["path"] == path
+                && finding.get("removed").is_none()),
+            "an unmarked row beside the marked one: {finding:#}"
+        );
+    }
+}
+
+const ORDER_ROUTE_PLACE: &str = "app/routes/api.v1.orders.$orderId.ts:9";
+
+/// The route module is renamed: the consumer's two sites lost the route main
+/// paired them with, and the PR's own diff removed it.
+#[tokio::test]
+async fn seed_http_route_rename_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = http_route_rename().await;
+    let row = lost_pairing_row(
+        &payload,
+        "missing_endpoint",
+        "GET",
+        "/api/v1/orders/:encoded",
+    );
+    assert_lost_pairing(
+        &row,
+        "storefront",
+        ("call_sites", &ORDER_SITES),
+        ["GET", ORDER_PATH, ORDER_ROUTE_PLACE],
+    );
+    assert_no_unmarked_row_holds(&payload, "missing_endpoint", "/api/v1/orders/:encoded");
+}
+
+/// The route module is deleted: the same break as a rename.
+#[tokio::test]
+async fn seed_http_route_removed_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-route-removed").await;
+    let row = lost_pairing_row(
+        &payload,
+        "missing_endpoint",
+        "GET",
+        "/api/v1/orders/:encoded",
+    );
+    assert_lost_pairing(
+        &row,
+        "storefront",
+        ("call_sites", &ORDER_SITES),
+        ["GET", ORDER_PATH, ORDER_ROUTE_PLACE],
+    );
+    assert_no_unmarked_row_holds(&payload, "missing_endpoint", "/api/v1/orders/:encoded");
+}
+
+/// No row says the PR removed something another service still uses
+/// (carrick#3092): what every seed whose correct check succeeds must give.
+fn assert_no_lost_pairing(payload: &serde_json::Value) {
+    for finding in findings_of(payload) {
+        assert!(
+            finding.get("removed").is_none(),
+            "a lost pairing: {finding:#}"
+        );
+    }
 }
 
 /// The delta the manifest's correct check names for seed `name`, in any order.
@@ -2705,10 +2819,18 @@ async fn seed_graphql_root_rename() {
     assert_delta(&payload, &["QUERY orderById"], &["QUERY order"]);
 }
 
-#[test]
-#[ignore = "carrick#3092: the rename marking shape is not pinned"]
-fn seed_graphql_root_rename_marking() {
-    panic!("carrick#3092: shape not pinned");
+#[tokio::test]
+async fn seed_graphql_root_rename_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("graphql-root-rename").await;
+    let row = lost_pairing_row(&payload, "missing_endpoint", "QUERY", "order");
+    assert_lost_pairing(
+        &row,
+        "storefront",
+        ("call_sites", &[ORDER_QUERY_SITE]),
+        ["QUERY", "order", "src/resolvers.ts:11"],
+    );
+    assert_no_unmarked_row_holds(&payload, "missing_endpoint", "order");
 }
 
 // ---- Socket events -----------------------------------------------------
@@ -2776,10 +2898,23 @@ async fn seed_socket_listener_rename() {
     );
 }
 
-#[test]
-#[ignore = "carrick#3092: the rename marking shape is not pinned"]
-fn seed_socket_listener_rename_marking() {
-    panic!("carrick#3092: shape not pinned");
+#[tokio::test]
+async fn seed_socket_listener_rename_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("socket-listener-rename").await;
+    let row = lost_pairing_row(
+        &payload,
+        "missing_endpoint",
+        "CLIENT->SERVER",
+        "order:update",
+    );
+    assert_lost_pairing(
+        &row,
+        "storefront",
+        ("call_sites", &["src/live.ts:12"]),
+        ["CLIENT->SERVER", "order:update", "src/realtime.ts:11"],
+    );
+    assert_no_unmarked_row_holds(&payload, "missing_endpoint", "order:update");
 }
 
 /// The emit is a call, so the delta, which reads endpoints, shows nothing.
@@ -2804,10 +2939,34 @@ async fn seed_socket_emit_rename() {
     assert_delta(&payload, &[], &[]);
 }
 
-#[test]
-#[ignore = "carrick#3092: the rename marking shape is not pinned"]
-fn seed_socket_emit_rename_marking() {
-    panic!("carrick#3092: shape not pinned");
+/// The emit is renamed: the listener in `storefront` lost the sender main
+/// paired it with. The renamed emit itself pairs with nothing and stays an
+/// unmarked `missing_endpoint`: it lost no pairing.
+#[tokio::test]
+async fn seed_socket_emit_rename_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("socket-emit-rename").await;
+    let row = lost_pairing_row(
+        &payload,
+        "orphaned_endpoint",
+        "SERVER->CLIENT",
+        "order:shipped",
+    );
+    assert_lost_pairing(
+        &row,
+        "storefront",
+        ("sites", &["src/live.ts:15"]),
+        ["SERVER->CLIENT", "order:shipped", "src/realtime.ts:12"],
+    );
+    assert_no_unmarked_row_holds(&payload, "orphaned_endpoint", "order:shipped");
+    let renamed = seed_finding(
+        &payload,
+        "missing_endpoint",
+        "SERVER->CLIENT",
+        "order:dispatched",
+        Some("src/realtime.ts:12"),
+    );
+    assert!(renamed.get("removed").is_none(), "{renamed:#}");
 }
 
 // ---- Pub/sub -----------------------------------------------------------
@@ -2860,10 +3019,18 @@ async fn seed_pubsub_subscriber_rename() {
     );
 }
 
-#[test]
-#[ignore = "carrick#3092: the rename marking shape is not pinned"]
-fn seed_pubsub_subscriber_rename_marking() {
-    panic!("carrick#3092: shape not pinned");
+#[tokio::test]
+async fn seed_pubsub_subscriber_rename_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("pubsub-subscriber-rename").await;
+    let row = lost_pairing_row(&payload, "missing_endpoint", "PUBSUB", "payments.settled");
+    assert_lost_pairing(
+        &row,
+        "storefront",
+        ("call_sites", &["src/payments.ts:10"]),
+        ["PUBSUB", "payments.settled", "src/events.ts:9"],
+    );
+    assert_no_unmarked_row_holds(&payload, "missing_endpoint", "payments.settled");
 }
 
 #[tokio::test]
@@ -2887,10 +3054,26 @@ async fn seed_pubsub_publish_rename() {
     assert_delta(&payload, &[], &[]);
 }
 
-#[test]
-#[ignore = "carrick#3092: the rename marking shape is not pinned"]
-fn seed_pubsub_publish_rename_marking() {
-    panic!("carrick#3092: shape not pinned");
+#[tokio::test]
+async fn seed_pubsub_publish_rename_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("pubsub-publish-rename").await;
+    let row = lost_pairing_row(&payload, "orphaned_endpoint", "PUBSUB", "orders.shipped");
+    assert_lost_pairing(
+        &row,
+        "storefront",
+        ("sites", &["src/payments.ts:14"]),
+        ["PUBSUB", "orders.shipped", "src/events.ts:15"],
+    );
+    assert_no_unmarked_row_holds(&payload, "orphaned_endpoint", "orders.shipped");
+    let renamed = seed_finding(
+        &payload,
+        "missing_endpoint",
+        "PUBSUB",
+        "orders.dispatched",
+        Some("src/events.ts:15"),
+    );
+    assert!(renamed.get("removed").is_none(), "{renamed:#}");
 }
 
 // ---- Functions and dependencies ----------------------------------------
@@ -3745,6 +3928,70 @@ async fn a_pr_that_edits_the_producers_response_type_introduces_the_break() {
     unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
     let finding = type_mismatch(&findings);
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}
+
+const WIDGET_ROUTE_FILE: &str = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+const GADGET_ROUTE_FILE: &str = "catalog-web/app/routes/api.v1.gadgets.$widgetId.ts";
+
+/// The PR result of `two_service_repo` after `change`, against main's index of
+/// it as it was.
+async fn two_service_pr(change: impl Fn(&Path)) -> serde_json::Value {
+    let (tmp, _, _) = setup();
+    let repo = two_service_repo(tmp.path());
+    let base = head(&repo);
+    let store = Store::default();
+    scan_with(&store, &repo, false).await;
+    change(&repo);
+    commit(&repo, "pr: seed");
+    event_with_base(tmp.path(), &base);
+    let payload = pr_payload_with(&store, &repo, false).await;
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    payload
+}
+
+/// The PR renames the producer's route and leaves the other service of the
+/// same repo calling the old one: the call lost the pairing main had, and the
+/// PR's diff removed its route (carrick#3092).
+#[tokio::test]
+async fn a_route_the_pr_renames_under_a_caller_in_the_same_repo_is_a_break() {
+    let _serial = SERIAL.lock().await;
+    let payload = two_service_pr(|repo| {
+        git(repo, &["mv", WIDGET_ROUTE_FILE, GADGET_ROUTE_FILE]);
+    })
+    .await;
+    let row = lost_pairing_row(
+        &payload,
+        "missing_endpoint",
+        "GET",
+        "/api/v1/widgets/:encoded",
+    );
+    assert_eq!(row["service"], "inventory-svc", "{row:#}");
+    assert_eq!(
+        row["removed"]["path"], "/api/v1/widgets/:widgetId",
+        "{row:#}"
+    );
+    assert_marks(&row, Some(false), Some("fact"), Some("not_checked"));
+}
+
+/// The PR renames the route and the caller with it: no pairing is lost.
+#[tokio::test]
+async fn a_rename_the_caller_follows_in_the_same_pr_is_no_break() {
+    let _serial = SERIAL.lock().await;
+    let payload = two_service_pr(|repo| {
+        git(repo, &["mv", WIDGET_ROUTE_FILE, GADGET_ROUTE_FILE]);
+        edit(
+            repo,
+            "inventory-svc/src/client.ts",
+            &[("/api/v1/widgets/", "/api/v1/gadgets/")],
+        );
+    })
+    .await;
+    assert_no_lost_pairing(&payload);
+    assert_delta(
+        &payload,
+        &["GET /api/v1/gadgets/:widgetId"],
+        &["GET /api/v1/widgets/:widgetId"],
+    );
 }
 
 #[tokio::test]
