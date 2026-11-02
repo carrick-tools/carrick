@@ -723,11 +723,11 @@ impl PositionIndex {
     /// [`crate::swc_scanner::SWC_SPAN_BASE`] as in a file parsed on its own
     /// (what [`crate::request_summary::FileIr`] spans convert to).
     pub fn lookup(&self, file: &Path, lo: u32, hi: u32, kind: Kind) -> Result<&Row, HoleReason> {
-        let (indexed, text) = self.file(file)?;
+        let (start, end) = self.rows_position(file, lo, hi)?;
+        let (indexed, _) = self.file(file)?;
         #[cfg(test)]
         self.lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (start, end) = rows_span(text, lo, hi);
         let row = indexed
             .rows
             .get(&(start, end, kind))
@@ -736,6 +736,19 @@ impl PositionIndex {
             return Err(HoleReason::CheckerThrew);
         }
         Ok(row)
+    }
+
+    /// The span [`Self::lookup`] reads for the SWC span `lo..hi` of `file`,
+    /// in the rows' numbering (UTF-16 code units): what a question to the
+    /// sidecar about that position is put in (carrick#2432).
+    pub fn rows_position(&self, file: &Path, lo: u32, hi: u32) -> Result<(u32, u32), HoleReason> {
+        let (_, text) = self.file(file)?;
+        Ok(rows_span(text, lo, hi))
+    }
+
+    /// The root the rows' file names are relative to.
+    pub fn scan_root(&self) -> &Path {
+        &self.scan_root
     }
 
     /// The [`Kind::Decl`] rows at [`Self::lookup`]'s position, in the order
@@ -1075,6 +1088,43 @@ mod tests {
         assert!(
             !PositionIndex::missing(Path::new("/repo")).may_call_through_an_unresolved_import()
         );
+    }
+
+    /// carrick#813: the span a question about a call is put in is the key
+    /// `lookup` finds the row under, on a line with non-ASCII text before the
+    /// call (UTF-16 offsets).
+    #[test]
+    fn the_rows_position_of_a_call_is_the_key_lookup_finds_it_under() {
+        let text = "const é = \"😀\"; f(1);\n";
+        let lo = text.find("f(1)").unwrap() as u32 + crate::swc_scanner::SWC_SPAN_BASE;
+        let hi = lo + 4;
+        let utf16_start = text[..text.find("f(1)").unwrap()].encode_utf16().count() as u32;
+        let mut index = PositionIndex::of(
+            Path::new("/repo"),
+            RowsFile {
+                header: Header {
+                    v: FORMAT_VERSION,
+                    typescript: "6.0.2".to_string(),
+                    service: "api".to_string(),
+                    files: 1,
+                },
+                files: vec![file_rows(
+                    "src/a.ts",
+                    Some(text),
+                    None,
+                    vec![row(Kind::Call, utf16_start, utf16_start + 4, Some("f"), 0)],
+                )],
+            },
+        );
+        index.bind(Path::new("/repo/src/a.ts"), text);
+        let file = Path::new("/repo/src/a.ts");
+        let (start, end) = index.rows_position(file, lo, hi).unwrap();
+        assert_eq!((start, end), (utf16_start, utf16_start + 4));
+        assert!(
+            start as usize != text.find("f(1)").unwrap(),
+            "not a byte offset"
+        );
+        assert!(index.lookup(file, lo, hi, Kind::Call).is_ok());
     }
 
     /// Every case of carrick#2413 §3 reads its reason, and a usable row

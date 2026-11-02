@@ -747,6 +747,17 @@ impl RequestSummaryInputs {
         }
     }
 
+    /// The span of the call row at `lo..hi` in `file`, in the rows' numbering:
+    /// the key [`Self::row_names`] reads, for a question put to the sidecar
+    /// about that call. `None` without rows or for a file they hold none for.
+    pub(crate) fn call_row_span(&self, file: &Path, lo: u32, hi: u32) -> Option<(u32, u32)> {
+        let ir = self.files.get(file)?;
+        self.positions
+            .as_ref()?
+            .rows_position(file, ir.swc_start(lo), ir.swc_start(hi))
+            .ok()
+    }
+
     /// The definition of `file` the declaration of `symbol` at `line` is,
     /// when the service holds `file`: what [`Self::row_names`] reads of a
     /// declaration in one of its files, for a call another service of the
