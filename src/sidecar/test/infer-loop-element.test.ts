@@ -149,7 +149,7 @@ describe('carrick#1029: a loop-registered route is typed for its own element', (
     ]);
     assert.deepStrictEqual(order, ['alpha', 'status', 'beta']);
     assert.strictEqual(byAlias.get('status'), '{ state: string; }');
-    assert.strictEqual(unwidened.get('status'), '{ state: "up" | "down"; }');
+    assert.match(unwidened.get('status') ?? '', /^\{ state: ("up" \| "down"|"down" \| "up"); \}$/);
     assert.strictEqual(byAlias.get('beta'), '{ items: { betaName: string; }[]; total: number; }');
   });
 

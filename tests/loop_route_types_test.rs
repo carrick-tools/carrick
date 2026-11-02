@@ -77,7 +77,7 @@ fn endpoint(path: &str, needle: &str, returned: &str, returns_value: bool) -> En
     let line = line_of(needle);
     assert_eq!(line_of(returned), line, "{returned} is on the route's line");
     EndpointResult {
-        handler_declaration_line: returns_value.then_some(line),
+        handler_declaration_line: returns_value.then_some(line as u32),
         registration_literal: None,
         view_module: false,
         candidate_id: format!("loop:{path}"),
