@@ -284,7 +284,7 @@ fn each_loop_element_is_typed_with_its_own_payload() {
         .expect("resolve_all_types");
     let typed = |path: &str| {
         let alias = requests[path].alias.clone().expect("an alias");
-        let text = result
+        result
             .inferred_types
             .iter()
             .find(|t| t.alias == alias)
@@ -292,8 +292,7 @@ fn each_loop_element_is_typed_with_its_own_payload() {
             .type_string
             .split_whitespace()
             .collect::<Vec<_>>()
-            .join(" ");
-        text
+            .join(" ")
     };
     assert_eq!(
         typed("/items/alpha-rows"),
