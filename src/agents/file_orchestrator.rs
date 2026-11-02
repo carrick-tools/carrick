@@ -4964,6 +4964,50 @@ impl FileOrchestrator {
         })
     }
 
+    /// carrick#1029: set `route_path` on every producer route-row request for
+    /// a row whose file and line serve more than one operation (one
+    /// registration made once per element of a list), so the sidecar can tell
+    /// which operation each request is for. The rows are the mount graph's,
+    /// keyed by the producer aliases [`Self::collect_type_requests`] builds
+    /// for them; a row with a line of its own is left unmarked. Returns how
+    /// many requests it marked.
+    pub fn mark_shared_route_lines(
+        requests: &mut [InferRequestItem],
+        mount_graph: &MountGraph,
+        repo_path: &str,
+    ) -> usize {
+        let mut by_line: HashMap<(String, u32), Vec<(String, String)>> = HashMap::new();
+        for endpoint in mount_graph.get_resolved_endpoints() {
+            let (file_path, line_number) = parse_file_location(&endpoint.file_location);
+            by_line.entry((file_path, line_number)).or_default().push((
+                normalize_manifest_method(&endpoint.method),
+                endpoint.full_path.clone(),
+            ));
+        }
+        let mut shared: HashMap<String, String> = HashMap::new();
+        for ((file_path, line_number), rows) in &by_line {
+            if !rows.iter().any(|(_, path)| *path != rows[0].1) {
+                continue;
+            }
+            for (method, path) in rows {
+                let key = OperationKey::http(method, path.clone());
+                let site_id = build_site_id(file_path, *line_number, &key, repo_path);
+                for kind in [ManifestTypeKind::Response, ManifestTypeKind::Request] {
+                    shared.insert(
+                        build_manifest_type_alias_with_site_id(
+                            &key,
+                            ManifestRole::Producer,
+                            kind,
+                            Some(&site_id),
+                        ),
+                        path.clone(),
+                    );
+                }
+            }
+        }
+        crate::services::type_sidecar::mark_shared_route_lines(requests, &shared)
+    }
+
     /// Collect type requests from analysis results for sidecar processing.
     ///
     /// Returns two vectors:
@@ -5004,8 +5048,6 @@ impl FileOrchestrator {
         let mut explicit_seen: HashSet<String> = HashSet::new();
         let mut infer_requests: Vec<InferRequestItem> = Vec::new();
         let mut endpoint_lookup: EndpointLookup = HashMap::new();
-        // Each producer row on a line that serves several, by alias: its path.
-        let mut shared_route_rows: HashMap<String, String> = HashMap::new();
         let mut data_call_lookup: DataCallLookup = HashMap::new();
         let mut inline_aliases: Vec<(String, String)> = Vec::new();
         let should_infer_request_body = |method: &str| {
@@ -5283,16 +5325,6 @@ impl FileOrchestrator {
                     ManifestTypeKind::Request,
                     Some(&site_id),
                 );
-                // carrick#1029: a line that serves several operations (one
-                // registration made once per element of a list) tells the
-                // sidecar which operation each request is for.
-                if endpoint_lookup
-                    .get(&lookup_key)
-                    .is_some_and(|entries| entries.iter().any(|(_, other)| *other != path))
-                {
-                    shared_route_rows.insert(response_alias.clone(), path.clone());
-                    shared_route_rows.insert(request_alias.clone(), path.clone());
-                }
 
                 // no-payload endpoints have no recoverable response contract:
                 // skip the explicit-symbol bundling as well as inference below,
@@ -5813,10 +5845,7 @@ impl FileOrchestrator {
             }
         }
 
-        let shared = crate::services::type_sidecar::mark_shared_route_lines(
-            &mut infer_requests,
-            &shared_route_rows,
-        );
+        let shared = Self::mark_shared_route_lines(&mut infer_requests, mount_graph, repo_path);
         debug!(
             "[FileOrchestrator] Collected {} explicit type requests, {} inference requests ({} on a line shared by several routes), {} inline aliases",
             explicit_requests.len(),
@@ -10981,6 +11010,10 @@ impl FileOrchestrator {
         // A payload the fact layer places is read there, not at the model
         // reader's locator (`CARRICK_SITE_PAYLOADS=1`; empty otherwise).
         crate::site_payloads::take_over(&mut infer, payload_infer);
+        // A request the fact layer placed names its row's path as the
+        // reader's does (carrick#1029).
+        let shared = Self::mark_shared_route_lines(&mut infer, mount_graph, repo_path);
+        debug!("[FileOrchestrator] {shared} inference requests on a line shared by several routes");
 
         debug!(
             "[FileOrchestrator] Resolving types: {} explicit ({} from non-HTTP protocols), {} inferred ({} from non-HTTP protocols)",
