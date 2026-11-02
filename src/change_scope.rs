@@ -1638,26 +1638,28 @@ impl<'a> CopyJudge<'a> {
         // A dependency-only move counts only where the service loads a
         // moved package (carrick#3115). What it loads is read on this tree,
         // so a pull request that edits anything it reads, or a repository
-        // input, leaves the move unread.
+        // input, leaves the move unread. A move of no package (a `version`
+        // rewrite) reaches no service whatever it loads, so the pull
+        // request's own edits do not matter to it: [`decide`] carries a
+        // service across it, and this judge agrees (carrick#3176).
         let mut moved_dependencies = false;
         if changed
             .iter()
             .any(|change| is_repo_input(&change.path) && !is_gitignore(&change.path))
         {
-            let pr_edits_what_it_loads = match pr_changes {
+            let pr_edits_what_it_loads = || match pr_changes {
                 Ok(pr_changes) => pr_changes.iter().any(|change| {
                     is_repo_input(&change.path) || inputs.reads(change, &mut |_| false)
                 }),
                 Err(_) => true,
             };
-            let moved = (!pr_edits_what_it_loads)
-                .then(|| self.moved(&copy.commit_hash, base, &changed, top))
-                .flatten();
-            let reach = moved.map_or(DependencyReach::Unread, |moved| {
-                moved.reach(&inputs, |moved| {
+            let reach = match self.moved(&copy.commit_hash, base, &changed, top) {
+                Some(moved) if moved.moves_nothing() => DependencyReach::Nothing,
+                Some(moved) if !pr_edits_what_it_loads() => moved.reach(&inputs, |moved| {
                     loaded_packages(self.repo_path, top, service, &inputs, &self.reads, moved)
-                })
-            });
+                }),
+                _ => DependencyReach::Unread,
+            };
             if reach != DependencyReach::Nothing {
                 return Some(true);
             }
@@ -3925,5 +3927,45 @@ mod tests {
         let judge = CopyJudge::new(&repo_path, &services, &main_self);
         assert_eq!(judge.differs(&main_self[0], &b), Some(false));
         assert_eq!(judge.differs(&copy_at("worker", &a), &b), Some(true));
+    }
+
+    /// carrick#3176. Main's copy of `api` was carried at A across a root
+    /// `version` bump to B, which moves no package. A pull request that bumps
+    /// the version again edits a repository input, which leaves what `api`
+    /// loads unread on this tree, but a move of nothing reaches no service
+    /// whatever it loads: the copy is main's at B, as the carry said.
+    #[test]
+    fn a_copy_carried_across_a_version_bump_is_current_for_a_pr_that_bumps_it_again() {
+        let (repo, a, services) = versioned_workspace();
+        set_version(repo.path(), "package.json", "1.0.1");
+        let b = commit_all(repo.path(), "bump");
+        set_version(repo.path(), "package.json", "1.0.2");
+        let main_self = [
+            copy_at("api", &a),
+            copy_at("web", &b),
+            copy_at("worker", &b),
+        ];
+        let repo_path = repo.path().to_string_lossy();
+        let judge = CopyJudge::new(&repo_path, &services, &main_self);
+        assert_eq!(judge.differs(&main_self[0], &b), Some(false));
+    }
+
+    /// A move of a package, read under a pull request that edits a
+    /// repository input, stays unread: the copy is stale.
+    #[test]
+    fn a_copy_stored_before_a_dependency_move_is_stale_for_a_pr_that_edits_a_manifest() {
+        let (repo, a, services) = dependency_workspace(Manager::Npm);
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        write_dependencies(repo.path(), Manager::Npm, &bumped, &bumped);
+        let b = commit_all(repo.path(), "move");
+        set_version(repo.path(), "package.json", "9.9.9");
+        let main_self = [
+            copy_at("api", &a),
+            copy_at("web", &b),
+            copy_at("worker", &b),
+        ];
+        let repo_path = repo.path().to_string_lossy();
+        let judge = CopyJudge::new(&repo_path, &services, &main_self);
+        assert_eq!(judge.differs(&main_self[0], &b), Some(true));
     }
 }

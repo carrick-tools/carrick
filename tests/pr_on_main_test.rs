@@ -3757,3 +3757,92 @@ async fn a_risk_in_a_file_the_pr_changed_is_still_introduced() {
     unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
 }
+
+/// Set the root manifest's own `version` in the two-service repo.
+fn set_root_version(repo: &Path, version: &str) {
+    let manifest = serde_json::json!({
+        "name": "widgets-mono",
+        "private": true,
+        "version": version,
+    });
+    std::fs::write(
+        repo.join("package.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Main's index of the two-service repo with `inventory-svc` carried across
+/// a root `version` bump: main at A (the consumer sending `main_verb`) is
+/// scanned, main moves to B by the bump alone and is scanned again, and the
+/// consumer's copy is put back at A, as a scoped push that carries it leaves
+/// it. `catalog-web` sits at B. The run's base is B.
+async fn carried_across_a_version_bump(
+    main_verb: &str,
+) -> (tempfile::TempDir, PathBuf, Store, String) {
+    let (tmp, _, _) = setup();
+    let repo = two_service_repo(tmp.path());
+    let consumer = repo.join("inventory-svc");
+    set_root_version(&repo, "1.0.0");
+    set_consumer_verb(&consumer, main_verb, 1);
+    commit(&repo, "main: versioned");
+    let a = head(&repo);
+    let store = Store::default();
+    scan(&store, &repo).await;
+
+    set_root_version(&repo, "1.0.1");
+    commit(&repo, "main: release bump");
+    let b = head(&repo);
+    scan(&store, &repo).await;
+    {
+        let mut repos = store.repos.lock().unwrap();
+        let carried = repos
+            .iter_mut()
+            .find(|stored| stored.service_name.as_deref() == Some("inventory-svc"))
+            .expect("main has a copy of the consumer");
+        assert_eq!(carried.commit_hash, b);
+        carried.commit_hash = a;
+    }
+    event_with_base(tmp.path(), &b);
+    (tmp, repo, store, b)
+}
+
+/// carrick#3176. A PR that bumps the version again and breaks the consumer's
+/// call is compared with main's copy, which the carry left current: the break
+/// is the PR's.
+#[tokio::test]
+async fn a_break_a_version_bump_pr_introduces_past_a_carried_copy_is_introduced() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, repo, store, _) = carried_across_a_version_bump("GET").await;
+    set_root_version(&repo, "1.0.2");
+    set_consumer_verb(&repo.join("inventory-svc"), "PUT", 1);
+    commit(&repo, "pr: a release bump and the wrong verb");
+    let payload = pr_payload(&store, &repo).await;
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert_eq!(
+        payload["baseline"]["copy"],
+        serde_json::json!("current"),
+        "{payload:#}"
+    );
+    let finding = wrong_verb(&findings_of(&payload));
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}
+
+/// The same carried copy holds a break main already has: a PR that only
+/// bumps the version finds it on main.
+#[tokio::test]
+async fn a_break_on_main_past_a_carried_copy_is_on_main_for_a_version_bump_pr() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, repo, store, _) = carried_across_a_version_bump("PUT").await;
+    set_root_version(&repo, "1.0.2");
+    commit(&repo, "pr: a release bump and nothing else");
+    let payload = pr_payload(&store, &repo).await;
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert_eq!(
+        payload["baseline"]["copy"],
+        serde_json::json!("current"),
+        "{payload:#}"
+    );
+    let finding = wrong_verb(&findings_of(&payload));
+    assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+}
