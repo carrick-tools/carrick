@@ -352,3 +352,12 @@ test("an ignored skills directory is reported, and a tracked one is not", () => 
   // Outside a repository git declines to answer, and this says nothing.
   assert.deepEqual(ignoredSkillRoots(workspace()), []);
 });
+
+test("every find_similar call in the reuse skill names its mode: `functions` or `audit: true`", () => {
+  // The server refuses a find_similar call that names neither, so an audit
+  // written as a bare call stops working (carrick-cloud#2851).
+  const body = renderTaskSkill("carrick-reuse", { slug: "acme-index" });
+  const calls = body.match(/find_similar\([^\n]*/g) ?? [];
+  assert.ok(calls.length >= 2, `expected the targeted and audit calls, got ${calls.length}`);
+  for (const call of calls) assert.match(call, /functions:|audit: true/, call);
+});

@@ -48,7 +48,7 @@ floor and the basis in the answer you got.
 ## Audit: the whole project
 
 ```
-find_similar({{SCOPE}})
+find_similar({{SCOPE}}, audit: true)
 ```
 
 `clusters` groups functions that describe the same behaviour, ordered by size.
