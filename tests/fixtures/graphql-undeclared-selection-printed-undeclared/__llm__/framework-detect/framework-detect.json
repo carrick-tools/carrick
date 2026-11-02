@@ -1,0 +1,6 @@
+{
+  "frameworks": ["hono"],
+  "data_fetchers": ["graphql-yoga"],
+  "messaging_clients": [],
+  "notes": "Hono server; the GraphQL schema is built in code and served through graphql-yoga."
+}

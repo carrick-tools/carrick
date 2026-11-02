@@ -24,7 +24,13 @@
 //!   does not, so the operation is valid at runtime; a printed copy is never
 //!   read as the whole schema, and the pair is unverifiable.
 //!
-//! In all three, the `Depot` operation selects only declared fields, one of them
+//! - `graphql-undeclared-selection-printed-undeclared/`: the same server, with
+//!   the printed copy committed in a folder the service walks and no
+//!   `graphqlSchemas` entry. The scan finds the service builds its schema in
+//!   code, so the copy it serves is read as possibly stale all the same
+//!   (carrick#3200).
+//!
+//! In all four, the `Depot` operation selects only declared fields, one of them
 //! through a fragment the compiled document carries, and stays compatible.
 
 use std::path::{Path, PathBuf};
@@ -195,6 +201,34 @@ fn a_printed_code_first_schema_leaves_the_pair_unverifiable() {
         response["verdict"], "unverifiable",
         "the code that builds the schema may declare the field the printed copy \
          lacks; never incompatible: {response:#}"
+    );
+
+    assert_eq!(
+        verdict(&blobs, "graphql|query|depot")["verdict"],
+        "compatible"
+    );
+}
+
+#[test]
+fn a_printed_copy_in_a_walked_folder_of_a_code_first_server_leaves_the_pair_unverifiable() {
+    let blobs = scan(&fixture_dir(
+        "graphql-undeclared-selection-printed-undeclared",
+    ));
+
+    let parcel = call(&blobs, "parcel", "apps/web/src/pages/ParcelPage.tsx");
+    assert_eq!(
+        parcel["undeclared_selection"],
+        serde_json::json!({
+            "fields": [{ "on_type": "Parcel", "field": "etaDays" }],
+            "schema": "apps/api/src/schema.graphql",
+            "partial": "printed_from_code"
+        }),
+        "no setting names the file, but the service builds its schema in code: {parcel:#}"
+    );
+    let response = verdict(&blobs, "graphql|query|parcel");
+    assert_eq!(
+        response["verdict"], "unverifiable",
+        "a stale printed copy must not read as a break: {response:#}"
     );
 
     assert_eq!(

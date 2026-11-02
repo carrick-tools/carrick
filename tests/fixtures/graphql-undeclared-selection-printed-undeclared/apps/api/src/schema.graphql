@@ -1,0 +1,14 @@
+type Query {
+  parcel(id: ID!): Parcel
+  depot(code: String!): Depot
+}
+
+type Parcel {
+  id: ID!
+  weightGrams: Int
+}
+
+type Depot {
+  code: String!
+  city: String
+}

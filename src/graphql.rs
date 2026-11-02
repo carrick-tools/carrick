@@ -776,6 +776,9 @@ pub struct SchemaCatalogue {
     /// here even when a service later shows it does not serve them: more
     /// schemas only make a reading a doubt, never a break.
     served_schemas: Vec<(PathBuf, crate::graphql_selection::SchemaFile)>,
+    /// Repository-relative walk roots of every service that builds its
+    /// schema in code ([`Self::record_builds_schema_in_code`]).
+    code_first_roots: std::sync::Mutex<Vec<PathBuf>>,
     /// Type name -> whether a tracked source file of the repository states
     /// schema text that defines or extends it. Read on demand, only for the
     /// types a document selects an undeclared field on.
@@ -1106,6 +1109,7 @@ impl SchemaCatalogue {
             unserved: Default::default(),
             tally: Default::default(),
             served_schemas,
+            code_first_roots: Default::default(),
             source_schema_types: Default::default(),
             source_files: Default::default(),
         }
@@ -1195,6 +1199,49 @@ impl SchemaCatalogue {
                 partial,
             });
             marked += 1;
+        }
+        marked
+    }
+
+    /// A service builds its GraphQL schema in code: every schema file under
+    /// its walk `roots` may be a copy printed from that code, named in
+    /// `graphqlSchemas` or not (carrick#3200).
+    pub fn record_builds_schema_in_code(&self, roots: &[PathBuf]) {
+        let mut recorded = self.code_first_roots.lock().unwrap();
+        for root in roots {
+            let root = repo_relative(&self.repo_root, root);
+            if !recorded.contains(&root) {
+                recorded.push(root);
+            }
+        }
+    }
+
+    /// Once every service is settled, so the order they were scanned in does
+    /// not matter: a reading of a schema file under the walk of a service that
+    /// builds its schema in code, with no doubt yet, gets
+    /// `PartialSchema::PrintedFromCode`. Returns how many rows it marked.
+    pub fn mark_printed_from_code(
+        &self,
+        calls: &mut [crate::analyzer::ApiEndpointDetails],
+    ) -> usize {
+        use crate::graphql_selection::PartialSchema;
+        let roots = self.code_first_roots.lock().unwrap();
+        if roots.is_empty() {
+            return 0;
+        }
+        let mut marked = 0;
+        for call in calls {
+            let Some(selection) = call.undeclared_selection.as_mut() else {
+                continue;
+            };
+            if selection.partial.is_none()
+                && roots
+                    .iter()
+                    .any(|root| Path::new(&selection.schema).starts_with(root))
+            {
+                selection.partial = Some(PartialSchema::PrintedFromCode);
+                marked += 1;
+            }
         }
         marked
     }

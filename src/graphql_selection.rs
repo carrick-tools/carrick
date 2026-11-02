@@ -69,8 +69,9 @@ pub enum PartialSchema {
     /// compose several of them, or the operation may go to another one.
     SeveralSchemas,
     /// The schema file is one a service names in `graphqlSchemas`, the
-    /// setting for a schema printed from a code-first server (carrick#1099).
-    /// The server builds its schema from code, so a printed file can be stale
+    /// setting for a schema printed from a code-first server (carrick#1099),
+    /// or the reading service builds a schema in code, so any schema file it
+    /// serves may be a copy printed from that code (carrick#3200). The server builds its schema from code, so a printed file can be stale
     /// against it: a field the code still declares may be missing from the
     /// file.
     PrintedFromCode,
@@ -99,8 +100,9 @@ impl PartialSchema {
                  the whole schema this operation is sent to"
             }
             PartialSchema::PrintedFromCode => {
-                "the schema read is a printed copy of a schema built in code (it is named in \
-                 `graphqlSchemas`), and a printed copy can be older than the code"
+                "the schema read may be a printed copy of a schema built in code (the service \
+                 builds one, or names this file in `graphqlSchemas`), and a printed copy can be \
+                 older than the code"
             }
             PartialSchema::TypesDefinedElsewhere => {
                 "the schema read refers to types it does not define, so it is not the whole schema"

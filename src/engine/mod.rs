@@ -1862,6 +1862,22 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         }
     }
 
+    // A service that builds its GraphQL schema in code makes every schema
+    // file it serves a possible stale printed copy (carrick#3200). Read here,
+    // with every service settled, so the order they were scanned in does not
+    // matter; a service held back keeps the generation the index serves.
+    for run in &mut runs {
+        let marked = scan
+            .graphql_schemas
+            .mark_printed_from_code(&mut run.data.calls);
+        if marked > 0 {
+            debug!(
+                "GraphQL operations: {marked} undeclared selection(s) read against a schema \
+                 file a code-first service serves"
+            );
+        }
+    }
+
     // Whether this run leaves a service short of a complete index. A missing
     // function description alone does not: it never held an index back.
     let incomplete = runs.iter().any(|run| run.owed.thins_the_index());
@@ -5252,6 +5268,7 @@ async fn analyze_current_repo_incremental(
                 &mut mount_graph,
                 service,
                 graphql_schemas,
+                analysis.builds_graphql_schema_in_code,
             );
             let (library, claims) = library_rows(
                 library_ask.as_ref(),
@@ -7464,6 +7481,7 @@ fn settle_graphql_documents(
     mount_graph: &mut crate::mount_graph::MountGraph,
     service: &Config,
     catalogue: &crate::graphql::SchemaCatalogue,
+    builds_schema_in_code: bool,
 ) {
     fold_graphql_transport_calls(mount_graph, graphql);
     document_sites.apply(graphql);
@@ -7512,6 +7530,9 @@ fn settle_graphql_documents(
     catalogue.record(label, summary);
     // What a document bound to a served schema selects that the schema does
     // not declare: a type check cannot see it (crate::graphql_selection).
+    if builds_schema_in_code {
+        catalogue.record_builds_schema_in_code(&service_graphql_roots(repo_path, service));
+    }
     let undeclared = catalogue.read_undeclared_selections(graphql);
     if undeclared > 0 {
         debug!(
@@ -12831,6 +12852,7 @@ async fn analyze_current_repo(
         &mut analysis_result.mount_graph,
         service,
         graphql_schemas,
+        analysis_result.builds_graphql_schema_in_code,
     );
     let (library, claims) =
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
@@ -24737,6 +24759,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &mut mount_graph,
             &Config::default(),
             &catalogue,
+            false,
         );
 
         assert!(
