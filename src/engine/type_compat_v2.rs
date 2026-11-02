@@ -227,9 +227,7 @@ pub(crate) fn inferred_response_modes(
             continue;
         }
         let placed = match read_modes.reads.as_slice() {
-            [read] if read.location != crate::services::type_sidecar::MessageSource::Unplaced => {
-                Some(read)
-            }
+            [read] if read.location.is_placed() => Some(read),
             _ => None,
         };
         let mut cases = Vec::new();
@@ -1634,6 +1632,29 @@ fn mode_unstated_reason(field: &str, cases: &[crate::cloud_storage::ResponseMode
     )
 }
 
+/// The sentence a call reads when the route's response comes from a function
+/// other routes share, depends on an argument the route passes it, and the
+/// route's own value could not pick one body (carrick#2372).
+fn argument_unknown_reason(arguments: &[&str]) -> String {
+    let mut names: Vec<&str> = arguments.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    let (named, noun) = match names.as_slice() {
+        [one] => (format!("`{one}`"), "argument"),
+        _ => (
+            names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(" and "),
+            "arguments",
+        ),
+    };
+    format!(
+        "Not compared: this route's response depends on the {named} {noun} it passes to a function other routes share, and Carrick cannot tell which body it sends."
+    )
+}
+
 /// Pick the case of `modes` a call that states `stated` receives
 /// (carrick#2054).
 ///
@@ -1657,13 +1678,17 @@ fn select_mode<'a>(
         fields.dedup();
         fields
     };
+    let arguments: Vec<&str> = modes
+        .reads
+        .iter()
+        .filter(|read| read.location == crate::services::type_sidecar::MessageSource::Argument)
+        .map(|read| read.field.as_str())
+        .collect();
+    if !arguments.is_empty() {
+        return ModeSelection::Unstated(argument_unknown_reason(&arguments));
+    }
     let read = match modes.reads.as_slice() {
-        [read]
-            if read.location != crate::services::type_sidecar::MessageSource::Unplaced
-                && !modes.cases.is_empty() =>
-        {
-            read
-        }
+        [read] if read.location.is_placed() && !modes.cases.is_empty() => read,
         _ => return ModeSelection::Unstated(case_unknown_reason(&fields())),
     };
     let value = stated
@@ -6241,6 +6266,35 @@ mod tests {
             select_mode(Some(&two_fields), &query("a")),
             ModeSelection::Unstated(
                 "Not compared: this route returns a different response depending on `kind` and `mode` in the request, and Carrick cannot tell which one this call receives.".to_string()
+            )
+        );
+
+        // carrick#2372: an argument of a shared function decides the body,
+        // whatever the call states, and the reason says so.
+        let mut argument = modes.clone();
+        argument.reads = vec![MessageRead {
+            location: MessageSource::Argument,
+            field: "mode".to_string(),
+        }];
+        argument.cases.clear();
+        assert_eq!(
+            select_mode(Some(&argument), &query("a")),
+            ModeSelection::Unstated(
+                "Not compared: this route's response depends on the `mode` argument it passes to a function other routes share, and Carrick cannot tell which body it sends.".to_string()
+            )
+        );
+        argument.reads.push(MessageRead {
+            location: MessageSource::Argument,
+            field: "id".to_string(),
+        });
+        argument.reads.push(MessageRead {
+            location: MessageSource::Query,
+            field: "view".to_string(),
+        });
+        assert_eq!(
+            select_mode(Some(&argument), &none),
+            ModeSelection::Unstated(
+                "Not compared: this route's response depends on the `id` and `mode` arguments it passes to a function other routes share, and Carrick cannot tell which body it sends.".to_string()
             )
         );
 
