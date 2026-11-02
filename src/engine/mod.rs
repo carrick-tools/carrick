@@ -26135,7 +26135,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     &PathBuf::from("svc/src/events.ts:4"),
                     Some(crate::agents::file_analyzer_agent::ResolutionSource::LibraryClaim)
                 ),
-                (&PathBuf::from("svc/src/events.ts:9"), None),
+                (
+                    &PathBuf::from("svc/src/events.ts:9"),
+                    Some(crate::agents::file_analyzer_agent::ResolutionSource::EventBus)
+                ),
             ]
         );
     }
@@ -26897,18 +26900,34 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 row(
                     "socket|CLIENT->SERVER|chat",
                     "/repo/svc/src/live.ts:9",
-                    None
+                    Some(ResolutionSource::SocketCall)
                 ),
                 row(
                     "socket|CLIENT->SERVER|chat",
                     "/repo/svc/src/other.ts:4",
-                    None
+                    Some(ResolutionSource::SocketCall)
                 ),
                 row("socket|CLIENT->SERVER|chat", "svc/src/live.ts:4", fact),
-                row("socket|CLIENT->SERVER|chat-room", live4, None),
-                row("socket|SERVER->CLIENT|chat", live4, None),
-                row("socket|SERVER->CLIENT|typing", live5, None),
-                row("socket|UNKNOWN|typing", live5, None),
+                row(
+                    "socket|CLIENT->SERVER|chat-room",
+                    live4,
+                    Some(ResolutionSource::SocketCall)
+                ),
+                row(
+                    "socket|SERVER->CLIENT|chat",
+                    live4,
+                    Some(ResolutionSource::SocketCall)
+                ),
+                row(
+                    "socket|SERVER->CLIENT|typing",
+                    live5,
+                    Some(ResolutionSource::SocketCall)
+                ),
+                row(
+                    "socket|UNKNOWN|typing",
+                    live5,
+                    Some(ResolutionSource::SocketCall)
+                ),
             ],
             "the listeners at the library listener's site in its direction or none fold; \
              every other listener stands, those at the library emitter's site included"
@@ -26916,9 +26935,17 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             rows(&cloud_data.calls),
             vec![
-                row("socket|CLIENT->SERVER|chat", live4, None),
+                row(
+                    "socket|CLIENT->SERVER|chat",
+                    live4,
+                    Some(ResolutionSource::SocketCall)
+                ),
                 row("socket|SERVER->CLIENT|typing", "svc/src/live.ts:5", fact),
-                row("socket|UNKNOWN|chat", live4, None),
+                row(
+                    "socket|UNKNOWN|chat",
+                    live4,
+                    Some(ResolutionSource::SocketCall)
+                ),
             ],
             "the emitters at the library emitter's site fold; those at a listener's site stand"
         );

@@ -254,6 +254,8 @@ fn row(key: &str, at: &str, source: Option<ResolutionSource>, claims: &[&str]) -
 }
 
 const FACT: Option<ResolutionSource> = Some(ResolutionSource::LibraryClaim);
+const SOCKET_CALL: Option<ResolutionSource> = Some(ResolutionSource::SocketCall);
+const EVENT_BUS: Option<ResolutionSource> = Some(ResolutionSource::EventBus);
 const MAKE: &str = "@fixture/live@1:Socket:make:new:()";
 const EMIT: &str = "@fixture/live@1:Socket:op:send:emit:on:instance";
 const ON: &str = "@fixture/live@1:Socket:op:receive:on:on:instance";
@@ -279,7 +281,12 @@ fn rows_with_claims() -> (Vec<Row>, Vec<Row>) {
                 FACT,
                 &[MAKE, ON],
             ),
-            row("socket|UNKNOWN|presence", "src/presence.ts:5", None, &[]),
+            row(
+                "socket|UNKNOWN|presence",
+                "src/presence.ts:5",
+                SOCKET_CALL,
+                &[],
+            ),
         ],
         vec![
             row("pubsub|orders.created", "src/orders.ts:4", FACT, &[PUBLISH]),
@@ -305,13 +312,18 @@ fn rows_with_claims() -> (Vec<Row>, Vec<Row>) {
 fn rows_without_claims() -> (Vec<Row>, Vec<Row>) {
     (
         vec![
-            row("pubsub|orders.created", "src/emails.ts:3", None, &[]),
-            row("socket|UNKNOWN|chat", "src/live.ts:5", None, &[]),
-            row("socket|UNKNOWN|presence", "src/presence.ts:5", None, &[]),
+            row("pubsub|orders.created", "src/emails.ts:3", EVENT_BUS, &[]),
+            row("socket|UNKNOWN|chat", "src/live.ts:5", SOCKET_CALL, &[]),
+            row(
+                "socket|UNKNOWN|presence",
+                "src/presence.ts:5",
+                SOCKET_CALL,
+                &[],
+            ),
         ],
         vec![
-            row("socket|UNKNOWN|join", "src/live.ts:14", None, &[]),
-            row("socket|UNKNOWN|typing", "src/live.ts:10", None, &[]),
+            row("socket|UNKNOWN|join", "src/live.ts:14", SOCKET_CALL, &[]),
+            row("socket|UNKNOWN|typing", "src/live.ts:10", SOCKET_CALL, &[]),
         ],
     )
 }
