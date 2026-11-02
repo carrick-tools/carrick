@@ -1457,6 +1457,21 @@ impl LibraryClaim {
         claim
     }
 
+    /// The claim without the picker that chose it: two exports' claims that
+    /// read a call the same way are equal whichever picker stated them
+    /// (carrick#3185).
+    pub fn without_picker(&self) -> LibraryClaim {
+        let mut claim = self.clone();
+        match &mut claim {
+            LibraryClaim::Make { picker, .. }
+            | LibraryClaim::Scope { picker, .. }
+            | LibraryClaim::Op { picker, .. }
+            | LibraryClaim::Result { picker, .. }
+            | LibraryClaim::Reserved { picker, .. } => *picker = None,
+        }
+        claim
+    }
+
     /// The `result` check for a make or op claim that carries a result: the
     /// same member, path, and receivers, asked on its own. `None` for a claim
     /// with no result and for any other kind.

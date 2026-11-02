@@ -217,6 +217,12 @@ impl ScopeLabel {
             .map(|(receiver, _)| receiver.as_str())
     }
 
+    /// Whether `other` opens the same scope at a call: the same member, the
+    /// prefix in the same slot, and the same binding (carrick#3185).
+    fn binds_as(&self, other: &ScopeLabel) -> bool {
+        self.member == other.member && self.name == other.name && self.binds == other.binds
+    }
+
     /// Whether the member returns the scoped instance and was verified on
     /// the receiver `receiver` of `package`'s `export`: a call of it on an
     /// instance read through `receiver` returns the object an op claimed on
@@ -1043,12 +1049,39 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             self.push(at, scope);
             return true;
         }
+        // An instance of an export no label names (the app `default` makes,
+        // where the store labels the scope on the named export of the same
+        // factory) opens the scope whose verdict names the member
+        // declaration the call resolves to (carrick#3185): the labels of its
+        // package verified there, where every one binds the same way.
+        let declared = self.declaration_of(host);
+        let by_declaration: Vec<Option<usize>> = parents
+            .iter()
+            .map(|end| {
+                if labels.iter().any(|label| label.applies_to(end)) {
+                    return None;
+                }
+                let (package, _, _) = identity(end)?;
+                let declared = declared.as_ref()?;
+                let matched: Vec<usize> = (0..labels.len())
+                    .filter(|&at| {
+                        labels[at].package == package
+                            && labels[at].verified_at(declared).next().is_some()
+                    })
+                    .collect();
+                let (&first, rest) = matched.split_first()?;
+                rest.iter()
+                    .all(|&other| labels[other].binds_as(labels[first]))
+                    .then_some(first)
+            })
+            .collect();
         let mut opened = false;
-        for label in labels {
+        for (index, label) in labels.into_iter().enumerate() {
             let applies: Vec<InstanceEnd> = parents
                 .iter()
-                .filter(|end| label.applies_to(end))
-                .cloned()
+                .zip(&by_declaration)
+                .filter(|(end, declared)| label.applies_to(end) || **declared == Some(index))
+                .map(|(end, _)| end.clone())
                 .collect();
             let Some((package, export, receiver)) = applies.first().and_then(identity) else {
                 continue;

@@ -1151,7 +1151,7 @@ struct Walker<'a> {
     /// The definitions being read, by how deep.
     reading: HashMap<(PathBuf, String), usize>,
     /// Calls whose member declaration stands for more than one op
-    /// (carrick#2474 R1): no site.
+    /// (carrick#2474 R1, [`Self::one_op`]): no site.
     ambiguous: std::cell::Cell<usize>,
     /// How many own factories' returns the value being read is inside.
     returns_depth: usize,
@@ -1278,7 +1278,7 @@ impl<'a> Walker<'a> {
     /// - with the receiver trace on, a member whose declaration a verified
     ///   op claim resolves to, whatever holds the receiver
     ///   ([`MemberDeclarations`]). A declaration that stands for more than
-    ///   one op is no site, and is counted.
+    ///   one op ([`Self::one_op`]) is no site, and is counted.
     fn library_end(
         &self,
         file: &Path,
@@ -1425,24 +1425,63 @@ impl<'a> Walker<'a> {
         // op claim resolves to (carrick#2474 R1).
         let declarations = self.labels.declarations.filter(|_| !construction)?;
         let ops = declarations.at(row.decl_file()?, row.decl_line()?);
-        match ops {
-            [] => None,
-            [one] => {
-                let claims = self.labels.get(&one.package, &one.export)?;
-                Some((
-                    SiteEnd {
-                        op: Some(one.op),
-                        scope: one.scope.clone(),
-                        ..end(&one.package, &one.export, Some(&one.member), claims)
-                    },
-                    ReachedBy::Declaration,
-                ))
-            }
-            _ => {
-                self.ambiguous.set(self.ambiguous.get() + 1);
-                None
-            }
+        if ops.is_empty() {
+            return None;
         }
+        let Some(one) = self.one_op(ops) else {
+            self.ambiguous.set(self.ambiguous.get() + 1);
+            return None;
+        };
+        let claims = self.labels.get(&one.package, &one.export)?;
+        Some((
+            SiteEnd {
+                op: Some(one.op),
+                scope: one.scope.clone(),
+                ..end(&one.package, &one.export, Some(&one.member), claims)
+            },
+            ReachedBy::Declaration,
+        ))
+    }
+
+    /// The one op the ops a member declaration stands for are (carrick#3185):
+    /// the only one, or the first of several that differ only in the export
+    /// whose claims they are, where each of those exports claims the member
+    /// the same way (the store labels a package's factory under every name
+    /// it is published as, `default` and a named export, and both name the
+    /// member's declaration). An op on what a scope member returns is one
+    /// only alone: its export also picks the scope label it is read under.
+    /// `None` where they disagree.
+    fn one_op<'d>(&self, ops: &'d [DeclaredOp]) -> Option<&'d DeclaredOp> {
+        let (first, rest) = ops.split_first()?;
+        if rest.is_empty() {
+            return Some(first);
+        }
+        let claimed = |op: &DeclaredOp| -> Option<Vec<LibraryClaim>> {
+            let claims = self.labels.get(&op.package, &op.export)?;
+            Some(
+                claims
+                    .claims
+                    .iter()
+                    .filter(|claim| {
+                        matches!(claim, LibraryClaim::Op { member: Some(member), .. } if *member == op.member)
+                    })
+                    .map(LibraryClaim::without_picker)
+                    .collect(),
+            )
+        };
+        let same = |a: &[LibraryClaim], b: &[LibraryClaim]| {
+            a.iter().all(|claim| b.contains(claim)) && b.iter().all(|claim| a.contains(claim))
+        };
+        let reading = claimed(first)?;
+        let agree = first.scope.is_none()
+            && rest.iter().all(|op| {
+                op.package == first.package
+                    && op.member == first.member
+                    && op.op == first.op
+                    && op.scope.is_none()
+                    && claimed(op).is_some_and(|other| same(&reading, &other))
+            });
+        agree.then_some(first)
     }
 
     /// Whether the callee is a value the repository declares: the call row
@@ -4601,6 +4640,41 @@ export function listen(): void {
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         Some(composed_lines(&decided, true))
+    }
+
+    /// carrick#3185: a package publishes its factory as the module, as a
+    /// named export and as `default`, and the store labels the same route
+    /// ops under both names but the `register` scope under the named one
+    /// alone. The app is made through `default`. A route registered on a
+    /// plugin's own app (a parameter, written in place or handed by name,
+    /// and one plugin down) resolves to a member declaration both exports'
+    /// ops name the same way: it is one op, so a site; and the `register`
+    /// call on the `default` app resolves to the declaration the named
+    /// export's scope was verified at, so it opens that scope. Every route
+    /// takes its full path, the nested one the version its caller states.
+    #[test]
+    fn routes_on_a_plugin_app_of_a_factory_published_under_two_names_take_their_paths() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-scopes-aliased")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        assert_eq!(discovery.counts.get("declaration_ambiguous"), None);
+        let got = composed_lines(&decided, false);
+        assert_eq!(
+            got,
+            texts(&[
+                "src/catalog.ts:11 <- /api/products",
+                "src/catalog.ts:14 <- /api/v2/orders",
+                "src/index.ts:12 <- /internal/status",
+                "src/index.ts:7 <- /health",
+            ]),
+            "{got:#?}"
+        );
     }
 
     /// carrick#2474 R2b on carrick#2325's tree (`d565a091`, its instances
