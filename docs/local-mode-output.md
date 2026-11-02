@@ -29,7 +29,7 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 | `carrick status [--json]` | local index, credential identity, and Carrick Cloud when a job is recorded | nothing | < 300 ms, plus one network read for each job recorded, in turn |
 | `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
-| `carrick check <file> --recheck` | the same, plus this repo's working tree and the blobs already on disk | nothing outside a temp directory it deletes | 10 s budget |
+| `carrick check <file> --recheck` | the same, plus the file's service in this repo's working tree and the blobs already on disk | `.carrick/working/` and `.carrick/judged/` (replaced by the next index) and a temp directory it deletes | 10 s budget |
 | `carrick refresh [--service <name>]` | local source and authenticated hosted indexes | `<dir>/.carrick/` | seconds |
 
 `status` answers about the workspace and takes no file; it is what a surface
@@ -48,21 +48,31 @@ is missing. The refusal body is printed either way, so a reader parsing the
 JSON is unaffected by the code.
 
 `carrick check --recheck` is the one read that recomputes (carrick#1036). When
-the file has changed since the index, it re-scans **that file's repo only** —
-deterministic extraction and the sidecar's type capture, no model, nothing on
-the wire — and re-runs the join over the blobs already in `.carrick/repos`
-plus the cached hosted snapshot, so the verdicts it prints are about the
-working tree rather than the tree the index was built on. It writes nothing:
-`.carrick/index.json` is untouched and the temporary generation is deleted on
-every path. The whole re-check has a budget (10 s, `CARRICK_RECHECK_BUDGET_MS`);
-past it the answer is the indexed one, and the `recheck` block below says so.
+the file has changed since the index, it re-scans **the file's own service**
+and the services that hold an operation reading a type declared in that file
+(`recheck.scope.reread`) — deterministic extraction and the sidecar's type
+capture, no model, nothing on the wire — and re-runs the join over the blobs
+already in `.carrick/repos` plus the cached hosted snapshot, so the verdicts it
+prints are about the working tree rather than the tree the index was built on.
+Every other service is judged at its newest known version: the copy the last
+re-check of it left in `.carrick/working/<index generation>/`, when its edits
+since the index are exactly the ones that copy was read for, else the index's
+own (named in `recheck.scope.stale`). It never writes `.carrick/index.json` or
+`.carrick/repos`; the temporary generation is deleted on every path. The type
+checker's finished answers are kept per index in
+`.carrick/judged/<index generation>/`, written by `index` and `refresh` and
+read by every re-check, so an edit that moves no type skips the checker's
+dependency install. A new index replaces both folders. The whole re-check has a
+budget (10 s, `CARRICK_RECHECK_BUDGET_MS`); past it the answer is the indexed
+one, and the `recheck` block below says so.
 A re-check that missed its budget is remembered in
-`.carrick/recheck-misses.json`, per repo and against the index it ran on (its
-`indexed_at`). Until `refresh` or `index` writes a new index, a later
-`--recheck` of a file in that repo starts no re-scan: it answers at once with
+`.carrick/recheck-misses.json`, per service and against the index it ran on
+(its `indexed_at`). Until `refresh` or `index` writes a new index, a later
+`--recheck` of a file in that service starts no re-scan: it answers at once with
 the indexed verdicts and the new functions from the parse, and its block
-carries `known_miss: true`. On such a repo `carrick check --changed` is the
-fresh read. A repo where the re-check fits never misses and is never recorded.
+carries `known_miss: true`. Another service of the same repo is still
+re-checked. On such a service `carrick check --changed` is the fresh read. A
+service where the re-check fits never misses and is never recorded.
 `carrick check --each <file>... --recheck --json` answers several files in one
 process, each element of the printed JSON array the body `check <file>
 --recheck --json` prints for that file alone; the post-edit hook asks it for a
@@ -218,7 +228,8 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `stale_since` | string (RFC 3339) | when the items above were computed. Present only on a `none` — otherwise the answer is now |
 | `reason` | string | why the re-check did not run, in one sentence. Present only on a `none` |
 | `new_functions` | array \| absent | functions this file declares in the working tree that the index does not hold under that name, `{ "name": string, "line": int }`, in line order, at most 20. Named from a parse of the file that does not wait on the re-scan, so it is present on a `none` that missed its budget too. Absent when the edit added no function, and when the index could not be read |
-| `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this repo already missed its budget against this index. Absent otherwise |
+| `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this file's service already missed its budget against this index. Absent otherwise |
+| `scope` | object \| absent | which services this re-check read: `reread` (the file's service first, then every service holding an operation that reads a type declared in the file), `not_reread` (`{ service, operations, reason }` for each other service, saying whose copy its verdicts used), and `stale` (the `not_reread` services edited since the index with no copy of the last re-check to stand in, so judged against their indexed version). Absent on a `none` that decided no scope |
 
 `new_functions` is a NAME comparison against everything the index holds for that
 file — the blobs the last local scan wrote AND the hosted record of the same

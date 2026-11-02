@@ -66,6 +66,8 @@ pub enum Reason {
     ExtendsUnfollowed,
     RepoInputChanged,
     InputsChanged,
+    /// A per-edit re-check named this service ([`RECHECK_SERVICES_ENV`]).
+    RecheckScope,
 }
 
 impl Reason {
@@ -81,6 +83,7 @@ impl Reason {
             Reason::ExtendsUnfollowed => "extends_unfollowed",
             Reason::RepoInputChanged => "repo_input_changed",
             Reason::InputsChanged => "inputs_changed",
+            Reason::RecheckScope => "recheck_scope",
         }
     }
 }
@@ -1318,6 +1321,23 @@ pub fn packages_moved_services(
         .collect()
 }
 
+/// The services a per-edit re-check re-reads, as a JSON list of service ids
+/// (`service_name`, or the repo's directory name for an unnamed one).
+///
+/// Only the per-edit re-check (`local_mode::recheck`) sets it. When it is set,
+/// [`plan`] analyses exactly the listed services and carries every other one
+/// from its stored generation, without computing what it reads. When it is
+/// unset the rule is the change-scope rule above, unchanged: `check --changed`
+/// and the CI runner never set it. Documented in `docs/local-mode-output.md`
+/// ("`recheck`").
+pub const RECHECK_SERVICES_ENV: &str = "CARRICK_RECHECK_SERVICES";
+
+/// The ids [`RECHECK_SERVICES_ENV`] names, or `None` when it is unset or not a
+/// JSON list of strings.
+fn recheck_services() -> Option<BTreeSet<String>> {
+    serde_json::from_str(&std::env::var(RECHECK_SERVICES_ENV).ok()?).ok()
+}
+
 /// Each service's scope, index for index with `services`, logged one line
 /// per service with a summary and the closure walk's wall time. `changes`
 /// lists what changed since each stored commit.
@@ -1328,11 +1348,41 @@ pub fn plan<'a>(
     stored: impl Fn(&Config) -> Option<&'a CloudRepoData>,
     this_run: ThisRun<'_>,
 ) -> Vec<Scope> {
+    plan_in(
+        repo_path,
+        services,
+        changes,
+        stored,
+        this_run,
+        recheck_services().as_ref(),
+    )
+}
+
+/// [`plan`], with the re-check's service list passed rather than read from the
+/// environment.
+fn plan_in<'a>(
+    repo_path: &str,
+    services: &[Config],
+    changes: &ChangedSince,
+    stored: impl Fn(&Config) -> Option<&'a CloudRepoData>,
+    this_run: ThisRun<'_>,
+    rechecking: Option<&BTreeSet<String>>,
+) -> Vec<Scope> {
     let mut walks = Walks::new(repo_path, changes);
+    let repo_label = Path::new(repo_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo_path.to_string());
     let scopes: Vec<Scope> = services
         .iter()
         .map(|service| {
-            let scope = walks.scope(service, Against::Stored(stored(service), this_run));
+            let scope = match rechecking {
+                Some(listed) => {
+                    let id = service.service_name.as_deref().unwrap_or(&repo_label);
+                    recheck_scope(listed.contains(id), stored(service))
+                }
+                None => walks.scope(service, Against::Stored(stored(service), this_run)),
+            };
             let label = service.service_name.as_deref().unwrap_or("(root)");
             match &scope {
                 Scope::Carried { commit } => info!(
@@ -1371,6 +1421,20 @@ pub fn plan<'a>(
         walks.walked
     );
     scopes
+}
+
+/// A service's scope under a per-edit re-check: analysed when the re-check
+/// named it, else carried at the commit its stored generation was written at.
+/// What the service reads is never computed: the re-check carries the newest
+/// known copy of every service it was not asked about.
+fn recheck_scope(listed: bool, stored: Option<&CloudRepoData>) -> Scope {
+    match (listed, stored) {
+        (true, _) => Scope::analysed(Reason::RecheckScope, "the re-check re-reads this service"),
+        (false, Some(stored)) => Scope::Carried {
+            commit: stored.commit_hash.clone(),
+        },
+        (false, None) => Scope::analysed(Reason::NoStored, "no stored index for this service"),
+    }
 }
 
 /// Whether the `carrick.json` an untracked-config run found names the
@@ -2950,6 +3014,55 @@ mod tests {
 
     fn write_config(repo: &Path) {
         std::fs::write(repo.join("carrick.json"), "{ \"services\": [] }").unwrap();
+    }
+
+    /// A per-edit re-check analyses the services it names and carries every
+    /// other one, even one that imports the edited file; unset, the rule is the
+    /// change-scope rule (carrick#3198).
+    #[test]
+    fn a_re_check_carries_every_service_it_did_not_name() {
+        let (repo, a, services) = workspace();
+        let blobs = stored_at(&services, &a);
+        std::fs::write(
+            repo.path().join("apps/api/src/types.ts"),
+            "export interface Order { id: number }\n",
+        )
+        .unwrap();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let scopes_with = |listed: Option<&BTreeSet<String>>| {
+            plan_in(
+                &repo_path,
+                &services,
+                &ChangedSince::new(&repo_path, &services, &names_of(&services)),
+                |service| {
+                    blobs
+                        .iter()
+                        .find(|blob| blob.service_name == service.service_name)
+                },
+                this_scanner(),
+                listed,
+            )
+        };
+
+        // Unset: `web` imports the edited file, so it is analysed with `api`.
+        assert_eq!(
+            carried(&scopes_with(None)),
+            [false, false, true],
+            "the change-scope rule is unchanged"
+        );
+
+        let only_api: BTreeSet<String> = ["api".to_string()].into();
+        let scopes = scopes_with(Some(&only_api));
+        assert_eq!(
+            carried(&scopes),
+            [false, true, true],
+            "web imports the edited file and is still carried: {scopes:?}"
+        );
+        assert_eq!(reason(&scopes[0]), Some(Reason::RecheckScope));
+
+        // A listed service with no stored generation is analysed, as ever.
+        let none_stored = recheck_scope(false, None);
+        assert_eq!(reason(&none_stored), Some(Reason::NoStored));
     }
 
     #[test]
