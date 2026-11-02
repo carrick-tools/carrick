@@ -1,0 +1,141 @@
+/**
+ * carrick#1029: a route registered once per element of a constant list is
+ * typed for the element its row's path names, not as the union of every
+ * element's payload.
+ *
+ * The fixture registers routes in a `for … of` over a tuple list written in
+ * place (one line), in a `.forEach` over a `const` list (several lines), and in
+ * a loop over a list a function returns, which the code does not state. The
+ * scanner sends the row's own path (`route_path`); the inferrer types the one
+ * handler with the list rewritten to the named element.
+ */
+
+import { describe, it, before, after } from 'node:test';
+import * as assert from 'node:assert';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { Project } from 'ts-morph';
+import { TypeInferrer } from '../src/type-inferrer.js';
+import { endsWithPath } from '../src/loop-element.js';
+import type { InferRequestItem } from '../src/types.js';
+
+const ROUTES = `interface Alpha {
+  alphaId: number;
+}
+interface Beta {
+  betaName: string;
+}
+interface App {
+  get(path: string, handler: () => Promise<unknown>): void;
+}
+declare const app: App;
+declare function rows(): { alpha: Alpha[]; beta: Beta[] };
+declare function listKinds(): Array<'alpha' | 'beta'>;
+
+for (const [path, key] of [['alpha-rows', 'alpha'], ['beta-rows', 'beta']] as const) app.get(\`/items/\${path}\`, async () => ({ items: rows()[key], total: 1 }));
+
+const KINDS = [
+  'alpha',
+  'beta',
+] as const;
+KINDS.forEach((kind) => {
+  app.get(\`/kinds/\${kind}\`, async () => ({ items: rows()[kind] }));
+});
+
+for (const kind of listKinds()) {
+  app.get(\`/listed/\${kind}\`, async () => ({ items: rows()[kind] }));
+}
+`;
+
+function lineOf(text: string, needle: string): number {
+  const index = text.indexOf(needle);
+  assert.ok(index >= 0, `fixture holds ${needle}`);
+  return text.slice(0, index).split('\n').length;
+}
+
+/** The type text with whitespace collapsed. */
+function collapse(text: string | undefined): string | undefined {
+  return text?.replace(/\s+/g, ' ');
+}
+
+describe('carrick#1029: a loop-registered route is typed for its own element', () => {
+  let repoDir: string;
+  let routesPath: string;
+
+  before(() => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loop-element-'));
+    fs.writeFileSync(
+      path.join(repoDir, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { strict: true, target: 'es2022', module: 'esnext', types: [] }, include: ['*.ts'] })
+    );
+    routesPath = path.join(repoDir, 'routes.ts');
+    fs.writeFileSync(routesPath, ROUTES);
+  });
+
+  after(() => {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  const read = (requests: InferRequestItem[]) => {
+    const project = new Project({ tsConfigFilePath: path.join(repoDir, 'tsconfig.json') });
+    const inferrer = new TypeInferrer({ project, repoRoot: repoDir });
+    const res = inferrer.infer(requests);
+    const text = project.getSourceFileOrThrow(routesPath).getFullText();
+    return {
+      text,
+      byAlias: new Map((res.inferred_types ?? []).map((t) => [t.alias, collapse(t.type_string)])),
+    };
+  };
+  const route = (alias: string, needle: string, routePath?: string): InferRequestItem => ({
+    file_path: routesPath,
+    line_number: lineOf(ROUTES, needle),
+    infer_kind: 'response_body',
+    alias,
+    ...(routePath ? { route_path: routePath } : {}),
+  });
+
+  it('types each element of a tuple list written in place, under a mount prefix', () => {
+    const { byAlias, text } = read([
+      route('alpha', 'app.get(`/items/', '/api/v1/items/alpha-rows'),
+      route('beta', 'app.get(`/items/', '/api/v1/items/beta-rows'),
+    ]);
+    assert.strictEqual(byAlias.get('alpha'), '{ items: { alphaId: number; }[]; total: number; }');
+    assert.strictEqual(byAlias.get('beta'), '{ items: { betaName: string; }[]; total: number; }');
+    // The file the scan loaded is the file left behind.
+    assert.strictEqual(text, ROUTES);
+  });
+
+  it('types each element of a const list a forEach registers over several lines', () => {
+    const { byAlias } = read([route('beta', 'app.get(`/kinds/', '/kinds/beta')]);
+    assert.strictEqual(byAlias.get('beta'), '{ items: { betaName: string; }[]; }');
+  });
+
+  it('keeps the union where the row states no path, or names no element', () => {
+    const { byAlias } = read([
+      route('unsent', 'app.get(`/items/'),
+      route('template', 'app.get(`/items/', '/items/:path'),
+      route('elsewhere', 'app.get(`/items/', '/other/alpha-rows'),
+    ]);
+    for (const alias of ['unsent', 'template', 'elsewhere']) {
+      assert.strictEqual(
+        byAlias.get(alias),
+        '{ items: { alphaId: number; }[] | { betaName: string; }[]; total: number; }',
+        alias
+      );
+    }
+  });
+
+  it('keeps the union for a list the code does not state', () => {
+    const { byAlias } = read([route('listed', 'app.get(`/listed/', '/listed/alpha')]);
+    assert.strictEqual(byAlias.get('listed'), '{ items: { alphaId: number; }[] | { betaName: string; }[]; }');
+  });
+
+  it('matches a path by its last segments, a parameter matching a parameter of any name', () => {
+    assert.ok(endsWithPath('/api/v1/projects/{name}/seo/a', '/projects/:name/seo/a'));
+    assert.ok(endsWithPath('/x/a', '/x/a'));
+    assert.ok(!endsWithPath('/x/a', '/x/b'));
+    assert.ok(!endsWithPath('/a', '/x/a'));
+    assert.ok(!endsWithPath('/x/:id', '/x/a'));
+  });
+});

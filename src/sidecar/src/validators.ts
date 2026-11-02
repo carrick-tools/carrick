@@ -128,6 +128,8 @@ export const InferRequestItemSchema = z.object({
   member: z.string().optional(),
   // The library store's label for the call's result (carrick#2818).
   result: ResultLabelSchema.optional(),
+  // The route row's own path, sent where its line serves several (carrick#1029).
+  route_path: z.string().min(1).optional(),
 });
 
 /**

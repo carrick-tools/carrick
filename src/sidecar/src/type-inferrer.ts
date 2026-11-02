@@ -79,6 +79,7 @@ import type { LabelledMembers } from './library-claims.js';
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
+import { loopElementPick, type LoopPick } from './loop-element.js';
 import {
   classifyStatusCodes,
   constituents,
@@ -870,12 +871,18 @@ export class TypeInferrer {
         // while the program the prints were made in is still the project's.
         // The unwidened re-read below records nothing: it prints the same
         // node, and its reading has a budget.
-        const prints = new PrintedTypes();
-        const result = prints.during(() => this.inferSingle(request, extractionConfig));
+        const pick = this.loopPickFor(request);
+        const result = pick
+          ? this.inferForLoopElement(request, pick, extractionConfig)
+          : this.inferRecordingNames(request, extractionConfig);
         if (result) {
           printedLength = result.type_string.length;
-          this.recordPrintedNames(result, request, prints);
           inferredTypes.push(result);
+          // A reading typed for one loop element is not re-read unwidened: the
+          // re-read rewrites the original file, where the element is not fixed.
+          if (pick) {
+            continue;
+          }
           if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
             responses.push({ request, result });
           } else if (request.infer_kind === 'request_body') {
@@ -1058,6 +1065,65 @@ export class TypeInferrer {
    * carrick#1836: list on `result` the declarations behind the names its text
    * prints that the request's file cannot resolve (`PrintedTypes.namesIn`).
    */
+  /** `inferSingle`, with what the names it prints meant (carrick#1836). */
+  private inferRecordingNames(
+    request: InferRequestItem,
+    extractionConfig: ExtractionConfig | undefined
+  ): InferredType | null {
+    const prints = new PrintedTypes();
+    const result = prints.during(() => this.inferSingle(request, extractionConfig));
+    if (result) this.recordPrintedNames(result, request, prints);
+    return result;
+  }
+
+  /**
+   * carrick#1029: the loop element a route row's path names, when its
+   * registration is made once per element of a constant list
+   * (`loop-element.ts`). Only a route row that states its path is read.
+   */
+  private loopPickFor(request: InferRequestItem): LoopPick | undefined {
+    if (!request.route_path) return undefined;
+    if (request.infer_kind !== 'response_body' && request.infer_kind !== 'request_body') return undefined;
+    const sourceFile = this.getSourceFile(request.file_path);
+    if (!sourceFile) return undefined;
+    const atLine = this.registrationAtLine(sourceFile, request.line_number);
+    return atLine ? loopElementPick(atLine.registration, request.route_path) : undefined;
+  }
+
+  /**
+   * The request inferred with the loop's list rewritten to the one element
+   * `pick` names, so the compiler types the handler for that element. The
+   * file is restored before returning, and the names the reading prints are
+   * recorded while the rewritten program is still the project's. Lines do not
+   * move (the rewrite is padded); a span after the list moves by the length
+   * the rewrite changed.
+   */
+  private inferForLoopElement(
+    request: InferRequestItem,
+    pick: LoopPick,
+    extractionConfig: ExtractionConfig | undefined
+  ): InferredType | null {
+    const original = pick.file.getFullText();
+    const delta = pick.text.length - (pick.end - pick.start);
+    const moved = (at: number | undefined) => (at !== undefined && at >= pick.end ? at + delta : at);
+    const mapped: InferRequestItem = {
+      ...request,
+      span_start: moved(request.span_start),
+      span_end: moved(request.span_end),
+    };
+    replaceFileText(pick.file, original.slice(0, pick.start) + pick.text + original.slice(pick.end));
+    try {
+      const result = this.inferRecordingNames(mapped, extractionConfig);
+      this.log(
+        `Typed ${request.file_path}:${request.line_number} (${request.infer_kind}) for loop element ` +
+          `${pick.index + 1} of ${pick.of}: ${request.route_path}`
+      );
+      return result;
+    } finally {
+      replaceFileText(pick.file, original);
+    }
+  }
+
   private recordPrintedNames(
     result: InferredType,
     request: InferRequestItem,

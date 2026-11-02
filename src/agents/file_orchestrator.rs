@@ -5004,6 +5004,8 @@ impl FileOrchestrator {
         let mut explicit_seen: HashSet<String> = HashSet::new();
         let mut infer_requests: Vec<InferRequestItem> = Vec::new();
         let mut endpoint_lookup: EndpointLookup = HashMap::new();
+        // Each producer row on a line that serves several, by alias: its path.
+        let mut shared_route_rows: HashMap<String, String> = HashMap::new();
         let mut data_call_lookup: DataCallLookup = HashMap::new();
         let mut inline_aliases: Vec<(String, String)> = Vec::new();
         let should_infer_request_body = |method: &str| {
@@ -5278,6 +5280,16 @@ impl FileOrchestrator {
                     ManifestTypeKind::Request,
                     Some(&site_id),
                 );
+                // carrick#1029: a line that serves several operations (one
+                // registration made once per element of a list) tells the
+                // sidecar which operation each request is for.
+                if endpoint_lookup
+                    .get(&lookup_key)
+                    .is_some_and(|entries| entries.iter().any(|(_, other)| *other != path))
+                {
+                    shared_route_rows.insert(response_alias.clone(), path.clone());
+                    shared_route_rows.insert(request_alias.clone(), path.clone());
+                }
 
                 // no-payload endpoints have no recoverable response contract:
                 // skip the explicit-symbol bundling as well as inference below,
@@ -5798,10 +5810,15 @@ impl FileOrchestrator {
             }
         }
 
+        let shared = crate::services::type_sidecar::mark_shared_route_lines(
+            &mut infer_requests,
+            &shared_route_rows,
+        );
         debug!(
-            "[FileOrchestrator] Collected {} explicit type requests, {} inference requests, {} inline aliases",
+            "[FileOrchestrator] Collected {} explicit type requests, {} inference requests ({} on a line shared by several routes), {} inline aliases",
             explicit_requests.len(),
             infer_requests.len(),
+            shared,
             inline_aliases.len()
         );
 
