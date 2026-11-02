@@ -508,13 +508,13 @@ pub fn resolve_call_edges(
 }
 
 /// The edges the compiler's `call` rows state where resolution by name
-/// stated none: a member call on a `const` receiver a call initialised
-/// (`const client = make(id); client.list()`), whatever declares what that
-/// call returns (carrick#2615). The type of `make` may be an inline function
-/// type, an alias, an inferred return or a parameter's declared type; the
-/// row's declaration names the member the compiler resolved, joined to the
-/// definition that opens at its file and line ([`crate::request_summary`]'s
-/// `RowCalls`).
+/// stated none: every member-shaped call site (`obj.m()`, `this.m()`,
+/// `this.f.m()`, `make().m()`, `a.b.m()`) whatever declares the receiver's
+/// type: a `const` a call initialised, a destructured or union-typed binding,
+/// a property chain (carrick#2615, carrick#813). The row's declaration names
+/// the member the compiler resolved, joined to the definition that opens at
+/// its file and line ([`crate::request_summary`]'s `RowCalls`). A bare call
+/// (`foo()`) is not asked: the resolver owns it.
 ///
 /// `row_target` is what the rows say the call spanning `lo..hi` in a file
 /// reaches; it is only consulted where [`CallSiteTargets`] holds nothing for
@@ -539,12 +539,10 @@ pub fn add_row_edges(
         for caller_key in callers {
             let mut edges: Vec<FunctionCallRef> = Vec::new();
             for callee in &index.callees[caller_key] {
-                let compiler_only = match callee.shape {
-                    CalleeShape::Member(_) => callee.receiver.call_bound,
-                    CalleeShape::CallResult => true,
-                    _ => false,
-                };
-                if !compiler_only
+                // Every member-shaped call the resolver left without a target
+                // asks the compiler; a bare call stays with the resolver.
+                let compiler_asked = !matches!(callee.shape, CalleeShape::Bare);
+                if !compiler_asked
                     || callee.span.is_dummy()
                     || sites
                         .target_at(&index.path, callee.span.lo.0, callee.span.hi.0)
@@ -1088,6 +1086,9 @@ impl<'a> CallResolver<'a> {
             CalleeShape::Member(_) => self.resolve_member(index, callee),
             // What the inner call returns is the compiler's to say.
             CalleeShape::CallResult => None,
+            // A member chain needs the value of its inner member, which the
+            // file does not state; only the compiler's row can.
+            CalleeShape::Chain => None,
         }
     }
 
