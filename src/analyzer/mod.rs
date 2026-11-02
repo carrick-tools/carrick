@@ -318,6 +318,18 @@ pub struct ApiEndpointDetails {
     /// (cloud#946). Wire path: `calls[].schema_binding`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_binding: Option<crate::graphql::SchemaBinding>,
+    /// On a GraphQL CALL entry bound to a served schema: the fields its
+    /// operation selects under this row's field that the schema does not
+    /// declare, the schema file, and why that file may not be the whole schema
+    /// served, when it may not ([`crate::graphql_selection`]). A server rejects
+    /// such an operation whatever either side's types say, so the pair's
+    /// response verdict reads it ([`Analyzer::set_pair_outcomes`]).
+    ///
+    /// `None` on every other entry and whenever every selected field is
+    /// declared, which is nearly every row. Wire path:
+    /// `calls[].undeclared_selection`, omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undeclared_selection: Option<crate::graphql_selection::UndeclaredSelection>,
     /// Where the handler function sits in `file_path`'s file, 1-based and
     /// inclusive (cloud#948). Carried from the mount-graph row an HTTP endpoint
     /// is projected from; `None` on calls, on non-HTTP operations, on a handler
@@ -558,6 +570,92 @@ type ConsumerRowKey = (crate::operation::Protocol, String, String, String, u32);
 struct ConsumerRow<'a> {
     source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
     name_scope: Option<&'a carrick_match::NameScope>,
+}
+
+/// Read each GraphQL consumer row's undeclared selection
+/// ([`ApiEndpointDetails::undeclared_selection`]) onto its response pair.
+///
+/// A server validates an operation against its schema before it runs it, so
+/// a selected field the schema does not declare fails the whole operation
+/// whatever the type check read: a resolver's record can still hold the
+/// field (carrick#1875), and a generated client type marks it optional, so
+/// the check reads such a pair compatible.
+///
+/// - When the scan holds the whole schema served, the pair is incompatible,
+///   stated as a fact (`resolved`), with the fields as its diagnostic.
+/// - When it may not, the reading is a doubt: a compatible pair becomes
+///   unverifiable with the doubt as its reason. An incompatible or
+///   unverifiable pair keeps the check's own answer.
+///
+/// A same-service pair is left as the check left it (carrick#2053). An
+/// outcome this changes is never settled from a stored copy
+/// (`judged: false`): the selection is read from the rows on every run.
+fn read_undeclared_selections(calls: &[ApiEndpointDetails], outcomes: &mut [PairCheckOutcome]) {
+    use crate::operation::Protocol;
+    use crate::services::type_sidecar::VerdictBucket;
+    let rows: HashMap<ConsumerRowKey, &crate::graphql_selection::UndeclaredSelection> = calls
+        .iter()
+        .filter_map(|call| {
+            let selection = call.undeclared_selection.as_ref()?;
+            if call.key.protocol() != Protocol::Graphql {
+                return None;
+            }
+            let service = call.service_id()?;
+            let (_, identity) = parse_producer_key(&call.key.canonical())?;
+            let (file, line) = consumer_identity(&call.file_path.display().to_string());
+            Some((
+                (
+                    Protocol::Graphql,
+                    service.to_string(),
+                    normalize_compat_path(&identity),
+                    file,
+                    line,
+                ),
+                selection,
+            ))
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    for outcome in outcomes.iter_mut() {
+        if outcome.type_kind != crate::cloud_storage::ManifestTypeKind::Response
+            || exact_key_protocol(&outcome.pseudo_method) != Some(Protocol::Graphql)
+            || outcome.producer_service == outcome.consumer_service
+        {
+            continue;
+        }
+        let key: ConsumerRowKey = (
+            Protocol::Graphql,
+            outcome.consumer_service.clone(),
+            normalize_compat_path(&outcome.identity),
+            outcome.consumer_file.clone(),
+            outcome.consumer_line.max(1),
+        );
+        let Some(selection) = rows.get(&key) else {
+            continue;
+        };
+        match selection.partial {
+            None => {
+                outcome.bucket = VerdictBucket::Incompatible;
+                outcome.resolved = true;
+                outcome.unresolved_reason = None;
+                outcome.diagnostic = Some(selection.break_sentence());
+            }
+            Some(partial) if outcome.bucket == VerdictBucket::Compatible => {
+                outcome.bucket = VerdictBucket::Unverifiable;
+                outcome.resolved = false;
+                outcome.unresolved_reason = Some(selection.doubt_sentence(partial));
+                outcome.diagnostic = None;
+            }
+            Some(_) => continue,
+        }
+        outcome.gate = None;
+        outcome.notes.clear();
+        outcome.consumer_reads.clear();
+        outcome.left_to_consumer = false;
+        outcome.judged = false;
+    }
 }
 
 /// Reconstruct a verified endpoint's DISPLAY `(method_or_label, path_or_name)`
@@ -1852,7 +1950,8 @@ impl Analyzer {
             .collect()
     }
 
-    pub fn set_pair_outcomes(&mut self, outcomes: Vec<PairCheckOutcome>) {
+    pub fn set_pair_outcomes(&mut self, mut outcomes: Vec<PairCheckOutcome>) {
+        read_undeclared_selections(&self.calls, &mut outcomes);
         self.pair_outcomes = Some(outcomes);
     }
 
@@ -4803,6 +4902,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -5449,6 +5549,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -5473,6 +5574,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -5497,6 +5599,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -5522,6 +5625,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -5602,6 +5706,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 schema_binding: None,
+                undeclared_selection: None,
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
@@ -5676,6 +5781,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 schema_binding: None,
+                undeclared_selection: None,
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
@@ -5729,6 +5835,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -5824,6 +5931,7 @@ mod tests {
                 resolution_source: consumer_source,
                 dispatch: None,
                 schema_binding: None,
+                undeclared_selection: None,
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
@@ -5983,6 +6091,7 @@ mod tests {
             resolution_source,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -6576,6 +6685,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::ImportedMember),
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -6733,6 +6843,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: value.map(case),
                 schema_binding: None,
+                undeclared_selection: None,
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
@@ -6821,6 +6932,7 @@ mod tests {
             resolution_source: None,
             dispatch: sends.map(case),
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -6950,6 +7062,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -7016,6 +7129,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -7082,6 +7196,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -8658,6 +8773,127 @@ mod tests {
             "a GraphQL edge with an explicit compatible verdict reads Some(true)"
         );
         assert!(matches[0].mismatch_reason.is_none());
+    }
+
+    /// A GraphQL consumer row that selects a field its served schema does not
+    /// declare decides its response pair (crate::graphql_selection): a break
+    /// when the scan holds the whole schema, a doubt that keeps the pair from
+    /// reading compatible when it may not. The check's own incompatible
+    /// answer stands beside a doubt, and a request pair and a same-service pair
+    /// are left as the check left them.
+    #[test]
+    fn an_undeclared_selection_decides_the_graphql_response_pair() {
+        use crate::graphql_selection::{PartialSchema, UndeclaredField, UndeclaredSelection};
+        use crate::operation::GraphqlOperationKind;
+        let row = |field: &str, line: u32, partial: Option<PartialSchema>| ApiEndpointDetails {
+            service_name: Some("consumer-svc".to_string()),
+            undeclared_selection: Some(UndeclaredSelection {
+                fields: vec![UndeclaredField {
+                    on_type: "Order".to_string(),
+                    field: "etaDays".to_string(),
+                }],
+                schema: "api/schema.graphql".to_string(),
+                partial,
+            }),
+            ..graphql_details(
+                OperationKey::graphql(GraphqlOperationKind::Query, field),
+                &format!("web/src/{field}.tsx:{line}"),
+            )
+        };
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer.calls = vec![
+            row("order", 7, None),
+            row("invoice", 3, Some(PartialSchema::SchemaTextInSource)),
+            row("refund", 4, Some(PartialSchema::SeveralSchemas)),
+            row("note", 5, None),
+            row("ledger", 6, None),
+        ];
+        let mut same_service = outcome(
+            "GRAPHQL",
+            "query|note",
+            "web/src/note.tsx:5",
+            VerdictBucket::Compatible,
+            None,
+        );
+        same_service.producer_service = "consumer-svc".to_string();
+        let mut request = outcome(
+            "GRAPHQL",
+            "query|ledger",
+            "web/src/ledger.tsx:6",
+            VerdictBucket::Compatible,
+            None,
+        );
+        request.type_kind = crate::cloud_storage::ManifestTypeKind::Request;
+        analyzer.set_pair_outcomes(vec![
+            outcome(
+                "GRAPHQL",
+                "query|order",
+                "web/src/order.tsx:7",
+                VerdictBucket::Compatible,
+                None,
+            ),
+            outcome(
+                "GRAPHQL",
+                "query|invoice",
+                "web/src/invoice.tsx:3",
+                VerdictBucket::Compatible,
+                None,
+            ),
+            outcome(
+                "GRAPHQL",
+                "query|refund",
+                "web/src/refund.tsx:4",
+                VerdictBucket::Incompatible,
+                Some("Type 'string' is not assignable to type 'number'."),
+            ),
+            same_service,
+            request,
+        ]);
+        let outcomes = analyzer.pair_outcomes();
+
+        let broken = &outcomes[0];
+        assert_eq!(broken.bucket, VerdictBucket::Incompatible);
+        assert!(broken.resolved && broken.unresolved_reason.is_none());
+        assert_eq!(
+            broken.diagnostic.as_deref(),
+            Some(
+                "The operation selects `Order.etaDays`, which the schema `api/schema.graphql` \
+                 does not declare; a GraphQL server rejects the whole operation."
+            )
+        );
+        assert!(!broken.judged, "read from the rows again on every run");
+
+        let doubted = &outcomes[1];
+        assert_eq!(doubted.bucket, VerdictBucket::Unverifiable);
+        assert!(!doubted.resolved);
+        assert!(
+            doubted
+                .unresolved_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("`Order.etaDays`")
+                    && reason.contains("builds its schema")),
+            "{:?}",
+            doubted.unresolved_reason
+        );
+
+        let checked = &outcomes[2];
+        assert_eq!(checked.bucket, VerdictBucket::Incompatible);
+        assert_eq!(
+            checked.diagnostic.as_deref(),
+            Some("Type 'string' is not assignable to type 'number'.")
+        );
+        assert!(checked.judged);
+
+        assert_eq!(
+            outcomes[3].bucket,
+            VerdictBucket::Compatible,
+            "same service"
+        );
+        assert_eq!(
+            outcomes[4].bucket,
+            VerdictBucket::Compatible,
+            "request half"
+        );
     }
 
     /// The socket cross-repo join. A `socket|DIRECTION|event` edge joins its

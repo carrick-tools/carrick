@@ -140,6 +140,13 @@ pub struct GraphqlOp {
     /// (`calls[].schema_binding`). `None` for producers and before
     /// attribution runs.
     pub schema_binding: Option<SchemaBinding>,
+    /// CONSUMER-only: the fields this row's operation selects under its field
+    /// that the schema it is sent to does not declare, set by
+    /// [`SchemaCatalogue::read_undeclared_selections`] on a row bound to a
+    /// served schema and carried onto the call row
+    /// (`calls[].undeclared_selection`). `None` when every selected field is
+    /// declared, and for producers.
+    pub undeclared_selection: Option<crate::graphql_selection::UndeclaredSelection>,
     /// PRODUCER-only: the root field's argument list as the SDL declares it
     /// (carrick#1158), the request half of the operation's contract. `None`
     /// for a field with no arguments and for every consumer.
@@ -763,6 +770,19 @@ pub struct SchemaCatalogue {
     /// Service -> what its walk read that it does not serve, for the report.
     unserved: std::sync::Mutex<BTreeMap<String, BTreeMap<PathBuf, usize>>>,
     tally: std::sync::Mutex<BTreeMap<String, AttributionSummary>>,
+    /// Every served file that states a schema (repository-relative), with
+    /// its types, for reading what a document selects against it
+    /// ([`Self::read_undeclared_selections`]). Walked files count as served
+    /// here even when a service later shows it does not serve them: more
+    /// schemas only make a reading a doubt, never a break.
+    served_schemas: Vec<(PathBuf, crate::graphql_selection::SchemaFile)>,
+    /// Type name -> whether a tracked source file of the repository states
+    /// schema text that defines or extends it. Read on demand, only for the
+    /// types a document selects an undeclared field on.
+    source_schema_types: std::sync::Mutex<HashMap<String, bool>>,
+    /// The repository's tracked source files, listed on first demand. `None`
+    /// when they could not be listed.
+    source_files: std::sync::OnceLock<Option<Vec<PathBuf>>>,
 }
 
 /// What a document's file says about where it is sent: its environment reads
@@ -816,6 +836,118 @@ impl Visit for EnvReads {
         }
         node.visit_children_with(self);
     }
+}
+
+/// The object and interface type names that schema text written in
+/// `file_path`'s source defines or extends: every template literal, tagged or
+/// not, and every string literal whose text parses as a schema (the parse
+/// decides, not a tag or a function name). Empty for a file that does not
+/// parse or is not a script.
+///
+/// Read only by [`SchemaCatalogue::read_undeclared_selections`], for the few
+/// files whose text names a type a document selects an undeclared field on.
+pub fn file_schema_text_types(file_path: &Path) -> BTreeSet<String> {
+    let is_script = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(crate::file_finder::is_source_extension);
+    if !is_script {
+        return BTreeSet::new();
+    }
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let Some(module) = parse_file(file_path, &cm, &handler) else {
+            return BTreeSet::new();
+        };
+        let mut texts = SchemaTexts::default();
+        module.visit_with(&mut texts);
+        texts.names
+    })
+}
+
+/// Collects the names [`file_schema_text_types`] returns.
+#[derive(Default)]
+struct SchemaTexts {
+    names: BTreeSet<String>,
+}
+
+impl Visit for SchemaTexts {
+    fn visit_tpl(&mut self, node: &swc_ecma_ast::Tpl) {
+        // Interpolations are dropped: an interpolated fragment of schema text
+        // leaves the rest parseable.
+        let text = node
+            .quasis
+            .iter()
+            .map(|quasi| {
+                quasi
+                    .cooked
+                    .as_ref()
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| quasi.raw.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.names
+            .extend(crate::graphql_selection::schema_text_types(&text));
+        node.visit_children_with(self);
+    }
+
+    fn visit_str(&mut self, node: &swc_ecma_ast::Str) {
+        self.names
+            .extend(crate::graphql_selection::schema_text_types(
+                &node.value.to_string_lossy(),
+            ));
+    }
+}
+
+/// The repository's tracked script sources outside dependency and test
+/// folders, repository-relative, for [`SchemaCatalogue::read_undeclared_selections`].
+/// When git cannot answer (the tree is not a repository) every such file on
+/// disk counts instead; `None` when neither can be listed.
+fn tracked_source_files(repo_root: &Path) -> Option<Vec<PathBuf>> {
+    let patterns: Vec<String> = crate::file_finder::SOURCE_EXTENSIONS
+        .iter()
+        .map(|extension| format!("*.{extension}"))
+        .collect();
+    let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    let listed: Vec<PathBuf> = match crate::git_state::tracked_paths(repo_root, &patterns) {
+        Ok(paths) => paths.into_iter().map(PathBuf::from).collect(),
+        Err(_) => {
+            if !repo_root.is_dir() {
+                return None;
+            }
+            WalkDir::new(repo_root)
+                .sort_by_file_name()
+                .into_iter()
+                .filter_entry(|e| {
+                    e.depth() == 0
+                        || !e
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name == ".git" || name == "node_modules")
+                            && crate::file_finder::git_boundary(e).is_none()
+                })
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.file_type().is_file()
+                        && crate::file_finder::has_source_extension(entry.path())
+                })
+                .map(|entry| repo_relative(repo_root, entry.path()))
+                .collect()
+        }
+    };
+    Some(
+        listed
+            .into_iter()
+            .filter(|file| {
+                !file.components().any(|c| c.as_os_str() == "node_modules")
+                    && !file.to_string_lossy().ends_with(".d.ts")
+                    && crate::file_finder::is_scanned_source(file, Path::new(""))
+            })
+            .collect(),
+    )
 }
 
 /// The schema identity one document was attributed to.
@@ -930,11 +1062,17 @@ impl SchemaCatalogue {
             .into_iter()
             .filter(|file| !crate::file_finder::is_under_test_dir(file, Path::new("")))
             .collect();
+        let mut served_schemas = Vec::new();
         let schemas: Vec<KnownSchema> = served
             .iter()
             .chain(tracked.difference(&served))
             .filter_map(|file| {
                 let content = std::fs::read_to_string(repo_root.join(file)).ok()?;
+                if served.contains(file)
+                    && let Some(schema) = crate::graphql_selection::SchemaFile::parse(&content)
+                {
+                    served_schemas.push((file.clone(), schema));
+                }
                 let root_keys: HashSet<String> = extract_from_document_text(&content, file, 1)
                     .producers
                     .iter()
@@ -976,7 +1114,138 @@ impl SchemaCatalogue {
             walked_verdicts: Default::default(),
             unserved: Default::default(),
             tally: Default::default(),
+            served_schemas,
+            source_schema_types: Default::default(),
+            source_files: Default::default(),
         }
+    }
+
+    /// For each consumer row bound to a served schema, read the fields its
+    /// operation selects under its field that the schema does not declare,
+    /// and why that schema may not be the whole one served
+    /// ([`crate::graphql_selection`]). Returns how many rows it marked.
+    ///
+    /// The reading is a break only when the scan holds the whole schema the
+    /// operation is sent to: the repository serves exactly one schema file,
+    /// the file defines every type it names or extends and every directive it
+    /// applies, the reading service states no schema of its own elsewhere, and
+    /// no tracked source file states schema text for a type the reading
+    /// involves, as a server that adds to the file when it builds its schema
+    /// at runtime does. Anything else is a doubt carried beside the fields.
+    pub fn read_undeclared_selections(&self, extraction: &mut GraphqlExtraction) -> usize {
+        use crate::graphql_selection::{PartialSchema, UndeclaredSelection};
+        if self.served_schemas.is_empty() {
+            return 0;
+        }
+        let relative = |path: &Path| {
+            let stripped = path
+                .strip_prefix(&self.canonical_root)
+                .unwrap_or(path)
+                .to_path_buf();
+            repo_relative(&self.repo_root, &stripped)
+        };
+        let own_sources: BTreeSet<PathBuf> = extraction
+            .producers
+            .iter()
+            .map(|op| relative(&op.file_path))
+            .collect();
+        let mut marked = 0;
+        for op in &mut extraction.consumers {
+            op.undeclared_selection = None;
+            if op.schema_binding != Some(SchemaBinding::Served) {
+                continue;
+            }
+            let (OperationKey::Graphql { kind, field }, Some(operation)) =
+                (&op.key, op.operation.as_ref())
+            else {
+                continue;
+            };
+            let serving: Vec<&(PathBuf, crate::graphql_selection::SchemaFile)> = self
+                .served_schemas
+                .iter()
+                .filter(|(_, schema)| schema.root_field_type(*kind, field).is_some())
+                .collect();
+            // A field undeclared in one serving schema and declared in another
+            // is not read as undeclared.
+            let mut undeclared: Option<BTreeSet<crate::graphql_selection::UndeclaredField>> = None;
+            for (_, schema) in &serving {
+                let mut fields = BTreeSet::new();
+                for selection in operation.selections_of(field) {
+                    fields.extend(schema.undeclared(*kind, field, selection));
+                }
+                undeclared = Some(match undeclared {
+                    None => fields,
+                    Some(previous) => previous.intersection(&fields).cloned().collect(),
+                });
+            }
+            let Some(fields) = undeclared.filter(|fields| !fields.is_empty()) else {
+                continue;
+            };
+            let (schema_file, schema) = serving[0];
+            let partial = if self.served_schemas.len() > 1
+                || own_sources.iter().any(|source| source != schema_file)
+            {
+                Some(PartialSchema::SeveralSchemas)
+            } else if let Some(doubt) = schema.own_doubt() {
+                Some(doubt)
+            } else {
+                let mut names: BTreeSet<String> =
+                    fields.iter().map(|f| f.on_type.clone()).collect();
+                names.extend(schema.root_type(*kind).map(str::to_string));
+                self.source_schema_text_for(&names)
+            };
+            op.undeclared_selection = Some(UndeclaredSelection {
+                fields: fields.into_iter().collect(),
+                schema: schema_file.to_string_lossy().into_owned(),
+                partial,
+            });
+            marked += 1;
+        }
+        marked
+    }
+
+    /// Whether a tracked source file of the repository states schema text
+    /// that defines or extends any of `names`: `SchemaTextInSource` when one
+    /// does, `SourcesUnread` when the sources could not be listed, `None`
+    /// otherwise. Each file is read only if its text names one of the types
+    /// not read before, and the answer is kept per type.
+    fn source_schema_text_for(
+        &self,
+        names: &BTreeSet<String>,
+    ) -> Option<crate::graphql_selection::PartialSchema> {
+        use crate::graphql_selection::PartialSchema;
+        let Some(files) = self
+            .source_files
+            .get_or_init(|| tracked_source_files(&self.repo_root))
+        else {
+            return Some(PartialSchema::SourcesUnread);
+        };
+        let mut known = self
+            .source_schema_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let unread: Vec<&String> = names.iter().filter(|n| !known.contains_key(*n)).collect();
+        if !unread.is_empty() {
+            let mut found: HashSet<&String> = HashSet::new();
+            for file in files {
+                let path = self.repo_root.join(file);
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if !unread.iter().any(|name| text.contains(name.as_str())) {
+                    continue;
+                }
+                let stated = file_schema_text_types(&path);
+                found.extend(unread.iter().filter(|name| stated.contains(name.as_str())));
+            }
+            for name in unread {
+                known.insert(name.clone(), found.contains(name));
+            }
+        }
+        names
+            .iter()
+            .any(|name| known.get(name).copied().unwrap_or(false))
+            .then_some(PartialSchema::SchemaTextInSource)
     }
 
     /// Decide whether the schema files `service`'s own walk read are schemas it
@@ -1387,6 +1656,7 @@ pub fn extract_from_document_text(
                     operation: None,
                     located_field_type: None,
                     schema_binding: None,
+                    undeclared_selection: None,
                     arguments: sdl_arguments(field),
                 });
             }
@@ -1403,6 +1673,7 @@ pub fn extract_from_document_text(
     if let Ok(document) = graphql_parser::parse_query::<String>(text) {
         use graphql_parser::query::Definition;
 
+        let fragments = crate::graphql_selection::fragments_of(&document);
         for definition in &document.definitions {
             let Definition::Operation(operation) = definition else {
                 continue; // standalone fragments carry no operation identity
@@ -1411,7 +1682,8 @@ pub fn extract_from_document_text(
             // spreads can't be resolved without the fragment source (often
             // interpolated) and introspection fields are no operation, so
             // neither is a root field here — skip, never guess.
-            let (operation, roots) = crate::graphql_document_sites::parsed_operation(operation);
+            let (operation, roots) =
+                crate::graphql_document_sites::parsed_operation(operation, &fragments);
             for field in roots {
                 extraction.consumers.push(GraphqlOp {
                     // alias-aware: match on the real field name, not the alias
@@ -1447,6 +1719,8 @@ pub fn extract_from_document_text(
                     // Read once a locate has joined (carrick#1760).
                     located_field_type: None,
                     schema_binding: None,
+                    // Read once attribution binds the row to a served schema.
+                    undeclared_selection: None,
                     arguments: None,
                 });
             }

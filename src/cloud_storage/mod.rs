@@ -1385,6 +1385,7 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
         // it, nine operations behind one route are one row on the wire.
         dispatch: endpoint.dispatch.clone(),
         schema_binding: None,
+        undeclared_selection: None,
         handler_span: endpoint.handler_span,
         name_scope: None,
         library_semantics: Vec::new(),
@@ -1416,6 +1417,7 @@ pub fn call_details(call: &crate::mount_graph::DataFetchingCall) -> ApiEndpointD
         // on (carrick#831): the consumer half of the same identity.
         dispatch: call.dispatch.clone(),
         schema_binding: None,
+        undeclared_selection: None,
         // A call has no handler.
         handler_span: None,
         name_scope: None,
@@ -2235,6 +2237,7 @@ mod tests {
                 view_module: false,
                 dispatch: None,
                 schema_binding: None,
+                undeclared_selection: None,
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),

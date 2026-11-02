@@ -1,0 +1,12 @@
+{
+  "services": [
+    {
+      "serviceName": "parcel-api",
+      "directory": "apps/api"
+    },
+    {
+      "serviceName": "parcel-web",
+      "directory": "apps/web"
+    }
+  ]
+}

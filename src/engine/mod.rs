@@ -7510,6 +7510,15 @@ fn settle_graphql_documents(
         );
     }
     catalogue.record(label, summary);
+    // What a document bound to a served schema selects that the schema does
+    // not declare: a type check cannot see it (crate::graphql_selection).
+    let undeclared = catalogue.read_undeclared_selections(graphql);
+    if undeclared > 0 {
+        debug!(
+            "GraphQL operations in {label}: {undeclared} row(s) select a field their served \
+             schema does not declare"
+        );
+    }
 }
 
 /// What a GraphQL document file's environment reads say about where it sends
@@ -7674,6 +7683,7 @@ fn append_deterministic_protocol_operations(
         // switches on a request field to reach them.
         dispatch: None,
         schema_binding: None,
+        undeclared_selection: None,
         // The handler span is placed from an HTTP route's registration
         // (cloud#948); these rows have none.
         handler_span: None,
@@ -7720,6 +7730,7 @@ fn append_deterministic_protocol_operations(
             .calls
             .extend(graphql.consumers.iter().map(|op| ApiEndpointDetails {
                 schema_binding: op.schema_binding,
+                undeclared_selection: op.undeclared_selection.clone(),
                 resolution_source: Some(
                     crate::agents::file_analyzer_agent::ResolutionSource::GraphqlDocument,
                 ),
@@ -15999,6 +16010,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -16439,6 +16451,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -16602,6 +16615,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -24491,6 +24505,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             operation: None,
             located_field_type: None,
             schema_binding: None,
+            undeclared_selection: None,
             arguments: None,
         }
     }
@@ -24520,6 +24535,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             operation: None,
             located_field_type: None,
             schema_binding: None,
+            undeclared_selection: None,
             arguments: None,
         }
     }
@@ -24766,6 +24782,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             operation: None,
             located_field_type: None,
             schema_binding: None,
+            undeclared_selection: None,
             arguments: None,
         }
     }
@@ -29080,6 +29097,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
@@ -29858,6 +29876,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 resolution_source: None,
                 dispatch: None,
                 schema_binding: None,
+                undeclared_selection: None,
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
