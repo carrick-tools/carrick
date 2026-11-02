@@ -66,13 +66,17 @@ fn line_of(needle: &str) -> i32 {
     ROUTES_TS[..at].lines().count() as i32 + 1
 }
 
-fn endpoint(path: &str, needle: &str) -> EndpointResult {
+/// A model row at `needle`'s line, its response located as the expression
+/// the handler returns there (the shape a model states for such a route).
+fn endpoint(path: &str, needle: &str, returned: &str) -> EndpointResult {
+    let line = line_of(needle);
+    assert_eq!(line_of(returned), line, "{returned} is on the route's line");
     EndpointResult {
         handler_declaration_line: None,
         registration_literal: None,
         view_module: false,
         candidate_id: format!("loop:{path}"),
-        line_number: line_of(needle),
+        line_number: line,
         owner_node: "app".to_string(),
         method: "GET".to_string(),
         path: path.to_string(),
@@ -82,8 +86,8 @@ fn endpoint(path: &str, needle: &str) -> EndpointResult {
         call_expression_span_end: None,
         payload_expression_text: None,
         payload_expression_line: None,
-        response_expression_text: None,
-        response_expression_line: None,
+        response_expression_text: Some(returned.to_string()),
+        response_expression_line: Some(line),
         emission_style: None,
         primary_type_symbol: None,
         type_import_source: None,
@@ -96,11 +100,27 @@ fn endpoint(path: &str, needle: &str) -> EndpointResult {
 fn response_requests(repo: &Path) -> HashMap<String, InferRequestItem> {
     let routes_file = repo.join("src/routes.ts").to_string_lossy().to_string();
     let endpoints = vec![
-        endpoint("/items/alpha-rows", "for (const [path"),
-        endpoint("/items/beta-rows", "for (const [path"),
-        endpoint("/listed/alpha", "app.get(`/listed/"),
-        endpoint("/listed/beta", "app.get(`/listed/"),
-        endpoint("/health", "app.get('/health'"),
+        endpoint(
+            "/items/alpha-rows",
+            "for (const [path",
+            "{ items: rows()[key] }",
+        ),
+        endpoint(
+            "/items/beta-rows",
+            "for (const [path",
+            "{ items: rows()[key] }",
+        ),
+        endpoint(
+            "/listed/alpha",
+            "app.get(`/listed/",
+            "{ items: rows()[kind] }",
+        ),
+        endpoint(
+            "/listed/beta",
+            "app.get(`/listed/",
+            "{ items: rows()[kind] }",
+        ),
+        endpoint("/health", "app.get('/health'", "{ ok: true }"),
     ];
     let mut file_results = HashMap::new();
     file_results.insert(
