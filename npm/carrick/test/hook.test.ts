@@ -63,7 +63,7 @@ test("a file with no indexed rows prints one line and no service-wide boundary",
     const context = (
       JSON.parse(run.stdout) as { hookSpecificOutput: { additionalContext: string } }
     ).hookSpecificOutput.additionalContext;
-    assert.match(context, /^Carrick re-checked \S+ after this edit: no contract problem\.$/, name);
+    assert.match(context, /^Carrick re-checked \S+ after this edit: no route or call to check\.$/, name);
   }
 });
 

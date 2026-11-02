@@ -133,6 +133,76 @@ test("a re-check that judged a service reading the edit at its indexed version n
   );
 });
 
+/** A routed file whose pairs the check did not judge: every verdict is `not_checked`. */
+function unjudged(): CheckResult {
+  const result = rechecked();
+  result.items = connectedRows(3).map((item) => ({
+    ...item,
+    verdict: { state: "not_checked", result: null, detail: "" },
+  }));
+  return result;
+}
+
+test("a re-check that judged no type pair never says no contract problem", () => {
+  const result = unjudged();
+  result.boundary = { types_degraded: { stage: "type check", detail: "sidecar not found" } };
+  const line = renderPostToolUse(result, "src/routes/users.ts");
+  assert.equal(
+    line,
+    "Carrick re-checked src/routes/users.ts after this edit: types were not checked (sidecar not found), so no contract verdict.",
+  );
+  assert.doesNotMatch(line ?? "", /no contract problem/);
+  // With no reason on the answer, it still says types were not checked.
+  delete result.boundary;
+  assert.match(
+    renderPostToolUse(result, "src/routes/users.ts") ?? "",
+    /: types were not checked \(no pair in this file was compared\), so no contract verdict\.$/,
+  );
+});
+
+test("a re-check that judged pairs and found none wrong still says no contract problem", () => {
+  const result = rechecked();
+  result.items = [
+    {
+      kind: "route",
+      method: "GET",
+      path: "/api/users",
+      line: 10,
+      col: 1,
+      source: "fact",
+      counterparts: [{ role: "consumer", service: "web", file: "src/api.ts", line: 4 }],
+      verdict: { state: "resolved", result: "compatible", detail: "" },
+    },
+  ];
+  assert.equal(
+    renderPostToolUse(result, "src/routes/users.ts"),
+    "Carrick re-checked src/routes/users.ts after this edit: no contract problem.",
+  );
+});
+
+test("a file restored to its indexed text says nothing was re-checked", () => {
+  const result = rechecked();
+  result.items = [
+    {
+      kind: "route",
+      method: "GET",
+      path: "/api/users",
+      line: 10,
+      col: 1,
+      source: "fact",
+      verdict: { state: "resolved", result: "compatible", detail: "" },
+    },
+  ];
+  result.stale = false;
+  result.recheck = { ran: "none", elapsed_ms: 0, reason: "the file has not changed since the index" };
+  const line = renderPostToolUse(result, "src/routes/users.ts");
+  assert.equal(
+    line,
+    "Carrick: src/routes/users.ts matches the index, so there was nothing to re-check. The index shows: no contract problem.",
+  );
+  assert.doesNotMatch(line ?? "", /re-checked src/);
+});
+
 test("an edit never carries the service-wide boundary", () => {
   for (const name of ["check-mismatch.json", "check-pre-rendered-boundary.json"]) {
     const context = renderPostToolUse(fixture(name)) ?? "";
@@ -223,9 +293,10 @@ test("a file with nothing to report still prints one line, and only that", () =>
   for (const name of ["check-silent.json", "check-clean.json"]) {
     const result = fixture(name);
     result.boundary = { unemitted_literal_sites: [`${result.file}:7`] };
+    // No rows: there was nothing to judge, so no contract claim is made.
     assert.equal(
       renderPostToolUse(result),
-      "Carrick re-checked src/util/format.ts after this edit: no contract problem.",
+      "Carrick re-checked src/util/format.ts after this edit: no route or call to check.",
       name,
     );
   }
@@ -716,7 +787,7 @@ test("an edit's uses are one counted line, never the list", () => {
   const uses = fixture("check-uses.json");
   assert.equal(
     renderPostToolUse(uses),
-    "Carrick re-checked src/client.ts after this edit: no contract problem.\nOther files use what this file declares: `carrick check src/client.ts` lists the 2 uses; open them if this edit changed a signature or a type.",
+    "Carrick re-checked src/client.ts after this edit: no route or call to check.\nOther files use what this file declares: `carrick check src/client.ts` lists the 2 uses; open them if this edit changed a signature or a type.",
   );
 });
 

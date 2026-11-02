@@ -124,8 +124,12 @@ test("the nudge is short, starts with Carrick, and names at most two functions",
   const one = nudge([fn("slugify")]);
   assert.equal(
     one,
-    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, then tell the user in one line what Carrick found.",
+    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, passing `functions: [{ name, file }]`, one entry per new function. Then tell the user in one line what Carrick found.",
   );
+  // The argument is named exactly: the server ignores any other name, and an
+  // agent that guessed `entries` got an answer to the wrong question.
+  assert.match(one, /`functions: \[\{ name, file \}\]`/);
+  assert.doesNotMatch(one, /entries/);
   assert.match(
     nudge([fn("slugify"), fn("titleCase")]),
     /added 2 new functions \(slugify and titleCase\)\./,
