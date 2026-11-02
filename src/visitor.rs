@@ -302,6 +302,10 @@ pub enum CalleeShape {
     /// compiler's `call` row says which definition it reaches
     /// ([`crate::call_graph::add_row_edges`], carrick#2822).
     CallResult,
+    /// `a.b.c(...)`, `this.a.b.c(...)`: a member called on a longer member
+    /// chain. Like [`CalleeShape::CallResult`], only the compiler's `call`
+    /// row says which definition it reaches.
+    Chain,
 }
 
 /// One call site inside a function body, as written in the AST.
@@ -337,11 +341,6 @@ pub struct ReceiverBinding {
     /// declares the receiver's class and the callee is not itself a parameter
     /// or a destructured name (carrick#1146).
     pub factory: Option<FactoryCall>,
-    /// A `const` receiver initialised by a call (`const client =
-    /// make(id)`), with no class declared for it: what the call returns is
-    /// the compiler's to say, through the member call's `call` row
-    /// (carrick#2615).
-    pub call_bound: bool,
 }
 
 /// SWC gives each lexical binding a distinct Id, including unknown and
@@ -414,7 +413,6 @@ impl LexicalReceivers {
         };
         let mut receiver = binding.receiver.clone();
         receiver.declared = binding.declared_id.is_some();
-        receiver.call_bound = binding.factory.is_some() && !receiver.declared;
         // A callee bound by a pattern is a value handed in, not the function
         // a same-named declaration or import would resolve to.
         receiver.factory = binding
@@ -465,7 +463,6 @@ impl Visit for LexicalReceivers {
                         declared: false,
                         local_member: None,
                         factory: None,
-                        call_bound: false,
                         origin: (!import.type_only && !type_only)
                             .then(|| import.src.value.to_string_lossy().into_owned()),
                     },
@@ -489,7 +486,6 @@ impl Visit for LexicalReceivers {
                     declared: false,
                     local_member: None,
                     factory: None,
-                    call_bound: false,
                     origin: Some(external.expr.value.to_string_lossy().into_owned()),
                 },
                 ..Default::default()
@@ -553,7 +549,6 @@ impl Visit for LexicalReceivers {
                                 declared: false,
                                 local_member: None,
                                 factory: None,
-                                call_bound: false,
                                 origin: Some(specifier.clone()),
                             },
                             ..Default::default()
@@ -835,16 +830,21 @@ impl CalleeCollector<'_> {
         self.source_map.lookup_char_pos(span.lo).line as u32
     }
 
-    /// Record the callee of one call site. Four shapes are kept: a bare
-    /// identifier, a member access on an identifier or on `this`, and
-    /// `this.field.foo()` — a two-level chain whose root the enclosing class
-    /// body declares (carrick#782).
+    /// Record the callee of one call site. Kept: a bare identifier; a member
+    /// access on an identifier, on `this` or on a call's value;
+    /// `this.field.foo()` (a field the enclosing class body declares,
+    /// carrick#782); and any longer member chain (`a.b.c()`, `this.a.b.c()`,
+    /// `a?.b.c()`) as [`CalleeShape::Chain`]. An optional call (`a?.b()`)
+    /// reaches here as an `OptChain` over the member, and is read as that
+    /// member.
     ///
-    /// Everything else (`a.b.c()`, `super.x()`, `getHandler()()`) is
-    /// deliberately dropped: it cannot be resolved to a definition without
-    /// type information, and a guess here is exactly the false edge this pass
-    /// exists to remove. `this.field` is the one two-level receiver the file
-    /// itself makes a statement about.
+    /// A chain, like a call's value, is never resolved by name: `a.b.c()`
+    /// needs the VALUE of `a.b`, which no statement in the file gives, and a
+    /// guess is exactly the false edge this pass exists to remove. It is
+    /// recorded so the compiler's `call` row for the site can state the edge
+    /// ([`crate::call_graph::add_row_edges`]). Dropped: `super.x()`, a
+    /// computed member (`a[b].c()`) and a callee that is itself a call
+    /// (`getHandler()()`).
     fn record(&mut self, callee: &Expr, span: swc_common::Span) {
         let line = self.line(span);
         match Self::unwrap_expr(callee) {
@@ -855,68 +855,75 @@ impl CalleeCollector<'_> {
                 span,
                 receiver: ReceiverBinding::default(),
             }),
-            Expr::Member(member) => {
-                let name = match &member.prop {
-                    MemberProp::Ident(prop) => prop.sym.to_string(),
-                    MemberProp::PrivateName(prop) => format!("#{}", prop.name),
-                    MemberProp::Computed(_) => return,
-                };
-                match Self::unwrap_expr(&member.obj) {
-                    Expr::This(_) => {
-                        if let Some(class) = self.enclosing_class.clone() {
-                            self.out.push(CalleeRef {
-                                name,
-                                shape: CalleeShape::ThisMember(class),
-                                line,
-                                span,
-                                receiver: ReceiverBinding::default(),
-                            });
-                        }
-                    }
-                    Expr::Ident(obj) => self.out.push(CalleeRef {
-                        name,
-                        shape: CalleeShape::Member(obj.sym.to_string()),
-                        line,
-                        span,
-                        receiver: ReceiverBinding::default(),
-                    }),
-                    // `this.field.foo()`. Nothing wider: `a.b.c()` needs the
-                    // VALUE of `a.b`, which no statement in the file gives.
-                    Expr::Member(inner) => {
-                        let Some(class) = self.enclosing_class.clone() else {
-                            return;
-                        };
-                        if !matches!(Self::unwrap_expr(&inner.obj), Expr::This(_)) {
-                            return;
-                        }
-                        let field = match &inner.prop {
-                            MemberProp::Ident(prop) => prop.sym.to_string(),
-                            MemberProp::PrivateName(prop) => format!("#{}", prop.name),
-                            MemberProp::Computed(_) => return,
-                        };
-                        self.out.push(CalleeRef {
-                            name,
-                            shape: CalleeShape::ThisFieldMember { class, field },
-                            line,
-                            span,
-                            receiver: ReceiverBinding::default(),
-                        });
-                    }
-                    // `make().foo()`: no name join can say what `make()`
-                    // returns, so resolution states no edge; the compiler's
-                    // `call` row for the site does (carrick#2822).
-                    Expr::Call(_) => self.out.push(CalleeRef {
-                        name,
-                        shape: CalleeShape::CallResult,
-                        line,
-                        span,
-                        receiver: ReceiverBinding::default(),
-                    }),
-                    _ => {}
+            other => {
+                if let Some(member) = Self::as_member(other) {
+                    self.record_member(member, line, span);
                 }
             }
-            _ => {}
         }
+    }
+
+    /// The member access an expression is, reading through the optional-chain
+    /// wrapper (`a?.b` is an `OptChain` over the member `a.b`).
+    fn as_member(expr: &Expr) -> Option<&MemberExpr> {
+        match Self::unwrap_expr(expr) {
+            Expr::Member(member) => Some(member),
+            Expr::OptChain(chain) => match &*chain.base {
+                OptChainBase::Member(member) => Some(member),
+                OptChainBase::Call(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The name a member property gives, or `None` for a computed one.
+    fn member_name(prop: &MemberProp) -> Option<String> {
+        match prop {
+            MemberProp::Ident(prop) => Some(prop.sym.to_string()),
+            MemberProp::PrivateName(prop) => Some(format!("#{}", prop.name)),
+            MemberProp::Computed(_) => None,
+        }
+    }
+
+    /// One `obj.name(...)` call: the shape follows what `obj` is.
+    fn record_member(&mut self, member: &MemberExpr, line: u32, span: swc_common::Span) {
+        let Some(name) = Self::member_name(&member.prop) else {
+            return;
+        };
+        let shape = match Self::unwrap_expr(&member.obj) {
+            Expr::This(_) => {
+                let Some(class) = self.enclosing_class.clone() else {
+                    return;
+                };
+                CalleeShape::ThisMember(class)
+            }
+            Expr::Ident(obj) => CalleeShape::Member(obj.sym.to_string()),
+            // `make().foo()`: no name join can say what `make()` returns, so
+            // resolution states no edge; the compiler's `call` row for the
+            // site does (carrick#2822).
+            Expr::Call(_) => CalleeShape::CallResult,
+            obj => {
+                let Some(inner) = Self::as_member(obj) else {
+                    return;
+                };
+                let Some(field) = Self::member_name(&inner.prop) else {
+                    return;
+                };
+                match (Self::unwrap_expr(&inner.obj), self.enclosing_class.clone()) {
+                    // `this.field.foo()`: the class body says what the field is.
+                    (Expr::This(_), Some(class)) => CalleeShape::ThisFieldMember { class, field },
+                    // Anything deeper (`a.b.c()`): only the compiler can say.
+                    _ => CalleeShape::Chain,
+                }
+            }
+        };
+        self.out.push(CalleeRef {
+            name,
+            shape,
+            line,
+            span,
+            receiver: ReceiverBinding::default(),
+        });
     }
 
     /// Record the component a JSX element renders (carrick#1149). Compiled,
@@ -2757,6 +2764,62 @@ second`): void {}
                 .tokens
                 .contains(&"café".to_string())
         );
+    }
+
+    /// The shape and name of every callee recorded in `source`'s functions.
+    fn callee_shapes(source: &str) -> Vec<(CalleeShape, String)> {
+        let (cm, module) = parse_ts(source);
+        let mut extractor = FunctionDefinitionExtractor::new(PathBuf::from("test.ts"), cm);
+        module.visit_with(&mut extractor);
+        let mut shapes: Vec<_> = extractor
+            .callee_refs
+            .values()
+            .flatten()
+            .map(|call| (call.shape.clone(), call.name.clone()))
+            .collect();
+        shapes.sort_by_key(|(_, name)| name.clone());
+        shapes
+    }
+
+    #[test]
+    fn a_member_chain_call_is_recorded_as_a_chain() {
+        assert_eq!(
+            callee_shapes("function f(a: any) { a.b.c(); }"),
+            vec![(CalleeShape::Chain, "c".to_string())]
+        );
+        assert_eq!(
+            callee_shapes("class K { f() { this.a.b.c(); } }"),
+            vec![(CalleeShape::Chain, "c".to_string())]
+        );
+        assert_eq!(
+            callee_shapes("function f(a: any) { a?.b.c(); a.b?.c(); }"),
+            vec![
+                (CalleeShape::Chain, "c".to_string()),
+                (CalleeShape::Chain, "c".to_string())
+            ]
+        );
+        // `this.field.x()` keeps its own shape.
+        assert_eq!(
+            callee_shapes("class K { f() { this.a.c(); } }"),
+            vec![(
+                CalleeShape::ThisFieldMember {
+                    class: "K".to_string(),
+                    field: "a".to_string()
+                },
+                "c".to_string()
+            )]
+        );
+        // An optional call on a plain member is that member.
+        assert_eq!(
+            callee_shapes("function f(a: any) { a?.b(); }"),
+            vec![(CalleeShape::Member("a".to_string()), "b".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_computed_member_or_super_call_is_not_recorded() {
+        assert!(callee_shapes("function f(a: any, b: string) { a[b].c(); a.b[b](); }").is_empty());
+        assert!(callee_shapes("class K extends J { f() { super.c(); } }").is_empty());
     }
 
     #[test]
