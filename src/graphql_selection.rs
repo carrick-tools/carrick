@@ -100,9 +100,7 @@ impl PartialSchema {
                  the whole schema this operation is sent to"
             }
             PartialSchema::PrintedFromCode => {
-                "the schema read may be a printed copy of a schema built in code (the service \
-                 builds one, or names this file in `graphqlSchemas`), and a printed copy can be \
-                 older than the code"
+                "the server is code-first, so this file may be a stale export of its schema"
             }
             PartialSchema::TypesDefinedElsewhere => {
                 "the schema read refers to types it does not define, so it is not the whole schema"
