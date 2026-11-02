@@ -62,7 +62,8 @@ import { printedTypeHoldsTopType, relateSymbolToRead } from './symbol-relation.j
 import { notePrintedType, PrintedTypes } from './printed-names.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
-import { readResponseModes, type JoinedBody, type ResponseModes } from './response-modes.js';
+import { readResponseModes, type JoinedBody, type MessageSource, type ResponseModes } from './response-modes.js';
+import { callInto, calledFunction, narrowByArguments } from './argument-modes.js';
 import { functionAtLine } from './function-line-index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
@@ -1517,6 +1518,10 @@ export class TypeInferrer {
     const returnTypeNode = func.getReturnTypeNode();
     const isExplicit = returnTypeNode !== undefined;
     let returnType = func.getReturnType();
+    // carrick#2372: a handler that returns its executor's result answers only
+    // the executor's returns its own arguments leave reachable.
+    const byArguments = this.returnNarrowedByArguments(func, this.unwrapPromiseType(returnType));
+    if (byArguments?.type) returnType = byArguments.type;
     let typeString = typeText(returnType, func);
     /** Reasons for any `any`/`unknown` this inference ends up publishing. */
     let provenance: TypeProvenance[] | undefined;
@@ -1696,6 +1701,9 @@ export class TypeInferrer {
     );
     if (provenance && provenance.length > 0) {
       inferred.any_provenance = provenance;
+    }
+    if (byArguments && !byArguments.type && byArguments.tested.length > 0) {
+      this.addArgumentReads(inferred, byArguments.tested);
     }
     // The relation is asked only of the function the row's own line names.
     // A locator that binds inside a callback of the handler (`user` in
@@ -2143,7 +2151,12 @@ export class TypeInferrer {
       return null;
     }
 
-    const payloadType = payloadNode.getType();
+    // carrick#2372: a located call into an executor the route shares answers
+    // only the executor's returns this call's arguments leave reachable.
+    const byArguments = Node.isCallExpression(payloadNode)
+      ? this.callNarrowedByArguments(payloadNode, this.unwrapPromiseType(payloadNode.getType()))
+      : undefined;
+    const payloadType = byArguments?.type ?? payloadNode.getType();
     let typeString = typeText(payloadType, payloadNode);
 
     const unwrapResult = this.unwrapTypeWithConfig(
@@ -2197,6 +2210,9 @@ export class TypeInferrer {
     this.relateModelSymbol(request, inferred, [
       unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
     ]);
+    if (byArguments && !byArguments.type && byArguments.tested.length > 0) {
+      this.addArgumentReads(inferred, byArguments.tested);
+    }
     return inferred;
   }
 
@@ -2637,7 +2653,7 @@ export class TypeInferrer {
       if (!returnedBranches.includes(locatedBranch)) return undefined;
       branches = returnedBranches;
     }
-    const survivors: Node[] = [];
+    let survivors: Node[] = [];
     for (const branch of branches) {
       const status = branch === locatedBranch ? siteStatus : this.responseSiteStatus(branch, true);
       if (status === 'variable') {
@@ -2651,11 +2667,31 @@ export class TypeInferrer {
       survivors.push(branch);
     }
 
+    // carrick#2372: the sends sit in an executor the route's handler calls,
+    // and other routes may call it with other arguments. Keep only the sends
+    // this route's arguments leave reachable.
+    const registered = this.registrationAtLine(sourceFile, request.line_number)?.handler;
+    const routeCall = registered && registered !== func ? callInto(registered, func) : undefined;
+    let argumentReads: string[] = [];
+    let narrowed = false;
+    if (routeCall && survivors.length >= 2) {
+      const narrowing = narrowByArguments(func, routeCall, survivors);
+      argumentReads = narrowing.tested;
+      if (narrowing.kept.length > 0 && narrowing.kept.length < survivors.length) {
+        this.log(
+          `Response sends at ${request.file_path}:${request.line_number} narrowed by the ` +
+            `arguments the route passes its executor: ${narrowing.kept.length} of ${survivors.length} kept`
+        );
+        survivors = narrowing.kept;
+        narrowed = true;
+      }
+    }
+
     // carrick#2463 (D2): an untied row claims "no success payload" only when
     // the function it reads keeps a send after the error sends are dropped.
     if (!tied && survivors.length === 0) return undefined;
     const locatedDropped = dropped(siteStatus);
-    if (!locatedDropped && survivors.length <= 1) return undefined;
+    if (!locatedDropped && survivors.length <= 1 && !narrowed) return undefined;
 
     const recovered =
       survivors.length > 0
@@ -2672,7 +2708,11 @@ export class TypeInferrer {
           `Response locator at ${request.file_path}:${request.line_number} names an error ` +
             'or redirect send; publishing the success sends of its handler instead'
         );
-        return this.inferredFromRecoveredPayload(request, recovered);
+        return this.withArgumentReads(
+          this.inferredFromRecoveredPayload(request, recovered),
+          recovered,
+          argumentReads
+        );
       }
       this.log(
         `Response locator at ${request.file_path}:${request.line_number} names an error ` +
@@ -2688,10 +2728,105 @@ export class TypeInferrer {
       });
     }
 
-    if (recovered && recovered.nodes.some((node) => contains(site, node))) {
-      return this.inferredFromRecoveredPayload(request, recovered);
+    if (recovered && (narrowed || recovered.nodes.some((node) => contains(site, node)))) {
+      return this.withArgumentReads(
+        this.inferredFromRecoveredPayload(request, recovered),
+        recovered,
+        argumentReads
+      );
     }
     return undefined;
+  }
+
+  /**
+   * carrick#2372: what `func` returns when it returns one call into a
+   * function of the program: see `callNarrowedByArguments`.
+   */
+  private returnNarrowedByArguments(
+    func: FunctionLike,
+    awaited: Type
+  ): { type?: Type; tested: string[] } | undefined {
+    const returned = this.returnedExpressions(func);
+    if (returned.length !== 1) return undefined;
+    let expression = this.peelTransparentExpression(returned[0]);
+    if (Node.isAwaitExpression(expression)) expression = this.peelTransparentExpression(expression.getExpression());
+    if (!Node.isCallExpression(expression)) return undefined;
+    return this.callNarrowedByArguments(expression, awaited, func);
+  }
+
+  /**
+   * carrick#2372: the one member of `awaited` (the awaited result type of
+   * `call`) the called function's returns can give for the arguments `call`
+   * passes, and the parameters the callee tests that those arguments state.
+   * `undefined` when `call` runs no function of the program (or runs
+   * `caller` itself), or its result is not a union.
+   *
+   * Each kept return is matched to the union members it is assignable to; a
+   * return that matches none (another union, a call) keeps every member, as
+   * does a narrowing that leaves more than one member.
+   */
+  private callNarrowedByArguments(
+    call: CallExpression,
+    awaited: Type,
+    caller?: FunctionLike
+  ): { type?: Type; tested: string[] } | undefined {
+    if (!awaited.isUnion()) return undefined;
+    const callee = calledFunction(call);
+    if (!callee || callee === caller) return undefined;
+    const bodies = this.returnedExpressions(callee as FunctionLike).flatMap((body) =>
+      this.expandResponseBranches(body, 0)
+    );
+    if (bodies.length === 0) return undefined;
+    const narrowing = narrowByArguments(callee, call, bodies);
+    const unchanged = { tested: narrowing.tested };
+    if (narrowing.kept.length === 0 || narrowing.kept.length === bodies.length) return unchanged;
+    const checker = this.project.getTypeChecker().compilerObject;
+    const members = awaited.getUnionTypes();
+    const kept = new Set<Type>();
+    for (const body of narrowing.kept) {
+      const bodyType = this.unwrapPromiseType(body.getType());
+      const matches = members.filter((member) =>
+        checker.isTypeAssignableTo(bodyType.compilerType, member.compilerType)
+      );
+      if (matches.length === 0) return unchanged;
+      for (const member of matches) kept.add(member);
+    }
+    if (kept.size !== 1) return unchanged;
+    const [type] = kept;
+    this.log(
+      `Call at ${call.getSourceFile().getFilePath()}:${call.getStartLineNumber()} narrowed by the ` +
+        `arguments it passes: ${narrowing.kept.length} of ${bodies.length} returns kept`
+    );
+    return { type, tested: narrowing.tested };
+  }
+
+  /**
+   * carrick#2372: a union read from an executor whose bodies depend on
+   * arguments the route passes, where those arguments could not tell the
+   * bodies apart. Each such parameter is listed as an `argument` read, so a
+   * mismatch against the union is not reported as this route's: no call can
+   * say which body the route sends.
+   */
+  private withArgumentReads(
+    inferred: InferredType,
+    recovered: { readTypes?: unknown[] } | undefined,
+    reads: string[]
+  ): InferredType {
+    if (reads.length === 0 || (recovered?.readTypes?.length ?? 0) < 2) return inferred;
+    return this.addArgumentReads(inferred, reads);
+  }
+
+  private addArgumentReads(inferred: InferredType, reads: string[]): InferredType {
+    const merged = new Map<string, { location: MessageSource; field: string }>();
+    for (const read of inferred.response_modes?.reads ?? []) merged.set(`${read.location}\u0000${read.field}`, read);
+    for (const field of reads) merged.set(`argument\u0000${field}`, { location: 'argument', field });
+    const sorted = [...merged.values()].sort((a, b) =>
+      a.location === b.location ? a.field.localeCompare(b.field) : a.location.localeCompare(b.location)
+    );
+    // Cases read off the incoming message no longer pick one body: an
+    // argument the route passes also decides it.
+    inferred.response_modes = { reads: sorted };
+    return inferred;
   }
 
   /**

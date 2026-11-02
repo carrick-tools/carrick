@@ -38,7 +38,7 @@ import { cannotComplete, stepsOnPath, type PathStep } from './failure-path.js';
  * are read so far; another protocol (a socket message, a pub/sub payload)
  * adds its own source here.
  */
-export type MessageSource = 'query' | 'body' | 'unplaced';
+export type MessageSource = 'query' | 'body' | 'argument' | 'unplaced';
 
 /** One incoming-message field a response union depends on. */
 export interface ResponseModeRead {
@@ -47,7 +47,10 @@ export interface ResponseModeRead {
    * `body`: a top-level property of the awaited result of a zero-argument
    * `json()` the default lib or an installed library declares. `unplaced`:
    * anything else (a header, a path parameter, the method, a framework's own
-   * accessor, a `json()` the repo declares).
+   * accessor, a `json()` the repo declares). `argument`: not the message,
+   * what the route passes (an argument, or a member of one) to a function
+   * other callers also call, which picks that function's body (carrick#2372,
+   * `argument-modes.ts`).
    */
   location: MessageSource;
   field: string;

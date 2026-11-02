@@ -2002,6 +2002,11 @@ pub enum MessageSource {
     Query,
     /// A top-level property of a JSON body.
     Body,
+    /// Not the message: what the route's handler passes (an argument, or a
+    /// member of one) to a function other callers also call (carrick#2372).
+    /// The function's bodies depend on it, and the route's own value could
+    /// not pick one of them.
+    Argument,
     /// Anything else: a header, a path parameter, a framework accessor.
     #[serde(other)]
     Unplaced,
@@ -2013,8 +2018,14 @@ impl MessageSource {
         match self {
             MessageSource::Query => "query",
             MessageSource::Body => "body",
+            MessageSource::Argument => "argument",
             MessageSource::Unplaced => "unplaced",
         }
+    }
+
+    /// A source a call states values of: a query parameter or a body field.
+    pub fn is_placed(self) -> bool {
+        matches!(self, MessageSource::Query | MessageSource::Body)
     }
 }
 
@@ -5581,6 +5592,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read.location, MessageSource::Unplaced);
+    }
+
+    /// carrick#2372: the sidecar's `argument` source round-trips, and is no
+    /// source a call states values of.
+    #[test]
+    fn an_argument_read_round_trips_and_is_not_placed() {
+        let read: MessageRead =
+            serde_json::from_value(serde_json::json!({ "location": "argument", "field": "mode" }))
+                .unwrap();
+        assert_eq!(read.location, MessageSource::Argument);
+        assert!(!read.location.is_placed());
+        assert_eq!(
+            serde_json::to_value(&read).unwrap(),
+            serde_json::json!({ "location": "argument", "field": "mode" })
+        );
     }
 
     /// The cap tracks the machine, with a floor and a ceiling. Without one,
