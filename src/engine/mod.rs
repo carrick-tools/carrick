@@ -6285,8 +6285,36 @@ impl LibraryAsk {
                 &install,
             ));
         }
-        crate::library_store::Asked::with_default_library(asked, library)
-            .map(|asked| asked.with_roles(crate::library_store::roles_for(site_questions)))
+        let asked = crate::library_store::Asked::with_default_library(asked, library);
+        // And the packages it reaches only through their types (carrick#2588):
+        // a package whose instance the service is handed as a parameter typed
+        // by a type-only import makes no library site, so only the compiler's
+        // call rows name it. Asked after everything above, so a cap drops
+        // these first, and never a package the service already asks by value.
+        let asked = if site_questions {
+            let by_value: BTreeSet<&str> = specifiers
+                .iter()
+                .map(|specifier| crate::request_summary::package_name(specifier))
+                .collect();
+            let typed: BTreeSet<String> =
+                crate::request_summary::discovery::called_packages(inputs)
+                    .into_iter()
+                    .filter(|package| !by_value.contains(package.as_str()))
+                    .collect();
+            let (asked, dropped) = crate::library_store::Asked::merged(
+                asked,
+                crate::library_store::request_declared(&typed, &install),
+            );
+            if dropped > 0 {
+                debug!(
+                    "Library store ask: {dropped} package(s) the service reaches only through their types were left out at the cap"
+                );
+            }
+            asked
+        } else {
+            asked
+        };
+        asked.map(|asked| asked.with_roles(crate::library_store::roles_for(site_questions)))
     }
 }
 

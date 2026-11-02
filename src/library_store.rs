@@ -398,6 +398,21 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
     })
 }
 
+/// [`request`] for packages a service reaches only through their types
+/// (carrick#2588, [`crate::request_summary::discovery::called_packages`]):
+/// only those its manifest or the repo root's declares, so a package
+/// installed as another package's dependency, whose types a call reaches
+/// through that package, is never asked on its account.
+pub fn request_declared(packages: &BTreeSet<String>, install: &Install<'_>) -> Option<Asked> {
+    let declared = declared_names(install.service_root, install.repo_root);
+    let packages: BTreeSet<String> = packages
+        .iter()
+        .filter(|package| declared.contains(package.as_str()))
+        .cloned()
+        .collect();
+    request(&packages, install)
+}
+
 /// The language's own library as the store is asked about it (carrick#2504):
 /// one `lib:<file>` package per default-library file the program loads, at
 /// the compiler's version, narrowed to the globals the code uses from it.
@@ -1760,6 +1775,32 @@ mod tests {
             &install_at(dir.path()),
         );
         assert_eq!(asked(request), one("lib", "1.0.0", &["lib", "lib/sub"]));
+    }
+
+    /// carrick#2588: a package reached only through its types is asked when
+    /// the service or the repo root declares it, and never when it is only
+    /// installed as another package's dependency.
+    #[test]
+    fn a_package_reached_through_its_types_is_asked_only_when_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        install_package(dir.path(), "framework", "2.0.0");
+        install_package(dir.path(), "logger", "1.0.0");
+        npm_lockfile(
+            dir.path(),
+            &[("framework", PUBLIC_TGZ), ("logger", PUBLIC_TGZ)],
+        );
+        write(
+            &dir.path().join("package.json"),
+            r#"{"name":"svc","dependencies":{"framework":"^2.0.0"}}"#,
+        );
+        assert_eq!(
+            asked(request_declared(
+                &specifiers(&["framework", "logger"]),
+                &install_at(dir.path())
+            )),
+            one("framework", "2.0.0", &["framework"])
+        );
+        assert!(request_declared(&specifiers(&["logger"]), &install_at(dir.path())).is_none());
     }
 
     #[test]
