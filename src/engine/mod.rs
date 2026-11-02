@@ -3410,6 +3410,7 @@ impl ServiceScan {
             walked.map(walk_lane::Walked::index),
             &self.workspace,
             Read::Sibling,
+            None,
         )
         else {
             return;
@@ -4732,6 +4733,7 @@ fn discover_service(
     positions: Option<crate::position_rows::PositionIndex>,
     workspace: &crate::external_call_candidates::WorkspaceScan,
     read: Read,
+    implementations: Option<&TypeSidecar>,
 ) -> FileDiscoveryResult {
     discover_with_positions(
         repo_path,
@@ -4742,6 +4744,7 @@ fn discover_service(
         crate::request_summary::discovery::receiver_trace_enabled(),
         &workspace.test_only,
         read,
+        implementations,
     )
 }
 
@@ -4890,6 +4893,7 @@ async fn analyze_current_repo_incremental(
         positions,
         workspace,
         Read::Own,
+        sidecar,
     )?;
     let siblings = reached_siblings(neighbours, sidecar.is_some(), &request_inputs);
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
@@ -10694,6 +10698,7 @@ fn discover_files_and_symbols(
         false,
         &Default::default(),
         Read::Own,
+        None,
     )
 }
 
@@ -10722,6 +10727,7 @@ fn discover_with_positions(
     receiver_trace: bool,
     test_only_cache: &crate::test_only_files::Cache,
     read: Read,
+    implementations: Option<&TypeSidecar>,
 ) -> FileDiscoveryResult {
     let own = read == Read::Own;
     if own {
@@ -11013,7 +11019,11 @@ fn discover_with_positions(
         // Member calls on a receiver a call initialised take their target
         // from the `call` row where resolution by name stated none
         // (carrick#2615).
-        let crate::call_graph::RowEdges { added, unfollowed } = crate::call_graph::add_row_edges(
+        let crate::call_graph::RowEdges {
+            added,
+            unfollowed,
+            edgeless,
+        } = crate::call_graph::add_row_edges(
             &mut all_function_definitions,
             &per_file_calls,
             &keys,
@@ -11021,6 +11031,34 @@ fn discover_with_positions(
             |file, lo, hi| request_inputs.call_target(file, lo, hi),
             |file, lo, hi| request_inputs.unfollowed_at(file, lo, hi),
         );
+        // A call through a declaration with no body takes the edge of its one
+        // implementation, where TypeScript names exactly one (carrick#813).
+        let unfollowed = match implementations {
+            Some(asker) if !edgeless.is_empty() => {
+                let targets = crate::implementation_edges::ask(
+                    &edgeless,
+                    &request_inputs,
+                    asker,
+                    crate::implementation_edges::IMPLEMENTATIONS_BUDGET,
+                );
+                let more = crate::call_graph::add_row_edges(
+                    &mut all_function_definitions,
+                    &per_file_calls,
+                    &keys,
+                    &request_inputs.sites,
+                    |file, lo, hi| targets.target_at(file, lo, hi),
+                    |_, _, _| None,
+                )
+                .added;
+                debug!(
+                    "Implementations for service {}: {}; edges added: {more}",
+                    service.service_name.as_deref().unwrap_or("(root)"),
+                    targets.summary()
+                );
+                crate::implementation_edges::settle(unfollowed, &edgeless, &targets)
+            }
+            _ => unfollowed,
+        };
         debug!(
             "Call edges the position rows added for service {}: {added}; member calls left unfollowed: {}",
             service.service_name.as_deref().unwrap_or("(root)"),
@@ -11093,6 +11131,7 @@ pub(crate) fn discover_service_inputs_within(
         true,
         &Default::default(),
         Read::Own,
+        None,
     )
     .expect("discovery reads the service")
     .request_inputs

@@ -48,6 +48,7 @@ pub mod graphql_schema_builder;
 pub mod graphql_selection;
 pub mod handler_span;
 pub mod help;
+pub mod implementation_edges;
 pub mod import_bindings;
 pub mod imported_request_member;
 pub mod in_process_pubsub;

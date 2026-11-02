@@ -526,6 +526,9 @@ pub fn resolve_call_edges(
 /// the call is left unfollowed, if it is ([`crate::unfollowed_calls`]). A
 /// call the rows do name a target for, whose edge the filters above drop (a
 /// recursive call, a definition outside the service), is not one of them.
+/// It is called a second time with the implementation each such call goes
+/// through ([`crate::implementation_edges`]) as `row_target`, so the filters
+/// and the dedupe are not written twice.
 pub fn add_row_edges(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     per_file: &HashMap<PathBuf, FileCallIndex>,
@@ -536,6 +539,7 @@ pub fn add_row_edges(
 ) -> RowEdges {
     let mut added = 0;
     let mut unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall> = Vec::new();
+    let mut edgeless: Vec<EdgelessCall> = Vec::new();
     let mut files: Vec<&PathBuf> = per_file.keys().collect();
     files.sort();
     for canonical in files {
@@ -561,6 +565,15 @@ pub fn add_row_edges(
                     if let Some(why) =
                         row_unfollowed(&index.path, callee.span.lo.0, callee.span.hi.0)
                     {
+                        if let Some(declared) = why.declared_at.clone() {
+                            edgeless.push(EdgelessCall {
+                                file: index.path.clone(),
+                                lo: callee.span.lo.0,
+                                hi: callee.span.hi.0,
+                                row: unfollowed.len(),
+                                declared,
+                            });
+                        }
                         unfollowed.push(crate::unfollowed_calls::UnfollowedMemberCall {
                             file: index.path.to_string_lossy().to_string(),
                             line: callee.line,
@@ -607,7 +620,11 @@ pub fn add_row_edges(
             dedupe_edges(&mut def.calls);
         }
     }
-    RowEdges { added, unfollowed }
+    RowEdges {
+        added,
+        unfollowed,
+        edgeless,
+    }
 }
 
 /// What [`add_row_edges`] produced.
@@ -617,6 +634,26 @@ pub struct RowEdges {
     pub added: usize,
     /// Member calls that took no edge and say why, paths as walked.
     pub unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall>,
+    /// The calls among them whose row names a declaration in the service
+    /// that is no definition, for [`crate::implementation_edges`].
+    pub edgeless: Vec<EdgelessCall>,
+}
+
+/// A member call that took no edge because the compiler's row names a
+/// declaration with no body (an interface member), which TypeScript may
+/// resolve to the one body that implements it
+/// ([`crate::implementation_edges`]).
+#[derive(Debug, Clone)]
+pub struct EdgelessCall {
+    /// The file as walked.
+    pub file: PathBuf,
+    /// The call's SWC span, as [`CallSiteTargets::target_at`] keys it.
+    pub lo: u32,
+    pub hi: u32,
+    /// Index of the call's row in [`RowEdges::unfollowed`].
+    pub row: usize,
+    /// The declaration's file as walked and line.
+    pub declared: (PathBuf, u32),
 }
 
 /// What [`resolve_call_edges`] produces besides the edges it writes into the

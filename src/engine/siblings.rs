@@ -318,6 +318,7 @@ impl SiblingRegistry {
             false,
             &Default::default(),
             Read::Sibling,
+            None,
         )
         .ok()?;
         let inputs = discovery.request_inputs;
