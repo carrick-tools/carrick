@@ -1217,6 +1217,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .map(|(service, _)| service.clone())
         .collect();
     type_compat_v2::clear_type_reach();
+    // A pull request's comparison with main reads the same listing against
+    // its base (carrick#3170).
+    let pr_changes = changes.clone().filter(|_| pr_run);
     let reach = match changes.filter(|_| pr_run) {
         Some(changes) => {
             let own: Vec<CloudRepoData> = previous_generations
@@ -2049,8 +2052,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 main_self: main_self_data,
                 surface_unchanged,
                 untouched: pr_base
-                    .as_deref()
-                    .and_then(|base| crate::git_state::unchanged_since(repo_path, base).ok()),
+                    .clone()
+                    .zip(pr_changes.clone())
+                    .map(|(base, changes)| PrChange {
+                        repo_path: repo_path.to_string(),
+                        repo_name: repo_name.clone(),
+                        services: services.clone(),
+                        changes,
+                        base,
+                    }),
                 copy,
             }
         });
@@ -13075,13 +13085,56 @@ struct MainBaselineInput {
     dependencies: crate::pr_baseline::DependencyBaseline,
     /// This run scanned exactly what main's copy describes.
     surface_unchanged: bool,
-    /// The tracked files the PR left as its base has them
-    /// ([`crate::git_state::unchanged_since`]); `None` when git could not say
-    /// (carrick#3170).
-    untouched: Option<std::collections::HashSet<String>>,
+    /// What the PR changed since its base, read only when main's side runs;
+    /// `None` when the run has no base (carrick#3170).
+    untouched: Option<PrChange>,
     /// Whether main's copy is main as this PR's base has it
     /// (carrick-cloud#1408).
     copy: crate::pr_baseline::MainCopy,
+}
+
+/// A pull request's change since its base, for the services of this repo.
+struct PrChange {
+    repo_path: String,
+    /// This repo's name: the id of a service with no `service_name`.
+    repo_name: String,
+    services: Vec<Config>,
+    changes: std::sync::Arc<crate::change_scope::ChangedSince>,
+    base: String,
+}
+
+impl PrChange {
+    /// Which services the change leaves untouched, beside every peer service
+    /// (carrick#3170).
+    fn untouched(&self, peers: &[CloudRepoData]) -> crate::pr_baseline::Untouched {
+        let untouched = crate::change_scope::untouched_since(
+            &self.repo_path,
+            &self.services,
+            &self.changes,
+            &self.base,
+        );
+        crate::pr_baseline::Untouched {
+            ours: self
+                .services
+                .iter()
+                .map(|service| {
+                    service
+                        .service_name
+                        .clone()
+                        .unwrap_or_else(|| self.repo_name.clone())
+                })
+                .zip(untouched)
+                .collect(),
+            peers: peers
+                .iter()
+                .map(|peer| {
+                    peer.service_name
+                        .clone()
+                        .unwrap_or_else(|| peer.repo_name.clone())
+                })
+                .collect(),
+        }
+    }
 }
 
 /// How long main's side of the comparison may take before the run gives up on
@@ -13181,6 +13234,7 @@ async fn main_side_findings(
         untouched,
         ..
     } = input;
+    let untouched = untouched.map(|change| change.untouched(&peers));
     // Main's own answers, from the scan that had main's sources on disk. The
     // recomputation below has none, so a response main's scan judged by
     // retyping the consumer's call (carrick#1491) is reached only here.
