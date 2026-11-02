@@ -3365,6 +3365,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             schema_binding: binding,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),

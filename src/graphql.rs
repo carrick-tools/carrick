@@ -1127,7 +1127,9 @@ impl SchemaCatalogue {
     ///
     /// The reading is a break only when the scan holds the whole schema the
     /// operation is sent to: the repository serves exactly one schema file,
-    /// the file defines every type it names or extends and every directive it
+    /// no service names it in `graphqlSchemas` (the setting for a schema
+    /// printed from a code-first server, which can be stale against the code
+    /// that builds it), the file defines every type it names or extends and every directive it
     /// applies, the reading service states no schema of its own elsewhere, and
     /// no tracked source file states schema text for a type the reading
     /// involves, as a server that adds to the file when it builds its schema
@@ -1186,6 +1188,8 @@ impl SchemaCatalogue {
                 || own_sources.iter().any(|source| source != schema_file)
             {
                 Some(PartialSchema::SeveralSchemas)
+            } else if self.declared.contains(schema_file) {
+                Some(PartialSchema::PrintedFromCode)
             } else if let Some(doubt) = schema.own_doubt() {
                 Some(doubt)
             } else {

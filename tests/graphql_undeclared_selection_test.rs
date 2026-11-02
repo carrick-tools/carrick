@@ -18,8 +18,13 @@
 //!   the schema, so the operation is valid at runtime. The scan reads the
 //!   schema file as possibly partial and the pair is unverifiable, never
 //!   incompatible.
+//! - `graphql-undeclared-selection-printed/`: the server builds its schema in
+//!   code, and the schema the scan reads is the copy printed from it, named in
+//!   `graphqlSchemas`. The code declares `etaDays` and the stale printed copy
+//!   does not, so the operation is valid at runtime; a printed copy is never
+//!   read as the whole schema, and the pair is unverifiable.
 //!
-//! In both, the `Depot` operation selects only declared fields, one of them
+//! In all three, the `Depot` operation selects only declared fields, one of them
 //! through a fragment the compiled document carries, and stays compatible.
 
 use std::path::{Path, PathBuf};
@@ -163,6 +168,33 @@ fn a_schema_the_server_adds_to_at_runtime_leaves_the_pair_unverifiable() {
         response["verdict"], "unverifiable",
         "the operation is valid against the schema the server builds; never \
          incompatible: {response:#}"
+    );
+
+    assert_eq!(
+        verdict(&blobs, "graphql|query|depot")["verdict"],
+        "compatible"
+    );
+}
+
+#[test]
+fn a_printed_code_first_schema_leaves_the_pair_unverifiable() {
+    let blobs = scan(&fixture_dir("graphql-undeclared-selection-printed"));
+
+    let parcel = call(&blobs, "parcel", "apps/web/src/pages/ParcelPage.tsx");
+    assert_eq!(
+        parcel["undeclared_selection"],
+        serde_json::json!({
+            "fields": [{ "on_type": "Parcel", "field": "etaDays" }],
+            "schema": "apps/api/dist/schema.graphql",
+            "partial": "printed_from_code"
+        }),
+        "the field is still recorded, with the printed copy as the doubt: {parcel:#}"
+    );
+    let response = verdict(&blobs, "graphql|query|parcel");
+    assert_eq!(
+        response["verdict"], "unverifiable",
+        "the code that builds the schema may declare the field the printed copy \
+         lacks; never incompatible: {response:#}"
     );
 
     assert_eq!(

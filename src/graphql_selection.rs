@@ -16,7 +16,8 @@
 //!   satisfies it.
 //!
 //! The answer is a fact only when the schema the scan read is the whole schema
-//! the server serves. [`SchemaFile::partial`] says when it may not be, and a
+//! the server serves. [`PartialSchema`] says when it may not be (a printed
+//! code-first schema is never taken as whole: it can be stale), and a
 //! doubt is carried beside the fields rather than dropped: the pair is then
 //! not judged compatible either (`Analyzer::set_pair_outcomes`).
 //!
@@ -67,6 +68,12 @@ pub enum PartialSchema {
     /// The repository serves more than one schema file, so a server may
     /// compose several of them, or the operation may go to another one.
     SeveralSchemas,
+    /// The schema file is one a service names in `graphqlSchemas`, the
+    /// setting for a schema printed from a code-first server (carrick#1099).
+    /// The server builds its schema from code, so a printed file can be stale
+    /// against it: a field the code still declares may be missing from the
+    /// file.
+    PrintedFromCode,
     /// The schema names, extends or roots its operations in a type it does
     /// not define, so the rest of it is written somewhere else.
     TypesDefinedElsewhere,
@@ -90,6 +97,10 @@ impl PartialSchema {
             PartialSchema::SeveralSchemas => {
                 "the repository serves more than one GraphQL schema, so the one read may not be \
                  the whole schema this operation is sent to"
+            }
+            PartialSchema::PrintedFromCode => {
+                "the schema read is a printed copy of a schema built in code (it is named in \
+                 `graphqlSchemas`), and a printed copy can be older than the code"
             }
             PartialSchema::TypesDefinedElsewhere => {
                 "the schema read refers to types it does not define, so it is not the whole schema"
