@@ -1,10 +1,17 @@
 # pr-seeds: one seeded PR change per finding kind and per protocol
 
-Three repos and the contracts between them, used by the `seed_*` tests of
+Four repos and the contracts between them, used by the `seed_*` tests of
 `tests/pr_on_main_test.rs` (carrick#3095). Each seed edits one repo on a branch
 and runs a real PR scan against main's stored index. The tests replay the
 model from hand-written answers in each repo's `__llm__/`, and run with the
 five fact-layer switches the cloud runner sets.
+
+`seeds.json` is the one definition of each seed: its edits, which the tests
+apply with `apply_seed`, and the check a correct Carrick posts for it
+(`expect`: title, conclusion and every row, a closed world). The PR-accuracy
+check that runs before each release replays the same seeds with the candidate
+build and scores the rendered check against `expect`. `known_miss` names the
+issue a seed's correct check waits on.
 
 - `orders-api` serves an HTTP route (`app/routes/api.v1.orders.$orderId.ts`),
   a GraphQL schema and resolver (`src/schema.graphql`, `src/resolvers.ts`), a
@@ -21,6 +28,11 @@ five fact-layer switches the cloud runner sets.
   negatives. It scans against a store of its own: its stub pins a package no
   registry has, which would make every cross-repo type check in a shared store
   unverifiable.
+- `rpc-api` serves a procedure router (a tRPC-shaped `t.router` from the
+  `fixture-procs` stub) under a fetch adapter at `/api/trpc`, and a web sub-app
+  mounted under `/api/v1`; `src/web/orders-view.ts` calls one procedure through
+  a typed client. Its library answers are `procedure-router`'s. It has a store
+  of its own for the same reason as `admin-api`.
 
 This tree is an answer key. Do not edit it, or a seed's edit, to make a run
 pass. A seed that fails today is `#[ignore]` with the issue that fixes it; that
@@ -61,8 +73,22 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `convention-copy` | route module copied to `api.v1.invoices.$invoiceId.ts` | `loader` added in the new file; delta new route | passes |
 | `route-moved-within-its-file` (`admin-api`) | `GET` and `POST` registrations swapped (`src/admin.ts:16-17`) | empty delta | passes |
 | `loop-route-edit` (`admin-api`) | edit inside the loop at `src/admin.ts:20` | empty delta | passes |
-
-RPC routers have no seed: no client row exists to pair with (carrick#937).
+| `http-field-type-change` | route field `total` from `number` to `string` | the same two rows as `http-field-rename` | passes |
+| `http-route-removed` | route module deleted | `missing_endpoint` at both sites; delta removed | passes |
+| `http-handler-body` | the loader's body changes, its type does not | empty delta, no introduced risk | passes |
+| `non-code-edit` | adds `docs/orders.md` | empty delta, no finding | passes |
+| `http-prefix-moved` (`rpc-api`) | sub-app mount `/api/v1` to `/api/v2` | delta new `/api/v2/reports/daily`, removed `/api/v1/...` | passes |
+| `http-edit-under-prefix` (`rpc-api`) | a handler body under the mounted prefix | empty delta | passes |
+| `trpc-procedure-added`, `-removed`, `-renamed` (`rpc-api`) | `orders.cancel` added, `orders.create` removed, `create` to `place` | delta under the adapter's endpoint (`POST /api/trpc/orders.cancel`) | passes |
+| `trpc-resolver-body` (`rpc-api`) | a mutation's body | empty delta, no introduced risk | passes |
+| `trpc-adapter-prefix-moved` (`rpc-api`) | the adapter's endpoint `/api/trpc` to `/trpc` | every procedure new under `/trpc`, removed under `/api/trpc` | passes |
+| `trpc-output-field-removed` (`rpc-api`) | `orders.list` output loses `total`, which the client reads | `type_mismatch` at `src/web/orders-view.ts:7` | ignored, carrick#937 (no procedure client call is read) |
+| `graphql-field-added` | `OrderView` gains nullable `note` (schema, resolver type, the answer's resolver line) | no introduced risk, no call left without a producer, empty delta | passes (carrick#3172) |
+| `graphql-root-added` | a root query `orders` no client calls | as above; delta new `QUERY orders` | passes (carrick#3172) |
+| `graphql-resolver-body` | the `order` resolver's body | as above, empty delta | passes (carrick#3172) |
+| `socket-listener-field-added` | the listener's `OrderUpdate` gains optional `note` | as above, empty delta | passes (carrick#3172) |
+| `socket-event-added` | a new `order:note` listener that relays to every client | as above for the old events; the relay's emit is one gap (`missing_endpoint`), as in `socket-emit-rename`; delta new listener | passes (carrick#3172) |
+| `pubsub-subscriber-field-added` | the subscriber's `PaymentSettled` gains optional `currency` (the answer's lines move) | as above; trivially until carrick#3089 types library pub/sub rows | passes (carrick#3172) |
 
 ## Type-reach seeds (carrick#3102)
 

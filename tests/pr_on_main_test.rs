@@ -2097,10 +2097,113 @@ fn edit(repo: &Path, file: &str, replacements: &[(&str, &str)]) {
     std::fs::write(&path, source).unwrap();
 }
 
+/// The seeds' manifest (`tests/fixtures/pr-seeds/seeds.json`): each seed's
+/// edits, and the check a correct Carrick posts for it, which the private
+/// PR-accuracy instrument scores the cloud's rendering against.
+fn seed_manifest() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr-seeds/seeds.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+}
+
+/// The manifest entry of seed `name`.
+fn seed_entry(name: &str) -> serde_json::Value {
+    seed_manifest()["seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|seed| seed["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("no seed {name} in seeds.json"))
+}
+
+/// Apply the edits of seed `name` from the manifest to `repo`: the one
+/// definition of each seed, which the PR-accuracy instrument replays too.
+fn apply_seed(repo: &Path, name: &str) {
+    for op in seed_entry(name)["edits"].as_array().unwrap() {
+        let field = |key: &str| {
+            op[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: {key} in {op}"))
+        };
+        match field("op") {
+            "replace" => {
+                let pairs: Vec<(String, String)> = op["pairs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|pair| {
+                        (
+                            pair[0].as_str().unwrap().to_string(),
+                            pair[1].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect();
+                let pairs: Vec<(&str, &str)> = pairs
+                    .iter()
+                    .map(|(from, to)| (from.as_str(), to.as_str()))
+                    .collect();
+                edit(repo, field("file"), &pairs);
+            }
+            "move" => git(repo, &["mv", field("from"), field("to")]),
+            "copy" => {
+                std::fs::copy(repo.join(field("from")), repo.join(field("to"))).unwrap();
+            }
+            "write" => {
+                let path = repo.join(field("file"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, field("text")).unwrap();
+            }
+            "delete" => git(repo, &["rm", "-q", field("file")]),
+            other => panic!("{name}: unknown edit op {other}"),
+        }
+    }
+}
+
+/// The PR result of seed `name`, its edits applied to its repo.
+async fn manifest_seed_payload(name: &str) -> serde_json::Value {
+    let repo = seed_entry(name)["repo"].as_str().unwrap().to_string();
+    seed_payload(&repo, |dir| apply_seed(dir, name)).await
+}
+
+/// The delta rows the manifest says seed `name`'s correct check carries.
+fn manifest_delta(name: &str, kind: &str) -> Vec<String> {
+    seed_entry(name)["expect"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["kind"] == kind)
+        .map(|row| row["label"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Every seed in the manifest applies to its fixture repo, and names a repo
+/// one of its stores scans.
+#[test]
+fn every_manifest_seed_applies_to_its_repo() {
+    let manifest = seed_manifest();
+    let stores = manifest["stores"].as_object().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    for seed in manifest["seeds"].as_array().unwrap() {
+        let name = seed["name"].as_str().unwrap();
+        let repo_name = seed["repo"].as_str().unwrap();
+        assert!(
+            stores
+                .values()
+                .any(|repos| repos.as_array().unwrap().iter().any(|r| r == repo_name)),
+            "{name}: no store scans {repo_name}"
+        );
+        let root = tmp.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = seed_repo(&root, repo_name);
+        apply_seed(&repo, name);
+    }
+}
+
 /// Main's index of the seed fixture, built once per run of this binary: the
 /// stored rows of the `orders-api` and `storefront` store, of the `admin-api`
 /// store (its router stub pins a package no registry has, which would fail
-/// every cross-repo type check it joined, trap 1), and the trees they came
+/// every cross-repo type check it joined, trap 1), of the `rpc-api` store
+/// (the same trap: its procedure and web stubs), and the trees they came
 /// from. Each seed copies what it edits.
 struct MainSnapshot {
     trees: PathBuf,
@@ -2108,6 +2211,8 @@ struct MainSnapshot {
     shared_reach: ReachObjects,
     admin_rows: Vec<CloudRepoData>,
     admin_reach: ReachObjects,
+    rpc_rows: Vec<CloudRepoData>,
+    rpc_reach: ReachObjects,
 }
 
 static MAIN: tokio::sync::OnceCell<MainSnapshot> = tokio::sync::OnceCell::const_new();
@@ -2134,12 +2239,17 @@ async fn main_snapshot() -> &'static MainSnapshot {
         scan_seed_repo(&shared, &orders).await;
         let admin_store = Store::default();
         scan_seed_repo(&admin_store, &admin).await;
+        let rpc = seed_repo(&trees, "rpc-api");
+        let rpc_store = Store::default();
+        scan_seed_repo(&rpc_store, &rpc).await;
         MainSnapshot {
             trees: unlinked(&trees),
             shared_rows: shared.repos.lock().unwrap().clone(),
             shared_reach: shared.type_reach.lock().unwrap().clone(),
             admin_rows: admin_store.repos.lock().unwrap().clone(),
             admin_reach: admin_store.type_reach.lock().unwrap().clone(),
+            rpc_rows: rpc_store.repos.lock().unwrap().clone(),
+            rpc_reach: rpc_store.type_reach.lock().unwrap().clone(),
         }
     })
     .await
@@ -2181,10 +2291,10 @@ async fn seed_payload_once(repo_name: &str, change: &dyn Fn(&Path)) -> serde_jso
     change(&repo);
     commit(&repo, "pr: seed");
     event_with_base(tmp.path(), &base);
-    let (rows, reach) = if repo_name == "admin-api" {
-        (&main.admin_rows, &main.admin_reach)
-    } else {
-        (&main.shared_rows, &main.shared_reach)
+    let (rows, reach) = match repo_name {
+        "admin-api" => (&main.admin_rows, &main.admin_reach),
+        "rpc-api" => (&main.rpc_rows, &main.rpc_reach),
+        _ => (&main.shared_rows, &main.shared_reach),
     };
     let store = Store {
         repos: Arc::new(Mutex::new(rows.clone())),
@@ -2301,7 +2411,6 @@ fn changed_functions(payload: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-const ORDER_ROUTE: &str = "app/routes/api.v1.orders.$orderId.ts";
 const ORDER_PATH: &str = "/api/v1/orders/:orderId";
 /// The two call sites of the consumer's request helper (trap 3): the helper
 /// call inside the client member, and the caller that reads the response.
@@ -2320,48 +2429,29 @@ fn assert_order_type_mismatch(payload: &serde_json::Value) {
 #[tokio::test]
 async fn seed_http_field_rename() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            ORDER_ROUTE,
-            &[
-                ("total: number;", "amount: number;"),
-                ("total: 1200", "amount: 1200"),
-            ],
-        )
-    })
-    .await;
+    let payload = manifest_seed_payload("http-field-rename").await;
     assert_order_type_mismatch(&payload);
 }
 
 #[tokio::test]
 async fn seed_http_field_removal() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            ORDER_ROUTE,
-            &[("  currency: string;\n", ""), (", currency: \"EUR\"", "")],
-        )
-    })
-    .await;
+    let payload = manifest_seed_payload("http-field-removal").await;
+    assert_order_type_mismatch(&payload);
+}
+
+/// A field's type changes under the same name: the consumer reads a number.
+#[tokio::test]
+async fn seed_http_field_type_change() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-field-type-change").await;
     assert_order_type_mismatch(&payload);
 }
 
 #[tokio::test]
 async fn seed_http_verb_change() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            ORDER_ROUTE,
-            &[(
-                "export async function loader",
-                "export async function action",
-            )],
-        )
-    })
-    .await;
+    let payload = manifest_seed_payload("http-verb-change").await;
     let finding = seed_finding(&payload, "method_mismatch", "GET", ORDER_PATH, None);
     assert_eq!(finding["expected_method"], "POST", "{finding:#}");
     assert_eq!(
@@ -2378,13 +2468,7 @@ async fn seed_http_verb_change() {
 }
 
 async fn http_route_rename() -> serde_json::Value {
-    seed_payload("orders-api", |repo| {
-        git(
-            repo,
-            &["mv", ORDER_ROUTE, "app/routes/api.v1.purchases.$orderId.ts"],
-        )
-    })
-    .await
+    manifest_seed_payload("http-route-rename").await
 }
 
 #[tokio::test]
@@ -2416,33 +2500,151 @@ fn seed_http_route_rename_marking() {
     panic!("carrick#3092: shape not pinned");
 }
 
+/// The delta the manifest's correct check names for seed `name`, in any order.
+fn assert_manifest_delta(payload: &serde_json::Value, name: &str) {
+    for (side, kind) in [
+        ("new_endpoints", "delta_new"),
+        ("removed_endpoints", "delta_removed"),
+    ] {
+        let mut got = delta_rows(&payload["delta"], side);
+        let mut want = manifest_delta(name, kind);
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "{name} {side}: {payload:#}");
+    }
+}
+
+/// No risk the PR introduces, and no call left without its producer, among
+/// the operations `touched` names: what an ordinary change must give.
+fn assert_quiet(payload: &serde_json::Value, touched: &[&str]) {
+    for finding in findings_of(payload) {
+        let introduced = finding["on_main"] == false
+            && (finding["kind"] == "type_mismatch" || finding["kind"] == "method_mismatch");
+        assert!(!introduced, "an introduced risk: {finding:#}");
+        if finding["kind"] == "missing_endpoint" {
+            let path = finding["path"].as_str().unwrap_or_default();
+            assert!(
+                !touched.iter().any(|op| path.contains(op)),
+                "a call left without its producer: {finding:#}"
+            );
+        }
+    }
+}
+
+/// The route module is deleted while the consumer still calls it.
+#[tokio::test]
+async fn seed_http_route_removed() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-route-removed").await;
+    let finding = seed_finding(
+        &payload,
+        "missing_endpoint",
+        "GET",
+        "/api/v1/orders/:encoded",
+        None,
+    );
+    assert_eq!(
+        finding["call_sites"],
+        serde_json::json!(ORDER_SITES),
+        "{finding:#}"
+    );
+    assert_manifest_delta(&payload, "http-route-removed");
+}
+
+/// A handler's body changes and its response type does not.
+#[tokio::test]
+async fn seed_http_handler_body() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-handler-body").await;
+    assert_manifest_delta(&payload, "http-handler-body");
+    assert_quiet(&payload, &["/api/v1/orders"]);
+}
+
+/// A PR that touches no code.
+#[tokio::test]
+async fn seed_non_code_edit() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("non-code-edit").await;
+    assert_manifest_delta(&payload, "non-code-edit");
+    assert!(findings_of(&payload).is_empty(), "{payload:#}");
+}
+
+// ---- Prefixes and procedure routers (rpc-api) -------------------------
+
+/// The prefix a sub-app is mounted under moves: every route under it moves.
+#[tokio::test]
+async fn seed_http_prefix_moved() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-prefix-moved").await;
+    assert_manifest_delta(&payload, "http-prefix-moved");
+}
+
+/// An edit inside a mounted sub-app's handler keeps every route, prefixed.
+#[tokio::test]
+async fn seed_http_edit_under_prefix() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-edit-under-prefix").await;
+    assert_manifest_delta(&payload, "http-edit-under-prefix");
+}
+
+#[tokio::test]
+async fn seed_trpc_procedure_added() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-procedure-added").await;
+    assert_manifest_delta(&payload, "trpc-procedure-added");
+}
+
+#[tokio::test]
+async fn seed_trpc_procedure_removed() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-procedure-removed").await;
+    assert_manifest_delta(&payload, "trpc-procedure-removed");
+}
+
+#[tokio::test]
+async fn seed_trpc_procedure_renamed() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-procedure-renamed").await;
+    assert_manifest_delta(&payload, "trpc-procedure-renamed");
+}
+
+#[tokio::test]
+async fn seed_trpc_resolver_body() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-resolver-body").await;
+    assert_manifest_delta(&payload, "trpc-resolver-body");
+    assert_quiet(&payload, &["orders."]);
+}
+
+/// The adapter's endpoint moves: every procedure moves with it.
+#[tokio::test]
+async fn seed_trpc_adapter_prefix_moved() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-adapter-prefix-moved").await;
+    assert_manifest_delta(&payload, "trpc-adapter-prefix-moved");
+}
+
+/// The procedure's output loses a field the client reads.
+#[tokio::test]
+#[ignore = "carrick#937: no procedure client call is read, so no pair exists to break"]
+async fn seed_trpc_output_field_removed() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-output-field-removed").await;
+    seed_finding_at(&payload, "type_mismatch", "src/web/orders-view.ts:7");
+}
+
 // ---- GraphQL -----------------------------------------------------------
 
 const ORDER_QUERY_SITE: &str = "src/order-query.ts:9";
 
 fn graphql_field_rename(repo: &Path) {
-    edit(
-        repo,
-        "src/schema.graphql",
-        &[("  total: Int!", "  amount: Int!")],
-    );
-    edit(
-        repo,
-        "src/resolvers.ts",
-        &[("  total: number;", "  amount: number;")],
-    );
+    apply_seed(repo, "graphql-field-rename");
 }
 
 /// The removed line sits above the resolver, so the model's answer for the
 /// file moves its resolver line with it.
 fn graphql_field_removal(repo: &Path) {
-    edit(repo, "src/schema.graphql", &[("  currency: String!\n", "")]);
-    edit(repo, "src/resolvers.ts", &[("  currency: string;\n", "")]);
-    edit(
-        repo,
-        "__llm__/analyze-file/resolvers.json",
-        &[("\"resolver_line\": 11", "\"resolver_line\": 10")],
-    );
+    apply_seed(repo, "graphql-field-removal");
 }
 
 /// What holds today: the break is found at the consumer, as a PR's, resolved.
@@ -2491,30 +2693,7 @@ async fn seed_graphql_field_removal_marking() {
 #[tokio::test]
 async fn seed_graphql_root_rename() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/schema.graphql",
-            &[("  order(id: ID!)", "  orderById(id: ID!)")],
-        );
-        edit(
-            repo,
-            "src/resolvers.ts",
-            &[("    order: (_parent", "    orderById: (_parent")],
-        );
-        edit(
-            repo,
-            "__llm__/analyze-file/resolvers.json",
-            &[
-                ("\"field\": \"order\"", "\"field\": \"orderById\""),
-                (
-                    "\"resolver_function\": \"order\"",
-                    "\"resolver_function\": \"orderById\"",
-                ),
-            ],
-        );
-    })
-    .await;
+    let payload = manifest_seed_payload("graphql-root-rename").await;
     seed_finding(
         &payload,
         "missing_endpoint",
@@ -2535,14 +2714,7 @@ fn seed_graphql_root_rename_marking() {
 // ---- Socket events -----------------------------------------------------
 
 async fn socket_field_rename() -> serde_json::Value {
-    seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/realtime.ts",
-            &[("  status: string;", "  state: string;")],
-        )
-    })
-    .await
+    manifest_seed_payload("socket-field-rename").await
 }
 
 #[tokio::test]
@@ -2575,17 +2747,7 @@ async fn seed_socket_field_rename_marking() {
 #[ignore = "carrick#3094: the emitter's inline payload reads unknown, so the pair is unverifiable"]
 async fn seed_socket_field_removal() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/realtime.ts",
-            &[(
-                "{ orderId: update.orderId, carrier: \"post\" }",
-                "{ orderId: update.orderId }",
-            )],
-        )
-    })
-    .await;
+    let payload = manifest_seed_payload("socket-field-removal").await;
     let finding = seed_finding(
         &payload,
         "type_mismatch",
@@ -2599,14 +2761,7 @@ async fn seed_socket_field_removal() {
 #[tokio::test]
 async fn seed_socket_listener_rename() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/realtime.ts",
-            &[("socket.on(\"order:update\"", "socket.on(\"order:changed\"")],
-        )
-    })
-    .await;
+    let payload = manifest_seed_payload("socket-listener-rename").await;
     seed_finding(
         &payload,
         "missing_endpoint",
@@ -2631,14 +2786,7 @@ fn seed_socket_listener_rename_marking() {
 #[tokio::test]
 async fn seed_socket_emit_rename() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/realtime.ts",
-            &[("io.emit(\"order:shipped\"", "io.emit(\"order:dispatched\"")],
-        )
-    })
-    .await;
+    let payload = manifest_seed_payload("socket-emit-rename").await;
     seed_finding(
         &payload,
         "missing_endpoint",
@@ -2668,17 +2816,7 @@ fn seed_socket_emit_rename_marking() {
 #[ignore = "carrick#3089: library-stated pub/sub rows have no type manifest entry, so both pairs are not_compared"]
 async fn seed_pubsub_field_rename() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/events.ts",
-            &[
-                ("  amount: number;", "  total: number;"),
-                ("event.amount", "event.total"),
-            ],
-        )
-    })
-    .await;
+    let payload = manifest_seed_payload("pubsub-field-rename").await;
     let finding = seed_finding(
         &payload,
         "type_mismatch",
@@ -2693,19 +2831,7 @@ async fn seed_pubsub_field_rename() {
 #[ignore = "carrick#3089: library-stated pub/sub rows have no type manifest entry, so both pairs are not_compared"]
 async fn seed_pubsub_field_removal() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/events.ts",
-            &[("{ orderId, carrier: \"post\" }", "{ orderId }")],
-        );
-        edit(
-            repo,
-            "__llm__/analyze-file/events.json",
-            &[(r#""{ orderId, carrier: \"post\" }""#, r#""{ orderId }""#)],
-        );
-    })
-    .await;
+    let payload = manifest_seed_payload("pubsub-field-removal").await;
     let finding = seed_finding(
         &payload,
         "type_mismatch",
@@ -2719,25 +2845,7 @@ async fn seed_pubsub_field_removal() {
 #[tokio::test]
 async fn seed_pubsub_subscriber_rename() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/events.ts",
-            &[(
-                "bus.subscribe(\"payments.settled\"",
-                "bus.subscribe(\"payments.cleared\"",
-            )],
-        );
-        edit(
-            repo,
-            "__llm__/analyze-file/events.json",
-            &[(
-                "\"topic\": \"payments.settled\"",
-                "\"topic\": \"payments.cleared\"",
-            )],
-        );
-    })
-    .await;
+    let payload = manifest_seed_payload("pubsub-subscriber-rename").await;
     seed_finding(
         &payload,
         "missing_endpoint",
@@ -2761,25 +2869,7 @@ fn seed_pubsub_subscriber_rename_marking() {
 #[tokio::test]
 async fn seed_pubsub_publish_rename() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "src/events.ts",
-            &[(
-                "bus.publish(\"orders.shipped\"",
-                "bus.publish(\"orders.dispatched\"",
-            )],
-        );
-        edit(
-            repo,
-            "__llm__/analyze-file/events.json",
-            &[(
-                "\"topic\": \"orders.shipped\"",
-                "\"topic\": \"orders.dispatched\"",
-            )],
-        );
-    })
-    .await;
+    let payload = manifest_seed_payload("pubsub-publish-rename").await;
     seed_finding(
         &payload,
         "missing_endpoint",
@@ -2810,11 +2900,7 @@ fn seed_pubsub_publish_rename_marking() {
 #[tokio::test]
 async fn seed_copied_helper() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        let money = "export function formatMinor(amount: number, currency: string): string {\n  const major = Math.trunc(amount / 100);\n  const minor = String(Math.abs(amount % 100)).padStart(2, \"0\");\n  return `${currency} ${major}.${minor}`;\n}\n";
-        std::fs::write(repo.join("src/money.ts"), money).unwrap();
-    })
-    .await;
+    let payload = manifest_seed_payload("copied-helper").await;
     assert!(
         changed_functions(&payload).contains(&"src/money.ts:formatMinor:added".to_string()),
         "{payload:#}"
@@ -2877,19 +2963,7 @@ async fn seed_dev_only_split() {
 #[tokio::test]
 async fn seed_respell_param() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        let renamed = "app/routes/api.v1.orders.$id.ts";
-        git(repo, &["mv", ORDER_ROUTE, renamed]);
-        edit(
-            repo,
-            renamed,
-            &[
-                ("params: { orderId: string }", "params: { id: string }"),
-                ("params.orderId", "params.id"),
-            ],
-        );
-    })
-    .await;
+    let payload = manifest_seed_payload("respell-param").await;
     assert_delta(&payload, &[], &[]);
     assert!(findings_of(&payload).is_empty(), "{payload:#}");
 }
@@ -2899,12 +2973,7 @@ async fn seed_respell_param() {
 #[tokio::test]
 async fn seed_convention_copy() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        let copy = "app/routes/api.v1.invoices.$invoiceId.ts";
-        std::fs::copy(repo.join(ORDER_ROUTE), repo.join(copy)).unwrap();
-        edit(repo, copy, &[("orderId", "invoiceId")]);
-    })
-    .await;
+    let payload = manifest_seed_payload("convention-copy").await;
     assert!(
         changed_functions(&payload)
             .contains(&"app/routes/api.v1.invoices.$invoiceId.ts:loader:added".to_string()),
@@ -2923,29 +2992,8 @@ async fn seed_convention_copy() {
 #[tokio::test]
 async fn seed_route_moved_within_its_file() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("admin-api", |repo| {
-        edit(
-            repo,
-            "src/admin.ts",
-            &[(
-                "app.get(\"/api/v1/admin/orders\", listOrders);\napp.post(\"/api/v1/admin/orders/:orderId/cancel\", cancelOrder);",
-                "// Cancelling comes first now.\napp.post(\"/api/v1/admin/orders/:orderId/cancel\", cancelOrder);\n\n// The list.\napp.get(\"/api/v1/admin/orders\", listOrders);",
-            )],
-        );
-        // The model's answer moves its lines with the registrations.
-        edit(
-            repo,
-            "__llm__/analyze-file/admin.json",
-            &[
-                ("\"candidate_id\": \"@line:16\",\n      \"line_number\": 16,", "\"candidate_id\": \"@line:20\",\n      \"line_number\": 20,"),
-                (
-                    "\"candidate_id\": \"@line:20\",\n      \"line_number\": 20,\n      \"owner_node\": \"app\",\n      \"method\": \"GET\",\n      \"path\": \"/api/v1/admin/reports",
-                    "\"candidate_id\": \"@line:23\",\n      \"line_number\": 23,\n      \"owner_node\": \"app\",\n      \"method\": \"GET\",\n      \"path\": \"/api/v1/admin/reports",
-                ),
-            ],
-        );
-    })
-    .await;
+    // The seed moves the model's answer's lines with the registrations.
+    let payload = manifest_seed_payload("route-moved-within-its-file").await;
     assert_delta(&payload, &[], &[]);
 }
 
@@ -2954,23 +3002,81 @@ async fn seed_route_moved_within_its_file() {
 #[tokio::test]
 async fn seed_loop_route_edit() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("admin-api", |repo| {
-        edit(
-            repo,
-            "src/admin.ts",
-            &[(
-                "  app.get(`/api/v1/admin/reports/${period}`, report);",
-                "  // One report route per period.\n  app.get(`/api/v1/admin/reports/${period}`, (_request, response) => response.send({ rows: [], period }));",
-            )],
-        );
-        edit(
-            repo,
-            "__llm__/analyze-file/admin.json",
-            &[("\"candidate_id\": \"@line:20\",\n      \"line_number\": 20,", "\"candidate_id\": \"@line:21\",\n      \"line_number\": 21,")],
-        );
-    })
-    .await;
+    let payload = manifest_seed_payload("loop-route-edit").await;
     assert_delta(&payload, &[], &[]);
+}
+
+// ---- Non-HTTP negatives (carrick#3172) ---------------------------------
+//
+// An ordinary change to a GraphQL, socket or pub/sub operation: no risk the
+// PR introduces, and no call left without its producer among the operations
+// it touched. Each guards a protocol before its risks post on a PR.
+
+/// The `OrderView` type gains a nullable field the storefront query does not
+/// read, with its resolver type.
+#[tokio::test]
+async fn seed_graphql_field_added() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("graphql-field-added").await;
+    assert_quiet(&payload, &["order"]);
+    assert_manifest_delta(&payload, "graphql-field-added");
+}
+
+/// A new root query no client calls.
+#[tokio::test]
+async fn seed_graphql_root_added() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("graphql-root-added").await;
+    assert_quiet(&payload, &["order", "orders"]);
+    assert_manifest_delta(&payload, "graphql-root-added");
+}
+
+/// A resolver's body changes and its return type does not.
+#[tokio::test]
+async fn seed_graphql_resolver_body() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("graphql-resolver-body").await;
+    assert_quiet(&payload, &["order"]);
+    assert_manifest_delta(&payload, "graphql-resolver-body");
+}
+
+/// The listener's payload type gains an optional field.
+#[tokio::test]
+async fn seed_socket_listener_field_added() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("socket-listener-field-added").await;
+    assert_quiet(&payload, &["order:update", "order:shipped"]);
+    assert_manifest_delta(&payload, "socket-listener-field-added");
+}
+
+/// A new listener that relays what it hears to every client. No client sends
+/// or hears `order:note` yet: the relay's emit is a call no listener takes,
+/// reported as a gap as `socket-emit-rename`'s is, never as a risk. The
+/// events that were there stay whole.
+#[tokio::test]
+async fn seed_socket_event_added() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("socket-event-added").await;
+    assert_quiet(&payload, &["order:update", "order:shipped"]);
+    let gaps: Vec<_> = findings_of(&payload)
+        .into_iter()
+        .filter(|f| f["path"] == "order:note" && f["kind"] != "orphaned_endpoint")
+        .collect();
+    assert_eq!(gaps.len(), 1, "{payload:#}");
+    assert_eq!(gaps[0]["kind"], "missing_endpoint", "{payload:#}");
+    assert_eq!(gaps[0]["method"], "SERVER->CLIENT", "{payload:#}");
+    assert_manifest_delta(&payload, "socket-event-added");
+}
+
+/// The subscriber's payload type gains an optional field. Until carrick#3089
+/// types library-stated pub/sub rows this passes with no pair compared; it
+/// guards from then on.
+#[tokio::test]
+async fn seed_pubsub_subscriber_field_added() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("pubsub-subscriber-field-added").await;
+    assert_quiet(&payload, &["payments.settled", "orders.shipped"]);
+    assert_manifest_delta(&payload, "pubsub-subscriber-field-added");
 }
 
 /// carrick#3082: a PR that adds a table of `{ method, path }` bookkeeping
