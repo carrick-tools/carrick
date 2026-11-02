@@ -1753,6 +1753,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         }
     }
 

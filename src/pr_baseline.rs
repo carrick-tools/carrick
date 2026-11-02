@@ -152,6 +152,9 @@ pub struct MainSide {
     /// What the PR changed of what each service reads, `None` when there is
     /// no base to compare with (carrick#3170).
     pub untouched: Option<Untouched>,
+    /// Main's pairings, from main's copy matched against the same peers: a
+    /// pairing the PR removed one side of is a break (carrick#3092).
+    pub pairings: Vec<MainPairing>,
 }
 
 /// Which services the PR changed nothing of (carrick#3170): a finding both
@@ -1571,6 +1574,7 @@ mod tests {
             stored: stored_type_sites(std::slice::from_ref(copy)),
             types_judged: true,
             untouched: None,
+            pairings: Vec::new(),
         }
     }
 

@@ -49,6 +49,7 @@ use swc_ecma_visit::VisitWith;
 mod answers_ahead;
 pub mod durability;
 mod pair_settle;
+mod pr_removals;
 mod route_boundaries;
 pub(crate) mod served_paths;
 pub mod service_workers;
@@ -2062,6 +2063,16 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 &main_self_data,
                 &as_uploaded,
             );
+            let removals = if surface_unchanged {
+                pr_removals::Removals::default()
+            } else {
+                pr_removals::Removals::of(
+                    repo_path,
+                    pr_base.as_deref(),
+                    &main_self_data,
+                    &current_services_data,
+                )
+            };
             MainBaselineInput {
                 // The peers are only needed when there is something to run.
                 peers: if surface_unchanged {
@@ -2087,6 +2098,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                         base,
                     }),
                 copy,
+                removals,
             }
         });
 
@@ -2492,7 +2504,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         );
     }
     if let Some(input) = main_baseline_input {
-        mark_findings_on_main(&mut results.findings, input, sidecar).await;
+        let unpaired = crate::pr_baseline::RunUnpaired {
+            calls: std::mem::take(&mut results.unpaired_calls),
+            receivers: std::mem::take(&mut results.unpaired_producers),
+        };
+        mark_findings_on_main(&mut results.findings, input, &unpaired, sidecar).await;
     } else if is_pr_run {
         // Nothing of this repo on main to compare with: say so on each
         // finding, rather than leave the cloud to read it as introduced
@@ -13335,6 +13351,9 @@ struct MainBaselineInput {
     /// Whether main's copy is main as this PR's base has it
     /// (carrick-cloud#1408).
     copy: crate::pr_baseline::MainCopy,
+    /// What the PR removed of main's copy, each placed in its diff or not
+    /// (carrick#3092). Empty when the surface is unchanged.
+    removals: pr_removals::Removals,
 }
 
 /// A pull request's change since its base, for the services of this repo.
@@ -13403,13 +13422,22 @@ fn main_side_timeout() -> std::time::Duration {
 /// and a panic guard: whatever goes wrong there is stated in one line and
 /// every finding says the run could not tell (carrick-cloud#1408). It never
 /// costs the run its PR result.
+///
+/// Main's side also runs when the PR removed an operation or a send main's
+/// copy states (carrick#3092): main's pairings say which of this run's
+/// unpaired calls and receivers lost a pairing the PR removed, and those rows
+/// are marked ([`crate::pr_baseline::mark_lost_pairings`]). The type check
+/// runs only when a finding carries a pairing to compare, so a PR that only
+/// removes runs main's matching without it.
 async fn mark_findings_on_main(
-    findings: &mut [crate::findings::Finding],
+    findings: &mut Vec<crate::findings::Finding>,
     input: MainBaselineInput,
+    unpaired: &crate::pr_baseline::RunUnpaired,
     sidecar: Option<&TypeSidecar>,
 ) {
-    if !crate::pr_baseline::has_anything_to_mark(findings) {
-        debug!("No mismatch to compare with main");
+    let mismatches = crate::pr_baseline::has_anything_to_mark(findings);
+    if !mismatches && input.removals.is_empty() {
+        debug!("No mismatch to compare with main, and nothing main has removed");
         return;
     }
     if input.surface_unchanged {
@@ -13419,6 +13447,10 @@ async fn mark_findings_on_main(
     }
 
     let copy = input.copy;
+    let mut input = input;
+    let removals = std::mem::take(&mut input.removals);
+    let placed_removals = removals.placed();
+    let sidecar = sidecar.filter(|_| mismatches);
     let sp = logging::spinner("Comparing findings with main...");
     let timeout = main_side_timeout();
     let started = std::time::Instant::now();
@@ -13438,7 +13470,26 @@ async fn mark_findings_on_main(
     );
     let failure = match outcome {
         Ok(Ok(Ok(main))) => {
-            crate::pr_baseline::mark_on_main(findings, &main, copy);
+            if mismatches {
+                crate::pr_baseline::mark_on_main(findings, &main, copy);
+            }
+            if !removals.is_empty() {
+                let marked = crate::pr_baseline::mark_lost_pairings(
+                    findings,
+                    &crate::pr_baseline::MainRemovals {
+                        pairings: main.pairings,
+                        operations: removals.operations,
+                        sends: removals.sends,
+                    },
+                    unpaired,
+                    copy,
+                    main.untouched.as_ref(),
+                );
+                info!(
+                    "Removed against main: {marked} row(s) mark a pairing main had that this PR \
+                     lost"
+                );
+            }
             logging::finish_spinner(&sp, "Compared findings with main");
             return;
         }
@@ -13451,7 +13502,18 @@ async fn mark_findings_on_main(
     };
     logging::finish_spinner_warn(&sp, "Could not compare findings with main");
     warn!("Findings are posted as not compared with main: {failure}");
-    crate::pr_baseline::mark_all_unknown(findings, crate::findings::OnMainUnknown::MainSideFailed);
+    if placed_removals > 0 {
+        warn!(
+            "{placed_removals} removal(s) this PR's diff places were not checked against main's \
+             pairings, so no row says the PR broke a caller"
+        );
+    }
+    if mismatches {
+        crate::pr_baseline::mark_all_unknown(
+            findings,
+            crate::findings::OnMainUnknown::MainSideFailed,
+        );
+    }
 }
 
 /// Main's side of the comparison: the same analysis this run's findings came
@@ -13512,6 +13574,7 @@ async fn main_side_findings(
     let mut findings = main_results.findings;
     findings.extend(crate::sdk_edges::type_mismatch_findings(sdk_join.edges()));
     Ok(crate::pr_baseline::MainSide {
+        pairings: pr_removals::main_pairings(&main_results.cross_repo_matches),
         findings,
         recomputed: analyzer.type_sites(),
         stored,

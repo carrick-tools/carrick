@@ -809,6 +809,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
 
         let projection = EvalProjection::from_results(
@@ -878,6 +880,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
 
         let projection = EvalProjection::from_results(
@@ -988,6 +992,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: matches,
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
 
         let manifest = vec![manifest_entry(
@@ -1081,6 +1087,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
 
         let projection = EvalProjection::from_results(
@@ -1136,6 +1144,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
         let own_routes: HashSet<(String, String)> = [(
             "http|GET|/api/items".to_string(),
@@ -1216,6 +1226,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
 
         // A socket emitter is a consumer, so its manifest entry carries the
@@ -1302,6 +1314,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
 
         // Two manifest entries on the SAME canonical key, distinguished only by
@@ -1380,6 +1394,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
         // Request entry FIRST (the manifest order that used to win).
         let manifest = vec![
@@ -1470,6 +1486,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
         let manifest = vec![manifest_entry_at(
             key,
@@ -1551,6 +1569,8 @@ mod tests {
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
+            unpaired_calls: vec![],
+            unpaired_producers: vec![],
         };
         let manifest = vec![
             manifest_entry_at(
