@@ -237,18 +237,16 @@ fn verified_edges<'a>(
             continue;
         }
         let receivers = walk().of(&[placed]);
-        for label in mounts
+        let here: Vec<&ScopeLabel> = mounts
             .iter()
+            .copied()
             .filter(|label| label.member == placed.call.callee)
-        {
+            .collect();
+        let applying = walk().applying(&placed, &here, &receivers);
+        for (label, parents) in here.into_iter().zip(applying) {
             let ScopeBinds::Mounts { arg, key } = &label.binds else {
                 continue;
             };
-            let parents: Vec<InstanceEnd> = receivers
-                .iter()
-                .filter(|end| label.applies_to(end))
-                .cloned()
-                .collect();
             if parents.is_empty() {
                 continue;
             }

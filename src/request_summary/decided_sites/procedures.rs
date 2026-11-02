@@ -640,12 +640,8 @@ impl Pass<'_, '_> {
         if !mount_labels.is_empty() && walk().library_call(file, host.call) {
             let receivers = walk().of(&[host]);
             let mut out: Vec<Result<String, &'static str>> = Vec::new();
-            for label in mount_labels {
-                let applying: Vec<_> = receivers
-                    .iter()
-                    .filter(|end| label.applies_to(end))
-                    .cloned()
-                    .collect();
+            let applying_to = walk().applying(&host, &mount_labels, &receivers);
+            for (label, applying) in mount_labels.into_iter().zip(applying_to) {
                 if applying.is_empty() {
                     continue;
                 }

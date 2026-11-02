@@ -358,18 +358,20 @@ impl<'c, 'a> Collect<'c, 'a> {
                 continue;
             }
             for (host, arg) in hosts {
-                for label in self.scopes.iter().filter(|label| {
+                let labels: Vec<&ScopeLabel> = self.scopes.iter().filter(|label| {
                     label.member == host.call.callee
                         && matches!(label.binds, ScopeBinds::Runs { arg: runs, key: None, .. } if runs == *arg)
-                }) {
+                }).collect();
+                let receivers = self.walk().of(&[*host]);
+                let applying = self.walk().applying(host, &labels, &receivers);
+                for (label, applies) in labels.into_iter().zip(applying) {
                     let ScopeBinds::Runs { param, .. } = label.binds else {
                         continue;
                     };
-                    let ends: Vec<InstanceEnd> = self
-                        .walk()
-                        .of(&[*host])
-                        .into_iter()
-                        .filter(|end| end.hole().is_some() || label.applies_to(end))
+                    let ends: Vec<InstanceEnd> = receivers
+                        .iter()
+                        .filter(|end| end.hole().is_some() || applies.contains(end))
+                        .cloned()
                         .collect();
                     let above = super::composed::aboves(&ends, self.mounts);
                     if unread(&above) {

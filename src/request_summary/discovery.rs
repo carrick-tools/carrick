@@ -4815,6 +4815,40 @@ export function listen(): void {
         );
     }
 
+    /// carrick#3207: the routes package registers its plugin on an app it is
+    /// handed; the host makes that app through the package's `default` export
+    /// while the store labels `register` on the named export alone. The
+    /// host's `register` call records a call-in for the plugin all the same:
+    /// the labels of the app's package verified at the member declaration the
+    /// call resolves to apply to the end, as they do to a scope a service
+    /// opens itself (carrick#3185). The call-in is what the plugin's route
+    /// segments join at.
+    #[test]
+    fn a_plugin_registered_on_an_app_made_through_the_other_export_records_its_call_in() {
+        use super::super::decided_sites::ScopeLabel;
+        let Some((on, exports, declarations)) = traced_fixture_in(
+            "receiver-scopes-default-export",
+            "packages/server",
+            "server",
+        ) else {
+            return;
+        };
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let lines = boundary_lines(&decided.boundaries);
+        let call_ins: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("call_in "))
+            .collect();
+        assert_eq!(
+            call_ins,
+            vec![
+                "call_in packages/routes/src/index.ts:11 p0 at packages/server/src/main.ts:8 [-] <- (top)"
+            ],
+            "{lines:#?}"
+        );
+    }
+
     /// carrick#2474 R2b on carrick#2325's tree (`d565a091`, its instances
     /// typed against a made-up plugin-server package): each route takes
     /// the prefix of every plugin scope above it, with an empty model

@@ -1049,40 +1049,9 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             self.push(at, scope);
             return true;
         }
-        // An instance of an export no label names (the app `default` makes,
-        // where the store labels the scope on the named export of the same
-        // factory) opens the scope whose verdict names the member
-        // declaration the call resolves to (carrick#3185): the labels of its
-        // package verified there, where every one binds the same way.
-        let declared = self.declaration_of(host);
-        let by_declaration: Vec<Option<usize>> = parents
-            .iter()
-            .map(|end| {
-                if labels.iter().any(|label| label.applies_to(end)) {
-                    return None;
-                }
-                let (package, _, _) = identity(end)?;
-                let declared = declared.as_ref()?;
-                let matched: Vec<usize> = (0..labels.len())
-                    .filter(|&at| {
-                        labels[at].package == package
-                            && labels[at].verified_at(declared).next().is_some()
-                    })
-                    .collect();
-                let (&first, rest) = matched.split_first()?;
-                rest.iter()
-                    .all(|&other| labels[other].binds_as(labels[first]))
-                    .then_some(first)
-            })
-            .collect();
+        let applying = self.applying(host, &labels, &parents);
         let mut opened = false;
-        for (index, label) in labels.into_iter().enumerate() {
-            let applies: Vec<InstanceEnd> = parents
-                .iter()
-                .zip(&by_declaration)
-                .filter(|(end, declared)| label.applies_to(end) || **declared == Some(index))
-                .map(|(end, _)| end.clone())
-                .collect();
+        for (label, applies) in labels.into_iter().zip(applying) {
             let Some((package, export, receiver)) = applies.first().and_then(identity) else {
                 continue;
             };
@@ -1184,6 +1153,56 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         let parents = self.nested().with_host(here).of(&[*host]);
         self.index.parents.borrow_mut().insert(key, parents.clone());
         parents
+    }
+
+    /// For each of `labels` (the labels of `host`'s member), the `ends` of
+    /// `host`'s receiver it applies to: those of the export it names, else,
+    /// for an end of an export no label names (the app `default` makes,
+    /// where the store labels the scope on the named export of the same
+    /// factory), the one label of the end's package whose verdict names the
+    /// member declaration the call resolves to, where every label verified
+    /// there binds the same way (carrick#3185, carrick#3207). Every gate
+    /// that reads a scope label against a call's receiver (the scope a call
+    /// opens, the call-ins at a join point, mount edges, adapter mounts)
+    /// asks here, so none keeps its own copy of the rule.
+    pub(super) fn applying(
+        &self,
+        host: &Placed<'_>,
+        labels: &[&ScopeLabel],
+        ends: &[InstanceEnd],
+    ) -> Vec<Vec<InstanceEnd>> {
+        let declared = self.declaration_of(host);
+        let by_declaration: Vec<Option<usize>> = ends
+            .iter()
+            .map(|end| {
+                if labels.iter().any(|label| label.applies_to(end)) {
+                    return None;
+                }
+                let (package, _, _) = identity(end)?;
+                let declared = declared.as_ref()?;
+                let matched: Vec<usize> = (0..labels.len())
+                    .filter(|&at| {
+                        labels[at].package == package
+                            && labels[at].verified_at(declared).next().is_some()
+                    })
+                    .collect();
+                let (&first, rest) = matched.split_first()?;
+                rest.iter()
+                    .all(|&other| labels[other].binds_as(labels[first]))
+                    .then_some(first)
+            })
+            .collect();
+        labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                ends.iter()
+                    .zip(&by_declaration)
+                    .filter(|(end, declared)| label.applies_to(end) || **declared == Some(index))
+                    .map(|(end, _)| end.clone())
+                    .collect()
+            })
+            .collect()
     }
 
     /// The member declaration (`decl_file`, `decl_line`) `host`'s call

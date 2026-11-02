@@ -1,0 +1,8 @@
+{
+  "name": "receiver-scopes-default-export-mount",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-mount-server": "^1.0.0"
+  }
+}
