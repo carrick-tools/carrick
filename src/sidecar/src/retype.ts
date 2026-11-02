@@ -39,6 +39,7 @@ import {
 import { statesNoBody } from './capture/index.js';
 import { lineIndex } from './line-index.js';
 import { typeToStringAsDeclared } from './print-type.js';
+import { typeArgumentOnlySelects } from './retype-selector.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
 import type {
   InferRequestItem,
@@ -46,6 +47,7 @@ import type {
   RetypeItem,
   RetypeLocatorItem,
   RetypeOutcome,
+  RetypePrescreen,
 } from './types.js';
 
 /** Names appended to a file that is not ours carry this prefix. */
@@ -219,13 +221,19 @@ export class Retyper {
    * program. A call that throws here is left to the retype, which reports
    * the failure itself.
    */
-  prescreen(items: RetypeLocatorItem[]): Array<string | undefined> {
+  prescreen(items: RetypeLocatorItem[]): Array<Omit<RetypePrescreen, 'item_id'>> {
     return items.map((item) => {
       try {
         const found = this.beforeRewrite(item);
-        return typeof found === 'string' ? found : undefined;
+        if (typeof found === 'string') return { reason: found };
+        // carrick#3158: no producer type is read here, so this is only the
+        // reason the retype would give for ANY object type literal; the
+        // scanner applies it when the producer's type is one.
+        return typeArgumentOnlySelects(found.call)
+          ? { fresh_type_reason: this.notReachedReason(found.call) }
+          : {};
       } catch {
-        return undefined;
+        return {};
       }
     });
   }
@@ -532,8 +540,7 @@ export class Retyper {
     const stated = call.getTypeArguments()[0]?.getType();
     if (!stated) return 'the retyped call carries no type argument';
     const checker = this.project.getTypeChecker().compilerObject;
-    const returned = call.getType().compilerType;
-    const result = checker.getAwaitedType(returned) ?? returned;
+    const result = this.resultOf(call);
     const target = stated.compilerType;
     if (result === target) return true;
     const reference = result as ts.TypeReference;
@@ -548,9 +555,27 @@ export class Retyper {
     for (const property of checker.getPropertiesOfType(result)) {
       if (checker.getTypeOfSymbolAtLocation(property, call.compilerNode) === target) return true;
     }
+    return this.notReachedReason(call);
+  }
+
+  /** What the call yields once awaited: the type the reach test compares. */
+  private resultOf(call: CallExpression): ts.Type {
+    const checker = this.project.getTypeChecker().compilerObject;
+    const returned = call.getType().compilerType;
+    return checker.getAwaitedType(returned) ?? returned;
+  }
+
+  /**
+   * The abstention for a call whose type argument is not in its result. The
+   * one place the sentence is built: the reach test gives it after the
+   * rewrite, and the prescreen gives it before one (carrick#3158), so the two
+   * can never word it differently.
+   */
+  private notReachedReason(call: CallExpression): string {
+    const checker = this.project.getTypeChecker().compilerObject;
     return (
       "the call's type argument does not reach its result " +
-      `('${checker.typeToString(result)}'), so it does not state the response`
+      `('${checker.typeToString(this.resultOf(call))}'), so it does not state the response`
     );
   }
 }

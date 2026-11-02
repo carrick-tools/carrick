@@ -63,6 +63,7 @@ import type {
   InferResponse,
   ResolveDefinitionsResponse,
   RetypeCheckResponse,
+  RetypePrescreen,
   RetypePrescreenResponse,
   VerifyClientSemanticsResponse,
   VerifyLibraryClaimsResponse,
@@ -718,22 +719,21 @@ function handleRetypePrescreen(
       request.items.map((item, index) => ({ item, index })),
       ({ item }) => item.file_path
     );
-    const reasons = new Array<string | undefined>(request.items.length);
+    const answers = new Array<Omit<RetypePrescreen, 'item_id'>>(request.items.length);
     for (const [key, entries] of groups) {
       projectComponents(key)
         .retyper.prescreen(entries.map(({ item }) => item))
-        .forEach((reason, position) => {
-          reasons[entries[position].index] = reason;
+        .forEach((answer, position) => {
+          answers[entries[position].index] = answer;
         });
     }
     return {
       request_id: request.request_id,
       status: 'success',
-      prescreens: request.items.map((item, index) =>
-        reasons[index] === undefined
-          ? { item_id: item.item_id }
-          : { item_id: item.item_id, reason: reasons[index] }
-      ),
+      prescreens: request.items.map((item, index) => ({
+        item_id: item.item_id,
+        ...answers[index],
+      })),
     };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
