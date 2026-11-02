@@ -66,7 +66,7 @@ use tracing::{debug, info};
 
 use super::durability::ModelSetup;
 use super::walk_lane::WalkEnded;
-use super::{CACHE_VERSION, PreviousGeneration, SettledDetection, SetupHashes, guidance_is_keyed};
+use super::{CACHE_VERSION, PreviousGeneration, SettledDetection, guidance_is_keyed};
 use crate::agents::framework_guidance_agent::ProtocolGuidance;
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
@@ -924,6 +924,7 @@ async fn answer_asked_ahead<Answer>(ahead: Option<Slot<Answer>>, wanted: &str) -
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::super::SetupHashes;
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
