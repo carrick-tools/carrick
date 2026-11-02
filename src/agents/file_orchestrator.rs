@@ -5005,6 +5005,27 @@ impl FileOrchestrator {
                 }
             }
         }
+        // TEMP-DEBUG-1029
+        for ((file_path, line_number), rows) in &by_line {
+            if file_path.ends_with("seo.ts") && (550..560).contains(line_number) {
+                debug!("DEBUG1029 row {file_path}:{line_number} {rows:?}");
+            }
+        }
+        for request in requests.iter() {
+            if request.file_path.ends_with("seo.ts") && (550..560).contains(&request.line_number) {
+                debug!(
+                    "DEBUG1029 request {}:{} {:?} {:?} shared={}",
+                    request.file_path,
+                    request.line_number,
+                    request.infer_kind,
+                    request.alias,
+                    request
+                        .alias
+                        .as_ref()
+                        .is_some_and(|a| shared.contains_key(a))
+                );
+            }
+        }
         crate::services::type_sidecar::mark_shared_route_lines(requests, &shared)
     }
 
