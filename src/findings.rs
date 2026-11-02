@@ -94,8 +94,7 @@ impl EdgeSource {
     /// - otherwise, every row stated by a deterministic pass (and at least one
     ///   row) -> `Fact`;
     /// - otherwise `None`: a row that recorded no source at all (an older
-    ///   peer blob, or a row built outside the emit/join phase — the GraphQL,
-    ///   socket and scanner-read pub/sub rows are in that set today) leaves
+    ///   peer blob, or a row built outside the emit/join phase) leaves
     ///   the fold unable to claim `Fact`, and claiming `Candidate` off a
     ///   silence would demote deterministic rows that simply do not carry the
     ///   field.
@@ -2004,6 +2003,27 @@ mod tests {
             "a row that stated no source cannot be claimed as a fact"
         );
         assert_eq!(EdgeSource::fold([]), None, "no rows, nothing to state");
+    }
+
+    /// carrick#3091: the pass-named sources of GraphQL, socket and bus rows are
+    /// facts; one model row among them still makes the pairing a candidate.
+    #[test]
+    fn protocol_pass_sources_fold_to_fact() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::{
+            EventBus, GraphqlDocument, GraphqlSchema, Model, SocketCall,
+        };
+
+        for pair in [
+            [Some(GraphqlSchema), Some(GraphqlDocument)],
+            [Some(SocketCall), Some(SocketCall)],
+            [Some(EventBus), Some(EventBus)],
+        ] {
+            assert_eq!(EdgeSource::fold(pair), Some(EdgeSource::Fact));
+        }
+        assert_eq!(
+            EdgeSource::fold([Some(GraphqlSchema), Some(Model)]),
+            Some(EdgeSource::Candidate)
+        );
     }
 
     /// `view_module` rides an orphaned endpoint only when true, so the common

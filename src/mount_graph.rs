@@ -197,7 +197,13 @@ impl ConsumerRole {
             | S::ClassController
             | S::DecoratorRoute
             | S::DeclaredOperation
-            | S::LibraryClaim => None,
+            | S::LibraryClaim
+            // The GraphQL, socket and bus passes (carrick#3091) state
+            // non-HTTP rows, which no HTTP call role describes.
+            | S::GraphqlSchema
+            | S::GraphqlDocument
+            | S::SocketCall
+            | S::EventBus => None,
         }
     }
 }

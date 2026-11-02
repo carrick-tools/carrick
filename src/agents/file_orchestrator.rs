@@ -1722,6 +1722,10 @@ impl ResolutionSource {
             | Self::ClassController
             | Self::DecoratorRoute
             | Self::ReceiverType => 1,
+            // The GraphQL, socket and bus passes (carrick#3091) read their own
+            // rows and never claim an HTTP call site, so they do not compete;
+            // ranked with the route sources, which also never share a site.
+            Self::GraphqlSchema | Self::GraphqlDocument | Self::SocketCall | Self::EventBus => 1,
             Self::InlineLiteral | Self::Model => 0,
             // Never arbitrated here: a declared operation (carrick#831) is
             // not a statement about a call SITE, so it never competes for one.

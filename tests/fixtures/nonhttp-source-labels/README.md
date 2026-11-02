@@ -17,7 +17,7 @@ by the scanner's own passes. No package is installed.
 | `pubsub\|orders.cancelled` | endpoints | `src/orders.ts:10` | absent | `route` | the scanner backfilled it into the model's list; it is not the model's |
 | `pubsub\|orders.shipped` | endpoints | `src/orders.ts:15` | absent | `route` | as above; on the `.subscribe(` line, not the `await client` line |
 | `pubsub\|payments.settled` | endpoints | `src/mocks/broker.ts:5` | absent | `mock` | a producer under a mock tree |
-| `socket\|CLIENT->SERVER\|chat:send` | endpoints | `src/realtime.ts:7` | absent | `route` | on the `.on(` line; the event pass leaves the span to it |
+| `socket\|CLIENT->SERVER\|chat:send` | endpoints | `src/realtime.ts:7` | `socket_call` | `route` | on the `.on(` line; the event pass leaves the span to it. Newly stated (carrick#3091): the socket pass names itself, no fixture edit |
 
 No `pubsub|chat:send` row: the socket listener claims its span.
 

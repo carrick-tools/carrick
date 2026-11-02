@@ -146,7 +146,7 @@ fn expected() -> Vec<Row> {
             "endpoints",
             "socket|client_to_server|chat:send",
             "src/realtime.ts:7",
-            None,
+            Some("socket_call"),
             "route",
         ),
     ];
@@ -154,8 +154,8 @@ fn expected() -> Vec<Row> {
     rows
 }
 
-/// The model's row says `model`; the rows the scanner's passes read state no
-/// source; a producer under a mock tree is tagged; a chained call sits on its
+/// The model's row says `model`; the socket pass's row says `socket_call`
+/// (carrick#3091); the rows the scanner backfilled state no source; a producer under a mock tree is tagged; a chained call sits on its
 /// method's line; a socket listener is not also a pub/sub row.
 #[test]
 fn each_row_states_its_source_provenance_and_line() {

@@ -667,13 +667,18 @@ mod tests {
             LibraryClaim,
             Model,
             DeclaredOperation,
+            GraphqlSchema,
+            GraphqlDocument,
+            SocketCall,
+            EventBus,
         ];
         for source in &all {
             match source {
                 RequestSpec | SameFileWrapper | ImportedMember | RequestSummary | WholeUrlEnv
                 | EnvBasePath | LiteralBasePath | NewUrl | FileBasedRoute | DescriptorRoute
                 | ClassController | DecoratorRoute | ReceiverType | InlineLiteral
-                | LibraryClaim | Model | DeclaredOperation => {}
+                | LibraryClaim | Model | DeclaredOperation | GraphqlSchema | GraphqlDocument
+                | SocketCall | EventBus => {}
             }
         }
         all

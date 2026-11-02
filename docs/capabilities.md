@@ -61,7 +61,12 @@ Every row, and every pairing of rows, carries a source (`EdgeSource`,
   keeps `status` at `partially_checked` or `unresolved`
   (`carrick-cloud/lambdas/mcp-server/src/tools/check-compat.ts:385`, tool
   description of `check_compatibility`).
-- A row with no stated source is read as not stated, never as candidate.
+- A row with no stated source is read as not stated, never as candidate. A
+  GraphQL field or operation the schema or a client document states, a socket
+  listener or emitter the socket pass reads, and an in-process bus publish or
+  subscribe state their pass (`graphql_schema`, `graphql_document`,
+  `socket_call`, `event_bus`), so a mismatch on them reaches the PR check as a
+  fact (carrick#3091).
 
 ## 4. Not covered
 
