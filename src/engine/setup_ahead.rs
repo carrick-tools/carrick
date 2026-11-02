@@ -66,7 +66,7 @@ use tracing::{debug, info};
 
 use super::durability::ModelSetup;
 use super::walk_lane::WalkEnded;
-use super::{CACHE_VERSION, PreviousGeneration, SettledDetection, guidance_is_keyed};
+use super::{CACHE_VERSION, PreviousGeneration, SettledDetection, SetupHashes, guidance_is_keyed};
 use crate::agents::framework_guidance_agent::ProtocolGuidance;
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
@@ -179,10 +179,10 @@ impl StoredSetup {
     /// cached guidance, from this cache version and these manifests. A
     /// complete generation returns `None`: the incremental branch reuses it
     /// whole, and a full analysis asks again as it always has.
-    pub(super) fn kept(&self, package_json_hash: &str) -> Option<SettledDetection> {
+    pub(super) fn kept(&self, hashes: &super::SetupHashes) -> Option<SettledDetection> {
         if self.guidance.as_ref().is_some_and(guidance_is_keyed)
             || self.cache_version != Some(CACHE_VERSION)
-            || self.package_json_hash.as_deref() != Some(package_json_hash)
+            || !hashes.match_stored(self.package_json_hash.as_deref())
         {
             return None;
         }
@@ -193,7 +193,7 @@ impl StoredSetup {
     }
 
     /// What the incremental branch does with this generation under the
-    /// manifests that hash to `package_json_hash`: replay its setup when it
+    /// manifests that hash to `hashes`: replay its setup when it
     /// holds one from this cache version and those manifests, otherwise ask.
     /// The one decision, read by that branch and by the queue.
     ///
@@ -205,10 +205,10 @@ impl StoredSetup {
     /// `Reuse` the queue asks nothing: if git then cannot compare the tree,
     /// the full analysis asks for itself as before, and the cloud answers
     /// from what it kept.
-    pub(super) fn decide(self, package_json_hash: &str) -> SetupAsk {
-        let kept = self.kept(package_json_hash);
+    pub(super) fn decide(self, hashes: &super::SetupHashes) -> SetupAsk {
+        let kept = self.kept(hashes);
         let replayable = self.cache_version == Some(CACHE_VERSION)
-            && self.package_json_hash.as_deref() == Some(package_json_hash);
+            && hashes.match_stored(self.package_json_hash.as_deref());
         match (self.detection, self.guidance) {
             (Some(detection), Some(guidance)) if replayable && guidance_is_keyed(&guidance) => {
                 SetupAsk::Reuse {
@@ -613,7 +613,7 @@ fn quietly<Read>(read: impl FnOnce() -> Read) -> Read {
 fn read_ask(repo_path: &str, service: ServiceAhead) -> Option<(String, AskAhead)> {
     let packages = super::load_packages_for_service(repo_path, &service.config).ok()?;
     let canonical = super::canonical_repo_path(repo_path);
-    let package_json_hash = super::hash_workspace_package_jsons(&packages, &canonical).ok()?;
+    let package_json_hash = super::workspace_setup_hashes(&packages, &canonical).ok()?;
     let settled = match service.stored {
         None => None,
         Some(stored) => match stored.decide(&package_json_hash) {
@@ -1411,15 +1411,90 @@ pub(crate) mod tests {
             ..complete()
         };
         assert!(matches!(
-            stored.decide(&hash_of("1.0.1")),
+            stored.decide(&SetupHashes::just(&hash_of("1.0.1"))),
             SetupAsk::Reuse { .. }
+        ));
+    }
+
+    /// The two hashes of the manifest `text`, as a scan of a service holding
+    /// only that `package.json` computes them.
+    fn hashes_of(text: &str) -> SetupHashes {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), text).unwrap();
+        let packages =
+            crate::packages::Packages::new(vec![dir.path().join("package.json")]).unwrap();
+        crate::engine::workspace_setup_hashes(&packages, dir.path().to_str().unwrap()).unwrap()
+    }
+
+    fn stored_under(hash: &str) -> StoredSetup {
+        StoredSetup {
+            package_json_hash: Some(hash.to_string()),
+            ..complete()
+        }
+    }
+
+    const VERSIONED: &str =
+        r#"{ "name": "cli", "version": "1.0.0", "dependencies": { "x": "^1" } }"#;
+
+    /// carrick#2568 one-time change of hash: a setup stored with the bytes
+    /// hash (every blob written before it) is replayed for the same manifest,
+    /// whole and kept alike, and the manifest's new hash is the one written.
+    #[test]
+    fn a_setup_stored_under_the_legacy_hash_is_replayed_for_an_unchanged_manifest() {
+        let now = hashes_of(VERSIONED);
+        assert_ne!(
+            now.current, now.legacy,
+            "a versioned manifest hashes two ways"
+        );
+        let stored = stored_under(&now.legacy);
+        assert!(matches!(
+            stored.clone().decide(&now),
+            SetupAsk::Reuse { .. }
+        ));
+        let deferred = StoredSetup {
+            guidance: None,
+            ..stored
+        };
+        assert!(deferred.kept(&now).is_some(), "a kept detection is kept");
+    }
+
+    #[test]
+    fn a_setup_stored_under_the_new_hash_is_replayed_after_a_version_bump() {
+        let stored = stored_under(&hashes_of(VERSIONED).current);
+        let bumped = hashes_of(&VERSIONED.replace("1.0.0", "1.0.1"));
+        assert!(matches!(stored.decide(&bumped), SetupAsk::Reuse { .. }));
+    }
+
+    #[test]
+    fn a_dependency_change_asks_again_under_either_stored_hash() {
+        let before = hashes_of(VERSIONED);
+        let changed = hashes_of(&VERSIONED.replace("\"x\": \"^1\"", "\"x\": \"^2\""));
+        for stored in [&before.current, &before.legacy] {
+            assert!(matches!(
+                stored_under(stored).decide(&changed),
+                SetupAsk::Ask(None)
+            ));
+        }
+    }
+
+    #[test]
+    fn an_unversioned_manifest_has_one_hash_and_matches_as_before() {
+        let now = hashes_of(r#"{ "name": "cli", "dependencies": { "x": "^1" } }"#);
+        assert_eq!(now.current, now.legacy);
+        assert!(matches!(
+            stored_under(&now.current).decide(&now),
+            SetupAsk::Reuse { .. }
+        ));
+        assert!(matches!(
+            stored_under("something else").decide(&now),
+            SetupAsk::Ask(None)
         ));
     }
 
     /// What `stored` is asked under [`MANIFESTS`]: `None` when its setup is
     /// replayed, otherwise whether a kept detection goes with the ask.
     fn asked(stored: StoredSetup) -> Option<Option<DetectionResult>> {
-        match stored.decide(MANIFESTS) {
+        match stored.decide(&SetupHashes::just(MANIFESTS)) {
             SetupAsk::Reuse { .. } => None,
             SetupAsk::Ask(settled) => Some(settled.map(|settled| settled.detection)),
         }
@@ -1439,7 +1514,7 @@ pub(crate) mod tests {
                 package_json_hash: Some("other manifests".to_string()),
                 ..complete()
             }
-            .decide(MANIFESTS),
+            .decide(&SetupHashes::just(MANIFESTS)),
             SetupAsk::Ask(None)
         ));
         // Written by another cache version: a full analysis, which asks all.
@@ -1448,7 +1523,7 @@ pub(crate) mod tests {
                 cache_version: Some(CACHE_VERSION - 1),
                 ..complete()
             }
-            .decide(MANIFESTS),
+            .decide(&SetupHashes::just(MANIFESTS)),
             SetupAsk::Ask(None)
         ));
         // Its guidance was deferred: the detection is kept, guidance asked.
@@ -1466,7 +1541,7 @@ pub(crate) mod tests {
                 guidance: Some(crate::local_mode::offline_guidance()),
                 ..complete()
             }
-            .decide(MANIFESTS),
+            .decide(&SetupHashes::just(MANIFESTS)),
             SetupAsk::Ask(Some(_))
         ));
         // Its detection was deferred: all of it is asked.
@@ -1476,7 +1551,7 @@ pub(crate) mod tests {
                 guidance: None,
                 ..complete()
             }
-            .decide(MANIFESTS),
+            .decide(&SetupHashes::just(MANIFESTS)),
             SetupAsk::Ask(None)
         ));
     }
@@ -1641,7 +1716,7 @@ pub(crate) mod tests {
         let (identity, ask) =
             read_ask(&repo_path, ahead(Some(deferred.clone()))).expect("its guidance is owed");
 
-        let kept = deferred.kept(&hash);
+        let kept = deferred.kept(&SetupHashes::just(&hash));
         assert!(kept.is_some());
         assert_eq!(ask.import_facts, ImportSample::default());
         assert_eq!(
