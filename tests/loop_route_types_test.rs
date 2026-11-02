@@ -75,7 +75,11 @@ fn line_of(needle: &str) -> i32 {
 /// value is the payload, and the response is asked as the handler's return.
 fn endpoint(path: &str, needle: &str, returned: &str, returns_value: bool) -> EndpointResult {
     let line = line_of(needle);
-    assert_eq!(line_of(returned), line, "{returned} is on the route's line");
+    let route_line = ROUTES_TS.lines().nth(line as usize - 1).unwrap_or_default();
+    assert!(
+        route_line.contains(returned),
+        "{returned} is on the route's line"
+    );
     EndpointResult {
         handler_declaration_line: returns_value.then_some(line as u32),
         registration_literal: None,
