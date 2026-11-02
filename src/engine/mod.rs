@@ -4479,6 +4479,20 @@ fn hash_file_content(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// What a setup-hash input contributes. A `package.json` that states a
+/// top-level `version` contributes its other keys alone, so a release bump
+/// asks no setup again (carrick#2568, #3126); every other input contributes
+/// its bytes, so unversioned manifests hash as they always did.
+fn manifest_hash_text(path: &Path, content: &str) -> String {
+    if path.file_name().is_some_and(|name| name == "package.json")
+        && let Some((_, rest)) = crate::change_scope::split_version(content)
+        && let Ok(rest) = serde_json::to_string(&rest)
+    {
+        return rest;
+    }
+    content.to_string()
+}
+
 /// Hash discovered manifests and Deno resolution inputs (sorted by relative path)
 /// for the detection/guidance/extraction-config cache gate. The artifacts
 /// behind the gate are generated from the MERGED dependency set, so the gate
@@ -4536,7 +4550,7 @@ fn hash_workspace_package_jsons(
         combined.push('\0');
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                combined.push_str(&content);
+                combined.push_str(&manifest_hash_text(path, &content));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 combined.push_str("missing")
@@ -14436,6 +14450,39 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             hash_workspace_package_jsons(&packages, dir.path().to_str().unwrap()).unwrap(),
             hash_file_content("package.json\0{}\0")
         );
+    }
+
+    fn hash_of_manifest(text: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), text).unwrap();
+        let packages = Packages::new(vec![dir.path().join("package.json")]).unwrap();
+        hash_workspace_package_jsons(&packages, dir.path().to_str().unwrap()).unwrap()
+    }
+
+    const VERSIONED: &str =
+        r#"{ "name": "cli", "version": "1.0.0", "dependencies": { "x": "^1" } }"#;
+
+    /// carrick#2568: a release bump asks no setup again.
+    #[test]
+    fn a_version_bump_leaves_the_manifest_hash_alone() {
+        let bumped = VERSIONED.replace("1.0.0", "1.0.1");
+        assert_eq!(hash_of_manifest(VERSIONED), hash_of_manifest(&bumped));
+        let added = VERSIONED.replace("\"x\": \"^1\"", "\"x\": \"^1\", \"y\": \"^2\"");
+        assert_ne!(hash_of_manifest(VERSIONED), hash_of_manifest(&added));
+    }
+
+    #[test]
+    fn a_manifest_without_a_readable_version_hashes_from_its_bytes() {
+        for text in [
+            r#"{ "name": "cli" }"#,
+            r#"{ "name": "cli", "dependencies": {} }"#,
+        ] {
+            assert_eq!(
+                hash_of_manifest(text),
+                hash_file_content(&format!("package.json\0{text}\0")),
+                "{text}"
+            );
+        }
     }
 
     /// A tree reached through a symlink hashes as the tree itself, whichever

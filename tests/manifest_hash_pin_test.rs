@@ -2,6 +2,9 @@
 //! guidance and extraction config are replayed on. A scan that computes
 //! another hash for the same tree asks for all three again, for every
 //! service, so the hash for each way of naming the root is pinned here.
+//! A `package.json` that states a top-level `version` hashes without it
+//! (carrick#2568); the manifests pinned here state none, so they still hash
+//! from their bytes.
 //!
 //! The expected values are what the released 0.3.114 binary wrote for this
 //! tree (darwin-arm64 build, sha256

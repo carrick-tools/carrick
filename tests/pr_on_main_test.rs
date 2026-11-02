@@ -3404,3 +3404,77 @@ async fn reach_off_takes_no_types_from_main() {
     let (_, dump) = reach_of(edit_legacy).await;
     assert!(dump.get("kept_main_types").is_none(), "{dump:#}");
 }
+
+/// What `npm version` rewrites: the manifest's and the lockfile's own
+/// `version` (the lockfile names it at the top and under `packages[""]`).
+fn bump_own_version(repo: &Path) {
+    edit(
+        repo,
+        "package.json",
+        &[("\"version\": \"1.0.0\"", "\"version\": \"1.0.1\"")],
+    );
+    edit(
+        repo,
+        "package-lock.json",
+        &[("\"version\": \"1.0.0\"", "\"version\": \"1.0.1\"")],
+    );
+}
+
+/// carrick#3126: a release bump moves no package, so it re-types nothing a
+/// source edit outside the program does not reach, and asks no setup again
+/// (carrick#2568).
+#[tokio::test]
+async fn reach_a_version_bump_keeps_reach() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        bump_own_version(repo);
+        edit_legacy(repo);
+    })
+    .await;
+    let (reached, unreached) = reached_protocols(&dump);
+    assert!(reached.is_empty(), "{dump:#}");
+    assert!(!unreached.is_empty(), "{dump:#}");
+    let aliases = dump["decided"]["aliases"].as_array().unwrap().len();
+    assert_eq!(dump["kept_main_types"], aliases, "{dump:#}");
+}
+
+/// A bump that also adds a dependency moves a package: whole. The reason is
+/// not pinned: the manifest hash moves, so the setup is asked again, and
+/// `setup_differs` is read before `repo_input`.
+#[tokio::test]
+async fn reach_a_version_bump_with_a_new_dependency_stays_whole() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        bump_own_version(repo);
+        edit(
+            repo,
+            "package.json",
+            &[(
+                "\"zod\": \"^3.22.0\"",
+                "\"zod\": \"^3.22.0\",\n    \"left-pad\": \"^1.3.0\"",
+            )],
+        );
+        edit_legacy(repo);
+    })
+    .await;
+    assert_eq!(dump["decided"]["decision"], "whole", "{dump:#}");
+    assert!(dump.get("kept_main_types").is_none(), "{dump:#}");
+}
+
+/// A bump of a package the service loads stays whole: this harness runs no
+/// scope plan, so only the move itself is read.
+#[tokio::test]
+async fn reach_a_lockfile_move_of_a_loaded_package_stays_whole() {
+    let _serial = SERIAL.lock().await;
+    let (_, dump) = reach_of(|repo| {
+        edit(
+            repo,
+            "package-lock.json",
+            &[("\"version\": \"2.4.1\"", "\"version\": \"2.4.2\"")],
+        );
+        edit_legacy(repo);
+    })
+    .await;
+    assert_eq!(whole_reason(&dump), "repo_input");
+    assert_eq!(dump["decided"]["whole_by"], "package-lock.json", "{dump:#}");
+}

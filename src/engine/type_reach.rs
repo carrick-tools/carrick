@@ -6,7 +6,10 @@
 //! re-typed whole or only in part: [`ReachDecision::Whole`] with the reason,
 //! or [`ReachDecision::Partial`] with the aliases the change reaches and the
 //! ones it cannot. Every reason to re-type whole fails closed: a missed type
-//! is a missed break.
+//! is a missed break. A changed repo input (a manifest, a lockfile, a
+//! `.gitignore`) is one such reason unless it moves nothing the service
+//! types: the scope plan's rulings (`change_scope::RuledOut`) or a change
+//! that moves no package keep reach (carrick#3126).
 //!
 //! The decision is logged, dumped (`CARRICK_TYPE_REACH_DUMP`) and kept for
 //! the run (`type_compat_v2::record_type_reach`). Nothing acts on it yet:
@@ -102,6 +105,10 @@ pub(crate) struct Decided {
     /// R: the walk's reached files and every changed path.
     pub reached_files: BTreeSet<String>,
     pub aliases: Vec<AliasReach>,
+    /// The repo input (relative to the top level) that decided `repo_input`,
+    /// so a `.gitignore` miss and a manifest miss read apart in the dump.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whole_by: Option<String>,
 }
 
 impl Decided {
@@ -111,6 +118,7 @@ impl Decided {
             changed: Vec::new(),
             reached_files: BTreeSet::new(),
             aliases: Vec::new(),
+            whole_by: None,
         }
     }
 
@@ -276,6 +284,9 @@ pub(crate) trait Walker {
     fn before(&self, top: &str) -> Option<String>;
     /// The text of `path` (relative to the scan root) in the working tree.
     fn after(&self, path: &str) -> String;
+    /// Whether the manifests and lockfiles changed since main's commit move
+    /// no package in any install root (carrick#3126).
+    fn moves_no_package(&self) -> bool;
     /// The sidecar's `reach` over main's graph.
     fn walk(
         &self,
@@ -359,11 +370,33 @@ pub(crate) fn decide(inputs: &Inputs<'_>, walker: &dyn Walker) -> Decided {
         Ok(changed) => changed,
         Err(_) => return Decided::whole("changes_unread"),
     };
-    if changed
+    // A repo input keeps reach when the scope plan ruled it out for this
+    // service, or when the change moves no package at all (carrick#3126).
+    let ruled_out = match inputs.gate.scope {
+        Some(Scope::Analysed {
+            reason: Reason::InputsChanged,
+            ruled_out,
+            ..
+        }) => Some(ruled_out),
+        _ => None,
+    };
+    let mut moves_no_package = None;
+    for change in changed
         .iter()
-        .any(|change| crate::change_scope::is_repo_input(&change.top))
+        .filter(|change| crate::change_scope::is_repo_input(&change.top))
     {
-        return Decided::whole("repo_input");
+        let quiet = if change.top.rsplit('/').next() == Some(".gitignore") {
+            ruled_out.is_some_and(|ruled| ruled.gitignores.contains(&change.top))
+        } else {
+            ruled_out.is_some_and(|ruled| ruled.dependencies)
+                || *moves_no_package.get_or_insert_with(|| walker.moves_no_package())
+        };
+        if !quiet {
+            return Decided {
+                whole_by: Some(change.top.clone()),
+                ..Decided::whole("repo_input")
+            };
+        }
     }
     if changed.iter().any(|change| {
         is_config_file(&change.path) || (nodes.contains(&change.path) && !is_source(&change.path))
@@ -490,6 +523,7 @@ pub(crate) fn decide(inputs: &Inputs<'_>, walker: &dyn Walker) -> Decided {
         changed: changed.iter().map(|change| change.path.clone()).collect(),
         reached_files,
         aliases,
+        whole_by: None,
     }
 }
 
@@ -584,9 +618,18 @@ struct SidecarWalker<'a> {
     sidecar: Option<&'a crate::services::type_sidecar::TypeSidecar>,
     repo_path: &'a str,
     commit: &'a str,
+    changes: &'a crate::change_scope::ChangedSince,
 }
 
 impl Walker for SidecarWalker<'_> {
+    fn moves_no_package(&self) -> bool {
+        // No top level, no move to read: whole.
+        crate::git_state::toplevel(self.repo_path)
+            .ok()
+            .and_then(|top| self.changes.dependency_move(self.commit, &top))
+            .is_some_and(|moved| moved.moves_nothing())
+    }
+
     fn before(&self, top: &str) -> Option<String> {
         crate::git_state::file_at_commit(self.repo_path, self.commit, top)
     }
@@ -672,6 +715,7 @@ pub(crate) fn decide_service(
         sidecar,
         repo_path: facts.repo_path,
         commit,
+        changes: &context.run.changes,
     };
     let decided = decide(&inputs, &walker);
     report(facts, decided, Some(started.elapsed()))
@@ -918,6 +962,7 @@ mod tests {
     /// git and the sidecar, answered from the test.
     struct Fake {
         missing_before: Vec<&'static str>,
+        moves_no_package: bool,
         answer: Result<ReachAnswer, String>,
         walked: RefCell<Vec<Vec<ReachChange>>>,
     }
@@ -926,6 +971,7 @@ mod tests {
         fn reaching(files: &[&str]) -> Self {
             Fake {
                 missing_before: Vec::new(),
+                moves_no_package: false,
                 answer: Ok(ReachAnswer {
                     reached: Reached::Files(files.iter().map(|f| f.to_string()).collect()),
                     augmented: Vec::new(),
@@ -937,6 +983,9 @@ mod tests {
     }
 
     impl Walker for Fake {
+        fn moves_no_package(&self) -> bool {
+            self.moves_no_package
+        }
         fn before(&self, top: &str) -> Option<String> {
             (!self.missing_before.contains(&top)).then(|| format!("before {top}"))
         }
@@ -1248,6 +1297,7 @@ mod tests {
             scope: Some(Scope::Analysed {
                 reason: Reason::UnresolvedImport,
                 detail: "x".to_string(),
+                ruled_out: Default::default(),
             }),
             ..Case::clean()
         };
@@ -1256,6 +1306,7 @@ mod tests {
             scope: Some(Scope::Analysed {
                 reason: Reason::InputsChanged,
                 detail: "x".to_string(),
+                ruled_out: Default::default(),
             }),
             ..Case::clean()
         };
@@ -1282,6 +1333,104 @@ mod tests {
             let case = Case::changing(vec![change('M', path)]);
             assert_eq!(case.reason(&Fake::reaching(&[])), "repo_input", "{path}");
         }
+    }
+
+    fn walker_moving_no_package() -> Fake {
+        Fake {
+            moves_no_package: true,
+            ..Fake::reaching(&[])
+        }
+    }
+
+    fn analysed_with(ruled_out: crate::change_scope::RuledOut) -> Option<Scope> {
+        Some(Scope::Analysed {
+            reason: Reason::InputsChanged,
+            detail: "x".to_string(),
+            ruled_out,
+        })
+    }
+
+    /// carrick#3126: a change that moves no package keeps reach, for the
+    /// manifest and the lockfile alike.
+    #[test]
+    fn a_manifest_and_lockfile_move_that_moves_no_package_keeps_reach() {
+        let changes = || {
+            vec![
+                change('M', "package.json"),
+                change('M', "package-lock.json"),
+                change('M', "src/a.ts"),
+            ]
+        };
+        reached_of(&Case::changing(changes()).decide(&walker_moving_no_package()));
+        assert_eq!(
+            Case::changing(changes()).reason(&Fake::reaching(&[])),
+            "repo_input"
+        );
+    }
+
+    #[test]
+    fn a_whole_repo_input_names_the_path_that_decided_it() {
+        let case = Case::changing(vec![change('M', "package.json"), change('M', ".gitignore")]);
+        let decided = case.decide(&walker_moving_no_package());
+        assert_eq!(decided.whole_by.as_deref(), Some(".gitignore"));
+    }
+
+    #[test]
+    fn a_lockfile_the_plan_ruled_out_keeps_reach() {
+        let ruled = crate::change_scope::RuledOut {
+            dependencies: true,
+            ..Default::default()
+        };
+        let case = Case {
+            scope: analysed_with(ruled),
+            ..Case::changing(vec![change('M', "pnpm-lock.yaml"), change('M', "src/a.ts")])
+        };
+        reached_of(&case.decide(&Fake::reaching(&[])));
+        let unruled = Case {
+            scope: analysed_with(Default::default()),
+            ..Case::changing(vec![change('M', "pnpm-lock.yaml")])
+        };
+        assert_eq!(unruled.reason(&Fake::reaching(&[])), "repo_input");
+    }
+
+    #[test]
+    fn a_gitignore_keeps_reach_only_when_the_plan_ruled_that_path_out() {
+        let ruled = crate::change_scope::RuledOut {
+            gitignores: BTreeSet::from([".gitignore".to_string()]),
+            ..Default::default()
+        };
+        let case = Case {
+            scope: analysed_with(ruled.clone()),
+            ..Case::changing(vec![change('M', ".gitignore")])
+        };
+        reached_of(&case.decide(&walker_moving_no_package()));
+        // Another path, and a plan that ruled nothing out, stay whole; a
+        // move that touches no package does not excuse a `.gitignore`.
+        for (scope, path) in [
+            (analysed_with(ruled), "apps/api/.gitignore"),
+            (None, ".gitignore"),
+        ] {
+            let case = Case {
+                scope,
+                ..Case::changing(vec![change('M', path)])
+            };
+            assert_eq!(case.reason(&walker_moving_no_package()), "repo_input");
+        }
+    }
+
+    #[test]
+    fn a_manifest_in_the_type_graph_is_whole_even_when_it_moves_no_package() {
+        let mut record = record();
+        record.graph = serde_json::json!({
+            "version": 1,
+            "strings": ["src/a.ts", "package.json"],
+            "files": [{ "p": 0 }, { "p": 1 }],
+        });
+        let case = Case {
+            record: Some(record),
+            ..Case::changing(vec![change('M', "package.json")])
+        };
+        assert_eq!(case.reason(&walker_moving_no_package()), "config_file");
     }
 
     #[test]

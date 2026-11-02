@@ -78,6 +78,15 @@ pub struct DependencyMove {
     workspace: BTreeMap<String, PathBuf>,
 }
 
+impl DependencyMove {
+    /// Whether the change moved no package in any install root: a `version`
+    /// rewrite of a root or workspace package, a lockfile that differs in
+    /// nothing a service loads. Holds for every service (carrick#3126).
+    pub fn moves_nothing(&self) -> bool {
+        self.roots.iter().all(|root| root.moved.is_empty())
+    }
+}
+
 #[derive(Debug)]
 struct InstallRoot {
     /// Top-relative, `""` for the top level.
