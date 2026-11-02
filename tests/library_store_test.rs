@@ -255,7 +255,6 @@ fn row(key: &str, at: &str, source: Option<ResolutionSource>, claims: &[&str]) -
 
 const FACT: Option<ResolutionSource> = Some(ResolutionSource::LibraryClaim);
 const SOCKET_CALL: Option<ResolutionSource> = Some(ResolutionSource::SocketCall);
-const EVENT_BUS: Option<ResolutionSource> = Some(ResolutionSource::EventBus);
 const MAKE: &str = "@fixture/live@1:Socket:make:new:()";
 const EMIT: &str = "@fixture/live@1:Socket:op:send:emit:on:instance";
 const ON: &str = "@fixture/live@1:Socket:op:receive:on:on:instance";
@@ -307,12 +306,12 @@ fn rows_with_claims() -> (Vec<Row>, Vec<Row>) {
 }
 
 /// What the scan states with no claims: the socket pass's rows, each of
-/// unknown direction, and the in-process bus pass's subscriber, which the
+/// unknown direction, and the subscriber the model reported and the scanner backfilled (no source), which the
 /// library row folds when there is one.
 fn rows_without_claims() -> (Vec<Row>, Vec<Row>) {
     (
         vec![
-            row("pubsub|orders.created", "src/emails.ts:3", EVENT_BUS, &[]),
+            row("pubsub|orders.created", "src/emails.ts:3", None, &[]),
             row("socket|UNKNOWN|chat", "src/live.ts:5", SOCKET_CALL, &[]),
             row(
                 "socket|UNKNOWN|presence",
