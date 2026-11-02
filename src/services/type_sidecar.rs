@@ -764,6 +764,11 @@ pub struct RetypePrescreen {
     /// type (carrick#3158); the caller applies it only for such a producer type.
     #[serde(default)]
     pub fresh_type_reason: Option<String>,
+    /// The same sentence for a call whose result stays deferred (carrick#3165);
+    /// the caller applies it only for a producer type with no top-level
+    /// `undefined`.
+    #[serde(default)]
+    pub undefined_free_reason: Option<String>,
 }
 
 /// What the consumer file's type-check said once the call stated the

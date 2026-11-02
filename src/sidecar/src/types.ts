@@ -519,11 +519,15 @@ export interface RetypePrescreenRequest extends BaseRequest {
  * appears in the result only as a conditional's selector. The caller applies
  * it only when the producer's type is such a type; it is never set beside
  * `reason`.
+ * `undefined_free_reason` (carrick#3165) is the same sentence for a call whose
+ * result is deferred: it holds for any stated type with no top-level
+ * `undefined`, and quotes the call's own result. Never set beside either.
  */
 export interface RetypePrescreen {
   item_id: string;
   reason?: string;
   fresh_type_reason?: string;
+  undefined_free_reason?: string;
 }
 
 export interface RetypePrescreenResponse extends BaseResponse {

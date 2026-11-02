@@ -2705,6 +2705,13 @@ pub(crate) struct CallLocator {
     /// the same call can reach a slot, so the rewrite decides it. `None` on a
     /// carried consumer's stored locator.
     pub prescreen_fresh_type: Option<String>,
+    /// The same abstention for a call whose result stays deferred under a free
+    /// type parameter, quoting the call's own result (carrick#3165). It is
+    /// applied only when the producer's text has no top-level `undefined`
+    /// ([`states_no_top_level_undefined`]): a stated type that has one reaches
+    /// a member of the result, so the rewrite decides it. `None` on a carried
+    /// consumer's stored locator.
+    pub prescreen_undefined_free: Option<String>,
 }
 
 /// A service scanned in THIS run, whose sources are on disk: the only kind of
@@ -2800,6 +2807,7 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
                 expression_line: request.expression_line,
                 prescreen: None,
                 prescreen_fresh_type: None,
+                prescreen_undefined_free: None,
             });
     }
     calls
@@ -2861,16 +2869,19 @@ pub(crate) fn prescreen_calls(
     };
     let mut decided = 0;
     let mut object_literal = 0;
+    let mut undefined_free = 0;
     for answer in answers {
         if let Some(call) = calls.get_mut(&answer.item_id) {
             decided += usize::from(answer.reason.is_some());
             object_literal += usize::from(answer.fresh_type_reason.is_some());
             call.prescreen = answer.reason;
+            undefined_free += usize::from(answer.undefined_free_reason.is_some());
             call.prescreen_fresh_type = answer.fresh_type_reason;
+            call.prescreen_undefined_free = answer.undefined_free_reason;
         }
     }
     info!(
-        "Prescreened {service_id}'s consumer calls: {decided} of {} abstain before any rewrite, {object_literal} more when the producer's type is an object literal, took {:.1}s",
+        "Prescreened {service_id}'s consumer calls: {decided} of {} abstain before any rewrite, {object_literal} more when the producer's type is an object literal, {undefined_free} more when it has no top-level undefined, took {:.1}s",
         items.len(),
         started.elapsed().as_secs_f64()
     );
@@ -2934,6 +2945,7 @@ pub(crate) fn stored_call_locators(
                 expression_line: evidence.expression_line,
                 prescreen: None,
                 prescreen_fresh_type: None,
+                prescreen_undefined_free: None,
             });
     }
     calls
@@ -3032,6 +3044,19 @@ fn retype_items<'a>(
             });
             continue;
         }
+        if let Some(reason) = call.prescreen_undefined_free.as_deref().filter(|_| {
+            retype_reads_producer_text(producer_type)
+                && states_no_top_level_undefined(producer_type)
+        }) {
+            decided.push(RetypeOutcome {
+                item_id: pair.spec.pair_key.clone(),
+                outcome: RetypeVerdict::Abstain,
+                diagnostics: Vec::new(),
+                reason: Some(reason.to_string()),
+                run_failed: false,
+            });
+            continue;
+        }
         by_service
             .entry(pair.consumer_service.as_str())
             .or_default()
@@ -3110,24 +3135,51 @@ fn states_new_object_type(text: &str) -> bool {
 /// The index of the bracket closing the one at `open`, skipping quoted
 /// strings and template literals (whose `${ ... }` nest).
 fn matching_close(chars: &[char], open: usize) -> Option<usize> {
+    closing_bracket(chars, open, false)
+}
+
+/// [`matching_close`], optionally also pairing `<` with `>` (type arguments).
+/// An arrow's `=>` never closes one.
+fn closing_bracket(chars: &[char], open: usize, angles: bool) -> Option<usize> {
     let mut stack: Vec<char> = Vec::new();
     let mut i = open;
     while i < chars.len() {
-        match chars[i] {
-            '\'' | '"' => i = skip_quoted(chars, i)?,
-            '`' => i = skip_template(chars, i)?,
-            '(' => stack.push(')'),
-            '[' => stack.push(']'),
-            '{' => stack.push('}'),
-            c @ (')' | ']' | '}') => {
-                if stack.pop() != Some(c) {
-                    return None;
-                }
-                if stack.is_empty() {
-                    return Some(i);
-                }
+        let closer = match chars[i] {
+            '\'' | '"' => {
+                i = skip_quoted(chars, i)?;
+                None
             }
-            _ => {}
+            '`' => {
+                i = skip_template(chars, i)?;
+                None
+            }
+            '(' => {
+                stack.push(')');
+                None
+            }
+            '[' => {
+                stack.push(']');
+                None
+            }
+            '{' => {
+                stack.push('}');
+                None
+            }
+            '<' if angles => {
+                stack.push('>');
+                None
+            }
+            c @ (')' | ']' | '}') => Some(c),
+            '>' if angles && !(i > 0 && chars[i - 1] == '=') => Some('>'),
+            _ => None,
+        };
+        if let Some(c) = closer {
+            if stack.pop() != Some(c) {
+                return None;
+            }
+            if stack.is_empty() {
+                return Some(i);
+            }
         }
         i += 1;
     }
@@ -3162,6 +3214,139 @@ fn skip_template(chars: &[char], open: usize) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Whether the producer's text, after the wire form, cannot be a type with a
+/// top-level `undefined` (carrick#3165): the only producer types for which a
+/// call whose result stays deferred (`prescreen_undefined_free`) is known not
+/// to reach its result. A stated type with one is identical to a member of
+/// that result, so the rewrite decides it. The text is split at top-level `|`
+/// and then `&`; every operand must be a shape that is never `undefined`:
+/// an array of anything, an object or tuple literal, `null`, `never`, a
+/// primitive keyword, a literal, or a parenthesised type that is itself so.
+/// A named type is refused (an alias can be `undefined`), and so is `toJSON`
+/// (its return type travels as the wire form).
+fn states_no_top_level_undefined(text: &str) -> bool {
+    if text.contains("toJSON") {
+        return false;
+    }
+    let trimmed = text.trim();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    never_undefined(&chars)
+}
+
+/// Whether every `|` member of `chars`, and every `&` operand of it, is a
+/// shape that is never `undefined`.
+fn never_undefined(chars: &[char]) -> bool {
+    let Some(members) = split_top_level(chars, '|') else {
+        return false;
+    };
+    members.iter().all(|member| {
+        let Some(operands) = split_top_level(member, '&') else {
+            return false;
+        };
+        operands.iter().all(|operand| operand_is_defined(operand))
+    })
+}
+
+/// The pieces of `chars` between top-level `separator`s, outside every
+/// bracket, quote and template.
+fn split_top_level(chars: &[char], separator: char) -> Option<Vec<&[char]>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' | '"' => i = skip_quoted(chars, i)?,
+            '`' => i = skip_template(chars, i)?,
+            '(' | '[' | '{' | '<' => i = closing_bracket(chars, i, true)?,
+            c if c == separator => {
+                parts.push(&chars[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&chars[start..]);
+    Some(parts)
+}
+
+/// Whether one `|`/`&` operand is never `undefined` (see
+/// [`states_no_top_level_undefined`]).
+fn operand_is_defined(operand: &[char]) -> bool {
+    let start = operand.iter().position(|c| !c.is_whitespace());
+    let end = operand.iter().rposition(|c| !c.is_whitespace());
+    let (Some(start), Some(end)) = (start, end) else {
+        return false;
+    };
+    let operand = &operand[start..=end];
+    let text: String = operand.iter().collect();
+    let last = operand.len() - 1;
+    // One shape that is itself never `undefined`.
+    if matches!(
+        text.as_str(),
+        "null"
+            | "never"
+            | "string"
+            | "number"
+            | "boolean"
+            | "bigint"
+            | "symbol"
+            | "object"
+            | "true"
+            | "false"
+    ) {
+        return true;
+    }
+    match operand[0] {
+        '{' | '[' if closing_bracket(operand, 0, true) == Some(last) => return true,
+        '(' if closing_bracket(operand, 0, true) == Some(last) => {
+            return never_undefined(&operand[1..last]);
+        }
+        '\'' | '"' if skip_quoted(operand, 0) == Some(last) => return true,
+        '`' if skip_template(operand, 0) == Some(last) => return true,
+        _ => {}
+    }
+    if text.parse::<f64>().is_ok_and(|n| n.is_finite()) {
+        return true;
+    }
+    // An array of anything: one primary, then one or more `[]`.
+    let mut primary_end = operand.len();
+    while primary_end >= 2 && operand[primary_end - 2] == '[' && operand[primary_end - 1] == ']' {
+        primary_end -= 2;
+    }
+    primary_end < operand.len() && primary_end > 0 && primary_ends_at(operand) == Some(primary_end)
+}
+
+/// Where the one primary at the start of `operand` ends, when it starts one:
+/// an identifier path with optional type arguments, a balanced `{ }`, `[ ]`
+/// or `( )`, a string or template literal, or a number.
+fn primary_ends_at(operand: &[char]) -> Option<usize> {
+    let first = *operand.first()?;
+    match first {
+        '{' | '[' | '(' => closing_bracket(operand, 0, true).map(|i| i + 1),
+        '\'' | '"' => skip_quoted(operand, 0).map(|i| i + 1),
+        '`' => skip_template(operand, 0).map(|i| i + 1),
+        c if c.is_ascii_digit() || c == '-' => Some(
+            operand
+                .iter()
+                .position(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+                .unwrap_or(operand.len()),
+        ),
+        c if c.is_alphabetic() || c == '_' || c == '$' => {
+            let mut i = operand
+                .iter()
+                .position(|c| !(c.is_alphanumeric() || matches!(c, '_' | '$' | '.')))
+                .unwrap_or(operand.len());
+            if operand.get(i) == Some(&'<') {
+                i = closing_bracket(operand, i, true)? + 1;
+            }
+            Some(i)
+        }
+        _ => None,
+    }
 }
 
 /// The longest the retype check may run in one scan, across every service
@@ -4027,6 +4212,7 @@ mod tests {
                         expression_line: Some(8),
                         prescreen: None,
                         prescreen_fresh_type: None,
+                        prescreen_undefined_free: None,
                     },
                 )]),
             },
@@ -4236,6 +4422,137 @@ mod tests {
             "{}",
             "{ a: string } | null",
             "{ toJSON(): string }",
+            "{ id: string; // note\n }",
+        ] {
+            let pairs = [retype_pair(ManifestTypeKind::Response, Some(producer))];
+            let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
+            let (items, decided) = retype_items(&pairs, &blamed, &local);
+            assert!(decided.is_empty(), "{producer:?} is not decided");
+            assert_eq!(items["web"].len(), 1, "{producer:?} is sent");
+        }
+    }
+
+    /// carrick#3165: the gate for a deferred result accepts only texts that
+    /// cannot have a top-level `undefined`.
+    #[test]
+    fn states_no_top_level_undefined_accepts_only_never_undefined_shapes() {
+        for yes in [
+            "{ a: string }",
+            "{}",
+            "{ a: string }[]",
+            "never[]",
+            "Foo[]",
+            "null | { a: string }",
+            "{ a: 1 } | { b: 2 }",
+            "({ a: string })",
+            "(\"a\" | \"b\")[]",
+            "\"x\" | \"y\"",
+            "`id-${string}`",
+            "string",
+            "true",
+            "never",
+            "[string, number]",
+            "{ a: 1 } & { b: 2 }",
+            "{ a: string | undefined }",
+            "{ a: '|' }",
+            "{ a: string };",
+            "{\n  a: string;\n  b: number;\n}",
+            "Map<string, number>[]",
+            "{ (): void; a: string }",
+            "{ a: () => void }",
+            "42",
+        ] {
+            assert!(states_no_top_level_undefined(yes), "{yes:?}");
+        }
+        for no in [
+            "undefined",
+            "{ a: string } | undefined",
+            "undefined | null",
+            "void",
+            "string | undefined",
+            "Foo",
+            "Foo | null",
+            "Response | undefined",
+            "{ toJSON(): undefined }",
+            "{ a: { toJSON(): string } }",
+            "Array<{ a: string }>",
+            "any",
+            "unknown",
+            "typeof x",
+            "keyof X",
+            "X[\"a\"]",
+            "() => void",
+            "A extends B ? C : D[]",
+            "{ a: string } & Bar",
+            "(undefined)",
+            "| { a: string }",
+            "{ a: string",
+            "",
+            "   ",
+        ] {
+            assert!(!states_no_top_level_undefined(no), "{no:?}");
+        }
+    }
+
+    /// carrick#3165: a call whose result stays deferred is decided without
+    /// being sent when the producer's text has no top-level `undefined`.
+    #[test]
+    fn retype_items_decide_an_undefined_free_call_without_sending_it() {
+        const WHY: &str = "the call's type argument does not reach its result ('X'), so it does not state the response";
+        let mut local = web_consumer();
+        local
+            .get_mut("web")
+            .unwrap()
+            .calls
+            .get_mut("C")
+            .unwrap()
+            .prescreen_undefined_free = Some(WHY.to_string());
+
+        for producer in ["{ id: string; }", "never[]", "{ a: string } | null", "{}"] {
+            let pairs = [retype_pair(ManifestTypeKind::Response, Some(producer))];
+            let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
+            let (items, decided) = retype_items(&pairs, &blamed, &local);
+            assert!(items.is_empty(), "{producer:?}: nothing is sent: {items:?}");
+            assert_eq!(
+                decided,
+                vec![RetypeOutcome {
+                    item_id: pairs[0].spec.pair_key.clone(),
+                    outcome: RetypeVerdict::Abstain,
+                    diagnostics: Vec::new(),
+                    reason: Some(WHY.to_string()),
+                    run_failed: false,
+                }]
+            );
+        }
+
+        // Not the consumer's to settle: no reason is written on it.
+        let pairs = [retype_pair(
+            ManifestTypeKind::Response,
+            Some("{ id: string; }"),
+        )];
+        let (items, decided) = retype_items(&pairs, &HashSet::new(), &local);
+        assert!(items.is_empty() && decided.is_empty());
+    }
+
+    /// carrick#3165: a producer text that can be `undefined` reaches a slot
+    /// of the same call, so it is sent to the retype as before.
+    #[test]
+    fn retype_items_send_an_undefined_free_call_whose_producer_text_is_not_undefined_free() {
+        let mut local = web_consumer();
+        local
+            .get_mut("web")
+            .unwrap()
+            .calls
+            .get_mut("C")
+            .unwrap()
+            .prescreen_undefined_free = Some("does not reach".to_string());
+
+        for producer in [
+            "string | undefined",
+            "Foo",
+            "{ a: 1 } | undefined",
+            "void",
+            "{ toJSON(): undefined }",
             "{ id: string; // note\n }",
         ] {
             let pairs = [retype_pair(ManifestTypeKind::Response, Some(producer))];
@@ -5350,6 +5667,7 @@ mod tests {
             expression_line: None,
             prescreen: None,
             prescreen_fresh_type: None,
+            prescreen_undefined_free: None,
         };
         let calls = HashMap::from([
             (
@@ -11445,6 +11763,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                                 expression_line: None,
                                 prescreen: None,
                                 prescreen_fresh_type: None,
+                                prescreen_undefined_free: None,
                             },
                         )
                     })
@@ -11538,6 +11857,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             expression_line: Some(line),
             prescreen: None,
             prescreen_fresh_type: None,
+            prescreen_undefined_free: None,
         };
         LocalConsumers::from([(
             "web".to_string(),
