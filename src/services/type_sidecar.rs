@@ -234,6 +234,15 @@ pub struct InferRequestItem {
     /// so those serialise as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ResultShape>,
+    /// carrick#1029: the route row's own full path, set on a producer's
+    /// `ResponseBody`, `FunctionReturn` or `RequestBody` request only where
+    /// the row's line serves more than one operation
+    /// (`FileOrchestrator::mark_shared_route_lines`). The sidecar types a
+    /// handler registered once per element of a constant list for the element
+    /// this path names (`src/sidecar/src/loop-element.ts`). Absent from every
+    /// other request, so those serialise as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_path: Option<String>,
 }
 
 // ============================================================================
@@ -5675,6 +5684,7 @@ mod tests {
             infer_kind: InferKind::ResponseBody,
             alias: None,
             param_name: None,
+            route_path: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));
@@ -5915,6 +5925,7 @@ mod tests {
                         infer_kind,
                         alias: Some("A".into()),
                         param_name: Some("event".into()),
+                        route_path: None,
                     })
                     .collect(),
                 extraction_config: Some(ExtractionConfig {
@@ -6370,6 +6381,7 @@ mod tests {
             infer_kind,
             alias: None,
             param_name: None,
+            route_path: None,
         };
         let others = [item(InferKind::CallResult), item(InferKind::FunctionReturn)];
         assert_eq!(claims_for_route_rows(&others, Some(&claims)), None);
@@ -8129,6 +8141,7 @@ mod tests {
             infer_kind,
             alias: Some(alias.into()),
             param_name: None,
+            route_path: None,
         };
         let explicit = vec![
             symbol_request("ItemDto", "Returned", None),
@@ -8356,6 +8369,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 infer_kind: InferKind::Expression,
                 alias: Some(format!("A{line}")),
                 param_name: None,
+                route_path: None,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
@@ -8402,6 +8416,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             infer_kind: InferKind::CallResult,
             alias: None,
             param_name: None,
+            route_path: None,
             member: None,
             result,
         };

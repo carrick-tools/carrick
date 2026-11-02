@@ -336,7 +336,7 @@ function readCondition(
 }
 
 /** The text of a string literal, `undefined` for anything else. */
-function stringLiteral(node: Node | undefined): string | undefined {
+export function stringLiteral(node: Node | undefined): string | undefined {
   if (!node) return undefined;
   let inner = node;
   while (Node.isParenthesizedExpression(inner)) inner = inner.getExpression();

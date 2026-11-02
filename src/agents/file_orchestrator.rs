@@ -4968,6 +4968,64 @@ impl FileOrchestrator {
         })
     }
 
+    /// carrick#1029: set `route_path` on every producer route-row request for
+    /// a row whose file and line serve more than one operation (one
+    /// registration made once per element of a list), so the sidecar can tell
+    /// which operation each request is for. The rows are the mount graph's,
+    /// keyed by the producer aliases [`Self::collect_type_requests`] builds
+    /// for them; a row with a line of its own is left unmarked. Returns how
+    /// many requests it marked.
+    pub fn mark_shared_route_lines(
+        requests: &mut [InferRequestItem],
+        mount_graph: &MountGraph,
+        repo_path: &str,
+    ) -> usize {
+        let mut by_line: HashMap<(String, u32), Vec<(String, String)>> = HashMap::new();
+        for endpoint in mount_graph.get_resolved_endpoints() {
+            let (file_path, line_number) = parse_file_location(&endpoint.file_location);
+            by_line.entry((file_path, line_number)).or_default().push((
+                normalize_manifest_method(&endpoint.method),
+                endpoint.full_path.clone(),
+            ));
+        }
+        let mut shared: HashMap<String, String> = HashMap::new();
+        for ((file_path, line_number), rows) in &by_line {
+            if !rows.iter().any(|(_, path)| *path != rows[0].1) {
+                continue;
+            }
+            for (method, path) in rows {
+                let key = OperationKey::http(method, path.clone());
+                let site_id = build_site_id(file_path, *line_number, &key, repo_path);
+                for kind in [ManifestTypeKind::Response, ManifestTypeKind::Request] {
+                    shared.insert(
+                        build_manifest_type_alias_with_site_id(
+                            &key,
+                            ManifestRole::Producer,
+                            kind,
+                            Some(&site_id),
+                        ),
+                        path.clone(),
+                    );
+                }
+            }
+        }
+        // A route's response is asked as `FunctionReturn` where the model
+        // states that the handler's return value is the payload.
+        let mut marked = 0;
+        for request in requests.iter_mut().filter(|request| {
+            matches!(
+                request.infer_kind,
+                InferKind::ResponseBody | InferKind::FunctionReturn | InferKind::RequestBody
+            )
+        }) {
+            if let Some(path) = request.alias.as_ref().and_then(|alias| shared.get(alias)) {
+                request.route_path = Some(path.clone());
+                marked += 1;
+            }
+        }
+        marked
+    }
+
     /// Collect type requests from analysis results for sidecar processing.
     ///
     /// Returns two vectors:
@@ -5132,6 +5190,7 @@ impl FileOrchestrator {
                         expression_line: None,
                         alias: Some(alias),
                         param_name: None,
+                        route_path: None,
                     });
                     true
                 }
@@ -5158,6 +5217,7 @@ impl FileOrchestrator {
                             .map(|l| if l > 0 { l as u32 } else { line_number }),
                         alias: Some(alias),
                         param_name: None,
+                        route_path: None,
                     });
                     true
                 }
@@ -5174,6 +5234,7 @@ impl FileOrchestrator {
                         expression_line: None,
                         alias: Some(alias),
                         param_name: None,
+                        route_path: None,
                     });
                     true
                 }
@@ -5802,10 +5863,12 @@ impl FileOrchestrator {
             }
         }
 
+        let shared = Self::mark_shared_route_lines(&mut infer_requests, mount_graph, repo_path);
         debug!(
-            "[FileOrchestrator] Collected {} explicit type requests, {} inference requests, {} inline aliases",
+            "[FileOrchestrator] Collected {} explicit type requests, {} inference requests ({} on a line shared by several routes), {} inline aliases",
             explicit_requests.len(),
             infer_requests.len(),
+            shared,
             inline_aliases.len()
         );
 
@@ -6247,6 +6310,7 @@ impl FileOrchestrator {
                         infer_kind: InferKind::Expression,
                         alias: Some(alias),
                         param_name: None,
+                        route_path: None,
                     },
                     ManifestRole::Producer => InferRequestItem {
                         member: None,
@@ -6267,6 +6331,7 @@ impl FileOrchestrator {
                         infer_kind: InferKind::FunctionParam,
                         alias: Some(alias),
                         param_name: Some(text.clone()),
+                        route_path: None,
                     },
                 };
                 requests.push(request);
@@ -6521,6 +6586,7 @@ impl FileOrchestrator {
                 infer_kind: InferKind::Expression,
                 alias: Some(alias),
                 param_name: None,
+                route_path: None,
             });
         }
         debug!(
@@ -6691,6 +6757,7 @@ impl FileOrchestrator {
                     infer_kind: InferKind::FunctionReturn,
                     alias: Some(alias),
                     param_name: None,
+                    route_path: None,
                 });
             }
         }
@@ -10961,6 +11028,10 @@ impl FileOrchestrator {
         // A payload the fact layer places is read there, not at the model
         // reader's locator (`CARRICK_SITE_PAYLOADS=1`; empty otherwise).
         crate::site_payloads::take_over(&mut infer, payload_infer);
+        // A request the fact layer placed names its row's path as the
+        // reader's does (carrick#1029).
+        let shared = Self::mark_shared_route_lines(&mut infer, mount_graph, repo_path);
+        debug!("[FileOrchestrator] {shared} inference requests on a line shared by several routes");
 
         debug!(
             "[FileOrchestrator] Resolving types: {} explicit ({} from non-HTTP protocols), {} inferred ({} from non-HTTP protocols)",

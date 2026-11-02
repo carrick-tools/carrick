@@ -97,6 +97,7 @@ fn ask(sidecar: &TypeSidecar, root: &Path, modules: &[(&str, &str)]) -> Vec<Stri
                 infer_kind: InferKind::SignatureReturn,
                 alias: Some(file.to_string()),
                 param_name: None,
+                route_path: None,
             };
             let response = sidecar.infer_types(&[item], None).expect("infer");
             response

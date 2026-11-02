@@ -80,6 +80,7 @@ import type { LabelledMembers } from './library-claims.js';
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
+import { loopElementPick, type LoopPick } from './loop-element.js';
 import {
   classifyStatusCodes,
   constituents,
@@ -771,6 +772,13 @@ interface WrapperReading {
  *   const inferrer = new TypeInferrer({ project });
  *   const result = inferrer.infer(requests, extractionConfig);
  */
+/**
+ * The kinds a route row's request is asked as, and so the kinds a loop
+ * element is read for (carrick#1029): a response read at the send or as the
+ * handler's return, and a request body.
+ */
+const LOOP_ROW_KINDS: ReadonlySet<string> = new Set(['response_body', 'function_return', 'request_body']);
+
 export class TypeInferrer {
   private readonly project: Project;
   private readonly packageOf: ((filePath: string) => string | undefined) | undefined;
@@ -843,6 +851,12 @@ export class TypeInferrer {
     const bodies: Array<{ request: InferRequestItem; result: InferredType }> = [];
     /** How long each request took, in the order they were done (carrick#1985). */
     const timings: InferSlotTiming[] = [];
+    /**
+     * Requests for a route registered once per loop element (carrick#1029),
+     * read after everything else, with where each answer goes in the answer
+     * order.
+     */
+    const loopRows: Array<{ request: InferRequestItem; at: number }> = [];
 
     for (const request of requests) {
       const slotStarted = performance.now();
@@ -871,11 +885,16 @@ export class TypeInferrer {
         // while the program the prints were made in is still the project's.
         // The unwidened re-read below records nothing: it prints the same
         // node, and its reading has a budget.
-        const prints = new PrintedTypes();
-        const result = prints.during(() => this.inferSingle(request, extractionConfig));
+        // carrick#1029: a route registered once per loop element is read
+        // last. Its reading rewrites its file, and a rewrite forgets every
+        // node of the file that the readings below still hold.
+        if (this.loopPickFor(request)) {
+          loopRows.push({ request, at: inferredTypes.length });
+          continue;
+        }
+        const result = this.inferRecordingNames(request, extractionConfig);
         if (result) {
           printedLength = result.type_string.length;
-          this.recordPrintedNames(result, request, prints);
           inferredTypes.push(result);
           if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
             responses.push({ request, result });
@@ -968,6 +987,30 @@ export class TypeInferrer {
       );
     }
 
+    // The loop rows, each typed for its own element. Not re-read unwidened:
+    // that re-read rewrites the original file, where the element is not
+    // fixed. Placed back in request order, last first so earlier places hold.
+    const loopAnswers: Array<{ at: number; result: InferredType }> = [];
+    // Each was counted done, and timed, where it was deferred.
+    for (const { request, at } of loopRows) {
+      const loc = this.formatRequestLocation(request);
+      try {
+        const pick = this.loopPickFor(request);
+        const result = pick
+          ? this.inferForLoopElement(request, pick, extractionConfig)
+          : this.inferRecordingNames(request, extractionConfig);
+        if (result) {
+          loopAnswers.push({ at, result });
+        } else {
+          errors.push(`Could not infer type at ${request.file_path}:${loc} (${request.infer_kind})`);
+        }
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        errors.push(`Error inferring type at ${request.file_path}:${loc}: ${error}`);
+      }
+    }
+    for (const { at, result } of loopAnswers.reverse()) inferredTypes.splice(at, 0, result);
+
     return {
       success: errors.length === 0 || inferredTypes.length > 0,
       inferred_types: inferredTypes.length > 0 ? inferredTypes : undefined,
@@ -1059,6 +1102,72 @@ export class TypeInferrer {
    * carrick#1836: list on `result` the declarations behind the names its text
    * prints that the request's file cannot resolve (`PrintedTypes.namesIn`).
    */
+  /** `inferSingle`, with what the names it prints meant (carrick#1836). */
+  private inferRecordingNames(
+    request: InferRequestItem,
+    extractionConfig: ExtractionConfig | undefined
+  ): InferredType | null {
+    const prints = new PrintedTypes();
+    const result = prints.during(() => this.inferSingle(request, extractionConfig));
+    if (result) this.recordPrintedNames(result, request, prints);
+    return result;
+  }
+
+  /**
+   * carrick#1029: the loop element a route row's path names, when its
+   * registration is made once per element of a constant list
+   * (`loop-element.ts`). Only a route row that states its path is read.
+   */
+  private loopPickFor(request: InferRequestItem): LoopPick | undefined {
+    if (!request.route_path) return undefined;
+    if (!LOOP_ROW_KINDS.has(request.infer_kind)) return undefined;
+    const sourceFile = this.getSourceFile(request.file_path);
+    if (!sourceFile) return undefined;
+    // Every call on the line, outermost first: on `LIST.forEach((x) =>
+    // app.get(…))` the loop's own call is the line's first registration-shaped
+    // call, and the registration is inside it.
+    for (const entry of descendantsOnLine(sourceFile, request.line_number)) {
+      if (entry.kind !== SyntaxKind.CallExpression) continue;
+      const pick = loopElementPick(wrap(sourceFile, entry), request.route_path);
+      if (pick) return pick;
+    }
+    return undefined;
+  }
+
+  /**
+   * The request inferred with the loop's list rewritten to the one element
+   * `pick` names, so the compiler types the handler for that element. The
+   * file is restored before returning, and the names the reading prints are
+   * recorded while the rewritten program is still the project's. Lines do not
+   * move (the rewrite is padded); a span after the list moves by the length
+   * the rewrite changed.
+   */
+  private inferForLoopElement(
+    request: InferRequestItem,
+    pick: LoopPick,
+    extractionConfig: ExtractionConfig | undefined
+  ): InferredType | null {
+    const original = pick.file.getFullText();
+    const delta = pick.text.length - (pick.end - pick.start);
+    const moved = (at: number | undefined) => (at !== undefined && at >= pick.end ? at + delta : at);
+    const mapped: InferRequestItem = {
+      ...request,
+      span_start: moved(request.span_start),
+      span_end: moved(request.span_end),
+    };
+    replaceFileText(pick.file, original.slice(0, pick.start) + pick.text + original.slice(pick.end));
+    try {
+      const result = this.inferRecordingNames(mapped, extractionConfig);
+      this.log(
+        `Typed ${request.file_path}:${request.line_number} (${request.infer_kind}) for loop element ` +
+          `${pick.index + 1} of ${pick.of}: ${request.route_path}`
+      );
+      return result;
+    } finally {
+      replaceFileText(pick.file, original);
+    }
+  }
+
   private recordPrintedNames(
     result: InferredType,
     request: InferRequestItem,

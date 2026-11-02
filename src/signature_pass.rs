@@ -531,6 +531,7 @@ fn build_infer_requests(
                 infer_kind: InferKind::SignatureReturn,
                 alias: Some(alias.clone()),
                 param_name: None,
+                route_path: None,
             });
             targets.insert(
                 alias,
@@ -560,6 +561,7 @@ fn build_infer_requests(
                 alias: Some(alias.clone()),
                 // ts-morph matches by getName(), which drops the rest `...`.
                 param_name: Some(arg.name.trim_start_matches("...").to_string()),
+                route_path: None,
             });
             targets.insert(
                 alias,
