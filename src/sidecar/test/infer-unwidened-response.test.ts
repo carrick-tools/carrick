@@ -104,7 +104,9 @@ export class HolidaysController {
 
   @Get('session')
   async session() {
-    return this.service.session(true);
+    // Not a literal: a literal argument picks one return (carrick#2372), and
+    // this row keeps both to read the discriminant on each.
+    return this.service.session(Date.now() > 0);
   }
 
   @Get('labels')
