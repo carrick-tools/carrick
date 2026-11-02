@@ -230,7 +230,7 @@ fn a_model_pubsub_twin_folds_onto_a_socket_site_row() {
 }
 
 /// With every switch off there are no site rows, so nothing yields: the scan
-/// states what it stated before the fix, the event pass's publisher (the
+/// states what it stated before the fix, the event pass's publisher, now naming its pass (carrick#3091; the
 /// model is not asked about `src/twin.ts` with the switches off).
 #[test]
 fn with_the_switches_off_the_bus_row_stands() {
@@ -240,7 +240,7 @@ fn with_the_switches_off_the_bus_row_stands() {
             "calls",
             "pubsub|chat.sent",
             &format!("{ANNOUNCE}:4"),
-            None
+            Some("event_bus")
         )]
     );
 }
