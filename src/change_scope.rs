@@ -1086,7 +1086,7 @@ pub fn untouched_since(
     base: &str,
 ) -> Vec<bool> {
     let mut walks = Walks::new(repo_path, changes);
-    services
+    let untouched: Vec<bool> = services
         .iter()
         .map(|service| {
             let scope = walks.scope(service, Against::Base(base));
@@ -1106,7 +1106,16 @@ pub fn untouched_since(
             }
             scope.is_carried()
         })
-        .collect()
+        .collect();
+    info!(
+        "pr base: {} of {} service(s) read nothing changed since {}; the closure walk took {:.2}s over {} service(s)",
+        untouched.iter().filter(|untouched| **untouched).count(),
+        untouched.len(),
+        short(base),
+        walks.closure_took.as_secs_f64(),
+        walks.walked
+    );
+    untouched
 }
 
 /// Each service's scope, index for index with `services`, logged one line
