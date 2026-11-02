@@ -173,6 +173,36 @@ test("a re-check that judged no type pair never says no contract problem", () =>
   );
 });
 
+test("the post-edit line names the reason the whole index was not type-checked", () => {
+  const result = unjudged();
+  // The boundary says something else: the build's own statement wins.
+  result.boundary = { types_degraded: { stage: "type check", detail: "a different cause" } };
+  result.type_check = { ran: false, reason: "type checker not found.", pairs: 2, judged: 0 };
+  assert.equal(
+    renderPostToolUse(result, "src/routes/users.ts"),
+    "Carrick re-checked src/routes/users.ts after this edit: types were not checked (type checker not found), so no contract verdict.",
+  );
+  // A check that ran leaves the old reasons alone.
+  result.type_check = { ran: true, pairs: 2, judged: 0 };
+  assert.match(renderPostToolUse(result, "src/routes/users.ts") ?? "", /\(a different cause\)/);
+});
+
+test("session start says when the whole index was built without type checking", () => {
+  const status = statusFixture("status-workspace.json");
+  status.type_check = { ran: false, reason: "type checker not found", pairs: 3, judged: 0 };
+  const lines = renderSessionStart(status).split("\n");
+  assert.ok(
+    lines.includes(
+      "Types were not checked for this index (type checker not found), so no pair has a type verdict.",
+    ),
+    lines.join("\n"),
+  );
+  status.type_check = { ran: true, pairs: 3, judged: 3 };
+  assert.doesNotMatch(renderSessionStart(status), /Types were not checked/);
+  delete status.type_check;
+  assert.doesNotMatch(renderSessionStart(status), /Types were not checked/);
+});
+
 test("a re-check that judged pairs and found none wrong still says no contract problem", () => {
   const result = rechecked();
   result.items = [

@@ -277,6 +277,13 @@ pub struct CheckOutput {
     /// which is every `touch` and every language-server read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recheck: Option<Recheck>,
+    /// Whether the type check ran, and why not when it did not (carrick#3204).
+    /// A re-check that answered states its own run; every other answer states
+    /// the index's. Without it a row that is `not_checked` cannot be told from
+    /// one the whole build never type-checked. Absent when the index predates
+    /// the field and no re-check answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_check: Option<TypeCheckState>,
     /// What other files of this repo use from this one, as the index recorded
     /// it: the callers of its functions and the operations that read its
     /// types (carrick#2067). Locations only, never a verdict, so `touch`
@@ -288,6 +295,31 @@ pub struct CheckOutput {
     /// both print. Always present, and empty when there is nothing to say.
     #[serde(default)]
     pub uses_lines: Vec<String>,
+}
+
+/// What the type check did, as a check answer states it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TypeCheckState {
+    /// False when the check did not run at all.
+    pub ran: bool,
+    /// Why it did not run. Absent when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Producer/consumer pairs the join matched.
+    pub pairs: usize,
+    /// Of those, the pairs the check reached a verdict on.
+    pub judged: usize,
+}
+
+impl From<&super::read_model::TypeCheckSummary> for TypeCheckState {
+    fn from(summary: &super::read_model::TypeCheckSummary) -> Self {
+        Self {
+            ran: summary.skipped.is_none(),
+            reason: summary.skipped.clone(),
+            pairs: summary.pairs,
+            judged: summary.judged,
+        }
+    }
 }
 
 /// What other files use from the queried one.
@@ -1034,6 +1066,25 @@ fn short_commit(commit: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_skipped_type_check_is_stated_as_not_run_with_its_reason() {
+        use super::super::read_model::TypeCheckSummary;
+        let summary = |skipped: Option<&str>| TypeCheckSummary {
+            skipped: skipped.map(str::to_string),
+            pairs: 4,
+            judged: 3,
+            not_stored: Vec::new(),
+        };
+        let ran = TypeCheckState::from(&summary(None));
+        assert_eq!(
+            (ran.ran, ran.reason, ran.pairs, ran.judged),
+            (true, None, 4, 3)
+        );
+        let skipped = TypeCheckState::from(&summary(Some("type checker not found")));
+        assert!(!skipped.ran);
+        assert_eq!(skipped.reason.as_deref(), Some("type checker not found"));
+    }
+
     use super::*;
 
     pub(super) fn output() -> CheckOutput {
@@ -1080,6 +1131,7 @@ mod tests {
                 super::super::NOT_CLASSIFIED_LOCALLY
             )],
             recheck: None,
+            type_check: None,
             uses: None,
             uses_lines: Vec::new(),
         }

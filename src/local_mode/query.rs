@@ -17,10 +17,10 @@ use std::process::Command;
 
 use super::contract::{
     Caller, CheckOutput, Counterpart, FunctionUse, Item, MAX_STALE_FILES, ReadError, ReadFailure,
-    Recheck, SCHEMA, STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService, TypeOperation,
-    TypeUse, Uses, Verdict,
+    Recheck, SCHEMA, STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService, TypeCheckState,
+    TypeOperation, TypeUse, Uses, Verdict,
 };
-use super::read_model::{FileUses, IndexedItem, IndexedRepo, LocalIndex};
+use super::read_model::{FileUses, IndexedItem, IndexedRepo, LocalIndex, TypeCheckSummary};
 
 /// Which of the two read-only commands is asking. The only difference is
 /// whether verdicts are stated: `touch` answers "what is on the other side of
@@ -172,9 +172,16 @@ pub fn answer(
         _ => None,
     };
     let items = match &recheck {
-        Some((Some(fresh), _)) => fresh.clone(),
+        Some((Some((fresh, _)), _)) => fresh.clone(),
         _ => items,
     };
+    // The type check the rows above came from: this run's own when a re-check
+    // answered, else the index's (carrick#3204).
+    let type_check = match &recheck {
+        Some((Some((_, stated)), _)) => Some(stated),
+        _ => index.type_check.as_ref(),
+    }
+    .map(TypeCheckState::from);
     // Rows this run computed are not "unresolved since your edit": they ARE
     // the edit. The file is still reported as changed at the top level, which
     // is a fact about the tree either way.
@@ -247,6 +254,7 @@ pub fn answer(
             })
             .collect(),
         recheck,
+        type_check,
         boundary,
         boundary_note,
         boundary_lines,
@@ -419,7 +427,7 @@ fn rechecked(
     index_generation: &str,
     reach: &super::recheck::Reach,
     before: &LocalIndex,
-) -> (Option<Vec<IndexedItem>>, Recheck) {
+) -> (Option<(Vec<IndexedItem>, TypeCheckSummary)>, Recheck) {
     let started = std::time::Instant::now();
     let workspace = match super::workspace::Workspace::load(workspace_root) {
         Ok(workspace) => workspace,
@@ -448,7 +456,7 @@ fn rechecked(
         before,
     ) {
         Ok(fresh) => (
-            Some(fresh.items),
+            Some((fresh.items, fresh.type_check)),
             Recheck {
                 ran: fresh.ran.as_str().to_string(),
                 elapsed_ms: fresh.elapsed.as_millis() as u64,

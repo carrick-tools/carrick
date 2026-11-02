@@ -151,11 +151,27 @@ export type CheckResult = {
    */
   recheck?: Recheck;
   /**
+   * Whether the type check ran, and why not (carrick#3204). A re-check that
+   * answered states its own run; every other answer states the index's.
+   * Absent from an older CLI.
+   */
+  type_check?: TypeCheckState;
+  /**
    * Who uses this file from elsewhere in its repo, already rendered by the CLI:
    * one line per type an operation reads and per function with callers in
    * other files (carrick#2067). Printed as it stands. Absent from an older CLI.
    */
   uses_lines?: string[];
+};
+
+/** What the type check did: `type_check` on a check answer and on a status answer. */
+export type TypeCheckState = {
+  /** False when the check did not run at all. */
+  ran: boolean;
+  /** Why it did not run. Absent when it ran. */
+  reason?: string;
+  pairs: number;
+  judged: number;
 };
 
 /** The `recheck` block of a `carrick.check/0` answer. */
@@ -437,6 +453,11 @@ export type StatusResult = {
    * the sentence rather than reconstructing one.
    */
   analysing?: string[];
+  /**
+   * What the last build's type check did (carrick#3204). The CLI's status
+   * names it `skipped` when it did not run; it is mapped to this shape on read.
+   */
+  type_check?: TypeCheckState;
   services: StatusService[];
 };
 
@@ -517,6 +538,10 @@ function checkResultOf(parsed: unknown): CheckResult | null {
   if (isRecord(recheck) && typeof recheck["ran"] === "string") {
     result.recheck = recheck as unknown as Recheck;
   }
+  const typeCheck = parsed["type_check"];
+  if (isRecord(typeCheck) && typeof typeCheck["ran"] === "boolean") {
+    result.type_check = typeCheck as unknown as TypeCheckState;
+  }
   return result;
 }
 
@@ -567,6 +592,16 @@ export function parseStatusResult(stdout: string): StatusResult | null {
   const lastScan = parsed["last_scan"];
   if (isRecord(lastScan) && Array.isArray(lastScan["scans"])) {
     result.last_scan = lastScan as unknown as RunSpend;
+  }
+  const statusCheck = parsed["type_check"];
+  if (isRecord(statusCheck) && typeof statusCheck["pairs"] === "number") {
+    const skipped = statusCheck["skipped"];
+    result.type_check = {
+      ran: typeof skipped !== "string",
+      ...(typeof skipped === "string" ? { reason: skipped } : {}),
+      pairs: statusCheck["pairs"],
+      judged: typeof statusCheck["judged"] === "number" ? statusCheck["judged"] : 0,
+    };
   }
   const repos = Array.isArray(parsed["repos"]) ? parsed["repos"] : [];
   for (const entry of repos) {

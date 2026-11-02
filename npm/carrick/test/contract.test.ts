@@ -131,3 +131,23 @@ test("the last paid scan's figures survive the parse, and nothing here prints th
   );
   assert.equal(malformed?.last_scan, undefined);
 });
+
+test("status and check answers carry the type check state", () => {
+  const status = parseStatusResult(
+    JSON.stringify({
+      schema: "carrick.status/0",
+      services: [],
+      type_check: { skipped: "type checker not found", pairs: 2, judged: 0 },
+    }),
+  );
+  assert.deepEqual(status?.type_check, {
+    ran: false,
+    reason: "type checker not found",
+    pairs: 2,
+    judged: 0,
+  });
+  const ran = parseStatusResult(
+    JSON.stringify({ schema: "carrick.status/0", services: [], type_check: { pairs: 2, judged: 2 } }),
+  );
+  assert.deepEqual(ran?.type_check, { ran: true, pairs: 2, judged: 2 });
+});
