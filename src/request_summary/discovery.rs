@@ -4483,6 +4483,8 @@ export function listen(): void {
                 "src/index.ts:16 POST /api/session/setup <- /api/session/setup",
                 "src/index.ts:18 GET / <- /",
                 "src/index.ts:20 GET /health <- /health",
+                // The base normalised through conditionals on one name.
+                "src/normalised.ts:16 GET /v2/status <- /v2/status",
             ]),
             "{got:#?}"
         );
