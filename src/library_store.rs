@@ -161,6 +161,9 @@ pub struct Install<'a> {
     /// `NPM_CONFIG_REGISTRY`, the default registry Deno installs from when
     /// it is set.
     pub npm_registry_env: Option<&'a str>,
+    /// `XDG_CONFIG_HOME`, which pnpm 11 and later reads its global config
+    /// from (`$XDG_CONFIG_HOME/pnpm/rc`) before the home directory's.
+    pub xdg_config_home: Option<&'a Path>,
 }
 
 /// What a service asks, and how to read the answer back onto its imports.
@@ -888,8 +891,8 @@ fn pnpm_lock(
 /// where pnpm reads it besides `.npmrc`: every `pnpm-workspace.yaml` from the
 /// lockfile's directory up to the repo root (`registry`, `'@scope:registry'`,
 /// and a `registries` map by scope or `default`), the home directory's
-/// `.config/pnpm/config.yaml` and `.config/pnpm/rc`, and
-/// `NPM_CONFIG_REGISTRY`. Any of them naming another registry for the
+/// `.config/pnpm/config.yaml` and `.config/pnpm/rc`, the same two files under
+/// `$XDG_CONFIG_HOME/pnpm`, and `NPM_CONFIG_REGISTRY`. Any of them naming another registry for the
 /// package's scope or the default sends nothing; none configured is the
 /// public default, as for Yarn Berry (carrick#2386).
 fn pnpm_configured_registry_is_public(name: &str, lock_dir: &Path, install: &Install<'_>) -> bool {
@@ -899,8 +902,15 @@ fn pnpm_configured_registry_is_public(name: &str, lock_dir: &Path, install: &Ins
         .into_iter()
         .filter_map(|dir| read_yaml(&dir.join("pnpm-workspace.yaml")))
         .collect();
-    if let Some(home) = install.home {
-        let pnpm = home.join(".config").join("pnpm");
+    // pnpm 11 reads its global config from `$XDG_CONFIG_HOME/pnpm`, else
+    // `~/.config/pnpm`. Which one wins does not matter here: a private
+    // registry named in either sends nothing, so both are read.
+    let global_dirs = install
+        .xdg_config_home
+        .map(|xdg| xdg.join("pnpm"))
+        .into_iter()
+        .chain(install.home.map(|home| home.join(".config").join("pnpm")));
+    for pnpm in global_dirs {
         if npmrc_maps_elsewhere(&pnpm.join("rc"), name) {
             return false;
         }
@@ -1710,6 +1720,7 @@ mod tests {
             home: None,
             yarn_registry_env: None,
             npm_registry_env: None,
+            xdg_config_home: None,
         }
     }
 
@@ -1969,6 +1980,7 @@ mod tests {
             home: None,
             yarn_registry_env: None,
             npm_registry_env: None,
+            xdg_config_home: None,
         };
         assert_eq!(
             asked(request(&specifiers(&["lib"]), &install)),
@@ -2133,6 +2145,50 @@ mod tests {
             ..install_at(dir.path())
         };
         assert_eq!(asked(request(&specifiers(&["lib"]), &at_home)), vec![]);
+        // `$XDG_CONFIG_HOME/pnpm/rc` and `config.yaml`, where pnpm 11 reads
+        // its global config; the home directory's is read as well.
+        for (file, text) in [
+            ("rc", "registry=https://npm.acme.dev/\n"),
+            ("config.yaml", "registry: https://npm.acme.dev/\n"),
+        ] {
+            let xdg = tempfile::tempdir().unwrap();
+            write(&xdg.path().join("pnpm").join(file), text);
+            let at_xdg = Install {
+                xdg_config_home: Some(xdg.path()),
+                ..install_at(dir.path())
+            };
+            assert_eq!(
+                asked(request(&specifiers(&["lib"]), &at_xdg)),
+                vec![],
+                "{file}"
+            );
+        }
+        let scoped = tempfile::tempdir().unwrap();
+        pnpm_two_document_install(scoped.path(), "@acme/lib");
+        let xdg = tempfile::tempdir().unwrap();
+        write(
+            &xdg.path().join("pnpm").join("rc"),
+            "@acme:registry=https://npm.acme.dev/\n",
+        );
+        let at_xdg = Install {
+            xdg_config_home: Some(xdg.path()),
+            ..install_at(scoped.path())
+        };
+        assert_eq!(asked(request(&specifiers(&["@acme/lib"]), &at_xdg)), vec![]);
+        // A public registry there is the same as none.
+        let xdg = tempfile::tempdir().unwrap();
+        write(
+            &xdg.path().join("pnpm").join("rc"),
+            "registry=https://registry.npmjs.org/\n",
+        );
+        let at_xdg = Install {
+            xdg_config_home: Some(xdg.path()),
+            ..install_at(dir.path())
+        };
+        assert_eq!(
+            asked(request(&specifiers(&["lib"]), &at_xdg)),
+            one("lib", "1.0.0", &["lib"])
+        );
         let env = Install {
             npm_registry_env: Some("https://npm.acme.dev/"),
             ..install_at(dir.path())

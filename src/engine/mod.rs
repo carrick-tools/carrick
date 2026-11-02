@@ -6241,12 +6241,14 @@ impl LibraryAsk {
         let home = dirs::home_dir();
         let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
         let npm_registry_env = std::env::var("NPM_CONFIG_REGISTRY").ok();
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
         let install = crate::library_store::Install {
             service_root,
             repo_root,
             home: home.as_deref(),
             yarn_registry_env: yarn_registry_env.as_deref(),
             npm_registry_env: npm_registry_env.as_deref(),
+            xdg_config_home: xdg_config_home.as_deref(),
         };
         let asked = crate::library_store::request(&specifiers, &install);
         // The language's own library (carrick#2504): the default-library
@@ -10949,6 +10951,7 @@ fn library_ask_health(
     let home = dirs::home_dir();
     let npm_registry_env = std::env::var("NPM_CONFIG_REGISTRY").ok();
     let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
     let health = crate::library_store::ask_health(
         &specifiers,
         &crate::library_store::Install {
@@ -10957,6 +10960,7 @@ fn library_ask_health(
             home: home.as_deref(),
             yarn_registry_env: yarn_registry_env.as_deref(),
             npm_registry_env: npm_registry_env.as_deref(),
+            xdg_config_home: xdg_config_home.as_deref(),
         },
     );
     if health.is_blind() {
