@@ -557,6 +557,12 @@ pub struct FileCentricAnalysisResult {
     pub raw_model_results: HashMap<String, FileAnalysisResult>,
     /// Aggregated mount graph
     pub mount_graph: MountGraph,
+    /// Whether any file of the service builds a GraphQL schema in code: the
+    /// per-file answer of [`crate::graphql_schema_builder`] that admits a
+    /// module to the model, kept for the service. Every schema file the
+    /// service serves is then a possible printed copy of that code, however
+    /// it came to sit in a walked folder (carrick#3200).
+    pub builds_graphql_schema_in_code: bool,
     /// Processing statistics
     pub stats: ProcessingStats,
     /// Inline-plugin registrations whose prefix the source does not state as
@@ -2934,6 +2940,8 @@ impl FileOrchestrator {
                 WorkspaceIndex::build_with_aliases(repo_root, None),
             ))
         });
+        // Whether any file answered yes above (carrick#3200).
+        let mut builds_graphql_schema_in_code = false;
         // Route tables that bind a path to an imported handler (#580 part b).
         // Collected here, where the file's content is already in hand, and
         // resolved after the whole pass: the endpoints belong to the CONTROLLER
@@ -3245,6 +3253,7 @@ impl FileOrchestrator {
                     )
                 });
             if is_graphql_schema_builder_file {
+                builds_graphql_schema_in_code = true;
                 debug!(
                     "GraphQL schema-builder file, given the declared schema fields: {} [{} HTTP candidate(s)]",
                     path_str,
@@ -4266,6 +4275,7 @@ impl FileOrchestrator {
                 file_results: HashMap::new(),
                 raw_model_results: HashMap::new(),
                 mount_graph: MountGraph::new(),
+                builds_graphql_schema_in_code: false,
                 stats,
                 unread_mount_prefixes: Vec::new(),
                 bundled_types: None,
@@ -4333,6 +4343,7 @@ impl FileOrchestrator {
                 file_results: HashMap::new(),
                 raw_model_results: HashMap::new(),
                 mount_graph: MountGraph::new(),
+                builds_graphql_schema_in_code: false,
                 stats,
                 unread_mount_prefixes: Vec::new(),
                 bundled_types: None,
@@ -4961,6 +4972,7 @@ impl FileOrchestrator {
             file_results,
             raw_model_results,
             mount_graph,
+            builds_graphql_schema_in_code,
             stats,
             unread_mount_prefixes: unread_prefixes,
             bundled_types: None,

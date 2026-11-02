@@ -45,6 +45,7 @@ pub mod graphql;
 pub mod graphql_document_sites;
 pub mod graphql_resolver_anchor;
 pub mod graphql_schema_builder;
+pub mod graphql_selection;
 pub mod handler_span;
 pub mod help;
 pub mod import_bindings;

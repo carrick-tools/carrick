@@ -120,6 +120,25 @@ pub struct DocumentOperation {
     /// The key each root field's value has in the result: its alias when it
     /// has one, else its name. Parallel to `fields`.
     pub response_keys: Vec<String>,
+    /// What each root field selects, fragment spreads read through to the
+    /// definitions the document holds. Parallel to `fields`. Read against the
+    /// schema the document is sent to ([`crate::graphql_selection`]).
+    pub selections: Vec<crate::graphql_selection::SelectionSet>,
+}
+
+impl DocumentOperation {
+    /// What every root field named `field` selects (one per occurrence: an
+    /// operation may select a field twice under two aliases).
+    pub fn selections_of<'s>(
+        &'s self,
+        field: &'s str,
+    ) -> impl Iterator<Item = &'s crate::graphql_selection::SelectionSet> {
+        self.fields
+            .iter()
+            .zip(&self.selections)
+            .filter(move |(name, _)| name.as_str() == field)
+            .map(|(_, selection)| selection)
+    }
 }
 
 /// A document bound to a name, or a document file imported whole.
@@ -417,6 +436,7 @@ fn site_consumer(
         located_field_type: None,
         // Set by attribution, which runs after these rows are placed.
         schema_binding: None,
+        undeclared_selection: None,
         arguments: None,
     }
 }
@@ -1130,8 +1150,15 @@ fn object_elements<'e>(object: &'e ObjectLit, key: &str) -> Vec<&'e ObjectLit> {
 /// A root fragment spread states no field and is left out, as it is when the
 /// same document is parsed from text.
 fn object_operations(document: &ObjectLit) -> Vec<DocumentOperation> {
-    object_elements(document, "definitions")
-        .into_iter()
+    let definitions = object_elements(document, "definitions");
+    // A compiled document carries the fragments its operations spread.
+    let fragments: HashMap<&str, &ObjectLit> = definitions
+        .iter()
+        .filter(|definition| string_property(definition, "kind") == Some("FragmentDefinition"))
+        .filter_map(|definition| Some((name_value(definition, "name")?, *definition)))
+        .collect();
+    definitions
+        .iter()
         .filter(|definition| string_property(definition, "kind") == Some("OperationDefinition"))
         .filter_map(|definition| {
             let kind = match string_property(definition, "operation")? {
@@ -1140,27 +1167,89 @@ fn object_operations(document: &ObjectLit) -> Vec<DocumentOperation> {
                 "subscription" => GraphqlOperationKind::Subscription,
                 _ => return None,
             };
-            let (fields, response_keys) = match property(definition, "selectionSet") {
-                Some(Expr::Object(selection_set)) => object_elements(selection_set, "selections")
-                    .into_iter()
-                    .filter(|selection| string_property(selection, "kind") == Some("Field"))
-                    .filter_map(|selection| {
-                        let name = name_value(selection, "name")?;
-                        let key = name_value(selection, "alias").unwrap_or(name);
-                        Some((name.to_string(), key.to_string()))
-                    })
-                    .filter(|(name, _)| !name.starts_with("__"))
-                    .unzip(),
-                _ => (Vec::new(), Vec::new()),
-            };
+            let mut fields = Vec::new();
+            let mut response_keys = Vec::new();
+            let mut selections = Vec::new();
+            if let Some(Expr::Object(selection_set)) = property(definition, "selectionSet") {
+                for selection in object_elements(selection_set, "selections") {
+                    if string_property(selection, "kind") != Some("Field") {
+                        continue;
+                    }
+                    let Some(name) = name_value(selection, "name") else {
+                        continue;
+                    };
+                    if name.starts_with("__") {
+                        continue;
+                    }
+                    fields.push(name.to_string());
+                    response_keys.push(name_value(selection, "alias").unwrap_or(name).to_string());
+                    selections.push(object_selection_set(selection, &fragments, &mut Vec::new()));
+                }
+            }
             Some(DocumentOperation {
                 kind,
                 name: name_value(definition, "name").map(str::to_string),
                 fields,
                 response_keys,
+                selections,
             })
         })
         .collect()
+}
+
+/// What the graphql-js node `node` (a field, an inline fragment or a fragment
+/// definition) selects under its `selectionSet`, written as an object
+/// literal: the compiled form of [`crate::graphql_selection::read_selection_set`].
+/// A spread of a fragment the document does not carry is not read, and a
+/// fragment that spreads itself is read once.
+fn object_selection_set<'o>(
+    node: &'o ObjectLit,
+    fragments: &HashMap<&'o str, &'o ObjectLit>,
+    expanding: &mut Vec<&'o str>,
+) -> crate::graphql_selection::SelectionSet {
+    use crate::graphql_selection::{SelectedField, SelectionSet};
+    let mut out = SelectionSet::default();
+    let Some(Expr::Object(selection_set)) = property(node, "selectionSet") else {
+        return out;
+    };
+    let condition = |node: &'o ObjectLit| match property(node, "typeCondition") {
+        Some(Expr::Object(named)) => name_value(named, "name").map(str::to_string),
+        _ => None,
+    };
+    for selection in object_elements(selection_set, "selections") {
+        match string_property(selection, "kind") {
+            Some("Field") => {
+                let Some(name) = name_value(selection, "name") else {
+                    continue;
+                };
+                out.fields.push(SelectedField {
+                    name: name.to_string(),
+                    selection: object_selection_set(selection, fragments, expanding),
+                });
+            }
+            Some("InlineFragment") => out.on_types.push((
+                condition(selection),
+                object_selection_set(selection, fragments, expanding),
+            )),
+            Some("FragmentSpread") => {
+                let Some(name) = name_value(selection, "name") else {
+                    continue;
+                };
+                let Some(fragment) = fragments.get(name) else {
+                    continue;
+                };
+                if expanding.contains(&name) {
+                    continue;
+                }
+                expanding.push(name);
+                let nested = object_selection_set(fragment, fragments, expanding);
+                expanding.pop();
+                out.on_types.push((condition(fragment), nested));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn text_operations(text: &str) -> Vec<DocumentOperation> {
@@ -1180,12 +1269,13 @@ fn text_operations_with_lines(text: &str) -> Vec<(DocumentOperation, Vec<u32>)> 
     let Ok(document) = graphql_parser::parse_query::<String>(text) else {
         return Vec::new();
     };
+    let fragments = crate::graphql_selection::fragments_of(&document);
     let mut operations = Vec::new();
     for definition in &document.definitions {
         let Definition::Operation(operation) = definition else {
             continue;
         };
-        let (operation, roots) = parsed_operation(operation);
+        let (operation, roots) = parsed_operation(operation, &fragments);
         let lines = roots
             .iter()
             .map(|field| field.position.line as u32)
@@ -1198,9 +1288,12 @@ fn text_operations_with_lines(text: &str) -> Vec<(DocumentOperation, Vec<u32>)> 
 /// The operation a parsed operation definition states, with the node of
 /// each of its root fields in the order of `fields`. An anonymous selection
 /// set is a query; fragment spreads and introspection fields at the root are
-/// left out, because they name no root field a row can be keyed by.
+/// left out, because they name no root field a row can be keyed by. Each root
+/// field's selection reads its spreads through `fragments`, the document's
+/// own fragment definitions.
 pub(crate) fn parsed_operation<'a, 'd>(
     definition: &'d graphql_parser::query::OperationDefinition<'a, String>,
+    fragments: &crate::graphql_selection::Fragments<'_>,
 ) -> (
     DocumentOperation,
     Vec<&'d graphql_parser::query::Field<'a, String>>,
@@ -1239,6 +1332,12 @@ pub(crate) fn parsed_operation<'a, 'd>(
         response_keys: roots
             .iter()
             .map(|field| field.alias.clone().unwrap_or_else(|| field.name.clone()))
+            .collect(),
+        selections: roots
+            .iter()
+            .map(|field| {
+                crate::graphql_selection::read_selection_set(&field.selection_set, fragments)
+            })
             .collect(),
     };
     (operation, roots)
@@ -2099,6 +2198,48 @@ export type PairQuery = { first?: { id: string } | null, second?: { id: string }
         let lo = (located.lo - SWC_SPAN_BASE) as usize;
         let hi = (located.hi - SWC_SPAN_BASE) as usize;
         Some(LOCATED_TYPES[lo..hi].to_string())
+    }
+
+    /// A compiled document's operations state what each root field selects,
+    /// inline fragments and the fragments it carries read on their type
+    /// condition, exactly as the same document's text does
+    /// ([`crate::graphql_selection`]).
+    #[test]
+    fn a_compiled_document_states_its_selection_as_its_text_does() {
+        let text = "query Depot { depot { code ... on Depot { city } ...Place } } \
+                    fragment Place on Depot { city zone }";
+        let compiled = r#"export const DepotDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"query","name":{"kind":"Name","value":"Depot"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"depot"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"code"}},{"kind":"InlineFragment","typeCondition":{"kind":"NamedType","name":{"kind":"Name","value":"Depot"}},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"city"}}]}},{"kind":"FragmentSpread","name":{"kind":"Name","value":"Place"}}]}}]}},{"kind":"FragmentDefinition","name":{"kind":"Name","value":"Place"},"typeCondition":{"kind":"NamedType","name":{"kind":"Name","value":"Depot"}},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"city"}},{"kind":"Field","name":{"kind":"Name","value":"zone"}}]}}]} as unknown as DocumentNode;"#;
+        let (_, module) =
+            crate::swc_scanner::parse_standalone_module(Path::new("graphql.ts"), compiled)
+                .expect("parses");
+        let object = module
+            .body
+            .iter()
+            .find_map(|item| match item {
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+                    Decl::Var(var) => match var.decls[0].init.as_deref().map(unwrap_expression) {
+                        Some(Expr::Object(object)) => Some(object),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the document object");
+        let operations = object_operations(object);
+        assert_eq!(operations, text_operations(text));
+        let [depot] = operations[0].selections.as_slice() else {
+            panic!("one root field: {operations:?}");
+        };
+        assert_eq!(depot.fields.len(), 1, "{depot:?}");
+        assert_eq!(
+            depot
+                .on_types
+                .iter()
+                .map(|(on, set)| (on.as_deref(), set.fields.len()))
+                .collect::<Vec<_>>(),
+            vec![(Some("Depot"), 1), (Some("Depot"), 2)]
+        );
     }
 
     /// A located type that is the result of the row's whole operation, one

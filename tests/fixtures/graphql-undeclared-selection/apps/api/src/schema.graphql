@@ -1,0 +1,21 @@
+type Query {
+  parcel(id: ID!): Parcel
+  depot(code: String!): Depot
+}
+
+type Parcel {
+  id: ID!
+  weightGrams: Int
+  status: ParcelStatus!
+}
+
+type Depot {
+  code: String!
+  city: String
+}
+
+enum ParcelStatus {
+  WAITING
+  MOVING
+  DELIVERED
+}

@@ -1,0 +1,43 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:58",
+      "line_number": 58,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/health",
+      "handler_name": "anonymous",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ ok: true }",
+      "response_expression_line": 58,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": [],
+  "graphql_operations": [
+    {
+      "kind": "query",
+      "field": "parcel",
+      "resolver_function": "resolve",
+      "resolver_line": 44,
+      "primary_type_symbol": "ParcelRecord",
+      "type_import_source": null,
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    },
+    {
+      "kind": "query",
+      "field": "depot",
+      "resolver_function": "resolve",
+      "resolver_line": 49,
+      "primary_type_symbol": "DepotRecord",
+      "type_import_source": null,
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    }
+  ]
+}

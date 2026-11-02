@@ -8816,6 +8816,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 value: value.to_string(),
             }),
             schema_binding: None,
+            undeclared_selection: None,
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
