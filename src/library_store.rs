@@ -443,6 +443,108 @@ pub fn runtime_global_packages(
         .collect()
 }
 
+/// What a service's ask leaves out of what it installed (carrick#2386): a
+/// lockfile the install wrote that does not read keeps every package it
+/// lists from the store, and nothing else says so. Counted, never sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AskHealth {
+    /// Installed registry packages the service's library calls go through
+    /// (runtime modules apart).
+    pub installed: usize,
+    /// Of those, the ones asked about.
+    pub sent: usize,
+    /// Lockfiles beside those packages' installs that do not read, as
+    /// [`from_public_registry`] reads them.
+    pub unreadable_lockfiles: BTreeSet<PathBuf>,
+}
+
+impl AskHealth {
+    /// The counts as fallback-tally keys.
+    pub fn counts(&self) -> Vec<(String, usize)> {
+        vec![
+            ("library_ask_npm_installed".to_string(), self.installed),
+            ("library_ask_npm_sent".to_string(), self.sent),
+            (
+                "library_ask_lockfile_unreadable".to_string(),
+                self.unreadable_lockfiles.len(),
+            ),
+        ]
+    }
+
+    /// Whether the ask is blind: packages installed and none asked about,
+    /// or a lockfile that does not read.
+    pub fn is_blind(&self) -> bool {
+        (self.installed > 0 && self.sent == 0) || !self.unreadable_lockfiles.is_empty()
+    }
+}
+
+/// [`AskHealth`] for the `specifiers` a service's library calls go through.
+pub fn ask_health(specifiers: &BTreeSet<String>, install: &Install<'_>) -> AskHealth {
+    let declared = declared_names(install.service_root, install.repo_root);
+    let runtime = installed(RUNTIME_TYPES, install);
+    let mut installed_names: BTreeMap<String, Installed> = BTreeMap::new();
+    let mut sent: BTreeSet<String> = BTreeSet::new();
+    for specifier in specifiers {
+        if specifier.starts_with("node:") {
+            continue;
+        }
+        if let Some(asked) = asked_as(specifier, &declared, runtime.as_ref(), install) {
+            if asked.runtime {
+                continue;
+            }
+            sent.insert(asked.package);
+        }
+        let name = crate::request_summary::package_name(specifier);
+        if let Some(package) = installed(name, install) {
+            installed_names.insert(name.to_string(), package);
+        }
+    }
+    let mut unreadable_lockfiles = BTreeSet::new();
+    for package in installed_names.values() {
+        let Some(lock_dir) = roots(&package.install_root, install.repo_root)
+            .into_iter()
+            .find(|dir| LOCKFILES.iter().any(|lock| dir.join(lock).is_file()))
+        else {
+            continue;
+        };
+        unreadable_lockfiles.extend(unreadable_in(&lock_dir));
+    }
+    AskHealth {
+        installed: installed_names.len(),
+        sent: sent.len(),
+        unreadable_lockfiles,
+    }
+}
+
+/// The lockfiles in `lock_dir`, and pnpm's install record beside its
+/// lockfile, that do not parse as their reader parses them.
+fn unreadable_in(lock_dir: &Path) -> Vec<PathBuf> {
+    let json = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some()
+    };
+    let mut out = Vec::new();
+    for name in ["package-lock.json", "npm-shrinkwrap.json"] {
+        let path = lock_dir.join(name);
+        if path.is_file() && !json(&path) {
+            out.push(path);
+        }
+    }
+    let pnpm = lock_dir.join("pnpm-lock.yaml");
+    if pnpm.is_file() {
+        if read_yaml_documents(&pnpm).is_none() {
+            out.push(pnpm);
+        }
+        let modules = lock_dir.join("node_modules").join(".modules.yaml");
+        if read_yaml(&modules).is_none() {
+            out.push(modules);
+        }
+    }
+    out
+}
+
 /// The entry one specifier is asked under.
 struct AskedAs {
     package: String,
@@ -582,7 +684,7 @@ fn from_public_registry(name: &str, package: &Installed, install: &Install<'_>) 
     let answers: Vec<bool> = [
         npm_lock(name, package, &lock_dir, NpmLock::Hidden),
         npm_lock(name, package, &lock_dir, NpmLock::Committed),
-        pnpm_lock(name, package, &lock_dir),
+        pnpm_lock(name, package, &lock_dir, install),
         yarn_lock(name, package, &lock_dir, install),
         deno_lock(name, package, &lock_dir, install),
     ]
@@ -696,6 +798,18 @@ fn read_yaml(path: &Path) -> Option<serde_yaml_ng::Value> {
     serde_yaml_ng::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
+/// Every document of one YAML file, parsed, or `None` when it is absent or
+/// any document is unreadable. pnpm 11 and later write a lockfile of two
+/// documents: the package manager's own, then the project's (carrick#2386).
+fn read_yaml_documents(path: &Path) -> Option<Vec<serde_yaml_ng::Value>> {
+    use serde::Deserialize as _;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_yaml_ng::Deserializer::from_str(&text)
+        .map(serde_yaml_ng::Value::deserialize)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+}
+
 /// pnpm's answer from `pnpm-lock.yaml` and the install's
 /// `node_modules/.modules.yaml`, or `None` when the lockfile is absent. The
 /// registry pnpm recorded for the package's scope (or its default) must be
@@ -704,7 +818,18 @@ fn read_yaml(path: &Path) -> Option<serde_yaml_ng::Value> {
 /// written with `lockfile-include-tarball-url=true` records one for every
 /// package (carrick#1721). A `tarball` elsewhere, a `type` (git, directory),
 /// a `directory` or a `repo` names another source.
-fn pnpm_lock(name: &str, package: &Installed, lock_dir: &Path) -> Option<bool> {
+///
+/// pnpm 11 and later record no `registries` in `.modules.yaml`. There the
+/// registry is read from the configuration pnpm reads, as for Yarn Berry
+/// ([`pnpm_configured_registry_is_public`]); the `.npmrc` files are read by
+/// the caller for every lockfile. Every lockfile document's `packages` is
+/// searched (carrick#2386).
+fn pnpm_lock(
+    name: &str,
+    package: &Installed,
+    lock_dir: &Path,
+    install: &Install<'_>,
+) -> Option<bool> {
     let lock_path = lock_dir.join("pnpm-lock.yaml");
     if !lock_path.is_file() {
         return None;
@@ -712,17 +837,18 @@ fn pnpm_lock(name: &str, package: &Installed, lock_dir: &Path) -> Option<bool> {
     let Some(modules) = read_yaml(&lock_dir.join("node_modules").join(".modules.yaml")) else {
         return Some(false);
     };
-    let registries = modules.get("registries");
-    let registry = scope_of(name)
-        .and_then(|scope| registries?.get(scope))
-        .or_else(|| registries?.get("default"))
-        .and_then(serde_yaml_ng::Value::as_str);
-    if !registry.is_some_and(is_public_url) {
+    let public = match modules.get("registries") {
+        Some(registries) => scope_of(name)
+            .and_then(|scope| registries.get(scope))
+            .or_else(|| registries.get("default"))
+            .and_then(serde_yaml_ng::Value::as_str)
+            .is_some_and(is_public_url),
+        None => pnpm_configured_registry_is_public(name, lock_dir, install),
+    };
+    if !public {
         return Some(false);
     }
-    let Some(serde_yaml_ng::Value::Mapping(packages)) =
-        read_yaml(&lock_path).and_then(|lock| lock.get("packages").cloned())
-    else {
+    let Some(documents) = read_yaml_documents(&lock_path) else {
         return Some(false);
     };
     // `name@1.2.3` and `name@1.2.3(peer@2.0.0)` (v9), `/name@1.2.3` (v6),
@@ -731,11 +857,18 @@ fn pnpm_lock(name: &str, package: &Installed, lock_dir: &Path) -> Option<bool> {
         format!("{name}@{}", package.version),
         format!("{name}/{}", package.version),
     ];
-    let entry = packages.iter().find_map(|(key, entry)| {
-        let key = key.as_str()?.trim_start_matches('/');
-        let bare = key.split('(').next().unwrap_or_default();
-        wanted.iter().any(|wanted| wanted == bare).then_some(entry)
-    });
+    let entry = documents
+        .iter()
+        .filter_map(|document| match document.get("packages") {
+            Some(serde_yaml_ng::Value::Mapping(packages)) => Some(packages),
+            _ => None,
+        })
+        .flat_map(|packages| packages.iter())
+        .find_map(|(key, entry)| {
+            let key = key.as_str()?.trim_start_matches('/');
+            let bare = key.split('(').next().unwrap_or_default();
+            wanted.iter().any(|wanted| wanted == bare).then_some(entry)
+        });
     let Some(resolution) = entry.and_then(|entry| entry.get("resolution")) else {
         return Some(false);
     };
@@ -748,6 +881,50 @@ fn pnpm_lock(name: &str, package: &Installed, lock_dir: &Path) -> Option<bool> {
                 .iter()
                 .all(|field| resolution.get(*field).is_none()),
     )
+}
+
+/// Whether the registry pnpm is configured to install `name` from is the
+/// public one, for an install that recorded none (pnpm 11 and later). Read
+/// where pnpm reads it besides `.npmrc`: every `pnpm-workspace.yaml` from the
+/// lockfile's directory up to the repo root (`registry`, `'@scope:registry'`,
+/// and a `registries` map by scope or `default`), the home directory's
+/// `.config/pnpm/config.yaml` and `.config/pnpm/rc`, and
+/// `NPM_CONFIG_REGISTRY`. Any of them naming another registry for the
+/// package's scope or the default sends nothing; none configured is the
+/// public default, as for Yarn Berry (carrick#2386).
+fn pnpm_configured_registry_is_public(name: &str, lock_dir: &Path, install: &Install<'_>) -> bool {
+    let scope = scope_of(name);
+    let scoped_key = scope.map(|scope| format!("{scope}:registry"));
+    let mut configs: Vec<serde_yaml_ng::Value> = roots(lock_dir, install.repo_root)
+        .into_iter()
+        .filter_map(|dir| read_yaml(&dir.join("pnpm-workspace.yaml")))
+        .collect();
+    if let Some(home) = install.home {
+        let pnpm = home.join(".config").join("pnpm");
+        if npmrc_maps_elsewhere(&pnpm.join("rc"), name) {
+            return false;
+        }
+        configs.extend(read_yaml(&pnpm.join("config.yaml")));
+    }
+    let text = |value: Option<&serde_yaml_ng::Value>| {
+        value
+            .and_then(serde_yaml_ng::Value::as_str)
+            .map(str::to_string)
+    };
+    let mut configured: Vec<String> = install
+        .npm_registry_env
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    for config in &configs {
+        configured.extend(text(config.get("registry")));
+        configured.extend(text(scoped_key.as_deref().and_then(|key| config.get(key))));
+        if let Some(registries) = config.get("registries") {
+            configured.extend(text(registries.get("default")));
+            configured.extend(text(scope.and_then(|scope| registries.get(scope))));
+        }
+    }
+    configured.iter().all(|registry| is_public_url(registry))
 }
 
 /// Yarn's answer from `yarn.lock`, or `None` when it is absent. A classic
@@ -1889,6 +2066,126 @@ mod tests {
             asked(request(&specifiers(&["lib"]), &install_at(private.path()))),
             vec![]
         );
+    }
+
+    /// A pnpm 11+ install: `.modules.yaml` is JSON and records no
+    /// registries, and the lockfile is two YAML documents, the first the
+    /// package manager's own (carrick#2386).
+    fn pnpm_two_document_install(root: &Path, name: &str) {
+        install_package(root, name, "1.0.0");
+        write(
+            &root.join("node_modules").join(".modules.yaml"),
+            "{\n  \"layoutVersion\": 5,\n  \"nodeLinker\": \"isolated\"\n}\n",
+        );
+        write(
+            &root.join("pnpm-lock.yaml"),
+            &format!(
+                "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies: {{}}\n\npackages:\n\n  'pm@12.0.0':\n    resolution: {{integrity: sha512-pm}}\n\n---\nlockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n\npackages:\n\n  '{name}@1.0.0':\n    resolution: {{integrity: sha512-abc}}\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn a_pnpm_install_with_a_two_document_lockfile_and_no_recorded_registry_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        pnpm_two_document_install(dir.path(), "lib");
+        assert_eq!(
+            asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
+            one("lib", "1.0.0", &["lib"])
+        );
+    }
+
+    #[test]
+    fn a_pnpm_install_with_no_recorded_registry_reads_the_registry_pnpm_is_configured_with() {
+        // The workspace file's default, its scope key, its `registries`
+        // map, the home config, and `NPM_CONFIG_REGISTRY`: each mapped off
+        // the public registry sends nothing.
+        for (name, workspace) in [
+            ("lib", "registry: https://npm.acme.dev/\n"),
+            ("@acme/lib", "'@acme:registry': https://npm.acme.dev/\n"),
+            ("lib", "registries:\n  default: https://npm.acme.dev/\n"),
+            (
+                "@acme/lib",
+                "registries:\n  '@acme': https://npm.acme.dev/\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            pnpm_two_document_install(dir.path(), name);
+            write(
+                &dir.path().join("pnpm-workspace.yaml"),
+                &format!("packages:\n  - 'apps/*'\n{workspace}"),
+            );
+            assert_eq!(
+                asked(request(&specifiers(&[name]), &install_at(dir.path()))),
+                vec![],
+                "{workspace}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        pnpm_two_document_install(dir.path(), "lib");
+        write(
+            &home.path().join(".config").join("pnpm").join("config.yaml"),
+            "registry: https://npm.acme.dev/\n",
+        );
+        let at_home = Install {
+            home: Some(home.path()),
+            ..install_at(dir.path())
+        };
+        assert_eq!(asked(request(&specifiers(&["lib"]), &at_home)), vec![]);
+        let env = Install {
+            npm_registry_env: Some("https://npm.acme.dev/"),
+            ..install_at(dir.path())
+        };
+        assert_eq!(asked(request(&specifiers(&["lib"]), &env)), vec![]);
+        // A public registry configured is the same as none.
+        let public = tempfile::tempdir().unwrap();
+        pnpm_two_document_install(public.path(), "lib");
+        write(
+            &public.path().join("pnpm-workspace.yaml"),
+            "registry: https://registry.npmjs.org/\n",
+        );
+        assert_eq!(
+            asked(request(&specifiers(&["lib"]), &install_at(public.path()))),
+            one("lib", "1.0.0", &["lib"])
+        );
+    }
+
+    /// carrick#2386: an install whose lockfile does not read sends nothing,
+    /// and the ask says so.
+    #[test]
+    fn an_ask_that_sends_none_of_what_is_installed_is_blind() {
+        let healthy = tempfile::tempdir().unwrap();
+        pnpm_two_document_install(healthy.path(), "lib");
+        let health = ask_health(&specifiers(&["lib"]), &install_at(healthy.path()));
+        assert_eq!((health.installed, health.sent), (1, 1));
+        assert!(!health.is_blind(), "{health:?}");
+
+        let broken = tempfile::tempdir().unwrap();
+        pnpm_two_document_install(broken.path(), "lib");
+        write(
+            &broken.path().join("pnpm-lock.yaml"),
+            "packages: [unclosed\n",
+        );
+        let health = ask_health(&specifiers(&["lib"]), &install_at(broken.path()));
+        assert_eq!((health.installed, health.sent), (1, 0));
+        assert_eq!(
+            health.unreadable_lockfiles,
+            BTreeSet::from([broken.path().join("pnpm-lock.yaml")])
+        );
+        assert!(health.is_blind());
+        assert_eq!(
+            health.counts(),
+            vec![
+                ("library_ask_npm_installed".to_string(), 1),
+                ("library_ask_npm_sent".to_string(), 0),
+                ("library_ask_lockfile_unreadable".to_string(), 1),
+            ]
+        );
+
+        // A service whose calls go through no installed package is not.
+        let none = ask_health(&specifiers(&["node:http"]), &install_at(healthy.path()));
+        assert_eq!(none, AskHealth::default());
     }
 
     #[test]

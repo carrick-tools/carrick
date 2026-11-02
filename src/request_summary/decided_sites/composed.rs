@@ -39,6 +39,12 @@ pub struct Composed {
     /// hole's reason (the path is relative to what serves the instance
     /// there), or `cycle`.
     pub end: String,
+    /// The route's own path this one joins, where the call writes it
+    /// through a conditional or a default and it was read from one of its
+    /// ways ([`super::instances::whole_ways`], carrick#2386). `None` where
+    /// the call writes it whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own: Option<String>,
 }
 
 /// An instance served under a prefix: a call of a member labelled with
@@ -527,6 +533,7 @@ pub(super) fn compose(
                 path,
                 edges: chain.edges.clone(),
                 end: chain.end.clone(),
+                own: None,
             };
             if out.contains(&composed) {
                 continue;
@@ -539,6 +546,38 @@ pub(super) fn compose(
         }
     }
     (out, budget.trimmed)
+}
+
+/// [`compose`] for a route whose own path the call writes through a
+/// conditional or a default: once per way written whole (`ways`,
+/// carrick#2386), each path marked with the way it joins. With no way,
+/// [`compose`] with no path, as before.
+pub(super) fn compose_ways(
+    ends: &[InstanceEnd],
+    ways: &[String],
+    mounts: &Mounts,
+) -> (Vec<Composed>, bool) {
+    if ways.is_empty() {
+        return compose(ends, None, mounts);
+    }
+    let mut out: Vec<Composed> = Vec::new();
+    let mut trimmed = false;
+    for way in ways {
+        let (composed, cut) = compose(ends, Some(way), mounts);
+        trimmed |= cut;
+        for mut composed in composed {
+            composed.own = Some(way.clone());
+            if out.contains(&composed) {
+                continue;
+            }
+            if out.len() == MAX_COMPOSED {
+                trimmed = true;
+                break;
+            }
+            out.push(composed);
+        }
+    }
+    (out, trimmed)
 }
 
 #[cfg(test)]

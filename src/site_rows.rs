@@ -256,12 +256,19 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
             .or_default() += decided.procedure_stops;
     }
     for record in records {
-        if record.bucket == Bucket::Lead || !label_states_a_route(record) {
+        if !label_states_a_route(record) {
             continue;
         }
         let Some(site) = site_of(decided, &record.anchors) else {
             continue;
         };
+        // A route whose name the record leaves unstated is traced only where
+        // the trace read its own path from the ways a conditional or a
+        // default writes (carrick#2386); the record itself is unchanged.
+        let ways_read = site.composed.iter().any(|composed| composed.own.is_some());
+        if record.bucket == Bucket::Lead && !ways_read {
+            continue;
+        }
         if let Some(procedure) = &site.procedure {
             // Each adapter and key path that reached it and named no path,
             // and a procedure nothing serves.
@@ -285,7 +292,7 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
             continue;
         }
         match traced_route(site, record) {
-            Ok(route) => out.routes.push(route),
+            Ok(routes) => out.routes.extend(routes),
             Err(reason) => *out.untraced.entry(reason).or_default() += 1,
         }
     }
@@ -328,8 +335,10 @@ fn procedure_route(
     })
 }
 
-/// `site`'s traced route, or why it has none.
-fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<TracedRoute, String> {
+/// `site`'s traced routes, or why it has none: one, or where the call writes
+/// its own path through a conditional or a default, one per way written
+/// whole (carrick#2386), each at the full paths that way joins.
+fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRoute>, String> {
     let method = forced_method(record)?;
     if site.composed_trimmed {
         return Err("trimmed".to_string());
@@ -348,33 +357,42 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<TracedRoute, 
             _ => format!("hole_{end}"),
         });
     }
-    let (Some(path), Some(mut full_paths)) = (
-        site.name_text(),
-        site.composed
-            .iter()
-            .map(|composed| composed.path.clone())
-            .collect::<Option<Vec<String>>>(),
-    ) else {
-        return Err("unread_prefix".to_string());
-    };
-    full_paths.sort();
-    full_paths.dedup();
-    Ok(TracedRoute {
-        file: site.file.clone(),
-        line: site.line,
-        method: method.to_uppercase(),
-        path,
-        full_paths,
-        handler: site
-            .handler
-            .as_ref()
-            .and_then(|handler| handler.name.clone()),
-        owner: site
-            .receiver
-            .as_ref()
-            .and_then(|receiver| receiver.symbol.clone()),
-        corrects: true,
-    })
+    // Each own path with the full paths it joins: the call's whole text, or
+    // each way it writes through a conditional or a default.
+    let mut by_own: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for composed in &site.composed {
+        let (Some(own), Some(path)) = (
+            composed.own.clone().or_else(|| site.name_text()),
+            composed.path.clone(),
+        ) else {
+            return Err("unread_prefix".to_string());
+        };
+        by_own.entry(own).or_default().push(path);
+    }
+    Ok(by_own
+        .into_iter()
+        .map(|(path, mut full_paths)| {
+            full_paths.sort();
+            full_paths.dedup();
+            TracedRoute {
+                file: site.file.clone(),
+                line: site.line,
+                method: method.to_uppercase(),
+                path,
+                full_paths,
+                handler: site
+                    .handler
+                    .as_ref()
+                    .and_then(|handler| handler.name.clone()),
+                owner: site
+                    .receiver
+                    .as_ref()
+                    .and_then(|receiver| receiver.symbol.clone()),
+                corrects: true,
+            }
+        })
+        .collect())
 }
 
 /// The id a site is asked under: its file and call span, unique in a run.

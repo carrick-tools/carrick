@@ -4439,6 +4439,61 @@ export function listen(): void {
         );
     }
 
+    /// carrick#2386: a route's own path written through a conditional or a
+    /// default (`base ? \`${base}api\` : "/api"`, `base ?? "/"`) is served at
+    /// each way the code writes whole, read the way a mount's prefix is. A
+    /// way led by a value read at runtime states nothing, and a path with no
+    /// way written whole stays unread. Two reads state the same routes.
+    #[test]
+    fn a_route_path_written_through_a_conditional_is_served_at_each_whole_way() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-route-prefix")
+        else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let served = |decided: &super::super::decided_sites::Decided| {
+            let records =
+                super::super::site_record::site_records(&on.inputs, &on.repo, decided, &labels);
+            let routes = crate::site_rows::traced(decided, &records);
+            let mut served: Vec<String> = routes
+                .routes
+                .iter()
+                .map(|route| {
+                    format!(
+                        "{}:{} {} {} <- {}",
+                        route.file,
+                        route.line,
+                        route.method,
+                        route.path,
+                        route.full_paths.join(" ")
+                    )
+                })
+                .collect();
+            served.sort();
+            (served, routes.untraced)
+        };
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let (got, untraced) = served(&decided);
+        assert_eq!(
+            got,
+            texts(&[
+                "src/index.ts:15 GET /api/session <- /api/session",
+                "src/index.ts:16 POST /api/session/setup <- /api/session/setup",
+                "src/index.ts:18 GET / <- /",
+                "src/index.ts:20 GET /health <- /health",
+            ]),
+            "{got:#?}"
+        );
+        assert_eq!(
+            untraced,
+            std::collections::BTreeMap::from([("unread_prefix".to_string(), 1)])
+        );
+        let (_, again) = decided_traced(&on, &exports, &declarations, &scopes);
+        assert_eq!(served(&again), (got, untraced));
+    }
+
     /// carrick#1678: a verb called on the object a scope member returns
     /// (`items.at("/items").get(list)`) is a route whose path is the scope
     /// call's argument and whose instance is the scope call's receiver: the
