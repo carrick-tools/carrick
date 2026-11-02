@@ -65,6 +65,8 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         call_through: None,
         route_boundaries: None,
         memory_peaks: None,
+        unfollowed_member_calls: Vec::new(),
+        unfollowed_member_calls_total: 0,
         type_reach: None,
         pair_outcomes: None,
     }

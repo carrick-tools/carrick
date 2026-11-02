@@ -52,3 +52,8 @@ export function viaInterface(store: Store) {
 export function viaAny(c: any) {
   c.getUser();
 }
+
+export function viaLibrary() {
+  const xs: number[] = [1, 2];
+  xs.map((x) => x + 1);
+}

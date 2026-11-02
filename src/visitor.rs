@@ -325,6 +325,10 @@ pub struct CalleeRef {
     pub span: swc_common::Span,
     /// Lexically resolved receiver facts; never serialized.
     pub receiver: ReceiverBinding,
+    /// For a member call, the receiver's source text (`store` in
+    /// `store.read()`), cut to [`crate::unfollowed_calls::RECEIVER_CHARS`];
+    /// empty for a bare call. Read only by the unfollowed-calls rows.
+    pub receiver_text: String,
 }
 
 /// The binding visible at one member call, independently of its indexed owner.
@@ -854,6 +858,7 @@ impl CalleeCollector<'_> {
                 line,
                 span,
                 receiver: ReceiverBinding::default(),
+                receiver_text: String::new(),
             }),
             other => {
                 if let Some(member) = Self::as_member(other) {
@@ -917,12 +922,18 @@ impl CalleeCollector<'_> {
                 }
             }
         };
+        let receiver_text = self
+            .source_map
+            .span_to_snippet(member.obj.span())
+            .map(|text| crate::unfollowed_calls::cut_receiver(&text))
+            .unwrap_or_default();
         self.out.push(CalleeRef {
             name,
             shape,
             line,
             span,
             receiver: ReceiverBinding::default(),
+            receiver_text,
         });
     }
 
@@ -969,6 +980,7 @@ impl CalleeCollector<'_> {
             line,
             span,
             receiver: ReceiverBinding::default(),
+            receiver_text: String::new(),
         });
     }
 }

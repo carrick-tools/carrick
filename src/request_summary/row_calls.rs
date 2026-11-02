@@ -358,6 +358,15 @@ impl Reach {
     }
 }
 
+/// Why a member call is left without a target ([`RequestSummaryInputs::unfollowed_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfollowed {
+    /// `interface_member`, or the hole the rows left ([`hole_key`]).
+    pub reason: String,
+    /// The declaration's file as walked and line, for `interface_member`.
+    pub declared_at: Option<(PathBuf, u32)>,
+}
+
 /// The calls that stay on the call graph with rows, and what the rows
 /// changed, for the run log.
 #[derive(Debug, Default)]
@@ -669,6 +678,62 @@ impl RequestSummaryInputs {
                 HoleReason::UnresolvedName
             }),
             joined => reach_of_join(declaring, joined),
+        }
+    }
+
+    /// The declaration the call row at `lo..hi` in `file` names, when it is
+    /// in a file of the service and is no definition of it: a member of an
+    /// interface or type (`store.read()` with `store: Store`), a parameter,
+    /// a field typed as a function. `None` for a library or package
+    /// declaration, a file outside the service, a file only tests import, and
+    /// a declaration that is a definition. Does not touch [`Self::reach`]: it
+    /// reads the row again to say what `Reach::NoFunction` there means.
+    fn declared_non_definition(&self, file: &Path, lo: u32, hi: u32) -> Option<(PathBuf, u32)> {
+        let positions = self.positions.as_ref()?;
+        let ir = self.files.get(file)?;
+        let row = positions
+            .lookup(file, ir.swc_start(lo), ir.swc_start(hi), Kind::Call)
+            .ok()?;
+        let symbol = row.symbol()?;
+        let decl_file = row.decl_file()?;
+        if decl_file.starts_with("lib:")
+            || decl_file.starts_with("pkg:")
+            || decl_file.split('/').any(|part| part == "node_modules")
+        {
+            return None;
+        }
+        let declaring = positions.path_of(decl_file);
+        let declared = self.files.get(&declaring)?;
+        let line = row.decl_line()?;
+        (!self.test_only.contains(&declaring)
+            && matches!(join(declared, Some(line), symbol), Join::None))
+        .then_some((declaring, line))
+    }
+
+    /// Why the member call at `lo..hi` in `file` is left without a target,
+    /// when the rows ran and name none (carrick#813): the hole the rows
+    /// left, or a declaration in the service that is no definition. `None`
+    /// for a call that stays on the call graph, a call in a file only tests
+    /// import, and a call that reaches a library, a package, a file outside
+    /// the service or a definition.
+    pub(crate) fn unfollowed_at(&self, file: &Path, lo: u32, hi: u32) -> Option<Unfollowed> {
+        let row_calls = self.row_calls.as_ref()?;
+        if row_calls.kept.contains(&(file.to_path_buf(), lo, hi)) || self.test_only.contains(file) {
+            return None;
+        }
+        match self.reach(file, lo, hi) {
+            Reach::Unknown(reason) => Some(Unfollowed {
+                reason: hole_key(reason),
+                declared_at: None,
+            }),
+            Reach::NoFunction => {
+                self.declared_non_definition(file, lo, hi)
+                    .map(|declared| Unfollowed {
+                        reason: crate::unfollowed_calls::INTERFACE_MEMBER.to_string(),
+                        declared_at: Some(declared),
+                    })
+            }
+            Reach::Function(..) | Reach::OutsideService(..) => None,
         }
     }
 

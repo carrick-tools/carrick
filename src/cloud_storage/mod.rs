@@ -924,6 +924,25 @@ pub struct CloudRepoData {
     /// a compare of two blobs drops it as it drops `last_updated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_peaks: Option<MemoryPeaks>,
+    /// Member calls the scan saw and could not tie to a definition of the
+    /// service ([`crate::unfollowed_calls`], carrick#813): `store.read()` on
+    /// an interface-typed receiver, a call on a value typed `any`. Labelled
+    /// leads for `get_callers`, never edges and never an input to matching,
+    /// the type check or findings. Sorted by file then line, at most
+    /// [`crate::unfollowed_calls::MAX_PER_SERVICE`]; the exact count is
+    /// `unfollowed_member_calls_total`.
+    ///
+    /// Written only when the run walks the compiler's position rows. Absent
+    /// otherwise, and on blobs written before the field existed, so a blob
+    /// with none is byte for byte what it was. Wire contract:
+    /// `tests/fixtures/unfollowed-calls/contract.json`, pinned by hash on
+    /// both sides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfollowed_member_calls: Vec<crate::unfollowed_calls::UnfollowedMemberCall>,
+    /// How many unfollowed member calls the scan saw: exact, beside the
+    /// capped list. Absent when there are none.
+    #[serde(default, skip_serializing_if = "crate::unfollowed_calls::is_zero")]
+    pub unfollowed_member_calls_total: u32,
     /// The service's type-reach record, stored as its own object beside this
     /// blob (carrick#3101): the gzipped object's digest and length.
     ///
@@ -1162,6 +1181,8 @@ impl CloudRepoData {
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         }
@@ -2835,6 +2856,8 @@ mod tests {
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         }

@@ -1,0 +1,26 @@
+{
+  "service": {
+    "repo_name": "org/store-app",
+    "service_name": "store-app",
+    "unfollowed_member_calls": [
+      {
+        "file": "src/callers.ts",
+        "line": 12,
+        "caller": "viaInterface",
+        "member": "read",
+        "receiver": "store",
+        "reason": "interface_member",
+        "declared_at": "src/store.ts:2"
+      },
+      {
+        "file": "src/callers.ts",
+        "line": 18,
+        "caller": "viaAny",
+        "member": "getUser",
+        "receiver": "c",
+        "reason": "untyped_receiver"
+      }
+    ],
+    "unfollowed_member_calls_total": 2
+  }
+}

@@ -5672,6 +5672,7 @@ async fn analyze_current_repo_incremental(
             );
             let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
             debug!("Handler spans placed on endpoint rows: {placed}");
+            crate::unfollowed_calls::attach(&mut cloud_data, &request_inputs.unfollowed, repo_path);
 
             // Same last step as the full branch: the boundary is read off the
             // finished payload once its paths are repo-relative (carrick#705).
@@ -9772,6 +9773,8 @@ fn build_cloud_data_from_mount_graph(
         call_through: None,
         route_boundaries: None,
         memory_peaks: None,
+        unfollowed_member_calls: Vec::new(),
+        unfollowed_member_calls_total: 0,
         type_reach: None,
         pair_outcomes: None,
     }
@@ -10979,7 +10982,7 @@ fn discover_with_positions(
     // after discovery (carrick#1564). Binding the rows is bounded: past the
     // budget the service reads as with no rows, and the run log says so
     // (carrick#2564).
-    let request_inputs = crate::request_summary::RequestSummaryInputs {
+    let mut request_inputs = crate::request_summary::RequestSummaryInputs {
         files: request_irs,
         sites: resolution.sites,
         bindings: resolution.bindings,
@@ -10988,6 +10991,7 @@ fn discover_with_positions(
         row_calls: None,
         rows_ran_out: false,
         test_only,
+        unfollowed: Vec::new(),
     }
     .linked(
         service.service_name.as_deref().unwrap_or("(root)"),
@@ -11009,17 +11013,20 @@ fn discover_with_positions(
         // Member calls on a receiver a call initialised take their target
         // from the `call` row where resolution by name stated none
         // (carrick#2615).
-        let added = crate::call_graph::add_row_edges(
+        let crate::call_graph::RowEdges { added, unfollowed } = crate::call_graph::add_row_edges(
             &mut all_function_definitions,
             &per_file_calls,
             &keys,
             &request_inputs.sites,
             |file, lo, hi| request_inputs.call_target(file, lo, hi),
+            |file, lo, hi| request_inputs.unfollowed_at(file, lo, hi),
         );
         debug!(
-            "Call edges the position rows added for service {}: {added}",
-            service.service_name.as_deref().unwrap_or("(root)")
+            "Call edges the position rows added for service {}: {added}; member calls left unfollowed: {}",
+            service.service_name.as_deref().unwrap_or("(root)"),
+            unfollowed.len()
         );
+        request_inputs.unfollowed = unfollowed;
     }
 
     debug!(
@@ -13295,6 +13302,7 @@ async fn analyze_current_repo(
     // file and a definition's file compare (cloud#948).
     let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
     debug!("Handler spans placed on endpoint rows: {placed}");
+    crate::unfollowed_calls::attach(&mut cloud_data, &request_inputs.unfollowed, repo_path);
 
     // 9. What this scan could not classify, stated beside what it did
     // (carrick#705). Collected last, off the finished payload and the stats of
@@ -15478,6 +15486,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         }
@@ -16493,6 +16503,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+unfollowed_member_calls: Vec::new(),
+unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -16717,6 +16729,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -16776,6 +16790,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         }];
@@ -16881,6 +16897,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         }];
@@ -17626,6 +17644,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -17690,6 +17710,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -17767,6 +17789,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 call_through: None,
                 route_boundaries: None,
                 memory_peaks: None,
+                unfollowed_member_calls: Vec::new(),
+                unfollowed_member_calls_total: 0,
                 type_reach: None,
                 pair_outcomes: None,
             }
@@ -17853,6 +17877,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -18086,6 +18112,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -18241,6 +18269,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -18373,6 +18403,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -18499,6 +18531,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         };
@@ -30548,6 +30582,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         }
