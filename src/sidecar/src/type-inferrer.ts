@@ -771,6 +771,13 @@ interface WrapperReading {
  *   const inferrer = new TypeInferrer({ project });
  *   const result = inferrer.infer(requests, extractionConfig);
  */
+/**
+ * The kinds a route row's request is asked as, and so the kinds a loop
+ * element is read for (carrick#1029): a response read at the send or as the
+ * handler's return, and a request body.
+ */
+const LOOP_ROW_KINDS: ReadonlySet<string> = new Set(['response_body', 'function_return', 'request_body']);
+
 export class TypeInferrer {
   private readonly project: Project;
   private readonly packageOf: ((filePath: string) => string | undefined) | undefined;
@@ -1083,7 +1090,7 @@ export class TypeInferrer {
    */
   private loopPickFor(request: InferRequestItem): LoopPick | undefined {
     if (!request.route_path) return undefined;
-    if (request.infer_kind !== 'response_body' && request.infer_kind !== 'request_body') return undefined;
+    if (!LOOP_ROW_KINDS.has(request.infer_kind)) return undefined;
     const sourceFile = this.getSourceFile(request.file_path);
     if (!sourceFile) return undefined;
     const atLine = this.registrationAtLine(sourceFile, request.line_number);

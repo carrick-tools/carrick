@@ -991,8 +991,9 @@ export interface InferRequestItem {
    */
   result?: ResultLabel;
   /**
-   * carrick#1029: the route row's own path, sent on a `response_body` or
-   * `request_body` request when the row's line serves more than one route. A
+   * carrick#1029: the route row's own path, sent on a `response_body`,
+   * `function_return` or `request_body` request when the row's line serves
+   * more than one route. A
    * handler registered once per element of a constant list is typed for the
    * element this path names (`loop-element.ts`).
    */

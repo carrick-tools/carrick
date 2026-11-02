@@ -24,7 +24,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use carrick::agent_service::AgentService;
-use carrick::agents::file_analyzer_agent::{EndpointResult, FileAnalysisResult};
+use carrick::agents::file_analyzer_agent::{EmissionStyle, EndpointResult, FileAnalysisResult};
 use carrick::agents::file_orchestrator::FileOrchestrator;
 use carrick::config::Config;
 use carrick::services::type_sidecar::{InferKind, InferRequestItem, TypeSidecar};
@@ -45,6 +45,9 @@ declare function rows(): { alpha: Alpha[]; beta: Beta[] };
 declare function listKinds(): Array<'alpha' | 'beta'>;
 
 for (const [path, key] of [['alpha-rows', 'alpha'], ['beta-rows', 'beta']] as const) app.get(`/items/${path}`, async () => ({ items: rows()[key] }));
+
+const KINDS = ['alpha', 'beta'] as const;
+KINDS.forEach((kind) => app.get(`/kinds/${kind}`, async () => ({ items: rows()[kind] })));
 
 for (const kind of listKinds()) {
   app.get(`/listed/${kind}`, async () => ({ items: rows()[kind] }));
@@ -68,11 +71,13 @@ fn line_of(needle: &str) -> i32 {
 
 /// A model row at `needle`'s line, its response located as the expression
 /// the handler returns there (the shape a model states for such a route).
-fn endpoint(path: &str, needle: &str, returned: &str) -> EndpointResult {
+/// With `returns_value` the model also states that the handler's return
+/// value is the payload, and the response is asked as the handler's return.
+fn endpoint(path: &str, needle: &str, returned: &str, returns_value: bool) -> EndpointResult {
     let line = line_of(needle);
     assert_eq!(line_of(returned), line, "{returned} is on the route's line");
     EndpointResult {
-        handler_declaration_line: None,
+        handler_declaration_line: returns_value.then_some(line),
         registration_literal: None,
         view_module: false,
         candidate_id: format!("loop:{path}"),
@@ -88,7 +93,7 @@ fn endpoint(path: &str, needle: &str, returned: &str) -> EndpointResult {
         payload_expression_line: None,
         response_expression_text: Some(returned.to_string()),
         response_expression_line: Some(line),
-        emission_style: None,
+        emission_style: returns_value.then_some(EmissionStyle::ReturnValue),
         primary_type_symbol: None,
         type_import_source: None,
         resolution_source: None,
@@ -104,23 +109,39 @@ fn response_requests(repo: &Path) -> HashMap<String, InferRequestItem> {
             "/items/alpha-rows",
             "for (const [path",
             "{ items: rows()[key] }",
+            false,
         ),
         endpoint(
             "/items/beta-rows",
             "for (const [path",
             "{ items: rows()[key] }",
+            false,
+        ),
+        endpoint(
+            "/kinds/alpha",
+            "KINDS.forEach",
+            "{ items: rows()[kind] }",
+            true,
+        ),
+        endpoint(
+            "/kinds/beta",
+            "KINDS.forEach",
+            "{ items: rows()[kind] }",
+            true,
         ),
         endpoint(
             "/listed/alpha",
             "app.get(`/listed/",
             "{ items: rows()[kind] }",
+            false,
         ),
         endpoint(
             "/listed/beta",
             "app.get(`/listed/",
             "{ items: rows()[kind] }",
+            false,
         ),
-        endpoint("/health", "app.get('/health'", "{ ok: true }"),
+        endpoint("/health", "app.get('/health'", "{ ok: true }", false),
     ];
     let mut file_results = HashMap::new();
     file_results.insert(
@@ -155,6 +176,10 @@ fn response_requests(repo: &Path) -> HashMap<String, InferRequestItem> {
             vec!["/items/alpha-rows", "/items/beta-rows"],
         ),
         (
+            line_of("KINDS.forEach"),
+            vec!["/kinds/alpha", "/kinds/beta"],
+        ),
+        (
             line_of("app.get(`/listed/"),
             vec!["/listed/alpha", "/listed/beta"],
         ),
@@ -163,10 +188,12 @@ fn response_requests(repo: &Path) -> HashMap<String, InferRequestItem> {
     .into_iter()
     .collect();
     let mut out = HashMap::new();
-    for item in infer
-        .into_iter()
-        .filter(|item| item.infer_kind == InferKind::ResponseBody)
-    {
+    for item in infer.into_iter().filter(|item| {
+        matches!(
+            item.infer_kind,
+            InferKind::ResponseBody | InferKind::FunctionReturn
+        )
+    }) {
         let key = match &item.route_path {
             Some(path) => path.clone(),
             None => {
@@ -203,6 +230,8 @@ fn a_shared_line_sends_each_rows_path() {
     for path in [
         "/items/alpha-rows",
         "/items/beta-rows",
+        "/kinds/alpha",
+        "/kinds/beta",
         "/listed/alpha",
         "/listed/beta",
     ] {
@@ -211,6 +240,11 @@ fn a_shared_line_sends_each_rows_path() {
             .unwrap_or_else(|| panic!("{path}: {requests:?}"));
         assert_eq!(item.route_path.as_deref(), Some(path));
     }
+    // A row whose handler's return is the payload is asked as that return.
+    assert_eq!(
+        requests["/kinds/alpha"].infer_kind,
+        InferKind::FunctionReturn
+    );
     assert_eq!(requests["/health"].route_path, None);
 }
 
@@ -265,6 +299,8 @@ fn each_loop_element_is_typed_with_its_own_payload() {
         typed("/items/beta-rows"),
         "{ items: { betaName: string; }[]; }"
     );
+    assert_eq!(typed("/kinds/alpha"), "{ items: { alphaId: number; }[]; }");
+    assert_eq!(typed("/kinds/beta"), "{ items: { betaName: string; }[]; }");
     for path in ["/listed/alpha", "/listed/beta"] {
         assert_eq!(
             typed(path),

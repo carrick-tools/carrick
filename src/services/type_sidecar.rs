@@ -235,8 +235,9 @@ pub struct InferRequestItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ResultShape>,
     /// carrick#1029: the route row's own full path, set on a producer's
-    /// `ResponseBody` or `RequestBody` request only where the row's line
-    /// serves more than one operation ([`mark_shared_route_lines`]). The
+    /// `ResponseBody`, `FunctionReturn` or `RequestBody` request only where
+    /// the row's line serves more than one operation
+    /// ([`mark_shared_route_lines`]). The
     /// sidecar types a handler registered once per element of a constant
     /// list for the element this path names. Absent from every other request,
     /// so those serialise as they did.
@@ -247,7 +248,9 @@ pub struct InferRequestItem {
 /// carrick#1029: set `route_path` on each producer route-row request for a
 /// row whose file and line hold more than one producer operation. `shared`
 /// names, by alias, the full path of each such row; a request for a row with
-/// a site of its own is not in it and is left as it is.
+/// a site of its own is not in it and is left as it is. A route's response is
+/// asked as `FunctionReturn` where the model states that the handler's return
+/// value is the payload.
 pub fn mark_shared_route_lines(
     requests: &mut [InferRequestItem],
     shared: &std::collections::HashMap<String, String>,
@@ -256,7 +259,7 @@ pub fn mark_shared_route_lines(
     for request in requests.iter_mut() {
         if !matches!(
             request.infer_kind,
-            InferKind::ResponseBody | InferKind::RequestBody
+            InferKind::ResponseBody | InferKind::FunctionReturn | InferKind::RequestBody
         ) {
             continue;
         }

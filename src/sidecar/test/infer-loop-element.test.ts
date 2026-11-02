@@ -107,8 +107,18 @@ describe('carrick#1029: a loop-registered route is typed for its own element', (
   });
 
   it('types each element of a const list a forEach registers over several lines', () => {
-    const { byAlias } = read([route('beta', 'app.get(`/kinds/', '/kinds/beta')]);
+    const { byAlias } = read([
+      route('beta', 'app.get(`/kinds/', '/kinds/beta'),
+      // The handler's return asked for, as a row whose return is its payload is.
+      {
+        ...route('alpha', 'app.get(`/kinds/', '/kinds/alpha'),
+        infer_kind: 'function_return',
+        expression_text: '{ items: rows()[kind] }',
+        expression_line: lineOf(ROUTES, 'app.get(`/kinds/'),
+      },
+    ]);
     assert.strictEqual(byAlias.get('beta'), '{ items: { betaName: string; }[]; }');
+    assert.strictEqual(byAlias.get('alpha'), '{ items: { alphaId: number; }[]; }');
   });
 
   it('keeps the union where the row states no path, or names no element', () => {
