@@ -5322,11 +5322,19 @@ async fn analyze_current_repo_incremental(
             if withdrawn > 0 {
                 debug!("Model routes withdrawn at library definitions: {withdrawn}");
             }
-            let traced = apply_traced_routes(
+            let guessed_withdrawn = withdraw_guessed_routes(
                 &mut mount_graph,
-                &protocol_extractions.site.traced.routes,
+                &protocol_extractions.site.traced.guessed,
                 repo_path,
             );
+            let traced = TracedApplied {
+                guessed_withdrawn,
+                ..apply_traced_routes(
+                    &mut mount_graph,
+                    &protocol_extractions.site.traced.routes,
+                    repo_path,
+                )
+            };
             let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
             let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
@@ -7038,6 +7046,37 @@ fn withdraw_model_routes_at_definitions(
     before - mount_graph.endpoints.len()
 }
 
+/// Withdraw the reader's route rows at the route sites whose own path the
+/// code writes in no whole way ([`crate::site_rows::GuessedRoute`]; ruling
+/// on PR #3182, 2026-11-02): a row the model stated of the site's method at
+/// its line guesses at a value only the running program knows, so it is no
+/// route, and the site stays a possible call. A row of another method, or
+/// one a pass, the documentation or a declaration stated, keeps its place.
+/// Returns how many rows it withdrew.
+fn withdraw_guessed_routes(
+    mount_graph: &mut MountGraph,
+    guessed: &[crate::site_rows::GuessedRoute],
+    repo_path: &str,
+) -> usize {
+    if guessed.is_empty() {
+        return 0;
+    }
+    let repo_root = normalize_protocol_file(Path::new(repo_path));
+    let before = mount_graph.endpoints.len();
+    mount_graph.endpoints.retain(|endpoint| {
+        endpoint.resolution_source
+            != Some(crate::agents::file_analyzer_agent::ResolutionSource::Model)
+            || !row_place(&endpoint.file_location, &repo_root).is_some_and(|(_, relative, line)| {
+                guessed.iter().any(|site| {
+                    site.file == relative
+                        && site.line == line
+                        && site.method.eq_ignore_ascii_case(&endpoint.method)
+                })
+            })
+    });
+    before - mount_graph.endpoints.len()
+}
+
 /// What [`apply_traced_routes`] did to the mount graph.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct TracedApplied {
@@ -7050,7 +7089,8 @@ struct TracedApplied {
     /// row 4).
     corrected: usize,
     /// Route sites where a row at the line states a method or path the trace
-    /// does not: nothing there is written.
+    /// does not, and is not a model row of a traced method: nothing there is
+    /// written.
     disagrees: usize,
     /// Of the rows that disagree, those the documentation fold labelled
     /// `descriptor_route`.
@@ -7066,6 +7106,13 @@ struct TracedApplied {
     /// path is held by another row at the line, so correcting it would make
     /// a twin of that row.
     twin: usize,
+    /// Model rows at a traced route's line of its method that state another
+    /// path, now at a traced full path, `library_claim` (ruling on PR #3182,
+    /// 2026-11-02: the trace wins).
+    replaced: usize,
+    /// Model rows withdrawn at route sites whose own path the code writes in
+    /// no whole way ([`withdraw_guessed_routes`]).
+    guessed_withdrawn: usize,
 }
 
 impl TracedApplied {
@@ -7086,6 +7133,11 @@ impl TracedApplied {
                     self.documented_conflict,
                 ),
                 ("routes_trace_twin".to_string(), self.twin),
+                ("routes_trace_replaced".to_string(), self.replaced),
+                (
+                    "routes_guessed_withdrawn".to_string(),
+                    self.guessed_withdrawn,
+                ),
             ])
             .filter(|(_, count)| *count > 0)
             .collect()
@@ -7101,12 +7153,13 @@ impl TracedApplied {
 /// labelled `descriptor_route` or a `carrick.json` declaration labelled
 /// `declared_operation`, which keeps it, and each traced path no row holds
 /// is written as a copy of an undeclared row there of the route's method.
-/// Where any row states another method or path, the site is counted and
-/// nothing is written: the reader and the trace disagree, and a compare
-/// replay decides (orchestrator's ruling, 2026-10-23). The one exception is
-/// a reader row stating the route's method and its own path with no prefix
-/// (carrick#2474 row 4): the reader read the call and not its scopes, so
-/// the row takes the traced full path, keeping its owner and handler. Where
+/// A model row of a traced route's method that states another path is
+/// replaced: it takes a traced full path, keeping its owner and handler
+/// (ruling on PR #3182, 2026-11-02: the trace wins). So does a reader row
+/// stating the route's method and its own path with no prefix (carrick#2474
+/// row 4): the reader read the call and not its scopes. Where any other row
+/// states another method or path (another method, the documentation, a
+/// declaration, a pass), the site is counted and nothing is written. Where
 /// no row to copy stands, one row is written per path, owned by the binding
 /// the route is registered on, and none where that binding has no symbol.
 /// Then documentation rows fold onto the rows written or corrected
@@ -7119,13 +7172,14 @@ fn apply_traced_routes(
     repo_path: &str,
 ) -> TracedApplied {
     let mut write = write_traced_routes(mount_graph, traced, repo_path);
-    if write.applied.added > 0 || write.applied.corrected > 0 {
+    if write.applied.added > 0 || write.applied.corrected > 0 || write.applied.replaced > 0 {
         write.applied.folded = FileOrchestrator::fold_documented_operations(mount_graph);
     }
     debug!(
         relabelled = write.applied.relabelled,
         added = write.applied.added,
         corrected = write.applied.corrected,
+        replaced = write.applied.replaced,
         disagrees = write.applied.disagrees,
         documented_conflict = write.applied.documented_conflict,
         refused = write.applied.refused,
@@ -7144,7 +7198,8 @@ struct TracedWrite {
     applied: TracedApplied,
     /// Rows relabelled `library_claim`.
     relabelled: Vec<usize>,
-    /// Rows corrected (row 4), with the full path each stated before.
+    /// Rows corrected (row 4) or replaced (a model row the trace wins over),
+    /// with the full path each stated before.
     corrected: Vec<(usize, String)>,
     /// The rows written: the last `applied.added` of the graph.
     added: std::ops::Range<usize>,
@@ -7250,20 +7305,31 @@ fn write_traced_routes(
                     && MountGraph::paths_equal_modulo_param_names(&route.path, &row.full_path)
             })
         };
+        // The trace wins over a model row of its method (ruling on PR
+        // #3182, 2026-11-02): the model read the call at some other path,
+        // and the trace states the path from the code. The row takes a
+        // traced full path no row here holds yet, keeping its owner and
+        // handler, as row 4's does.
+        let replaceable = |index: usize| {
+            let row = &mount_graph.endpoints[index];
+            row.resolution_source == Some(ResolutionSource::Model)
+                && routes
+                    .iter()
+                    .any(|route| route.method.eq_ignore_ascii_case(&row.method))
+        };
         let mut twins: Vec<usize> = Vec::new();
         let disagreeing = if !disagreeing.is_empty()
-            && disagreeing.iter().all(|&index| own_path(index))
+            && disagreeing
+                .iter()
+                .all(|&index| own_path(index) || replaceable(index))
         {
-            for index in disagreeing {
+            let disagreeing: Vec<(usize, bool)> = disagreeing
+                .into_iter()
+                .map(|index| (index, own_path(index)))
+                .collect();
+            for (index, corrects) in disagreeing {
                 let method = mount_graph.endpoints[index].method.clone();
                 let path = mount_graph.endpoints[index].full_path.clone();
-                let Some(route) = routes.iter().find(|route| {
-                    route.corrects
-                        && route.method.eq_ignore_ascii_case(&method)
-                        && MountGraph::paths_equal_modulo_param_names(&route.path, &path)
-                }) else {
-                    continue;
-                };
                 let held = |full_path: &str| {
                     here.iter().any(|&other| {
                         let row = &mount_graph.endpoints[other];
@@ -7271,20 +7337,42 @@ fn write_traced_routes(
                             && MountGraph::paths_equal_modulo_param_names(&row.full_path, full_path)
                     })
                 };
-                let Some(full_path) = route
-                    .full_paths
+                // Row 4 takes the route its own path names; a replaced row
+                // the first route of its method with a full path no row
+                // here holds.
+                let taken = routes
                     .iter()
-                    .find(|full_path| !held(full_path))
-                    .cloned()
-                else {
+                    .filter(|route| {
+                        route.method.eq_ignore_ascii_case(&method)
+                            && (!corrects
+                                || (route.corrects
+                                    && MountGraph::paths_equal_modulo_param_names(
+                                        &route.path,
+                                        &path,
+                                    )))
+                    })
+                    .find_map(|route| {
+                        route
+                            .full_paths
+                            .iter()
+                            .find(|full_path| !held(full_path))
+                            .map(|full_path| (route, full_path.clone()))
+                    });
+                let Some((route, full_path)) = taken else {
                     applied.twin += 1;
                     twins.push(index);
                     continue;
                 };
+                let own = route.path.clone();
                 let row = &mut mount_graph.endpoints[index];
                 row.full_path = full_path;
                 row.resolution_source = Some(ResolutionSource::LibraryClaim);
-                applied.corrected += 1;
+                if corrects {
+                    applied.corrected += 1;
+                } else {
+                    row.path = own;
+                    applied.replaced += 1;
+                }
                 write.corrected.push((index, path));
             }
             Vec::new()
@@ -12885,11 +12973,19 @@ async fn analyze_current_repo(
     if withdrawn > 0 {
         debug!("Model routes withdrawn at library definitions: {withdrawn}");
     }
-    let traced = apply_traced_routes(
+    let guessed_withdrawn = withdraw_guessed_routes(
         &mut analysis_result.mount_graph,
-        &protocol_extractions.site.traced.routes,
+        &protocol_extractions.site.traced.guessed,
         repo_path,
     );
+    let traced = TracedApplied {
+        guessed_withdrawn,
+        ..apply_traced_routes(
+            &mut analysis_result.mount_graph,
+            &protocol_extractions.site.traced.routes,
+            repo_path,
+        )
+    };
     let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
     let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
     // The repo's own statement of what a body-dispatching handler serves
@@ -26578,45 +26674,66 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     }
 
     /// carrick#2474 R6c: a procedure's call writes no path of its own, so a
-    /// reader row at its line that states its key path with no mount is
-    /// another reading, not row 4's: it stays, the site is counted, and
+    /// row at its line that states its key path with no mount is another
+    /// reading, not row 4's. A model row of the procedure's method is
+    /// replaced by the traced path (ruling on PR #3182, 2026-11-02: the
+    /// trace wins); a row a pass stated stays, the site is counted, and
     /// nothing there is written.
     #[test]
     fn a_row_at_a_procedure_s_key_path_is_kept_and_counted() {
         use crate::agents::file_analyzer_agent::ResolutionSource;
         let mut graph = crate::mount_graph::MountGraph::new();
-        graph.endpoints = vec![traced_row(
-            "src/router.ts:7",
-            "GET",
-            "/ping",
-            "/ping",
-            ResolutionSource::Model,
-        )];
+        graph.endpoints = vec![
+            traced_row(
+                "src/router.ts:7",
+                "GET",
+                "/ping",
+                "/ping",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/router.ts:9",
+                "GET",
+                "/pong",
+                "/pong",
+                ResolutionSource::InlineLiteral,
+            ),
+        ];
         let before = traced_rows(&graph);
         let applied = apply_traced_routes(
             &mut graph,
-            &[crate::site_rows::TracedRoute {
-                corrects: false,
-                ..traced_route("src/router.ts", 7, "GET", "/ping", &["/rpc/ping"])
-            }],
+            &[
+                crate::site_rows::TracedRoute {
+                    corrects: false,
+                    ..traced_route("src/router.ts", 7, "GET", "/ping", &["/rpc/ping"])
+                },
+                crate::site_rows::TracedRoute {
+                    corrects: false,
+                    ..traced_route("src/router.ts", 9, "GET", "/pong", &["/rpc/pong"])
+                },
+            ],
             ".",
         );
         assert_eq!(
             applied,
             TracedApplied {
+                replaced: 1,
                 disagrees: 1,
                 ..TracedApplied::default()
             }
         );
-        assert_eq!(traced_rows(&graph), before);
+        let mut after = before.clone();
+        after[0] = "src/router.ts:7 GET /rpc/ping library_claim".to_string();
+        assert_eq!(traced_rows(&graph), after);
     }
 
     /// carrick#2474 R3 S1 (orchestrator's ruling, 2026-10-23): where a row
-    /// at a traced route's line states another path or method, the site is
-    /// counted and nothing there is written; a documentation row that
-    /// disagrees is counted apart. The one exception (carrick#2474 row 4,
-    /// R5b): a row stating the route's method and its own path with no
-    /// prefix takes the traced full path, keeping its owner.
+    /// at a traced route's line states another method, or is a
+    /// documentation row stating another path, the site is counted and
+    /// nothing there is written; a documentation row that disagrees is
+    /// counted apart. A row stating the route's method and its own path with
+    /// no prefix (carrick#2474 row 4, R5b) takes the traced full path,
+    /// keeping its owner.
     #[test]
     fn a_row_that_disagrees_with_a_traced_route_is_kept_and_nothing_written() {
         use crate::agents::file_analyzer_agent::ResolutionSource;
@@ -26678,6 +26795,189 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ("routes_trace_disagrees".to_string(), 2),
                 ("routes_documented_conflict".to_string(), 1),
             ]
+        );
+    }
+
+    /// Ruling on PR #3182 (2026-11-02): the trace wins over a model row of
+    /// its method that states another path. The row takes a traced full
+    /// path, keeping its owner and handler, and the route's other paths are
+    /// written as copies of it. A model row of another method, or a row a
+    /// pass stated, at the line still blocks the write; a model row whose
+    /// every traced path another row there holds is left as a twin.
+    #[test]
+    fn a_traced_route_replaces_a_model_row_of_its_method_that_disagrees() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![
+            // The model guessed at the base: the trace states two ways.
+            traced_row(
+                "src/app.ts:5",
+                "GET",
+                "/health",
+                "/health",
+                ResolutionSource::Model,
+            ),
+            // A model row of the method beside one of a pass, at one line.
+            traced_row(
+                "src/app.ts:9",
+                "POST",
+                "/jobs",
+                "/jobs",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/app.ts:9",
+                "POST",
+                "/tasks",
+                "/tasks",
+                ResolutionSource::InlineLiteral,
+            ),
+            // A model row beside an agreeing one: every traced path is held.
+            traced_row(
+                "src/app.ts:12",
+                "GET",
+                "/v1/ready",
+                "/v1/ready",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/app.ts:12",
+                "GET",
+                "/ready",
+                "/ready",
+                ResolutionSource::Model,
+            ),
+        ];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[
+                traced_route("src/app.ts", 5, "GET", "/api/health", &["/api/health"]),
+                traced_route("src/app.ts", 5, "GET", "/v2/health", &["/v2/health"]),
+                traced_route("src/app.ts", 9, "POST", "/api/jobs", &["/api/jobs"]),
+                traced_route("src/app.ts", 12, "GET", "/ready", &["/ready"]),
+            ],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                replaced: 1,
+                added: 1,
+                relabelled: 1,
+                twin: 1,
+                disagrees: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/app.ts:5 GET /api/health library_claim",
+                "src/app.ts:9 POST /jobs model",
+                "src/app.ts:9 POST /tasks inline_literal",
+                "src/app.ts:12 GET /v1/ready model",
+                "src/app.ts:12 GET /ready library_claim",
+                "src/app.ts:5 GET /v2/health library_claim",
+            ]
+        );
+        // The replaced row keeps its owner and handler and takes the traced
+        // route's own path; the copy is made from it.
+        assert_eq!(graph.endpoints[0].owner, "router");
+        assert_eq!(graph.endpoints[0].handler.as_deref(), Some("list"));
+        assert_eq!(graph.endpoints[0].path, "/api/health");
+        assert_eq!(graph.endpoints[5].owner, "router");
+        assert_eq!(
+            applied.tally(&std::collections::BTreeMap::new()),
+            vec![
+                ("routes_trace_disagrees".to_string(), 1),
+                ("routes_trace_twin".to_string(), 1),
+                ("routes_trace_replaced".to_string(), 1),
+            ]
+        );
+    }
+
+    /// Ruling on PR #3182 (2026-11-02): at a route site whose own path the
+    /// code writes in no whole way, the model's row of the site's method is
+    /// withdrawn; a row of another method, a row a pass or the
+    /// documentation stated, and a model row on another line stay.
+    #[test]
+    fn a_model_row_at_a_guessed_route_site_is_withdrawn() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![
+            traced_row(
+                "src/index.ts:14",
+                "GET",
+                "/health",
+                "/health",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/index.ts:14",
+                "POST",
+                "/health",
+                "/health",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/index.ts:19",
+                "GET",
+                "/",
+                "/",
+                ResolutionSource::InlineLiteral,
+            ),
+            traced_row(
+                "src/index.ts:19",
+                "GET",
+                "/root",
+                "/root",
+                ResolutionSource::DescriptorRoute,
+            ),
+            traced_row(
+                "src/index.ts:21",
+                "GET",
+                "/ready",
+                "/ready",
+                ResolutionSource::Model,
+            ),
+        ];
+        let guessed = |line: u32, method: &str| crate::site_rows::GuessedRoute {
+            file: "src/index.ts".to_string(),
+            line,
+            method: method.to_string(),
+        };
+        let withdrawn =
+            withdraw_guessed_routes(&mut graph, &[guessed(14, "GET"), guessed(19, "GET")], ".");
+        assert_eq!(withdrawn, 1);
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/index.ts:14 POST /health model",
+                "src/index.ts:19 GET / inline_literal",
+                "src/index.ts:19 GET /root descriptor_route",
+                "src/index.ts:21 GET /ready model",
+            ]
+        );
+        // A graph whose rows name the walked path, absolute under the repo.
+        let mut walked = crate::mount_graph::MountGraph::new();
+        walked.endpoints = vec![traced_row(
+            "/repo/src/index.ts:14",
+            "GET",
+            "/health",
+            "/health",
+            ResolutionSource::Model,
+        )];
+        assert_eq!(
+            withdraw_guessed_routes(&mut walked, &[guessed(14, "GET")], "/repo"),
+            1
+        );
+        assert_eq!(
+            TracedApplied {
+                guessed_withdrawn: withdrawn,
+                ..TracedApplied::default()
+            }
+            .tally(&std::collections::BTreeMap::new()),
+            vec![("routes_guessed_withdrawn".to_string(), 1)]
         );
     }
 

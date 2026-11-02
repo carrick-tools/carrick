@@ -116,6 +116,7 @@ pub(super) fn settle(
         for (key, value) in [
             ("routes_across_relabelled", applied.relabelled),
             ("routes_across_corrected", applied.corrected),
+            ("routes_across_replaced", applied.replaced),
             ("routes_across_added_untyped", applied.added),
             ("routes_across_owner_unknown", applied.owner_unknown),
             ("routes_trace_disagrees", applied.disagrees),
@@ -251,7 +252,7 @@ fn write(
             calls.retain(|call| !held_by_endpoint(call, file, line));
         }
     }
-    if write.applied.added > 0 || write.applied.corrected > 0 {
+    if write.applied.added > 0 || write.applied.corrected > 0 || write.applied.replaced > 0 {
         // A row added here has no type anchor this scan, so documentation
         // that states its operation folds onto it as onto any partner, and
         // its manifest entries stay under the shared key at the

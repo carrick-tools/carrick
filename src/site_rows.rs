@@ -238,6 +238,26 @@ pub struct TracedRoutes {
     /// `method_unstated`, `trimmed`, `no_instance`, `mount_unverified`,
     /// `hole_<end>` (an instance end that is not the top), `unread_prefix`.
     pub untraced: std::collections::BTreeMap<String, usize>,
+    /// Route sites whose own path the code writes in no whole way: a
+    /// reader row there guesses at a value the code never states, so it is
+    /// no route and the site stays a possible call ([`GuessedRoute`]).
+    pub guessed: Vec<GuessedRoute>,
+}
+
+/// A route site whose own path the code writes in no whole way (the
+/// record's name is unstated, or the call's own path holds a value no way
+/// of a conditional or a default reads whole):`` `${base}health` ``, `base.replace(…)`, a local holding a value
+/// read at runtime (ruling on PR #3182, 2026-11-02). The label states that
+/// a route of `method` is registered here; the path it serves is a value
+/// only the running program knows. A reader row of the method at the line
+/// is withdrawn ([`crate::engine`]'s `withdraw_guessed_routes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuessedRoute {
+    /// Repo-relative, `/`-separated.
+    pub file: String,
+    pub line: u32,
+    /// The method the label forces, upper case.
+    pub method: String,
 }
 
 /// The routes the receiver trace serves at a full path (carrick#2474 R3
@@ -267,6 +287,16 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
         // default writes (carrick#2386); the record itself is unchanged.
         let ways_read = site.composed.iter().any(|composed| composed.own.is_some());
         if record.bucket == Bucket::Lead && !ways_read {
+            // No whole way: a reader row of the method here is a guess.
+            if site.procedure.is_none()
+                && let Ok(method) = forced_method(record)
+            {
+                out.guessed.push(GuessedRoute {
+                    file: site.file.clone(),
+                    line: site.line,
+                    method: method.to_uppercase(),
+                });
+            }
             continue;
         }
         if let Some(procedure) = &site.procedure {
@@ -293,7 +323,12 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
         }
         match traced_route(site, record) {
             Ok(routes) => out.routes.extend(routes),
-            Err(reason) => *out.untraced.entry(reason).or_default() += 1,
+            Err(Untraced::Counted(reason)) => *out.untraced.entry(reason).or_default() += 1,
+            Err(Untraced::Guessed(method)) => out.guessed.push(GuessedRoute {
+                file: site.file.clone(),
+                line: site.line,
+                method,
+            }),
         }
     }
     out
@@ -335,16 +370,31 @@ fn procedure_route(
     })
 }
 
+/// Why a route site has no traced route ([`traced_route`]).
+enum Untraced {
+    /// Left to the reader, counted by this reason.
+    Counted(String),
+    /// The call's own path holds a value the code writes in no whole way:
+    /// a guessed site of this method, upper case ([`GuessedRoute`]).
+    Guessed(String),
+}
+
+impl From<String> for Untraced {
+    fn from(reason: String) -> Self {
+        Untraced::Counted(reason)
+    }
+}
+
 /// `site`'s traced routes, or why it has none: one, or where the call writes
 /// its own path through a conditional or a default, one per way written
 /// whole (carrick#2386), each at the full paths that way joins.
-fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRoute>, String> {
+fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRoute>, Untraced> {
     let method = forced_method(record)?;
     if site.composed_trimmed {
-        return Err("trimmed".to_string());
+        return Err("trimmed".to_string().into());
     }
     if site.composed.is_empty() {
-        return Err("no_instance".to_string());
+        return Err("no_instance".to_string().into());
     }
     if let Some(end) = site
         .composed
@@ -355,7 +405,24 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
         return Err(match end {
             "mount_unverified" => end.to_string(),
             _ => format!("hole_{end}"),
-        });
+        }
+        .into());
+    }
+    // The call's own path holds a value the code writes in no whole way (a
+    // base joined with text, rewritten by a call, held in a local, or a loop
+    // element typed as `string`) and no way of a conditional or a default
+    // is read: the code states no single literal path here, so a reader row
+    // of the method is a guess (ruling on PR #3182, 2026-11-02). A site
+    // whose own path is read but whose prefix is not stays `unread_prefix`.
+    let own_read =
+        site.name_text().is_some() || site.composed.iter().any(|composed| composed.own.is_some());
+    if !own_read
+        && site
+            .name
+            .iter()
+            .any(|piece| matches!(piece, crate::request_summary::Piece::Opaque { .. }))
+    {
+        return Err(Untraced::Guessed(method.to_uppercase()));
     }
     // Each own path with the full paths it joins: the call's whole text, or
     // each way it writes through a conditional or a default.
@@ -366,7 +433,7 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
             composed.own.clone().or_else(|| site.name_text()),
             composed.path.clone(),
         ) else {
-            return Err("unread_prefix".to_string());
+            return Err("unread_prefix".to_string().into());
         };
         by_own.entry(own).or_default().push(path);
     }

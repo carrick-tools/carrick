@@ -4472,10 +4472,15 @@ export function listen(): void {
                 })
                 .collect();
             served.sort();
-            (served, routes.untraced)
+            let guessed: Vec<String> = routes
+                .guessed
+                .iter()
+                .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
+                .collect();
+            (served, routes.untraced, guessed)
         };
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
-        let (got, untraced) = served(&decided);
+        let (got, untraced, guessed) = served(&decided);
         assert_eq!(
             got,
             texts(&[
@@ -4488,12 +4493,67 @@ export function listen(): void {
             ]),
             "{got:#?}"
         );
-        assert_eq!(
-            untraced,
-            std::collections::BTreeMap::from([("unread_prefix".to_string(), 1)])
-        );
+        // The base with no way written whole (`${base}health`) states no
+        // path: a guessed site (ruling on PR #3182), not an unread prefix.
+        assert!(untraced.is_empty(), "{untraced:#?}");
+        assert_eq!(guessed, texts(&["src/index.ts:22 GET"]));
         let (_, again) = decided_traced(&on, &exports, &declarations, &scopes);
-        assert_eq!(served(&again), (got, untraced));
+        assert_eq!(served(&again), (got, untraced, guessed));
+    }
+
+    /// Ruling on PR #3182 (2026-11-02): a route whose own path the code
+    /// writes in no whole way (a base joined with text, a base rewritten by
+    /// a call, a local holding a value read at runtime, a loop over values
+    /// the compiler types as `string`) is a guessed site: no route is
+    /// served there, and the reader's row of its method is withdrawn. A
+    /// literal route beside them is served as before.
+    #[test]
+    fn a_route_path_written_in_no_whole_way_is_a_guessed_site() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-route-guessed")
+        else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        let routes = crate::site_rows::traced(&decided, &records);
+        let served: Vec<String> = routes
+            .routes
+            .iter()
+            .map(|route| {
+                format!(
+                    "{}:{} {} {}",
+                    route.file,
+                    route.line,
+                    route.method,
+                    route.full_paths.join(" ")
+                )
+            })
+            .collect();
+        assert_eq!(
+            served,
+            texts(&["src/index.ts:21 GET /ready"]),
+            "{served:#?}"
+        );
+        let mut guessed: Vec<String> = routes
+            .guessed
+            .iter()
+            .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
+            .collect();
+        guessed.sort();
+        assert_eq!(
+            guessed,
+            texts(&[
+                "src/index.ts:14 GET",
+                "src/index.ts:16 POST",
+                "src/index.ts:19 GET",
+                "src/table.ts:17 GET",
+            ]),
+            "{guessed:#?}"
+        );
     }
 
     /// carrick#1678: a verb called on the object a scope member returns
