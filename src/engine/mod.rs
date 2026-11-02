@@ -2048,6 +2048,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 },
                 main_self: main_self_data,
                 surface_unchanged,
+                untouched: pr_base
+                    .as_deref()
+                    .and_then(|base| crate::git_state::unchanged_since(repo_path, base).ok()),
                 copy,
             }
         });
@@ -13072,6 +13075,10 @@ struct MainBaselineInput {
     dependencies: crate::pr_baseline::DependencyBaseline,
     /// This run scanned exactly what main's copy describes.
     surface_unchanged: bool,
+    /// The tracked files the PR left as its base has them
+    /// ([`crate::git_state::unchanged_since`]); `None` when git could not say
+    /// (carrick#3170).
+    untouched: Option<std::collections::HashSet<String>>,
     /// Whether main's copy is main as this PR's base has it
     /// (carrick-cloud#1408).
     copy: crate::pr_baseline::MainCopy,
@@ -13169,7 +13176,10 @@ async fn main_side_findings(
         None => {}
     }
     let MainBaselineInput {
-        peers, main_self, ..
+        peers,
+        main_self,
+        untouched,
+        ..
     } = input;
     // Main's own answers, from the scan that had main's sources on disk. The
     // recomputation below has none, so a response main's scan judged by
@@ -13208,6 +13218,7 @@ async fn main_side_findings(
         recomputed: analyzer.type_sites(),
         stored,
         types_judged: type_check == crate::local_mode::JoinTypeCheck::Ran,
+        untouched,
     })
 }
 

@@ -3478,3 +3478,54 @@ async fn reach_a_lockfile_move_of_a_loaded_package_stays_whole() {
     assert_eq!(whole_reason(&dump), "repo_input");
     assert_eq!(dump["decided"]["whole_by"], "package-lock.json", "{dump:#}");
 }
+
+/// carrick#3170. A risk sited in a file the PR did not change is on main,
+/// whatever main's recomputation says. Main's copy is rewritten so its
+/// recomputation does not reach the wrong verb the base commit sends (the way
+/// a type that main's stored text resolves differently from the PR's read
+/// would), which is what read the risk as introduced.
+async fn main_copy_hiding_the_wrong_verb() -> (tempfile::TempDir, PathBuf, Store) {
+    let (tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan(&store, &producer).await;
+    set_consumer_verb(&consumer, "PUT", 1);
+    commit(&consumer, "main: sends the wrong verb");
+    let base = head(&consumer);
+    scan(&store, &consumer).await;
+    rewrite_main_copy(&store, "inventory-svc", |copy| {
+        for call in &mut copy.calls {
+            if let carrick::operation::OperationKey::Http { method, .. } = &mut call.key {
+                *method = "GET".to_string();
+            }
+        }
+        if let Some(graph) = copy.mount_graph.as_mut() {
+            for call in &mut graph.data_calls {
+                call.method = "GET".to_string();
+            }
+        }
+    });
+    event_with_base(tmp.path(), &base);
+    (tmp, consumer, store)
+}
+
+#[tokio::test]
+async fn a_risk_in_a_file_the_pr_did_not_change_is_on_main() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, consumer, store) = main_copy_hiding_the_wrong_verb().await;
+    set_dependency(&consumer, "left-pad", "^1.3.0");
+    commit(&consumer, "pr: a manifest bump and nothing else");
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+}
+
+#[tokio::test]
+async fn a_risk_in_a_file_the_pr_changed_is_still_introduced() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, consumer, store) = main_copy_hiding_the_wrong_verb().await;
+    set_consumer_verb(&consumer, "PUT", 2);
+    commit(&consumer, "pr: edits the file that holds the risk");
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}

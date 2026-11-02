@@ -143,6 +143,10 @@ pub struct MainSide {
     pub stored: Vec<MainTypeSite>,
     /// Main's recomputed type check ran.
     pub types_judged: bool,
+    /// The tracked files the PR left as its base has them, repo-relative.
+    /// `None` when git could not say. A risk whose every site is in one of
+    /// them is main's (carrick#3170).
+    pub untouched: Option<HashSet<String>>,
 }
 
 /// Whether main's copy is main as this PR's base has it.
@@ -164,6 +168,10 @@ pub enum MainCopy {
 /// and main's side judged at least one group the PR has more sites in; else
 /// the run could not tell, and the finding carries why. A finding with no
 /// pairing is left as it is.
+///
+/// A finding whose every site is in a file the PR left alone
+/// ([`MainSide::untouched`]) is main's, whatever main's recomputation says:
+/// the PR did not write that code (carrick#3170).
 ///
 /// Main's sites are its recomputed findings, plus each stored mismatch at a
 /// site the recomputation reached no resolved answer for. Where the
@@ -194,6 +202,14 @@ pub fn mark_on_main(pr: &mut [Finding], main: &MainSide, copy: MainCopy) {
     for finding in pr.iter_mut() {
         let groups: Vec<SiteGroup> = groups(finding).into_iter().map(|(g, _)| g).collect();
         if groups.is_empty() {
+            continue;
+        }
+        if let Some(untouched) = &main.untouched
+            && groups
+                .iter()
+                .all(|(_, _, file)| !file.is_empty() && untouched.contains(file))
+        {
+            finding.set_on_main(Some(true));
             continue;
         }
         let short: Vec<&SiteGroup> = groups
@@ -1243,6 +1259,28 @@ mod tests {
         assert_eq!(on_main(&pr[0]), Some(true));
     }
 
+    /// carrick#3170. A site in a file the PR left alone is main's, though
+    /// main's recomputation lacks it. One site in an edited file is enough to
+    /// leave the question to the comparison.
+    #[test]
+    fn a_finding_sited_only_in_untouched_files_is_on_main() {
+        let untouched = |files: &[&str]| MainSide {
+            untouched: Some(files.iter().map(|file| file.to_string()).collect()),
+            ..main_side(Vec::new())
+        };
+        let mut pr = vec![type_mismatch(ORDERS, "src/checkout.ts:40")];
+        mark_on_main(&mut pr, &untouched(&["src/checkout.ts"]), MainCopy::Current);
+        assert_eq!(on_main(&pr[0]), Some(true));
+
+        let mut pr = vec![type_mismatch(ORDERS, "src/checkout.ts:40")];
+        mark_on_main(&mut pr, &untouched(&["src/cart.ts"]), MainCopy::Current);
+        assert_eq!(on_main(&pr[0]), Some(false));
+
+        let mut pr = vec![type_mismatch(ORDERS, "src/checkout.ts:40")];
+        mark_on_main(&mut pr, &main_side(Vec::new()), MainCopy::Current);
+        assert_eq!(on_main(&pr[0]), Some(false), "git could not say");
+    }
+
     #[test]
     fn a_pairing_main_does_not_have_is_introduced() {
         let main = main_side(vec![type_mismatch(ORDERS, "src/checkout.ts:40")]);
@@ -1396,6 +1434,7 @@ mod tests {
             recomputed: vec![recomputed_unresolved(site)],
             stored: stored_type_sites(std::slice::from_ref(copy)),
             types_judged: true,
+            untouched: None,
         }
     }
 
