@@ -917,6 +917,18 @@ pub struct EndpointRef {
     pub method: String,
     pub path: String,
     pub service: Option<String>,
+    /// Whether the operation's rows are facts or candidates, folded over the
+    /// `resolution_source` of every row of it by [`EdgeSource::fold`] (the
+    /// split is [`ResolutionSource::is_candidate`]): `fact` when a
+    /// deterministic pass (the trace, a library claim, a descriptor, a schema)
+    /// stated every row, `candidate` when the model stated any. A new
+    /// endpoint's rows are this run's; a removed endpoint's are main's stored
+    /// index's. Omitted when a row states no source, as on an index written
+    /// before the field existed.
+    ///
+    /// [`ResolutionSource::is_candidate`]: crate::agents::file_analyzer_agent::ResolutionSource::is_candidate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_source: Option<EdgeSource>,
 }
 
 /// What this PR changed relative to the repo's last-indexed (main) state.
@@ -1488,11 +1500,13 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/x".to_string(),
                     service: None,
+                    edge_source: None,
                 }],
                 removed_endpoints: vec![EndpointRef {
                     method: "GET".to_string(),
                     path: "/y".to_string(),
                     service: None,
+                    edge_source: None,
                 }],
             }),
             verified: vec![VerifiedEndpoint {

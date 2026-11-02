@@ -475,6 +475,9 @@ struct DeltaRow {
     key: crate::operation::OperationKey,
     places: Vec<std::path::PathBuf>,
     commit: String,
+    /// The `resolution_source` of every row in `places`, in the same order:
+    /// what the delta row's `edge_source` folds over.
+    sources: Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
 }
 
 /// `endpoint` under its identity for `service`. When two spellings of one
@@ -492,11 +495,13 @@ fn keep_first_spelling(
             key: endpoint.key.clone(),
             places: Vec::new(),
             commit: commit.to_string(),
+            sources: Vec::new(),
         });
     if endpoint.key.display_labels() < row.key.display_labels() {
         row.key = endpoint.key.clone();
     }
     row.places.push(endpoint.file_path.clone());
+    row.sources.push(endpoint.resolution_source);
 }
 
 impl DeltaBaseline {
@@ -553,6 +558,10 @@ fn delta_candidates(
                 method: label,
                 path: name,
                 service: service.clone(),
+                // Folded over every row of the operation, as a finding's is:
+                // a new row's from this run, a removed row's from main's
+                // stored index.
+                edge_source: crate::findings::EdgeSource::fold(row.sources.iter().copied()),
             },
             places: row
                 .places
@@ -29981,6 +29990,82 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 vec!["/gadgets/{id}".to_string()]
             ),
             "each row keeps its own spelling"
+        );
+    }
+
+    /// Every delta row says where its operation came from (`edge_source`),
+    /// folded over the operation's rows as a finding's is: a route the trace
+    /// or a library claim states is a fact, one the model read is a
+    /// candidate, and one row of each makes the operation a candidate. A new
+    /// endpoint's rows are this run's; a removed endpoint's are main's stored
+    /// index's, and an index whose rows state no source gives none.
+    #[test]
+    fn every_pr_delta_row_carries_where_its_operation_came_from() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::findings::EdgeSource;
+        const THIS: &str = "0.4.0";
+        let stating = |rows: &[(&str, Option<ResolutionSource>)]| {
+            let paths: Vec<&str> = rows.iter().map(|(path, _)| *path).collect();
+            let mut repo = service_stating("web", Some(THIS), &paths);
+            for (endpoint, (_, source)) in repo.endpoints.iter_mut().zip(rows) {
+                endpoint.resolution_source = *source;
+            }
+            repo
+        };
+        let DeltaBaseline::Keys(previous) = DeltaBaseline::of(
+            [&stating(&[
+                ("/kept", Some(ResolutionSource::ReceiverType)),
+                ("/gone-traced", Some(ResolutionSource::ReceiverType)),
+                ("/gone-model", Some(ResolutionSource::Model)),
+                ("/gone-unstated", None),
+            ])],
+            THIS,
+        ) else {
+            panic!("this version's index is the baseline");
+        };
+        let delta = key_delta(
+            &previous,
+            &[stating(&[
+                ("/kept", Some(ResolutionSource::Model)),
+                ("/new-traced", Some(ResolutionSource::ReceiverType)),
+                ("/new-claimed", Some(ResolutionSource::LibraryClaim)),
+                ("/new-model", Some(ResolutionSource::Model)),
+                ("/new-both", Some(ResolutionSource::ReceiverType)),
+                ("/new-both", Some(ResolutionSource::Model)),
+            ])],
+        );
+        let sources = |refs: &[crate::findings::EndpointRef]| -> Vec<(String, Option<EdgeSource>)> {
+            refs.iter()
+                .map(|r| (r.path.clone(), r.edge_source))
+                .collect()
+        };
+        assert_eq!(
+            sources(&delta.new_endpoints),
+            vec![
+                ("/new-both".to_string(), Some(EdgeSource::Candidate)),
+                ("/new-claimed".to_string(), Some(EdgeSource::Fact)),
+                ("/new-model".to_string(), Some(EdgeSource::Candidate)),
+                ("/new-traced".to_string(), Some(EdgeSource::Fact)),
+            ],
+            "a kept route whose source changed is not a delta row"
+        );
+        assert_eq!(
+            sources(&delta.removed_endpoints),
+            vec![
+                ("/gone-model".to_string(), Some(EdgeSource::Candidate)),
+                ("/gone-traced".to_string(), Some(EdgeSource::Fact)),
+                ("/gone-unstated".to_string(), None),
+            ]
+        );
+        // On the wire: lower-case, as a finding's, and absent when unstated.
+        let wire = serde_json::to_value(&delta.removed_endpoints).unwrap();
+        assert_eq!(wire[0]["edge_source"], "candidate");
+        assert_eq!(wire[1]["edge_source"], "fact");
+        assert!(wire[2].get("edge_source").is_none(), "got: {}", wire[2]);
+        assert_eq!(
+            wire[2],
+            serde_json::json!({"method": "GET", "path": "/gone-unstated", "service": "web"}),
+            "an unstated row's delta entry is the shape the cloud already reads"
         );
     }
 

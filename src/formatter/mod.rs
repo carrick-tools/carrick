@@ -1678,6 +1678,7 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/payments".to_string(),
                 service: None,
+                edge_source: None,
             }],
         };
         let output = format_analysis_results(
@@ -1702,6 +1703,7 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/payments/:id/refunds".to_string(),
                 service: None,
+                edge_source: None,
             }],
         };
         let output = format_analysis_results(
@@ -1726,6 +1728,7 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/payments".to_string(),
                 service: None,
+                edge_source: None,
             }],
         };
         let output = format_analysis_results(
@@ -2617,11 +2620,13 @@ mod tests {
                     method: "POST".to_string(),
                     path: "/v2/invoices".to_string(),
                     service: Some("billing".to_string()),
+                    edge_source: None,
                 },
                 EndpointRef {
                     method: "GET".to_string(),
                     path: "/charges".to_string(),
                     service: None,
+                    edge_source: None,
                 },
             ],
             removed_endpoints: vec![],
@@ -2656,6 +2661,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/health".to_string(),
                 service: None,
+                edge_source: None,
             }],
             removed_endpoints: vec![],
         };
@@ -2678,11 +2684,13 @@ mod tests {
                     method: "DELETE".to_string(),
                     path: "/api/sessions".to_string(),
                     service: None,
+                    edge_source: None,
                 },
                 EndpointRef {
                     method: "GET".to_string(),
                     path: "/api/unused".to_string(),
                     service: Some("auth".to_string()),
+                    edge_source: None,
                 },
             ],
         };
@@ -2714,12 +2722,14 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/orders/:id".to_string(),
                     service: None,
+                    edge_source: None,
                 },
                 // Same prefix, different segment count — must NOT be flagged.
                 EndpointRef {
                     method: "GET".to_string(),
                     path: "/orders".to_string(),
                     service: None,
+                    edge_source: None,
                 },
                 // Param matches a concrete missing segment, but the method
                 // differs — must NOT be flagged.
@@ -2727,6 +2737,7 @@ mod tests {
                     method: "DELETE".to_string(),
                     path: "/users/:id".to_string(),
                     service: None,
+                    edge_source: None,
                 },
             ],
         };
@@ -2770,6 +2781,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/a|b".to_string(),
                 service: Some("sv`c".to_string()),
+                edge_source: None,
             }],
             removed_endpoints: vec![],
         };
@@ -2792,6 +2804,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/x".to_string(),
                 service: Some("``".to_string()),
+                edge_source: None,
             }],
             removed_endpoints: vec![],
         };
