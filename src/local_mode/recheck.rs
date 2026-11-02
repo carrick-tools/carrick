@@ -268,10 +268,17 @@ pub fn run(
             // for another reason before the deadline says nothing about
             // whether this service fits, and remembering it would switch the
             // re-check off on a service where it does. The scan does not say
-            // which of the services it was reading had not finished, so every
-            // service in the scope is recorded.
+            // which of the services it was reading had not finished, so only
+            // the edited file's own service is recorded: a reader service
+            // re-read beside it is tried again on its own next edit, where a
+            // miss is its own. A lost record costs one more re-check; a wrong
+            // one switches a service off for the whole index.
             if Instant::now() >= deadline {
-                ServiceMisses::record(&misses, index_generation, &plan.misses(started.elapsed()));
+                ServiceMisses::record(
+                    &misses,
+                    index_generation,
+                    &plan.miss_of(&reach.owner, started.elapsed()),
+                );
             }
             Err(Degraded {
                 reason,
@@ -511,9 +518,12 @@ impl Plan {
     }
 
     /// Every service in the scope, as a miss of this re-check.
-    fn misses(&self, elapsed: Duration) -> Vec<(String, Miss)> {
+    /// The miss to remember when this re-check ran out of time: the edited
+    /// file's own service only, never a reader service re-read beside it.
+    fn miss_of(&self, owner: &str, elapsed: Duration) -> Vec<(String, Miss)> {
         self.services
             .iter()
+            .filter(|service| service.as_str() == owner)
             .map(|service| {
                 (
                     service.clone(),
@@ -1659,6 +1669,39 @@ mod tests {
     /// A miss is remembered per service and per index generation: another
     /// service of the same repo, or the same service against a newer index,
     /// tries the re-check again (carrick#3198).
+    #[test]
+    fn a_timed_out_re_check_remembers_only_the_edited_files_service() {
+        let plan = Plan {
+            generation: "g1".to_string(),
+            services: vec!["types-owner".to_string(), "big-reader".to_string()],
+            digests: Default::default(),
+            working: Default::default(),
+            files: [
+                ("types-owner".to_string(), 3),
+                ("big-reader".to_string(), 900),
+            ]
+            .into_iter()
+            .collect(),
+            scope: RecheckScope {
+                reread: vec!["types-owner".to_string(), "big-reader".to_string()],
+                not_reread: Vec::new(),
+                stale: Vec::new(),
+            },
+        };
+        let recorded = plan.miss_of("types-owner", Duration::from_millis(10_000));
+        assert_eq!(
+            recorded,
+            vec![(
+                "types-owner".to_string(),
+                Miss {
+                    elapsed_ms: 10_000,
+                    files: 3
+                }
+            )],
+            "a reader re-read beside the edited service is tried again on its own edit"
+        );
+    }
+
     #[test]
     fn a_service_miss_holds_for_its_service_and_generation_only() {
         let dir = tempfile::tempdir().expect("a temp dir");
