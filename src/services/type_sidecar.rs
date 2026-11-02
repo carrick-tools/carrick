@@ -2002,9 +2002,10 @@ pub enum MessageSource {
     Query,
     /// A top-level property of a JSON body.
     Body,
-    /// Not the message: an argument the route's handler passes a function
-    /// other routes also call (carrick#2372). The function's bodies depend
-    /// on it, and the route's own value could not pick one of them.
+    /// Not the message: what the route's handler passes (an argument, or a
+    /// member of one) to a function other callers also call (carrick#2372).
+    /// The function's bodies depend on it, and the route's own value could
+    /// not pick one of them.
     Argument,
     /// Anything else: a header, a path parameter, a framework accessor.
     #[serde(other)]

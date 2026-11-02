@@ -48,8 +48,9 @@ export interface ResponseModeRead {
    * `json()` the default lib or an installed library declares. `unplaced`:
    * anything else (a header, a path parameter, the method, a framework's own
    * accessor, a `json()` the repo declares). `argument`: not the message,
-   * an argument the route passes a function other routes also call, which
-   * picks that function's body (carrick#2372, `argument-modes.ts`).
+   * what the route passes (an argument, or a member of one) to a function
+   * other callers also call, which picks that function's body (carrick#2372,
+   * `argument-modes.ts`).
    */
   location: MessageSource;
   field: string;

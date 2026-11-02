@@ -1633,25 +1633,20 @@ fn mode_unstated_reason(field: &str, cases: &[crate::cloud_storage::ResponseMode
 }
 
 /// The sentence a call reads when the route's response comes from a function
-/// other routes share, depends on an argument the route passes it, and the
-/// route's own value could not pick one body (carrick#2372).
+/// the route shares with other callers, depends on what the route passes it
+/// (an argument, or a member of one), and the route's own value could not
+/// pick one body (carrick#2372).
 fn argument_unknown_reason(arguments: &[&str]) -> String {
     let mut names: Vec<&str> = arguments.to_vec();
     names.sort_unstable();
     names.dedup();
-    let (named, noun) = match names.as_slice() {
-        [one] => (format!("`{one}`"), "argument"),
-        _ => (
-            names
-                .iter()
-                .map(|name| format!("`{name}`"))
-                .collect::<Vec<_>>()
-                .join(" and "),
-            "arguments",
-        ),
-    };
+    let named = names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
     format!(
-        "Not compared: this route's response depends on the {named} {noun} it passes to a function other routes share, and Carrick cannot tell which body it sends."
+        "Not compared: this route's response depends on what it passes for {named} to a function it shares with other callers, and Carrick cannot tell which body it sends."
     )
 }
 
@@ -6280,7 +6275,7 @@ mod tests {
         assert_eq!(
             select_mode(Some(&argument), &query("a")),
             ModeSelection::Unstated(
-                "Not compared: this route's response depends on the `mode` argument it passes to a function other routes share, and Carrick cannot tell which body it sends.".to_string()
+                "Not compared: this route's response depends on what it passes for `mode` to a function it shares with other callers, and Carrick cannot tell which body it sends.".to_string()
             )
         );
         argument.reads.push(MessageRead {
@@ -6294,7 +6289,7 @@ mod tests {
         assert_eq!(
             select_mode(Some(&argument), &none),
             ModeSelection::Unstated(
-                "Not compared: this route's response depends on the `id` and `mode` arguments it passes to a function other routes share, and Carrick cannot tell which body it sends.".to_string()
+                "Not compared: this route's response depends on what it passes for `id` and `mode` to a function it shares with other callers, and Carrick cannot tell which body it sends.".to_string()
             )
         );
 
