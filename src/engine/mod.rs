@@ -3366,7 +3366,7 @@ impl ServiceScan {
             previous.file_results.as_ref().unwrap_or(&no_answers),
             &unchanged,
         );
-        let Ok(package_json_hash) = hash_workspace_package_jsons(&packages, repo_path) else {
+        let Ok(package_json_hash) = workspace_setup_hashes(&packages, repo_path) else {
             return;
         };
         // The setup the analysis will take: the one its stored generation
@@ -4493,6 +4493,47 @@ fn manifest_hash_text(path: &Path, content: &str) -> String {
     content.to_string()
 }
 
+/// The two hashes a service's manifests have: `current`, written into every
+/// blob from now on, and `legacy`, the bytes as every blob written before
+/// carrick#2568 hashed them. A stored setup is the same one when it holds
+/// either, so the one-time change of hash asks no setup again: an unchanged
+/// manifest matches `legacy`, a version-only bump matches `current`, and a
+/// real dependency change matches neither. Drop `legacy` once no stored blob
+/// predates 0.3.140.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetupHashes {
+    pub(crate) current: String,
+    pub(crate) legacy: String,
+}
+
+impl SetupHashes {
+    /// Whether a stored `package_json_hash` was computed from these manifests.
+    pub(crate) fn match_stored(&self, stored: Option<&str>) -> bool {
+        stored.is_some_and(|stored| stored == self.current || stored == self.legacy)
+    }
+
+    /// One hash standing for both, for tests that name the manifests by a label.
+    #[cfg(test)]
+    pub(crate) fn just(hash: &str) -> Self {
+        Self {
+            current: hash.to_string(),
+            legacy: hash.to_string(),
+        }
+    }
+}
+
+/// [`SetupHashes`] of the discovered manifests (see
+/// [`hash_workspace_package_jsons`], which is the `current` one).
+fn workspace_setup_hashes(
+    packages: &Packages,
+    repo_path: &str,
+) -> Result<SetupHashes, std::io::Error> {
+    Ok(SetupHashes {
+        current: manifest_set_hash(packages, repo_path, manifest_hash_text)?,
+        legacy: manifest_set_hash(packages, repo_path, |_, content| content.to_string())?,
+    })
+}
+
 /// Hash discovered manifests and Deno resolution inputs (sorted by relative path)
 /// for the detection/guidance/extraction-config cache gate. The artifacts
 /// behind the gate are generated from the MERGED dependency set, so the gate
@@ -4502,6 +4543,14 @@ fn manifest_hash_text(path: &Path, content: &str) -> String {
 fn hash_workspace_package_jsons(
     packages: &Packages,
     repo_path: &str,
+) -> Result<String, std::io::Error> {
+    manifest_set_hash(packages, repo_path, manifest_hash_text)
+}
+
+fn manifest_set_hash(
+    packages: &Packages,
+    repo_path: &str,
+    text_of: impl Fn(&Path, &str) -> String,
 ) -> Result<String, std::io::Error> {
     let repo_root = Path::new(repo_path);
     let inputs = crate::deno_support::resolution_inputs(repo_root, &packages.source_paths)?;
@@ -4550,7 +4599,7 @@ fn hash_workspace_package_jsons(
         combined.push('\0');
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                combined.push_str(&manifest_hash_text(path, &content));
+                combined.push_str(&text_of(path, &content));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 combined.push_str("missing")
@@ -4868,9 +4917,10 @@ async fn analyze_current_repo_incremental(
             // detection/guidance/extraction config. Covers workspace
             // manifests, not just the repo root (raw file content, not the
             // serialized struct, for deterministic comparison).
-            let current_pkg_hash = hash_workspace_package_jsons(packages, repo_path)?;
+            let setup_hashes = workspace_setup_hashes(packages, repo_path)?;
+            let current_pkg_hash = setup_hashes.current.clone();
 
-            let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
+            let pkg_changed = !setup_hashes.match_stored(prev.package_json_hash.as_deref());
 
             // Get framework detection, guidance, and extraction config
             // (cached or fresh — all three share the package_json_hash gate).
@@ -4896,7 +4946,7 @@ async fn analyze_current_repo_incremental(
                     )
                 }
             } else {
-                match setup_ahead::StoredSetup::of(prev).decide(&current_pkg_hash) {
+                match setup_ahead::StoredSetup::of(prev).decide(&setup_hashes) {
                     setup_ahead::SetupAsk::Reuse {
                         detection,
                         guidance,
@@ -5636,7 +5686,7 @@ async fn analyze_current_repo_incremental(
     // (carrick#1126).
     let settled = match previous_data {
         Some(prev) => {
-            SettledDetection::kept_by(prev, &hash_workspace_package_jsons(packages, repo_path)?)
+            SettledDetection::kept_by(prev, &workspace_setup_hashes(packages, repo_path)?)
         }
         None => None,
     };
@@ -5810,8 +5860,8 @@ fn guidance_is_keyed(guidance: &ProtocolGuidance) -> bool {
 impl SettledDetection {
     /// The detection `prev` kept when its guidance was deferred or cannot be
     /// replayed ([`setup_ahead::StoredSetup::kept`]).
-    fn kept_by(prev: &CloudRepoData, current_pkg_hash: &str) -> Option<Self> {
-        setup_ahead::StoredSetup::of(prev).kept(current_pkg_hash)
+    fn kept_by(prev: &CloudRepoData, hashes: &SetupHashes) -> Option<Self> {
+        setup_ahead::StoredSetup::of(prev).kept(hashes)
     }
 }
 
