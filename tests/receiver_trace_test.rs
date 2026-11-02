@@ -903,6 +903,61 @@ fn routes_across_services_take_the_receiving_scope() {
     );
 }
 
+/// carrick#2588: a routes package that uses its server package only through
+/// its types (`import type`, every route registered on an app it is handed,
+/// no app built anywhere in the package) is asked the store about that
+/// package, as a package imported as a value is. So its route calls reach the
+/// labels, end at its plugin's parameter, and take the scope prefix the
+/// plugin states (`opts.routePrefix ?? '/api/v1'`) at the join point, where
+/// the host registers the plugin on an app the labelled export made. Without
+/// the ask the routes package has no site, and its rows keep the mock
+/// answer's bare paths. With the switch off, nothing moves.
+#[test]
+fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
+    let off = scan_fixture("receiver-scopes-types-only", true, None);
+    let (off_graph, _) = endpoint_rows(&off);
+    assert_eq!(
+        off_graph,
+        vec![
+            "packages/routes/src/widgets.ts:4 GET /widgets model widgetRoutes",
+            "packages/server/src/main.ts:7 GET /health model app",
+        ]
+    );
+
+    let (on, fallbacks) = scan_fixture_reading("receiver-scopes-types-only", true, Some("1"));
+    let (graph, flat) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            // The mock answer's row, corrected in place: it keeps its owner.
+            "packages/routes/src/widgets.ts:4 GET /api/v1/widgets library_claim widgetRoutes",
+            // Added: the mock answer states no row there.
+            "packages/routes/src/widgets.ts:5 POST /api/v1/widgets/:widgetId/parts library_claim app",
+            "packages/server/src/main.ts:7 GET /health library_claim app",
+        ]
+    );
+    let flat_of_graph: Vec<String> = graph
+        .iter()
+        .map(|row| row.rsplit_once(' ').unwrap().0.to_string())
+        .collect();
+    assert_eq!(flat, flat_of_graph);
+    assert_eq!(
+        route_counts(&fallbacks),
+        vec![
+            "routes routes_across_added_untyped=1",
+            "routes routes_across_corrected=1",
+            // The package's own sites end at the plugin's parameter: the
+            // join point writes them.
+            "routes routes_untraced_hole_entry_point=2",
+        ]
+    );
+    // With the fact layer off the switch changes no byte.
+    assert_eq!(
+        scan_fixture("receiver-scopes-types-only", false, Some("1")),
+        scan_fixture("receiver-scopes-types-only", false, None)
+    );
+}
+
 /// Each service's `routes_*` counts, as `service key=count`.
 fn route_counts(fallbacks: &Fallbacks) -> Vec<String> {
     let mut out = Vec::new();

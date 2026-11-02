@@ -1,0 +1,29 @@
+{
+  "library_claims": [
+    {
+      "package": "fixture-plugin-server",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-plugin-server",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [
+            { "member": "register", "of": "instance:()", "name": { "arg": 1, "key": "prefix" }, "runs": { "arg": 0 }, "yields": { "param": 0, "export": "App", "side": "server" }, "picker": "fixture-picker" },
+            { "member": "group", "of": "instance:()", "name": { "arg": 0 }, "runs": { "arg": 1 }, "yields": { "param": 0, "export": "App", "side": "server" }, "picker": "fixture-picker" }
+          ],
+          "ops": [
+            { "op": "receive", "member": "get", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "GET", "picker": "fixture-picker" },
+            { "op": "receive", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

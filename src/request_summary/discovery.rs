@@ -324,6 +324,27 @@ fn is_free_name(ir: &FileIr, call: &CallIr) -> bool {
         && root_name(call).is_some_and(|root| !ir.bindings.contains_key(root))
 }
 
+/// The packages a service's calls reach, as the compiler resolves them
+/// (carrick#2588): for each `call` row whose declaration is outside the
+/// repository, the package it is declared in, by the name it is installed
+/// under (`@types/x` types `x`). A call on an instance handed in as a
+/// parameter typed by a type-only import (`import type { App } from
+/// 'framework'`) names its package here and nowhere in the library sites.
+/// The language's own library and the runtime's types are asked by the
+/// globals the code uses ([`runtime_globals`]), so neither is here.
+pub fn called_packages(inputs: &RequestSummaryInputs) -> BTreeSet<String> {
+    let Some(positions) = inputs.positions.as_ref() else {
+        return BTreeSet::new();
+    };
+    positions
+        .call_rows()
+        .filter(|row| !in_repo(row))
+        .filter_map(|row| row.decl_package())
+        .filter(|package| *package != RUNTIME_TYPES)
+        .map(crate::engine::type_compat_v2::types_package_runtime_name)
+        .collect()
+}
+
 /// The globals a service's calls use that the runtime's types package
 /// declares, by the store's key for the file they are declared in
 /// (carrick#2445): a Node program that loads no DOM library has its

@@ -478,10 +478,10 @@ mod tests {
 
     /// carrick#2725: a route registered on a framework instance handed in as
     /// a parameter, in a module that imports the framework as a type only,
-    /// is no finished walk: the service asked the store nothing about the
-    /// framework, so its first answer holds no export of it and does not
-    /// name it answered, and the call is `unanswered_package`, which D4
-    /// keeps. Counting it answered while its exports are dropped (what the
+    /// is no finished walk while the service's first answer holds no export
+    /// of the framework and does not name it answered (the store has not
+    /// answered it yet; since carrick#2588 the service asks about it): the
+    /// call is `unanswered_package`, which D4 keeps. Counting it answered while its exports are dropped (what the
     /// first answer did with a store answer that holds more than was asked)
     /// made both walks finished. The fixture's README says more.
     #[test]
