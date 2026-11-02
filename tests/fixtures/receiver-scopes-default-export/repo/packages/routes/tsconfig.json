@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": [],
+    "baseUrl": "."
+  },
+  "include": [
+    "src/**/*"
+  ]
+}

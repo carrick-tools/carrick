@@ -958,6 +958,26 @@ fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
     );
 }
 
+/// carrick#3207: the same tree as the types-only package's, with the host
+/// making its app through the server package's `default` export while the
+/// store labels `register` on the named export alone. The host's `register`
+/// call still records the call-in the routes package's segments join at, so
+/// the plugin's routes take the `/api/v1` scope prefix as `library_claim`
+/// rows, as they do for a host that imports the named export.
+#[test]
+fn a_host_made_through_the_other_export_still_joins_the_plugins_routes() {
+    let (on, _) = scan_fixture_reading("receiver-scopes-default-export", true, Some("1"));
+    let (graph, _) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            "packages/routes/src/widgets.ts:4 GET /api/v1/widgets library_claim widgetRoutes",
+            "packages/routes/src/widgets.ts:5 POST /api/v1/widgets/:widgetId/parts library_claim app",
+            "packages/server/src/main.ts:7 GET /health library_claim app",
+        ]
+    );
+}
+
 /// Each service's `routes_*` counts, as `service key=count`.
 fn route_counts(fallbacks: &Fallbacks) -> Vec<String> {
     let mut out = Vec::new();
