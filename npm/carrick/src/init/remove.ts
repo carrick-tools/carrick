@@ -58,7 +58,7 @@ import { disconnectMcpClients, inspectMcpClients, type McpRemoval } from "./mcp.
 import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
 import { CODEX_HOOKS_FILE, isEmptyHooksDocument, readHooksFile, uninstallCodexHooks } from "./codex.ts";
-import { AGENTS_FILE, hasAgentsSection, removeAgentsSection } from "./agents-section.ts";
+import { AGENTS_FILE, CARRICK_HEADING, CLAUDE_FILE, hasAgentsSection, removeAgentsSection } from "./agents-section.ts";
 import { inspectTaskSkills, removeTaskSkills, SKILL_ROOTS, skillRootLink } from "./task-skills.ts";
 import { noticeFile, removeNotice } from "./outdated.ts";
 import { readWorkspaceFile, removeSelection, withoutOurExclusions, WORKSPACE_FILE } from "./workspace-file.ts";
@@ -208,8 +208,8 @@ export const SCAFFOLD_FILES = [
 
 /** The files the scaffold merged INTO, which only their owner can unpick. */
 const SECTION_CARRIERS: Array<{ file: string; holds: (body: string) => boolean; what: string }> = [
-  { file: "AGENTS.md", holds: (body) => /^##\s+Carrick\s*$/m.test(body), what: 'the "## Carrick" section' },
-  { file: "CLAUDE.md", holds: (body) => /^##\s+Carrick\s*$/m.test(body), what: 'the "## Carrick" section' },
+  { file: "AGENTS.md", holds: (body) => CARRICK_HEADING.test(body), what: 'the "## Carrick" section' },
+  { file: "CLAUDE.md", holds: (body) => CARRICK_HEADING.test(body), what: 'the "## Carrick" section' },
   {
     file: path.join(".claude", "settings.json"),
     holds: (body) => body.includes("$CLAUDE_PROJECT_DIR/.claude/"),
@@ -309,8 +309,8 @@ export type FolderPlan = {
   codex: "entries" | "file" | null;
   /** The task skills still as init wrote them, relative to the folder. */
   skills: string[];
-  /** Our "Carrick check" section in AGENTS.md is there (carrick#2828). */
-  agents: boolean;
+  /** The files (AGENTS.md, CLAUDE.md) holding our check or rules block (carrick#2828). */
+  agents: string[];
   /** The names init added to the exclude list; `file` where they are all it holds. */
   selection: { names: string[]; file: boolean } | null;
   carrick: boolean;
@@ -325,7 +325,7 @@ export function folderPlan(workspace: string): FolderPlan {
     settings: [],
     codex: null,
     skills: [],
-    agents: false,
+    agents: [],
     selection: null,
     carrick: false,
     leaves: [],
@@ -387,7 +387,7 @@ export function folderPlan(workspace: string): FolderPlan {
     if (link !== null) plan.leaves.push(`${link.path} is a link to ${link.target}, so nothing was removed through it.`);
   }
 
-  plan.agents = hasAgentsSection(workspace);
+  plan.agents = [AGENTS_FILE, CLAUDE_FILE].filter((file) => hasAgentsSection(workspace, file));
 
   // The repo selection, which is the one thing init writes into a file a user
   // can also write to (carrick#1344). Only the names init put in the exclude
@@ -416,7 +416,7 @@ export function folderLines(plan: FolderPlan): string[] {
   if (plan.codex === "file") lines.push(`${CODEX_HOOKS_FILE}, which holds only Carrick's hook entries`);
   if (plan.codex === "entries") lines.push(`Carrick's hook entries in ${CODEX_HOOKS_FILE}`);
   if (plan.skills.length > 0) lines.push(`${plan.skills.length} task skill file(s) in ${SKILL_ROOTS.join(" and ")}`);
-  if (plan.agents) lines.push(`The "Carrick check" section in ${AGENTS_FILE}`);
+  for (const file of plan.agents) lines.push(`The Carrick sections in ${file}`);
   if (plan.selection !== null) {
     lines.push(
       plan.selection.file
@@ -498,18 +498,18 @@ function removeFolder(plan: FolderPlan, out: InitOutput): void {
     }
   }
 
-  if (plan.agents) {
+  for (const file of plan.agents) {
     try {
-      const agents = removeAgentsSection(workspace);
+      const agents = removeAgentsSection(workspace, file);
       if (agents !== null) {
         out.done(
           agents === "file removed"
-            ? `${AGENTS_FILE} removed, with the Carrick check section that was the whole of it`
-            : `The "Carrick check" section removed from ${AGENTS_FILE}; the rest of the file is yours and was left`,
+            ? `${file} removed, with the Carrick sections that were the whole of it`
+            : `The Carrick sections removed from ${file}; the rest of the file is yours and was left`,
         );
       }
     } catch (error) {
-      out.refuse(`Could not edit ${AGENTS_FILE}: ${(error as Error).message}. Remove the "Carrick check" section there by hand.`);
+      out.refuse(`Could not edit ${file}: ${(error as Error).message}. Remove the Carrick sections there by hand.`);
     }
   }
 

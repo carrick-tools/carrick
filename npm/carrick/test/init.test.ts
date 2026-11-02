@@ -43,8 +43,8 @@ import {
   namedButExcluded,
   CANCELLED,
   NOTHING_WRITTEN,
-  scaffoldSentence,
-  reposToScaffold,
+  setupWarning,
+  reposWithoutSetup,
   preselectedRepos,
   chooseEditors,
   type InitOptions,
@@ -396,12 +396,9 @@ function fakeClaude(root: string): string {
   return bin;
 }
 
-// The seam document carrick-cloud#799 pins: the scaffold tool's agent reads
-// it, so what lands on disk has to be the scanner's own bytes, not a
-// re-serialisation of what this client could parse.
-/** The closing instruction for one repo, as the fixtures name it. */
-function scaffoldFor(name: string): string {
-  return scaffoldSentence([{ path: `/repos/${name}`, name, remote: null, problem: null }]);
+/** The closing warning for one repo that is not set up for scanning, as the fixtures name it. */
+function setupFor(name: string): string {
+  return setupWarning([{ path: `/repos/${name}`, name, remote: null, problem: null }]);
 }
 
 test("the proposal is written as the scanner printed it, into an ignored directory", () => {
@@ -476,11 +473,15 @@ test("the hook entries land beside everything else the settings file holds", () 
   const merged = mergeCarrickHooks(existing);
   const written = JSON.parse(merged.body);
   assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
-  assert.equal(written.hooks.PreToolUse.length, 1);
+  // Their gate stays first; our search nudge follows it.
+  assert.equal(written.hooks.PreToolUse.length, 2);
+  assert.equal(written.hooks.PreToolUse[0].hooks[0].command, "./my-own-gate.sh");
+  assert.equal(written.hooks.PreToolUse[1].hooks[0].command, "carrick hook search-nudge");
   // The user's own session-start script survives, with ours after it.
-  assert.equal(written.hooks.SessionStart.length, 2);
+  assert.equal(written.hooks.SessionStart.length, 3);
   assert.equal(written.hooks.SessionStart[0].hooks[0].command, "./my-own-start.sh");
   assert.equal(written.hooks.SessionStart[1].hooks[0].command, "carrick hook session-start");
+  assert.equal(written.hooks.SessionStart[2].hooks[0].command, "carrick hook orient");
   assert.equal(written.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
   // The Read hook (carrick#2069) is its own group beside the Edit one.
   assert.equal(written.hooks.PostToolUse[0].matcher, "Write|Edit|MultiEdit");
@@ -494,11 +495,12 @@ test("the hook entries land beside everything else the settings file holds", () 
 });
 
 // carrick#2854: the hosted scaffold's hook pack wires the same session-start
-// message init does, so a session got it twice. Init replaces the pack's
-// session-start entry (the exact `$CLAUDE_PROJECT_DIR/.claude/session-start.sh`
-// command the scaffold writes) and keeps the pack's prompt reminder and search
-// nudge, which init has nothing in place of, and every entry of the user's.
-test("init replaces the scaffold's session-start entry and keeps its nudges and the user's own", () => {
+// message init does, so a session got it twice. Init replaces the whole pack
+// (its three scripts, by their exact `$CLAUDE_PROJECT_DIR/.claude/<name>.sh`
+// commands) with its own entries (the orient, first-prompt and search-nudge
+// hooks stand where the pack's reminder and gate did), and keeps every entry of
+// the user's.
+test("init replaces the scaffold's whole hook pack and keeps the user's own", () => {
   const pack = (name: string) => ({ type: "command", command: `"$CLAUDE_PROJECT_DIR/.claude/${name}.sh"` });
   const scaffolded = JSON.stringify(
     {
@@ -521,21 +523,17 @@ test("init replaces the scaffold's session-start entry and keeps its nudges and 
   );
   const merged = mergeCarrickHooks(scaffolded);
   const written = JSON.parse(merged.body);
+  const commands = (groups: Array<{ hooks: Array<{ command: string }> }>) => groups.map((group) => group.hooks[0]!.command);
   assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
-  assert.deepEqual(
-    written.hooks.SessionStart.map((group: { hooks: Array<{ command: string }> }) => group.hooks[0]!.command),
-    ["carrick hook session-start"],
-    "one session-start message",
-  );
-  assert.deepEqual(written.hooks.UserPromptSubmit, [{ hooks: [pack("turn-reminder")] }]);
-  assert.deepEqual(written.hooks.PreToolUse, [
-    { matcher: "Grep", hooks: [pack("search-gate")] },
-    { matcher: "Bash", hooks: [pack("search-gate")] },
-    { matcher: "Bash", hooks: [{ type: "command", command: "./guard.sh" }] },
-  ]);
+  assert.deepEqual(commands(written.hooks.SessionStart), ["carrick hook session-start", "carrick hook orient"]);
+  assert.deepEqual(commands(written.hooks.UserPromptSubmit), ["carrick hook first-prompt"]);
+  assert.deepEqual(commands(written.hooks.PreToolUse), ["./guard.sh", "carrick hook search-nudge"]);
   assert.equal(written.hooks.Stop.length, 2);
   assert.equal(written.hooks.Stop[0].hooks[0].command, '"$CLAUDE_PROJECT_DIR/.claude/notify.sh"');
-  assert.equal(JSON.stringify(written).includes("session-start.sh"), false);
+  const text = JSON.stringify(written);
+  for (const gone of ["session-start.sh", "turn-reminder.sh", "search-gate.sh"]) {
+    assert.equal(text.includes(gone), false, `${gone} is still wired`);
+  }
   // Settled: a second run changes nothing.
   assert.equal(mergeCarrickHooks(merged.body).changed, false);
   // `carrick remove` is not a replacement: the pack's entries stay for their owner.
@@ -623,7 +621,7 @@ test("an absolute hook command is written, and is still recognised as ours", () 
   assert.equal(rewritten.hooks.PostToolUse.length, 2);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks.length, 1);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
-  assert.equal(rewritten.hooks.SessionStart.length, 1);
+  assert.equal(rewritten.hooks.SessionStart.length, 2, "session-start and orient, once each");
 });
 
 test("a quoted absolute hook command is ours too, and a lookalike is not", () => {
@@ -1143,9 +1141,9 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
       assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
       // A repo already in the project is not a project to look up or create.
       assert.doesNotMatch(result.stdout, /Projects in this workspace/);
-      // Setup ends where the dashboard's checklist ends: one sentence naming
-      // the scaffold tool, which carries the instructions (cloud#832).
-      assert.ok(result.stdout.includes(scaffoldFor("acme/api")), result.stdout);
+      // Setup ends with the one line naming the repos that are not set up for
+      // scanning yet.
+      assert.ok(result.stdout.includes(setupFor("acme/api")), result.stdout);
       // `claude` is on PATH and has never run under this home, so there is
       // no ~/.claude: it is still set up, by its own command, and nothing
       // says no agent client was found (carrick#1489). The entry carries
@@ -1258,11 +1256,10 @@ test("the executable CLI reads the hosted index onto an indexed repo and names t
     // is this command's, and `carrick index` stays the only scan in the flow
     // (carrick#1008, cloud#832).
     assert.doesNotMatch(result.stdout, /carrick refresh/);
-    // Both branches end on the same sentence: whether a scan runs at all is
-    // the scaffold tool's to state, from the repo it is asked about
-    // (cloud#832), so the terminal carries no second copy of it.
-    assert.ok(result.stdout.trimEnd().endsWith(scaffoldFor("acme/api")), result.stdout);
-    assert.ok(result.stdout.includes(scaffoldFor("acme/api")), result.stdout);
+    // Both branches end on the same sentence: the repo is not set up for
+    // scanning yet, and the page that says how.
+    assert.ok(result.stdout.trimEnd().endsWith(setupFor("acme/api")), result.stdout);
+    assert.ok(result.stdout.includes(setupFor("acme/api")), result.stdout);
     assert.doesNotMatch(result.stdout, /is connected and has no hosted index yet/);
   } finally {
     fixture.cleanup();
@@ -1405,7 +1402,7 @@ test("a hosted read that fails leaves the setup written and says what went wrong
     );
     // A refusal does not end the run: the rest of the setup is written, and
     // the closing block is the one every other branch ends on.
-    assert.ok(result.stdout.trimEnd().endsWith(scaffoldFor("acme/api")), result.stdout);
+    assert.ok(result.stdout.trimEnd().endsWith(setupFor("acme/api")), result.stdout);
     assert.equal(fs.existsSync(path.join(fixture.repo, PROPOSAL_FILE)), true);
   } finally {
     fixture.cleanup();
@@ -1466,10 +1463,11 @@ test("a first init writes the proposal, its ignore file, the hook settings, the 
         ...taskSkillPaths(),
       ].sort(),
     );
-    assert.equal(
-      fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8").includes("run `carrick check --changed`"),
-      true,
-    );
+    const agents = fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8");
+    assert.equal(agents.includes("run `carrick check --changed`"), true);
+    // And the rules block after it, scoped to the project the run chose.
+    assert.equal(agents.includes("<!-- carrick:rules start -->"), true);
+    assert.match(agents, /Pass `project: "payments"`/);
 
     // The proposal is the whole derivation, including the config it would once
     // have written into the tree.
@@ -1493,19 +1491,17 @@ test("a first init writes the proposal, its ignore file, the hook settings, the 
     // step between them. No "Restart Claude Code" line: the block says a NEW
     // agent session, which is the one that loads the server (carrick#1512).
     assert.equal(
-      result.stdout.trimEnd().split("\n").slice(-5).join("\n"),
+      result.stdout.trimEnd().split("\n").slice(-3).join("\n"),
       [
         "◇ Set up in project payments: repo",
         "▲ Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.",
-        "",
-        "Next: paste this into a new agent session",
-        `  ${scaffoldFor("acme/api")}`,
+        `▲ ${setupFor("acme/api")}`,
       ].join("\n"),
       result.stdout,
     );
     assert.doesNotMatch(result.stdout, /Restart Claude Code/);
     // The quickstart carries what left the terminal, and none of it is printed.
-    assert.doesNotMatch(result.stdout, /--plugin-dir|--install-extension|carrick templates workflow|docs\.carrick\.tools\/carrick-json/);
+    assert.doesNotMatch(result.stdout, /--plugin-dir|--install-extension|docs\.carrick\.tools\/carrick-json/);
   } finally {
     fixture.cleanup();
   }
@@ -2368,14 +2364,10 @@ for (const claims of ["adopts", "before-1359"] as const) {
       // Part 4: one line for what is set up — the project and its repos —
       // the to-dos, then the prompt; part 5: the install leads it.
       assert.ok(out.lines.includes("◇ Set up in project Acme (acme): acme-api"), said);
-      assert.equal(
-        out.lines.at(-1),
-        [
-          "Next: paste this into a new agent session",
-          "First install dependencies: run `npm install`.",
-          scaffoldFor("acme/acme-api"),
-        ].join("\n"),
-      );
+      assert.deepEqual(out.lines.slice(-2), [
+        `▲ ${setupFor("acme/acme-api")}`,
+        "▲ Dependencies are not installed. Run `npm install` before the next scan.",
+      ]);
       assert.doesNotMatch(said, /slug|No agent client|Docs:|Restart Claude Code/);
     } finally {
       fixture.restore();
@@ -2404,7 +2396,7 @@ test("a workspace read that fails after the yes leaves the setup written and exi
       ),
       out.lines.join("\n"),
     );
-    assert.equal(out.lines.at(-1)?.startsWith("Next: paste this into a new agent session"), true, out.lines.join("\n"));
+    assert.ok(out.lines.includes(`▲ ${setupFor("acme/acme-api")}`), out.lines.join("\n"));
   } finally {
     fixture.restore();
   }
@@ -2417,7 +2409,7 @@ test("the plain rendering is one line per thing, with no colour and no box", () 
   out.warn("Hosted index is older than this CLI");
   out.refuse("Hosted index could not be read into .carrick/: no reason");
   out.say("Connect repositories in your browser: https://app.carrick.tools/repos");
-  out.note("Next: paste this to your agent", [scaffoldFor("acme/api")]);
+  out.note("Next: paste this to your agent", [setupFor("acme/api")]);
   assert.deepEqual(written.join("").split("\n"), [
     "◇ Repo acme/api connected",
     "▲ Hosted index is older than this CLI",
@@ -2425,7 +2417,7 @@ test("the plain rendering is one line per thing, with no colour and no box", () 
     "Connect repositories in your browser: https://app.carrick.tools/repos",
     "",
     "Next: paste this to your agent",
-    `  ${scaffoldFor("acme/api")}`,
+    `  ${setupFor("acme/api")}`,
     "",
     "",
   ]);
@@ -3010,7 +3002,7 @@ test("the picker preselects the connected repos of the majority project, and say
 // its config and its workflow is already set up, and telling an agent to
 // scaffold it again is what the run did on a folder where every repo was
 // (carrick#1365).
-test("only a repo missing its config or its workflow is sent to the scaffold tool", () => {
+test("only a repo missing its config or its workflow is named as not set up", () => {
   const repo = (name: string) => ({ path: `/w/${name}`, name: `acme/${name}`, remote: null, problem: null });
   const repos = ["api", "web", "jobs", "docs", "site"].map(repo);
   const present = new Set([
@@ -3018,25 +3010,20 @@ test("only a repo missing its config or its workflow is sent to the scaffold too
     `/w/api/${TEMPLATE_PATHS.workflow}`,
     "/w/web/carrick.json",
   ]);
-  const owed = reposToScaffold(repos, (target) => present.has(target));
+  const owed = reposWithoutSetup(repos, (target: string) => present.has(target));
   assert.deepEqual(owed.map((entry) => entry.name), ["acme/web", "acme/jobs", "acme/docs", "acme/site"]);
-  assert.deepEqual(reposToScaffold([repos[0]!], (target) => present.has(target)), []);
+  assert.deepEqual(reposWithoutSetup([repos[0]!], (target: string) => present.has(target)), []);
 
-  // The owner/repo is the value of `repo`, so it is said once (carrick#1574).
+  const tail = "Each needs .github/workflows/carrick.yml (carrick templates workflow prints it) and a carrick.json written from .carrick/proposal.json: https://docs.carrick.tools/building-the-index";
+  assert.equal(setupWarning([repos[1]!]), `acme/web is not set up for scanning yet. ${tail}`);
   assert.equal(
-    scaffoldSentence([repos[1]!]),
-    "Run the carrick scaffold tool with `repo` set to acme/web, and follow what it returns.",
+    setupWarning(owed),
+    `acme/web, acme/jobs, acme/docs and 1 more are not set up for scanning yet. ${tail}`,
   );
-  // Several repos: carrick-cloud#1404 moves this to one `repos` call.
+  // A repo known here only by its folder is named by it.
   assert.equal(
-    scaffoldSentence(owed),
-    "Run the carrick scaffold tool for acme/web, acme/jobs, acme/docs and 1 more, once each, passing that repo's owner/repo as `repo`, and follow what it returns.",
-  );
-  // A repo known here only by its folder: the agent still has to find the
-  // owner/repo, and the sentence still asks it to.
-  assert.equal(
-    scaffoldSentence([{ path: "/w/local", name: null, remote: null, problem: "it has no origin remote" }]),
-    "Run the carrick scaffold tool for local, passing its owner/repo as `repo`, and follow what it returns.",
+    setupWarning([{ path: "/w/local", name: null, remote: null, problem: "it has no origin remote" }]),
+    `local is not set up for scanning yet. ${tail}`,
   );
 });
 
@@ -3396,18 +3383,13 @@ test("inside one repo, init asks which repos beside it belong with it, and a yes
       for (const skill of taskSkillPaths()) assert.ok(fs.existsSync(path.join(repo, skill)), skill);
       assert.equal(gitStatus(repo), "?? package.json\n", repo);
     }
-    // The agent is told where the proposal is, because it is not where the
-    // reader started.
+    // Both repos are named as not set up, in the one closing line.
     assert.equal(
       out.lines.at(-1),
-      [
-        "Next: paste this into a new agent session",
-        scaffoldSentence([
-          { path: fixture.app, name: "example-org/shop-app", remote: null, problem: null },
-          { path: fixture.api, name: "example-org/shop-api", remote: null, problem: null },
-        ]),
-        `The init folder is ${fixture.folder}.`,
-      ].join("\n"),
+      `▲ ${setupWarning([
+        { path: fixture.app, name: "example-org/shop-app", remote: null, problem: null },
+        { path: fixture.api, name: "example-org/shop-api", remote: null, problem: null },
+      ])}`,
     );
     assert.doesNotMatch(said, /Restart Claude Code|not on this machine/);
   } finally {
@@ -4069,7 +4051,7 @@ test("--local on that workspace is the run a laptop workspace gets, line for lin
   // A server that does not send the field: today's run.
   const laptop = await run(null, []);
   assert.ok(laptop.questions.includes("Go ahead?"), laptop.questions.join("\n"));
-  assert.match(laptop.text, /Next: paste this into a new agent session\nRun the carrick scaffold tool with `repo` set to acme\/api/);
+  assert.match(laptop.text, /▲ acme\/api is not set up for scanning yet\./);
   assert.deepEqual(laptop.asked, ["resolve-repos acme/api", "list-projects", "resolve-repos acme/api"]);
   // The flag on a workspace whose index Carrick builds, and the two values
   // that are not "cloud", one of them a word this build has never seen.
@@ -4249,5 +4231,61 @@ test("removing task skills deletes nothing through a link out of the harness fol
     assert.ok(deleted.some((p) => p.startsWith(".agents")));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("writesLine names a CLAUDE.md section only when one is written", () => {
+  const base = { workspaceFile: false, editorFiles: [], claudeCode: true, folder: null, home: "/home/dev" };
+  assert.equal(writesLine(base), writesLine({ ...base, claudeMd: false }));
+  assert.equal(
+    writesLine({ ...base, claudeMd: true }),
+    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, add a Carrick section to CLAUDE.md, and add Carrick's MCP server to Claude Code",
+  );
+});
+
+test("a first init writes the blocks into a CLAUDE.md that does not import AGENTS.md, and leaves one that does", posixNativeFixture, () => {
+  for (const imports of [false, true]) {
+    const fixture = executableInitFixture("payments", "absent", "monorepo");
+    try {
+      const claude = path.join(fixture.repo, "CLAUDE.md");
+      fs.writeFileSync(claude, imports ? "# Mine\n\n@AGENTS.md\n" : "# Mine\n\nrules\n");
+      const result = spawnSync(
+        process.execPath,
+        [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--yes", fixture.repo],
+        { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      const body = fs.readFileSync(claude, "utf8");
+      if (imports) {
+        assert.equal(body, "# Mine\n\n@AGENTS.md\n");
+      } else {
+        assert.ok(body.startsWith("# Mine\n\nrules\n\n"));
+        assert.ok(body.includes("<!-- carrick:check start -->") && body.includes("<!-- carrick:rules start -->"));
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+test("a first init leaves its rules out of a file with a Carrick section of its own, and says so", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "monorepo");
+  try {
+    fs.writeFileSync(path.join(fixture.repo, "AGENTS.md"), "# Mine\n\n## Carrick\n\nask first\n");
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const body = fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8");
+    assert.equal(body.includes("<!-- carrick:rules start -->"), false);
+    assert.ok(body.includes("<!-- carrick:check start -->"));
+    assert.ok(
+      result.stdout.includes("AGENTS.md already has a Carrick section of its own, so init left its rules out of that file."),
+      result.stdout,
+    );
+  } finally {
+    fixture.cleanup();
   }
 });

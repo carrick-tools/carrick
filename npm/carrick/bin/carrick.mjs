@@ -36,8 +36,11 @@ if (nodeMajor() < NODE_FLOOR) {
 }
 
 const HOOKS = {
+  "first-prompt": "../dist/hook/first-prompt.js",
+  orient: "../dist/hook/orient.js",
   "post-edit": "../dist/hook/post-edit.js",
   "post-read": "../dist/hook/post-read.js",
+  "search-nudge": "../dist/hook/search-nudge.js",
   "session-start": "../dist/hook/session-start.js",
   stop: "../dist/hook/stop.js",
   "user-prompt": "../dist/hook/user-prompt.js",
@@ -292,6 +295,12 @@ function extraHelp() {
     "    hook post-read               Claude Code PostToolUse hook for Read (who",
     "                                 depends on the file, once per file per session)",
     "    hook session-start           Claude Code SessionStart hook",
+    "    hook orient                  SessionStart hook for either host (one line:",
+    "                                 read the project map first)",
+    "    hook first-prompt            UserPromptSubmit hook for either host (one",
+    "                                 line, once per session)",
+    "    hook search-nudge            Claude Code PreToolUse hook for Grep and Bash",
+    "                                 (one line, first search of a session)",
     "    hook stop                    Claude Code Stop hook (one reuse nudge per",
     "                                 task, silent when the task added no function)",
     "    hook user-prompt             Codex UserPromptSubmit hook (the same nudge,",

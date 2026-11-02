@@ -291,6 +291,25 @@ the Claude ones, and only where the workspace holds a `.codex/` directory — th
 folder is Codex's project config layer and the one init writes into, so its
 absence means Codex is not set up here and doctor says nothing about it.
 
+## The orientation hooks and the rules block
+
+Three small hooks and one block of text send an agent to Carrick at the moment
+it needs it. Each is its own entry in the settings file, or its own marked
+block, so it can be removed alone. None reads the index.
+
+| Part | Governed code | What it does |
+|---|---|---|
+| `carrick hook orient` (Claude Code and Codex, `SessionStart`) | `npm/carrick/src/hook/orient.ts` | prints one line asking the agent to read the project map first, naming the project the task skills were written with. Silent when no task skill is installed |
+| `carrick hook first-prompt` (Claude Code and Codex, `UserPromptSubmit`) | `npm/carrick/src/hook/first-prompt.ts` | on the first prompt of a session, one line preferring one inline `search_by_intent` to a grep sweep or a search subagent |
+| `carrick hook search-nudge` (Claude Code, `PreToolUse` for `Grep` and `Bash`) | `npm/carrick/src/hook/search-nudge.ts`, `npm/carrick/src/hook/search-command.ts` | on the first search of a session, one line naming the index. Never blocks. Silent once the session has called a Carrick tool |
+| `carrick:rules` block in `AGENTS.md` (and `CLAUDE.md` where it does not import `AGENTS.md`) | `npm/carrick/src/init/agents-section.ts` | tells the agent which Carrick tool to call at which decision point, after the `carrick:check` block |
+
+All three print nothing under `CARRICK_CHANNEL=off`, and nothing where a
+committed `.claude/settings.json` still wires the hosted scaffold's script for
+the same job. `carrick init` replaces those three scripts' entries in a settings
+file it writes. A file with a hand-written `## Carrick` section keeps it and gets
+no rules block.
+
 ## Ordering against the cloud
 
 The bodies name MCP tools, and a skill that names a tool the deployed server

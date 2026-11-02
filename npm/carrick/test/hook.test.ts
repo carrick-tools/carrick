@@ -996,3 +996,263 @@ test("the lsp and off channels print nothing from a Read and write no session fi
   assert.equal(runCount(argvLog), 0);
   assert.equal(fs.existsSync(path.join(home, ".carrick", "sessions")), false);
 });
+
+// ---------------------------------------------------------------------------
+// The three activation levers: orient, first-prompt, search-nudge. Each is its
+// own hook so it can be dropped on its own.
+
+import { searchCommandIn } from "../src/hook/search-command.ts";
+import { renderTaskSkill, skillFile, SKILL_ROOTS } from "../src/init/task-skills.ts";
+
+/** A workspace that holds the task skills, written with a project slug. */
+function skilledWorkspace(t: { after: (fn: () => void) => void }, slug: string | null = "acme-index") {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const target = path.join(workspace.root, skillFile(SKILL_ROOTS[0]!, "carrick-impact"));
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, renderTaskSkill("carrick-impact", { slug }));
+  return workspace;
+}
+
+function additionalContext(stdout: string, event: string): string {
+  const parsed = JSON.parse(stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+  assert.deepEqual(Object.keys(parsed), ["hookSpecificOutput"]);
+  assert.equal(parsed.hookSpecificOutput.hookEventName, event);
+  return parsed.hookSpecificOutput.additionalContext;
+}
+
+test("orient names the project map call with the slug the task skills were written with", async (t) => {
+  const workspace = skilledWorkspace(t);
+  const run = await runHook("orient.ts", {
+    cwd: workspace.root,
+    payload: { hook_event_name: "SessionStart", session_id: "o-1" },
+    env: fakeEnv({ CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.equal(run.code, 0);
+  const line = additionalContext(run.stdout, "SessionStart");
+  assert.match(line, /call mcp__carrick__get_project_map with project: "acme-index" and service set to the repo or service you are working in\./);
+  assert.match(line, /^Your working directory is on disk and holds the code this session is about; `ls` it first, then read the repo you are asked about\./);
+  assert.doesNotMatch(line, /carrick\.json/);
+});
+
+test("orient names the repo form where the skills were written without a project", async (t) => {
+  const workspace = skilledWorkspace(t, null);
+  const run = await runHook("orient.ts", {
+    cwd: workspace.root,
+    payload: { hook_event_name: "SessionStart" },
+    env: fakeEnv({ CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.match(additionalContext(run.stdout, "SessionStart"), /repo: "<owner\/repo>" and service set to/);
+});
+
+test("orient is silent when the channel is off, with no task skill, and with the old pack wired", async (t) => {
+  const workspace = skilledWorkspace(t);
+  const off = await runHook("orient.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CLAUDE_PROJECT_DIR: workspace.root, CARRICK_CHANNEL: "off" }),
+  });
+  assert.equal(off.stdout, "");
+
+  const bare = makeWorkspace();
+  t.after(() => bare.cleanup());
+  const none = await runHook("orient.ts", { cwd: bare.root, env: fakeEnv({ CLAUDE_PROJECT_DIR: bare.root }) });
+  assert.equal(none.code, 0);
+  assert.equal(none.stdout, "");
+
+  fs.mkdirSync(path.join(workspace.root, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(workspace.root, ".claude", "settings.json"),
+    JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: "$CLAUDE_PROJECT_DIR/.claude/session-start.sh" }] }] } }),
+  );
+  const packed = await runHook("orient.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.equal(packed.stdout, "");
+});
+
+test("first-prompt speaks once per session id and is silent the second time", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CLAUDE_PROJECT_DIR: workspace.root });
+  const payload = { hook_event_name: "UserPromptSubmit", session_id: "fp-1", cwd: workspace.root };
+
+  const first = await runHook("first-prompt.ts", { cwd: workspace.root, payload, env });
+  assert.equal(first.code, 0);
+  assert.equal(
+    additionalContext(first.stdout, "UserPromptSubmit"),
+    "Prefer one inline mcp__carrick__search_by_intent call over a grep sweep or a search subagent: describe the behaviour in plain English and it answers in one call, covering every repo in this project rather than only this one.",
+  );
+  const second = await runHook("first-prompt.ts", { cwd: workspace.root, payload, env });
+  assert.equal(second.stdout, "");
+  const other = await runHook("first-prompt.ts", {
+    cwd: workspace.root,
+    payload: { ...payload, session_id: "fp-2" },
+    env,
+  });
+  assert.match(other.stdout, /search_by_intent/);
+});
+
+test("first-prompt is silent when off, with no session id, and with the old reminder wired", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const payload = { hook_event_name: "UserPromptSubmit", session_id: "fp-3", cwd: workspace.root };
+
+  const off = await runHook("first-prompt.ts", {
+    cwd: workspace.root,
+    payload,
+    env: fakeEnv({ HOME: home, CARRICK_CHANNEL: "off", CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.equal(off.stdout, "");
+  const noId = await runHook("first-prompt.ts", {
+    cwd: workspace.root,
+    payload: { hook_event_name: "UserPromptSubmit" },
+    env: fakeEnv({ HOME: home, CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.equal(noId.stdout, "");
+
+  fs.mkdirSync(path.join(workspace.root, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(workspace.root, ".claude", "settings.json"),
+    JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "$CLAUDE_PROJECT_DIR/.claude/turn-reminder.sh" }] }] } }),
+  );
+  const packed = await runHook("first-prompt.ts", {
+    cwd: workspace.root,
+    payload,
+    env: fakeEnv({ HOME: home, CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.equal(packed.stdout, "");
+});
+
+test("searchCommandIn reads the command each segment runs, not the words around it", () => {
+  assert.equal(searchCommandIn("echo 'grep x'"), false);
+  assert.equal(searchCommandIn('echo "grep x" | cat'), false);
+  assert.equal(searchCommandIn("cd a && rg -n foo src"), true);
+  assert.equal(searchCommandIn("git grep foo"), true);
+  assert.equal(searchCommandIn("git log --oneline"), false);
+  assert.equal(searchCommandIn("cat <<EOF\ngrep x\nEOF"), false);
+  assert.equal(searchCommandIn("cat <<-'EOF'\n\tgrep x\n\tEOF\nls"), false);
+  assert.equal(searchCommandIn("cat <<EOF\nhello\nEOF\nrg foo"), true);
+  assert.equal(searchCommandIn("FOO=1 sudo /usr/bin/grep -r x ."), true);
+  assert.equal(searchCommandIn("find . -name '*.ts'"), true);
+  assert.equal(searchCommandIn("ls | xargs grep foo"), true);
+  assert.equal(searchCommandIn("cat <<< grep"), false);
+  assert.equal(searchCommandIn("npm test"), false);
+  assert.equal(searchCommandIn(""), false);
+});
+
+test("search-nudge: Grep nudges once, then stays silent for the session", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CLAUDE_PROJECT_DIR: workspace.root });
+  const payload = { hook_event_name: "PreToolUse", tool_name: "Grep", session_id: "sn-1", tool_input: { pattern: "x" }, cwd: workspace.root };
+
+  const first = await runHook("search-nudge.ts", { cwd: workspace.root, payload, env });
+  assert.equal(first.code, 0);
+  const wire = JSON.parse(first.stdout) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(wire), ["hookSpecificOutput"], "never a permissionDecision");
+  assert.equal(
+    additionalContext(first.stdout, "PreToolUse"),
+    "Carrick has an index of this workspace. For a helper, an endpoint, a consumer or a type that lives elsewhere, `search_by_intent` and the other Carrick tools answer what grep cannot; grep to confirm a location.",
+  );
+  const second = await runHook("search-nudge.ts", { cwd: workspace.root, payload, env });
+  assert.equal(second.stdout, "");
+});
+
+test("search-nudge: only a Bash command that searches counts", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CLAUDE_PROJECT_DIR: workspace.root });
+  const bash = (session: string, command: string) => ({
+    hook_event_name: "PreToolUse",
+    tool_name: "Bash",
+    session_id: session,
+    tool_input: { command },
+    cwd: workspace.root,
+  });
+
+  const echoed = await runHook("search-nudge.ts", { cwd: workspace.root, payload: bash("sn-2", "echo 'grep x'"), env });
+  assert.equal(echoed.stdout, "");
+  const heredoc = await runHook("search-nudge.ts", { cwd: workspace.root, payload: bash("sn-2", "cat <<EOF\ngrep x\nEOF"), env });
+  assert.equal(heredoc.stdout, "");
+  const chained = await runHook("search-nudge.ts", { cwd: workspace.root, payload: bash("sn-2", "cd a && rg -n foo src"), env });
+  assert.match(chained.stdout, /search_by_intent/);
+  const gitGrep = await runHook("search-nudge.ts", { cwd: workspace.root, payload: bash("sn-3", "git grep foo"), env });
+  assert.match(gitGrep.stdout, /search_by_intent/);
+  const edit = await runHook("search-nudge.ts", {
+    cwd: workspace.root,
+    payload: { hook_event_name: "PreToolUse", tool_name: "Read", session_id: "sn-4", tool_input: {} },
+    env,
+  });
+  assert.equal(edit.stdout, "");
+});
+
+test("search-nudge is silent once the transcript shows a Carrick tool call, and marks the session", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CLAUDE_PROJECT_DIR: workspace.root });
+  const transcript = path.join(home, "transcript.jsonl");
+  fs.writeFileSync(transcript, '{"type":"assistant","content":[{"type":"tool_use","name":"mcp__carrick__get_project_map","input":{}}]}\n');
+  const payload = { hook_event_name: "PreToolUse", tool_name: "Grep", session_id: "sn-5", transcript_path: transcript, tool_input: {} };
+  const run = await runHook("search-nudge.ts", { cwd: workspace.root, payload, env });
+  assert.equal(run.stdout, "");
+  // Prose that merely names the namespace is not a call.
+  const prose = path.join(home, "prose.jsonl");
+  fs.writeFileSync(prose, '{"text":"call mcp__carrick__get_project_map first"}\n');
+  const named = await runHook("search-nudge.ts", {
+    cwd: workspace.root,
+    payload: { ...payload, session_id: "sn-6", transcript_path: prose },
+    env,
+  });
+  assert.match(named.stdout, /search_by_intent/);
+});
+
+test("search-nudge is silent when off and with the old gate wired", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const payload = { hook_event_name: "PreToolUse", tool_name: "Grep", session_id: "sn-7", tool_input: {}, cwd: workspace.root };
+  const off = await runHook("search-nudge.ts", {
+    cwd: workspace.root,
+    payload,
+    env: fakeEnv({ HOME: home, CARRICK_CHANNEL: "off", CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.equal(off.stdout, "");
+  fs.mkdirSync(path.join(workspace.root, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(workspace.root, ".claude", "settings.json"),
+    JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Grep|Bash", hooks: [{ type: "command", command: "$CLAUDE_PROJECT_DIR/.claude/search-gate.sh" }] }] } }),
+  );
+  const packed = await runHook("search-nudge.ts", {
+    cwd: workspace.root,
+    payload,
+    env: fakeEnv({ HOME: home, CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.equal(packed.stdout, "");
+});
+
+test("the three lever hooks fit the 300 ms budget", async (t) => {
+  const workspace = skilledWorkspace(t);
+  const home = fakeHome(t);
+  for (const [script, payload] of [
+    ["orient.ts", { hook_event_name: "SessionStart" }],
+    ["first-prompt.ts", { hook_event_name: "UserPromptSubmit", session_id: "b-1" }],
+    ["search-nudge.ts", { hook_event_name: "PreToolUse", tool_name: "Grep", session_id: "b-2", tool_input: {} }],
+  ] as const) {
+    const run = await runHook(script, {
+      cwd: workspace.root,
+      payload,
+      env: fakeEnv({ HOME: home, CLAUDE_PROJECT_DIR: workspace.root, CARRICK_LOG_QUIET: "0" }),
+      nodeArgs: [`--import=${path.join(testDir, "cpu-usage.mjs")}`],
+    });
+    assert.match(run.stdout, /additionalContext/, `${script} printed nothing`);
+    const cpu = /carrick-test-cpu-ms=(\d+)/.exec(run.stderr);
+    assert.ok(cpu, `${script} reported no CPU time: ${run.stderr}`);
+    assert.ok(Number(cpu[1]) < 300, `${script} used ${cpu[1]}ms of CPU`);
+  }
+});
