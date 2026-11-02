@@ -978,6 +978,43 @@ fn a_host_made_through_the_other_export_still_joins_the_plugins_routes() {
     );
 }
 
+/// carrick#3207, the mount-edge gate: a child app and its parent are both
+/// made through the server package's `default` export while the store labels
+/// the mounting member (`mount`) on the named export alone. The mount edge is
+/// still read, so the child's route takes the parent's prefix as a
+/// `library_claim` row.
+#[test]
+fn a_mount_on_an_app_made_through_the_other_export_still_prefixes_the_child() {
+    let (on, _) = scan_fixture_reading("receiver-scopes-default-export-mount", true, Some("1"));
+    let (graph, _) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            "src/index.ts:10 GET /health library_claim app",
+            // The mock answer's row for the mount call itself, as with the
+            // named export.
+            "src/index.ts:11 GET /v1/users inline_literal app",
+            // Without the mount edge the child's route is not read at all.
+            "src/index.ts:8 GET /v1/users/list library_claim users",
+        ]
+    );
+}
+
+/// carrick#3207, the adapter-mount gate: the app a procedure router's
+/// middleware adapter is mounted on is made through the web package's
+/// `default` export while the store labels `use` on the named export alone.
+/// The adapter mount is still read, so the router's procedures are served
+/// under its prefix.
+#[test]
+fn an_adapter_mounted_on_an_app_made_through_the_other_export_serves_the_router() {
+    let (on, _) = scan_fixture_reading("procedure-router-default-export", true, Some("1"));
+    let (graph, _) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec!["src/router.ts:4 GET /rpc/ping library_claim appRouter"]
+    );
+}
+
 /// Each service's `routes_*` counts, as `service key=count`.
 fn route_counts(fallbacks: &Fallbacks) -> Vec<String> {
     let mut out = Vec::new();
