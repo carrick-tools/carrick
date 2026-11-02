@@ -1122,8 +1122,15 @@ export class TypeInferrer {
     if (!LOOP_ROW_KINDS.has(request.infer_kind)) return undefined;
     const sourceFile = this.getSourceFile(request.file_path);
     if (!sourceFile) return undefined;
-    const atLine = this.registrationAtLine(sourceFile, request.line_number);
-    return atLine ? loopElementPick(atLine.registration, request.route_path) : undefined;
+    // Every call on the line, outermost first: on `LIST.forEach((x) =>
+    // app.get(…))` the loop's own call is the line's first registration-shaped
+    // call, and the registration is inside it.
+    for (const entry of descendantsOnLine(sourceFile, request.line_number)) {
+      if (entry.kind !== SyntaxKind.CallExpression) continue;
+      const pick = loopElementPick(wrap(sourceFile, entry), request.route_path);
+      if (pick) return pick;
+    }
+    return undefined;
   }
 
   /**
