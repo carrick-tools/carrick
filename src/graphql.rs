@@ -918,23 +918,9 @@ fn tracked_source_files(repo_root: &Path) -> Option<Vec<PathBuf>> {
             if !repo_root.is_dir() {
                 return None;
             }
-            WalkDir::new(repo_root)
-                .sort_by_file_name()
-                .into_iter()
-                .filter_entry(|e| {
-                    e.depth() == 0
-                        || !e
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|name| name == ".git" || name == "node_modules")
-                            && crate::file_finder::git_boundary(e).is_none()
-                })
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry.file_type().is_file()
-                        && crate::file_finder::has_source_extension(entry.path())
-                })
-                .map(|entry| repo_relative(repo_root, entry.path()))
+            files_on_disk(repo_root, crate::file_finder::has_source_extension)
+                .iter()
+                .map(|path| repo_relative(repo_root, path))
                 .collect()
         }
     };
@@ -998,12 +984,17 @@ fn repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
         .collect()
 }
 
-/// Every GraphQL file on disk under `repo_root`, skipping `.git`, dependency
-/// folders and checkouts of their own
+/// Every GraphQL file on disk under `repo_root` ([`files_on_disk`]).
+fn graphql_files_on_disk(repo_root: &Path) -> Vec<PathBuf> {
+    files_on_disk(repo_root, is_graphql_file)
+}
+
+/// Every file on disk under `repo_root` that `keep` accepts, skipping `.git`,
+/// dependency folders and checkouts of their own
 /// ([`crate::file_finder::git_boundary`]): the fallback when git cannot say
 /// what is tracked. Build folders are walked, because a committed printed
 /// schema usually sits in one.
-fn graphql_files_on_disk(repo_root: &Path) -> Vec<PathBuf> {
+fn files_on_disk(repo_root: &Path, keep: fn(&Path) -> bool) -> Vec<PathBuf> {
     WalkDir::new(repo_root)
         .sort_by_file_name()
         .into_iter()
@@ -1016,7 +1007,7 @@ fn graphql_files_on_disk(repo_root: &Path) -> Vec<PathBuf> {
                     && crate::file_finder::git_boundary(e).is_none()
         })
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file() && is_graphql_file(entry.path()))
+        .filter(|entry| entry.file_type().is_file() && keep(entry.path()))
         .map(|entry| entry.path().to_path_buf())
         .collect()
 }
