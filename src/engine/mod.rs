@@ -7258,7 +7258,9 @@ fn withdraw_model_routes_at_definitions(
 /// code writes in no whole way ([`crate::site_rows::GuessedRoute`]; ruling
 /// on PR #3182, 2026-11-02): a row the model stated of the site's method at
 /// its line guesses at a value only the running program knows, so it is no
-/// route, and the site stays a possible call. A row of another method, or
+/// route, and the site stays a possible call. A path that writes its first
+/// segment whole before the value is no guessed site (carrick#3237). A row
+/// of another method, or
 /// one a pass, the documentation or a declaration stated, keeps its place.
 /// Returns how many rows it withdrew.
 fn withdraw_guessed_routes(
