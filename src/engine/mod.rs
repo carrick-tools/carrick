@@ -8156,6 +8156,13 @@ struct LibrarySiteIndex {
         crate::operation::SocketDirection,
         bool,
     )>,
+    /// The pub/sub rows whose name is global with no namespace, sorted by
+    /// file, line and name: the rows a type-manifest entry anchors
+    /// (carrick#3089). The type check pairs non-HTTP entries by key alone
+    /// (`type_compat_v2::build_check_pairs`), so a service-scoped or
+    /// namespaced row's entry could be judged in a pair the matcher never
+    /// makes; those rows get none.
+    global_pubsub: Vec<(PathBuf, u32, String, crate::operation::PubsubRole)>,
 }
 
 impl LibrarySiteIndex {
@@ -8172,6 +8179,13 @@ impl LibrarySiteIndex {
                 .insert((file.clone(), row.line, row.name.clone()));
             match row.kind {
                 LibraryRowKind::Pubsub(role) => {
+                    if row.name_scope.scope == crate::services::type_sidecar::NameScopeKind::Global
+                        && row.name_scope.namespace.is_none()
+                    {
+                        index
+                            .global_pubsub
+                            .push((file.clone(), row.line, row.name.clone(), role));
+                    }
                     index
                         .pubsub
                         .insert((file, row.line, row.name.clone(), role));
@@ -8186,6 +8200,21 @@ impl LibrarySiteIndex {
                 }
             }
         }
+        index.global_pubsub.sort_by(|a, b| {
+            (
+                &a.0,
+                a.1,
+                &a.2,
+                a.3 == crate::operation::PubsubRole::Publisher,
+            )
+                .cmp(&(
+                    &b.0,
+                    b.1,
+                    &b.2,
+                    b.3 == crate::operation::PubsubRole::Publisher,
+                ))
+        });
+        index.global_pubsub.dedup();
         index
     }
 
@@ -8768,6 +8797,55 @@ fn append_pubsub_manifest_entries(
                 call_id.as_deref(),
             );
         }
+    }
+
+    // The library rows (carrick#3089): each global, un-namespaced row gets
+    // the entry the model's op at its site would have had, keyed and
+    // site-id'd the same way, so the two never both exist for one call. The
+    // fact layer's slot types it; a symbol the folded model op names is its
+    // request when no slot does (the op's symbol request is already sent at
+    // this alias by `collect_pubsub_type_requests`).
+    let mut folded_symbols: HashMap<(PathBuf, u32, String, PubsubRole), String> = HashMap::new();
+    for (path, result) in file_results {
+        for op in &result.pubsub_operations {
+            let (Some(role), Some(symbol)) = (op.role, op.primary_type_symbol.as_ref()) else {
+                continue;
+            };
+            let line = u32::try_from(op.line_number).unwrap_or(0);
+            folded_symbols
+                .entry((
+                    library.relative(Path::new(path)),
+                    line,
+                    op.topic.clone(),
+                    role,
+                ))
+                .or_insert_with(|| symbol.clone());
+        }
+    }
+    for (file, line, name, pubsub_role) in &library.global_pubsub {
+        let role = match pubsub_role {
+            PubsubRole::Subscriber => ManifestRole::Producer,
+            PubsubRole::Publisher => ManifestRole::Consumer,
+        };
+        let key = OperationKey::pubsub(name.clone());
+        let file_path = file.to_string_lossy();
+        let anchor_line = (*line).max(1);
+        let call_id = match role {
+            ManifestRole::Consumer => Some(build_site_id(&file_path, anchor_line, &key, repo_root)),
+            ManifestRole::Producer => None,
+        };
+        let symbol = folded_symbols
+            .get(&(file.clone(), *line, name.clone(), *pubsub_role))
+            .cloned();
+        add_protocol_manifest_entry(
+            entries,
+            &key,
+            role,
+            &file_path,
+            anchor_line,
+            symbol,
+            call_id.as_deref(),
+        );
     }
 }
 
@@ -29387,6 +29465,201 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
         assert_eq!(manifest_alias, expected);
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// A library pub/sub row at `file:line` whose name is global, in
+    /// `namespace` (carrick#3089).
+    fn global_pubsub_row(
+        file: &str,
+        line: u32,
+        name: &str,
+        role: crate::operation::PubsubRole,
+        namespace: Option<&str>,
+    ) -> crate::library_claims::LibraryRow {
+        crate::library_claims::LibraryRow {
+            name_scope: crate::services::type_sidecar::NameScope {
+                scope: crate::services::type_sidecar::NameScopeKind::Global,
+                namespace: namespace.map(String::from),
+            },
+            ..library_row(
+                file,
+                line,
+                name,
+                crate::library_claims::LibraryRowKind::Pubsub(role),
+            )
+        }
+    }
+
+    fn pubsub_entries_for(
+        rows: Vec<crate::library_claims::LibraryRow>,
+        file_results: &HashMap<String, FileAnalysisResult>,
+    ) -> Vec<TypeManifestEntry> {
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(
+            &mut entries,
+            file_results,
+            &socket_sites::SocketSites::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::of(&crate::library_claims::LibraryRows { rows }, "/repo"),
+            "/repo",
+        );
+        entries
+    }
+
+    /// carrick#3089: a global library row with no model op at its site gets
+    /// one entry, a publisher's site-id'd as `build_site_id` spells it and a
+    /// subscriber's plain; a service-scoped or namespaced row gets none.
+    #[test]
+    fn a_global_library_pubsub_row_gets_one_manifest_entry() {
+        use crate::operation::PubsubRole;
+
+        let entries = pubsub_entries_for(
+            vec![
+                global_pubsub_row(
+                    "/repo/src/jobs.ts",
+                    6,
+                    "jobs.created",
+                    PubsubRole::Publisher,
+                    None,
+                ),
+                global_pubsub_row(
+                    "/repo/src/jobs.ts",
+                    10,
+                    "jobs.done",
+                    PubsubRole::Subscriber,
+                    None,
+                ),
+                global_pubsub_row(
+                    "/repo/src/jobs.ts",
+                    12,
+                    "jobs.scoped",
+                    PubsubRole::Subscriber,
+                    Some("queue"),
+                ),
+                library_row(
+                    "/repo/src/jobs.ts",
+                    14,
+                    "jobs.local",
+                    crate::library_claims::LibraryRowKind::Pubsub(PubsubRole::Publisher),
+                ),
+            ],
+            &HashMap::new(),
+        );
+        let found: Vec<(String, ManifestRole, &str, u32, Option<&str>)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key.canonical(),
+                    entry.role,
+                    entry.file_path.as_str(),
+                    entry.line_number,
+                    entry.primary_type_symbol.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "pubsub|jobs.created".to_string(),
+                    ManifestRole::Consumer,
+                    "src/jobs.ts",
+                    6,
+                    None
+                ),
+                (
+                    "pubsub|jobs.done".to_string(),
+                    ManifestRole::Producer,
+                    "src/jobs.ts",
+                    10,
+                    None
+                ),
+            ]
+        );
+        let created = OperationKey::pubsub("jobs.created");
+        assert_eq!(
+            entries[0].type_alias,
+            crate::type_manifest::build_manifest_type_alias_with_site_id(
+                &created,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                Some(&build_site_id("src/jobs.ts", 6, &created, "/repo")),
+            )
+        );
+        assert_eq!(
+            entries[1].type_alias,
+            crate::type_manifest::build_manifest_type_alias(
+                &OperationKey::pubsub("jobs.done"),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            )
+        );
+    }
+
+    /// carrick#3089 T2: the model op folded into a global library row lends
+    /// the row's entry its symbol, and the symbol request the op already
+    /// sends carries the entry's alias; a model op at no library row stands
+    /// as before.
+    #[test]
+    fn a_folded_model_op_s_symbol_types_the_library_row_s_entry() {
+        use crate::operation::PubsubRole;
+
+        let mut named = pubsub_op("jobs.named", PubsubRole::Publisher, Some("Job"), None);
+        named.line_number = 17;
+        let mut alone = pubsub_op("jobs.other", PubsubRole::Publisher, Some("Other"), None);
+        alone.line_number = 20;
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "/repo/src/jobs.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![named, alone],
+                ..Default::default()
+            },
+        );
+        let entries = pubsub_entries_for(
+            vec![global_pubsub_row(
+                "src/jobs.ts",
+                17,
+                "jobs.named",
+                PubsubRole::Publisher,
+                None,
+            )],
+            &file_results,
+        );
+        let found: Vec<(String, u32, Option<&str>)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key.canonical(),
+                    entry.line_number,
+                    entry.primary_type_symbol.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("pubsub|jobs.other".to_string(), 20, Some("Other")),
+                ("pubsub|jobs.named".to_string(), 17, Some("Job")),
+            ],
+            "the op at no library row stands; the folded op's symbol types the row"
+        );
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_pubsub_type_requests(
+            &file_results,
+            "/repo",
+            &modules_without_config(),
+            &BTreeSet::new(),
+        );
+        let request = requests
+            .iter()
+            .find(|r| r.symbol_name == "Job")
+            .expect("the folded op's symbol request");
+        assert_eq!(
+            request.alias.as_deref(),
+            Some(entries[1].type_alias.as_str())
+        );
     }
 
     /// Fan-in regression (the corpus-2 compat false-negative): two publishers on

@@ -67,8 +67,8 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `socket-field-removal` | the `order:shipped` emit drops `carrier` (`src/realtime.ts:12`) | `type_mismatch` `SERVER->CLIENT order:shipped` at `src/realtime.ts:12` | ignored, carrick#3094, carrick#3090, carrick#3091 |
 | `socket-listener-rename` | `order:update` to `order:changed` (`src/realtime.ts:11`) | `missing_endpoint` at `src/live.ts:12`; delta | passes; `_marking` ignored, carrick#3092 |
 | `socket-emit-rename` | `order:shipped` to `order:dispatched` (`src/realtime.ts:12`) | `missing_endpoint` at the PR's emit, `orphaned_endpoint`, no delta row | passes; `_marking` ignored, carrick#3092 |
-| `pubsub-field-rename` | subscriber's `PaymentSettled.amount` to `total` (`src/events.ts:5`) | `type_mismatch` `PUBSUB payments.settled` at `src/payments.ts:10` | ignored, carrick#3089 |
-| `pubsub-field-removal` | publish of `orders.shipped` drops `carrier` (`src/events.ts:15`) | `type_mismatch` `PUBSUB orders.shipped` at `src/events.ts:15` | ignored, carrick#3089 |
+| `pubsub-field-rename` | subscriber's `PaymentSettled.amount` to `total` (`src/events.ts:5`) | `type_mismatch` `PUBSUB payments.settled` at `src/payments.ts:10` | passes; shown waits on carrick-cloud#2829 |
+| `pubsub-field-removal` | publish of `orders.shipped` drops `carrier` (`src/events.ts:15`) | `type_mismatch` `PUBSUB orders.shipped` at `src/events.ts:15` | passes; shown waits on carrick-cloud#2829 |
 | `pubsub-subscriber-rename` | `payments.settled` to `payments.cleared` (`src/events.ts:9`) | `missing_endpoint` at `src/payments.ts:10`; delta | passes; `_marking` ignored, carrick#3092 |
 | `pubsub-publish-rename` | `orders.shipped` to `orders.dispatched` (`src/events.ts:15`) | `missing_endpoint` at the PR's publish, `orphaned_endpoint`, no delta row | passes; `_marking` ignored, carrick#3092 |
 | `copied-helper` | adds `src/money.ts`, a copy of `storefront`'s `formatMinor` | `functions.changed` has `src/money.ts:formatMinor:added`, no finding | passes |
@@ -94,7 +94,7 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `graphql-resolver-body` | the `order` resolver's body | as above, empty delta | passes (carrick#3172) |
 | `socket-listener-field-added` | the listener's `OrderUpdate` gains optional `note` | as above, empty delta | passes (carrick#3172) |
 | `socket-event-added` | a new `order:note` listener that relays to every client | as above for the old events; the relay's emit is one gap (`missing_endpoint`), as in `socket-emit-rename`; delta new listener | passes (carrick#3172) |
-| `pubsub-subscriber-field-added` | the subscriber's `PaymentSettled` gains optional `currency` (the answer's lines move) | as above; trivially until carrick#3089 types library pub/sub rows | passes (carrick#3172) |
+| `pubsub-subscriber-field-added` | the subscriber's `PaymentSettled` gains optional `currency` (the answer's lines move) | as above | passes (carrick#3172) |
 
 ## Type-reach seeds (carrick#3102)
 
