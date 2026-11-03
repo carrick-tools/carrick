@@ -840,8 +840,8 @@ fn service_rows<'a>(
 ///
 /// The cloud keys every row by `sanitizeService` (carrick-cloud
 /// `lambdas/_shared/service_slug.ts`), so `resolve-repos` answers
-/// `ainyc-canonry-api` for a blob whose `service_name` is
-/// `@ainyc/canonry-api`. Compared raw, every scoped or punctuated name missed
+/// `acme-orders-api` for a blob whose `service_name` is
+/// `@acme/orders-api`. Compared raw, every scoped or punctuated name missed
 /// its own row: no hosted blob was replayed and every read downloaded the
 /// whole project again.
 fn service_of(blob: &CloudRepoData) -> String {
