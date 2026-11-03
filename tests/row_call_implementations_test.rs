@@ -320,3 +320,47 @@ fn a_call_in_a_file_only_tests_import_takes_its_implementation_edge() {
         "run.ts is only imported by a test and has no rows: {rows:#?}"
     );
 }
+
+/// carrick#3220: the question is answered over the walk's program, not the
+/// tsconfig's. `SinkB` implements `Sink` in a walked file the tsconfig
+/// (`include: ["src/main.ts"]`) does not reach, so `flush` has two
+/// implementations and takes no edge.
+#[test]
+fn an_implementation_outside_the_tsconfig_program_is_counted() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let blob = scan_fixture("row-call-implementations-outside-program", true, false);
+    let edges = edges_of(&blob);
+    assert!(
+        !edges
+            .iter()
+            .any(|(from, callee, ..)| from == "flush" && callee == "SinkA.put"),
+        "flush -> SinkA.put is a false edge: {edges:#?}"
+    );
+    let rows = rows_of(&blob);
+    let row = row_of(&rows, "flush").unwrap_or_else(|| panic!("flush has a row: {rows:#?}"));
+    assert_eq!(row["reason"], "several_implementations", "{row}");
+}
+
+/// carrick#3220: a call in a file the tsconfig does not list is asked, and
+/// takes the edge of its one implementation.
+#[test]
+fn a_call_outside_the_tsconfig_program_is_asked() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let blob = scan_fixture("row-call-implementations-outside-program", true, false);
+    let edges = edges_of(&blob);
+    assert!(
+        has(&edges, "readOne", "read", "src/store.ts", 5),
+        "readOne -> read: {edges:#?}"
+    );
+    let rows = rows_of(&blob);
+    assert!(
+        row_of(&rows, "readOne").is_none(),
+        "readOne has a row: {rows:#?}"
+    );
+}

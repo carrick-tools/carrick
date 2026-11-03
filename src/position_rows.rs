@@ -751,6 +751,15 @@ impl PositionIndex {
         &self.scan_root
     }
 
+    /// Every file the index holds rows or a skip for, as absolute walked
+    /// paths ([`Self::path_of`]), sorted: the files the walk's program
+    /// holds (carrick#3220).
+    pub fn files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self.files.keys().map(|f| self.path_of(f)).collect();
+        files.sort();
+        files
+    }
+
     /// The [`Kind::Decl`] rows at [`Self::lookup`]'s position, in the order
     /// written (by declaring file, then position). None unless the member is
     /// read on a union whose constituents declare it at more than one place;

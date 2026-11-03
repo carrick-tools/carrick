@@ -54,7 +54,11 @@ pub(crate) trait AskImplementations {
         &self,
         queries: &[ImplementationsQuery],
         scan_root: &Path,
+        files: &[PathBuf],
     ) -> Result<Vec<ImplementationsAnswer>, String>;
+
+    /// Drop the programs the asks kept; called once after the last chunk.
+    fn release(&self);
 }
 
 impl AskImplementations for TypeSidecar {
@@ -62,9 +66,16 @@ impl AskImplementations for TypeSidecar {
         &self,
         queries: &[ImplementationsQuery],
         scan_root: &Path,
+        files: &[PathBuf],
     ) -> Result<Vec<ImplementationsAnswer>, String> {
-        self.implementations(queries, scan_root)
+        self.implementations(queries, scan_root, files)
             .map_err(|e| e.to_string())
+    }
+
+    fn release(&self) {
+        if let Err(e) = self.release_implementations() {
+            debug!("implementations: the release failed: {e}");
+        }
     }
 }
 
@@ -205,6 +216,7 @@ pub(crate) fn ask(
         },
         asker,
         positions.scan_root(),
+        &positions.files(),
         budget,
         |answer| {
             classify(
@@ -225,6 +237,7 @@ fn ask_with(
     place: impl Fn(&EdgelessCall) -> Option<ImplementationsQuery>,
     asker: &dyn AskImplementations,
     scan_root: &Path,
+    files: &[PathBuf],
     budget: Duration,
     read: impl Fn(&ImplementationsAnswer) -> Outcome,
 ) -> ImplementationTargets {
@@ -260,7 +273,7 @@ fn ask_with(
         }
         targets.asked += chunk.len();
         let queries: Vec<ImplementationsQuery> = chunk.iter().map(|(_, q)| q.clone()).collect();
-        let answers = match asker.ask(&queries, scan_root) {
+        let answers = match asker.ask(&queries, scan_root, files) {
             Ok(answers) if answers.len() == chunk.len() => Some(answers),
             Ok(answers) => {
                 let why = format!("{} answers to {} questions", answers.len(), chunk.len());
@@ -288,6 +301,10 @@ fn ask_with(
             }
             set(&mut targets, group, &read(answer));
         }
+    }
+    // However the pass ended, the programs the asks kept are dropped once.
+    if !questions.is_empty() {
+        asker.release();
     }
     targets.took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     targets
@@ -466,6 +483,8 @@ mod tests {
     /// Answers one definition for every question and keeps what it was asked.
     struct Stub {
         asked: RefCell<Vec<Vec<ImplementationsQuery>>>,
+        files: RefCell<Vec<Vec<PathBuf>>>,
+        released: std::cell::Cell<usize>,
         fail_first: bool,
     }
 
@@ -474,7 +493,9 @@ mod tests {
             &self,
             queries: &[ImplementationsQuery],
             _: &Path,
+            files: &[PathBuf],
         ) -> Result<Vec<ImplementationsAnswer>, String> {
+            self.files.borrow_mut().push(files.to_vec());
             let first = self.asked.borrow().is_empty();
             self.asked.borrow_mut().push(queries.to_vec());
             if self.fail_first && first {
@@ -485,12 +506,18 @@ mod tests {
                 .map(|_| answer(vec![entry("src/a.ts", 1, "read")]))
                 .collect())
         }
+
+        fn release(&self) {
+            self.released.set(self.released.get() + 1);
+        }
     }
 
     #[test]
     fn three_calls_through_one_declaration_ask_one_question() {
         let stub = Stub {
             asked: RefCell::new(Vec::new()),
+            files: RefCell::new(Vec::new()),
+            released: std::cell::Cell::new(0),
             fail_first: false,
         };
         let calls = vec![
@@ -503,6 +530,7 @@ mod tests {
             place,
             &stub,
             Path::new(ROOT),
+            &[],
             Duration::from_secs(60),
             read,
         );
@@ -523,6 +551,8 @@ mod tests {
     fn a_failed_chunk_is_no_edge_and_the_scan_goes_on() {
         let stub = Stub {
             asked: RefCell::new(Vec::new()),
+            files: RefCell::new(Vec::new()),
+            released: std::cell::Cell::new(0),
             fail_first: true,
         };
         // 65 declarations: two chunks, the first fails.
@@ -541,6 +571,7 @@ mod tests {
             place,
             &stub,
             Path::new(ROOT),
+            &[],
             Duration::from_secs(60),
             read,
         );
@@ -567,16 +598,64 @@ mod tests {
     fn a_spent_budget_asks_nothing_and_leaves_every_call_unasked() {
         let stub = Stub {
             asked: RefCell::new(Vec::new()),
+            files: RefCell::new(Vec::new()),
+            released: std::cell::Cell::new(0),
             fail_first: false,
         };
         let calls = vec![call("/repo/src/y.ts", 10, 0, ("/repo/src/p.ts", 4))];
-        let targets = ask_with(&calls, place, &stub, Path::new(ROOT), Duration::ZERO, read);
+        let targets = ask_with(
+            &calls,
+            place,
+            &stub,
+            Path::new(ROOT),
+            &[],
+            Duration::ZERO,
+            read,
+        );
         assert!(stub.asked.borrow().is_empty());
         assert_eq!(
             targets.outcome_at(Path::new("/repo/src/y.ts"), 10, 15),
             Some(&Outcome::Unasked)
         );
         assert_eq!(targets.unasked, 1);
+    }
+
+    /// carrick#3220: the programs the asks kept are released once, however
+    /// the pass ends, and every chunk carries the files.
+    #[test]
+    fn the_kept_programs_are_released_once_on_each_ending() {
+        let files = vec![PathBuf::from("/repo/src/y.ts")];
+        // 65 declarations are two chunks; one is a single chunk.
+        for (declarations, fail_first, budget, chunks) in [
+            (65, false, Duration::from_secs(60), 2),
+            (1, true, Duration::from_secs(60), 1),
+            (1, false, Duration::ZERO, 0),
+        ] {
+            let stub = Stub {
+                asked: RefCell::new(Vec::new()),
+                files: RefCell::new(Vec::new()),
+                released: std::cell::Cell::new(0),
+                fail_first,
+            };
+            let calls: Vec<_> = (0..declarations)
+                .map(|i| {
+                    call(
+                        "/repo/src/y.ts",
+                        i * 10,
+                        i as usize,
+                        ("/repo/src/p.ts", i + 1),
+                    )
+                })
+                .collect();
+            ask_with(&calls, place, &stub, Path::new(ROOT), &files, budget, read);
+            assert_eq!(
+                stub.released.get(),
+                1,
+                "{declarations} {fail_first} {budget:?}"
+            );
+            assert_eq!(stub.asked.borrow().len(), chunks);
+            assert!(stub.files.borrow().iter().all(|f| f == &files));
+        }
     }
 
     fn row(reason: &str) -> UnfollowedMemberCall {

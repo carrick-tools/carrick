@@ -1752,7 +1752,12 @@ enum SidecarRequest {
         request_id: String,
         queries: Vec<ImplementationsQuery>,
         scan_root: String,
+        /// Every file the service's position index holds, absolute
+        /// (carrick#3220): the walk's program.
+        files: Vec<String>,
     },
+    #[serde(rename = "release_implementations")]
+    ReleaseImplementations { request_id: String },
     #[serde(rename = "add_program_files")]
     AddProgramFiles {
         request_id: String,
@@ -1770,6 +1775,7 @@ impl SidecarRequest {
             SidecarRequest::Init { .. }
             | SidecarRequest::ListProgramFiles { .. }
             | SidecarRequest::ReachGraph { .. }
+            | SidecarRequest::ReleaseImplementations { .. }
             | SidecarRequest::Shutdown { .. } => 0,
             SidecarRequest::Reach { changes, .. } => changes.len(),
             SidecarRequest::AddProgramFiles { files, .. }
@@ -4181,6 +4187,7 @@ impl TypeSidecar {
         &self,
         queries: &[ImplementationsQuery],
         scan_root: &Path,
+        files: &[PathBuf],
     ) -> Result<Vec<ImplementationsAnswer>, SidecarError> {
         self.ensure_ready()?;
         let request_id = self.next_request_id();
@@ -4188,6 +4195,10 @@ impl TypeSidecar {
             request_id: request_id.clone(),
             queries: queries.to_vec(),
             scan_root: scan_root.to_string_lossy().into_owned(),
+            files: files
+                .iter()
+                .map(|file| file.to_string_lossy().into_owned())
+                .collect(),
         };
         self.send_request(&request)?;
         // A progress frame follows each answer, so the deadline is a silence.
@@ -4201,6 +4212,29 @@ impl TypeSidecar {
             })?)
             .map_err(|e| SidecarError::DeserializationError(e.to_string()))?;
         Ok(result.answers)
+    }
+
+    /// Drop the programs `implementations` keeps, once a service's last
+    /// chunk is asked (carrick#3220). Answers how many were dropped.
+    pub fn release_implementations(&self) -> Result<usize, SidecarError> {
+        self.ensure_ready()?;
+        let request_id = self.next_request_id();
+        let request = SidecarRequest::ReleaseImplementations {
+            request_id: request_id.clone(),
+        };
+        self.send_request(&request)?;
+        let value = self.operation_result(&request_id)?;
+        if value.get("status").and_then(|s| s.as_str()) != Some("success") {
+            return Err(SidecarError::ImplementationsFailed(frame_errors(&value)));
+        }
+        value
+            .get("result")
+            .and_then(|r| r.get("released"))
+            .and_then(|n| n.as_u64())
+            .map(|n| n as usize)
+            .ok_or_else(|| {
+                SidecarError::ImplementationsFailed("no `released` in the answer".to_string())
+            })
     }
 
     /// Names the sidecar build this process runs: a hash of every script
@@ -6528,6 +6562,7 @@ mod tests {
                 end: 151,
             }],
             scan_root: "/repo".into(),
+            files: vec!["/repo/src/handlers.ts".into()],
         };
         assert_eq!(
             serde_json::to_value(&request).unwrap(),
@@ -6535,8 +6570,16 @@ mod tests {
                 "action": "implementations",
                 "request_id": "req-3",
                 "queries": [{ "file": "/repo/src/handlers.ts", "start": 120, "end": 151 }],
-                "scan_root": "/repo"
+                "scan_root": "/repo",
+                "files": ["/repo/src/handlers.ts"]
             })
+        );
+        assert_eq!(
+            serde_json::to_value(SidecarRequest::ReleaseImplementations {
+                request_id: "req-4".into()
+            })
+            .unwrap(),
+            serde_json::json!({ "action": "release_implementations", "request_id": "req-4" })
         );
         assert_eq!(request.item_count(), 1);
 
