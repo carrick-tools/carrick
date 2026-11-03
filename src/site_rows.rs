@@ -236,7 +236,9 @@ pub struct TracedRoutes {
     pub routes: Vec<TracedRoute>,
     /// Route sites the trace does not serve at a full path, by reason:
     /// `method_unstated`, `trimmed`, `no_instance`, `mount_unverified`,
-    /// `hole_<end>` (an instance end that is not the top), `unread_prefix`.
+    /// `hole_<end>` (an instance end that is not the top), `unread_prefix`,
+    /// `unread_own_part` (the path writes its first segment whole and then a
+    /// value the code does not read, carrick#3237).
     pub untraced: std::collections::BTreeMap<String, usize>,
     /// Route sites whose own path the code writes in no whole way: a
     /// reader row there guesses at a value the code never states, so it is
@@ -249,8 +251,9 @@ pub struct TracedRoutes {
 /// of a conditional or a default reads whole):`` `${base}health` ``, `base.replace(…)`, a local holding a value
 /// read at runtime (ruling on PR #3182, 2026-11-02). The label states that
 /// a route of `method` is registered here; the path it serves is a value
-/// only the running program knows. A reader row of the method at the line
-/// is withdrawn ([`crate::engine`]'s `withdraw_guessed_routes`).
+/// only the running program knows. Not a path that writes its first segment
+/// whole before the value (`unread_own_part`, carrick#3237): its row stands.
+/// A reader row of the method at the line is withdrawn ([`crate::engine`]'s `withdraw_guessed_routes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuessedRoute {
     /// Repo-relative, `/`-separated.
@@ -287,10 +290,18 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
         // default writes (carrick#2386); the record itself is unchanged.
         let ways_read = site.composed.iter().any(|composed| composed.own.is_some());
         if record.bucket == Bucket::Lead && !ways_read {
-            // No whole way: a reader row of the method here is a guess.
+            // No whole way: a reader row of the method here is a guess,
+            // unless the path writes its first segment whole before the
+            // value (carrick#3237): then the row stands, counted apart.
             if site.procedure.is_none()
                 && let Ok(method) = forced_method(record)
             {
+                if states_first_segment(&site.name) {
+                    *out.untraced
+                        .entry("unread_own_part".to_string())
+                        .or_default() += 1;
+                    continue;
+                }
                 out.guessed.push(GuessedRoute {
                     file: site.file.clone(),
                     line: site.line,
@@ -385,6 +396,26 @@ impl From<String> for Untraced {
     }
 }
 
+/// Whether a route's own path writes its first segment whole before any value
+/// the code does not read (`/users/${id}`, `/docs/spec${tail}`): the text of
+/// its leading literal pieces holds a slash, a name, and a slash. Such a path
+/// says where the route lives, so a reader's row there is no guess
+/// (carrick#3237). `/v${n}/x` and a value first (`${base}health`) do not.
+fn states_first_segment(name: &[crate::request_summary::Piece]) -> bool {
+    let head: String = name
+        .iter()
+        .map_while(|piece| match piece {
+            crate::request_summary::Piece::Lit(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let Some(rest) = head.strip_prefix('/') else {
+        return false;
+    };
+    rest.split_once('/')
+        .is_some_and(|(segment, _)| !segment.is_empty())
+}
+
 /// `site`'s traced routes, or why it has none: one, or where the call writes
 /// its own path through a conditional or a default, one per way written
 /// whole (carrick#2386), each at the full paths that way joins.
@@ -414,6 +445,8 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
     // is read: the code states no single literal path here, so a reader row
     // of the method is a guess (ruling on PR #3182, 2026-11-02). A site
     // whose own path is read but whose prefix is not stays `unread_prefix`.
+    // A path that writes its first segment whole before the value is counted
+    // `unread_own_part` and keeps the row (carrick#3237).
     let own_read =
         site.name_text().is_some() || site.composed.iter().any(|composed| composed.own.is_some());
     if !own_read
@@ -422,6 +455,9 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
             .iter()
             .any(|piece| matches!(piece, crate::request_summary::Piece::Opaque { .. }))
     {
+        if states_first_segment(&site.name) {
+            return Err("unread_own_part".to_string().into());
+        }
         return Err(Untraced::Guessed(method.to_uppercase()));
     }
     // Each own path with the full paths it joins: the call's whole text, or

@@ -4616,6 +4616,45 @@ export function listen(): void {
         );
     }
 
+    /// carrick#3237: a route path that writes its first segment whole before
+    /// a value the code does not read (`/widgets/kinds/${kind}`,
+    /// `/docs/spec${tail}`) is not a guessed site: no route is served there
+    /// yet, it is counted as `unread_own_part`, and the reader's row stands.
+    /// A path that starts with its value (`${head}health`) stays guessed.
+    #[test]
+    fn a_route_path_that_writes_its_first_segment_is_not_a_guessed_site() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("receiver-route-stated-head", "packages/routes", "routes")
+        else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        let routes = crate::site_rows::traced(&decided, &records);
+        let mut guessed: Vec<String> = routes
+            .guessed
+            .iter()
+            .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
+            .collect();
+        guessed.sort();
+        assert_eq!(
+            guessed,
+            texts(&["packages/routes/src/families.ts:21 GET"]),
+            "{:#?}",
+            routes.guessed
+        );
+        assert_eq!(
+            routes.untraced.get("unread_own_part"),
+            Some(&2),
+            "{:#?}",
+            routes.untraced
+        );
+    }
+
     /// carrick#1678: a verb called on the object a scope member returns
     /// (`items.at("/items").get(list)`) is a route whose path is the scope
     /// call's argument and whose instance is the scope call's receiver: the
