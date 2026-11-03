@@ -747,6 +747,29 @@ impl RequestSummaryInputs {
         }
     }
 
+    /// The declaration with no body the member call at `lo..hi` in `file`
+    /// goes through, for the question of which body implements it
+    /// ([`crate::implementation_edges`]): [`Self::declared_non_definition`]
+    /// where the rows name no function and no other pass keeps the call.
+    /// Unlike [`Self::unfollowed_at`] it does not skip a file only tests
+    /// import: a call there takes an edge like any other, while the file
+    /// still gets no row.
+    pub(crate) fn edgeless_declaration(
+        &self,
+        file: &Path,
+        lo: u32,
+        hi: u32,
+    ) -> Option<(PathBuf, u32)> {
+        let row_calls = self.row_calls.as_ref()?;
+        if row_calls.kept.contains(&(file.to_path_buf(), lo, hi)) {
+            return None;
+        }
+        match self.reach(file, lo, hi) {
+            Reach::NoFunction => self.declared_non_definition(file, lo, hi),
+            _ => None,
+        }
+    }
+
     /// The span of the call row at `lo..hi` in `file`, in the rows' numbering:
     /// the key [`Self::row_names`] reads, for a question put to the sidecar
     /// about that call. `None` without rows or for a file they hold none for.

@@ -536,6 +536,7 @@ pub fn add_row_edges(
     sites: &CallSiteTargets,
     row_target: impl Fn(&Path, u32, u32) -> Option<(PathBuf, String)>,
     row_unfollowed: impl Fn(&Path, u32, u32) -> Option<crate::request_summary::Unfollowed>,
+    row_declaration: impl Fn(&Path, u32, u32) -> Option<(PathBuf, u32)>,
 ) -> RowEdges {
     let mut added = 0;
     let mut unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall> = Vec::new();
@@ -562,18 +563,21 @@ pub fn add_row_edges(
                 }
                 let Some((file, key)) = row_target(&index.path, callee.span.lo.0, callee.span.hi.0)
                 else {
-                    if let Some(why) =
-                        row_unfollowed(&index.path, callee.span.lo.0, callee.span.hi.0)
+                    let why = row_unfollowed(&index.path, callee.span.lo.0, callee.span.hi.0);
+                    // Asked whether or not a row is written: a call in a file
+                    // only tests import has none and may still take an edge.
+                    if let Some(declared) =
+                        row_declaration(&index.path, callee.span.lo.0, callee.span.hi.0)
                     {
-                        if let Some(declared) = why.declared_at.clone() {
-                            edgeless.push(EdgelessCall {
-                                file: index.path.clone(),
-                                lo: callee.span.lo.0,
-                                hi: callee.span.hi.0,
-                                row: unfollowed.len(),
-                                declared,
-                            });
-                        }
+                        edgeless.push(EdgelessCall {
+                            file: index.path.clone(),
+                            lo: callee.span.lo.0,
+                            hi: callee.span.hi.0,
+                            row: why.is_some().then_some(unfollowed.len()),
+                            declared,
+                        });
+                    }
+                    if let Some(why) = why {
                         unfollowed.push(crate::unfollowed_calls::UnfollowedMemberCall {
                             file: index.path.to_string_lossy().to_string(),
                             line: callee.line,
@@ -650,8 +654,9 @@ pub struct EdgelessCall {
     /// The call's SWC span, as [`CallSiteTargets::target_at`] keys it.
     pub lo: u32,
     pub hi: u32,
-    /// Index of the call's row in [`RowEdges::unfollowed`].
-    pub row: usize,
+    /// Index of the call's row in [`RowEdges::unfollowed`]; `None` for a
+    /// call that has no row (it is in a file only tests import).
+    pub row: Option<usize>,
     /// The declaration's file as walked and line.
     pub declared: (PathBuf, u32),
 }

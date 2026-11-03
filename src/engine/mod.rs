@@ -11149,6 +11149,7 @@ fn discover_with_positions(
             &request_inputs.sites,
             |file, lo, hi| request_inputs.call_target(file, lo, hi),
             |file, lo, hi| request_inputs.unfollowed_at(file, lo, hi),
+            |file, lo, hi| request_inputs.edgeless_declaration(file, lo, hi),
         );
         // A call through a declaration with no body takes the edge of its one
         // implementation, where TypeScript names exactly one (carrick#813).
@@ -11166,6 +11167,7 @@ fn discover_with_positions(
                     &keys,
                     &request_inputs.sites,
                     |file, lo, hi| targets.target_at(file, lo, hi),
+                    |_, _, _| None,
                     |_, _, _| None,
                 )
                 .added;

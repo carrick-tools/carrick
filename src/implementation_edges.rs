@@ -299,15 +299,17 @@ pub(crate) fn settle(
     let mut gone: HashSet<usize> = HashSet::new();
     let mut reasons: HashMap<usize, &'static str> = HashMap::new();
     for call in calls {
+        // A call with no row has nothing to settle.
+        let Some(row) = call.row else { continue };
         match targets.outcome_at(&call.file, call.lo, call.hi) {
             Some(Outcome::One(..)) => {
-                gone.insert(call.row);
+                gone.insert(row);
             }
             Some(Outcome::Several) => {
-                reasons.insert(call.row, SEVERAL_IMPLEMENTATIONS);
+                reasons.insert(row, SEVERAL_IMPLEMENTATIONS);
             }
             Some(Outcome::OverCap) => {
-                reasons.insert(call.row, IMPLEMENTATIONS_OVER_CAP);
+                reasons.insert(row, IMPLEMENTATIONS_OVER_CAP);
             }
             _ => {}
         }
@@ -434,7 +436,7 @@ mod tests {
             file: PathBuf::from(file),
             lo,
             hi: lo + 5,
-            row,
+            row: Some(row),
             declared: (PathBuf::from(declared.0), declared.1),
         }
     }

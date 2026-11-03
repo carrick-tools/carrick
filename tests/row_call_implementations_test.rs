@@ -14,8 +14,10 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/row-call-implementations")
+fn fixture_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 /// Whether the live sidecar can run. CI builds it before the Rust tests, so
@@ -34,20 +36,31 @@ fn sidecar_available() -> bool {
     node && built
 }
 
-/// The blob the fixture scan stores.
+/// The blob the main fixture's scan stores.
 fn scan_blob(rows: bool) -> serde_json::Value {
+    scan_fixture("row-call-implementations", rows, false)
+}
+
+/// The blob a fixture's scan stores. `trace` turns the receiver trace on, as
+/// production runs with the fact layer: it is what marks a file only tests
+/// import.
+fn scan_fixture(name: &str, rows: bool, trace: bool) -> serde_json::Value {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
-    cmd.arg(fixture_dir())
+    cmd.arg(fixture_dir(name))
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env_remove("CARRICK_POSITION_ROWS");
+        .env_remove("CARRICK_POSITION_ROWS")
+        .env_remove("CARRICK_RECEIVER_TRACE");
     if rows {
         cmd.env("CARRICK_POSITION_ROWS", "1");
+    }
+    if trace {
+        cmd.env("CARRICK_RECEIVER_TRACE", "1");
     }
     for var in [
         "GITHUB_REPOSITORY",
@@ -269,4 +282,41 @@ fn no_sidecar_no_implementation_edges() {
     .collect();
     assert_eq!(edges_of(&blob), expected);
     assert!(rows_of(&blob).is_empty());
+}
+
+/// A call in a file only tests import is asked like any other, so it takes
+/// its implementation's edge, and the file still gets no row. One test: with
+/// the receiver trace off the file is not test-only and `o.ping()` has a row;
+/// with the edge gate coupled to the row gate the edges go missing.
+#[test]
+fn a_call_in_a_file_only_tests_import_takes_its_implementation_edge() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let blob = scan_fixture("row-call-implementations-test-only", true, true);
+    let edges = edges_of(&blob);
+    // `store: Store` in `direct`.
+    assert!(
+        has(&edges, "direct", "read", "src/store.ts", 9),
+        "direct -> read: {edges:#?}"
+    );
+    // The call inside the callback handed to `runEach`; the caller is the
+    // callback or `main`, as the callback tests assert.
+    assert!(
+        edges.iter().any(|(_, callee, file, line)| callee == "read"
+            && file == "src/store.ts"
+            && *line == 14),
+        "a callback's read call states an edge: {edges:#?}"
+    );
+    // The test-only rule is active: no row for a call in `run.ts`, whose
+    // declaration (`Orphan.ping`) has no implementation.
+    let rows = rows_of(&blob);
+    assert!(
+        rows.iter().all(|row| !row["file"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("src/run.ts")),
+        "run.ts is only imported by a test and has no rows: {rows:#?}"
+    );
 }
