@@ -96,15 +96,6 @@ the merge base of the base commit and HEAD to the tree the scan read.
   open. A row the diff places by its lines is listed whatever moved. The
   cost: a pull request that changes such an input and also moves a mount
   prefix or a path constant lists no delta for the routes that moved.
-- A finding that exists only at head, with a producer or consumer service
-  that loads a package whose version the pull request moved
-  (`change_scope::packages_moved_since`), is posted as not compared with
-  main (`on_main_unknown: "reading_moved"`) rather than as one the pull
-  request introduced. The library store answers per package version, so the
-  pairing may be code the scanner now reads differently, not code the pull
-  request wrote. Only manifests, lockfiles and package manager settings
-  count here: an edit to any other file, a JSON file or a schema included,
-  leaves the finding the pull request's.
 - Everything else is a reading that moved. It is counted in one info line of
   the run log and not listed.
 - Each listed operation carries `edge_source`: `fact` when a deterministic
@@ -118,6 +109,28 @@ the merge base of the base commit and HEAD to the tree the scan read.
   the scan could not read are not counted yet.
 - With no base commit, or when git cannot read the diff, the scan lists no
   endpoint changes and says why in the run log.
+
+### Dependency updates and finding attribution (`reading_moved`)
+
+When a pull request changes the version of a package a service loads, a
+finding that exists only at head, where that service is the producer or
+consumer, is marked as not compared with main
+(`on_main_unknown: "reading_moved"`) instead of as introduced by the PR.
+
+**Why.** The library store keeps one answer per package version. After a
+version change (`change_scope::packages_moved_since`), the scanner can read
+unchanged code differently, so the finding may come from code the PR never
+wrote. The check goes neutral and never fails on such a finding.
+
+**Which files count.**
+
+- A package move: a manifest, lockfile or package manager setting that
+  changes the version of a package the service loads.
+- Not a package move: any other file, including schemas, JSON data files,
+  tsconfig and source. A PR that edits only these keeps its findings
+  attributed to it.
+- A PR that does both still gets `reading_moved` for the services that load
+  the moved package.
 
 ## What `--changed-only` analyses
 
