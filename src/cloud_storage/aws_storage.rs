@@ -2524,6 +2524,8 @@ impl CloudStorage for AwsStorage {
                     call_through: None,
                     route_boundaries: None,
                     memory_peaks: None,
+                    unfollowed_member_calls: Vec::new(),
+                    unfollowed_member_calls_total: 0,
                     type_reach: None,
                     pair_outcomes: None,
                 };
@@ -4871,6 +4873,61 @@ mod tests {
         include_str!("../../tests/fixtures/final-losses/contract.json");
     const FINAL_LOSS_CONTRACT_SHA256: &str =
         "9b72a0481077aec2fc53b474837f75f83b7631c45bd12749489c5ad83f427c72";
+
+    /// The one example of the unfollowed member calls both repos read
+    /// (carrick#813). The cloud pins the same bytes by the same hash in
+    /// `lambdas/mcp-server/src/tools/unfollowed_calls_contract.fixture.json`.
+    const UNFOLLOWED_CONTRACT: &str =
+        include_str!("../../tests/fixtures/unfollowed-calls/contract.json");
+    const UNFOLLOWED_CONTRACT_SHA256: &str =
+        "667563e31bb5cb8135a206a5bbd4f397a23c01dfe40a06840a1bccfb3d4b0af8";
+
+    #[test]
+    fn the_unfollowed_calls_contract_is_the_one_the_cloud_pins() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            format!("{:x}", Sha256::digest(UNFOLLOWED_CONTRACT.as_bytes())),
+            UNFOLLOWED_CONTRACT_SHA256
+        );
+    }
+
+    /// The blob writes the contract's spelling: the contract's service reads
+    /// into the blob's own types and writes back as the same keys, and a blob
+    /// without the fields reads (an older scan) and writes neither.
+    #[test]
+    fn the_blob_spells_unfollowed_calls_as_the_contract_does() {
+        let contract: serde_json::Value = serde_json::from_str(UNFOLLOWED_CONTRACT).unwrap();
+        let service = &contract["service"];
+        let mut data = blob();
+        let bare = serde_json::to_value(&data).unwrap();
+        assert!(bare.get("unfollowed_member_calls").is_none());
+        assert!(bare.get("unfollowed_member_calls_total").is_none());
+        let older: CloudRepoData = serde_json::from_value(bare).unwrap();
+        assert!(older.unfollowed_member_calls.is_empty());
+        assert_eq!(older.unfollowed_member_calls_total, 0);
+
+        data.unfollowed_member_calls =
+            serde_json::from_value(service["unfollowed_member_calls"].clone()).unwrap();
+        data.unfollowed_member_calls_total =
+            service["unfollowed_member_calls_total"].as_u64().unwrap() as u32;
+        let written = serde_json::to_value(&data).unwrap();
+        assert_eq!(
+            written["unfollowed_member_calls"],
+            service["unfollowed_member_calls"]
+        );
+        assert_eq!(
+            written["unfollowed_member_calls_total"],
+            service["unfollowed_member_calls_total"]
+        );
+        let back: CloudRepoData = serde_json::from_value(written).unwrap();
+        assert_eq!(back.unfollowed_member_calls, data.unfollowed_member_calls);
+        assert_eq!(back.unfollowed_member_calls[0].reason, "interface_member");
+        assert_eq!(
+            back.unfollowed_member_calls[0].declared_at.as_deref(),
+            Some("src/store.ts:2")
+        );
+        assert_eq!(back.unfollowed_member_calls[1].declared_at, None);
+    }
 
     #[test]
     fn the_final_loss_contract_is_the_one_the_cloud_pins() {

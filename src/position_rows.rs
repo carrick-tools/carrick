@@ -696,6 +696,13 @@ impl PositionIndex {
         };
     }
 
+    /// Whether the walk wrote rows for `file` at all, usable or not: false
+    /// for a walk that produced none and for a file outside it.
+    pub fn holds_rows_for(&self, file: &Path) -> bool {
+        self.relative(file)
+            .is_some_and(|relative| self.files.contains_key(&relative))
+    }
+
     /// Why `file` holds no usable rows, or its rows.
     fn file(&self, file: &Path) -> Result<(&IndexedFile, Option<&Utf16Offsets>), HoleReason> {
         let indexed = self

@@ -212,6 +212,7 @@ mod row_links;
 // The definition each call reaches, read from the compiler's per-position
 // rows when the run walks them (carrick#2413 slice D).
 mod row_calls;
+pub use row_calls::Unfollowed;
 pub(crate) use row_calls::{CallIntoFile, Reach as CallReach};
 
 // What binding the rows costs, and the budget that bounds it (carrick#2564).
@@ -8074,6 +8075,10 @@ pub struct RequestSummaryInputs {
     /// ([`crate::test_only_files`], carrick#2775), as walked: the trace
     /// ignores the router mounts made in them. Empty with it off.
     pub(crate) test_only: HashSet<PathBuf>,
+    /// With rows, the member calls that took no call edge and say why
+    /// (carrick#813), paths as walked; set by discovery after the row edges
+    /// are added. Written on the blob by [`crate::unfollowed_calls::attach`].
+    pub(crate) unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall>,
 }
 
 impl RequestSummaryInputs {

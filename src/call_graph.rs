@@ -521,15 +521,21 @@ pub fn resolve_call_edges(
 /// the site, so every edge resolution stated is unchanged. A target the
 /// merged definitions do not hold (a file outside the service) adds nothing,
 /// and neither does a call at module scope whose row the resolver dropped for
-/// want of an edge. Returns how many edges were added.
+/// want of an edge. Returns how many edges were added, and the member calls
+/// that took none: where the rows name no target, `row_unfollowed` says why
+/// the call is left unfollowed, if it is ([`crate::unfollowed_calls`]). A
+/// call the rows do name a target for, whose edge the filters above drop (a
+/// recursive call, a definition outside the service), is not one of them.
 pub fn add_row_edges(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     per_file: &HashMap<PathBuf, FileCallIndex>,
     keys: &RekeyIndex,
     sites: &CallSiteTargets,
     row_target: impl Fn(&Path, u32, u32) -> Option<(PathBuf, String)>,
-) -> usize {
+    row_unfollowed: impl Fn(&Path, u32, u32) -> Option<crate::request_summary::Unfollowed>,
+) -> RowEdges {
     let mut added = 0;
+    let mut unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall> = Vec::new();
     let mut files: Vec<&PathBuf> = per_file.keys().collect();
     files.sort();
     for canonical in files {
@@ -552,6 +558,21 @@ pub fn add_row_edges(
                 }
                 let Some((file, key)) = row_target(&index.path, callee.span.lo.0, callee.span.hi.0)
                 else {
+                    if let Some(why) =
+                        row_unfollowed(&index.path, callee.span.lo.0, callee.span.hi.0)
+                    {
+                        unfollowed.push(crate::unfollowed_calls::UnfollowedMemberCall {
+                            file: index.path.to_string_lossy().to_string(),
+                            line: callee.line,
+                            caller: caller_key.clone(),
+                            member: callee.name.clone(),
+                            receiver: callee.receiver_text.clone(),
+                            reason: why.reason,
+                            declared_at: why
+                                .declared_at
+                                .map(|(file, line)| format!("{}:{line}", file.to_string_lossy())),
+                        });
+                    }
                     continue;
                 };
                 if file == index.path && key == *caller_key {
@@ -586,7 +607,16 @@ pub fn add_row_edges(
             dedupe_edges(&mut def.calls);
         }
     }
-    added
+    RowEdges { added, unfollowed }
+}
+
+/// What [`add_row_edges`] produced.
+#[derive(Debug, Default)]
+pub struct RowEdges {
+    /// Edges written into the definitions.
+    pub added: usize,
+    /// Member calls that took no edge and say why, paths as walked.
+    pub unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall>,
 }
 
 /// What [`resolve_call_edges`] produces besides the edges it writes into the

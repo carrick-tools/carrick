@@ -102,6 +102,7 @@ pub mod swc_scanner;
 pub mod test_only_files;
 pub mod time_limits;
 pub mod type_manifest;
+pub mod unfollowed_calls;
 pub mod untrusted_yarn;
 pub mod url_normalizer;
 pub mod utils;

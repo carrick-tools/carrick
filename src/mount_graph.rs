@@ -1559,6 +1559,8 @@ mod tests {
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
+            unfollowed_member_calls: Vec::new(),
+            unfollowed_member_calls_total: 0,
             type_reach: None,
             pair_outcomes: None,
         }
