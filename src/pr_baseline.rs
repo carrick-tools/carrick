@@ -211,10 +211,11 @@ fn pair_services(finding: &Finding) -> (Option<&str>, Option<&str>) {
     }
 }
 
-/// Which services of this repo read an input other than source files that the
-/// PR changed (carrick#1712, [`crate::change_scope::reading_moved_services`]).
-/// A file such a service never touched can read differently at head than on
-/// main, so a pairing only head has is not provably the PR's.
+/// Which services of this repo load a package whose version the PR moved
+/// (carrick#3230, [`crate::change_scope::packages_moved_services`]). The
+/// library store answers per package version, so a file such a service never
+/// touched can read differently at head than on main, and a pairing only head
+/// has is not provably the PR's.
 #[derive(Clone, Debug, Default)]
 pub struct ReadingMoved {
     /// Each service of this repo, by id (`service_name`, else the repo), with
@@ -224,7 +225,7 @@ pub struct ReadingMoved {
 
 impl ReadingMoved {
     /// Each service as `(id, service_name)` against the moved set of
-    /// [`crate::change_scope::reading_moved_services`], where `None` means
+    /// [`crate::change_scope::packages_moved_services`], where `None` means
     /// every service.
     pub fn of(
         services: impl Iterator<Item = (String, Option<String>)>,

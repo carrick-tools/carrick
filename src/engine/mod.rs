@@ -13506,13 +13506,13 @@ struct PrChange {
 }
 
 impl PrChange {
-    /// Which services read an input other than source files the change
-    /// touched (carrick#1712). `None` in the set means every service.
+    /// Which services load a package whose version the change moved
+    /// (carrick#3230). `None` in the set means every service.
     fn reading_moved(&self) -> crate::pr_baseline::ReadingMoved {
-        let moved = crate::change_scope::reading_moved_services(
+        let moved = crate::change_scope::packages_moved_services(
             &self.repo_path,
             &self.services,
-            Some(&self.changes),
+            &self.changes,
             &self.base,
         );
         crate::pr_baseline::ReadingMoved::of(
