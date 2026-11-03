@@ -10,8 +10,10 @@
 //! Two phases, both of which already exist:
 //!
 //! 1. **One repo, re-scanned.** The same subprocess `index` runs per repo, with
-//!    no model, no upload and no network: deterministic extraction plus the
-//!    sidecar's type capture, over the working tree. The blob the last index
+//!    no model and no upload: deterministic extraction plus the sidecar's type
+//!    capture, over the working tree. Its one network request is a read-only
+//!    ask to the library store with package names, versions and import
+//!    specifiers, no source (`engine/mod.rs` `read_from_library_store`). The blob the last index
 //!    wrote for that repo is handed in as `previous_data`, so the hosted model
 //!    answers for the files the edit did not touch replay exactly as they do on
 //!    an incremental scan.
