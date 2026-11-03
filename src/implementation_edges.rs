@@ -121,7 +121,7 @@ pub(crate) struct ImplementationTargets {
 }
 
 /// Questions the run-log line names for each reason.
-const NAMED_PER_REASON: usize = 5;
+const NAMED_PER_REASON: usize = 10;
 
 /// The 1-based line of a UTF-16 offset in `file`, or the offset itself when
 /// the file cannot be read.
@@ -653,7 +653,7 @@ mod tests {
     }
 
     /// The debug line names each question that searched nothing: the call's
-    /// file and line, then the declaration's, at most five per reason.
+    /// file and line, then the declaration's, at most ten per reason.
     #[test]
     fn the_summary_names_the_questions_that_searched_nothing() {
         struct Nothing;
@@ -680,8 +680,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("script.mjs");
         std::fs::write(&file, "a\nb\nread();\n").unwrap();
-        // 7 declarations, each asked from the call on line 3 (offset 4).
-        let calls: Vec<_> = (0..7)
+        // 12 declarations, each asked from the call on line 3 (offset 4).
+        let calls: Vec<_> = (0..12)
             .map(|i| EdgelessCall {
                 file: file.clone(),
                 lo: 4 + i * 100,
@@ -709,8 +709,8 @@ mod tests {
         let line = targets.summary();
         let shown = format!("{}:3 -> /repo/src/p.ts:1", file.display());
         assert!(line.contains(&shown), "{line}");
-        assert!(line.contains("/repo/src/p.ts:5"), "{line}");
-        assert!(!line.contains("/repo/src/p.ts:6"), "{line}");
+        assert!(line.contains("/repo/src/p.ts:10"), "{line}");
+        assert!(!line.contains("/repo/src/p.ts:11"), "{line}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
