@@ -323,6 +323,14 @@ export interface HealthRequest extends BaseRequest {
 }
 
 /**
+ * Drop the programs the `implementations` action keeps (carrick#3220): Rust
+ * sends it after the last chunk, the sidecar cannot see which that is.
+ */
+export interface ReleaseImplementationsRequest extends BaseRequest {
+  action: 'release_implementations';
+}
+
+/**
  * Shutdown the sidecar process
  */
 export interface ShutdownRequest extends BaseRequest {
@@ -938,6 +946,7 @@ export type SidecarRequest =
   | ReachGraphRequest
   | ReachRequest
   | AddProgramFilesRequest
+  | ReleaseImplementationsRequest
   | PositionRowsRequest
   | ImplementationsRequest;
 
@@ -1165,6 +1174,12 @@ export interface ShutdownResponse extends BaseResponse {
 /** Response for implementations: one answer per question, in request order. */
 export interface ImplementationsResponse extends BaseResponse {
   result?: { answers: ImplementationsAnswer[] };
+  errors?: string[];
+}
+
+/** Response for release_implementations: the programs dropped. */
+export interface ReleaseImplementationsResponse extends BaseResponse {
+  result?: { released: number };
   errors?: string[];
 }
 
@@ -1562,6 +1577,7 @@ export type SidecarResponse =
   | ReachGraphResponse
   | ReachResponse
   | AddProgramFilesResponse
+  | ReleaseImplementationsResponse
   | PositionRowsResponse
   | ImplementationsResponse
   | ErrorResponse;

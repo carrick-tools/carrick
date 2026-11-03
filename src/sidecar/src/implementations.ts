@@ -118,6 +118,14 @@ export class ImplementationPrograms {
     }
     return held;
   }
+
+  /** Drop every kept program, as Rust asks when its last chunk is done; the count dropped. */
+  clear(): number {
+    const dropped = this.kept.size;
+    this.kept.clear();
+    this.filesKey = '';
+    return dropped;
+  }
 }
 
 /** An answer with nothing found, and why. */
