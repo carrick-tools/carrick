@@ -8725,6 +8725,14 @@ fn append_pubsub_operations(
 /// manifest anchor for it would orphan the anchor. The same `sockets` set
 /// feeds the fold both places, and so does `in_process` (carrick#1513): a
 /// row it withdrew has no operation to anchor.
+///
+/// A model op the library row at its site states is skipped above, and the
+/// library row gets the entry instead (carrick#3089): every stated pub/sub
+/// row whose name is global with no namespace, keyed and site-id'd as a
+/// model op would be, carrying the folded op's symbol when it names one.
+/// The fact layer's slot at the call types it (`SitePayloads::requests`).
+/// A service-scoped or namespaced row gets none, since the type check pairs
+/// non-HTTP entries by key alone.
 fn append_pubsub_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
@@ -8805,9 +8813,13 @@ fn append_pubsub_manifest_entries(
     // fact layer's slot types it; a symbol the folded model op names is its
     // request when no slot does (the op's symbol request is already sent at
     // this alias by `collect_pubsub_type_requests`).
+    // Sorted paths, first op wins: two model ops at one site naming different
+    // symbols pick the same one on every scan.
     let mut folded_symbols: HashMap<(PathBuf, u32, String, PubsubRole), String> = HashMap::new();
-    for (path, result) in file_results {
-        for op in &result.pubsub_operations {
+    let mut paths: Vec<&String> = file_results.keys().collect();
+    paths.sort();
+    for path in paths {
+        for op in &file_results[path].pubsub_operations {
             let (Some(role), Some(symbol)) = (op.role, op.primary_type_symbol.as_ref()) else {
                 continue;
             };
