@@ -115,6 +115,32 @@ pub(crate) struct ImplementationTargets {
     took_ms: u64,
     /// Answers by the sidecar's reason for searching nothing.
     reasons: BTreeMap<String, usize>,
+    /// The first [`NAMED_PER_REASON`] questions for each such reason: the
+    /// question's file and offset, then the declaration's file and line.
+    named: BTreeMap<String, Vec<(String, u32, PathBuf, u32)>>,
+}
+
+/// Questions the run-log line names for each reason.
+const NAMED_PER_REASON: usize = 5;
+
+/// The 1-based line of a UTF-16 offset in `file`, or the offset itself when
+/// the file cannot be read.
+fn line_of(file: &str, offset: u32) -> String {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return format!("@{offset}");
+    };
+    let mut units = 0u32;
+    let mut line = 1u32;
+    for ch in text.chars() {
+        if units >= offset {
+            break;
+        }
+        units += u32::try_from(ch.len_utf16()).unwrap_or(1);
+        if ch == '\n' {
+            line += 1;
+        }
+    }
+    line.to_string()
 }
 
 impl ImplementationTargets {
@@ -135,7 +161,7 @@ impl ImplementationTargets {
     pub(crate) fn summary(&self) -> String {
         format!(
             "declarations asked: {}, answered: {}, failed: {}{}, left unasked: {}, \
-             took {} ms, searched nothing by reason: {:?}",
+             took {} ms, searched nothing by reason: {:?}{}",
             self.asked,
             self.answered,
             self.failed,
@@ -145,8 +171,29 @@ impl ImplementationTargets {
                 .unwrap_or_default(),
             self.unasked,
             self.took_ms,
-            self.reasons
+            self.reasons,
+            self.named_questions()
         )
+    }
+
+    /// ` [reason: file:line -> declared_file:line, ...]` for each reason.
+    fn named_questions(&self) -> String {
+        self.named
+            .iter()
+            .map(|(reason, questions)| {
+                let shown: Vec<String> = questions
+                    .iter()
+                    .map(|(file, start, declared, line)| {
+                        format!(
+                            "{file}:{} -> {}:{line}",
+                            line_of(file, *start),
+                            declared.display()
+                        )
+                    })
+                    .collect();
+                format!(" [{reason}: {}]", shown.join(", "))
+            })
+            .collect()
     }
 }
 
@@ -295,9 +342,20 @@ fn ask_with(
             continue;
         };
         targets.answered += chunk.len();
-        for ((group, _), answer) in chunk.iter().zip(&answers) {
+        for ((group, query), answer) in chunk.iter().zip(&answers) {
             if let Some(reason) = &answer.reason {
                 *targets.reasons.entry(reason.clone()).or_default() += 1;
+                let named = targets.named.entry(reason.clone()).or_default();
+                if named.len() < NAMED_PER_REASON {
+                    if let Some(first) = group.first() {
+                        named.push((
+                            query.file.clone(),
+                            query.start,
+                            first.declared.0.clone(),
+                            first.declared.1,
+                        ));
+                    }
+                }
             }
             set(&mut targets, group, &read(answer));
         }
@@ -592,6 +650,68 @@ mod tests {
             line.contains("failed: 64 (first error: the sidecar died)"),
             "{line}"
         );
+    }
+
+    /// The debug line names each question that searched nothing: the call's
+    /// file and line, then the declaration's, at most five per reason.
+    #[test]
+    fn the_summary_names_the_questions_that_searched_nothing() {
+        struct Nothing;
+        impl AskImplementations for Nothing {
+            fn ask(
+                &self,
+                queries: &[ImplementationsQuery],
+                _: &Path,
+                _: &[PathBuf],
+            ) -> Result<Vec<ImplementationsAnswer>, String> {
+                Ok(queries
+                    .iter()
+                    .map(|_| ImplementationsAnswer {
+                        declaration: None,
+                        implementations: vec![],
+                        too_many: false,
+                        reason: Some("not_in_program".to_string()),
+                    })
+                    .collect())
+            }
+            fn release(&self) {}
+        }
+        let dir = std::env::temp_dir().join(format!("impl-summary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("script.mjs");
+        std::fs::write(&file, "a\nb\nread();\n").unwrap();
+        // 7 declarations, each asked from the call on line 3 (offset 4).
+        let calls: Vec<_> = (0..7)
+            .map(|i| EdgelessCall {
+                file: file.clone(),
+                lo: 4 + i * 100,
+                hi: 9 + i * 100,
+                row: Some(i as usize),
+                declared: (PathBuf::from("/repo/src/p.ts"), i + 1),
+            })
+            .collect();
+        let stub = Nothing;
+        let targets = ask_with(
+            &calls,
+            |call| {
+                Some(ImplementationsQuery {
+                    file: call.file.to_string_lossy().into_owned(),
+                    start: 4,
+                    end: 9,
+                })
+            },
+            &stub,
+            Path::new(ROOT),
+            &[],
+            Duration::from_secs(60),
+            read,
+        );
+        let line = targets.summary();
+        let shown = format!("{}:3 -> /repo/src/p.ts:1", file.display());
+        assert!(line.contains(&shown), "{line}");
+        assert!(line.contains("/repo/src/p.ts:5"), "{line}");
+        assert!(!line.contains("/repo/src/p.ts:6"), "{line}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
