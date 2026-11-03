@@ -94,6 +94,11 @@ pub(crate) struct ImplementationTargets {
     asked: usize,
     /// Declarations that came back answered.
     answered: usize,
+    /// Declarations in chunks whose ask erred or came back with a wrong
+    /// count of answers: asked, never answered.
+    failed: usize,
+    /// Why the first such chunk failed.
+    first_error: Option<String>,
     /// Declarations left unasked by the budget.
     unasked: usize,
     took_ms: u64,
@@ -118,9 +123,18 @@ impl ImplementationTargets {
     /// The run-log line for one service.
     pub(crate) fn summary(&self) -> String {
         format!(
-            "declarations asked: {}, answered: {}, left unasked: {}, took {} ms, \
-             searched nothing by reason: {:?}",
-            self.asked, self.answered, self.unasked, self.took_ms, self.reasons
+            "declarations asked: {}, answered: {}, failed: {}{}, left unasked: {}, \
+             took {} ms, searched nothing by reason: {:?}",
+            self.asked,
+            self.answered,
+            self.failed,
+            self.first_error
+                .as_ref()
+                .map(|e| format!(" (first error: {e})"))
+                .unwrap_or_default(),
+            self.unasked,
+            self.took_ms,
+            self.reasons
         )
     }
 }
@@ -249,19 +263,19 @@ fn ask_with(
         let answers = match asker.ask(&queries, scan_root) {
             Ok(answers) if answers.len() == chunk.len() => Some(answers),
             Ok(answers) => {
-                debug!(
-                    "implementations: {} answers to {} questions, none read",
-                    answers.len(),
-                    chunk.len()
-                );
+                let why = format!("{} answers to {} questions", answers.len(), chunk.len());
+                debug!("implementations: {why}, none read");
+                targets.first_error.get_or_insert(why);
                 None
             }
             Err(e) => {
                 debug!("implementations: the ask failed: {e}");
+                targets.first_error.get_or_insert(e);
                 None
             }
         };
         let Some(answers) = answers else {
+            targets.failed += chunk.len();
             for (group, _) in chunk {
                 set(&mut targets, group, &Outcome::NoEdge);
             }
@@ -541,6 +555,12 @@ mod tests {
                 .is_some()
         );
         assert_eq!(targets.answered, 1);
+        assert_eq!(targets.failed, 64);
+        let line = targets.summary();
+        assert!(
+            line.contains("failed: 64 (first error: the sidecar died)"),
+            "{line}"
+        );
     }
 
     #[test]
