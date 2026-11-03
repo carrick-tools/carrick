@@ -5958,6 +5958,114 @@ impl FileOrchestrator {
         requests
     }
 
+    /// Build `InferRequestItem`s for socket payloads written inline
+    /// (carrick#3094): an emitter with no payload type symbol is asked as an
+    /// `Expression` at its payload argument, and a listener whose first
+    /// parameter states an inline type is asked as a `FunctionParam` at its
+    /// handler. Sibling of `collect_socket_type_requests`, which covers the
+    /// named-symbol ops; the two never ask for one op.
+    ///
+    /// The alias is `build_manifest_type_alias(&op.key, role, Response)` with no
+    /// site id, byte-identical to the one `append_protocol_manifest_entries`
+    /// stamps on a socket entry. One request per alias: an alias a symbol
+    /// anchors (same role) or an earlier op already asked is not asked again
+    /// (two inline emitters of one event share the alias, the existing fan-in
+    /// limit, carrick#291). A file that cannot be read yields no request.
+    pub fn collect_socket_infer_requests(
+        &self,
+        sockets: &crate::socket_io::SocketExtraction,
+        repo_path: &str,
+    ) -> Vec<InferRequestItem> {
+        let repo_root = std::path::Path::new(repo_path);
+        let repo_root_absolute = if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        };
+
+        let alias_of = |op: &crate::socket_io::SocketOp, role: ManifestRole| {
+            build_manifest_type_alias(&op.key, role, ManifestTypeKind::Response)
+        };
+        // Aliases the symbol path already anchors: the bundle wins anyway.
+        let mut seen: HashSet<String> = HashSet::new();
+        for op in &sockets.listeners {
+            if op.payload_type_symbol.is_some() {
+                seen.insert(alias_of(op, ManifestRole::Producer));
+            }
+        }
+        for op in &sockets.emitters {
+            if op.payload_type_symbol.is_some() {
+                seen.insert(alias_of(op, ManifestRole::Consumer));
+            }
+        }
+
+        let mut candidates: Vec<(&crate::socket_io::SocketOp, ManifestRole)> = sockets
+            .listeners
+            .iter()
+            .filter(|op| op.handler_param.is_some())
+            .map(|op| (op, ManifestRole::Producer))
+            .chain(
+                sockets
+                    .emitters
+                    .iter()
+                    .filter(|op| op.payload_span.is_some())
+                    .map(|op| (op, ManifestRole::Consumer)),
+            )
+            .collect();
+        candidates.sort_by(|(a, _), (b, _)| (&a.file_path, a.line).cmp(&(&b.file_path, b.line)));
+
+        let mut sources: HashMap<String, Option<String>> = HashMap::new();
+        let mut requests: Vec<InferRequestItem> = Vec::new();
+        for (op, role) in candidates {
+            let alias = alias_of(op, role);
+            if seen.contains(&alias) {
+                continue;
+            }
+            let file_abs =
+                Self::to_absolute_path(&op.file_path.to_string_lossy(), &repo_root_absolute);
+            let Some(source) = sources
+                .entry(file_abs.clone())
+                .or_insert_with(|| std::fs::read_to_string(&file_abs).ok())
+                .as_deref()
+            else {
+                continue;
+            };
+            let (span, infer_kind, param_name) = match (&op.handler_param, op.payload_span) {
+                (Some(handler), _) => (
+                    handler.span,
+                    InferKind::FunctionParam,
+                    Some(handler.name.clone()),
+                ),
+                (None, Some(span)) => (span, InferKind::Expression, None),
+                (None, None) => continue,
+            };
+            seen.insert(alias.clone());
+            requests.push(InferRequestItem {
+                file_path: file_abs,
+                line_number: op.line,
+                span_start: Some(crate::utils::sidecar_position(source, span.0)),
+                span_end: Some(crate::utils::sidecar_position(source, span.1)),
+                expression_text: None,
+                expression_line: None,
+                infer_kind,
+                alias: Some(alias),
+                param_name,
+                member: None,
+                result: None,
+                route_path: None,
+            });
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} socket inline-payload infer requests",
+            requests.len()
+        );
+        requests
+    }
+
     /// Build `SymbolRequest`s for pub/sub decoded-payload anchors (#corpus-2
     /// resolution dim).
     ///

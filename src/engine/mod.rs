@@ -5687,6 +5687,13 @@ async fn analyze_current_repo_incremental(
             protocol_infer.extend(
                 file_orchestrator.collect_pubsub_infer_requests(&pubsub_results, repo_path),
             );
+            // Socket payloads written inline (an object literal at the emit,
+            // a type literal on the listener's parameter) are read where
+            // they are written (carrick#3094).
+            protocol_infer.extend(file_orchestrator.collect_socket_infer_requests(
+                &library_sites.typed_sockets(&protocol_extractions.sockets),
+                repo_path,
+            ));
             // A GraphQL consumer row whose executed document declares the
             // field's result type reads that type where it is declared
             // (carrick#1761).
@@ -13355,6 +13362,13 @@ async fn analyze_current_repo(
     // the LLM-located payload expression through the same infer path.
     protocol_infer
         .extend(file_orchestrator.collect_pubsub_infer_requests(&pubsub_results, repo_path));
+    // Socket payloads written inline (an object literal at the emit, a type
+    // literal on the listener's parameter) are read where they are written
+    // (carrick#3094).
+    protocol_infer.extend(file_orchestrator.collect_socket_infer_requests(
+        &library_sites.typed_sockets(&protocol_extractions.sockets),
+        repo_path,
+    ));
     // A GraphQL consumer row whose executed document declares the field's
     // result type reads that type where it is declared (carrick#1761).
     protocol_infer.extend(
@@ -24897,6 +24911,8 @@ unfollowed_member_calls_total: 0,
             line: 12,
             payload_type_symbol: symbol.map(String::from),
             payload_type_source: source.map(String::from),
+            payload_span: None,
+            handler_param: None,
         }
     }
 
@@ -27564,6 +27580,8 @@ unfollowed_member_calls_total: 0,
             line,
             payload_type_symbol: None,
             payload_type_source: None,
+            payload_span: None,
+            handler_param: None,
         }
     }
 
@@ -29322,6 +29340,85 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
     }
 
+    /// Socket payloads written inline are asked at the place they are written
+    /// (carrick#3094): an emitter with no symbol as an `Expression` over its
+    /// payload argument, a listener with an inline parameter type as a
+    /// `FunctionParam` over its handler. A symbol, a named annotation and an
+    /// unannotated parameter ask nothing here, and the alias is the manifest's.
+    #[test]
+    fn socket_inline_payloads_become_infer_requests() {
+        use crate::services::type_sidecar::InferKind;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("live.ts");
+        let source = r#"import { Server } from "socket.io";
+const io = new Server();
+const shipped: Shipped = load();
+io.emit("inline:out", { id: 1 });
+io.emit("named:out", shipped);
+io.on("inline:in", (event: { id: string }) => {});
+io.on("named:in", (event: Named) => {});
+io.on("bare:in", (event) => {});
+"#;
+        std::fs::write(&file, source).unwrap();
+        let sockets = crate::socket_io::scan_files(std::slice::from_ref(&file), &[]);
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests =
+            orchestrator.collect_socket_infer_requests(&sockets, &dir.path().to_string_lossy());
+        assert_eq!(requests.len(), 2, "{requests:#?}");
+
+        let alias = |name: &str, role: ManifestRole, direction| {
+            crate::type_manifest::build_manifest_type_alias(
+                &OperationKey::socket(name, direction),
+                role,
+                ManifestTypeKind::Response,
+            )
+        };
+        let text = |request: &crate::services::type_sidecar::InferRequestItem| {
+            let (start, end) = (
+                request.span_start.unwrap() as usize,
+                request.span_end.unwrap() as usize,
+            );
+            source[start..end].to_string()
+        };
+
+        let emit = requests
+            .iter()
+            .find(|r| r.infer_kind == InferKind::Expression)
+            .expect("an Expression request for the emit");
+        assert_eq!(
+            emit.alias.as_deref(),
+            Some(
+                alias(
+                    "inline:out",
+                    ManifestRole::Consumer,
+                    crate::operation::SocketDirection::ServerToClient
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(text(emit), "{ id: 1 }");
+
+        let listen = requests
+            .iter()
+            .find(|r| r.infer_kind == InferKind::FunctionParam)
+            .expect("a FunctionParam request for the listener");
+        assert_eq!(
+            listen.alias.as_deref(),
+            Some(
+                alias(
+                    "inline:in",
+                    ManifestRole::Producer,
+                    crate::operation::SocketDirection::ClientToServer
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(listen.param_name.as_deref(), Some("event"));
+        assert_eq!(text(listen), "(event: { id: string }) => {}");
+    }
+
     /// The same fragile alias contract for pub/sub (PR-6, corpus-2 resolution dim):
     /// the SymbolRequest alias produced by `collect_pubsub_type_requests` MUST
     /// byte-match the manifest entry's alias from `append_pubsub_manifest_entries`,
@@ -29826,6 +29923,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     line: 28,
                     payload_type_symbol: Some("Payment".to_string()),
                     payload_type_source: Some("../src/types".to_string()),
+                    payload_span: None,
+                    handler_param: None,
                 }],
             },
             library: Default::default(),
@@ -30097,6 +30196,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     line: 28,
                     payload_type_symbol: None,
                     payload_type_source: None,
+                    payload_span: None,
+                    handler_param: None,
                 }],
             },
             ..Default::default()

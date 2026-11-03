@@ -3020,7 +3020,6 @@ async fn seed_socket_field_rename_marking() {
 /// The emit's payload is an inline object literal the emitter's own file
 /// states; dropping `carrier` from it breaks the listener in `storefront`.
 #[tokio::test]
-#[ignore = "carrick#3094: the emitter's inline payload reads unknown, so the pair is unverifiable"]
 async fn seed_socket_field_removal() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("socket-field-removal").await;

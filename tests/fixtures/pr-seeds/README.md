@@ -64,7 +64,7 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `graphql-field-removal` | `currency` dropped from `OrderView` (schema and resolver type; the answer's resolver line 11 to 10) | as above | as above |
 | `graphql-root-rename` | `order` to `orderById` (schema :2, resolvers :11, answer) | `missing_endpoint` `QUERY order` at `src/order-query.ts:9`; delta | passes; `_marking` ignored, carrick#3092 |
 | `socket-field-rename` | listener's `OrderUpdate.status` to `state` (`src/realtime.ts:5`) | `type_mismatch` at `storefront` `src/live.ts:12`, `on_main: false`, `resolved`; marking: `CLIENT->SERVER order:update` label, `edge_source` | passes; `_marking` ignored, carrick#3090 and carrick#3091 |
-| `socket-field-removal` | the `order:shipped` emit drops `carrier` (`src/realtime.ts:12`) | `type_mismatch` `SERVER->CLIENT order:shipped` at `src/realtime.ts:12` | ignored, carrick#3094, carrick#3090, carrick#3091 |
+| `socket-field-removal` | the `order:shipped` emit drops `carrier` (`src/realtime.ts:12`) | `type_mismatch` `SERVER->CLIENT order:shipped` at `src/realtime.ts:12` | passes; shown waits on carrick-cloud#2829 |
 | `socket-listener-rename` | `order:update` to `order:changed` (`src/realtime.ts:11`) | `missing_endpoint` at `src/live.ts:12`; delta | passes; `_marking` ignored, carrick#3092 |
 | `socket-emit-rename` | `order:shipped` to `order:dispatched` (`src/realtime.ts:12`) | `missing_endpoint` at the PR's emit, `orphaned_endpoint`, no delta row | passes; `_marking` ignored, carrick#3092 |
 | `pubsub-field-rename` | subscriber's `PaymentSettled.amount` to `total` (`src/events.ts:5`) | `type_mismatch` `PUBSUB payments.settled` at `src/payments.ts:10` | ignored, carrick#3089 |
