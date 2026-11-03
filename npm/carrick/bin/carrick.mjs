@@ -312,6 +312,35 @@ function extraHelp() {
   ].join("\n");
 }
 
+/**
+ * `lsp --help` and `templates --help` print their own help and exit 0. Before
+ * this, `lsp` started the language server on any argument and `templates`
+ * read `--help` as a template name and refused it (carrick-cloud#2884).
+ */
+const SUBCOMMAND_HELP = {
+  lsp: [
+    "carrick lsp --stdio",
+    "",
+    "Run the language server on stdin and stdout, for an editor or an agent that",
+    "speaks LSP. It reads the index this folder already holds and writes nothing",
+    "into the repository.",
+    "",
+  ],
+  templates: [
+    "carrick templates <name> [--variable value]...",
+    "",
+    "Print a file to add to a repo to stdout: `workflow` (the GitHub Actions",
+    "workflow) or `carrick.json`. Each --variable value pair fills a placeholder",
+    "of that name, for example `--default-branch trunk`. It writes no file.",
+    "",
+  ],
+};
+const helpLines = SUBCOMMAND_HELP[command];
+if (helpLines && rest.some((argument) => argument === "--help" || argument === "-h")) {
+  process.stdout.write(helpLines.join("\n"));
+  process.exit(0);
+}
+
 switch (command) {
   case "login": {
     const { login } = await import("../dist/auth/run.js");

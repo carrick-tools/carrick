@@ -1993,8 +1993,13 @@ fn report_with_scans(
 }
 
 fn print_help() {
-    crate::errln!(
-        r#"Carrick — read-only facts from your disk
+    crate::errln!("{}", HELP);
+}
+
+/// The text `carrick --help` prints. `check --help`'s re-check wording names
+/// what goes on the wire; `help_says_what_a_recheck_sends` pins it
+/// (carrick-cloud#2884).
+const HELP: &str = r#"Carrick — read-only facts from your disk
 
 USAGE:
     carrick derive  [--workspace <dir>] --json
@@ -2044,7 +2049,11 @@ USAGE:
                --recheck re-extracts the file and re-judges it against the
                index before answering, when the tree has moved past the index:
                one repo is re-scanned and the join runs over blobs already on
-               disk, with no model and nothing on the wire. It has ten seconds
+               disk, with no model. It asks Carrick's library store, read-only
+               and signed in, about the installed packages: package names,
+               versions, import specifiers and the TypeScript library globals
+               the code uses go on the wire, no source code, and the store
+               builds nothing for the ask. It has ten seconds
                (CARRICK_RECHECK_BUDGET_MS); past that the answer is the indexed
                one and says so. A repo whose re-check missed its budget is
                remembered against that index (.carrick/recheck-misses.json):
@@ -2070,6 +2079,8 @@ USAGE:
                Several files (`check a.ts b.ts`) are checked the same way:
                the named files, always re-extracted, each repo scanned once,
                the same summary line and exit code as --changed.
+               --changed and named files ask the library store the same way
+               as --recheck.
     refresh    Re-scan one service (or every repo) and re-join.
 
 On macOS, index, resume and refresh keep this machine from idle-sleeping until
@@ -2083,9 +2094,7 @@ names with `exclude`. `touch` and `check` find an index above the file, or
 take its workspace from --workspace or CARRICK_WORKSPACE.
 
 Output shape: docs/local-mode-output.md (`--json` prints carrick.check/0, or
-carrick.status/0 from `status`)."#
-    );
-}
+carrick.status/0 from `status`)."#;
 
 #[cfg(test)]
 #[path = "derive_candidates_tests.rs"]
@@ -2094,6 +2103,18 @@ mod derive_candidates_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every re-extracting `check` asks the library store about the installed
+    /// packages (engine `read_from_library_store`, `AskBody::ReadOnly`), so
+    /// the help may not claim "nothing on the wire" (carrick-cloud#2884).
+    #[test]
+    fn help_says_what_a_recheck_sends() {
+        assert!(!HELP.contains("nothing on the wire"));
+        let flat = HELP.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(
+            "package names, versions, import specifiers and the TypeScript library globals the code uses go on the wire, no source code"
+        ));
+    }
 
     fn args(input: &[&str]) -> Vec<String> {
         input.iter().map(|s| s.to_string()).collect()
