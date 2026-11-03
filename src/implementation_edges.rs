@@ -346,15 +346,15 @@ fn ask_with(
             if let Some(reason) = &answer.reason {
                 *targets.reasons.entry(reason.clone()).or_default() += 1;
                 let named = targets.named.entry(reason.clone()).or_default();
-                if named.len() < NAMED_PER_REASON {
-                    if let Some(first) = group.first() {
-                        named.push((
-                            query.file.clone(),
-                            query.start,
-                            first.declared.0.clone(),
-                            first.declared.1,
-                        ));
-                    }
+                if named.len() < NAMED_PER_REASON
+                    && let Some(first) = group.first()
+                {
+                    named.push((
+                        query.file.clone(),
+                        query.start,
+                        first.declared.0.clone(),
+                        first.declared.1,
+                    ));
                 }
             }
             set(&mut targets, group, &read(answer));
