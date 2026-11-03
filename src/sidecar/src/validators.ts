@@ -327,6 +327,10 @@ export const HealthRequestSchema = BaseRequestSchema.extend({
   action: z.literal('health'),
 });
 
+export const ReleaseImplementationsRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('release_implementations'),
+});
+
 export const ShutdownRequestSchema = BaseRequestSchema.extend({
   action: z.literal('shutdown'),
 });
@@ -772,6 +776,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   AddProgramFilesRequestSchema,
   PositionRowsRequestSchema,
   ImplementationsRequestSchema,
+  ReleaseImplementationsRequestSchema,
 ]);
 
 // ============================================================================

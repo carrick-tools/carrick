@@ -74,6 +74,7 @@ import type {
   ReachGraphResponse,
   ReachResponse,
   AddProgramFilesResponse,
+  ReleaseImplementationsResponse,
   PositionRowsResponse,
   ImplementationsResponse,
   ErrorResponse,
@@ -980,6 +981,17 @@ function handleAddProgramFiles(
 
 const implementationPrograms = new ImplementationPrograms();
 
+/** Handle the 'release_implementations' action - drop the kept programs. */
+function handleReleaseImplementations(
+  request: SidecarRequest & { action: 'release_implementations' }
+): ReleaseImplementationsResponse {
+  return {
+    request_id: request.request_id,
+    status: 'success',
+    result: { released: implementationPrograms.clear() },
+  };
+}
+
 /**
  * Handle the 'implementations' action - the implementations of the bodyless
  * declaration each call goes through (carrick#2432). Answered over the walk's
@@ -1126,6 +1138,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handlePositionRows(request);
     case 'implementations':
       return handleImplementations(request);
+    case 'release_implementations':
+      return handleReleaseImplementations(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

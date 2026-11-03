@@ -83,4 +83,14 @@ describe('implementations: the walk\'s program (carrick#3220 R1)', () => {
     ask(walked.slice(1), programs);
     assert.strictEqual(programs.builds, 2);
   });
+
+  it('releases the kept programs, and the next request builds again', () => {
+    const programs = new ImplementationPrograms();
+    ask(walked, programs);
+    assert.strictEqual(programs.builds, 1);
+    assert.strictEqual(programs.clear(), 1);
+    assert.strictEqual(programs.clear(), 0);
+    ask(walked, programs);
+    assert.strictEqual(programs.builds, 2);
+  });
 });

@@ -141,6 +141,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `reach` | no | The files a set of edits can reach in a `reach_graph` graph: `{ reached, augmented, exports_moved }` |
 | `position_rows` | yes | Write the compiler's rows for every call, member access, comparison and identifier of a service's files (record-only) |
 | `implementations` | yes | The implementations of the bodyless declaration each given call goes through |
+| `release_implementations` | no | Drop the programs `implementations` keeps; `{ released }` is how many (Rust sends it after the last chunk) |
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
@@ -1034,6 +1035,8 @@ Each query is the span of a `call` (or `member`) position row: `start` and `end`
 ```
 
 One answer per query, in request order. A declaration and each implementation are named as a position row names a declaration, so an implementation joins to a definition as a `call` row at it would; its line is where the implementation's declaration starts, decorators included. Implementations are sorted by `decl_file`, then position, and never include the declaration's own signatures. More than 16 → `too_many: true` and none listed. `reason`, when nothing was searched: `not_in_program`, `no_call` (no `call` or `member` node has that span), `no_symbol`, `no_declaration`, `has_body` (the declaration runs its own body) or `checker_threw`. The position rows carry no implementations (version 4).
+
+`release_implementations` carries no payload beyond the envelope and answers `{ "released": <programs dropped> }`. The program `implementations` builds is kept across requests with the same `files`; the sidecar cannot see the last chunk, so the caller says when.
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 
