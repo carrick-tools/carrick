@@ -3012,7 +3012,7 @@ link.emit("order.shipped", parcel);
     }
 
     /// The text a `(lo, hi)` SWC span selects in `source` (ASCII sources).
-    fn spanned<'a>(source: &'a str, span: (u32, u32)) -> &'a str {
+    fn spanned(source: &str, span: (u32, u32)) -> &str {
         let start = crate::utils::sidecar_position(source, span.0) as usize;
         let end = crate::utils::sidecar_position(source, span.1) as usize;
         &source[start..end]
