@@ -30720,17 +30720,17 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "the PR wrote no unread site"
         );
         assert_eq!(
-            sources(&[rewritten.place.clone()]),
+            sources(std::slice::from_ref(&rewritten.place)),
             named([candidate, fact, fact]),
             "a GET site serves the GET route alone"
         );
         assert_eq!(
-            sources(&[plugin.place.clone()]),
+            sources(std::slice::from_ref(&plugin.place)),
             named([candidate, candidate, fact]),
             "an ALL site serves every route of its service, and no query"
         );
         assert_eq!(
-            sources(&[elsewhere.place.clone()]),
+            sources(std::slice::from_ref(&elsewhere.place)),
             named([fact, fact, fact]),
             "a site of another service serves none"
         );
