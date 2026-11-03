@@ -174,6 +174,13 @@ pub enum OnMainUnknown {
     /// untouched, or the two contradict each other. Doubt lands here, never on
     /// `on_main: false`.
     RemovalUnplaced,
+    /// The pairing exists only at the PR's head, but the PR changed an input
+    /// other than source files that the producer's or consumer's service
+    /// reads (its manifest, lockfile, tsconfig chain or `carrick.json`,
+    /// carrick#1712). Those can move how the scanner reads code the PR never
+    /// touched, so a pairing that only head shows may be the same code read
+    /// differently, not one the PR wrote.
+    ReadingMoved,
 }
 
 /// The operation a PR removed or renamed away that another service still uses

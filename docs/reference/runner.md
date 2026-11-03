@@ -96,6 +96,11 @@ the merge base of the base commit and HEAD to the tree the scan read.
   open. A row the diff places by its lines is listed whatever moved. The
   cost: a pull request that changes such an input and also moves a mount
   prefix or a path constant lists no delta for the routes that moved.
+- A finding that exists only at head, with a producer or consumer service in
+  that same state, is posted as not compared with main
+  (`on_main_unknown: "reading_moved"`) rather than as one the pull request
+  introduced, because the pairing may be code the scanner now reads
+  differently, not code the pull request wrote.
 - Everything else is a reading that moved. It is counted in one info line of
   the run log and not listed.
 - Each listed operation carries `edge_source`: `fact` when a deterministic

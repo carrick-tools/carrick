@@ -13506,6 +13506,29 @@ struct PrChange {
 }
 
 impl PrChange {
+    /// Which services read an input other than source files the change
+    /// touched (carrick#1712). `None` in the set means every service.
+    fn reading_moved(&self) -> crate::pr_baseline::ReadingMoved {
+        let moved = crate::change_scope::reading_moved_services(
+            &self.repo_path,
+            &self.services,
+            Some(&self.changes),
+            &self.base,
+        );
+        crate::pr_baseline::ReadingMoved::of(
+            self.services.iter().map(|service| {
+                (
+                    service
+                        .service_name
+                        .clone()
+                        .unwrap_or_else(|| self.repo_name.clone()),
+                    service.service_name.clone(),
+                )
+            }),
+            &moved,
+        )
+    }
+
     /// Which services the change leaves untouched, beside every peer service
     /// (carrick#3170).
     fn untouched(&self, peers: &[CloudRepoData]) -> crate::pr_baseline::Untouched {
@@ -13679,6 +13702,7 @@ async fn main_side_findings(
         untouched,
         ..
     } = input;
+    let reading_moved = untouched.as_ref().map(PrChange::reading_moved);
     let untouched = untouched.map(|change| change.untouched(&peers));
     // Main's own answers, from the scan that had main's sources on disk. The
     // recomputation below has none, so a response main's scan judged by
@@ -13719,6 +13743,7 @@ async fn main_side_findings(
         stored,
         types_judged: type_check == crate::local_mode::JoinTypeCheck::Ran,
         untouched,
+        reading_moved,
     })
 }
 
