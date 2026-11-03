@@ -149,12 +149,10 @@ fn an_untyped_receiver_states_no_edge_and_an_interface_member_takes_its_implemen
         return;
     }
     let edges = scan_edges(true);
-    for caller in ["viaAny"] {
-        assert!(
-            !edges.iter().any(|(from, ..)| from == caller),
-            "{caller} states no edge: {edges:#?}"
-        );
-    }
+    assert!(
+        !edges.iter().any(|(from, ..)| from == "viaAny"),
+        "viaAny states no edge: {edges:#?}"
+    );
     // `store.read()` with `store: Store`: the closure the factory returns is
     // the one implementation, so the call reaches it.
     assert!(
