@@ -721,6 +721,16 @@ impl RequestSummaryInputs {
         if row_calls.kept.contains(&(file.to_path_buf(), lo, hi)) || self.test_only.contains(file) {
             return None;
         }
+        // The walk holds no rows for this file (it produced none, or the
+        // file is not in it): a scan-level fact reported elsewhere, not a
+        // call the code left open.
+        if !self
+            .positions
+            .as_ref()
+            .is_some_and(|positions| positions.holds_rows_for(file))
+        {
+            return None;
+        }
         match self.reach(file, lo, hi) {
             Reach::Unknown(reason) => Some(Unfollowed {
                 reason: hole_key(reason),
@@ -1295,6 +1305,29 @@ mod tests {
             stated,
             BTreeMap::from([line(4, "/untyped"), line(8, "/required")])
         );
+    }
+
+    /// A walk that produced no rows is a scan-level fact, not a call left
+    /// open: no call is written as unfollowed (fix G).
+    #[test]
+    fn a_walk_with_no_rows_leaves_no_call_unfollowed() {
+        let Some(mut on) = calls(&[], true) else {
+            return;
+        };
+        let any = |inputs: &RequestSummaryInputs| {
+            every_call(&inputs.files)
+                .into_iter()
+                .any(|(file, call, _)| {
+                    inputs
+                        .unfollowed_at(file, call.site.lo, call.site.hi)
+                        .is_some()
+                })
+        };
+        assert!(any(&on.inputs), "the fixture leaves a call open with rows");
+        on.inputs.positions = Some(crate::position_rows::PositionIndex::missing(&on.repo));
+        assert!(!any(&on.inputs), "a walk with no rows writes no call");
+        on.inputs.positions = None;
+        assert!(!any(&on.inputs), "no walk writes no call");
     }
 
     /// Each call's target is read from the rows once: asking again looks no

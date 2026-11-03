@@ -839,7 +839,33 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
         "the walk is one process of its own"
     );
     assert_walk_first(&on.events);
-    assert_eq!(on.blobs, off.blobs, "writing rows moved the blob");
+    // Rows add the calls the code left open (carrick#813) and nothing else.
+    let mut on_blobs = on.blobs.clone();
+    let mut left_open = Vec::new();
+    for blob in on_blobs.values_mut() {
+        let blob = blob.as_object_mut().expect("a blob is an object");
+        if let Some(rows) = blob.remove("unfollowed_member_calls") {
+            left_open.extend(rows.as_array().expect("rows are a list").clone());
+        }
+        blob.remove("unfollowed_member_calls_total");
+    }
+    assert_eq!(on_blobs, off.blobs, "writing rows moved the blob");
+    assert_eq!(
+        left_open
+            .iter()
+            .map(|row| (
+                row["file"].as_str().unwrap_or_default().to_string(),
+                row["line"].as_u64().unwrap_or_default(),
+                row["reason"].as_str().unwrap_or_default().to_string()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            "apps/api/src/broken.ts".to_string(),
+            4,
+            "unresolved_name".to_string()
+        )],
+        "{left_open:#?}"
+    );
     assert_eq!(read_as(&on), BTreeSet::from(["read".to_string()]));
     assert_eq!(
         on.rows

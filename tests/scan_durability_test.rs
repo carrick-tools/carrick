@@ -1418,7 +1418,14 @@ async fn walking_before_the_loop_makes_the_same_setup_requests_and_index() {
 
     assert_eq!(asked_unwalked, [3, 18, 3]);
     assert_eq!(asked_walked, asked_unwalked);
-    assert_eq!(index_written(&walked), index_written(&unwalked));
+    // Rows add the calls the code left open (carrick#813) and nothing else.
+    let mut with_rows = index_written(&walked);
+    for service in &mut with_rows {
+        let service = service.as_object_mut().unwrap();
+        service.remove("unfollowed_member_calls");
+        service.remove("unfollowed_member_calls_total");
+    }
+    assert_eq!(with_rows, index_written(&unwalked));
     for storage in [&walked, &unwalked] {
         assert!(storage.scan_failed.lock().unwrap().is_empty());
     }
