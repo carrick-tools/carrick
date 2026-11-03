@@ -174,6 +174,7 @@ impl Placeable for RemovedSend {
 }
 
 /// Mark each of `removed` placed when the PR's diff lists it.
+#[allow(clippy::too_many_arguments)]
 fn place<R: Placeable>(
     repo_path: &str,
     base: &str,
