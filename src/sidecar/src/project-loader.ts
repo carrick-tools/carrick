@@ -533,6 +533,19 @@ export class ProjectLoader {
   }
 
   /**
+   * A `listed` project for a key from `projectKeyFor`, built by the same
+   * factory and neither kept nor shared: the caller adds files to it and
+   * drops it. Neither `getProject()` nor `getProjectFor()` sees it
+   * (carrick#3220).
+   */
+  freshProjectFor(key: string): Project {
+    if (!this.initialized || !this.buildProject) {
+      throw new Error('Project not initialized. Call load() first and ensure it succeeds.');
+    }
+    return key === '' ? this.buildProject('listed') : this.projectFromConfig(key, 'listed');
+  }
+
+  /**
    * Drop the program behind a key from `projectKeyFor`, so the memory it
    * holds can go before the next one is built. The next `getProjectFor` on
    * the key builds it again. For a walk that reads one owner's program at a

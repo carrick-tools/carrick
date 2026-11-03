@@ -9,8 +9,8 @@
  * scanner's `sidecar_position` gives). The call's symbol and declaration are
  * read exactly as the row read them ({@link PositionWalker.symbolOf}), and
  * go-to-implementation is asked once per declaration, at its name, over the
- * language service's program of the project that owns the file. That is the
- * analysis program: nothing here releases it.
+ * walk's program for the file's owner ({@link ImplementationPrograms}): the
+ * owner's tsconfig program plus every walked file it does not list.
  *
  * Each answer:
  * - holds none of the declaration's own signatures: asked at an overloaded
@@ -28,6 +28,7 @@
  * action is the only place they are asked.
  */
 
+import * as crypto from 'node:crypto';
 import * as path from 'node:path';
 import { ts } from 'ts-morph';
 import { attributedDeclaration } from './declaration-attribution.js';
@@ -43,6 +44,10 @@ export interface ImplementationsOptions {
   /** Every name in an answer is relative to it, as in the position rows. */
   scanRoot: string;
   queries: ImplementationsQuery[];
+  /** Every walked file of the service, absolute: the program is the walk's (carrick#3220). */
+  files: string[];
+  /** The programs built for the service's chunks; one per process. */
+  programs: ImplementationPrograms;
   /** Called after each question is answered. */
   onAnswer?: () => void;
 }
@@ -60,9 +65,7 @@ export function findImplementations(options: ImplementationsOptions): Implementa
   });
 
   for (const [key, indexes] of groups) {
-    const service = loader.getProjectFor(key).getLanguageService().compilerObject;
-    const program = service.getProgram();
-    if (!program) throw new Error('the language service built no program');
+    const { program, service } = options.programs.of(loader, key, options.files);
     const finder = new ImplementationFinder(program, service, new PositionWalker(program, paths, loader));
     for (const index of indexes) {
       answers[index] = finder.answer(queries[index]);
@@ -70,6 +73,51 @@ export function findImplementations(options: ImplementationsOptions): Implementa
     }
   }
   return answers;
+}
+
+/**
+ * The program a question is answered in: the walk's. A fresh `listed` project
+ * from the loader's factory for the owner key, with each of the owner's walked
+ * files added as `walkGroup` adds them (position-rows.ts), built once. It is
+ * never the kept default project, so type resolution's program is untouched.
+ *
+ * A service asks in chunks, each a request with the same `files`: the program
+ * is kept while they repeat and dropped when a request names other files.
+ */
+export class ImplementationPrograms {
+  /** Programs built, for the tests. */
+  builds = 0;
+  private filesKey = '';
+  private readonly kept = new Map<string, { program: ts.Program; service: ts.LanguageService }>();
+
+  of(loader: ProjectLoader, key: string, files: string[]): { program: ts.Program; service: ts.LanguageService } {
+    const filesKey = crypto.createHash('sha256').update(JSON.stringify([...files].sort())).digest('hex');
+    if (filesKey !== this.filesKey) {
+      this.kept.clear();
+      this.filesKey = filesKey;
+    }
+    let held = this.kept.get(key);
+    if (!held) {
+      const project = loader.freshProjectFor(key);
+      for (const file of files) {
+        if (loader.projectKeyFor(file) !== key) continue;
+        // A file no program lists is added, as the walk adds it.
+        if (project.getSourceFile(file)) continue;
+        try {
+          project.addSourceFileAtPath(file);
+        } catch {
+          // Unreadable: its question answers `not_in_program`.
+        }
+      }
+      const service = project.getLanguageService().compilerObject;
+      const program = service.getProgram();
+      if (!program) throw new Error('the language service built no program');
+      held = { program, service };
+      this.kept.set(key, held);
+      this.builds += 1;
+    }
+    return held;
+  }
 }
 
 /** An answer with nothing found, and why. */

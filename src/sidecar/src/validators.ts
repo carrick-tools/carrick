@@ -393,6 +393,7 @@ export const ImplementationsRequestSchema = BaseRequestSchema.extend({
       end: z.number().int().nonnegative(),
     })
   ),
+  files: z.array(z.string().min(1, 'File path cannot be empty')),
   scan_root: z.string().min(1, 'Scan root cannot be empty'),
 });
 
