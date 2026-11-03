@@ -24,6 +24,7 @@ use tracing::info;
 use crate::agents::file_analyzer_agent::ResolutionSource;
 use crate::analyzer::{CrossRepoMatch, location_file};
 use crate::cloud_storage::CloudRepoData;
+use crate::config::Config;
 use crate::operation::{OperationKey, Protocol};
 use crate::pr_baseline::{MainConsumer, MainPairing, MainProducer, RemovedOperation, RemovedSend};
 use crate::pr_delta_anchor::{Candidate, MainSource, Place};
@@ -75,6 +76,8 @@ impl Removals {
         base: Option<&str>,
         main_self: &[CloudRepoData],
         current: &[CloudRepoData],
+        services: &[Config],
+        changes: Option<&crate::change_scope::ChangedSince>,
     ) -> Self {
         let mut operations = removed_operations(main_self, current);
         let mut sends = removed_sends(main_self, current);
@@ -127,6 +130,8 @@ impl Removals {
             &endpoint_places,
             main_rows(false),
             "operation",
+            services,
+            changes,
         );
         place(
             repo_path,
@@ -135,6 +140,8 @@ impl Removals {
             &call_places,
             main_rows(true),
             "send",
+            services,
+            changes,
         );
         Removals {
             operations: operations.into_iter().flat_map(|op| op.rows).collect(),
@@ -167,6 +174,7 @@ impl Placeable for RemovedSend {
 }
 
 /// Mark each of `removed` placed when the PR's diff lists it.
+#[allow(clippy::too_many_arguments)]
 fn place<R: Placeable>(
     repo_path: &str,
     base: &str,
@@ -174,6 +182,8 @@ fn place<R: Placeable>(
     scan: &[Place],
     main: Vec<MainSource>,
     what: &str,
+    services: &[Config],
+    changes: Option<&crate::change_scope::ChangedSince>,
 ) {
     if removed.is_empty() {
         return;
@@ -186,7 +196,19 @@ fn place<R: Placeable>(
             places: removal.places.clone(),
         })
         .collect();
-    match crate::pr_delta_anchor::run(repo_path, base, Vec::new(), candidates, scan, main, &[]) {
+    let reading_moved = |merge_base: &str| {
+        crate::change_scope::reading_moved_services(repo_path, services, changes, merge_base)
+    };
+    match crate::pr_delta_anchor::run(
+        repo_path,
+        base,
+        Vec::new(),
+        candidates,
+        scan,
+        main,
+        reading_moved,
+        &[],
+    ) {
         Ok(anchored) => {
             let listed: HashSet<usize> = anchored.removed.into_iter().collect();
             info!(

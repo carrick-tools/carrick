@@ -554,6 +554,18 @@ pub fn is_repo_input(path: &str) -> bool {
             .is_some_and(|(_, extension)| REPO_INPUT_EXTENSIONS.contains(&extension))
 }
 
+/// Whether `path` is a repo input that decides which version of a package is
+/// installed: a manifest, a lockfile, or a package manager's settings. Not a
+/// schema, `carrick.json`, or a git file.
+fn is_package_input(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    REPO_INPUT_NAMES.contains(&name)
+        && !matches!(
+            name,
+            "carrick.json" | ".gitignore" | ".gitmodules" | ".gitattributes"
+        )
+}
+
 /// Whether `service` is carried or analysed.
 ///
 /// `stored` is its stored generation, `config_json` this run's carrick.json
@@ -919,6 +931,14 @@ enum Against<'a> {
     /// A commit, with no blob to gate on: a pull request's base
     /// ([`untouched_since`]).
     Base(&'a str),
+    /// A commit, read for what moves how the scanner reads a service whose
+    /// source the diff leaves to the line rules: the paths changed since it
+    /// without source files and schemas ([`reading_moved_since`]).
+    Inputs(&'a str),
+    /// A commit, read for a package a service loads that moved since it:
+    /// the paths changed since it that install packages
+    /// ([`is_package_input`], [`packages_moved_since`]).
+    Packages(&'a str),
 }
 
 /// What the closure walks over one tree share across its services. Services
@@ -933,6 +953,9 @@ struct Walks<'r> {
     untracked: std::cell::OnceCell<Option<Vec<String>>>,
     stops: HashMap<PathBuf, bool>,
     keeps_imports_of: HashMap<(String, String), bool>,
+    /// What the package inputs alone moved since each commit
+    /// ([`Against::Packages`]).
+    package_moves: HashMap<String, Option<std::sync::Arc<DependencyMove>>>,
     reads: ClosureReads,
     closure_took: std::time::Duration,
     walked: usize,
@@ -948,6 +971,7 @@ impl<'r> Walks<'r> {
             untracked: std::cell::OnceCell::new(),
             stops: HashMap::new(),
             keeps_imports_of: HashMap::new(),
+            package_moves: HashMap::new(),
             reads: ClosureReads::default(),
             closure_took: std::time::Duration::ZERO,
             walked: 0,
@@ -964,6 +988,7 @@ impl<'r> Walks<'r> {
             untracked,
             stops,
             keeps_imports_of,
+            package_moves,
             reads,
             closure_took,
             walked,
@@ -974,9 +999,32 @@ impl<'r> Walks<'r> {
         let untracked: &std::cell::OnceCell<_> = untracked;
         let commit: Option<&str> = match against {
             Against::Stored(stored, _) => stored.map(|blob| blob.commit_hash.as_str()),
-            Against::Base(commit) => Some(commit),
+            Against::Base(commit) | Against::Inputs(commit) | Against::Packages(commit) => {
+                Some(commit)
+            }
         };
         let changed = commit.map(|commit| changes.since(commit));
+        // The rows of a source file or a schema are placed by the diff's
+        // lines, so only the other inputs say the reading moved.
+        let changed = match against {
+            Against::Inputs(_) => changed.map(|listed| {
+                listed.map(|paths| {
+                    paths
+                        .into_iter()
+                        .filter(|change| !places_rows_by_line(&change.path))
+                        .collect::<Vec<_>>()
+                })
+            }),
+            Against::Packages(_) => changed.map(|listed| {
+                listed.map(|paths| {
+                    paths
+                        .into_iter()
+                        .filter(|change| is_package_input(&change.path))
+                        .collect::<Vec<_>>()
+                })
+            }),
+            _ => changed,
+        };
         let changed = match &changed {
             Some(Ok(paths)) => Ok(paths.as_slice()),
             Some(Err(reason)) => Err(reason.as_str()),
@@ -1006,10 +1054,23 @@ impl<'r> Walks<'r> {
                 })
         };
         let dependencies = |inputs: &ServiceInputs| {
-            let (Some(commit), Some(top), Ok(_)) = (commit, top, changed) else {
+            let (Some(commit), Some(top), Ok(paths)) = (commit, top, changed) else {
                 return DependencyReach::Unread;
             };
-            match changes.dependency_move(commit, top) {
+            // Read from the package inputs alone, so a schema or a source
+            // file beside them does not make the move one this rule cannot
+            // read.
+            let moved = match against {
+                Against::Packages(_) => package_moves
+                    .entry(commit.to_string())
+                    .or_insert_with(|| {
+                        dependency_move(repo_path, top, commit, None, paths)
+                            .map(std::sync::Arc::new)
+                    })
+                    .clone(),
+                _ => changes.dependency_move(commit, top),
+            };
+            match moved {
                 Some(moved) => moved.reach(inputs, |moved| {
                     loaded_packages(repo_path, top, service, inputs, reads, moved)
                 }),
@@ -1057,15 +1118,17 @@ impl<'r> Walks<'r> {
                 dependencies,
                 inputs,
             ),
-            Against::Base(commit) => decide_change(
-                commit,
-                changed,
-                version_only,
-                gitignore_edit_moves,
-                keeps_imports,
-                dependencies,
-                inputs,
-            ),
+            Against::Base(commit) | Against::Inputs(commit) | Against::Packages(commit) => {
+                decide_change(
+                    commit,
+                    changed,
+                    version_only,
+                    gitignore_edit_moves,
+                    keeps_imports,
+                    dependencies,
+                    inputs,
+                )
+            }
         }
     }
 }
@@ -1116,6 +1179,143 @@ pub fn untouched_since(
         walks.walked
     );
     untouched
+}
+
+/// Whether the rows a change to `path` moves are the ones the diff places by
+/// line: a source file, or a GraphQL schema file.
+fn places_rows_by_line(path: &str) -> bool {
+    crate::file_finder::has_source_extension(Path::new(path))
+        || path
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| REPO_INPUT_EXTENSIONS.contains(&extension))
+}
+
+/// For each of `services`, index for index, whether the change since `base`
+/// moves an input other than source files and schemas that the service reads
+/// (its manifest, lockfile, tsconfig chain, `carrick.json`, the packages it
+/// loads: the rule of [`untouched_since`], on the changed paths that are not
+/// source files or schemas). A reading that moved on such an input lists a
+/// route the PR did not touch, so the PR's delta does not list a row it
+/// places only by the file and the line it shares with main's
+/// (carrick#1712). `true` whenever git cannot compare.
+pub fn reading_moved_since(
+    repo_path: &str,
+    services: &[Config],
+    changes: &ChangedSince,
+    base: &str,
+) -> Vec<bool> {
+    // A change of source files alone moves no input: no closure is walked.
+    if changes
+        .since(base)
+        .is_ok_and(|paths| paths.iter().all(|change| places_rows_by_line(&change.path)))
+    {
+        return vec![false; services.len()];
+    }
+    let mut walks = Walks::new(repo_path, changes);
+    let moved: Vec<bool> = services
+        .iter()
+        .map(|service| {
+            let scope = walks.scope(service, Against::Inputs(base));
+            if let Scope::Analysed { reason, detail, .. } = &scope {
+                debug!(
+                    "pr base: {} reads an input changed since {} ({}: {detail})",
+                    service.service_name.as_deref().unwrap_or("(root)"),
+                    short(base),
+                    reason.as_str()
+                );
+            }
+            !scope.is_carried()
+        })
+        .collect();
+    info!(
+        "pr base: {} of {} service(s) read an input other than source changed since {}",
+        moved.iter().filter(|moved| **moved).count(),
+        moved.len(),
+        short(base)
+    );
+    moved
+}
+
+/// The names of the `services` whose reading may have moved since `base`
+/// ([`reading_moved_since`]); every service when the run holds no listing of
+/// the change (`changes` is `None`).
+pub fn reading_moved_services(
+    repo_path: &str,
+    services: &[Config],
+    changes: Option<&ChangedSince>,
+    base: &str,
+) -> BTreeSet<Option<String>> {
+    let moved = match changes {
+        Some(changes) => reading_moved_since(repo_path, services, changes, base),
+        None => vec![true; services.len()],
+    };
+    services
+        .iter()
+        .zip(moved)
+        .filter(|(_, moved)| *moved)
+        .map(|(service, _)| service.service_name.clone())
+        .collect()
+}
+
+/// For each of `services`, index for index, whether the change since `base`
+/// moves a package the service loads: the dependency-move rule of
+/// [`untouched_since`], read on the changed manifests, lockfiles and package
+/// manager settings alone ([`is_package_input`]). The library store keeps an
+/// answer per package version, so such a move can change how the scanner
+/// reads code the change left alone (carrick#3230); an edit to any other file
+/// is the change's own. `true` whenever git cannot compare, or the rule cannot
+/// read the move.
+pub fn packages_moved_since(
+    repo_path: &str,
+    services: &[Config],
+    changes: &ChangedSince,
+    base: &str,
+) -> Vec<bool> {
+    if changes
+        .since(base)
+        .is_ok_and(|paths| !paths.iter().any(|change| is_package_input(&change.path)))
+    {
+        return vec![false; services.len()];
+    }
+    let mut walks = Walks::new(repo_path, changes);
+    let moved: Vec<bool> = services
+        .iter()
+        .map(|service| {
+            let scope = walks.scope(service, Against::Packages(base));
+            if let Scope::Analysed { reason, detail, .. } = &scope {
+                debug!(
+                    "pr base: {} loads a package moved since {} ({}: {detail})",
+                    service.service_name.as_deref().unwrap_or("(root)"),
+                    short(base),
+                    reason.as_str()
+                );
+            }
+            !scope.is_carried()
+        })
+        .collect();
+    info!(
+        "pr base: {} of {} service(s) load a package moved since {}",
+        moved.iter().filter(|moved| **moved).count(),
+        moved.len(),
+        short(base)
+    );
+    moved
+}
+
+/// The names of the `services` that load a package moved since `base`
+/// ([`packages_moved_since`]).
+pub fn packages_moved_services(
+    repo_path: &str,
+    services: &[Config],
+    changes: &ChangedSince,
+    base: &str,
+) -> BTreeSet<Option<String>> {
+    services
+        .iter()
+        .zip(packages_moved_since(repo_path, services, changes, base))
+        .filter(|(_, moved)| *moved)
+        .map(|(service, _)| service.service_name.clone())
+        .collect()
 }
 
 /// Each service's scope, index for index with `services`, logged one line
@@ -3662,6 +3862,113 @@ mod tests {
             [false, false, false],
             "git cannot compare with a commit it does not hold"
         );
+    }
+
+    /// carrick#1712: which services a pull request leaves a reading of that
+    /// could have moved, by the inputs other than source files.
+    #[test]
+    fn reading_moved_since_reads_the_inputs_other_than_source() {
+        let (repo, base, services) = dependency_workspace(Manager::Npm);
+        let path = repo.path().to_string_lossy().to_string();
+        let moved = |base: &str| {
+            let changes = ChangedSince::new(&path, &services, &[]);
+            reading_moved_since(&path, &services, &changes, base)
+        };
+        // A dependency only `worker` loads moves: `worker` alone.
+        let bumped = moved_versions("lib-b", "1.1.0");
+        write_dependencies(repo.path(), Manager::Npm, &bumped, &bumped);
+        let bump = commit_all(repo.path(), "move");
+        assert_eq!(moved(&base), [false, false, true]);
+        // A source edit in `api` moves no input.
+        std::fs::write(
+            repo.path().join("apps/api/src/server.ts"),
+            "import { a } from \"lib-a\";\nexport const server = [a];\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "source");
+        assert_eq!(moved(&bump), [false, false, false]);
+        // `web`'s tsconfig chain.
+        std::fs::write(
+            repo.path().join("apps/web/tsconfig.json"),
+            r#"{ "compilerOptions": { "types": ["lib-f"], "strict": true } }"#,
+        )
+        .unwrap();
+        let before_tsconfig = commit_all(repo.path(), "tsconfig");
+        assert_eq!(moved(&bump), [false, true, false]);
+        // A manifest edit that moves only its version.
+        set_version(repo.path(), "package.json", "1.0.1");
+        set_version(repo.path(), "apps/api/package.json", "1.0.1");
+        commit_all(repo.path(), "version");
+        assert_eq!(moved(&before_tsconfig), [false, false, false]);
+        assert_eq!(
+            moved("0000000"),
+            [true, true, true],
+            "git cannot compare with a commit it does not hold"
+        );
+    }
+
+    /// carrick#3230: which services load a package a pull request moved. A
+    /// JSON file, a tsconfig chain or a schema the scan reads moves none.
+    #[test]
+    fn packages_moved_since_reads_only_what_installs_packages() {
+        let (repo, base, services) = dependency_workspace(Manager::Npm);
+        let path = repo.path().to_string_lossy().to_string();
+        let moved = |base: &str| {
+            let changes = ChangedSince::new(&path, &services, &[]);
+            packages_moved_since(&path, &services, &changes, base)
+        };
+        // A dependency only `worker` loads moves: `worker` alone.
+        let bumped = moved_versions("lib-b", "1.1.0");
+        write_dependencies(repo.path(), Manager::Npm, &bumped, &bumped);
+        let bump = commit_all(repo.path(), "move");
+        assert_eq!(moved(&base), [false, false, true]);
+        // A JSON file, `web`'s tsconfig chain and a schema, with a source
+        // edit: no package moves.
+        std::fs::write(repo.path().join("apps/api/src/labels.json"), "{}\n").unwrap();
+        std::fs::write(
+            repo.path().join("apps/web/tsconfig.json"),
+            r#"{ "compilerOptions": { "types": ["lib-f"], "strict": true } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("apps/api/schema.graphql"),
+            "type Q { a: Int }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("apps/api/src/server.ts"),
+            "import { a } from \"lib-a\";\nexport const server = [a];\n",
+        )
+        .unwrap();
+        let edits = commit_all(repo.path(), "json, tsconfig, schema, source");
+        assert_eq!(moved(&bump), [false, false, false]);
+        // The same files beside the dependency move still name `worker`.
+        assert_eq!(moved(&base), [false, false, true]);
+        // A manifest edit that moves only its version.
+        set_version(repo.path(), "package.json", "1.0.1");
+        commit_all(repo.path(), "version");
+        assert_eq!(moved(&edits), [false, false, false]);
+        assert_eq!(
+            moved("0000000"),
+            [true, true, true],
+            "git cannot compare with a commit it does not hold"
+        );
+    }
+
+    /// `versions` of [`first_versions`] with `package` at `version`.
+    fn moved_versions(package: &str, version: &str) -> BTreeMap<String, String> {
+        moved(&first_versions(), package, version)
+    }
+
+    #[test]
+    fn reading_moved_services_names_every_service_without_a_listing() {
+        let (repo, base, services) = dependency_workspace(Manager::Npm);
+        let path = repo.path().to_string_lossy().to_string();
+        let names: BTreeSet<Option<String>> = services
+            .iter()
+            .map(|service| service.service_name.clone())
+            .collect();
+        assert_eq!(reading_moved_services(&path, &services, None, &base), names);
     }
 
     /// `lib-c` moved in the lockfile alone: no manifest names it, and `api`

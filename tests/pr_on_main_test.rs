@@ -406,6 +406,31 @@ async fn a_pr_run_marks_each_finding_with_whether_main_had_it() {
     assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
 }
 
+/// carrick#3230. A JSON file the scan reads moves no package: the PR that
+/// also edits one still introduced the wrong verb it wrote.
+#[tokio::test]
+async fn a_pr_that_also_edits_a_json_file_still_introduces_its_risk() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan(&store, &producer).await;
+    set_consumer_verb(&consumer, "GET", 0);
+    commit(&consumer, "main: get");
+    let base = head(&consumer);
+    scan(&store, &consumer).await;
+    set_consumer_verb(&consumer, "PUT", 0);
+    std::fs::write(
+        consumer.join("src/labels.json"),
+        "{ \"title\": \"Stock\" }\n",
+    )
+    .unwrap();
+    commit(&consumer, "pr: put, and a JSON file");
+    event_with_base(tmp.path(), &base);
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}
+
 /// Declare `name` at `spec` in the repo's manifest.
 fn set_dependency(repo: &Path, name: &str, spec: &str) {
     let manifest = repo.join("package.json");
@@ -3915,7 +3940,7 @@ async fn a_risk_in_a_file_the_pr_did_not_change_is_on_main() {
 /// the consumer's side rests on: the comparison with main decides, though no
 /// file holding the risk changed.
 #[tokio::test]
-async fn a_dependency_move_the_consumer_loads_leaves_the_risk_to_the_comparison() {
+async fn a_dependency_move_the_consumer_loads_is_not_compared_with_main() {
     let _serial = SERIAL.lock().await;
     let (_tmp, consumer, store) =
         main_copy_hiding_the_wrong_verb(|repo| load_left_pad(repo, "1.3.0")).await;
@@ -3928,7 +3953,15 @@ async fn a_dependency_move_the_consumer_loads_leaves_the_risk_to_the_comparison(
     let finding = wrong_verb(&pr_scan(&store, &consumer).await);
     unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
     assert_eq!(main_side_runs(), runs + 1, "main's side ran");
-    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+    // Main's recomputation does not reach the wrong verb, but the consumer
+    // loads a package the PR moved, so the PR is not credited with it
+    // (carrick#3230).
+    assert!(finding.get("on_main").is_none(), "{finding:#}");
+    assert_eq!(
+        finding["on_main_unknown"],
+        serde_json::json!("reading_moved"),
+        "{finding:#}"
+    );
 }
 
 /// One repo holding both fixture services, `catalog-web` (the producer) and

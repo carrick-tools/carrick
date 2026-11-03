@@ -152,6 +152,9 @@ pub struct MainSide {
     /// What the PR changed of what each service reads, `None` when there is
     /// no base to compare with (carrick#3170).
     pub untouched: Option<Untouched>,
+    /// Which services read an input the PR changed other than source files,
+    /// `None` when there is no base to compare with (carrick#1712).
+    pub reading_moved: Option<ReadingMoved>,
     /// Main's pairings, from main's copy matched against the same peers: a
     /// pairing the PR removed one side of is a break (carrick#3092).
     pub pairings: Vec<MainPairing>,
@@ -186,18 +189,69 @@ impl Untouched {
             Some(id) if self.peers.contains(id) => true,
             _ => every_ours,
         };
-        let (producer, consumer) = match finding {
-            Finding::TypeMismatch {
-                pair: Some(pair),
-                direction: Some(_),
-                ..
-            } => crate::analyzer::pair_key_services(pair)
-                .map_or((None, None), |(producer, consumer)| {
-                    (Some(producer), Some(consumer))
-                }),
-            _ => (None, None),
-        };
+        let (producer, consumer) = pair_services(finding);
         side(producer) && side(consumer)
+    }
+}
+
+/// The producer and consumer services a type mismatch names in its pairing
+/// ([`crate::analyzer::pair_key_services`]); `None` for a side the finding
+/// does not name (a method mismatch's pairing, a published package's).
+fn pair_services(finding: &Finding) -> (Option<&str>, Option<&str>) {
+    match finding {
+        Finding::TypeMismatch {
+            pair: Some(pair),
+            direction: Some(_),
+            ..
+        } => crate::analyzer::pair_key_services(pair)
+            .map_or((None, None), |(producer, consumer)| {
+                (Some(producer), Some(consumer))
+            }),
+        _ => (None, None),
+    }
+}
+
+/// Which services of this repo load a package whose version the PR moved
+/// (carrick#3230, [`crate::change_scope::packages_moved_services`]). The
+/// library store answers per package version, so a file such a service never
+/// touched can read differently at head than on main, and a pairing only head
+/// has is not provably the PR's.
+#[derive(Clone, Debug, Default)]
+pub struct ReadingMoved {
+    /// Each service of this repo, by id (`service_name`, else the repo), with
+    /// whether its reading moved.
+    pub ours: BTreeMap<String, bool>,
+}
+
+impl ReadingMoved {
+    /// Each service as `(id, service_name)` against the moved set of
+    /// [`crate::change_scope::packages_moved_services`], where `None` means
+    /// every service.
+    pub fn of(
+        services: impl Iterator<Item = (String, Option<String>)>,
+        moved: &BTreeSet<Option<String>>,
+    ) -> Self {
+        let all = moved.contains(&None);
+        Self {
+            ours: services
+                .map(|(id, name)| (id, all || moved.contains(&name)))
+                .collect(),
+        }
+    }
+
+    /// Whether the producer's or the consumer's service of `finding` read
+    /// differently at head. A peer never did (a PR changes nothing of another
+    /// repo). A side the finding does not name, or names as no known service,
+    /// could be any service of this repo, so it counts when one of them moved.
+    fn holds_for(&self, finding: &Finding) -> bool {
+        let any_ours = self.ours.values().any(|moved| *moved);
+        let side = |service: Option<&str>| match service {
+            Some(id) if self.ours.contains_key(id) => self.ours[id],
+            Some(_) => false,
+            None => any_ours,
+        };
+        let (producer, consumer) = pair_services(finding);
+        side(producer) || side(consumer)
     }
 }
 
@@ -275,7 +329,15 @@ pub fn mark_on_main(pr: &mut [Finding], main: &MainSide, copy: MainCopy) {
         } else if copy == MainCopy::OtherScanner {
             finding.set_on_main_unknown(OnMainUnknown::MainIndexOtherScanner);
         } else if short.iter().any(|group| judged(main, group)) {
-            finding.set_on_main(Some(false));
+            if main
+                .reading_moved
+                .as_ref()
+                .is_some_and(|moved| moved.holds_for(finding))
+            {
+                finding.set_on_main_unknown(OnMainUnknown::ReadingMoved);
+            } else {
+                finding.set_on_main(Some(false));
+            }
         } else {
             finding.set_on_main_unknown(OnMainUnknown::MainTypesUnjudged);
         }
@@ -1420,6 +1482,136 @@ mod tests {
         );
     }
 
+    /// Main's side where main judged the pairing absent, with the services
+    /// whose reading moved (`None` for no base).
+    fn main_reading(moved: Option<&[(&str, bool)]>) -> MainSide {
+        MainSide {
+            reading_moved: moved.map(|moved| ReadingMoved {
+                ours: moved
+                    .iter()
+                    .map(|(service, moved)| (service.to_string(), *moved))
+                    .collect(),
+            }),
+            ..main_side(Vec::new())
+        }
+    }
+
+    fn marked_unknown(finding: Finding, main: &MainSide) -> (Option<bool>, Option<OnMainUnknown>) {
+        let mut pr = vec![finding];
+        mark_on_main(&mut pr, main, MainCopy::Current);
+        (on_main(&pr[0]), unknown(&pr[0]))
+    }
+
+    /// carrick#1712. A pairing only head has, in a service whose reading
+    /// moved, may be the same code read differently: it is not the PR's.
+    #[test]
+    fn a_pairing_only_head_has_in_a_service_whose_reading_moved_is_unknown() {
+        let finding = || type_mismatch(ORDERS, "src/checkout.ts:40");
+        assert_eq!(
+            marked_unknown(
+                finding(),
+                &main_reading(Some(&[("orders-api", false), ("web", true)]))
+            ),
+            (None, Some(OnMainUnknown::ReadingMoved)),
+            "the consumer's reading moved"
+        );
+        assert_eq!(
+            marked_unknown(
+                finding(),
+                &main_reading(Some(&[("orders-api", true), ("web", false)]))
+            ),
+            (None, Some(OnMainUnknown::ReadingMoved)),
+            "the producer's reading moved"
+        );
+        assert_eq!(
+            marked_unknown(
+                finding(),
+                &main_reading(Some(&[("orders-api", false), ("web", false)]))
+            ),
+            (Some(false), None),
+            "no reading moved"
+        );
+        assert_eq!(
+            marked_unknown(finding(), &main_reading(None)),
+            (Some(false), None),
+            "no base to compare with"
+        );
+        assert_eq!(
+            marked_unknown(finding(), &main_reading(Some(&[("other", true)]))),
+            (Some(false), None),
+            "the service whose reading moved is neither side"
+        );
+    }
+
+    /// A finding main also has stays on main whatever moved, and a stale or
+    /// other-scanner copy keeps its own reason.
+    #[test]
+    fn reading_moved_leaves_a_finding_main_has_and_the_copy_reasons() {
+        let moved = main_reading(Some(&[("orders-api", true), ("web", true)]));
+        let main = MainSide {
+            findings: vec![type_mismatch(ORDERS, "src/checkout.ts:40")],
+            ..moved.clone()
+        };
+        let mut pr = vec![type_mismatch(ORDERS, "src/checkout.ts:52")];
+        mark_on_main(&mut pr, &main, MainCopy::Current);
+        assert_eq!(on_main(&pr[0]), Some(true));
+        assert_eq!(unknown(&pr[0]), None);
+        for (copy, reason) in [
+            (MainCopy::Stale, OnMainUnknown::MainIndexStale),
+            (MainCopy::OtherScanner, OnMainUnknown::MainIndexOtherScanner),
+        ] {
+            let mut pr = vec![type_mismatch(ORDERS, "src/checkout.ts:40")];
+            mark_on_main(&mut pr, &moved, copy);
+            assert_eq!(unknown(&pr[0]), Some(reason));
+        }
+    }
+
+    /// `None` in the moved set means every service.
+    #[test]
+    fn none_in_the_moved_set_moves_every_service() {
+        let services = || {
+            ["orders-api", "web"]
+                .iter()
+                .map(|name| (name.to_string(), Some(name.to_string())))
+        };
+        let all = ReadingMoved::of(services(), &BTreeSet::from([None]));
+        assert!(all.ours.values().all(|moved| *moved));
+        let one = ReadingMoved::of(services(), &BTreeSet::from([Some("web".to_string())]));
+        assert_eq!(
+            one.ours,
+            BTreeMap::from([("orders-api".to_string(), false), ("web".to_string(), true)])
+        );
+        let finding = type_mismatch(ORDERS, "src/checkout.ts:40");
+        let main = MainSide {
+            reading_moved: Some(all),
+            ..main_side(Vec::new())
+        };
+        assert_eq!(
+            marked_unknown(finding, &main),
+            (None, Some(OnMainUnknown::ReadingMoved))
+        );
+    }
+
+    /// A side the finding does not name counts when any service moved.
+    #[test]
+    fn an_unnamed_side_counts_when_any_service_moved() {
+        let verb = || method_mismatch("POST /orders/:id~PUT", &["src/checkout.ts:3"]);
+        assert_eq!(
+            marked_unknown(
+                verb(),
+                &main_reading(Some(&[("web", false), ("api", true)]))
+            ),
+            (None, Some(OnMainUnknown::ReadingMoved))
+        );
+        assert_eq!(
+            marked_unknown(
+                verb(),
+                &main_reading(Some(&[("web", false), ("api", false)]))
+            ),
+            (Some(false), None)
+        );
+    }
+
     #[test]
     fn a_pairing_main_does_not_have_is_introduced() {
         let main = main_side(vec![type_mismatch(ORDERS, "src/checkout.ts:40")]);
@@ -1574,6 +1766,7 @@ mod tests {
             stored: stored_type_sites(std::slice::from_ref(copy)),
             types_judged: true,
             untouched: None,
+            reading_moved: None,
             pairings: Vec::new(),
         }
     }

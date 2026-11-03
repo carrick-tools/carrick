@@ -707,6 +707,8 @@ fn anchored_delta(
     base: Option<&str>,
     previous: &HashMap<ServiceEndpointKey, DeltaRow>,
     current: &[CloudRepoData],
+    services: &[Config],
+    changes: Option<&crate::change_scope::ChangedSince>,
     unread: &[UnreadRoute],
 ) -> Option<crate::findings::PrDelta> {
     let Some(base) = base else {
@@ -746,7 +748,19 @@ fn anchored_delta(
                 })
         })
         .collect();
-    match crate::pr_delta_anchor::run(repo_path, base, new, removed, &scan, main, &serving) {
+    let reading_moved = |merge_base: &str| {
+        crate::change_scope::reading_moved_services(repo_path, services, changes, merge_base)
+    };
+    match crate::pr_delta_anchor::run(
+        repo_path,
+        base,
+        new,
+        removed,
+        &scan,
+        main,
+        reading_moved,
+        &serving,
+    ) {
         Ok(anchored) => {
             info!("{}", anchored.summary());
             Some(delta_of(
@@ -2167,6 +2181,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     pr_base.as_deref(),
                     &main_self_data,
                     &current_services_data,
+                    &services,
+                    pr_changes.as_deref(),
                 )
             };
             MainBaselineInput {
@@ -2282,6 +2298,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 pr_base.as_deref(),
                 &previous,
                 &current_services_data,
+                &services,
+                pr_changes.as_deref(),
                 &unread,
             )
         }
@@ -13496,6 +13514,29 @@ struct PrChange {
 }
 
 impl PrChange {
+    /// Which services load a package whose version the change moved
+    /// (carrick#3230). `None` in the set means every service.
+    fn reading_moved(&self) -> crate::pr_baseline::ReadingMoved {
+        let moved = crate::change_scope::packages_moved_services(
+            &self.repo_path,
+            &self.services,
+            &self.changes,
+            &self.base,
+        );
+        crate::pr_baseline::ReadingMoved::of(
+            self.services.iter().map(|service| {
+                (
+                    service
+                        .service_name
+                        .clone()
+                        .unwrap_or_else(|| self.repo_name.clone()),
+                    service.service_name.clone(),
+                )
+            }),
+            &moved,
+        )
+    }
+
     /// Which services the change leaves untouched, beside every peer service
     /// (carrick#3170).
     fn untouched(&self, peers: &[CloudRepoData]) -> crate::pr_baseline::Untouched {
@@ -13669,6 +13710,7 @@ async fn main_side_findings(
         untouched,
         ..
     } = input;
+    let reading_moved = untouched.as_ref().map(PrChange::reading_moved);
     let untouched = untouched.map(|change| change.untouched(&peers));
     // Main's own answers, from the scan that had main's sources on disk. The
     // recomputation below has none, so a response main's scan judged by
@@ -13709,6 +13751,7 @@ async fn main_side_findings(
         stored,
         types_judged: type_check == crate::local_mode::JoinTypeCheck::Ran,
         untouched,
+        reading_moved,
     })
 }
 
