@@ -538,6 +538,7 @@ fn place_main_rows(repo_path: &str, base: &str, rows: Vec<MainSource>) -> Vec<Ma
 /// reads it). Git is asked only about files that hold a candidate row or one
 /// of `unread`; a run with no candidate makes no git call. `Err` means git
 /// could not read the diff.
+#[allow(clippy::too_many_arguments)]
 pub fn run<T>(
     repo_path: &str,
     pr_base: &str,
@@ -1188,6 +1189,7 @@ mod tests {
                 reading_moved: 2,
                 ..LeftOut::default()
             },
+            unread_written: Vec::new(),
         };
         assert!(
             anchored
