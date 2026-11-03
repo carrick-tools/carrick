@@ -87,6 +87,15 @@ the merge base of the base commit and HEAD to the tree the scan read.
   edits or deletes that file.
 - Everything else is a reading that moved. It is counted in one info line of
   the run log and not listed.
+- Each listed operation carries `edge_source`: `fact` when a deterministic
+  pass stated every row of it, `candidate` when the model stated any (a new
+  operation's rows are this scan's, a removed one's are main's). A removed
+  HTTP route is `candidate` whatever its rows on main were when the pull
+  request wrote, on a line it added or changed, a route registration of the
+  same service whose path the scan could not read and whose method serves
+  the route's: the registration may still serve it, so its absence proves
+  nothing (carrick#3222). Registrations of the other protocols whose name
+  the scan could not read are not counted yet.
 - With no base commit, or when git cannot read the diff, the scan lists no
   endpoint changes and says why in the run log.
 

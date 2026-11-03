@@ -137,6 +137,11 @@ pub struct Anchored<T> {
     pub new: Vec<T>,
     pub removed: Vec<T>,
     pub left_out: LeftOut,
+    /// Of the route sites this scan could not read a path for that the
+    /// caller named, those on a line the PR added or changed, or in a file it
+    /// added: registrations the PR wrote in a form the scan cannot read, so
+    /// a removal they could serve is not proven (carrick#3222).
+    pub unread_written: Vec<Place>,
 }
 
 impl<T> Anchored<T> {
@@ -206,6 +211,16 @@ impl Context<'_> {
     /// Whether this scan holds a row of `place`'s service at exactly `place`.
     fn scan_holds(&self, place: &Place) -> bool {
         self.scan.iter().any(|row| row == place)
+    }
+
+    /// Whether the PR wrote `place`'s line: it added the file, or added or
+    /// changed that line. A place with no line is never written.
+    fn written(&self, place: &Place) -> bool {
+        match self.diff.0.get(&place.file) {
+            Some(FileDiff::Added) => true,
+            Some(FileDiff::Modified(hunks)) => place.line > 0 && on_changed_line(hunks, place.line),
+            _ => false,
+        }
     }
 
     /// Line `line` of `file` at the merge base, in the working tree.
@@ -284,15 +299,22 @@ impl Context<'_> {
 /// between its stored commit and the merge base never passes. A row with no
 /// line passes when the PR touches its file. `scan` is every row this scan
 /// states and `main` every row of main's index in a file that holds a
-/// candidate.
+/// candidate. Of `unread`, the route sites this scan could not read a path
+/// for, the result keeps those the PR wrote (`unread_written`).
 pub fn anchor<T>(
     new: Vec<Candidate<T>>,
     removed: Vec<Candidate<T>>,
     scan: &[Place],
     main: &[MainRow],
     diff: &Diff,
+    unread: &[Place],
 ) -> Anchored<T> {
     let context = Context { diff, main, scan };
+    let unread_written = unread
+        .iter()
+        .filter(|place| context.written(place))
+        .cloned()
+        .collect();
     let mut left_out = LeftOut::default();
     let mut listed_new = Vec::new();
     for candidate in new {
@@ -350,6 +372,7 @@ pub fn anchor<T>(
         new: listed_new,
         removed: listed_removed,
         left_out,
+        unread_written,
     }
 }
 
@@ -478,9 +501,9 @@ fn place_main_rows(repo_path: &str, base: &str, rows: Vec<MainSource>) -> Vec<Ma
 /// tree: on a merge checkout the merge base is `pr_base`, and on a head
 /// checkout it is the fork point, so commits main gained after the PR
 /// branched are never read as the PR's (as `pr_functions::block_for_run`
-/// reads it). Git is asked only about files that hold a candidate row; a run
-/// with no candidate makes no git call. `Err` means git could not read the
-/// diff.
+/// reads it). Git is asked only about files that hold a candidate row or one
+/// of `unread`; a run with no candidate makes no git call. `Err` means git
+/// could not read the diff.
 pub fn run<T>(
     repo_path: &str,
     pr_base: &str,
@@ -488,24 +511,27 @@ pub fn run<T>(
     removed: Vec<Candidate<T>>,
     scan: &[Place],
     main: Vec<MainSource>,
+    unread: &[Place],
 ) -> Result<Anchored<T>, String> {
     if new.is_empty() && removed.is_empty() {
-        return Ok(anchor(new, removed, scan, &[], &Diff::default()));
+        return Ok(anchor(new, removed, scan, &[], &Diff::default(), unread));
     }
     let files: BTreeSet<String> = new
         .iter()
         .chain(&removed)
         .flat_map(|candidate| candidate.places.iter().map(|place| place.file.clone()))
         .collect();
+    let mut diff_files = files.clone();
+    diff_files.extend(unread.iter().map(|place| place.file.clone()));
     let head = crate::git_state::head_commit(repo_path)?;
     let merge_base = crate::git_state::merge_base(repo_path, pr_base, &head)?;
-    let diff = read_diff(repo_path, &merge_base, &files)?;
+    let diff = read_diff(repo_path, &merge_base, &diff_files)?;
     let in_files: Vec<MainSource> = main
         .into_iter()
         .filter(|row| files.contains(&row.place.file))
         .collect();
     let main = place_main_rows(repo_path, &merge_base, in_files);
-    Ok(anchor(new, removed, scan, &main, &diff))
+    Ok(anchor(new, removed, scan, &main, &diff, unread))
 }
 
 #[cfg(test)]
@@ -561,7 +587,7 @@ mod tests {
         main: &[MainRow],
         diff: &Diff,
     ) -> (Vec<&'static str>, Vec<&'static str>, LeftOut) {
-        let anchored = anchor(new, removed, scan, main, diff);
+        let anchored = anchor(new, removed, scan, main, diff, &[]);
         (anchored.new, anchored.removed, anchored.left_out)
     }
 
@@ -788,6 +814,39 @@ mod tests {
         assert_eq!(out.total(), 0);
     }
 
+    /// carrick#3222: of the route sites the scan could not read a path for,
+    /// the result keeps those the PR wrote: on a line it added or changed, or
+    /// in a file it added. One on a line it left alone, or in a file it does
+    /// not touch, is a registration main read the same way.
+    #[test]
+    fn an_unread_route_site_on_a_line_the_pr_wrote_is_kept() {
+        const PLUGIN: &str = "src/plugin.ts";
+        const OTHER: &str = "src/other.ts";
+        let d = diff(vec![
+            (ROUTES, FileDiff::Modified(vec![hunk(9, 1, 9, 2)])),
+            (PLUGIN, FileDiff::Added),
+        ]);
+        let unread = [
+            place(ROUTES, 10),
+            place(ROUTES, 30),
+            place(PLUGIN, 4),
+            place(OTHER, 9),
+        ];
+        let anchored = anchor(
+            vec![],
+            vec![candidate("gone", &[(ROUTES, 9)])],
+            &[],
+            &[],
+            &d,
+            &unread,
+        );
+        assert_eq!(anchored.removed, vec!["gone"]);
+        assert_eq!(
+            anchored.unread_written,
+            vec![place(ROUTES, 10), place(PLUGIN, 4)]
+        );
+    }
+
     #[test]
     fn the_summary_names_what_was_left_out() {
         let anchored: Anchored<&str> = Anchored {
@@ -799,6 +858,7 @@ mod tests {
                 main_moved: 1,
                 placed_by_file: 0,
             },
+            unread_written: Vec::new(),
         };
         assert_eq!(
             anchored.summary(),
@@ -891,10 +951,38 @@ mod tests {
             vec![],
             &[],
             vec![],
+            &[],
         )
         .unwrap();
         assert_eq!(anchored.new, vec!["in the pr"]);
         assert_eq!(anchored.left_out.untouched_file, 1);
+    }
+
+    /// carrick#3222: the diff is read for a file that holds only an unread
+    /// route site, so a registration the PR moved into another file is seen
+    /// as written.
+    #[test]
+    fn the_reader_reads_a_file_that_holds_only_an_unread_route_site() {
+        let (repo, base) = committed_repo(&[
+            ("routes.ts", "a\nroute\nc\n"),
+            ("plugin.ts", "p\nq\n"),
+            ("kept.ts", "k\nl\n"),
+        ]);
+        let dir = repo.path();
+        std::fs::write(dir.join("routes.ts"), "a\nc\n").unwrap();
+        std::fs::write(dir.join("plugin.ts"), "p\nunread\n").unwrap();
+        let anchored = run(
+            &dir.to_string_lossy(),
+            &base,
+            vec![],
+            vec![candidate("gone", &[("routes.ts", 2)])],
+            &[],
+            vec![],
+            &[place("plugin.ts", 2), place("kept.ts", 2)],
+        )
+        .unwrap();
+        assert_eq!(anchored.removed, vec!["gone"]);
+        assert_eq!(anchored.unread_written, vec![place("plugin.ts", 2)]);
     }
 
     #[test]
@@ -908,9 +996,11 @@ mod tests {
             vec![],
             &[],
             vec![],
+            &[place("a.ts", 1)],
         )
         .unwrap();
         assert!(anchored.new.is_empty() && anchored.removed.is_empty());
+        assert!(anchored.unread_written.is_empty());
         assert!(
             run(
                 &dir.path().to_string_lossy(),
@@ -919,6 +1009,7 @@ mod tests {
                 vec![],
                 &[],
                 vec![],
+                &[],
             )
             .is_err(),
             "git cannot read a diff here"

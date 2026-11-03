@@ -2472,6 +2472,7 @@ async fn seed_http_verb_change() {
         &["POST /api/v1/orders/:orderId"],
         &["GET /api/v1/orders/:orderId"],
     );
+    assert_removed_rows_are_facts(&payload);
 }
 
 async fn http_route_rename() -> serde_json::Value {
@@ -2499,6 +2500,7 @@ async fn seed_http_route_rename() {
         &["GET /api/v1/purchases/:orderId"],
         &["GET /api/v1/orders/:orderId"],
     );
+    assert_removed_rows_are_facts(&payload);
 }
 
 /// The row of `kind` for `method path` that records a pairing main had and
@@ -2663,6 +2665,7 @@ async fn seed_http_route_removed() {
         "{finding:#}"
     );
     assert_manifest_delta(&payload, "http-route-removed");
+    assert_removed_rows_are_facts(&payload);
 }
 
 /// A handler's body changes and its response type does not.
@@ -2691,6 +2694,7 @@ async fn seed_http_prefix_moved() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("http-prefix-moved").await;
     assert_manifest_delta(&payload, "http-prefix-moved");
+    assert_removed_rows_are_facts(&payload);
 }
 
 /// An edit inside a mounted sub-app's handler keeps every route, prefixed.
@@ -2699,6 +2703,46 @@ async fn seed_http_edit_under_prefix() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("http-edit-under-prefix").await;
     assert_manifest_delta(&payload, "http-edit-under-prefix");
+}
+
+/// A route's path moves into an option whose default is the same path. The
+/// route is still served there, but the scan cannot read the path
+/// (carrick#3191), so main's row is missing from this run. That removal is
+/// inferred from a registration the PR rewrote into a path the scan cannot
+/// read, so no removed row is a fact (carrick#3222): a candidate, or none
+/// once the default is read.
+#[tokio::test]
+async fn seed_http_path_into_option_default() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-path-into-option-default").await;
+    assert!(
+        delta_rows(&payload["delta"], "new_endpoints").is_empty(),
+        "{payload:#}"
+    );
+    for row in payload["delta"]["removed_endpoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        assert_eq!(
+            row["edge_source"], "candidate",
+            "a removal the PR's rewrite leaves unproven: {payload:#}"
+        );
+    }
+}
+
+/// Every removed row of the payload's delta is a fact: a removal whose
+/// registration the PR deleted or rewrote to another key stays one
+/// (carrick#3222).
+fn assert_removed_rows_are_facts(payload: &serde_json::Value) {
+    let removed = payload["delta"]["removed_endpoints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!removed.is_empty(), "no removed row: {payload:#}");
+    for row in removed {
+        assert_eq!(row["edge_source"], "fact", "{row:#}");
+    }
 }
 
 #[tokio::test]
@@ -2713,6 +2757,7 @@ async fn seed_trpc_procedure_removed() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-procedure-removed").await;
     assert_manifest_delta(&payload, "trpc-procedure-removed");
+    assert_removed_rows_are_facts(&payload);
 }
 
 #[tokio::test]
@@ -2720,6 +2765,7 @@ async fn seed_trpc_procedure_renamed() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-procedure-renamed").await;
     assert_manifest_delta(&payload, "trpc-procedure-renamed");
+    assert_removed_rows_are_facts(&payload);
 }
 
 #[tokio::test]
@@ -2736,6 +2782,7 @@ async fn seed_trpc_adapter_prefix_moved() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-adapter-prefix-moved").await;
     assert_manifest_delta(&payload, "trpc-adapter-prefix-moved");
+    assert_removed_rows_are_facts(&payload);
 }
 
 /// The procedure's output loses a field the client reads.
@@ -2817,6 +2864,7 @@ async fn seed_graphql_root_rename() {
     );
     seed_finding(&payload, "orphaned_endpoint", "QUERY", "orderById", None);
     assert_delta(&payload, &["QUERY orderById"], &["QUERY order"]);
+    assert_removed_rows_are_facts(&payload);
 }
 
 #[tokio::test]
@@ -2896,6 +2944,7 @@ async fn seed_socket_listener_rename() {
         &["CLIENT->SERVER order:changed"],
         &["CLIENT->SERVER order:update"],
     );
+    assert_removed_rows_are_facts(&payload);
 }
 
 #[tokio::test]
@@ -3017,6 +3066,7 @@ async fn seed_pubsub_subscriber_rename() {
         &["PUBSUB payments.cleared"],
         &["PUBSUB payments.settled"],
     );
+    assert_removed_rows_are_facts(&payload);
 }
 
 #[tokio::test]

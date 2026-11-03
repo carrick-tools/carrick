@@ -185,6 +185,10 @@ pub struct ServiceAnalysis {
     /// Its type-reach record, for the store to keep beside its blob
     /// (carrick#3101). Never serialised into the blob.
     pub type_reach: Option<crate::cloud_storage::TypeReachObject>,
+    /// Its route sites whose own path the receiver trace could not read
+    /// ([`crate::site_rows::GuessedRoute`]), for a PR's endpoint delta
+    /// (carrick#3222). Never serialised.
+    pub unread_routes: Vec<crate::site_rows::GuessedRoute>,
 }
 
 /// The model work one service still owes once its analysis has run.
