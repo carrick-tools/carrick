@@ -85,6 +85,17 @@ the merge base of the base commit and HEAD to the tree the scan read.
   merge base is main's, not the pull request's. When git cannot read the
   file at main's commit, the operation is listed only if the pull request
   edits or deletes that file.
+- The same-place passes (a new operation at main's place, a removed one
+  whose place this scan holds) list nothing for a service whose inputs other
+  than source files and schemas the pull request changes (carrick#1712,
+  `change_scope::reading_moved_since`): its manifest, lockfile, tsconfig
+  chain or `carrick.json`, the packages it loads. Those inputs can move how
+  the scanner reads a registration the pull request never touched. The
+  exemptions of `--changed-only` apply: a version-only manifest bump and a
+  dependency move that reaches nothing the service loads leave the passes
+  open. A row the diff places by its lines is listed whatever moved. The
+  cost: a pull request that changes such an input and also moves a mount
+  prefix or a path constant lists no delta for the routes that moved.
 - Everything else is a reading that moved. It is counted in one info line of
   the run log and not listed.
 - Each listed operation carries `edge_source`: `fact` when a deterministic

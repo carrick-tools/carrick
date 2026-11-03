@@ -707,6 +707,8 @@ fn anchored_delta(
     base: Option<&str>,
     previous: &HashMap<ServiceEndpointKey, DeltaRow>,
     current: &[CloudRepoData],
+    services: &[Config],
+    changes: Option<&crate::change_scope::ChangedSince>,
     unread: &[UnreadRoute],
 ) -> Option<crate::findings::PrDelta> {
     let Some(base) = base else {
@@ -746,7 +748,19 @@ fn anchored_delta(
                 })
         })
         .collect();
-    match crate::pr_delta_anchor::run(repo_path, base, new, removed, &scan, main, &serving) {
+    let reading_moved = |merge_base: &str| {
+        crate::change_scope::reading_moved_services(repo_path, services, changes, merge_base)
+    };
+    match crate::pr_delta_anchor::run(
+        repo_path,
+        base,
+        new,
+        removed,
+        &scan,
+        main,
+        reading_moved,
+        &serving,
+    ) {
         Ok(anchored) => {
             info!("{}", anchored.summary());
             Some(delta_of(
@@ -2167,6 +2181,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     pr_base.as_deref(),
                     &main_self_data,
                     &current_services_data,
+                    &services,
+                    pr_changes.as_deref(),
                 )
             };
             MainBaselineInput {
@@ -2282,6 +2298,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 pr_base.as_deref(),
                 &previous,
                 &current_services_data,
+                &services,
+                pr_changes.as_deref(),
                 &unread,
             )
         }

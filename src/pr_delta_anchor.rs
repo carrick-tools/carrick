@@ -94,6 +94,7 @@ enum Reason {
     UntouchedFile,
     MainMoved,
     PlacedByFile,
+    ReadingMoved,
 }
 
 impl Reason {
@@ -103,6 +104,7 @@ impl Reason {
             Reason::UntouchedFile => "untouched_file",
             Reason::MainMoved => "main_moved",
             Reason::PlacedByFile => "placed_by_file",
+            Reason::ReadingMoved => "reading_moved",
         }
     }
 }
@@ -114,11 +116,16 @@ pub struct LeftOut {
     pub untouched_file: usize,
     pub main_moved: usize,
     pub placed_by_file: usize,
+    pub reading_moved: usize,
 }
 
 impl LeftOut {
     pub fn total(&self) -> usize {
-        self.edited_file + self.untouched_file + self.main_moved + self.placed_by_file
+        self.edited_file
+            + self.untouched_file
+            + self.main_moved
+            + self.placed_by_file
+            + self.reading_moved
     }
 
     fn count(&mut self, reason: Reason) {
@@ -127,6 +134,7 @@ impl LeftOut {
             Reason::UntouchedFile => self.untouched_file += 1,
             Reason::MainMoved => self.main_moved += 1,
             Reason::PlacedByFile => self.placed_by_file += 1,
+            Reason::ReadingMoved => self.reading_moved += 1,
         }
     }
 }
@@ -164,6 +172,10 @@ impl<T> Anchored<T> {
                 out.placed_by_file,
                 "in a file git could not read at main's commit",
             ),
+            (
+                out.reading_moved,
+                "in a service whose dependencies or config this PR changes",
+            ),
         ]
         .into_iter()
         .filter(|(count, _)| *count > 0)
@@ -189,6 +201,10 @@ struct Context<'a> {
     diff: &'a Diff,
     main: &'a [MainRow],
     scan: &'a [Place],
+    /// The services whose inputs other than source files this PR changes:
+    /// their reading may have moved with no edit to the file that states a
+    /// route, so the same-place passes do not list their rows.
+    reading_moved: &'a BTreeSet<Option<String>>,
 }
 
 impl Context<'_> {
@@ -232,6 +248,15 @@ impl Context<'_> {
         }
     }
 
+    /// Whether the same-place pass lists a row of `place`'s service.
+    fn same_place_allowed(&self, place: &Place) -> Result<(), Reason> {
+        if self.reading_moved.contains(&place.service) {
+            Err(Reason::ReadingMoved)
+        } else {
+            Ok(())
+        }
+    }
+
     fn judge_new(&self, place: &Place) -> Result<(), Reason> {
         let change = self.diff.0.get(&place.file);
         match change {
@@ -241,7 +266,7 @@ impl Context<'_> {
             _ => {}
         }
         if place.line > 0 && self.main_holds_same_place(place) {
-            return Ok(());
+            return self.same_place_allowed(place);
         }
         Err(match change {
             None => Reason::UntouchedFile,
@@ -276,11 +301,11 @@ impl Context<'_> {
                         ..at_base.clone()
                     }) =>
                 {
-                    Ok(())
+                    self.same_place_allowed(place)
                 }
                 Some(_) => Err(Reason::EditedFile),
             },
-            None if self.scan_holds(&at_base) => Ok(()),
+            None if self.scan_holds(&at_base) => self.same_place_allowed(place),
             None => Err(Reason::UntouchedFile),
         }
     }
@@ -299,6 +324,9 @@ impl Context<'_> {
 /// between its stored commit and the merge base never passes. A row with no
 /// line passes when the PR touches its file. `scan` is every row this scan
 /// states and `main` every row of main's index in a file that holds a
+/// candidate. Those same-place passes are closed for a service in
+/// `reading_moved`: a PR that changes an input of the service other than
+/// source files (carrick#1712).
 /// candidate. Of `unread`, the route sites this scan could not read a path
 /// for, the result keeps those the PR wrote (`unread_written`).
 pub fn anchor<T>(
@@ -307,9 +335,15 @@ pub fn anchor<T>(
     scan: &[Place],
     main: &[MainRow],
     diff: &Diff,
+    reading_moved: &BTreeSet<Option<String>>,
     unread: &[Place],
 ) -> Anchored<T> {
-    let context = Context { diff, main, scan };
+    let context = Context {
+        diff,
+        main,
+        scan,
+        reading_moved,
+    };
     let unread_written = unread
         .iter()
         .filter(|place| context.written(place))
@@ -511,10 +545,19 @@ pub fn run<T>(
     removed: Vec<Candidate<T>>,
     scan: &[Place],
     main: Vec<MainSource>,
+    reading_moved: impl FnOnce(&str) -> BTreeSet<Option<String>>,
     unread: &[Place],
 ) -> Result<Anchored<T>, String> {
     if new.is_empty() && removed.is_empty() {
-        return Ok(anchor(new, removed, scan, &[], &Diff::default(), unread));
+        return Ok(anchor(
+            new,
+            removed,
+            scan,
+            &[],
+            &Diff::default(),
+            &BTreeSet::new(),
+            unread,
+        ));
     }
     let files: BTreeSet<String> = new
         .iter()
@@ -531,7 +574,8 @@ pub fn run<T>(
         .filter(|row| files.contains(&row.place.file))
         .collect();
     let main = place_main_rows(repo_path, &merge_base, in_files);
-    Ok(anchor(new, removed, scan, &main, &diff, unread))
+    let moved = reading_moved(&merge_base);
+    Ok(anchor(new, removed, scan, &main, &diff, &moved, unread))
 }
 
 #[cfg(test)]
@@ -587,8 +631,25 @@ mod tests {
         main: &[MainRow],
         diff: &Diff,
     ) -> (Vec<&'static str>, Vec<&'static str>, LeftOut) {
-        let anchored = anchor(new, removed, scan, main, diff, &[]);
+        listed_moved(new, removed, scan, main, diff, &BTreeSet::new())
+    }
+
+    /// [`listed`] with the services whose reading moved.
+    fn listed_moved(
+        new: Vec<Candidate<&'static str>>,
+        removed: Vec<Candidate<&'static str>>,
+        scan: &[Place],
+        main: &[MainRow],
+        diff: &Diff,
+        reading_moved: &BTreeSet<Option<String>>,
+    ) -> (Vec<&'static str>, Vec<&'static str>, LeftOut) {
+        let anchored = anchor(new, removed, scan, main, diff, reading_moved, &[]);
         (anchored.new, anchored.removed, anchored.left_out)
+    }
+
+    /// The service of [`place`], whose reading moved.
+    fn web_moved() -> BTreeSet<Option<String>> {
+        BTreeSet::from([Some("web".to_string())])
     }
 
     fn new_only(
@@ -838,6 +899,7 @@ mod tests {
             &[],
             &[],
             &d,
+            &BTreeSet::new(),
             &unread,
         );
         assert_eq!(anchored.removed, vec!["gone"]);
@@ -857,6 +919,7 @@ mod tests {
                 untouched_file: 2,
                 main_moved: 1,
                 placed_by_file: 0,
+                reading_moved: 0,
             },
             unread_written: Vec::new(),
         };
@@ -951,6 +1014,7 @@ mod tests {
             vec![],
             &[],
             vec![],
+            |_| BTreeSet::new(),
             &[],
         )
         .unwrap();
@@ -978,6 +1042,7 @@ mod tests {
             vec![candidate("gone", &[("routes.ts", 2)])],
             &[],
             vec![],
+            |_| BTreeSet::new(),
             &[place("plugin.ts", 2), place("kept.ts", 2)],
         )
         .unwrap();
@@ -996,6 +1061,7 @@ mod tests {
             vec![],
             &[],
             vec![],
+            |_| panic!("no candidate, no question"),
             &[place("a.ts", 1)],
         )
         .unwrap();
@@ -1009,10 +1075,124 @@ mod tests {
                 vec![],
                 &[],
                 vec![],
+                |_| BTreeSet::new(),
                 &[],
             )
             .is_err(),
             "git cannot read a diff here"
+        );
+    }
+
+    /// carrick#1712: the PR changes an input of the service other than a
+    /// source file, so a row it shares a place with on main may be the same
+    /// registration read another way.
+    #[test]
+    fn a_same_place_pair_in_a_service_whose_reading_moved_is_left_out() {
+        for edit in [None, Some(FileDiff::Modified(vec![hunk(40, 1, 40, 1)]))] {
+            let d = Diff(edit.into_iter().map(|e| (ROUTES.to_string(), e)).collect());
+            let main = [main_row(ROUTES, 10, AtBase::At(10))];
+            let scan = [place(ROUTES, 10)];
+            let (new, removed, out) = listed_moved(
+                vec![candidate("/new", &[(ROUTES, 10)])],
+                vec![Candidate {
+                    item: "/old",
+                    places: vec![place(ROUTES, 10)],
+                }],
+                &scan,
+                &main,
+                &d,
+                &web_moved(),
+            );
+            assert!(new.is_empty() && removed.is_empty(), "{d:?}");
+            assert_eq!(out.reading_moved, 2, "{d:?}");
+            assert_eq!(out.total(), 2);
+            // The same pair lists in a service whose reading held.
+            let (new, removed, _) = listed(
+                vec![candidate("/new", &[(ROUTES, 10)])],
+                vec![Candidate {
+                    item: "/old",
+                    places: vec![place(ROUTES, 10)],
+                }],
+                &scan,
+                &main,
+                &d,
+            );
+            assert_eq!((new, removed), (vec!["/new"], vec!["/old"]), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn rows_the_diff_places_by_line_are_listed_in_a_service_whose_reading_moved() {
+        let moved = web_moved();
+        let main_at = |line| [main_row(ROUTES, line, AtBase::At(line))];
+        // An added file, a changed line and a row with no line, new.
+        let added = diff(vec![(ROUTES, FileDiff::Added)]);
+        let edited = diff(vec![(ROUTES, FileDiff::Modified(vec![hunk(9, 1, 9, 2)]))]);
+        for (rows, d) in [
+            (&[(ROUTES, 4)][..], &added),
+            (&[(ROUTES, 9)][..], &edited),
+            (&[(ROUTES, 0)][..], &edited),
+        ] {
+            let (new, _, out) = listed_moved(
+                vec![candidate("x", rows)],
+                vec![],
+                &[],
+                &main_at(rows[0].1),
+                d,
+                &moved,
+            );
+            assert_eq!(new, vec!["x"], "{rows:?}");
+            assert_eq!(out, LeftOut::default());
+        }
+        // A removed row in a deleted file and on a replaced line.
+        for d in [
+            diff(vec![(ROUTES, FileDiff::Deleted)]),
+            diff(vec![(ROUTES, FileDiff::Modified(vec![hunk(5, 1, 5, 2)]))]),
+        ] {
+            let row = main_row(ROUTES, 5, AtBase::At(5));
+            let candidate = Candidate {
+                item: "x",
+                places: vec![row.place.clone()],
+            };
+            let (_, removed, _) = listed_moved(vec![], vec![candidate], &[], &[row], &d, &moved);
+            assert_eq!(removed, vec!["x"], "{d:?}");
+        }
+    }
+
+    #[test]
+    fn a_removed_row_whose_scan_row_moved_through_the_hunks_is_left_out_when_reading_moved() {
+        let d = diff(vec![(ROUTES, FileDiff::Modified(vec![hunk(0, 0, 1, 2)]))]);
+        let row = main_row(ROUTES, 5, AtBase::At(5));
+        let candidate = Candidate {
+            item: "x",
+            places: vec![row.place.clone()],
+        };
+        let (_, removed, out) = listed_moved(
+            vec![],
+            vec![candidate],
+            &[place(ROUTES, 7)],
+            &[row],
+            &d,
+            &web_moved(),
+        );
+        assert!(removed.is_empty());
+        assert_eq!(out.reading_moved, 1);
+    }
+
+    #[test]
+    fn the_summary_names_a_service_whose_dependencies_or_config_the_pr_changes() {
+        let anchored: Anchored<&str> = Anchored {
+            new: vec![],
+            removed: vec![],
+            left_out: LeftOut {
+                reading_moved: 2,
+                ..LeftOut::default()
+            },
+        };
+        assert!(
+            anchored
+                .summary()
+                .contains("2 in a service whose dependencies or config this PR changes")
         );
     }
 
