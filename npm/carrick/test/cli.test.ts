@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { binary, check, recheckTimeoutMs, status, timeoutMs } from "../src/cli.ts";
 import { fakeBin, fakeEnv, firstCall, fixturePath, makeWorkspace } from "./helpers.ts";
@@ -153,3 +154,19 @@ test("a CLI slower than the limit is killed", async (t) => {
   assert.equal(outcome.result, null);
   assert.ok(outcome.ms < 2000, `gave up after ${outcome.ms}ms`);
 });
+
+// carrick-cloud#2884: `--help` is an answer, not an argument. `lsp` used to
+// start the language server and `templates` refused `--help` as a name.
+for (const command of ["lsp", "templates"]) {
+  for (const flag of ["--help", "-h"]) {
+    test(`carrick ${command} ${flag} prints its help and exits 0`, () => {
+      const run = spawnSync(
+        process.execPath,
+        [path.join(import.meta.dirname, "..", "bin", "carrick.mjs"), command, flag],
+        { encoding: "utf8", timeout: 10000, input: "" },
+      );
+      assert.equal(run.status, 0, run.stderr);
+      assert.match(run.stdout, new RegExp(`^carrick ${command} `));
+    });
+  }
+}
