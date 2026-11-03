@@ -1,0 +1,11 @@
+{
+  "name": "receiver-route-stated-head",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencies": {
+    "fixture-plugin-server": "^1.0.0"
+  },
+  "version": "0.0.0"
+}

@@ -155,6 +155,17 @@ fn scan_cmd(
         cassettes.join("library-claims/default.json"),
     )
     .unwrap();
+    // A fixture's own reader answers, for files whose routes the mock reader
+    // writes no row for (a template path).
+    let reader = fixture_dir(name).join("__llm__/analyze-file");
+    if reader.is_dir() {
+        let to = cassettes.join("analyze-file");
+        std::fs::create_dir_all(&to).unwrap();
+        for answer in std::fs::read_dir(&reader).unwrap() {
+            let answer = answer.unwrap().path();
+            std::fs::copy(&answer, to.join(answer.file_name().unwrap())).unwrap();
+        }
+    }
     std::fs::create_dir_all(home).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.arg(".")
@@ -956,6 +967,52 @@ fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
         scan_fixture("receiver-scopes-types-only", false, Some("1")),
         scan_fixture("receiver-scopes-types-only", false, None)
     );
+}
+
+/// carrick#3237: in a package that uses its framework only through types,
+/// a route path that writes its first segment before a value the code does
+/// not read (`/widgets/kinds/${kind}`, `/docs/spec${tail}`) keeps the
+/// reader's row, counted `unread_own_part`; the path that starts with its
+/// value (`${head}health`) is a guessed site and its row is withdrawn.
+#[test]
+fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
+    let off = scan_fixture("receiver-route-stated-head", true, None);
+    let (on, fallbacks) = scan_fixture_reading("receiver-route-stated-head", true, Some("1"));
+    let (graph, _) = endpoint_rows(&on);
+    let family: Vec<&String> = graph
+        .iter()
+        .filter(|row| row.contains("families.ts"))
+        .collect();
+    assert!(
+        family
+            .iter()
+            .any(|row| row.contains("families.ts:14 POST /widgets/kinds/:kind"))
+            && family
+                .iter()
+                .any(|row| row.contains("families.ts:17 GET /docs/spec")),
+        "{family:#?}"
+    );
+    assert!(
+        family.iter().all(|row| !row.contains("health")),
+        "{family:#?}"
+    );
+    for row in family
+        .iter()
+        .filter(|row| row.contains("families.ts:14 ") || row.contains("families.ts:17 "))
+    {
+        assert!(row.contains(" model "), "{row}");
+    }
+    let counts = route_counts(&fallbacks);
+    assert!(
+        counts.contains(&"routes routes_untraced_unread_own_part=2".to_string())
+            && counts.contains(&"routes routes_guessed_withdrawn=1".to_string()),
+        "{counts:#?}"
+    );
+    // With the trace off the reader's rows are all there is.
+    assert_eq!(scan_fixture("receiver-route-stated-head", true, None), off);
+    // An incremental re-scan gives the same rows.
+    let again = scan_runs("receiver-route-stated-head", &[], true, Some("1"), 2);
+    assert_eq!(endpoint_rows(&again[1]).0, graph);
 }
 
 /// carrick#3207: the same tree as the types-only package's, with the host
