@@ -1023,7 +1023,10 @@ pub struct EndpointRef {
     /// stated every row, `candidate` when the model stated any. A new
     /// endpoint's rows are this run's; a removed endpoint's are main's stored
     /// index's. Omitted when a row states no source, as on an index written
-    /// before the field existed.
+    /// before the field existed. A removed HTTP route is `candidate` whatever
+    /// its rows were when the PR wrote a route site this run could not read a
+    /// path for that could serve it (carrick#3222; `docs/reference/runner.md`,
+    /// "The endpoint delta").
     ///
     /// [`ResolutionSource::is_candidate`]: crate::agents::file_analyzer_agent::ResolutionSource::is_candidate
     #[serde(skip_serializing_if = "Option::is_none")]

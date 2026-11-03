@@ -186,7 +186,7 @@ fn place<R: Placeable>(
             places: removal.places.clone(),
         })
         .collect();
-    match crate::pr_delta_anchor::run(repo_path, base, Vec::new(), candidates, scan, main) {
+    match crate::pr_delta_anchor::run(repo_path, base, Vec::new(), candidates, scan, main, &[]) {
         Ok(anchored) => {
             let listed: HashSet<usize> = anchored.removed.into_iter().collect();
             info!(

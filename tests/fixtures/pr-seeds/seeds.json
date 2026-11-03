@@ -235,6 +235,21 @@
       }
     },
     {
+      "name": "http-path-into-option-default",
+      "protocol": "http",
+      "repo": "rpc-api",
+      "edits": [
+        {"op": "replace", "file": "src/server.ts", "pairs": [["reports.get(\"/reports/daily\", (_request, reply) => {", "const { dailyPath = \"/reports/daily\" }: { dailyPath?: string } = JSON.parse(\"{}\");\nreports.get(dailyPath, (_request, reply) => {"]]}
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": []
+      },
+      "known_miss": "carrick#3191: the route is not indexed at its default, so the delta keeps a removed row; carrick#3222 makes it a candidate, which the check hides only with the provenance gate on (carrick-cloud#2866)"
+    },
+    {
       "name": "trpc-procedure-added",
       "protocol": "trpc",
       "repo": "rpc-api",
