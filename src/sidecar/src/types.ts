@@ -418,6 +418,12 @@ export interface ImplementationsRequest extends BaseRequest {
   action: 'implementations';
   /** One question per call, each the span of its `call` (or `member`) position row. */
   queries: ImplementationsQuery[];
+  /**
+   * Every file the service's position index holds, as absolute walked paths.
+   * The question is answered over the walk's program: the owner's tsconfig
+   * program plus each of these files it does not list (carrick#3220).
+   */
+  files: string[];
   /** The scanned repo's root: every name in an answer is relative to it. */
   scan_root: string;
 }

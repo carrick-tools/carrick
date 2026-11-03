@@ -49,7 +49,7 @@ import {
   writeEntry,
 } from './infer-cache.js';
 import { writePositionRows } from './position-rows.js';
-import { findImplementations } from './implementations.js';
+import { ImplementationPrograms, findImplementations } from './implementations.js';
 import { importGraphOf, mergeGraphs, reach, serialiseGraph } from './affected-set.js';
 import type {
   BundleResult,
@@ -978,11 +978,13 @@ function handleAddProgramFiles(
   }
 }
 
+const implementationPrograms = new ImplementationPrograms();
+
 /**
  * Handle the 'implementations' action - the implementations of the bodyless
- * declaration each call goes through (carrick#2432). Asked of the analysis
- * process: it reads the programs the service's other actions read, and
- * releases none of them.
+ * declaration each call goes through (carrick#2432). Answered over the walk's
+ * program, built fresh from the request's `files` (carrick#3220); the
+ * default project is neither built nor changed.
  */
 function handleImplementations(
   request: SidecarRequest & { action: 'implementations' }
@@ -997,6 +999,8 @@ function handleImplementations(
       loader,
       scanRoot: request.scan_root,
       queries: request.queries,
+      files: request.files,
+      programs: implementationPrograms,
       onAnswer: () => {
         done += 1;
         report();
