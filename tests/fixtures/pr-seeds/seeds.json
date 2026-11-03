@@ -1,5 +1,5 @@
 {
-  "_doc": "Seeded PRs: one known change each, with the check a correct Carrick would post for it. The edits are the one source for both readers: tests/pr_on_main_test.rs (`apply_seed`, payload assertions) and the private PR-accuracy instrument, which replays each seed with a candidate build and the cloud's renderer and scores the posted check against `expect`. `expect` is a closed world: `rows` names every row the correct check carries (an `optional` row may be there or not), so any other row is false and a missing one is a miss. Kinds: `risk_introduced` (a contract risk the PR introduces, at its call site; `label` is the operation as the check names it), `checked_line` (\"Checked N contracts. Nothing to flag.\"), and the hidden delta kinds `delta_new`, `delta_removed`, `removed_still_called`. `title` is the title class (`no_contract_changes`, `no_contract_risks`, `risks_introduced`, `not_clean` for any title that is not one of the two clean ones). `open: true` marks a seed whose correct row has no kind yet: a row it posts is new, not false. `known_miss` names the issue a seed waits on when today's scanner or renderer does not give the correct check. Edit ops: `replace` (each `from` must be in the file), `move` (git mv), `copy`, `write`, `delete`. A seed that moves lines in a file with an `__llm__/analyze-file/` answer moves the answer's lines in the same seed. This file is an answer key: never edit `expect` to make a run pass.",
+  "_doc": "Seeded PRs: one known change each, with the check a correct Carrick would post for it. The edits are the one source for both readers: tests/pr_on_main_test.rs (`apply_seed`, payload assertions) and the private PR-accuracy instrument, which replays each seed with a candidate build and the cloud's renderer and scores the posted check against `expect`. `expect` is a closed world: `rows` names every row the correct check carries (an `optional` row may be there or not), so any other row is false and a missing one is a miss. Kinds: `risk_introduced` (a contract risk the PR introduces, at its call site; `label` is the operation as the check names it), `checked_line` (\"Checked N contracts. Nothing to flag.\"), and the hidden delta kinds `delta_new`, `delta_removed`, `removed_still_called`. `title` is the title class (`no_contract_changes`, `no_contract_risks`, `risks_introduced`, `not_clean` for any title that is not one of the two clean ones). `open: true` marks a seed whose correct row has no kind yet: a row it posts is new, not false. `change` is the kind of change the seed makes, from a closed list (`shape_break`, `verb_change`, `removed_while_used`, `sender_renamed`, `delta_only`, `quiet`). `known_miss` is `{\"stage\", \"issues\"}`: `stage` is the first stage (`found`, `paired`, `judged`, `finding`, `shown`) at which today's check for the seed is wrong, `issues` the open issues it waits on (`carrick#N` or `carrick-cloud#N`). It is a test expectation, never a status: `pr_on_main_test` computes the scanner stages (found to finding) from the payload and fails when the declaration is behind or ahead of them. `retired: {date, reason}` takes a seed out of every run; a seed is never deleted without it. Edit ops: `replace` (each `from` must be in the file), `move` (git mv), `copy`, `write`, `delete`. A seed that moves lines in a file with an `__llm__/analyze-file/` answer moves the answer's lines in the same seed. This file is an answer key: never edit `expect` to make a run pass.",
   "stores": {
     "shared": ["orders-api", "storefront"],
     "admin": ["admin-api"],
@@ -14,6 +14,7 @@
     {
       "name": "http-field-rename",
       "protocol": "http",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "app/routes/api.v1.orders.$orderId.ts", "pairs": [["total: number;", "amount: number;"], ["total: 1200", "amount: 1200"]]}
@@ -30,6 +31,7 @@
     {
       "name": "http-field-removal",
       "protocol": "http",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "app/routes/api.v1.orders.$orderId.ts", "pairs": [["  currency: string;\n", ""], [", currency: \"EUR\"", ""]]}
@@ -46,6 +48,7 @@
     {
       "name": "http-field-type-change",
       "protocol": "http",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "app/routes/api.v1.orders.$orderId.ts", "pairs": [["total: number;", "total: string;"], ["total: 1200", "total: \"12.00\""]]}
@@ -62,6 +65,7 @@
     {
       "name": "http-verb-change",
       "protocol": "http",
+      "change": "verb_change",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "app/routes/api.v1.orders.$orderId.ts", "pairs": [["export async function loader", "export async function action"]]}
@@ -80,6 +84,7 @@
     {
       "name": "http-route-rename",
       "protocol": "http",
+      "change": "removed_while_used",
       "repo": "orders-api",
       "edits": [
         {"op": "move", "from": "app/routes/api.v1.orders.$orderId.ts", "to": "app/routes/api.v1.purchases.$orderId.ts"}
@@ -93,11 +98,12 @@
           {"kind": "removed_still_called", "label": "GET /api/v1/orders/:orderId"}
         ]
       },
-      "known_miss": "the check posts nothing for a removed route a consumer still calls: the warning was hidden at D4 (carrick-cloud#2763), and the call's missing endpoint never posts"
+      "known_miss": {"stage": "shown", "issues": ["carrick#3092", "carrick-cloud#2866"]}
     },
     {
       "name": "http-route-removed",
       "protocol": "http",
+      "change": "removed_while_used",
       "repo": "orders-api",
       "edits": [
         {"op": "delete", "file": "app/routes/api.v1.orders.$orderId.ts"}
@@ -110,11 +116,12 @@
           {"kind": "removed_still_called", "label": "GET /api/v1/orders/:orderId"}
         ]
       },
-      "known_miss": "the check posts nothing for a removed route a consumer still calls: the warning was hidden at D4 (carrick-cloud#2763), and the call's missing endpoint never posts"
+      "known_miss": {"stage": "shown", "issues": ["carrick#3092", "carrick-cloud#2866"]}
     },
     {
       "name": "convention-copy",
       "protocol": "http",
+      "change": "delta_only",
       "repo": "orders-api",
       "edits": [
         {"op": "copy", "from": "app/routes/api.v1.orders.$orderId.ts", "to": "app/routes/api.v1.invoices.$invoiceId.ts"},
@@ -133,6 +140,7 @@
     {
       "name": "respell-param",
       "protocol": "http",
+      "change": "quiet",
       "repo": "orders-api",
       "edits": [
         {"op": "move", "from": "app/routes/api.v1.orders.$orderId.ts", "to": "app/routes/api.v1.orders.$id.ts"},
@@ -148,6 +156,7 @@
     {
       "name": "http-handler-body",
       "protocol": "http",
+      "change": "quiet",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "app/routes/api.v1.orders.$orderId.ts", "pairs": [["String(params.orderId)", "params.orderId.trim()"]]}
@@ -162,6 +171,7 @@
     {
       "name": "non-code-edit",
       "protocol": "http",
+      "change": "quiet",
       "repo": "orders-api",
       "edits": [
         {"op": "write", "file": "docs/orders.md", "text": "# Orders\n\nThe orders service serves one order by id.\n"}
@@ -176,6 +186,7 @@
     {
       "name": "route-moved-within-its-file",
       "protocol": "http",
+      "change": "quiet",
       "repo": "admin-api",
       "edits": [
         {"op": "replace", "file": "src/admin.ts", "pairs": [["app.get(\"/api/v1/admin/orders\", listOrders);\napp.post(\"/api/v1/admin/orders/:orderId/cancel\", cancelOrder);", "// Cancelling comes first now.\napp.post(\"/api/v1/admin/orders/:orderId/cancel\", cancelOrder);\n\n// The list.\napp.get(\"/api/v1/admin/orders\", listOrders);"]]},
@@ -191,6 +202,7 @@
     {
       "name": "loop-route-edit",
       "protocol": "http",
+      "change": "quiet",
       "repo": "admin-api",
       "edits": [
         {"op": "replace", "file": "src/admin.ts", "pairs": [["  app.get(`/api/v1/admin/reports/${period}`, report);", "  // One report route per period.\n  app.get(`/api/v1/admin/reports/${period}`, (_request, response) => response.send({ rows: [], period }));"]]},
@@ -206,6 +218,7 @@
     {
       "name": "http-prefix-moved",
       "protocol": "http",
+      "change": "delta_only",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/server.ts", "pairs": [["app.use(\"/api/v1\", reports);", "app.use(\"/api/v2\", reports);"]]}
@@ -223,6 +236,7 @@
     {
       "name": "http-edit-under-prefix",
       "protocol": "http",
+      "change": "quiet",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/server.ts", "pairs": [["  reply.send({ rows: [] });", "  reply.send({ rows: [], generatedAt: Date.now() });"]]}
@@ -237,6 +251,7 @@
     {
       "name": "http-path-into-option-default",
       "protocol": "http",
+      "change": "quiet",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/server.ts", "pairs": [["reports.get(\"/reports/daily\", (_request, reply) => {", "const { dailyPath = \"/reports/daily\" }: { dailyPath?: string } = JSON.parse(\"{}\");\nreports.get(dailyPath, (_request, reply) => {"]]}
@@ -247,11 +262,12 @@
         "quiet": true,
         "rows": []
       },
-      "known_miss": "carrick#3191: the route is not indexed at its default, so the delta keeps a removed row; carrick#3222 makes it a candidate, which the check hides only with the provenance gate on (carrick-cloud#2866)"
+      "known_miss": {"stage": "finding", "issues": ["carrick#3191"]}
     },
     {
       "name": "trpc-procedure-added",
       "protocol": "trpc",
+      "change": "delta_only",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/orders.ts", "pairs": [["  create: t.procedure.input({ id: \"string\" }).mutation(() => ({ id: \"2\" })),\n", "  create: t.procedure.input({ id: \"string\" }).mutation(() => ({ id: \"2\" })),\n  cancel: t.procedure.input({ id: \"string\" }).mutation(() => ({ cancelled: true })),\n"]]}
@@ -268,6 +284,7 @@
     {
       "name": "trpc-procedure-removed",
       "protocol": "trpc",
+      "change": "delta_only",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/orders.ts", "pairs": [["  create: t.procedure.input({ id: \"string\" }).mutation(() => ({ id: \"2\" })),\n", ""]]}
@@ -284,6 +301,7 @@
     {
       "name": "trpc-procedure-renamed",
       "protocol": "trpc",
+      "change": "delta_only",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/orders.ts", "pairs": [["  create: t.procedure", "  place: t.procedure"]]}
@@ -301,6 +319,7 @@
     {
       "name": "trpc-resolver-body",
       "protocol": "trpc",
+      "change": "quiet",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/orders.ts", "pairs": [["mutation(() => ({ id: \"2\" }))", "mutation(() => ({ id: String(placed.length + 1) }))"]]}
@@ -315,6 +334,7 @@
     {
       "name": "trpc-adapter-prefix-moved",
       "protocol": "trpc",
+      "change": "delta_only",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/server.ts", "pairs": [["app.all(\"/api/trpc/*\"", "app.all(\"/trpc/*\""], ["endpoint: \"/api/trpc\"", "endpoint: \"/trpc\""]]},
@@ -337,6 +357,7 @@
     {
       "name": "trpc-output-field-removed",
       "protocol": "trpc",
+      "change": "shape_break",
       "repo": "rpc-api",
       "edits": [
         {"op": "replace", "file": "src/orders.ts", "pairs": [["  id: string;\n  total: number;\n", "  id: string;\n"], ["[{ id: \"1\", total: 1200 }]", "[{ id: \"1\" }]"]]}
@@ -348,11 +369,12 @@
           {"kind": "risk_introduced", "label": "GET /api/trpc/orders.list", "site": "src/web/orders-view.ts:7"}
         ]
       },
-      "known_miss": "carrick#937: no procedure client call is read, so no pair exists to break"
+      "known_miss": {"stage": "found", "issues": ["carrick#937"]}
     },
     {
       "name": "graphql-field-rename",
       "protocol": "graphql",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/schema.graphql", "pairs": [["  total: Int!", "  amount: Int!"]]},
@@ -363,11 +385,12 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "QUERY order", "site": "src/order-query.ts:9"}]
       },
-      "known_miss": "carrick-cloud#2774 hides non-HTTP risks until carrick-cloud#2828 opens GraphQL; carrick#3090 (label) and carrick#3091 (edge_source)"
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829"]}
     },
     {
       "name": "graphql-field-removal",
       "protocol": "graphql",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/schema.graphql", "pairs": [["  currency: String!\n", ""]]},
@@ -379,11 +402,12 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "QUERY order", "site": "src/order-query.ts:9"}]
       },
-      "known_miss": "carrick-cloud#2774 hides non-HTTP risks until carrick-cloud#2828 opens GraphQL; carrick#3090 (label) and carrick#3091 (edge_source)"
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829"]}
     },
     {
       "name": "graphql-root-rename",
       "protocol": "graphql",
+      "change": "removed_while_used",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/schema.graphql", "pairs": [["  order(id: ID!)", "  orderById(id: ID!)"]]},
@@ -399,11 +423,12 @@
           {"kind": "removed_still_called", "label": "QUERY order"}
         ]
       },
-      "known_miss": "the check posts nothing for a removed operation a consumer still calls (D4, carrick-cloud#2763); carrick#3092"
+      "known_miss": {"stage": "shown", "issues": ["carrick#3092", "carrick-cloud#2866"]}
     },
     {
       "name": "graphql-field-added",
       "protocol": "graphql",
+      "change": "quiet",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/schema.graphql", "pairs": [["  currency: String!\n}", "  currency: String!\n  note: String\n}"]]},
@@ -420,6 +445,7 @@
     {
       "name": "graphql-root-added",
       "protocol": "graphql",
+      "change": "delta_only",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/schema.graphql", "pairs": [["  order(id: ID!): OrderView\n", "  order(id: ID!): OrderView\n  orders: [OrderView!]!\n"]]},
@@ -439,6 +465,7 @@
     {
       "name": "graphql-resolver-body",
       "protocol": "graphql",
+      "change": "quiet",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/resolvers.ts", "pairs": [["orders.get(args.id) ?? null", "orders.get(args.id.trim()) ?? null"]]}
@@ -453,6 +480,7 @@
     {
       "name": "socket-field-rename",
       "protocol": "socket",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/realtime.ts", "pairs": [["  status: string;", "  state: string;"]]}
@@ -462,11 +490,12 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "CLIENT->SERVER order:update", "site": "src/live.ts:12"}]
       },
-      "known_miss": "carrick-cloud#2774 hides non-HTTP risks; carrick#3090 (label) and carrick#3091 (edge_source)"
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829"]}
     },
     {
       "name": "socket-field-removal",
       "protocol": "socket",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/realtime.ts", "pairs": [["{ orderId: update.orderId, carrier: \"post\" }", "{ orderId: update.orderId }"]]}
@@ -476,11 +505,12 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "SERVER->CLIENT order:shipped", "site": "src/realtime.ts:12"}]
       },
-      "known_miss": "carrick#3094 (inline emit payload unknown), then carrick#3090 and carrick#3091; carrick-cloud#2774 hides non-HTTP risks"
+      "known_miss": {"stage": "judged", "issues": ["carrick#3094"]}
     },
     {
       "name": "socket-listener-rename",
       "protocol": "socket",
+      "change": "removed_while_used",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/realtime.ts", "pairs": [["socket.on(\"order:update\"", "socket.on(\"order:changed\""]]}
@@ -494,11 +524,12 @@
           {"kind": "removed_still_called", "label": "CLIENT->SERVER order:update"}
         ]
       },
-      "known_miss": "the check posts nothing for a removed operation a consumer still calls (D4, carrick-cloud#2763); carrick#3092"
+      "known_miss": {"stage": "shown", "issues": ["carrick#3092", "carrick-cloud#2866"]}
     },
     {
       "name": "socket-emit-rename",
       "protocol": "socket",
+      "change": "sender_renamed",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/realtime.ts", "pairs": [["io.emit(\"order:shipped\"", "io.emit(\"order:dispatched\""]]}
@@ -509,11 +540,12 @@
         "open": true,
         "rows": []
       },
-      "known_miss": "a renamed emit leaves the storefront listener with no sender, and nothing posts for it (carrick#3092)"
+      "known_miss": {"stage": "shown", "issues": ["carrick#3092"]}
     },
     {
       "name": "socket-listener-field-added",
       "protocol": "socket",
+      "change": "quiet",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/realtime.ts", "pairs": [["  status: string;\n};", "  status: string;\n  note?: string;\n};"]]}
@@ -528,6 +560,7 @@
     {
       "name": "socket-event-added",
       "protocol": "socket",
+      "change": "delta_only",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/realtime.ts", "pairs": [["    io.emit(\"order:shipped\", { orderId: update.orderId, carrier: \"post\" });\n  });\n", "    io.emit(\"order:shipped\", { orderId: update.orderId, carrier: \"post\" });\n  });\n  socket.on(\"order:note\", (note: { orderId: string; text: string }) => {\n    io.emit(\"order:note\", note);\n  });\n"]]}
@@ -545,6 +578,7 @@
     {
       "name": "pubsub-field-rename",
       "protocol": "pubsub",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/events.ts", "pairs": [["  amount: number;", "  total: number;"], ["event.amount", "event.total"]]}
@@ -554,11 +588,12 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "PUBSUB payments.settled", "site": "src/payments.ts:10"}]
       },
-      "known_miss": "carrick#3089 (library-stated pub/sub rows not compared); carrick-cloud#2774 hides non-HTTP risks"
+      "known_miss": {"stage": "judged", "issues": ["carrick#3089"]}
     },
     {
       "name": "pubsub-field-removal",
       "protocol": "pubsub",
+      "change": "shape_break",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/events.ts", "pairs": [["{ orderId, carrier: \"post\" }", "{ orderId }"]]},
@@ -569,11 +604,12 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "PUBSUB orders.shipped", "site": "src/events.ts:15"}]
       },
-      "known_miss": "carrick#3089 (library-stated pub/sub rows not compared); carrick-cloud#2774 hides non-HTTP risks"
+      "known_miss": {"stage": "judged", "issues": ["carrick#3089"]}
     },
     {
       "name": "pubsub-subscriber-rename",
       "protocol": "pubsub",
+      "change": "removed_while_used",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/events.ts", "pairs": [["bus.subscribe(\"payments.settled\"", "bus.subscribe(\"payments.cleared\""]]},
@@ -588,11 +624,12 @@
           {"kind": "removed_still_called", "label": "PUBSUB payments.settled"}
         ]
       },
-      "known_miss": "the check posts nothing for a removed operation a consumer still calls (D4, carrick-cloud#2763); carrick#3092"
+      "known_miss": {"stage": "shown", "issues": ["carrick#3092", "carrick-cloud#2866"]}
     },
     {
       "name": "pubsub-publish-rename",
       "protocol": "pubsub",
+      "change": "sender_renamed",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/events.ts", "pairs": [["bus.publish(\"orders.shipped\"", "bus.publish(\"orders.dispatched\""]]},
@@ -604,11 +641,12 @@
         "open": true,
         "rows": []
       },
-      "known_miss": "a renamed publish leaves the storefront subscriber with no sender, and nothing posts for it (carrick#3092)"
+      "known_miss": {"stage": "shown", "issues": ["carrick#3092"]}
     },
     {
       "name": "pubsub-subscriber-field-added",
       "protocol": "pubsub",
+      "change": "quiet",
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "src/events.ts", "pairs": [["  amount: number;\n};", "  amount: number;\n  currency?: string;\n};"]]},
@@ -624,6 +662,7 @@
     {
       "name": "copied-helper",
       "protocol": "http",
+      "change": "quiet",
       "repo": "orders-api",
       "edits": [
         {"op": "write", "file": "src/money.ts", "text": "export function formatMinor(amount: number, currency: string): string {\n  const major = Math.trunc(amount / 100);\n  const minor = String(Math.abs(amount % 100)).padStart(2, \"0\");\n  return `${currency} ${major}.${minor}`;\n}\n"}

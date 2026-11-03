@@ -535,6 +535,16 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # A PR seed is retired, never deleted (carrick-cloud#2880): the seeds
+      # on the base commit must all still be in the head's file.
+      - name: Check no PR seed was deleted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          git fetch --depth=1 origin "$BASE_SHA"
+          git show "$BASE_SHA:tests/fixtures/pr-seeds/seeds.json" > "$RUNNER_TEMP/base-seeds.json"
+          python3 scripts/seed-retirement-check.py "$RUNNER_TEMP/base-seeds.json" tests/fixtures/pr-seeds/seeds.json
+
   # The release compile (about 140 s) runs in the merge queue only: a pull
   # request run skips it, and the `ci-result` gate accepts that skip for this
   # job on `pull_request` alone, so a release-profile break is caught before

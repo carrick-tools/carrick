@@ -10,8 +10,13 @@ five fact-layer switches the cloud runner sets.
 apply with `apply_seed`, and the check a correct Carrick posts for it
 (`expect`: title, conclusion and every row, a closed world). The PR-accuracy
 check that runs before each release replays the same seeds with the candidate
-build and scores the rendered check against `expect`. `known_miss` names the
-issue a seed's correct check waits on.
+build and scores the rendered check against `expect`. `change` is the kind of
+change the seed makes. `known_miss` is `{stage, issues}`: the first stage
+(found, paired, judged, finding, shown) at which the check for the seed is
+wrong today, and the issues it waits on. Every seed test holds the payload to
+that stage (`tests/support/seed_stages.rs`), in both directions, so closing a
+miss moves the declaration in the same PR. A seed is removed only by
+`retired: {date, reason}`; `scripts/seed-retirement-check.py` fails a deletion.
 
 - `orders-api` serves an HTTP route (`app/routes/api.v1.orders.$orderId.ts`),
   a GraphQL schema and resolver (`src/schema.graphql`, `src/resolvers.ts`), a

@@ -25,6 +25,11 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// The scanner stages of a seed and the shape of `seeds.json`
+/// (carrick-cloud#2880); the rule is described in the module.
+#[path = "support/seed_stages.rs"]
+mod seed_stages;
+
 /// The tests in this binary share the process environment and the injected
 /// fault, so they run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2186,11 +2191,20 @@ fn apply_seed(repo: &Path, name: &str) {
 
 /// The PR result of seed `name`, its edits applied to its repo. A seed whose
 /// correct check succeeds (a quiet seed) must mark no lost pairing
-/// (carrick#3092), so every test of one asserts that here.
+/// (carrick#3092), so every test of one asserts that here. Every seed is also
+/// held to its declared stage (`known_miss.stage`), in both directions
+/// (carrick-cloud#2880): the scanner stages the payload reaches must be the
+/// declared ones, so a fix that closes a miss fails until the declaration
+/// moves, and a declaration never outlives its miss.
 async fn manifest_seed_payload(name: &str) -> serde_json::Value {
     let entry = seed_entry(name);
+    assert!(
+        !seed_stages::is_retired(&entry),
+        "{name} is retired: drop its tests"
+    );
     let repo = entry["repo"].as_str().unwrap().to_string();
     let payload = seed_payload(&repo, |dir| apply_seed(dir, name)).await;
+    seed_stages::assert_declared_stage(name, &entry, &payload);
     if entry["expect"]["conclusion"] == "success" {
         assert_no_lost_pairing(&payload);
     }
@@ -2216,6 +2230,9 @@ fn every_manifest_seed_applies_to_its_repo() {
     let stores = manifest["stores"].as_object().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     for seed in manifest["seeds"].as_array().unwrap() {
+        if seed_stages::is_retired(seed) {
+            continue;
+        }
         let name = seed["name"].as_str().unwrap();
         let repo_name = seed["repo"].as_str().unwrap();
         assert!(
@@ -2229,6 +2246,80 @@ fn every_manifest_seed_applies_to_its_repo() {
         let repo = seed_repo(&root, repo_name);
         apply_seed(&repo, name);
     }
+}
+
+/// `seeds.json` is well formed: `change` from the closed list, `known_miss` a
+/// `{stage, issues}` object and never a status or a string, `retired` a
+/// `{date, reason}` object (carrick-cloud#2880).
+#[test]
+fn every_known_miss_is_structured() {
+    for seed in seed_manifest()["seeds"].as_array().unwrap() {
+        if let Some(problem) = seed_stages::seed_shape_problem(seed) {
+            panic!("{problem}");
+        }
+    }
+}
+
+/// The checks behind `every_known_miss_is_structured` refuse the shapes the
+/// table must never hold.
+#[test]
+fn a_malformed_seed_entry_is_refused() {
+    let seed = |extra: serde_json::Value| {
+        let mut seed = serde_json::json!({"name": "s", "change": "quiet"});
+        seed.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        seed
+    };
+    let refused = |extra: serde_json::Value| seed_stages::seed_shape_problem(&seed(extra));
+    assert!(refused(serde_json::json!({})).is_none());
+    assert!(refused(serde_json::json!({"known_miss": "waits on carrick#1"})).is_some());
+    assert!(refused(serde_json::json!({"status": "open"})).is_some());
+    assert!(refused(serde_json::json!({"known_miss": {"stage": "shown", "issues": []}})).is_some());
+    assert!(
+        refused(serde_json::json!({"known_miss": {"stage": "later", "issues": ["carrick#1"]}}))
+            .is_some()
+    );
+    assert!(
+        refused(serde_json::json!({"known_miss": {"stage": "shown", "issues": ["carrick#1"], "note": "x"}}))
+            .is_some()
+    );
+    assert!(
+        refused(
+            serde_json::json!({"known_miss": {"stage": "shown", "issues": ["carrick-cloud#2"]}})
+        )
+        .is_none()
+    );
+    assert!(refused(serde_json::json!({"retired": {"date": "2026-11-03"}})).is_some());
+    assert!(
+        refused(serde_json::json!({"retired": {"date": "2026-11-03", "reason": "moved"}}))
+            .is_none()
+    );
+    let mut unlisted = seed(serde_json::json!({}));
+    unlisted["change"] = serde_json::json!("other");
+    assert!(seed_stages::seed_shape_problem(&unlisted).is_some());
+}
+
+/// Every seed that takes part in runs has its stage asserted by a test that
+/// runs: a seed whose only test is `#[ignore]`d would carry a declaration
+/// nothing holds it to (carrick-cloud#2880).
+#[test]
+fn every_seed_has_a_stage_test() {
+    let names: Vec<String> = seed_manifest()["seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|seed| !seed_stages::is_retired(seed))
+        .map(|seed| seed["name"].as_str().unwrap().to_string())
+        .collect();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/pr_on_main_test.rs");
+    let source = std::fs::read_to_string(path).unwrap();
+    let covered = seed_stages::seeds_with_a_running_test(&source, &names);
+    let missing: Vec<&String> = names.iter().filter(|n| !covered.contains(n)).collect();
+    assert!(
+        missing.is_empty(),
+        "no running test calls manifest_seed_payload for {missing:?}"
+    );
 }
 
 /// Main's index of the seed fixture, built once per run of this binary: the
@@ -2823,16 +2914,6 @@ async fn seed_trpc_output_field_removed() {
 
 const ORDER_QUERY_SITE: &str = "src/order-query.ts:9";
 
-fn graphql_field_rename(repo: &Path) {
-    apply_seed(repo, "graphql-field-rename");
-}
-
-/// The removed line sits above the resolver, so the model's answer for the
-/// file moves its resolver line with it.
-fn graphql_field_removal(repo: &Path) {
-    apply_seed(repo, "graphql-field-removal");
-}
-
 /// What holds today: the break is found at the consumer, as a PR's, resolved.
 fn assert_graphql_found(payload: &serde_json::Value) {
     let finding = seed_finding_at(payload, "type_mismatch", ORDER_QUERY_SITE);
@@ -2855,25 +2936,25 @@ fn assert_graphql_marked(payload: &serde_json::Value) {
 #[tokio::test]
 async fn seed_graphql_field_rename() {
     let _serial = SERIAL.lock().await;
-    assert_graphql_found(&seed_payload("orders-api", graphql_field_rename).await);
+    assert_graphql_found(&manifest_seed_payload("graphql-field-rename").await);
 }
 
 #[tokio::test]
 async fn seed_graphql_field_rename_marking() {
     let _serial = SERIAL.lock().await;
-    assert_graphql_marked(&seed_payload("orders-api", graphql_field_rename).await);
+    assert_graphql_marked(&manifest_seed_payload("graphql-field-rename").await);
 }
 
 #[tokio::test]
 async fn seed_graphql_field_removal() {
     let _serial = SERIAL.lock().await;
-    assert_graphql_found(&seed_payload("orders-api", graphql_field_removal).await);
+    assert_graphql_found(&manifest_seed_payload("graphql-field-removal").await);
 }
 
 #[tokio::test]
 async fn seed_graphql_field_removal_marking() {
     let _serial = SERIAL.lock().await;
-    assert_graphql_marked(&seed_payload("orders-api", graphql_field_removal).await);
+    assert_graphql_marked(&manifest_seed_payload("graphql-field-removal").await);
 }
 
 #[tokio::test]
@@ -3339,6 +3420,34 @@ async fn seed_pubsub_subscriber_field_added() {
 
 /// carrick#3082: a PR that adds a table of `{ method, path }` bookkeeping
 /// records adds no endpoint, so the delta lists none of its paths.
+// The four seeds whose assertion tests above are `#[ignore]`d for an open
+// issue still hold their scanner stage: each runs here, and fails when the run
+// stops at another stage than `known_miss` declares (carrick-cloud#2880).
+
+#[tokio::test]
+async fn stage_trpc_output_field_removed() {
+    let _serial = SERIAL.lock().await;
+    manifest_seed_payload("trpc-output-field-removed").await;
+}
+
+#[tokio::test]
+async fn stage_socket_field_removal() {
+    let _serial = SERIAL.lock().await;
+    manifest_seed_payload("socket-field-removal").await;
+}
+
+#[tokio::test]
+async fn stage_pubsub_field_rename() {
+    let _serial = SERIAL.lock().await;
+    manifest_seed_payload("pubsub-field-rename").await;
+}
+
+#[tokio::test]
+async fn stage_pubsub_field_removal() {
+    let _serial = SERIAL.lock().await;
+    manifest_seed_payload("pubsub-field-removal").await;
+}
+
 #[tokio::test]
 async fn a_pr_adding_a_table_of_route_records_lists_no_new_endpoint() {
     let _serial = SERIAL.lock().await;
