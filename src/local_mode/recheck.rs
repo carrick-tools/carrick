@@ -12,8 +12,10 @@
 //! 1. **One repo, re-scanned.** The same subprocess `index` runs per repo, with
 //!    no model and no upload: deterministic extraction plus the sidecar's type
 //!    capture, over the working tree. Its one network request is a read-only
-//!    ask to the library store with package names, versions and import
-//!    specifiers, no source (`engine/mod.rs` `read_from_library_store`). The blob the last index
+//!    ask to the library store with package names, versions, import
+//!    specifiers and the TypeScript library globals the code uses, no source
+//!    (`engine/mod.rs` `read_from_library_store`, `library_store.rs`
+//!    `RegistryPackage`). The blob the last index
 //!    wrote for that repo is handed in as `previous_data`, so the hosted model
 //!    answers for the files the edit did not touch replay exactly as they do on
 //!    an incremental scan.

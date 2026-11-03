@@ -2051,8 +2051,9 @@ USAGE:
                one repo is re-scanned and the join runs over blobs already on
                disk, with no model. It asks Carrick's library store, read-only
                and signed in, about the installed packages: package names,
-               versions and import specifiers go on the wire, no source code,
-               and the store builds nothing for the ask. It has ten seconds
+               versions, import specifiers and the TypeScript library globals
+               the code uses go on the wire, no source code, and the store
+               builds nothing for the ask. It has ten seconds
                (CARRICK_RECHECK_BUDGET_MS); past that the answer is the indexed
                one and says so. A repo whose re-check missed its budget is
                remembered against that index (.carrick/recheck-misses.json):
@@ -2111,7 +2112,7 @@ mod tests {
         assert!(!HELP.contains("nothing on the wire"));
         let flat = HELP.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains(
-            "package names, versions and import specifiers go on the wire, no source code"
+            "package names, versions, import specifiers and the TypeScript library globals the code uses go on the wire, no source code"
         ));
     }
 

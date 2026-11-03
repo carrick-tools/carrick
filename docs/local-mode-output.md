@@ -509,7 +509,7 @@ the workspace it finds the merge base of `HEAD` and the main branch
 checks every source file the scan reads that differs from it: committed on the
 branch, uncommitted, or untracked. Each repo with such a file is scanned once
 with `--changed-only`, with no model. It asks Carrick's library store, read-only,
-for the installed packages (names, versions and import specifiers, no source
+for the installed packages (names, versions, import specifiers and the TypeScript library globals the code uses, no source
 code): only the services
 whose inputs changed are re-extracted, and every other service is carried from
 the blob the index holds for it (carrick#2826). The re-extracted services run
