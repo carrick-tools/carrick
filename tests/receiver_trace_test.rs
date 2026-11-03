@@ -1292,16 +1292,24 @@ fn a_changed_only_scan_resolves_routes_across_a_carried_service() {
 fn a_carried_blob_without_boundaries_reads_as_one_with_none() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let (repo, storage, _) = scanned_then_server_edited(tmp.path());
-    let path = std::fs::read_dir(&storage)
+    // The store holds more than one file per service: the blob
+    // (`<repo>__routes.json`) and its type-reach object
+    // (`<repo>__routes.type-reach.json.gz`, local_dir_storage.rs
+    // `type_reach_path`). Directory order is arbitrary, so a name that merely
+    // contains "routes" took the gzip file on some runs (carrick#3232). Name
+    // the blob exactly and require one.
+    let matches: Vec<PathBuf> = std::fs::read_dir(&storage)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .find(|path| {
+        .filter(|path| {
             path.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .contains("routes")
+                .ends_with("__routes.json")
         })
-        .expect("the routes blob");
+        .collect();
+    assert_eq!(matches.len(), 1, "the routes blob: {matches:#?}");
+    let path = matches[0].clone();
     let mut routes: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert!(
