@@ -59,7 +59,7 @@ fn stage_index(stage: &str) -> Option<usize> {
     STAGES.iter().position(|s| *s == stage)
 }
 
-fn array<'a>(value: &'a Value) -> &'a [Value] {
+fn array(value: &Value) -> &[Value] {
     value.as_array().map(Vec::as_slice).unwrap_or(&[])
 }
 
