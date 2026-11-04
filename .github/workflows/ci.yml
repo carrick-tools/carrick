@@ -26,7 +26,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The Rust tests run as 17 shards on 17 runners. Each shard compiles only the
+  # The Rust tests run as 21 shards on 21 runners. Each shard compiles only the
   # library and the test binaries it runs (about 40 s), so the slowest shard,
   # not the sum, is what a PR waits on. Before the split four shards of
   # 260-400 s each compiled every target they ran in one `cargo test` call.
@@ -35,7 +35,9 @@ jobs:
   # test-seconds each (about 70 s at four tests at once); scan shards hold
   # about 66 s each. Two things cut a binary across shards, both with nextest
   # `--partition slice:k/m` (even; `count:` is deprecated upstream): the
-  # library's unit tests (lib-1, lib-2) and `local_mode_test` (n2, n3) and `call_through_rows_test` (n6, n4, n5). A
+  # library's unit tests (lib-1, lib-2) and `local_mode_test` (n2, n3) and `call_through_rows_test` (n6, n4, n5) and
+  # `pr_on_main_test` (pr-1 to pr-4: each of its 100+ tests is a full scan with
+  # the type sidecar, about 94% of the old n9's time). A
   # `partitioned:` target runs in its own nextest call, because `--partition`
   # slices every test of a call, not one binary of it. `local_mode_test` runs
   # first in its shard; two of its tests claim every slot (.config/nextest.toml).
@@ -116,7 +118,23 @@ jobs:
           - shard: n9
             runner: nextest
             targets: >-
-              --test pr_on_main_test --test sidecar_integration_test --test position_rows_test --test action_install_test --test graphql_code_first_response_types_test --test route_request_anchor_test --test loop_route_types_test --test no_payload_registration_line_test --test env_var_template_call_segment_test --test commonjs_require_callers_test --test eval_xrepo --test bundle_row_id_golden_test --test derive_matches_scan_test --test derive_reach_units_test
+              --test sidecar_integration_test --test position_rows_test --test action_install_test --test graphql_code_first_response_types_test --test route_request_anchor_test --test loop_route_types_test --test no_payload_registration_line_test --test env_var_template_call_segment_test --test commonjs_require_callers_test --test eval_xrepo --test bundle_row_id_golden_test --test derive_matches_scan_test --test derive_reach_units_test
+          - shard: pr-1
+            runner: nextest
+            partitioned: --test pr_on_main_test
+            partition: slice:1/4
+          - shard: pr-2
+            runner: nextest
+            partitioned: --test pr_on_main_test
+            partition: slice:2/4
+          - shard: pr-3
+            runner: nextest
+            partitioned: --test pr_on_main_test
+            partition: slice:3/4
+          - shard: pr-4
+            runner: nextest
+            partitioned: --test pr_on_main_test
+            partition: slice:4/4
           - shard: scan-1
             runner: cargo
             targets: >-
