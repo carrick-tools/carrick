@@ -1,0 +1,43 @@
+name: Nightly seed type-reach pairs
+
+# A PR run pairs the type-reach decision off/on for one seed per protocol
+# (`REACH_SAMPLE` in tests/pr_on_main_test.rs); every other seed runs its own
+# assertions on the one pass. This job sets CARRICK_PR_SEED_REACH_ALL=1 so
+# every seed runs the pair, in four slices of the one test binary. The
+# nightly-only passes are the second scan of each seed outside REACH_SAMPLE.
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARRICK_PR_SEED_REACH_ALL: "1"
+
+jobs:
+  seeds:
+    name: Seed reach pairs (${{ matrix.slice }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/rust-test-setup
+        id: setup
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: nextest@0.9.148
+      - name: Run this slice
+        env:
+          SLICE: ${{ matrix.slice }}
+        run: cargo nextest run --no-fail-fast --test pr_on_main_test --partition "slice:${SLICE}/4"
+      - uses: ./.github/actions/rust-test-cache-save
+        with:
+          cache-hit: ${{ steps.setup.outputs.cache-hit }}

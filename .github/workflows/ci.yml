@@ -122,19 +122,11 @@ jobs:
           - shard: pr-1
             runner: nextest
             partitioned: --test pr_on_main_test
-            partition: slice:1/4
+            partition: slice:1/2
           - shard: pr-2
             runner: nextest
             partitioned: --test pr_on_main_test
-            partition: slice:2/4
-          - shard: pr-3
-            runner: nextest
-            partitioned: --test pr_on_main_test
-            partition: slice:3/4
-          - shard: pr-4
-            runner: nextest
-            partitioned: --test pr_on_main_test
-            partition: slice:4/4
+            partition: slice:2/2
           - shard: scan-1
             runner: cargo
             targets: >-
