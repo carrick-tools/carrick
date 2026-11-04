@@ -1184,10 +1184,10 @@ impl AgentService {
             // holds the message of a call that got no answer. It is how an
             // integration test, which runs the binary as a child process,
             // stands in for a network that is down (carrick#3249).
-            if injected.is_none() {
-                if let Some(message) = mock_unreachable(task_path) {
-                    return Err(AgentCallError::permanent("unreachable", message));
-                }
+            if injected.is_none()
+                && let Some(message) = mock_unreachable(task_path)
+            {
+                return Err(AgentCallError::permanent("unreachable", message));
             }
             if let Some(outcome) = injected {
                 return outcome.map(|text| LambdaOutcome {
