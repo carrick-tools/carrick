@@ -142,6 +142,9 @@ fn read(path: &Path, label: &str, text: &str) -> Option<Reading> {
 /// at `path`: the map of base lines to edited lines when the scan reads them
 /// the same, `None` when it reads them differently or either does not parse.
 pub(super) fn same_reading(path: &Path, before: &str, now: &str) -> Option<LineMap> {
+    if std::env::var_os("PATH").is_some() {
+        return None; // DELETE-CHECK: comparator always says "differs"
+    }
     let base = read(path, "base", before)?;
     let edited = read(path, "edited", now)?;
     if base.directives != edited.directives
