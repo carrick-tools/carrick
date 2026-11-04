@@ -12172,8 +12172,18 @@ impl FileOrchestrator {
     /// that names no handler. The fold across services reads it too
     /// (carrick#2474 R5d).
     pub(crate) fn is_documentation_row(endpoint: &ResolvedEndpoint) -> bool {
-        endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
-            && endpoint.handler.as_deref() == Some(ROUTE_DESCRIPTOR_OWNER)
+        Self::is_documentation_route(endpoint.resolution_source, endpoint.handler.as_deref())
+    }
+
+    /// [`Self::is_documentation_row`], for a caller that holds a row's two
+    /// marks and not the row: the joined operations `check --changed` reads
+    /// (carrick#3192).
+    pub(crate) fn is_documentation_route(
+        resolution_source: Option<ResolutionSource>,
+        handler: Option<&str>,
+    ) -> bool {
+        resolution_source == Some(ResolutionSource::DescriptorRoute)
+            && handler == Some(ROUTE_DESCRIPTOR_OWNER)
     }
 
     /// Apply `folds`, read from `graph` by [`Self::documented_folds`]: how
