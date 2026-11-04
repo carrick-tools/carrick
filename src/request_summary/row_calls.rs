@@ -747,6 +747,40 @@ impl RequestSummaryInputs {
         }
     }
 
+    /// The declaration with no body the member call at `lo..hi` in `file`
+    /// goes through, for the question of which body implements it
+    /// ([`crate::implementation_edges`]): [`Self::declared_non_definition`]
+    /// where the rows name no function and no other pass keeps the call.
+    /// Unlike [`Self::unfollowed_at`] it does not skip a file only tests
+    /// import: a call there takes an edge like any other, while the file
+    /// still gets no row.
+    pub(crate) fn edgeless_declaration(
+        &self,
+        file: &Path,
+        lo: u32,
+        hi: u32,
+    ) -> Option<(PathBuf, u32)> {
+        let row_calls = self.row_calls.as_ref()?;
+        if row_calls.kept.contains(&(file.to_path_buf(), lo, hi)) {
+            return None;
+        }
+        match self.reach(file, lo, hi) {
+            Reach::NoFunction => self.declared_non_definition(file, lo, hi),
+            _ => None,
+        }
+    }
+
+    /// The span of the call row at `lo..hi` in `file`, in the rows' numbering:
+    /// the key [`Self::row_names`] reads, for a question put to the sidecar
+    /// about that call. `None` without rows or for a file they hold none for.
+    pub(crate) fn call_row_span(&self, file: &Path, lo: u32, hi: u32) -> Option<(u32, u32)> {
+        let ir = self.files.get(file)?;
+        self.positions
+            .as_ref()?
+            .rows_position(file, ir.swc_start(lo), ir.swc_start(hi))
+            .ok()
+    }
+
     /// The definition of `file` the declaration of `symbol` at `line` is,
     /// when the service holds `file`: what [`Self::row_names`] reads of a
     /// declaration in one of its files, for a call another service of the

@@ -35,6 +35,15 @@ pub const RECEIVER_CHARS: usize = 60;
 /// type in the service's own files, which is no definition.
 pub const INTERFACE_MEMBER: &str = "interface_member";
 
+/// The reason for a call through a declaration TypeScript gives two or more
+/// implementations in the program ([`crate::implementation_edges`]): any of
+/// them may be the one that runs, so none is given an edge.
+pub const SEVERAL_IMPLEMENTATIONS: &str = "several_implementations";
+
+/// The reason when the declaration has more implementations than the
+/// sidecar lists.
+pub const IMPLEMENTATIONS_OVER_CAP: &str = "implementations_over_cap";
+
 /// One member call the scan could not follow (`unfollowed_member_calls[]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnfollowedMemberCall {
@@ -47,7 +56,8 @@ pub struct UnfollowedMemberCall {
     pub member: String,
     /// The receiver's source text, cut to [`RECEIVER_CHARS`].
     pub receiver: String,
-    /// `interface_member`, or the name of the hole the rows left
+    /// `interface_member`, `several_implementations`,
+    /// `implementations_over_cap`, or the name of the hole the rows left
     /// ([`crate::request_summary::HoleReason`]), such as `untyped_receiver`.
     pub reason: String,
     /// `<file>:<line>` of the declaration, for `interface_member`.

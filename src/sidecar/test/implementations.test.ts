@@ -95,6 +95,7 @@ describe('implementations: go-to-implementation where discovery stops (carrick#2
           action: 'implementations',
           request_id: 'impl',
           queries: QUERIES.map(([file, text]) => span(file, text)),
+          files: fs.readdirSync(path.join(repo, 'src')).map((name) => path.join(repo, 'src', name)),
           scan_root: repo,
         },
         60_000

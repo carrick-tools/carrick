@@ -141,6 +141,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `reach` | no | The files a set of edits can reach in a `reach_graph` graph: `{ reached, augmented, exports_moved }` |
 | `position_rows` | yes | Write the compiler's rows for every call, member access, comparison and identifier of a service's files (record-only) |
 | `implementations` | yes | The implementations of the bodyless declaration each given call goes through |
+| `release_implementations` | no | Drop the programs `implementations` keeps; `{ released }` is how many (Rust sends it after the last chunk) |
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
@@ -1008,16 +1009,19 @@ The symbol follows aliases to a target that has a declaration. The declaration i
 
 #### `implementations` - What implements the declaration a call goes through (carrick#2432)
 
-Asked where discovery stops at a call through a bodyless declaration: an interface's or type literal's method, a function-typed property signature, an abstract member, or a function-typed class property or parameter with no initializer. Asked of the service's analysis process, over the language service's program of the project that owns each file; nothing is released. One batch per service.
+Asked where discovery stops at a call through a bodyless declaration: an interface's or type literal's method, a function-typed property signature, an abstract member, or a function-typed class property or parameter with no initializer. Asked of the service's analysis process, over a fresh program of the project that owns each file with every walked file in `files` added, so an implementation the tsconfig does not reach is still seen. That program is kept until `release_implementations`.
 
 ```json
 {
   "request_id": "15",
   "action": "implementations",
   "queries": [{ "file": "/repo/apps/api/src/handlers.ts", "start": 120, "end": 151 }],
-  "scan_root": "/repo"
+  "scan_root": "/repo",
+  "files": ["/repo/apps/api/src/handlers.ts", "/repo/apps/api/src/port.ts", "/repo/apps/api/src/http-port.ts"]
 }
 ```
+
+`files` are the walk's files, the program the answers are read over.
 
 Each query is the span of a `call` (or `member`) position row: `start` and `end` in UTF-16 code units, as the rows key them. The call's symbol and declaration are read as that row reads them, and go-to-implementation is asked once per declaration, at its name.
 
@@ -1034,6 +1038,15 @@ Each query is the span of a `call` (or `member`) position row: `start` and `end`
 ```
 
 One answer per query, in request order. A declaration and each implementation are named as a position row names a declaration, so an implementation joins to a definition as a `call` row at it would; its line is where the implementation's declaration starts, decorators included. Implementations are sorted by `decl_file`, then position, and never include the declaration's own signatures. More than 16 → `too_many: true` and none listed. `reason`, when nothing was searched: `not_in_program`, `no_call` (no `call` or `member` node has that span), `no_symbol`, `no_declaration`, `has_body` (the declaration runs its own body) or `checker_threw`. The position rows carry no implementations (version 4).
+
+`release_implementations` carries no payload beyond the envelope and answers `{ "released": <programs dropped> }`. The program `implementations` builds is kept across requests with the same `files`; the sidecar cannot see the last chunk, so the caller says when.
+
+```json
+{
+  "request_id": "16",
+  "action": "release_implementations"
+}
+```
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 

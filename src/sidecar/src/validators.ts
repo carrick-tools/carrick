@@ -327,6 +327,10 @@ export const HealthRequestSchema = BaseRequestSchema.extend({
   action: z.literal('health'),
 });
 
+export const ReleaseImplementationsRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('release_implementations'),
+});
+
 export const ShutdownRequestSchema = BaseRequestSchema.extend({
   action: z.literal('shutdown'),
 });
@@ -393,6 +397,7 @@ export const ImplementationsRequestSchema = BaseRequestSchema.extend({
       end: z.number().int().nonnegative(),
     })
   ),
+  files: z.array(z.string().min(1, 'File path cannot be empty')),
   scan_root: z.string().min(1, 'Scan root cannot be empty'),
 });
 
@@ -771,6 +776,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   AddProgramFilesRequestSchema,
   PositionRowsRequestSchema,
   ImplementationsRequestSchema,
+  ReleaseImplementationsRequestSchema,
 ]);
 
 // ============================================================================
