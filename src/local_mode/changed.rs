@@ -362,7 +362,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     let lost = answers_lost(&rejoined.index, changed.keys());
     if !lost.is_empty() {
         output.not_checked = Some(lost.join(" "));
-    } else if std::env::var_os("B3249_DELETE_CHECK").is_none()
+    } else if std::env::var_os("B3249_DELETE_CHECK").is_some()
         && super::recheck::library_not_signed_in(&rejoined.index, changed.keys())
     {
         // The re-scan asked the library store and was never signed in to be
