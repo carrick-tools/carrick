@@ -576,6 +576,34 @@ main branch (on a branch, `refresh` would take the branch's own new problems
 in as already indexed). What the index did read still decides: a call it
 matched that now reaches no route fails whichever build wrote it.
 
+**A library store that cannot be asked** (carrick#3249). The re-scan asks
+Carrick's library store which exports of the installed packages register routes
+and make calls. When the ask gets no answer, every row a library package states
+is missing: a route registered through a server package does not exist locally,
+a pass over it would read "checked 0 routes", and every caller of it would read
+as a call to no route. The check does not pass and does not fail on those
+claims. It prints one line and exits 2. With no credential, nothing is sent:
+
+```
+carrick check: not checked: library facts unavailable: this machine is not signed in. Run carrick login.
+```
+
+With a credential and a store that cannot be reached (a network error, a
+timeout, a 5xx):
+
+```
+carrick check: not checked: library facts unavailable: Carrick's library store could not be reached.
+```
+
+`--json` carries the same sentence as `not_checked`. `check <file> --recheck`
+reports it as `recheck.ran` `none` with it as `recheck.reason`, and exits 2. A
+store that answered, including with no claims for a package, and a signed-in
+run that reaches the store, print and exit as before. The CI runner is
+untouched: it signs in with OIDC, and a local-mode check does not run there.
+The mark is read from the scan of the services re-extracted for the check, and
+a service carried from an index written while offline keeps its mark until the
+next `carrick refresh`.
+
 **Pairs the check could not judge** (carrick#3012). A matched route or call in
 a changed file whose pair has no verdict, or whose verdict is unresolved
 because one side has no usable type, cannot show a type change. It is counted

@@ -362,6 +362,14 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     let lost = answers_lost(&rejoined.index, changed.keys());
     if !lost.is_empty() {
         output.not_checked = Some(lost.join(" "));
+    } else if let Some(sentence) =
+        super::recheck::library_unavailable(&rejoined.index, changed.keys())
+    {
+        // The re-scan asked the library store and got no answer: a route
+        // registered through a server package is missing, so "checked 0
+        // routes" is not a pass, and a call to it is not a call to no route
+        // (carrick#3249).
+        output.not_checked = Some(sentence.to_string());
     }
 
     let wanted: BTreeMap<String, &BTreeSet<String>> = changed
