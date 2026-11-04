@@ -707,8 +707,7 @@ fn judge(
         let in_change = is_changed(repo, &operation.file);
         // A row in a file the work did not touch is read only when its repo
         // was re-scanned in this run (carrick#2998, rule 1).
-        // DELETE-CHECK: the old filter, back.
-        if !in_change {
+        if !in_change && !changed.contains_key(repo) {
             continue;
         }
         if in_change {
