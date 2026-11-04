@@ -485,7 +485,14 @@ fn run_generation(
     // The join reads every blob back and asks nobody anything, so its wait is
     // part of the local read the next build's opening line quotes.
     let join_started = Instant::now();
-    let join = join(&exe, join_target, blobs, &generation.join("join.json"))?;
+    let built_judged = generation.join("judged");
+    let join = join(
+        &exe,
+        join_target,
+        blobs,
+        &generation.join("join.json"),
+        &built_judged,
+    )?;
     timing.local_secs += join_started.elapsed().as_secs_f64();
 
     let mut index = build(workspace, blobs, &join, &remote_services)?;
@@ -547,6 +554,9 @@ fn run_generation(
     index
         .write(&workspace.index_file())
         .map_err(|e| format!("could not write {}: {e}", workspace.index_file().display()))?;
+    // This index's type-check answers become the ones every re-check against
+    // it starts from, and the older index's are dropped.
+    super::recheck::adopt_index_state(workspace, &built_judged, &index.indexed_at);
     // The marker is written last. An interrupted replacement cannot combine a
     // new account's read model with the preceding account's retained blobs.
     std::fs::write(
@@ -963,9 +973,19 @@ pub(super) fn scan_command(
 }
 
 /// Phase 2: join every blob, and hand the result back.
-fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, String> {
+fn join(
+    exe: &Path,
+    repo: &Path,
+    blobs: &Path,
+    out: &Path,
+    judged: &Path,
+) -> Result<LocalJoin, String> {
+    // The type checker's finished answers are kept where the build leaves
+    // them for the per-edit re-check to find ([`super::recheck::adopt_index_state`]).
+    let mut command = join_command(exe, repo, blobs, out);
+    command.env(crate::engine::type_compat_v2::JUDGE_ANSWERS_ENV, judged);
     run_scan(
-        join_command(exe, repo, blobs, out),
+        command,
         "workspace join",
         Reporting {
             working: "joining the workspace".to_string(),

@@ -559,6 +559,35 @@ pub struct Recheck {
     /// every other answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub known_miss: bool,
+    /// Which services this re-check read, and which it judged against their
+    /// newest known copy (`docs/local-mode-output.md`, "`recheck`"). Absent on
+    /// a `none` that had no service to name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<RecheckScope>,
+}
+
+/// The services one re-check re-read, and what it did about the rest.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RecheckScope {
+    /// The edited file's own service, plus every service holding an operation
+    /// that reads a type declared in the file.
+    pub reread: Vec<String>,
+    /// Every other service, judged at its newest known version.
+    pub not_reread: Vec<NotReread>,
+    /// The ones of `not_reread` with edits since the index and no re-check copy
+    /// of them, or that read a path edited since the index, so they are judged
+    /// against a version that predates the edit.
+    pub stale: Vec<String>,
+}
+
+/// One service a re-check did not read.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NotReread {
+    pub service: String,
+    /// Routes and calls the index holds for it.
+    pub operations: usize,
+    /// Whose copy of the service the verdicts used, in one phrase.
+    pub reason: String,
 }
 
 /// One function the working tree declares and the index does not.
@@ -1268,6 +1297,7 @@ mod tests {
             reason: None,
             new_functions: Vec::new(),
             known_miss: false,
+            scope: None,
         });
         let text = fresh.render();
         assert!(
@@ -1288,6 +1318,7 @@ mod tests {
             reason: Some("the re-scan ran past the budget".to_string()),
             new_functions: Vec::new(),
             known_miss: false,
+            scope: None,
         });
         let text = degraded.render();
         assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");
@@ -1307,6 +1338,7 @@ mod tests {
             reason: Some("the file has not changed since the index".to_string()),
             new_functions: Vec::new(),
             known_miss: false,
+            scope: None,
         });
         let text = unchanged.render();
         assert!(

@@ -1,0 +1,7 @@
+{
+  "name": "inventory-svc",
+  "private": true,
+  "dependencies": {
+    "undici": "^6.0.0"
+  }
+}

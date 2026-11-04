@@ -13662,7 +13662,7 @@ impl PrChange {
                         .clone()
                         .unwrap_or_else(|| self.repo_name.clone())
                 })
-                .zip(untouched)
+                .zip(untouched.iter().map(Option::is_none))
                 .collect(),
             peers: peers
                 .iter()

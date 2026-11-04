@@ -300,6 +300,9 @@ export function answersTheEdit(result: CheckResult): boolean {
   return ran !== undefined && ran !== "none";
 }
 
+/** Services a stale re-check line names before it counts the rest. */
+const MAX_STALE_SERVICES = 3;
+
 /** Files one "not re-checked" line names before it counts the rest. */
 const MAX_NOTED_FILES = 5;
 
@@ -367,11 +370,27 @@ export function renderPostToolUse(
     if (result.deleted) {
       lines.push(deletedLine(result, where));
     } else {
-      const count =
-        problems.length === 0
-          ? "no contract problem"
-          : `${problems.length} contract ${problems.length === 1 ? "problem" : "problems"}`;
-      lines.push(`Carrick re-checked ${where} after this edit: ${count}.`);
+      const stale = result.recheck?.scope?.stale ?? [];
+      if (stale.length > 0) {
+        // A service that reads this edit was judged at a version that
+        // predates it, so "no contract problem" would be a claim the check
+        // did not make. Problems found still list as below.
+        const count =
+          problems.length === 0
+            ? "no contract problem in what it re-read"
+            : `${problems.length} contract ${problems.length === 1 ? "problem" : "problems"} in what it re-read`;
+        const names = stale.slice(0, MAX_STALE_SERVICES).join(", ");
+        const more = stale.length > MAX_STALE_SERVICES ? `, and ${stale.length - MAX_STALE_SERVICES} more` : "";
+        lines.push(
+          `Carrick re-checked ${where}: ${count}; ${stale.length} ${stale.length === 1 ? "service" : "services"} that read this edit ${stale.length === 1 ? "was" : "were"} judged at their indexed version (${names}${more}). Run \`carrick check --changed\` before you finish.`,
+        );
+      } else {
+        const count =
+          problems.length === 0
+            ? "no contract problem"
+            : `${problems.length} contract ${problems.length === 1 ? "problem" : "problems"}`;
+        lines.push(`Carrick re-checked ${where} after this edit: ${count}.`);
+      }
     }
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);

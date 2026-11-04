@@ -41,10 +41,18 @@ fn repo_root() -> PathBuf {
 /// the workspace file. Returns the workspace root, which owns the temp dir for
 /// as long as the test holds it.
 fn workspace(fixture: &str, repos: &[&str]) -> tempfile::TempDir {
+    workspace_prepared(fixture, repos, |_| {})
+}
+
+/// [`workspace`], with `prepare` run on the workspace after the fixture is
+/// copied and before each repo is committed, so a test can add an edge the
+/// fixture does not hold without editing the fixture.
+fn workspace_prepared(fixture: &str, repos: &[&str], prepare: impl Fn(&Path)) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
     let source = repo_root().join("tests/fixtures").join(fixture);
     for repo in repos {
         copy_tree(&source.join(repo), &dir.path().join(repo));
+        prepare(&dir.path().join(repo));
         git(&dir.path().join(repo), &["init", "-q", "."]);
         git(&dir.path().join(repo), &["add", "-A"]);
         git(
@@ -4241,6 +4249,325 @@ fn carrying_leaves_a_clean_tree_and_a_model_scan_alone() {
         3,
         "the model answered for the edited file again"
     );
+}
+
+// --- carrick#3198: the per-edit re-check reads the edited file's service ---
+
+const SHOP: &str = "recheck-one-repo-two-services";
+const SHOP_ROUTE: &str = "shop/catalog/app/routes/api.v1.widgets.$widgetId.ts";
+const SHOP_HEALTH: &str = "shop/catalog/app/routes/api.v1.health.ts";
+const SHOP_CLIENT: &str = "shop/inventory/src/client.ts";
+const SHOP_LEDGER: &str = "shop/ledger/app/routes/api.v1.entries.ts";
+
+/// An ample budget, so a re-check that fits is the thing under test.
+const AMPLE: [(&str, &str); 1] = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
+
+fn shop() -> tempfile::TempDir {
+    workspace(SHOP, &["shop"])
+}
+
+/// `check <file> --recheck --json`, parsed.
+fn recheck_json(root: &Path, file: &str, env: &[(&str, &str)]) -> serde_json::Value {
+    let text = run_with_env(
+        root,
+        &["check", file, "--workspace", ".", "--recheck", "--json"],
+        env,
+    );
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
+}
+
+fn reread(answer: &serde_json::Value) -> Vec<String> {
+    answer["recheck"]["scope"]["reread"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no recheck.scope.reread in:\n{answer:#}"))
+        .iter()
+        .map(|id| id.as_str().expect("a service id").to_string())
+        .collect()
+}
+
+/// Append a comment, which moves no type and no row.
+fn comment_in(file: &Path, text: &str) {
+    let existing = std::fs::read_to_string(file).expect("read the file");
+    std::fs::write(file, format!("{existing}\n// {text}\n")).expect("write the comment");
+}
+
+/// A re-check reads the edited file's service and judges every other service
+/// at the newest copy it has: here the client, as the last re-check left it.
+/// Reading the whole repo again would give the same verdict by a different
+/// road, so the scope is what pins this (carrick#3198).
+#[test]
+#[serial]
+fn a_re_check_reads_only_the_edited_files_service_and_judges_against_the_last_re_check() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+
+    // The client now reads a string where the route serves a number.
+    edit(
+        &root.join(SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let client = recheck_json(root, SHOP_CLIENT, &AMPLE);
+    assert_eq!(reread(&client), ["inventory"], "{client:#}");
+    assert_eq!(
+        client["items"][0]["verdict"]["result"],
+        serde_json::json!("type_mismatch"),
+        "{client:#}"
+    );
+
+    // The route is changed to match. The client is NOT re-read: it stands in
+    // at the copy the last re-check left, which already reads a string.
+    let route = root.join(SHOP_ROUTE);
+    edit(&route, "activeCount: number", "activeCount: string");
+    edit(&route, "activeCount: 3", "activeCount: \"3\"");
+    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    assert_eq!(
+        answer["items"][0]["verdict"]["result"],
+        serde_json::json!("compatible"),
+        "judged against the client as the last re-check left it:\n{answer:#}"
+    );
+    let not_reread = answer["recheck"]["scope"]["not_reread"]
+        .as_array()
+        .expect("not_reread");
+    let inventory = not_reread
+        .iter()
+        .find(|entry| entry["service"] == "inventory")
+        .unwrap_or_else(|| panic!("inventory is named as not re-read:\n{answer:#}"));
+    assert_eq!(
+        inventory["reason"],
+        serde_json::json!("judged at your last re-check of it"),
+        "{answer:#}"
+    );
+    assert!(
+        answer["recheck"]["scope"]["stale"]
+            .as_array()
+            .is_none_or(|stale| stale.is_empty()),
+        "{answer:#}"
+    );
+}
+
+/// A service that imports the edited file is never judged unannounced. The
+/// type-use record names only the operations that read a type the file
+/// declares, so a constant the client imports is invisible to it; the import
+/// closure names the reader, the scope calls it stale, and a service that
+/// imports nothing keeps its plain reason (carrick#3198).
+#[test]
+#[serial]
+fn a_re_check_names_a_service_that_reads_the_edited_file() {
+    let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
+        std::fs::write(
+            repo.join("catalog/app/shared.ts"),
+            "export const widgetBase = \"/api/v1/widgets\";\n",
+        )
+        .expect("write the shared module");
+        let client = repo.join("inventory/src/client.ts");
+        edit(
+            &client,
+            "import { send } from \"./send.js\";",
+            "import { send } from \"./send.js\";\nimport { widgetBase } from \"../../catalog/app/shared\";",
+        );
+        edit(
+            &client,
+            "/api/v1/widgets/${encoded}",
+            "${widgetBase}/${encoded}",
+        );
+    });
+    let root = workspace.path();
+    index(root);
+
+    let shared = "shop/catalog/app/shared.ts";
+    edit(&root.join(shared), "/api/v1/widgets", "/api/v2/widgets");
+    let answer = recheck_json(root, shared, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    let reason_of = |service: &str| -> String {
+        answer["recheck"]["scope"]["not_reread"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["service"] == service))
+            .and_then(|entry| entry["reason"].as_str())
+            .unwrap_or_else(|| panic!("{service} is named as not re-read:\n{answer:#}"))
+            .to_string()
+    };
+    assert!(
+        reason_of("inventory").starts_with("reads catalog/app/shared.ts, edited since the index"),
+        "{answer:#}"
+    );
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!(["inventory"]),
+        "{answer:#}"
+    );
+    assert_eq!(
+        reason_of("ledger"),
+        "no edits since the index; judged at its indexed version",
+        "ledger imports nothing, so the edit is none of its business:\n{answer:#}"
+    );
+}
+
+/// A miss in one service leaves the other services of the repo re-checked, and
+/// a new index tries the missed one again.
+#[test]
+#[serial]
+fn a_miss_in_one_service_leaves_the_others_re_checked() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    comment_in(&root.join(SHOP_ROUTE), "catalog edit one");
+    comment_in(&root.join(SHOP_LEDGER), "ledger edit");
+
+    let missed = recheck_json(root, SHOP_ROUTE, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
+    assert_eq!(
+        missed["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{missed:#}"
+    );
+    assert_eq!(
+        missed["recheck"]["known_miss"],
+        serde_json::Value::Null,
+        "{missed:#}"
+    );
+
+    // Another service of the same repo is still re-checked.
+    let ledger = recheck_json(root, SHOP_LEDGER, &AMPLE);
+    assert_ne!(
+        ledger["recheck"]["ran"],
+        serde_json::json!("none"),
+        "one service's miss does not silence the repo:\n{ledger:#}"
+    );
+    assert_eq!(reread(&ledger), ["ledger"], "{ledger:#}");
+
+    // The missed service starts no re-scan, and the reason names it.
+    comment_in(&root.join(SHOP_ROUTE), "catalog edit two");
+    let skipped = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(
+        skipped["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{skipped:#}"
+    );
+    assert_eq!(skipped["recheck"]["known_miss"], serde_json::json!(true));
+    assert!(
+        skipped["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("catalog") && reason.contains("check --changed")),
+        "the reason names the service and the fresh read:\n{skipped:#}"
+    );
+
+    // A new index is a new generation: catalog is re-checked again.
+    std::thread::sleep(Duration::from_millis(1100));
+    index(root);
+    comment_in(&root.join(SHOP_ROUTE), "catalog edit three");
+    let fresh = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_ne!(
+        fresh["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{fresh:#}"
+    );
+}
+
+/// `check --each` reads the memory per file: after a service misses, its other
+/// files answer at once with the reason while another service's file is still
+/// re-checked.
+#[test]
+#[serial]
+fn check_each_answers_a_missed_services_other_files_at_once() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    comment_in(&root.join(SHOP_ROUTE), "catalog route");
+    comment_in(&root.join(SHOP_HEALTH), "catalog health");
+    comment_in(&root.join(SHOP_LEDGER), "ledger");
+
+    let missed = recheck_json(root, SHOP_ROUTE, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
+    assert_eq!(missed["recheck"]["ran"], serde_json::json!("none"));
+
+    let text = run_with_env(
+        root,
+        &[
+            "check",
+            "--each",
+            SHOP_HEALTH,
+            SHOP_LEDGER,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+        &AMPLE,
+    );
+    let answers: Vec<serde_json::Value> =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not a JSON array: {e}\n{text}"));
+    assert_eq!(answers.len(), 2, "{text}");
+    assert_eq!(answers[0]["recheck"]["known_miss"], serde_json::json!(true));
+    assert!(
+        answers[0]["recheck"]["elapsed_ms"].as_u64().unwrap() < 1000,
+        "the missed service's other file answers at once:\n{:#}",
+        answers[0]
+    );
+    assert_ne!(
+        answers[1]["recheck"]["ran"],
+        serde_json::json!("none"),
+        "the other service's file is re-checked:\n{:#}",
+        answers[1]
+    );
+}
+
+/// The type checker's answers are kept per index, and a re-check of an edit
+/// that moves no type reads the index's own answer instead of judging again.
+///
+/// Proved by planting: the one answer `refresh` kept is rewritten to say the
+/// pair is unverifiable, and a comment-only edit's re-check then reports that
+/// verdict, so it can only have come from the kept file. The folder still
+/// holds that one key afterwards, which also shows the capture's stubs are
+/// byte-stable across a re-scan.
+#[test]
+#[serial]
+fn a_type_neutral_edit_reuses_the_indexs_type_check_answer() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+
+    let kept = |root: &Path| -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(generations) = std::fs::read_dir(root.join(".carrick/judged")) else {
+            return found;
+        };
+        for generation in generations.filter_map(Result::ok) {
+            for answer in std::fs::read_dir(generation.path())
+                .expect("read a generation")
+                .filter_map(Result::ok)
+            {
+                found.push(answer.path());
+            }
+        }
+        found
+    };
+    let before = kept(root);
+    assert_eq!(
+        before.len(),
+        1,
+        "`refresh` keeps the one answer its join reached: {before:?}"
+    );
+    let text = std::fs::read_to_string(&before[0]).expect("read the kept answer");
+    assert!(text.contains("\"bucket\":\"compatible\""), "{text}");
+    std::fs::write(
+        &before[0],
+        text.replace("\"bucket\":\"compatible\"", "\"bucket\":\"unverifiable\""),
+    )
+    .expect("plant the answer");
+
+    comment_in(&root.join(SHOP_ROUTE), "moves no type");
+    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(
+        answer["recheck"]["ran"],
+        serde_json::json!("extraction+types")
+    );
+    assert_eq!(
+        answer["items"][0]["verdict"]["state"],
+        serde_json::json!("unresolved"),
+        "the verdict is the kept answer's, not a new judgement:\n{answer:#}"
+    );
+    assert_eq!(kept(root), before, "no second key: the stubs did not move");
 }
 
 /// The environment a check or a refresh needs to walk a repo's services and
