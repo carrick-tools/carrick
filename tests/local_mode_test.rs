@@ -4346,7 +4346,10 @@ fn shared_package_repo(root: &Path) -> PathBuf {
         "carrick.json",
         "{ \"services\": [\n  { \"name\": \"contracts\", \"directory\": \"packages/contracts\" },\n  { \"name\": \"api\", \"directory\": \"services/api\" },\n  { \"name\": \"client\", \"directory\": \"services/client\" }\n] }",
     );
-    write("package.json", "{ \"name\": \"monorepo\", \"private\": true }");
+    write(
+        "package.json",
+        "{ \"name\": \"monorepo\", \"private\": true }",
+    );
     write(
         "packages/contracts/package.json",
         "{ \"name\": \"contracts\", \"private\": true }",

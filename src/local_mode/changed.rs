@@ -1260,7 +1260,8 @@ mod tests {
         let text = output(vec![broken.clone(), unjudged.clone()], 1, 2).render(false);
         let summary = text.lines().next().unwrap();
         assert!(
-            summary.contains(", plus 1 outside the changed files not judged before, run with --all"),
+            summary
+                .contains(", plus 1 outside the changed files not judged before, run with --all"),
             "{text}"
         );
         assert!(
@@ -1271,7 +1272,10 @@ mod tests {
             text.contains("[outside the changed files: this change moved its verdict]"),
             "{text}"
         );
-        assert!(!text.contains("not judged before, does not fail]"), "{text}");
+        assert!(
+            !text.contains("not judged before, does not fail]"),
+            "{text}"
+        );
 
         let all = output(vec![unjudged.clone()], 0, 1).render(true);
         assert!(
@@ -1279,7 +1283,10 @@ mod tests {
             "{all}"
         );
         assert!(
-            all.lines().next().unwrap().ends_with("; 1 row outside the changed files whose verdict this change moved"),
+            all.lines()
+                .next()
+                .unwrap()
+                .ends_with("; 1 row outside the changed files whose verdict this change moved"),
             "{all}"
         );
         let none = output(vec![], 0, 0).render(false);
