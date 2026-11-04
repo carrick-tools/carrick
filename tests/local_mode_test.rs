@@ -4320,13 +4320,30 @@ fn check_changed_names_a_call_only_documentation_still_serves_after_its_handler_
     let root = workspace.path();
     edit(&root.join(DOC_WIDGETS), "'/widgets'", "'/gadgets'");
 
-    let (code, text) = check_changed(root, true);
+    let debug = root.join("debug-3192.txt");
+    let output = Command::new(carrick())
+        .args(["check", "--changed", "--workspace", ".", "--json"])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_DEBUG_3192_FILE", &debug)
+        .output()
+        .expect("spawn check");
+    let code = output.status.code();
+    let text = String::from_utf8(output.stdout).expect("utf8");
     let problems = problems_of(&text);
     let named: Vec<&String> = problems
         .iter()
         .filter(|p| p.starts_with("repo/packages/web/src/client.ts:") && p.contains("fails=true"))
         .collect();
-    assert_eq!(named.len(), 1, "{problems:#?}");
+    assert_eq!(
+        named.len(),
+        1,
+        "{problems:#?}\ncode={code:?}\ndebug:\n{}\nindex:\n{}",
+        std::fs::read_to_string(&debug).unwrap_or_else(|_| "NO DEBUG FILE".into()),
+        std::fs::read_to_string(root.join(".carrick/index.json")).unwrap_or_default()
+    );
     assert!(
         named[0].contains("widgets.ts") && named[0].contains("openapi.ts"),
         "the reason names both places: {}",
