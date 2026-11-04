@@ -517,9 +517,8 @@ side by side: each one's type sidecar is held to a 3 GB heap (unless
 `CARRICK_SIDECAR_MAX_OLD_SPACE_MB` says otherwise), and the scan runs as many
 at once as the free memory holds at that cap. One join then runs over those
 blobs and every blob the index already holds — the same two phases as
-`check --recheck`, once for all files. Untouched files are
-never reported, even when their service is re-extracted, except a call the index matched
-that now reaches no route (the work removed or moved its route).
+`check --recheck`, once for all files. A row in an untouched file
+is reported only in the two cases under "Files the work did not touch" below.
 
 Human output is one summary line, then one line per problem:
 
@@ -533,7 +532,8 @@ inventory-svc/src/client.ts:13  no route  call GET /api/v1/gadgets/:gadgetId: no
 `services`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
 `problems` (`kind` `incompatible` | `no_route`, `file`, `line`, `role`,
 `method`, `path`, `other`, `reason`, `source`, `already_indexed`,
-`unconfirmed`, `other_build`, `fails`), `failing`,
+`unconfirmed`, `outside_the_change`, `other_build`, `fails`), `failing`,
+`outside_moved`,
 `elapsed_ms`, `not_checked` when nothing could be checked, and
 `index_scanner` when the index was written by another scanner build.
 
@@ -592,10 +592,21 @@ A problem the index already held is counted as that, whatever else holds for
 it. `--json` always lists every problem, with its `source`,
 `already_indexed`, `unconfirmed` and `fails`.
 
-**Files the work did not touch.** A call in such a file is reported only when
-the index matched it and no service serves it now. It is listed when it fails,
-and with `--all` otherwise; it is never counted on the summary line, which is
-about the changed files.
+**Files the work did not touch.** A row in such a file, in a repo this run
+re-scanned, is reported in two cases. Both are marked `outside_the_change` and
+never add to `routes`, `calls` or `type_checked`, which are about the changed
+files.
+
+- A call the index matched that now reaches no route. It is listed when it
+  fails, and with `--all` otherwise.
+- A pair whose rebuilt verdict is a mismatch (`type_mismatch` or
+  `method_mismatch`) and that the index did not already hold as a mismatch at
+  the same line. If the index held it resolved and compatible, the work moved
+  it: it fails like a problem in a changed file, on a fact. If the index held
+  no such row, or an unresolved one, it may have resolved for a reason
+  unrelated to the edit, so it never fails: `--all` lists it, and the summary
+  counts it as "not judged before". Both kinds are counted in `outside_moved`
+  and on the summary line.
 
 **Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same
 pass over the files named, in any repos of the workspace, instead of the

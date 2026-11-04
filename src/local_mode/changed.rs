@@ -71,6 +71,11 @@ pub struct ChangedOutput {
     /// When this lists rows, `type_checked` is 0 and nothing fails, the run
     /// exits [`EXIT_NOTHING_COVERED`].
     pub not_type_checked: Vec<NotTypeChecked>,
+    /// Rows in files the work did not touch whose verdict this change moved
+    /// to a mismatch, or that had no earlier verdict (carrick#2998). Not part
+    /// of `routes`, `calls` or `type_checked`, which stay about the edited
+    /// files.
+    pub outside_moved: usize,
     pub elapsed_ms: u64,
     /// Why nothing was checked, when nothing was. The run then exits
     /// [`EXIT_NOTHING_COVERED`].
@@ -146,10 +151,15 @@ pub struct Problem {
     /// fails the run.
     pub unconfirmed: bool,
     /// In a file the work did not touch: a call the index matched whose
-    /// route the work took away. Listed when it fails, and with `--all`;
-    /// never counted on the summary line, which is about the edited files.
-    #[serde(skip)]
+    /// route the work took away, or a pair whose verdict the work moved to a
+    /// mismatch. Listed when it fails, and with `--all`; counted on the
+    /// summary line only through `outside_moved`.
     pub outside_the_change: bool,
+    /// Outside the change, and the index held no resolved, compatible row
+    /// to move from: it may have resolved for a reason unrelated to the edit
+    /// (carrick#2961). Never fails.
+    #[serde(skip)]
+    pub not_judged_before: bool,
     /// New only because the index lacks the row, and the index was written by
     /// another scanner build, which may simply not have read it
     /// (carrick#2911). Printed, never fails, and the run exits
@@ -176,6 +186,22 @@ pub struct NotTypeChecked {
 
 /// The words a customer reads about pairs the check could not judge. Kept
 /// here, in one place; they wait on David's approval (carrick#3012).
+/// The words a customer reads about rows outside the changed files whose
+/// verdict the change moved (carrick#2998). In one place; they wait on
+/// David's approval.
+fn outside_moved_clause(count: usize) -> String {
+    format!(
+        "; {} outside the changed files whose verdict this change moved",
+        plural(count, "row", "rows")
+    )
+}
+const OUTSIDE_FAILING_NOTE: &str = " [outside the changed files: this change moved its verdict]";
+const OUTSIDE_NOT_JUDGED_NOTE: &str =
+    " [outside the changed files: not judged before, does not fail]";
+fn outside_not_judged_counted(count: usize) -> String {
+    format!("{count} outside the changed files not judged before")
+}
+
 const NOT_TYPE_CHECKED_SUFFIX: &str = "not type-checked (one side has no usable type)";
 const NOTHING_TYPE_CHECKED: &str = "not checked: no matched route or call in the changed files has a usable type on both sides, so a type change cannot be seen";
 
@@ -287,6 +313,7 @@ fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
         failing: 0,
         type_checked: 0,
         not_type_checked: Vec::new(),
+        outside_moved: 0,
         elapsed_ms: 0,
         not_checked: Some(reason.into()),
         index_scanner: None,
@@ -385,6 +412,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     output.failing = judged.problems.iter().filter(|p| p.fails).count();
     output.type_checked = judged.type_checked;
     output.not_type_checked = judged.not_type_checked;
+    output.outside_moved = judged.outside_moved;
     output.problems = judged.problems;
     output
 }
@@ -574,6 +602,52 @@ struct Judged {
     problems: Vec<Problem>,
     type_checked: usize,
     not_type_checked: Vec<NotTypeChecked>,
+    /// Rows outside the changed files that this change moved to a mismatch,
+    /// or that had no earlier verdict to move from (carrick#2998).
+    outside_moved: usize,
+}
+
+/// What the index held, before this pass, for a mismatching row of a file the
+/// work did not touch.
+enum OutsideBefore {
+    /// The same row carried a mismatch already.
+    Mismatch,
+    /// The same row was resolved and compatible: this change broke the pair.
+    Agreed,
+    /// No such row, no verdict, or an unresolved one: it may have resolved
+    /// for a reason unrelated to the edit (carrick#2961).
+    NotJudged,
+}
+
+/// The earlier state of the row at the same line, in the same file, with the
+/// same key. An untouched file's lines do not move.
+fn outside_before(
+    before: &LocalIndex,
+    strict: bool,
+    repo: &str,
+    operation: &JoinedOperation,
+) -> OutsideBefore {
+    let Some(old) = indexed_rows(before, repo, &operation.file)
+        .find(|old| same_operation(old, operation, strict) && old.line == operation.line)
+    else {
+        return OutsideBefore::NotJudged;
+    };
+    match old.verdict.as_ref() {
+        Some(verdict)
+            if matches!(
+                verdict.result.as_deref(),
+                Some("type_mismatch" | "method_mismatch")
+            ) =>
+        {
+            OutsideBefore::Mismatch
+        }
+        Some(verdict)
+            if verdict.state == "resolved" && verdict.result.as_deref() == Some("compatible") =>
+        {
+            OutsideBefore::Agreed
+        }
+        _ => OutsideBefore::NotJudged,
+    }
 }
 
 /// The problems in the changed files, read off the rebuilt index and the join
@@ -624,17 +698,23 @@ fn judge(
         problems: Vec::new(),
         type_checked: 0,
         not_type_checked: Vec::new(),
+        outside_moved: 0,
     };
     for operation in &join.operations {
         let Some(&(repo, repo_path)) = repo_of.get(operation.service.as_str()) else {
             continue;
         };
-        if !is_changed(repo, &operation.file) {
+        let in_change = is_changed(repo, &operation.file);
+        // A row in a file the work did not touch is read only when its repo
+        // was re-scanned in this run (carrick#2998, rule 1).
+        if !in_change && !changed.contains_key(repo) {
             continue;
         }
-        match operation.role {
-            Role::Producer => judged.routes += 1,
-            Role::Consumer => judged.calls += 1,
+        if in_change {
+            match operation.role {
+                Role::Producer => judged.routes += 1,
+                Role::Consumer => judged.calls += 1,
+            }
         }
         let Some(item) = item_of(repo, operation) else {
             continue;
@@ -645,6 +725,10 @@ fn judge(
                 Some("type_mismatch" | "method_mismatch")
             )
         });
+        // Outside the change only a rebuilt mismatch is a candidate (rule 2).
+        if !in_change && !mismatch {
+            continue;
+        }
         // A matched pair the check could not judge is named, not passed
         // (carrick#3012): no verdict, or a side without a usable type.
         let unjudged = item
@@ -674,7 +758,9 @@ fn judge(
             }
             continue;
         }
-        judged.type_checked += 1;
+        if in_change {
+            judged.type_checked += 1;
+        }
         let finding = super::index::finding_for(operation, &join.findings);
         // A finding resting only on rows the source states, whose verdict was
         // reached or needs none: the rule the cloud enforces on (cloud#599).
@@ -694,6 +780,21 @@ fn judge(
                     .and_then(|verdict| verdict.result.as_deref())
                     .is_some_and(|result| matches!(result, "type_mismatch" | "method_mismatch"))
         });
+        // A row outside the change is the work's only if the index held the
+        // same row, at the same line, with a pair that agreed (rules 3 to 6).
+        let outside = if in_change {
+            None
+        } else {
+            match outside_before(before, strict, repo, operation) {
+                // It carried a mismatch before the change: not this work's.
+                OutsideBefore::Mismatch => continue,
+                other => Some(other),
+            }
+        };
+        let moved_here = matches!(outside, Some(OutsideBefore::Agreed));
+        // Outside the change a sibling's mismatch at another line says
+        // nothing about this row; `outside_before` decided on the line.
+        let already = already && in_change;
         let named: Vec<&String> = finding
             .map(|f| f.call_sites.iter().collect())
             .unwrap_or_default();
@@ -728,10 +829,14 @@ fn judge(
                 .unwrap_or_else(|| "not_stated".to_string()),
             already_indexed: already,
             unconfirmed: false,
-            outside_the_change: false,
-            other_build: fact && !already && !same_build,
-            fails: fact && !already && same_build,
+            outside_the_change: !in_change,
+            not_judged_before: matches!(outside, Some(OutsideBefore::NotJudged)),
+            other_build: fact && !already && !same_build && (in_change || moved_here),
+            fails: fact && !already && same_build && (in_change || moved_here),
         });
+        if !in_change {
+            judged.outside_moved += 1;
+        }
     }
 
     for unmatched in &join.unmatched {
@@ -783,6 +888,7 @@ fn judge(
                     already_indexed: already,
                     unconfirmed,
                     outside_the_change: !is_changed(repo, &file),
+                    not_judged_before: false,
                     other_build,
                     fails: new_fact && !other_build,
                 });
@@ -907,8 +1013,12 @@ impl ChangedOutput {
         // edited files.
         let mut unlisted: BTreeMap<Unlisted, usize> = BTreeMap::new();
         for problem in &self.problems {
-            if let (false, false, Some(why)) = (all, problem.outside_the_change, problem.unlisted())
-            {
+            if let (false, Some(why)) = (all, problem.unlisted()) {
+                // A file the work did not touch counts only when its verdict
+                // was not judged before; the rest lists by failing.
+                if problem.outside_the_change && why != Unlisted::OutsideNotJudged {
+                    continue;
+                }
                 *unlisted.entry(why).or_default() += 1;
             }
         }
@@ -949,6 +1059,9 @@ impl ChangedOutput {
                 self.not_type_checked.len()
             ));
         }
+        if self.outside_moved > 0 {
+            out.push_str(&outside_moved_clause(self.outside_moved));
+        }
         out.push('\n');
         for problem in listed {
             let at = match problem.line {
@@ -966,6 +1079,11 @@ impl ChangedOutput {
             };
             let note = if problem.other_build {
                 " [not checked: the index is from another scanner build]"
+            } else if problem.outside_the_change
+                && problem.kind == ProblemKind::Incompatible
+                && problem.fails
+            {
+                OUTSIDE_FAILING_NOTE
             } else {
                 problem.unlisted().map_or("", Unlisted::note)
             };
@@ -1037,6 +1155,7 @@ enum Unlisted {
     Unconfirmed,
     Candidate,
     NotStated,
+    OutsideNotJudged,
 }
 
 impl Unlisted {
@@ -1046,6 +1165,7 @@ impl Unlisted {
             Unlisted::Unconfirmed => " [unconfirmed: the base is set at run time, does not fail]",
             Unlisted::Candidate => " [model candidate, does not fail]",
             Unlisted::NotStated => " [source not stated, does not fail]",
+            Unlisted::OutsideNotJudged => OUTSIDE_NOT_JUDGED_NOTE,
         }
     }
 
@@ -1055,6 +1175,7 @@ impl Unlisted {
             Unlisted::Unconfirmed => format!("{count} unconfirmed"),
             Unlisted::Candidate => plural(count, "model candidate", "model candidates"),
             Unlisted::NotStated => format!("{count} with no stated source"),
+            Unlisted::OutsideNotJudged => outside_not_judged_counted(count),
         }
     }
 }
@@ -1068,6 +1189,7 @@ impl Problem {
             (true, _) => None,
             // Listed without `--all`: it is why the run exits 2.
             _ if self.other_build => None,
+            _ if self.not_judged_before => Some(Unlisted::OutsideNotJudged),
             _ if self.already_indexed => Some(Unlisted::AlreadyIndexed),
             _ if self.unconfirmed => Some(Unlisted::Unconfirmed),
             (false, "candidate") => Some(Unlisted::Candidate),
@@ -1107,9 +1229,61 @@ mod tests {
             already_indexed: false,
             unconfirmed: false,
             outside_the_change: false,
+            not_judged_before: false,
             other_build: false,
             fails,
         }
+    }
+
+    /// Rows outside the changed files whose verdict the change moved: the
+    /// summary says so, a failing one carries its note, and one not judged
+    /// before adds only to its own count (carrick#2998).
+    #[test]
+    fn outside_rows_are_said_on_the_summary_and_noted() {
+        let mut broken = problem(ProblemKind::Incompatible, true);
+        broken.outside_the_change = true;
+        let mut unjudged = problem(ProblemKind::Incompatible, false);
+        unjudged.outside_the_change = true;
+        unjudged.not_judged_before = true;
+        unjudged.path = "/u".to_string();
+        let output = |problems: Vec<Problem>, failing: usize, moved: usize| ChangedOutput {
+            calls: 1,
+            files: 1,
+            services: 2,
+            problems,
+            failing,
+            outside_moved: moved,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+
+        let text = output(vec![broken.clone(), unjudged.clone()], 1, 2).render(false);
+        let summary = text.lines().next().unwrap();
+        assert!(
+            summary.contains(", plus 1 outside the changed files not judged before, run with --all"),
+            "{text}"
+        );
+        assert!(
+            summary.ends_with("; 2 rows outside the changed files whose verdict this change moved"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[outside the changed files: this change moved its verdict]"),
+            "{text}"
+        );
+        assert!(!text.contains("not judged before, does not fail]"), "{text}");
+
+        let all = output(vec![unjudged.clone()], 0, 1).render(true);
+        assert!(
+            all.contains("[outside the changed files: not judged before, does not fail]"),
+            "{all}"
+        );
+        assert!(
+            all.lines().next().unwrap().ends_with("; 1 row outside the changed files whose verdict this change moved"),
+            "{all}"
+        );
+        let none = output(vec![], 0, 0).render(false);
+        assert!(!none.contains("outside the changed files"), "{none}");
     }
 
     /// A file the work did not touch never adds to the summary of the edited

@@ -4242,3 +4242,185 @@ fn carrying_leaves_a_clean_tree_and_a_model_scan_alone() {
         "the model answered for the edited file again"
     );
 }
+
+/// The consumer's `Widget` type moves into its own file, which `client.ts`
+/// imports. Committed before the index is built, so the edit that follows is
+/// to a file holding no route and no call.
+fn move_the_consumers_type_to_its_own_file(inventory: &Path) {
+    let client = inventory.join("src/client.ts");
+    edit(
+        &client,
+        "export type Widget = {\n  id: string;\n  name: string;\n  activeCount: number;\n};\n",
+        "import type { Widget } from \"./types.js\";\n",
+    );
+    std::fs::write(
+        inventory.join("src/types.ts"),
+        "export type Widget = {\n  id: string;\n  name: string;\n  activeCount: number;\n};\n",
+    )
+    .expect("write types.ts");
+    commit_all(inventory, "move the type");
+}
+
+/// The problem rows of a `--json` answer that sit in a file ending `suffix`.
+fn problems_in(json: &serde_json::Value, suffix: &str) -> Vec<serde_json::Value> {
+    json["problems"]
+        .as_array()
+        .expect("problems")
+        .iter()
+        .filter(|p| p["file"].as_str().is_some_and(|f| f.ends_with(suffix)))
+        .cloned()
+        .collect()
+}
+
+/// A type edited in a file that holds no route and no call breaks the call
+/// that reads it (carrick#2998): the check reports the call in the untouched
+/// file, marked as outside the change, and fails the run.
+#[test]
+#[serial]
+fn a_shared_type_edit_fails_the_rows_it_breaks() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    move_the_consumers_type_to_its_own_file(&root.join("inventory-svc"));
+    index(root);
+    edit(
+        &root.join("inventory-svc/src/types.ts"),
+        "activeCount: number",
+        "activeCount: string",
+    );
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(1), "{json:#}");
+    let call = problems_in(&json, "src/client.ts")
+        .into_iter()
+        .find(|p| p["role"] == "call" && p["kind"] == "incompatible")
+        .unwrap_or_else(|| panic!("the call in client.ts is reported:\n{json:#}"));
+    assert_eq!(call["outside_the_change"], true, "{call:#}");
+    assert_eq!(call["fails"], true, "{call:#}");
+    assert_eq!(json["outside_moved"], 1, "{json:#}");
+    assert_eq!(json["routes"], 0, "the counts stay about the edited file");
+    assert_eq!(json["calls"], 0, "the counts stay about the edited file");
+
+    let (_, text) = check_changed(root, false);
+    assert!(
+        text.contains("; 1 row outside the changed files whose verdict this change moved"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[outside the changed files: this change moved its verdict]"),
+        "{text}"
+    );
+}
+
+/// A comment is not a type change: nothing outside the edited file moves.
+#[test]
+#[serial]
+fn a_comment_in_a_shared_type_file_moves_nothing_outside_it() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    move_the_consumers_type_to_its_own_file(&root.join("inventory-svc"));
+    index(root);
+    edit(
+        &root.join("inventory-svc/src/types.ts"),
+        "export type Widget",
+        "// what the catalog sends\nexport type Widget",
+    );
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(0), "{json:#}");
+    assert_eq!(json["outside_moved"], 0, "{json:#}");
+}
+
+/// One repo, three services: `contracts` holds a type and no route or call,
+/// `api` serves a route whose handler returns it through a helper, and
+/// `client` keeps its own copy of the type and calls the route.
+fn shared_package_repo(root: &Path) -> PathBuf {
+    let repo = root.join("monorepo");
+    let write = |relative: &str, contents: &str| {
+        let path = repo.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(
+        "carrick.json",
+        "{ \"services\": [\n  { \"name\": \"contracts\", \"directory\": \"packages/contracts\" },\n  { \"name\": \"api\", \"directory\": \"services/api\" },\n  { \"name\": \"client\", \"directory\": \"services/client\" }\n] }",
+    );
+    write("package.json", "{ \"name\": \"monorepo\", \"private\": true }");
+    write(
+        "packages/contracts/package.json",
+        "{ \"name\": \"contracts\", \"private\": true }",
+    );
+    write(
+        "packages/contracts/src/index.ts",
+        "export type WidgetDto = { id: string; activeCount: number };\n",
+    );
+    write(
+        "services/api/package.json",
+        "{ \"name\": \"api\", \"private\": true, \"dependencies\": { \"@remix-run/node\": \"^2.0.0\" } }",
+    );
+    write(
+        "services/api/app/routes/api.v1.widgets.$widgetId.ts",
+        "import type { WidgetDto } from \"../../../../packages/contracts/src/index\";\n\n\
+         function build(id: string): WidgetDto {\n  return { id, activeCount: 3 };\n}\n\n\
+         export async function loader({\n  params,\n}: {\n  params: { widgetId: string };\n}): Promise<WidgetDto> {\n  return build(String(params.widgetId));\n}\n",
+    );
+    write(
+        "services/client/package.json",
+        "{ \"name\": \"client\", \"private\": true, \"dependencies\": { \"undici\": \"^6.0.0\" } }",
+    );
+    write(
+        "services/client/src/client.ts",
+        "export type WidgetDto = { id: string; activeCount: number };\n\n\
+         export class CatalogClient {\n  constructor(private readonly baseUrl: string) {}\n\n\
+         \x20 async readWidget(widgetId: string): Promise<WidgetDto> {\n    const response = await fetch(`${this.baseUrl}/api/v1/widgets/${widgetId}`, {\n      method: \"GET\",\n    });\n    return (await response.json()) as WidgetDto;\n  }\n}\n",
+    );
+    std::fs::write(
+        root.join("carrick-workspace.json"),
+        "{ \"repos\": [\"./monorepo\"] }\n",
+    )
+    .expect("write the workspace file");
+    git(&repo, &["init", "-q", "."]);
+    commit_all(&repo, "fixture");
+    repo
+}
+
+/// The customer shape of carrick#2998: the edit is in a package holding no
+/// route and no call, and the pair it breaks is a route and a call in other
+/// services, neither in a changed file. Also proves a service re-extracted
+/// because of an imported package re-types its untouched file.
+#[test]
+#[serial]
+fn a_shared_package_edit_fails_the_pair_it_breaks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    shared_package_repo(root);
+    index(root);
+    edit(
+        &root.join("monorepo/packages/contracts/src/index.ts"),
+        "activeCount: number",
+        "activeCount: string",
+    );
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(1), "{json:#}");
+    let outside_failing = json["problems"]
+        .as_array()
+        .expect("problems")
+        .iter()
+        .any(|p| p["outside_the_change"] == true && p["fails"] == true);
+    assert!(outside_failing, "{json:#}");
+
+    // The same edit as a comment moves nothing.
+    git(&root.join("monorepo"), &["checkout", "-q", "."]);
+    edit(
+        &root.join("monorepo/packages/contracts/src/index.ts"),
+        "export type",
+        "// the widget\nexport type",
+    );
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(0), "{json:#}");
+    assert_eq!(json["outside_moved"], 0, "{json:#}");
+}
