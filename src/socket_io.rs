@@ -182,6 +182,27 @@ pub struct SocketOp {
     /// `./types/payment`), paired with `payload_type_symbol`. `None` when the
     /// symbol is not imported (same-file or untyped).
     pub payload_type_source: Option<String>,
+    /// SWC span (`lo`, `hi`, counted from `SWC_SPAN_BASE`) of an emitter's
+    /// payload argument, set only when the emitter has no
+    /// `payload_type_symbol`: a literal, call, member read, or an identifier
+    /// with no annotated binding. The type is then read off the expression
+    /// itself (carrick#3094).
+    pub payload_span: Option<(u32, u32)>,
+    /// A listener's handler when its first parameter states an inline type
+    /// (a literal, union, intersection or generic annotation that is not a
+    /// named reference). The type is then read off that parameter
+    /// (carrick#3094).
+    pub handler_param: Option<HandlerParam>,
+}
+
+/// The handler function and first-parameter name of a listener whose payload
+/// type is written inline in the parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerParam {
+    /// SWC span (`lo`, `hi`) of the handler function expression.
+    pub span: (u32, u32),
+    /// The first parameter's identifier.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1621,6 +1642,8 @@ impl OpCollector<'_> {
                     line,
                     payload_type_symbol: None,
                     payload_type_source: None,
+                    payload_span: None,
+                    handler_param: None,
                 });
             }
             return;
@@ -1677,12 +1700,23 @@ impl OpCollector<'_> {
                 }
                 None => (None, None),
             };
+            // No named symbol: an emitter's payload argument is asked as an
+            // expression, a listener's inline-typed parameter as a parameter.
+            let (payload_span, handler_param) = if payload_type_symbol.is_some() {
+                (None, None)
+            } else if is_listener {
+                (None, Self::listener_inline_param(args))
+            } else {
+                (Self::emitter_payload_span(args), None)
+            };
             let op = SocketOp {
                 key: OperationKey::socket(event.value.to_string_lossy().into_owned(), direction),
                 file_path: self.file_path.to_path_buf(),
                 line,
                 payload_type_symbol,
                 payload_type_source,
+                payload_span,
+                handler_param,
             };
             if is_listener {
                 self.extraction.listeners.push(op);
@@ -1727,6 +1761,8 @@ impl OpCollector<'_> {
                 line: entry.line,
                 payload_type_symbol,
                 payload_type_source,
+                payload_span: None,
+                handler_param: None,
             });
         }
     }
@@ -1754,6 +1790,46 @@ impl OpCollector<'_> {
             _ => None,
         };
         first_param_symbol(first_param)
+    }
+
+    /// The handler of a listener call and its first parameter's name, when
+    /// that parameter is a plain identifier with a type annotation that is
+    /// not a named reference (`(event: { id: string }) => …`). An annotation
+    /// is a stated type; an unannotated parameter reads `any` from the
+    /// library's typings and stays out, as does a destructured one
+    /// (carrick#3094).
+    fn listener_inline_param(args: &[ExprOrSpread]) -> Option<HandlerParam> {
+        let handler = args.get(1)?;
+        let (span, first_param): (Span, Option<&Pat>) = match &*handler.expr {
+            Expr::Arrow(arrow) => (arrow.span, arrow.params.first()),
+            Expr::Fn(func) => (
+                func.function.span,
+                func.function.params.first().map(|p| &p.pat),
+            ),
+            _ => return None,
+        };
+        let Pat::Ident(ident) = first_param? else {
+            return None;
+        };
+        let type_ann = ident.type_ann.as_deref()?;
+        if named_type_symbol(type_ann).is_some() {
+            return None;
+        }
+        Some(HandlerParam {
+            span: (span.lo.0, span.hi.0),
+            name: ident.id.sym.to_string(),
+        })
+    }
+
+    /// Span of an emitter call's payload argument. A spread argument has no
+    /// single expression to read.
+    fn emitter_payload_span(args: &[ExprOrSpread]) -> Option<(u32, u32)> {
+        let payload = args.get(1)?;
+        if payload.spread.is_some() {
+            return None;
+        }
+        let span = payload.expr.span();
+        Some((span.lo.0, span.hi.0))
     }
 
     /// Payload type symbol of an emitter call — the second argument's binding
@@ -2933,5 +3009,73 @@ link.emit("order.shipped", parcel);
             &["wire-transport"],
         );
         assert_eq!(keys(&result.emitters), vec!["socket|UNKNOWN|order.shipped"]);
+    }
+
+    /// The text a `(lo, hi)` SWC span selects in `source` (ASCII sources).
+    fn spanned(source: &str, span: (u32, u32)) -> &str {
+        let start = crate::utils::sidecar_position(source, span.0) as usize;
+        let end = crate::utils::sidecar_position(source, span.1) as usize;
+        &source[start..end]
+    }
+
+    #[test]
+    fn emitter_without_a_symbol_carries_its_payload_span() {
+        let source = r#"
+import { Server } from "socket.io";
+const io = new Server();
+const named: Shipped = load();
+io.emit("inline:event", { a: 1 });
+io.emit("named:event", named);
+io.emit("bare:event");
+"#;
+        let result = extract(source);
+        let inline = result
+            .emitters
+            .iter()
+            .find(|op| op.key.canonical().ends_with("inline:event"))
+            .unwrap();
+        assert_eq!(spanned(source, inline.payload_span.unwrap()), "{ a: 1 }");
+        let named = result
+            .emitters
+            .iter()
+            .find(|op| op.key.canonical().ends_with("named:event"))
+            .unwrap();
+        assert_eq!(named.payload_type_symbol.as_deref(), Some("Shipped"));
+        assert_eq!(named.payload_span, None, "a symbol wins");
+        let bare = result
+            .emitters
+            .iter()
+            .find(|op| op.key.canonical().ends_with("bare:event"))
+            .unwrap();
+        assert_eq!(bare.payload_span, None, "no payload argument");
+    }
+
+    #[test]
+    fn listener_with_an_inline_parameter_type_carries_its_handler() {
+        let source = r#"
+import { io } from "socket.io-client";
+const socket = io("http://localhost");
+socket.on("inline:event", (event: { id: string }) => {});
+socket.on("named:event", (event: Named) => {});
+socket.on("bare:event", (event) => {});
+socket.on("destructured:event", ({ id }: { id: string }) => {});
+"#;
+        let result = extract(source);
+        let find = |suffix: &str| {
+            result
+                .listeners
+                .iter()
+                .find(|op| op.key.canonical().ends_with(suffix))
+                .unwrap()
+        };
+        let handler = find("inline:event").handler_param.clone().unwrap();
+        assert_eq!(handler.name, "event");
+        assert_eq!(
+            spanned(source, handler.span),
+            "(event: { id: string }) => {}"
+        );
+        assert_eq!(find("named:event").handler_param, None);
+        assert_eq!(find("bare:event").handler_param, None);
+        assert_eq!(find("destructured:event").handler_param, None);
     }
 }

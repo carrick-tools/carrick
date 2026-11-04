@@ -505,7 +505,7 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "SERVER->CLIENT order:shipped", "site": "src/realtime.ts:12"}]
       },
-      "known_miss": {"stage": "judged", "issues": ["carrick#3094"]}
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829"]}
     },
     {
       "name": "socket-listener-rename",
