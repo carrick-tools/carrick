@@ -547,6 +547,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-lint-
 
+      - name: Scanner key and release-diff check tests
+        run: bash scripts/scanner-key.test.sh
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
