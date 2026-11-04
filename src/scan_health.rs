@@ -116,6 +116,9 @@ struct Registry {
     /// reads differently from "never asked". Not a loss: the file reader's
     /// rows stand, the library rows are missing and are asked again next scan.
     library_pending: BTreeMap<Scope, LibraryUnready>,
+    /// The services whose library-store ask went unsent because this machine
+    /// is not signed in (carrick#3249).
+    library_not_signed_in: std::collections::BTreeSet<Scope>,
     /// What the time limits that ran out while each service was analysed
     /// cost it, by kind (carrick#2021). The cross-service check's are read
     /// off its outcomes instead ([`crate::time_limits::from_check_outcomes`]),
@@ -337,6 +340,7 @@ impl Registry {
         self.intents_failed.retain(|(s, _, _)| s != scope);
         self.time_limits.remove(scope);
         self.library_pending.remove(scope);
+        self.library_not_signed_in.remove(scope);
     }
 
     /// Records that `limit` ran out while `scope` was analysed, at a cost of
@@ -798,6 +802,26 @@ pub fn library_packages_for(service: Option<&str>) -> Option<(usize, usize)> {
         .lock()
         .expect("scan health lock")
         .library_packages_for(&service.map(str::to_string))
+}
+
+/// Records that the current service's library-store ask was never sent
+/// because this machine is not signed in (carrick#3249): the scan has no
+/// library facts, which is not the store's answer that it labels nothing.
+pub fn record_library_not_signed_in() {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .library_not_signed_in
+        .insert(crate::current_service::name());
+}
+
+/// Whether `service`'s library-store ask went unsent for want of a sign-in.
+pub fn library_not_signed_in_for(service: Option<&str>) -> bool {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .library_not_signed_in
+        .contains(&service.map(str::to_string))
 }
 
 /// The sentences naming the library packages the run ended without.

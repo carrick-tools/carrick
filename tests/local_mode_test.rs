@@ -4242,3 +4242,100 @@ fn carrying_leaves_a_clean_tree_and_a_model_scan_alone() {
         "the model answered for the edited file again"
     );
 }
+
+/// carrick#3249: a machine that is not signed in cannot ask the library
+/// store, so a route registered through a server package does not exist
+/// locally. `check --changed` must not read that as a pass.
+///
+/// The fixture's one route is registered through a package whose claims the
+/// store cassette holds. The index is written with the store answering (the
+/// mock stands for a signed-in machine). Then the route's path is renamed on a
+/// branch and the check runs twice: with no credential, which is a real
+/// `oidc_unavailable` before any request leaves the process, and with the
+/// store answering, which behaves as before.
+#[test]
+#[serial]
+fn check_changed_says_when_the_library_store_cannot_be_asked() {
+    let workspace = workspace("receiver-trace", &["repo"]);
+    let root = workspace.path();
+    let cassettes = root.join("cassettes");
+    std::fs::create_dir_all(cassettes.join("library-claims")).unwrap();
+    std::fs::copy(
+        repo_root().join("tests/fixtures/receiver-trace/library-claims.json"),
+        cassettes.join("library-claims/default.json"),
+    )
+    .unwrap();
+    let cassettes = format!("{}/", cassettes.display());
+    let signed_in = |args: &[&str]| {
+        let output = Command::new(carrick())
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_CHECK_BUDGET_MS", "600000")
+            .env("CARRICK_MOCK_ALL", "1")
+            .env("CARRICK_MOCK_FIXTURE_DIR", &cassettes)
+            .output()
+            .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        )
+    };
+    let repo = root.join("repo");
+    // One root service, found as `carrick init` finds it.
+    git(&repo, &["rm", "-q", "carrick.json"]);
+    commit_all(&repo, "no config");
+    git(&repo, &["branch", "-M", "main"]);
+    let (code, _) = signed_in(&["refresh", "--workspace", "."]);
+    assert_eq!(code, Some(0));
+
+    git(&repo, &["checkout", "-qb", "feature"]);
+    edit(&repo.join("src/routes.ts"), "\"/c\"", "\"/d\"");
+    commit_all(&repo, "rename the route");
+
+    let (code, text) = check_changed(root, false);
+    assert_eq!(code, Some(2), "not signed in is not a pass:\n{text}");
+    assert_eq!(
+        text,
+        "carrick check: not checked: library facts unavailable: this machine is not signed \
+         in. Run carrick login.\n"
+    );
+    let (_, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(
+        json["not_checked"],
+        "library facts unavailable: this machine is not signed in. Run carrick login.",
+        "{json:#}"
+    );
+
+    let (code, text) = carrick_code(
+        root,
+        &[
+            "check",
+            "repo/src/routes.ts",
+            "--recheck",
+            "--workspace",
+            ".",
+            "--json",
+        ],
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).expect("--json is JSON");
+    assert_eq!(json["recheck"]["ran"], "none", "{json:#}");
+    assert_eq!(
+        json["recheck"]["reason"],
+        "library facts unavailable: this machine is not signed in. Run carrick login.",
+        "{json:#}"
+    );
+    assert_eq!(
+        code,
+        Some(2),
+        "a re-check that read nothing exits 2:\n{text}"
+    );
+
+    let (_, text) = signed_in(&["check", "--changed", "--workspace", "."]);
+    assert!(
+        text.starts_with("carrick check: checked 1 route") && !text.contains("not signed in"),
+        "a signed-in run reads the route through the store's claims:\n{text}"
+    );
+}

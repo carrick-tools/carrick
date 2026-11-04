@@ -1897,7 +1897,17 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
             } else {
                 crate::out!("{}", output.render());
             }
-            0
+            // A re-check that could not read the library store for want of a
+            // sign-in covered nothing, as `check --changed` does (carrick#3249).
+            let signed_out = matches!(mode, Mode::Check)
+                && output.recheck.as_ref().is_some_and(|recheck| {
+                    recheck.reason.as_deref() == Some(super::recheck::LIBRARY_NOT_SIGNED_IN)
+                });
+            if signed_out {
+                super::changed::EXIT_NOTHING_COVERED
+            } else {
+                0
+            }
         }
         Err(error) => refuse(error),
     }

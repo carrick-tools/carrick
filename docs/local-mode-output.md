@@ -562,6 +562,23 @@ main branch (on a branch, `refresh` would take the branch's own new problems
 in as already indexed). What the index did read still decides: a call it
 matched that now reaches no route fails whichever build wrote it.
 
+**A machine that is not signed in** (carrick#3249). The re-scan asks Carrick's
+library store which exports of the installed packages register routes and make
+calls. With no credential the ask is never sent, so every row a library package
+states is missing: a route registered through a server package does not exist
+locally, and a pass over it would read "checked 0 routes". The check does not
+pass. It prints one line and exits 2:
+
+```
+carrick check: not checked: library facts unavailable: this machine is not signed in. Run carrick login.
+```
+
+`--json` carries the same sentence as `not_checked`. `check <file> --recheck`
+reports it as `recheck.ran` `none` with it as `recheck.reason`, and exits 2. A
+signed-in run, and a run where the store answered and labels nothing for a
+package, print and exit as before. The CI runner is untouched: it signs in with
+OIDC, and a local-mode check does not run there.
+
 **Pairs the check could not judge** (carrick#3012). A matched route or call in
 a changed file whose pair has no verdict, or whose verdict is unresolved
 because one side has no usable type, cannot show a type change. It is counted

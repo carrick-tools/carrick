@@ -6689,6 +6689,9 @@ fn library_rows(
     // A read-only pass (carrick#2907) started no build, so a package it ends
     // without is unknown, as it was before the pass asked: nothing is
     // pending on its account.
+    if ask.read_only && settled.not_signed_in {
+        crate::scan_health::record_library_not_signed_in();
+    }
     if !ask.read_only {
         crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
             pending: settled.pending,

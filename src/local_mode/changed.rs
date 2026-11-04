@@ -362,6 +362,11 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     let lost = answers_lost(&rejoined.index, changed.keys());
     if !lost.is_empty() {
         output.not_checked = Some(lost.join(" "));
+    } else if super::recheck::library_not_signed_in(&rejoined.index, changed.keys()) {
+        // The re-scan asked the library store and was never signed in to be
+        // answered: a route registered through a server package is missing,
+        // so "checked 0 routes" is not a pass (carrick#3249).
+        output.not_checked = Some(super::recheck::LIBRARY_NOT_SIGNED_IN.to_string());
     }
 
     let wanted: BTreeMap<String, &BTreeSet<String>> = changed

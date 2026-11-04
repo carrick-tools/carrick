@@ -362,6 +362,9 @@ fn inside(
 ) -> Result<Fresh, String> {
     let name = repo_label(repo);
     let rejoined = rejoin_held(workspace, held, &[repo], generation, deadline, None)?;
+    if library_not_signed_in(&rejoined.index, [&name]) {
+        return Err(LIBRARY_NOT_SIGNED_IN.to_string());
+    }
 
     let items = rejoined
         .index
@@ -386,6 +389,40 @@ fn inside(
         ran,
         elapsed: Duration::default(),
     })
+}
+
+/// What a check says when the re-scan could not read the library store for
+/// want of a sign-in (carrick#3249). The scan then holds no row a library
+/// package states, so a route registered through a server package does not
+/// exist locally and a pass would read as "checked 0 routes". The command is
+/// the one `carrick --help` documents for signing in. Nothing a signed-in run
+/// prints changes, and the CI runner never reaches this: it authenticates with
+/// OIDC and does not run a local-mode check.
+pub const LIBRARY_NOT_SIGNED_IN: &str =
+    "library facts unavailable: this machine is not signed in. Run carrick login.";
+
+/// Whether a re-scan of `repos` could not read the library store because this
+/// machine is not signed in. Both signals must hold: the re-scanned service
+/// says its ask went unsent, and this machine holds no credential now (a
+/// service carried from an earlier unsigned `refresh` keeps its flag until
+/// the next refresh, and must not outlive the sign-in).
+pub(super) fn library_not_signed_in<'a>(
+    rebuilt: &super::read_model::LocalIndex,
+    repos: impl IntoIterator<Item = &'a String>,
+) -> bool {
+    let repos: std::collections::BTreeSet<&String> = repos.into_iter().collect();
+    rebuilt
+        .repos
+        .iter()
+        .filter(|repo| repos.contains(&repo.name))
+        .flat_map(|repo| repo.services.iter())
+        .any(|service| {
+            service
+                .boundary
+                .as_ref()
+                .is_some_and(|boundary| boundary.library_not_signed_in)
+        })
+        && crate::credentials::CloudAuth::detect().is_err()
 }
 
 /// What one re-extraction of some repos produced, joined against everything
