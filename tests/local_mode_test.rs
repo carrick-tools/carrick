@@ -4376,4 +4376,54 @@ fn check_changed_says_when_the_library_store_cannot_be_asked() {
         text.starts_with("carrick check: checked 1 route") && !text.contains("not signed in"),
         "a signed-in run reads the route through the store's claims:\n{text}"
     );
+
+    // Signed in, and the store cannot be reached: the same refusal to read a
+    // pass, with its own cause. The fixture directory stands in for the dead
+    // network with a message for the store's route.
+    let down = root.join("down");
+    std::fs::create_dir_all(down.join("library-claims")).unwrap();
+    std::fs::write(
+        down.join("library-claims/unreachable.txt"),
+        "network is down",
+    )
+    .unwrap();
+    let offline = |args: &[&str]| {
+        let output = Command::new(carrick())
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_CHECK_BUDGET_MS", "600000")
+            .env("CARRICK_RECHECK_BUDGET_MS", "600000")
+            .env("CARRICK_MOCK_ALL", "1")
+            .env("CARRICK_MOCK_FIXTURE_DIR", format!("{}/", down.display()))
+            .output()
+            .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        )
+    };
+    let (code, text) = offline(&["check", "--changed", "--workspace", "."]);
+    assert_eq!(code, Some(2), "an unreachable store is not a pass:\n{text}");
+    assert_eq!(
+        text,
+        "carrick check: not checked: library facts unavailable: Carrick's library store could \
+         not be reached.\n"
+    );
+    let (code, text) = offline(&[
+        "check",
+        "repo/src/routes.ts",
+        "--recheck",
+        "--workspace",
+        ".",
+        "--json",
+    ]);
+    let json: serde_json::Value = serde_json::from_str(&text).expect("--json is JSON");
+    assert_eq!(
+        json["recheck"]["reason"],
+        "library facts unavailable: Carrick's library store could not be reached.",
+        "{json:#}"
+    );
+    assert_eq!(code, Some(2), "{text}");
 }

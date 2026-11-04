@@ -37,7 +37,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -1476,10 +1476,16 @@ where
 /// refuse the ask; it was never sent (carrick#3249).
 const NOT_SIGNED_IN_CODE: &str = "oidc_unavailable";
 
-/// Why [`try_ask`] had no answer: the machine holds no usable credential, or
-/// any other refusal, error or timeout.
-struct AskFailed {
-    not_signed_in: bool,
+/// Why an ask had no answer (carrick#3249): the machine holds no usable
+/// credential, so nothing was sent, or the store could not be reached or
+/// refused (a network error, a timeout, a 5xx). Neither is the store's answer
+/// that a package labels nothing, so a reader of the scan must not take the
+/// missing library rows for that answer.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskFailure {
+    NotSignedIn,
+    Unreachable,
 }
 
 /// [`ask`], saying when there was no answer (a refusal, an error, a timeout
@@ -1489,7 +1495,7 @@ async fn try_ask<G, GateFut, S, Fut>(
     gate: G,
     send: S,
     limit: Duration,
-) -> Result<LibraryAnswer, AskFailed>
+) -> Result<LibraryAnswer, AskFailure>
 where
     G: FnOnce(&LibraryClaimsRequest) -> GateFut,
     GateFut: Future,
@@ -1501,15 +1507,15 @@ where
         Ok(Ok(text)) => Ok(parse_answer(&text)),
         Ok(Err(error)) => {
             warn!(%error, "library store: no claims this scan");
-            Err(AskFailed {
-                not_signed_in: error.code == NOT_SIGNED_IN_CODE,
+            Err(if error.code == NOT_SIGNED_IN_CODE {
+                AskFailure::NotSignedIn
+            } else {
+                AskFailure::Unreachable
             })
         }
         Err(_) => {
             warn!("library store: no answer in time; no claims this scan");
-            Err(AskFailed {
-                not_signed_in: false,
-            })
+            Err(AskFailure::Unreachable)
         }
     }
 }
@@ -1526,11 +1532,9 @@ pub struct Settled {
     pub build_failed: BTreeSet<String>,
     /// Whether the store was asked at all.
     pub asked: bool,
-    /// The first ask went unanswered because this machine holds no usable
-    /// credential, so the scan has no library facts for a reason the reader
-    /// can mend (carrick#3249). False for an empty answer and for every
-    /// other failure.
-    pub not_signed_in: bool,
+    /// Why the first ask went unanswered (carrick#3249). `None` for an answer,
+    /// including one that names nothing.
+    pub failure: Option<AskFailure>,
 }
 
 /// The store's first answer to a scan, sent the moment it arrives while the
@@ -1631,7 +1635,7 @@ where
             }
             return Settled {
                 asked: true,
-                not_signed_in: failed.not_signed_in,
+                failure: Some(failed),
                 ..Settled::default()
             };
         }
@@ -1684,7 +1688,7 @@ where
         pending,
         build_failed,
         asked: true,
-        not_signed_in: false,
+        failure: None,
     }
 }
 
@@ -3631,14 +3635,15 @@ mod tests {
             None,
         )
         .await;
-        assert!(settled.asked && settled.not_signed_in);
+        assert!(settled.asked);
+        assert_eq!(settled.failure, Some(AskFailure::NotSignedIn));
         assert!(settled.exports.is_empty());
     }
 
     /// carrick#3249: any other failed ask, and an answer naming nothing, are
     /// not a missing sign-in.
     #[tokio::test(start_paused = true)]
-    async fn another_failed_ask_and_an_empty_answer_are_not_a_missing_sign_in() {
+    async fn another_failed_ask_is_unreachable_and_an_empty_answer_is_no_failure() {
         let dir = tempfile::tempdir().unwrap();
         let asked = asked_lib_and_other(dir.path());
         let failed = ask_until_settled(
@@ -3653,7 +3658,8 @@ mod tests {
             None,
         )
         .await;
-        assert!(failed.asked && !failed.not_signed_in);
+        assert!(failed.asked);
+        assert_eq!(failed.failure, Some(AskFailure::Unreachable));
         let empty = ask_until_settled(
             &asked,
             |_| async {},
@@ -3661,7 +3667,8 @@ mod tests {
             None,
         )
         .await;
-        assert!(empty.asked && !empty.not_signed_in);
+        assert!(empty.asked);
+        assert_eq!(empty.failure, None);
     }
 
     /// carrick#2725: the first answer names as answered only the packages

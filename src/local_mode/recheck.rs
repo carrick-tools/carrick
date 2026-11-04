@@ -362,8 +362,8 @@ fn inside(
 ) -> Result<Fresh, String> {
     let name = repo_label(repo);
     let rejoined = rejoin_held(workspace, held, &[repo], generation, deadline, None)?;
-    if library_not_signed_in(&rejoined.index, [&name]) {
-        return Err(LIBRARY_NOT_SIGNED_IN.to_string());
+    if let Some(sentence) = library_unavailable(&rejoined.index, [&name]) {
+        return Err(sentence.to_string());
     }
 
     let items = rejoined
@@ -391,38 +391,47 @@ fn inside(
     })
 }
 
-/// What a check says when the re-scan could not read the library store for
-/// want of a sign-in (carrick#3249). The scan then holds no row a library
-/// package states, so a route registered through a server package does not
-/// exist locally and a pass would read as "checked 0 routes". The command is
-/// the one `carrick --help` documents for signing in. Nothing a signed-in run
+/// What a check says when the re-scan could not read the library store
+/// (carrick#3249). The scan then holds no row a library package states, so a
+/// route registered through a server package does not exist locally: a pass
+/// would read "checked 0 routes", or fail every caller of the missing routes
+/// as having no route. The first sentence names the sign-in command
+/// `carrick --help` documents; the second is for a store that could not be
+/// reached (network error, timeout, 5xx). Nothing a signed-in, online run
 /// prints changes, and the CI runner never reaches this: it authenticates with
 /// OIDC and does not run a local-mode check.
 pub const LIBRARY_NOT_SIGNED_IN: &str =
     "library facts unavailable: this machine is not signed in. Run carrick login.";
+pub const LIBRARY_UNREACHABLE: &str =
+    "library facts unavailable: Carrick's library store could not be reached.";
 
-/// Whether a re-scan of `repos` could not read the library store because this
-/// machine is not signed in. Both signals must hold: the re-scanned service
-/// says its ask went unsent, and this machine holds no credential now (a
-/// service carried from an earlier unsigned `refresh` keeps its flag until
-/// the next refresh, and must not outlive the sign-in).
-pub(super) fn library_not_signed_in<'a>(
+/// What a re-scan of `repos` could not read of the library store, as the
+/// sentence a check prints. A not-signed-in mark counts only while this
+/// machine still holds no credential: a service carried from an earlier
+/// unsigned `refresh` keeps its mark until the next refresh, and must not
+/// outlive the sign-in.
+pub(super) fn library_unavailable<'a>(
     rebuilt: &super::read_model::LocalIndex,
     repos: impl IntoIterator<Item = &'a String>,
-) -> bool {
+) -> Option<&'static str> {
+    use crate::library_store::AskFailure;
     let repos: std::collections::BTreeSet<&String> = repos.into_iter().collect();
-    rebuilt
+    let failures: Vec<AskFailure> = rebuilt
         .repos
         .iter()
         .filter(|repo| repos.contains(&repo.name))
         .flat_map(|repo| repo.services.iter())
-        .any(|service| {
-            service
-                .boundary
-                .as_ref()
-                .is_some_and(|boundary| boundary.library_not_signed_in)
-        })
+        .filter_map(|service| service.boundary.as_ref()?.library_ask_failed)
+        .collect();
+    if failures.contains(&AskFailure::NotSignedIn)
         && crate::credentials::CloudAuth::detect().is_err()
+    {
+        Some(LIBRARY_NOT_SIGNED_IN)
+    } else if failures.contains(&AskFailure::Unreachable) {
+        Some(LIBRARY_UNREACHABLE)
+    } else {
+        None
+    }
 }
 
 /// What one re-extraction of some repos produced, joined against everything
