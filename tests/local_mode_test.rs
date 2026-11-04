@@ -4418,7 +4418,16 @@ fn a_shared_package_edit_fails_the_pair_it_breaks() {
 
     let (code, body) = check_changed(root, true);
     let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
-    assert_eq!(code, Some(1), "{json:#}");
+    // TEMP DIAGNOSTIC (removed before merge): what the named files judge.
+    let probe = check_files(
+        root,
+        &[
+            "monorepo/services/api/app/routes/api.v1.widgets.$widgetId.ts",
+            "monorepo/services/client/src/inventory.ts",
+            "monorepo/packages/contracts/src/index.ts",
+        ],
+    );
+    assert_eq!(code, Some(1), "{json:#}\nPROBE {probe:?}");
     let outside_failing = json["problems"]
         .as_array()
         .expect("problems")
