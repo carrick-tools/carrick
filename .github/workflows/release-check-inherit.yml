@@ -1,0 +1,45 @@
+name: Release check inherit
+
+# A commit on main whose scanner key (scripts/scanner-key.sh) equals that of a
+# commit the replay box checked inherits that commit's `release-check` status,
+# so main's tip reads the box's verdict after a docs merge too. The reconcile is
+# scripts/release-check-inherit.sh (carrick-cloud#2916, sub-ticket B). The
+# auto-release workflow reads this status on main's tip.
+#
+# It posts with GITHUB_TOKEN, so its own statuses start no further run. It posts
+# nothing while the box has checked no commit (main's check is switched off).
+
+on:
+  push:
+    branches: [main]
+  status:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-check-inherit
+  cancel-in-progress: false
+
+jobs:
+  inherit:
+    name: Inherit release-check
+    # A status event for any other context starts no work.
+    if: github.event_name != 'status' || github.event.context == 'release-check'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Reconcile release-check on main's recent commits
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          INHERIT_REF: origin/main
+        run: bash scripts/release-check-inherit.sh
