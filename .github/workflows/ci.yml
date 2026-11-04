@@ -449,6 +449,11 @@ jobs:
       - name: Main's check trigger skips docs and version-only commits
         run: bash scripts/main-check-trigger.test.sh
 
+      # Same-key commits on main inherit the box's release-check status
+      # (scripts/release-check-inherit.sh, carrick-cloud#2916), gh stubbed.
+      - name: Same-key commits inherit the release-check verdict
+        run: bash scripts/release-check-inherit.test.sh
+
       # The release's glibc floor check (scripts/glibc-floor.sh, carrick#2218)
       # against stubbed objdump output: it must fail a binary above the floor.
       - name: The glibc floor check fails a binary above the floor
