@@ -2340,42 +2340,234 @@ struct MainSnapshot {
 
 static MAIN: tokio::sync::OnceCell<MainSnapshot> = tokio::sync::OnceCell::const_new();
 
+/// The file in a snapshot directory that holds its rows and reach records.
+/// It is renamed into place last, so its presence means the directory is
+/// complete.
+const SNAPSHOT_FILE: &str = "snapshot.json";
+
+impl MainSnapshot {
+    /// The snapshot as `SNAPSHOT_FILE` holds it, beside its trees.
+    fn to_json(&self) -> serde_json::Value {
+        let reach = |objects: &ReachObjects| {
+            use base64::Engine as _;
+            let mut entries: Vec<serde_json::Value> = objects
+                .iter()
+                .map(|((repo, service), gz)| {
+                    serde_json::json!([
+                        repo,
+                        service,
+                        base64::engine::general_purpose::STANDARD.encode(gz)
+                    ])
+                })
+                .collect();
+            entries.sort_by_key(|entry| entry.to_string());
+            entries
+        };
+        serde_json::json!({
+            "shared_rows": self.shared_rows,
+            "shared_reach": reach(&self.shared_reach),
+            "admin_rows": self.admin_rows,
+            "admin_reach": reach(&self.admin_reach),
+            "rpc_rows": self.rpc_rows,
+            "rpc_reach": reach(&self.rpc_reach),
+        })
+    }
+}
+
 /// Scan `repo` typed, with the model answering from its own `__llm__`.
 async fn scan_seed_repo(store: &Store, repo: &Path) {
     let _cassettes = Cassettes::from(&repo.join("__llm__"));
     scan_with(store, repo, true).await;
 }
 
-async fn main_snapshot() -> &'static MainSnapshot {
-    MAIN.get_or_init(|| async {
-        seed_env();
-        let _fact_layer = FactLayer::on();
-        // The trees outlive the run: a static is never dropped, and each seed
-        // copies from them for as long as the binary runs.
-        let trees = tempfile::tempdir().unwrap().keep();
-        let orders = seed_repo(&trees, "orders-api");
-        let storefront = seed_repo(&trees, "storefront");
-        let admin = seed_repo(&trees, "admin-api");
-        let shared = Store::default();
-        scan_seed_repo(&shared, &orders).await;
-        scan_seed_repo(&shared, &storefront).await;
-        scan_seed_repo(&shared, &orders).await;
-        let admin_store = Store::default();
-        scan_seed_repo(&admin_store, &admin).await;
-        let rpc = seed_repo(&trees, "rpc-api");
-        let rpc_store = Store::default();
-        scan_seed_repo(&rpc_store, &rpc).await;
-        MainSnapshot {
-            trees: unlinked(&trees),
-            shared_rows: shared.repos.lock().unwrap().clone(),
-            shared_reach: shared.type_reach.lock().unwrap().clone(),
-            admin_rows: admin_store.repos.lock().unwrap().clone(),
-            admin_reach: admin_store.type_reach.lock().unwrap().clone(),
-            rpc_rows: rpc_store.repos.lock().unwrap().clone(),
-            rpc_reach: rpc_store.type_reach.lock().unwrap().clone(),
+/// Seed main's trees under `trees` and scan them into the three stores.
+async fn build_snapshot(trees: &Path) -> MainSnapshot {
+    seed_env();
+    let _fact_layer = FactLayer::on();
+    std::fs::create_dir_all(trees).unwrap();
+    let orders = seed_repo(trees, "orders-api");
+    let storefront = seed_repo(trees, "storefront");
+    let admin = seed_repo(trees, "admin-api");
+    let shared = Store::default();
+    scan_seed_repo(&shared, &orders).await;
+    scan_seed_repo(&shared, &storefront).await;
+    scan_seed_repo(&shared, &orders).await;
+    let admin_store = Store::default();
+    scan_seed_repo(&admin_store, &admin).await;
+    let rpc = seed_repo(trees, "rpc-api");
+    let rpc_store = Store::default();
+    scan_seed_repo(&rpc_store, &rpc).await;
+    MainSnapshot {
+        trees: unlinked(trees),
+        shared_rows: shared.repos.lock().unwrap().clone(),
+        shared_reach: shared.type_reach.lock().unwrap().clone(),
+        admin_rows: admin_store.repos.lock().unwrap().clone(),
+        admin_reach: admin_store.type_reach.lock().unwrap().clone(),
+        rpc_rows: rpc_store.repos.lock().unwrap().clone(),
+        rpc_reach: rpc_store.type_reach.lock().unwrap().clone(),
+    }
+}
+
+/// Write `snapshot`'s rows and reach records into `dir`, which already holds
+/// its trees at `dir/trees`.
+fn write_snapshot(snapshot: &MainSnapshot, dir: &Path) {
+    assert_eq!(snapshot.trees, unlinked(&dir.join("trees")));
+    let partial = dir.join(format!("{SNAPSHOT_FILE}.partial"));
+    std::fs::write(&partial, snapshot.to_json().to_string()).unwrap();
+    std::fs::rename(&partial, dir.join(SNAPSHOT_FILE)).unwrap();
+}
+
+/// The snapshot `write_snapshot` wrote into `dir`.
+fn read_snapshot(dir: &Path) -> MainSnapshot {
+    let file = std::fs::read_to_string(dir.join(SNAPSHOT_FILE)).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&file).unwrap();
+    let rows = |key: &str| -> Vec<CloudRepoData> {
+        serde_json::from_value(json[key].clone()).expect("cached rows read back")
+    };
+    let reach = |key: &str| -> ReachObjects {
+        use base64::Engine as _;
+        json[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let repo = entry[0].as_str().unwrap().to_string();
+                let service = entry[1].as_str().map(str::to_string);
+                let gz = base64::engine::general_purpose::STANDARD
+                    .decode(entry[2].as_str().unwrap())
+                    .unwrap();
+                ((repo, service), gz)
+            })
+            .collect()
+    };
+    MainSnapshot {
+        trees: unlinked(&dir.join("trees")),
+        shared_rows: rows("shared_rows"),
+        shared_reach: reach("shared_reach"),
+        admin_rows: rows("admin_rows"),
+        admin_reach: reach("admin_reach"),
+        rpc_rows: rows("rpc_rows"),
+        rpc_reach: reach("rpc_reach"),
+    }
+}
+
+/// Every file under `dir`, sorted.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
         }
-    })
-    .await
+    }
+    files.sort();
+    files
+}
+
+/// What main's snapshot is made from: the seed fixtures' bytes, and the size
+/// and modification time of this test binary and of the built sidecar it
+/// types with. Any change to one names a new snapshot directory.
+fn snapshot_key() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut add = |bytes: &[u8]| {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let seeds = manifest.join("tests/fixtures/pr-seeds");
+    for file in files_under(&seeds) {
+        add(file
+            .strip_prefix(&seeds)
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes());
+        add(&std::fs::read(&file).unwrap());
+    }
+    let stamp = |path: &Path| {
+        let meta = std::fs::metadata(path).unwrap();
+        let modified = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{}:{}:{modified}", path.display(), meta.len())
+    };
+    add(stamp(&std::env::current_exe().unwrap()).as_bytes());
+    let sidecar = manifest.join("src/sidecar/dist/src");
+    if sidecar.is_dir() {
+        for file in files_under(&sidecar) {
+            add(stamp(&file).as_bytes());
+        }
+    }
+    format!("{:x}", hash.finalize())[..16].to_string()
+}
+
+/// Main's snapshot, scanned once for every process that runs this binary's
+/// tests: nextest runs each test in its own process, so an in-process cell
+/// alone would re-scan main for every seed. The first process to take the
+/// lock scans main into `$CARGO_TARGET_TMPDIR/pr-on-main-snapshot-<key>/`
+/// (trees and rows together, so the rows name the trees' commits); every
+/// later one reads it back.
+async fn cached_snapshot() -> MainSnapshot {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&root).unwrap();
+    let lock = std::fs::File::create(root.join("pr-on-main-snapshot.lock")).unwrap();
+    lock.lock().unwrap();
+    let dir = root.join(format!("pr-on-main-snapshot-{}", snapshot_key()));
+    if !dir.join(SNAPSHOT_FILE).exists() {
+        // A directory with no snapshot file is what a killed build left.
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        let built = build_snapshot(&dir.join("trees")).await;
+        write_snapshot(&built, &dir);
+    }
+    let snapshot = read_snapshot(&dir);
+    lock.unlock().unwrap();
+    snapshot
+}
+
+async fn main_snapshot() -> &'static MainSnapshot {
+    MAIN.get_or_init(cached_snapshot).await
+}
+
+/// The cache keeps everything a seed reads from main: the snapshot read
+/// back from its directory is the one that was scanned, its rows name the
+/// commits of its trees, and a seed run on each posts the same result.
+#[tokio::test]
+async fn snapshot_from_cache_equals_fresh_scan() {
+    let _serial = SERIAL.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = unlinked(tmp.path());
+    let fresh = build_snapshot(&dir.join("trees")).await;
+    write_snapshot(&fresh, &dir);
+    let cached = read_snapshot(&dir);
+    assert_eq!(cached.trees, fresh.trees);
+    assert_eq!(cached.to_json(), fresh.to_json());
+    for row in cached
+        .shared_rows
+        .iter()
+        .chain(&cached.admin_rows)
+        .chain(&cached.rpc_rows)
+    {
+        assert_eq!(
+            head(&cached.trees.join(&row.repo_name)),
+            row.commit_hash,
+            "{} names a commit its cached tree does not hold",
+            row.repo_name
+        );
+    }
+    let change = |repo: &Path| apply_seed(repo, "http-field-rename");
+    let from_cache = seed_payload_from(&cached, "orders-api", &change).await;
+    let from_scan = seed_payload_from(&fresh, "orders-api", &change).await;
+    assert_eq!(from_cache, from_scan);
 }
 
 /// The result of scanning `repo_name` of the fixture as a PR that applies
@@ -2403,7 +2595,15 @@ async fn seed_payload(repo_name: &str, change: impl Fn(&Path)) -> serde_json::Va
 }
 
 async fn seed_payload_once(repo_name: &str, change: &dyn Fn(&Path)) -> serde_json::Value {
-    let main = main_snapshot().await;
+    seed_payload_from(main_snapshot().await, repo_name, change).await
+}
+
+/// The PR result of `repo_name` with `change` applied, against `main`.
+async fn seed_payload_from(
+    main: &MainSnapshot,
+    repo_name: &str,
+    change: &dyn Fn(&Path),
+) -> serde_json::Value {
     seed_env();
     let _fact_layer = FactLayer::on();
     let tmp = tempfile::tempdir().unwrap();
