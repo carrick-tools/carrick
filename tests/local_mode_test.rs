@@ -4764,6 +4764,95 @@ fn a_type_neutral_edit_reuses_the_indexs_type_check_answer() {
     assert_eq!(kept(root), before, "no second key: the stubs did not move");
 }
 
+/// The consumer's `Widget` type moves into its own file, which `client.ts`
+/// imports. Committed before the index is built, so the edit that follows is
+/// to a file holding no route and no call.
+fn move_the_consumers_type_to_its_own_file(inventory: &Path) {
+    let client = inventory.join("src/client.ts");
+    edit(
+        &client,
+        "export type Widget = {\n  id: string;\n  name: string;\n  activeCount: number;\n};\n",
+        "import type { Widget } from \"./types.js\";\n",
+    );
+    std::fs::write(
+        inventory.join("src/types.ts"),
+        "export type Widget = {\n  id: string;\n  name: string;\n  activeCount: number;\n};\n",
+    )
+    .expect("write types.ts");
+    commit_all(inventory, "move the type");
+}
+
+/// The problem rows of a `--json` answer that sit in a file ending `suffix`.
+fn problems_in(json: &serde_json::Value, suffix: &str) -> Vec<serde_json::Value> {
+    json["problems"]
+        .as_array()
+        .expect("problems")
+        .iter()
+        .filter(|p| p["file"].as_str().is_some_and(|f| f.ends_with(suffix)))
+        .cloned()
+        .collect()
+}
+
+/// A type edited in a file that holds no route and no call breaks the call
+/// that reads it (carrick#2998): the check reports the call in the untouched
+/// file, marked as outside the change, and fails the run.
+#[test]
+#[serial]
+fn a_shared_type_edit_fails_the_rows_it_breaks() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    move_the_consumers_type_to_its_own_file(&root.join("inventory-svc"));
+    index(root);
+    edit(
+        &root.join("inventory-svc/src/types.ts"),
+        "activeCount: number",
+        "activeCount: string",
+    );
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(1), "{json:#}");
+    let call = problems_in(&json, "src/client.ts")
+        .into_iter()
+        .find(|p| p["role"] == "call" && p["kind"] == "incompatible")
+        .unwrap_or_else(|| panic!("the call in client.ts is reported:\n{json:#}"));
+    assert_eq!(call["outside_the_change"], true, "{call:#}");
+    assert_eq!(call["fails"], true, "{call:#}");
+    assert!(json["outside_moved"].as_u64() >= Some(1), "{json:#}");
+    assert_eq!(json["routes"], 0, "the counts stay about the edited file");
+    assert_eq!(json["calls"], 0, "the counts stay about the edited file");
+
+    let (_, text) = check_changed(root, false);
+    assert!(
+        text.contains(" outside the changed files whose verdict this change moved"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[outside the changed files: this change moved its verdict]"),
+        "{text}"
+    );
+}
+
+/// A comment is not a type change: nothing outside the edited file moves.
+#[test]
+#[serial]
+fn a_comment_in_a_shared_type_file_moves_nothing_outside_it() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    move_the_consumers_type_to_its_own_file(&root.join("inventory-svc"));
+    index(root);
+    edit(
+        &root.join("inventory-svc/src/types.ts"),
+        "export type Widget",
+        "// what the catalog sends\nexport type Widget",
+    );
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(0), "{json:#}");
+    assert_eq!(json["outside_moved"], 0, "{json:#}");
+}
+
 /// The environment a check or a refresh needs to walk a repo's services and
 /// read the sibling a service calls into, with the models mocked and the
 /// store's label for the default library coming from the repo's cassette.
