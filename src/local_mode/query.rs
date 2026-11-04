@@ -711,24 +711,11 @@ pub(crate) fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>
     for text in [diff, untracked] {
         changed.extend(
             text.split('\0')
-                .filter(|l| !l.is_empty() && !is_surface_entry(l))
+                .filter(|l| !l.is_empty() && !crate::change_scope::is_surface_entry(l))
                 .map(str::to_string),
         );
     }
     Some(changed)
-}
-
-/// The basename a type capture gives the surface entry it places inside the
-/// service's `rootDir` for as long as it runs (the sidecar's
-/// `SURFACE_ENTRY_BASENAME`, `src/sidecar/src/capture/index.ts`).
-const SURFACE_ENTRY_BASENAME: &str = "__carrick_surface__";
-
-/// Whether `path` is a capture's transient surface entry: another scan's
-/// file, never the user's change (carrick#2928, carrick#2931).
-fn is_surface_entry(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .is_some_and(|name| name.starts_with(SURFACE_ENTRY_BASENAME))
 }
 
 /// Whether the file itself has been written since the index was built.
