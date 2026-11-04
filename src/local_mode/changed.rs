@@ -801,7 +801,6 @@ fn judge(
         .operations
         .iter()
         .filter(|operation| operation.role == Role::Consumer)
-        .take(0)
     {
         let Some(&(repo, repo_path)) = repo_of.get(operation.service.as_str()) else {
             continue;
