@@ -212,7 +212,7 @@ pub fn run(
     relative: &str,
     index_generation: &str,
     reach: &Reach,
-) -> Result<Fresh, Degraded> {
+) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
     let deadline = started + budget();
     // The index is read once, here, and named twice: for what the edit added
@@ -222,25 +222,25 @@ pub fn run(
     let held = match Held::read(workspace) {
         Ok(held) => held,
         Err(reason) => {
-            return Err(Degraded {
+            return Err(Box::new(Degraded {
                 reason,
                 new_functions: Vec::new(),
                 elapsed: started.elapsed(),
                 known_miss: false,
                 scope: None,
-            });
+            }));
         }
     };
     let new_functions = added_functions(&held, repo, relative);
     let misses = ServiceMisses::path(workspace);
     if let Some(miss) = ServiceMisses::read(&misses).holds(index_generation, &reach.owner) {
-        return Err(Degraded {
+        return Err(Box::new(Degraded {
             reason: miss_reason(&reach.owner, miss),
             new_functions,
             elapsed: started.elapsed(),
             known_miss: true,
             scope: None,
-        });
+        }));
     }
     let plan = Plan::make(workspace, repo, reach, index_generation);
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
@@ -280,13 +280,13 @@ pub fn run(
                     &plan.miss_of(&reach.owner, started.elapsed()),
                 );
             }
-            Err(Degraded {
+            Err(Box::new(Degraded {
                 reason,
                 new_functions,
                 elapsed: started.elapsed(),
                 known_miss: false,
                 scope: Some(plan.scope.clone()),
-            })
+            }))
         }
     }
 }
