@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.143](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.142...carrick-v0.3.143) (2026-11-04)
+
+
+### Features
+
+* **local-mode:** a check keeps the walks of carried services it had to do (carrick[#3245](https://github.com/carrick-tools/carrick/issues/3245) T2) ([#3256](https://github.com/carrick-tools/carrick/issues/3256)) ([7bb1cd6](https://github.com/carrick-tools/carrick/commit/7bb1cd67e41b2dacef7f73d72a04bc434129a696))
+* **local-mode:** a check where nothing the scan reads moved starts no re-scan ([#3260](https://github.com/carrick-tools/carrick/issues/3260)) ([8c05263](https://github.com/carrick-tools/carrick/commit/8c052635a7abd9df94b71ea6d2aa687afb289ef0))
+* **local-mode:** the after-edit re-check reads the edited file's service and remembers a miss per service ([#3219](https://github.com/carrick-tools/carrick/issues/3219)) ([8c05263](https://github.com/carrick-tools/carrick/commit/8c052635a7abd9df94b71ea6d2aa687afb289ef0))
+
+
+### Bug Fixes
+
+* a killed check leaves no surface entry, and one left behind moves no scope ([#3250](https://github.com/carrick-tools/carrick/issues/3250)) ([7de27e9](https://github.com/carrick-tools/carrick/commit/7de27e93d327f005f5d2f6899f1b9939d139474a))
+* **check:** report rows outside the changed files that the change broke ([#3257](https://github.com/carrick-tools/carrick/issues/3257)) ([8c05263](https://github.com/carrick-tools/carrick/commit/8c052635a7abd9df94b71ea6d2aa687afb289ef0))
+* **local-mode:** a check on a machine that is not signed in says so instead of passing ([#3259](https://github.com/carrick-tools/carrick/issues/3259)) ([8c05263](https://github.com/carrick-tools/carrick/commit/8c052635a7abd9df94b71ea6d2aa687afb289ef0))
+* **local-mode:** name a call whose handler moved and only documentation still serves ([#3258](https://github.com/carrick-tools/carrick/issues/3258)) ([8c05263](https://github.com/carrick-tools/carrick/commit/8c052635a7abd9df94b71ea6d2aa687afb289ef0))
+* **pubsub:** library-stated pub/sub rows get a type manifest entry ([#3089](https://github.com/carrick-tools/carrick/issues/3089)) ([#3243](https://github.com/carrick-tools/carrick/issues/3243)) ([75fa683](https://github.com/carrick-tools/carrick/commit/75fa683f67df51b66acee670776cf9e69530dd25))
+* **socket:** read inline socket payloads where they are written ([#3094](https://github.com/carrick-tools/carrick/issues/3094)) ([#3242](https://github.com/carrick-tools/carrick/issues/3242)) ([25c10a6](https://github.com/carrick-tools/carrick/commit/25c10a60137d06e146724284d45679cf17866c65))
+
+
+### CI/CD
+
+* slice pr_on_main_test across four shards ([#3265](https://github.com/carrick-tools/carrick/issues/3265)) ([8d872a2](https://github.com/carrick-tools/carrick/commit/8d872a2c2599cc7aa85a7a74d14c7ece33e2ec13))
+
 ## [0.3.142](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.141...carrick-v0.3.142) (2026-11-03)
 
 
