@@ -158,6 +158,15 @@ expect_call "client_payload[tag]=carrick-v0.0.0" "announce-cli: names the tag"
 expect_call "client_payload[version]=0.0.0" "announce-cli: names the version"
 expect_call "client_payload[source_sha]=abc123" "announce-cli: names the source sha"
 
+# Main's check dispatch: event, sha and key, nothing else.
+: > "$calls"
+"$script" main-check 0123456789abcdef0123456789abcdef01234567 abc123key > /dev/null
+expect_call "api repos/carrick-tools/carrick-cloud/dispatches" "main-check: dispatches to carrick-cloud"
+expect_call "event_type=carrick-main-check" "main-check: sends the event"
+expect_call "client_payload[sha]=0123456789abcdef0123456789abcdef01234567" "main-check: names the sha"
+expect_call "client_payload[key]=abc123key" "main-check: names the key"
+if "$script" main-check onlysha > /dev/null 2>&1; then fail "main-check: a missing key exits 0"; else pass "main-check: a missing key fails"; fi
+
 # A failed dispatch fails the step and names the backfill command.
 printf '#!/usr/bin/env bash\nexit 1\n' > "$work/gh-fail"
 chmod +x "$work/gh-fail"
