@@ -22,6 +22,7 @@ import {
   uninstallCodexHooks,
   writeCodexHooks,
 } from "../src/init/codex.ts";
+import { carrickHooks } from "../src/init/settings.ts";
 import { checkCodexHooks, findingCount } from "../src/init/doctor.ts";
 import { outdatedInstall } from "../src/init/outdated.ts";
 
@@ -78,8 +79,9 @@ test("a hooks file the user already has keeps everything in it", (t) => {
   const merged = read(root);
   assert.equal((merged as unknown as { description: string }).description, "our own hooks");
   assert.equal(merged.hooks["PreToolUse"]!.length, 1);
-  // Theirs first, ours after it, on the event they share.
-  assert.equal(merged.hooks["UserPromptSubmit"]!.length, 2);
+  // Theirs first, ours after it (the reuse nudge and the first-prompt line),
+  // on the event they share.
+  assert.equal(merged.hooks["UserPromptSubmit"]!.length, 3);
   assert.equal(
     (merged.hooks["UserPromptSubmit"]![0]!["hooks"] as Array<{ command: string }>)[0]!.command,
     "./scripts/remind.sh",
@@ -103,7 +105,13 @@ test("a file that was only ever ours goes when the entries do", (t) => {
   writeCodexHooks(root, "carrick");
   assert.deepEqual(
     installedCodexHooks(root).map((entry) => entry.command),
-    ["carrick hook session-start", "carrick hook post-edit", "carrick hook user-prompt"],
+    [
+      "carrick hook session-start",
+      "carrick hook orient",
+      "carrick hook post-edit",
+      "carrick hook user-prompt",
+      "carrick hook first-prompt",
+    ],
   );
 
   assert.equal(uninstallCodexHooks(root), "file removed");
@@ -138,7 +146,7 @@ test("an install that had to name a path is recognised as ours", (t) => {
   const root = workspace(t);
   const own = '"/opt/my tools/carrick/bin/carrick.mjs"';
   writeCodexHooks(root, own);
-  assert.equal(installedCodexHooks(root).length, 3);
+  assert.equal(installedCodexHooks(root).length, 5);
   assert.equal(uninstallCodexHooks(root), "file removed");
 });
 
@@ -203,7 +211,7 @@ test("an older two-entry file is stale for doctor and outdated, and a re-run add
   assert.equal(writeCodexHooks(root, "carrick"), "written");
   assert.equal(findingCount(checkCodexHooks(root)), 0);
   assert.deepEqual(outdatedInstall(root).hooks, []);
-  assert.equal(read(root).hooks["SessionStart"]!.length, 1, "added once, not twice");
+  assert.equal(read(root).hooks["SessionStart"]!.length, 2, "session-start and orient, each added once");
 });
 
 test("a user's own SessionStart entry stays beside ours and survives the removal", (t) => {
@@ -216,7 +224,7 @@ test("a user's own SessionStart entry stays beside ours and survives the removal
 
   writeCodexHooks(root, "carrick");
   const merged = read(root).hooks["SessionStart"]!;
-  assert.equal(merged.length, 2);
+  assert.equal(merged.length, 3);
   assert.equal((merged[0]!["hooks"] as Array<{ command: string }>)[0]!.command, "./scripts/greet.sh");
 
   assert.equal(uninstallCodexHooks(root), "removed");
@@ -227,4 +235,51 @@ test("the init trust line is true on every Codex surface", () => {
   const source = fs.readFileSync(path.join(packageRoot, "src", "init", "run.ts"), "utf8");
   assert.match(source, /Only the terminal app asks; until you do, Codex skips them without saying so/);
   assert.doesNotMatch(source, /Codex asks you to trust the Carrick hooks the next time it starts/);
+});
+
+// The three activation levers are additions: with them filtered out, both hook
+// sets equal what origin/main wrote before they existed, so dropping all three
+// reproduces today's file byte for byte.
+const LEVER_COMMANDS = ["hook orient", "hook first-prompt", "hook search-nudge"];
+
+function withoutLevers(set: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string }> }>>) {
+  const kept: Record<string, unknown> = {};
+  for (const [event, groups] of Object.entries(set)) {
+    const rest = groups.filter((group) => !group.hooks.some((entry) => LEVER_COMMANDS.some((name) => entry.command.endsWith(name))));
+    if (rest.length > 0) kept[event] = rest;
+  }
+  return kept;
+}
+
+test("without the three lever entries, both hook sets are what they were before them", () => {
+  const before = JSON.parse(
+    fs.readFileSync(path.join(packageRoot, "test", "fixtures", "levers", "hooks-before-levers.json"), "utf8"),
+  ) as { claude: unknown; codex: unknown };
+  assert.deepEqual(withoutLevers(carrickHooks("carrick")), before.claude);
+  assert.deepEqual(withoutLevers(codexHooks("carrick")), before.codex);
+});
+
+test("the lever entries are appended in the pinned order, with the short timeout", () => {
+  const claude = carrickHooks("carrick");
+  assert.deepEqual(
+    claude["SessionStart"]!.map((group) => group.hooks[0]!.command),
+    ["carrick hook session-start", "carrick hook orient"],
+  );
+  assert.equal(claude["SessionStart"]![1]!.hooks[0]!.timeout, 5);
+  assert.equal(claude["UserPromptSubmit"]!.length, 1);
+  assert.equal(claude["UserPromptSubmit"]![0]!.hooks[0]!.command, "carrick hook first-prompt");
+  assert.equal(claude["PreToolUse"]![0]!.matcher, "Grep|Bash");
+  assert.equal(claude["PreToolUse"]![0]!.hooks[0]!.command, "carrick hook search-nudge");
+  assert.equal(claude["PreToolUse"]![0]!.hooks[0]!.timeout, 5);
+
+  const codex = codexHooks("carrick");
+  assert.deepEqual(
+    codex["SessionStart"]!.map((group) => group.hooks[0]!.command),
+    ["carrick hook session-start", "carrick hook orient"],
+  );
+  assert.deepEqual(
+    codex["UserPromptSubmit"]!.map((group) => group.hooks[0]!.command),
+    ["carrick hook user-prompt", "carrick hook first-prompt"],
+  );
+  assert.equal(codex["PreToolUse"], undefined, "no search nudge on Codex yet");
 });

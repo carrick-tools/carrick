@@ -64,6 +64,10 @@ export function codexHooks(command = "carrick"): Record<string, HookGroup[]> {
       {
         hooks: [{ type: "command", command: `${command} hook session-start`, timeout: 30 }],
       },
+      // One line: read the project map first. Its own group, droppable alone.
+      {
+        hooks: [{ type: "command", command: `${command} hook orient`, timeout: 5 }],
+      },
     ],
     // One call can carry a patch touching several files, and each one is a
     // separate `carrick check`, so this timeout is not the single-file 15 the
@@ -81,6 +85,12 @@ export function codexHooks(command = "carrick"): Record<string, HookGroup[]> {
     UserPromptSubmit: [
       {
         hooks: [{ type: "command", command: `${command} hook user-prompt`, timeout: 5 }],
+      },
+      // One line on the first prompt of a session. A second group so it can be
+      // dropped alone. No search nudge on Codex yet: its shell tool payload is
+      // unverified.
+      {
+        hooks: [{ type: "command", command: `${command} hook first-prompt`, timeout: 5 }],
       },
     ],
   };

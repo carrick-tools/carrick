@@ -48,6 +48,10 @@ export type SessionRecord = {
    * asks once per file per session, whatever the answer was.
    */
   read: string[];
+  /** The first-prompt reminder has been given (carrick levers); absent until then. */
+  prompted?: boolean;
+  /** The first-search nudge has been given or ruled out; absent until then. */
+  searchNudged?: boolean;
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -113,6 +117,8 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       read: Array.isArray(record.read)
         ? record.read.filter((entry): entry is string => typeof entry === "string")
         : [],
+      ...(record.prompted === true ? { prompted: true } : {}),
+      ...(record.searchNudged === true ? { searchNudged: true } : {}),
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -235,6 +241,33 @@ export function record(sessionId: string, found: NewFunction[], home?: string): 
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
   return current;
+}
+
+/**
+ * Claim a once-per-session flag: true for the caller that set it, false where
+ * it was already set. The two lever hooks that speak once per session use this
+ * so a second prompt or search says nothing. Never throws.
+ */
+export function claimOnce(
+  sessionId: string,
+  flag: "prompted" | "searchNudged",
+  home?: string,
+): boolean {
+  const current = readSession(sessionId, home);
+  if (current[flag] === true) return false;
+  current[flag] = true;
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+  return true;
+}
+
+/** True where this session's flag is already set. */
+export function alreadyClaimed(
+  sessionId: string,
+  flag: "prompted" | "searchNudged",
+  home?: string,
+): boolean {
+  return readSession(sessionId, home)[flag] === true;
 }
 
 /** What a nudge has not yet named, oldest first. */

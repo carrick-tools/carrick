@@ -91,6 +91,11 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
       {
         hooks: [{ type: "command", command: `${command} hook session-start`, timeout: 30 }],
       },
+      // One line: read the project map first. Its own group so it can be
+      // dropped alone.
+      {
+        hooks: [{ type: "command", command: `${command} hook orient`, timeout: 5 }],
+      },
     ],
     // The end of a task, which is the only moment a reuse check is worth a
     // model turn: the post-edit hook records what each edit added and this
@@ -99,6 +104,20 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
     Stop: [
       {
         hooks: [{ type: "command", command: `${command} hook stop`, timeout: 5 }],
+      },
+    ],
+    // One line on the first prompt of a session: prefer one inline
+    // `search_by_intent` over a grep sweep or a search subagent.
+    UserPromptSubmit: [
+      {
+        hooks: [{ type: "command", command: `${command} hook first-prompt`, timeout: 5 }],
+      },
+    ],
+    // One line on the first search of a session. Never blocks.
+    PreToolUse: [
+      {
+        matcher: "Grep|Bash",
+        hooks: [{ type: "command", command: `${command} hook search-nudge`, timeout: 5 }],
       },
     ],
   };
@@ -207,19 +226,20 @@ export function hookTarget(command: string): string | null {
 }
 
 /**
- * Whether a settings entry is the hosted scaffold hook pack's session start.
+ * Whether a settings entry is one of the hosted scaffold hook pack's three
+ * scripts: session start, prompt reminder and search gate.
  *
- * The pack wires its session-start script by exactly this command
- * (carrick-cloud `lambdas/mcp-server/src/tools/scaffold.ts`,
- * `buildHookSettings`). The test is the whole command, so a user's own script
- * in the same directory, or the same script run with arguments, is never taken
- * for the pack's. That script prints the message `carrick hook session-start`
- * prints, so a repo holding both sent every session two of them
- * (carrick#2854). The pack's prompt reminder and search nudge stay: init has
- * nothing in their place, and they are what sends an agent to Carrick before
- * it greps.
+ * The pack wires each script by exactly this command (carrick-cloud
+ * `lambdas/mcp-server/src/tools/scaffold.ts`, `buildHookSettings`). The test is
+ * the whole command, so a user's own script in the same directory, or the same
+ * script run with arguments, is never taken for the pack's. The session-start
+ * script printed the message `carrick hook session-start` prints, so a repo
+ * holding both sent every session two of them (carrick#2854). The prompt
+ * reminder and search gate are what sent an agent to Carrick before it grepped;
+ * `carrick hook first-prompt` and `carrick hook search-nudge` say the same
+ * things and stand in their place, so init swaps all three for its own entries.
  */
-const SCAFFOLD_HOOK = /^"?\$CLAUDE_PROJECT_DIR\/\.claude\/session-start\.sh"?$/;
+const SCAFFOLD_HOOK = /^"?\$CLAUDE_PROJECT_DIR\/\.claude\/(?:session-start|turn-reminder|search-gate)\.sh"?$/;
 
 export function isScaffoldHook(entry: unknown): boolean {
   if (typeof entry !== "object" || entry === null) return false;

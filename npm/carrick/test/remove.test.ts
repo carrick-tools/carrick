@@ -27,7 +27,7 @@ import {
   mcpRemovalLines,
   SCAFFOLD_FILES,
 } from "../src/init/remove.ts";
-import { writeAgentsSection } from "../src/init/agents-section.ts";
+import { writeAgentsSection, writeClaudeSection } from "../src/init/agents-section.ts";
 import { MCP_URL } from "../src/init/mcp.ts";
 import { INSTALL_ID_HEADER, installIdPath } from "../src/init/install-id.ts";
 import { sessionFile, sessionsDir } from "../src/hook/reuse.ts";
@@ -706,11 +706,18 @@ test("the folder plan lists our AGENTS.md check section, and a file without it l
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-remove-agents-"));
   try {
     fs.writeFileSync(path.join(dir, "AGENTS.md"), "# Repo\n\n## Carrick check\n\nMine, no markers.\n");
-    assert.equal(folderPlan(dir).agents, false);
-    writeAgentsSection(dir);
+    assert.deepEqual(folderPlan(dir).agents, []);
+    writeAgentsSection(dir, { slug: null });
     const plan = folderPlan(dir);
-    assert.equal(plan.agents, true);
-    assert.ok(folderLines(plan).includes('The "Carrick check" section in AGENTS.md'));
+    assert.deepEqual(plan.agents, ["AGENTS.md"]);
+    assert.ok(folderLines(plan).includes("The Carrick sections in AGENTS.md"));
+    // A CLAUDE.md that does not import AGENTS.md carries the same blocks, so the
+    // plan lists it too and the removal takes them out of it.
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# Mine\n");
+    writeClaudeSection(dir, { slug: null });
+    const both = folderPlan(dir);
+    assert.deepEqual(both.agents, ["AGENTS.md", "CLAUDE.md"]);
+    assert.ok(folderLines(both).includes("The Carrick sections in CLAUDE.md"));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

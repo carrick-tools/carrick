@@ -56,7 +56,14 @@ import { writeRepoCopy } from "./repo-copies.ts";
 import { claudeCodeFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
-import { AGENTS_FILE, writeAgentsSection } from "./agents-section.ts";
+import {
+  AGENTS_FILE,
+  CLAUDE_FILE,
+  claudeCarries,
+  hasOwnCarrickSection,
+  writeAgentsSection,
+  writeClaudeSection,
+} from "./agents-section.ts";
 import { ignoredSkillRoots, taskSkillWarnings, writeTaskSkills } from "./task-skills.ts";
 import { recordCliVersion } from "./outdated.ts";
 import { findCarrick, offerGlobalInstall } from "../global-install.ts";
@@ -77,18 +84,17 @@ import {
 import { renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
 
 /**
- * The repos this run covers that the scaffold tool still has work in.
+ * The repos this run covers that are not set up for scanning yet.
  *
- * The two files that tool writes: the `carrick.json` a scan reads, and the
- * workflow that runs the scan. A repo holding both has been scaffolded, and
- * the closing instruction is then an instruction to do nothing — which is what
- * it was on a folder where every repo was already set up (carrick#1365).
+ * Two files make a repo scannable: the `carrick.json` a scan reads, and the
+ * workflow that runs the scan. A repo holding both needs nothing said about it
+ * (carrick#1365).
  *
  * The repo root only, because that is where the scanner looks for a config
  * (`Config::load_services`): a `carrick.json` deeper in the tree is a fixture
  * or a nested example, not this repo's.
  */
-export function reposToScaffold(
+export function reposWithoutSetup(
   repos: RepoIdentity[],
   exists: (target: string) => boolean = fs.existsSync,
 ): RepoIdentity[] {
@@ -100,40 +106,14 @@ export function reposToScaffold(
 }
 
 /**
- * The instruction to paste, naming the repos it is about.
- *
- * The scaffold tool's branch turns on `repo` and turns soft without it: with
- * no `repo` the response keeps its default ending and tells the agent to run
- * the scan — on a repo CI already indexes, which is the row the whole
- * workspace reads (carrick-cloud `src/tools/scaffold.ts`, cloud#805 item 1).
- * So the names are in the sentence, one call per repo.
- *
- * One repo whose owner/repo is known is the value of `repo`, said once; the
- * sentence used to name it and then ask for it again (carrick#1574). A repo
- * known here only by its folder still needs the agent to find its owner/repo.
- * The several-repo sentence is carrick-cloud#1404's: the tool now takes them
- * all in one `repos` call.
+ * The one line a laptop-lane run closes on when repos still need their config
+ * and workflow. The commands it names are this package's own, and the page is
+ * the steps for a repo the cloud does not build.
  */
-export function scaffoldSentence(repos: RepoIdentity[]): string {
+export function setupWarning(repos: RepoIdentity[]): string {
   const names = repos.map((repo) => repo.name ?? path.basename(repo.path));
-  if (names.length === 1) {
-    return repos[0]?.name
-      ? `Run the carrick scaffold tool with \`repo\` set to ${names[0]}, and follow what it returns.`
-      : `Run the carrick scaffold tool for ${names[0]}, passing its owner/repo as \`repo\`, and follow what it returns.`;
-  }
-  const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
-  return `Run the carrick scaffold tool for ${shown}, once each, passing that repo's owner/repo as \`repo\`, and follow what it returns.`;
-}
-
-/** The title of the block a run closes on when there is scaffolding left to do. */
-export const NEXT_TITLE = "Next: paste this into a new agent session";
-
-/**
- * The line that tells the agent where the proposal is, for a run that set up
- * the folder above the one it started in (carrick#1512).
- */
-export function initFolderSentence(workspace: string): string {
-  return `The init folder is ${tilde(workspace)}.`;
+  const one = names.length === 1;
+  return `${listed(names, 3)} ${one ? "is" : "are"} not set up for scanning yet. Each needs .github/workflows/carrick.yml (carrick templates workflow prints it) and a carrick.json written from .carrick/proposal.json: https://docs.carrick.tools/building-the-index`;
 }
 
 /** What a run with nothing left to set up closes on: what this machine can do now. */
@@ -443,6 +423,8 @@ export function writesLine(options: {
   editorFiles: string[];
   claudeCode: boolean;
   folder: string | null;
+  /** The folder holds a CLAUDE.md that does not import AGENTS.md, so it gets the blocks too. */
+  claudeMd?: boolean;
   home?: string;
 }): string {
   const mcp = [
@@ -453,6 +435,7 @@ export function writesLine(options: {
   const parts = [
     `Add Carrick's hooks and skills to .claude/, .agents/ and .codex/${where}`,
     options.workspaceFile ? `create .carrick/ and ${WORKSPACE_FILE}` : "create .carrick/",
+    ...(options.claudeMd ? [`add a Carrick section to ${CLAUDE_FILE}`] : []),
     ...(mcp.length > 0 ? [`add Carrick's MCP server to ${listed(mcp, 5)}`] : []),
   ];
   return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
@@ -974,6 +957,7 @@ async function cloudLane(input: {
         editorFiles: offered.filter((client) => editors.includes(client.name)).map((client) => client.file),
         claudeCode: claudeCodeFound(),
         folder: selected.some((repo) => realPath(repo.path) !== realPath(workspace)) ? tilde(realPath(workspace)) : null,
+        claudeMd: claudeCarries(workspace),
       }),
     ]),
   );
@@ -1417,6 +1401,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
         claudeCode: claudeCodeFound(),
         // A folder of repos: the copy in each repo is written as well.
         folder: selected.some((repo) => realPath(repo.path) !== realPath(workspace)) ? tilde(realPath(workspace)) : null,
+        claudeMd: claudeCarries(workspace),
       }),
     });
     out.say(nextBlock(next));
@@ -1581,12 +1566,23 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     out.refuse(`Could not write the task skills: ${(error as Error).message}`);
   }
 
-  // The check block in AGENTS.md (carrick#2828): only our marked section is
-  // written, and every other line of the file is left as it is.
-  try {
-    writeAgentsSection(workspace);
-  } catch (error) {
-    out.refuse(`Could not write the Carrick check section in ${AGENTS_FILE}: ${(error as Error).message}`);
+  // The check block in AGENTS.md (carrick#2828) and the rules block after it:
+  // only our marked sections are written, and every other line of the file is
+  // left as it is. Claude Code reads CLAUDE.md and skips AGENTS.md where one
+  // exists, so a CLAUDE.md that does not import AGENTS.md gets the same blocks.
+  // A file with a Carrick section of its own keeps it and gets no rules block.
+  const scope = { slug: projectSlug };
+  for (const [file, write] of [
+    [AGENTS_FILE, () => writeAgentsSection(workspace, scope)],
+    [CLAUDE_FILE, () => writeClaudeSection(workspace, scope)],
+  ] as const) {
+    try {
+      if (write() !== null && hasOwnCarrickSection(workspace, file)) {
+        todo.push(`${file} already has a Carrick section of its own, so init left its rules out of that file.`);
+      }
+    } catch (error) {
+      out.refuse(`Could not write the Carrick check section in ${file}: ${(error as Error).message}`);
+    }
   }
 
   // The same hooks and skills inside each repo of a folder, because an agent
@@ -1763,30 +1759,17 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     if (downloaded) out.done(READY_SENTENCE);
     return 0;
   }
-  // The scaffold tool writes the files a repo needs; a repo that has them needs
-  // nothing pasted anywhere. The line used to close every run, including one
-  // where every covered repo already had its config and its workflow, and
-  // "this repo" named nothing in a folder of several (carrick#1365).
+  // A repo missing its config or its workflow is named in one line. The cloud
+  // lane built its index without either, and does not reach this point.
   //
   // An install the first scan would be refused over goes in front of it: the
   // agent otherwise found out from the refusal (carrick#1489).
-  const unscaffolded = reposToScaffold(selectedRepos);
-  if (unscaffolded.length > 0) {
-    const install = installSentence(installs, "agent");
-    // A new session, because that is the one that loads the MCP server this
-    // run has just added (carrick#1512).
-    out.note(NEXT_TITLE, [
-      ...(install === null ? [] : [install]),
-      scaffoldSentence(unscaffolded),
-      // The scaffold tool reads the proposal from the folder init ran in, and
-      // a run that moved to the folder above did not run where it started.
-      ...(realPath(workspace) === realPath(startedIn) ? [] : [initFolderSentence(workspace)]),
-    ]);
-  } else {
-    const install = installSentence(installs, "reader");
-    if (install !== null) out.warn(install);
-    out.done(READY_SENTENCE);
-  }
+  const unset = reposWithoutSetup(selectedRepos);
+  if (unset.length > 0) out.warn(setupWarning(unset));
+  const install = installSentence(installs, "reader");
+  if (install !== null) out.warn(install);
+  // "The index is on this machine" is only true of repos that were ready.
+  if (unset.length === 0) out.done(READY_SENTENCE);
   return 0;
 }
 
