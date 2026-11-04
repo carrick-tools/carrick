@@ -98,16 +98,31 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+/// A re-scanning `check` (`--changed`, named files, `--recheck`) asks the
+/// library store, and a machine with no credential is refused and not checked
+/// (carrick#3249). These tests are about what a check finds, so they run as a
+/// signed-in machine does: the mock store answers, with no claims, which is
+/// the answer the store gave before. The one test that wants the refusal
+/// builds its own command.
+fn as_signed_in(command: &mut Command, args: &[&str]) {
+    if args.first() == Some(&"check") {
+        command.env("CARRICK_MOCK_ALL", "1");
+    }
+}
+
 /// Run a carrick command in the workspace and return its stdout. Read-only
 /// commands must always exit 0, which is asserted here rather than in every
 /// test: a hook that fails an edit because an index is stale is the failure
 /// mode this path exists to avoid.
 fn run(workspace: &Path, args: &[&str]) -> String {
-    let output = Command::new(carrick())
+    let mut command = Command::new(carrick());
+    command
         .args(args)
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
-        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"));
+    as_signed_in(&mut command, args);
+    let output = command
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
     assert!(
@@ -185,6 +200,7 @@ fn run_with_env(workspace: &Path, args: &[&str], env: &[(&str, &str)]) -> String
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"));
+    as_signed_in(&mut command, args);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -2608,6 +2624,7 @@ fn check_changed(workspace: &Path, json: bool) -> (Option<i32>, String) {
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
     (
@@ -2625,6 +2642,7 @@ fn check_changed_all(workspace: &Path) -> (Option<i32>, String) {
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap_or_else(|e| panic!("carrick check --changed --all: {e}"));
     (
@@ -2643,6 +2661,7 @@ fn check_files(workspace: &Path, files: &[&str]) -> (Option<i32>, String) {
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap_or_else(|e| panic!("carrick check {files:?}: {e}"));
     (
@@ -2819,6 +2838,7 @@ fn a_signalled_check_ends_its_re_scan_and_the_re_scans_sidecar() {
         .args(["check", "--changed", "--workspace", "."])
         .current_dir(root)
         .env_remove("CARRICK_TOKEN")
+        .env("CARRICK_MOCK_ALL", "1")
         .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
         .env("CARRICK_SIDECAR_DIR", root.join(".busy-sidecar"))
@@ -2928,6 +2948,7 @@ fn check_changed_keeps_talking_to_a_caller_that_kills_silent_commands() {
         .args(["check", "--changed", "--workspace", ".", "--json"])
         .current_dir(root)
         .env_remove("CARRICK_TOKEN")
+        .env("CARRICK_MOCK_ALL", "1")
         .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
         .env("CARRICK_SIDECAR_DIR", root.join(".stalled-sidecar"))
@@ -3640,13 +3661,16 @@ fn carry_workspace_with(prepare: impl FnOnce(&Path)) -> tempfile::TempDir {
 
 /// A command with its exit code, since a failing check is the point here.
 fn carrick_code(workspace: &Path, args: &[&str]) -> (Option<i32>, String) {
-    let output = Command::new(carrick())
+    let mut command = Command::new(carrick());
+    command
         .args(args)
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
-        .env("CARRICK_RECHECK_BUDGET_MS", "600000")
+        .env("CARRICK_RECHECK_BUDGET_MS", "600000");
+    as_signed_in(&mut command, args);
+    let output = command
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
     (
@@ -4294,14 +4318,29 @@ fn check_changed_says_when_the_library_store_cannot_be_asked() {
     edit(&repo.join("src/routes.ts"), "\"/c\"", "\"/d\"");
     commit_all(&repo, "rename the route");
 
-    let (code, text) = check_changed(root, false);
+    let unsigned = |args: &[&str]| {
+        let output = Command::new(carrick())
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_CHECK_BUDGET_MS", "600000")
+            .env("CARRICK_RECHECK_BUDGET_MS", "600000")
+            .output()
+            .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        )
+    };
+    let (code, text) = unsigned(&["check", "--changed", "--workspace", "."]);
     assert_eq!(code, Some(2), "not signed in is not a pass:\n{text}");
     assert_eq!(
         text,
         "carrick check: not checked: library facts unavailable: this machine is not signed \
          in. Run carrick login.\n"
     );
-    let (_, body) = check_changed(root, true);
+    let (_, body) = unsigned(&["check", "--changed", "--workspace", ".", "--json"]);
     let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
     assert_eq!(
         json["not_checked"],
@@ -4309,17 +4348,14 @@ fn check_changed_says_when_the_library_store_cannot_be_asked() {
         "{json:#}"
     );
 
-    let (code, text) = carrick_code(
-        root,
-        &[
-            "check",
-            "repo/src/routes.ts",
-            "--recheck",
-            "--workspace",
-            ".",
-            "--json",
-        ],
-    );
+    let (code, text) = unsigned(&[
+        "check",
+        "repo/src/routes.ts",
+        "--recheck",
+        "--workspace",
+        ".",
+        "--json",
+    ]);
     let json: serde_json::Value = serde_json::from_str(&text).expect("--json is JSON");
     assert_eq!(json["recheck"]["ran"], "none", "{json:#}");
     assert_eq!(
