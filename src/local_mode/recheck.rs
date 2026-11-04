@@ -624,18 +624,18 @@ fn read_working(
 /// The type-use record lists the operations that read a type the edited file
 /// declares; it does not list one that reads a constant, a wrapper or a type
 /// it could not trace. The import closure the change scope already walks
-/// ([`crate::change_scope::untouched_since`]) names those. A service whose
-/// closure cannot be walked (no stored config on this machine) is named too:
-/// it is not known to be untouched.
+/// ([`crate::change_scope::untouched_since`]) names those. A service's own
+/// edits are left out of the listing: the digest already accounts for them
+/// (its last re-check's copy, or stale). A service whose closure cannot be
+/// walked (no stored config on this machine) is named too: it is not known to
+/// be untouched.
 fn readers_of_the_edit(
     repo: &Path,
     reach: &Reach,
     held: &Held,
 ) -> std::collections::BTreeMap<String, String> {
-    use std::collections::BTreeMap;
     let repo_path = repo.to_string_lossy().to_string();
-    let mut by_commit: BTreeMap<&str, Vec<(&str, crate::config::Config)>> = BTreeMap::new();
-    let mut readers = BTreeMap::new();
+    let mut readers = std::collections::BTreeMap::new();
     for service in reach
         .services
         .iter()
@@ -647,32 +647,28 @@ fn readers_of_the_edit(
             .find(|blob| service_id(blob) == service.name)
             .and_then(|blob| blob.config_json.as_deref())
             .and_then(|json| serde_json::from_str::<crate::config::Config>(json).ok());
-        match config {
-            Some(config) => by_commit
-                .entry(service.commit.as_str())
-                .or_default()
-                .push((service.name.as_str(), config)),
-            None => {
-                readers.insert(
-                    service.name.clone(),
-                    "its config is not on this machine, so what it reads is unknown; judged at its indexed version"
-                        .to_string(),
-                );
-            }
-        }
-    }
-    for (commit, group) in by_commit {
-        let configs: Vec<crate::config::Config> =
-            group.iter().map(|(_, config)| config.clone()).collect();
-        let changes = crate::change_scope::ChangedSince::new(&repo_path, &configs, &[]);
-        let reads = crate::change_scope::untouched_since(&repo_path, &configs, &changes, commit);
-        for ((name, _), read) in group.iter().zip(reads) {
-            if let Some(path) = read {
-                readers.insert(
-                    name.to_string(),
-                    format!("reads {path}, edited since the index; judged at its indexed version"),
-                );
-            }
+        let Some(config) = config else {
+            readers.insert(
+                service.name.clone(),
+                "its config is not on this machine, so what it reads is unknown; judged at its indexed version"
+                    .to_string(),
+            );
+            continue;
+        };
+        let own = service.clone();
+        let changes = crate::change_scope::ChangedSince::new(&repo_path, &[], &[])
+            .without(move |path| own.covers(path));
+        let read = crate::change_scope::untouched_since(
+            &repo_path,
+            std::slice::from_ref(&config),
+            &changes,
+            &service.commit,
+        );
+        if let Some(Some(path)) = read.first() {
+            readers.insert(
+                service.name.clone(),
+                format!("reads {path}, edited since the index; judged at its indexed version"),
+            );
         }
     }
     readers

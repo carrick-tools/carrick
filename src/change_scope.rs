@@ -857,6 +857,9 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
+/// Whether a changed path is left out of a [`ChangedSince`] listing.
+type DroppedPaths = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// The paths changed since each stored commit, listed once per commit for the
 /// whole run: [`plan`] reads them, and so does a pull request scan's type-reach
 /// decision (carrick#3102), so git is asked once.
@@ -867,6 +870,8 @@ fn short(commit: &str) -> &str {
 pub struct ChangedSince {
     repo_path: String,
     scaffold_config: Option<String>,
+    /// Paths this listing leaves out ([`ChangedSince::without`]).
+    dropped: Option<DroppedPaths>,
     listed: std::sync::Mutex<HashMap<String, Result<Vec<ChangedPath>, String>>>,
     moved: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<DependencyMove>>>>,
 }
@@ -880,9 +885,18 @@ impl ChangedSince {
             scaffold_config: scaffold_config_is_the_stored_one(services, stored_services)
                 .then(|| crate::git_state::untracked_root_config(repo_path))
                 .flatten(),
+            dropped: None,
             listed: Default::default(),
             moved: Default::default(),
         }
+    }
+
+    /// The same listing without the paths `dropped` names: a caller that asks
+    /// what a service reads of the changes other than its own (the per-edit
+    /// re-check, `local_mode::recheck`).
+    pub fn without(mut self, dropped: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.dropped = Some(Box::new(dropped));
+        self
     }
 
     /// What the manifests and lockfiles changed since `commit` moved, read
@@ -918,6 +932,9 @@ impl ChangedSince {
                 let mut paths = crate::git_state::changed_paths(&self.repo_path, commit, None);
                 if let (Ok(paths), Some(config)) = (&mut paths, &self.scaffold_config) {
                     paths.retain(|change| !(change.status == 'A' && &change.path == config));
+                }
+                if let (Ok(paths), Some(dropped)) = (&mut paths, &self.dropped) {
+                    paths.retain(|change| !dropped(&change.path));
                 }
                 paths
             })
