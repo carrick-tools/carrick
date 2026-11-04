@@ -1184,6 +1184,7 @@ fn judge(
             unconfirmed: !confirmed,
             outside_the_change: true,
             other_build: false,
+            not_judged_before: false,
             fails: confirmed,
         });
     }
