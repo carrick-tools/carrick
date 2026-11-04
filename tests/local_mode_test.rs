@@ -3278,9 +3278,23 @@ fn check_changed_answers_a_comment_only_edit_without_a_re_scan() {
         "the switch re-scans:\n{stderr}"
     );
     assert!(always["problems"][0]["line"].is_u64(), "{always:#}");
+    // This machine is not signed in (carrick#3249), so a forced re-scan says
+    // its library facts were unavailable; the answer from the index has no
+    // such line. What the two must agree on is the problems and their lines.
+    assert!(
+        always["not_checked"]
+            .as_str()
+            .is_some_and(|line| line.contains("not signed in")),
+        "{always:#}"
+    );
+    let mut always = without_how(&always);
+    always
+        .as_object_mut()
+        .expect("an object")
+        .remove("not_checked");
     assert_eq!(
         without_how(&json),
-        without_how(&always),
+        always,
         "the answer without the re-scan is the re-scan's, at the moved line"
     );
 }
