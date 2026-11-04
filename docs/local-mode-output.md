@@ -52,9 +52,12 @@ the file has changed since the index, it re-scans **that file's repo only** —
 deterministic extraction and the sidecar's type capture, no model, nothing on
 the wire — and re-runs the join over the blobs already in `.carrick/repos`
 plus the cached hosted snapshot, so the verdicts it prints are about the
-working tree rather than the tree the index was built on. It writes nothing:
-`.carrick/index.json` is untouched and the temporary generation is deleted on
-every path. The whole re-check has a budget (10 s, `CARRICK_RECHECK_BUDGET_MS`);
+working tree rather than the tree the index was built on. It leaves
+`.carrick/index.json` untouched and deletes the temporary generation on every
+path. The one thing it keeps is the compiler rows of a service it carried and
+had to walk, in `.carrick/positions/`; a later check or re-check reuses them
+only while the build, the commit and every file's hash are the ones they were
+walked at (carrick#3245). The whole re-check has a budget (10 s, `CARRICK_RECHECK_BUDGET_MS`);
 past it the answer is the indexed one, and the `recheck` block below says so.
 A re-check that missed its budget is remembered in
 `.carrick/recheck-misses.json`, per repo and against the index it ran on (its
