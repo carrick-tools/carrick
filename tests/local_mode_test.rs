@@ -4331,3 +4331,144 @@ fn a_comment_in_a_shared_type_file_moves_nothing_outside_it() {
     assert_eq!(code, Some(0), "{json:#}");
     assert_eq!(json["outside_moved"], 0, "{json:#}");
 }
+
+/// The environment a check or a refresh needs to walk a repo's services and
+/// read the sibling a service calls into, with the models mocked and the
+/// store's label for the default library coming from the repo's cassette.
+fn walking_env(repo: &Path) -> Vec<(String, String)> {
+    let sidecar = repo_root().join("src/sidecar");
+    vec![
+        ("CARRICK_MOCK_ALL".into(), "1".into()),
+        (
+            "CARRICK_MOCK_FIXTURE_DIR".into(),
+            format!("{}/", repo.join("__llm__").display()),
+        ),
+        ("CARRICK_POSITION_ROWS".into(), "1".into()),
+        ("CARRICK_SITE_QUESTIONS".into(), "1".into()),
+        ("CARRICK_SKIP_INTENTS".into(), "1".into()),
+        ("CARRICK_ALLOW_UNPREPARED".into(), "1".into()),
+        ("CARRICK_NO_UPDATE_CHECK".into(), "1".into()),
+        ("CARRICK_SIDECAR_DIR".into(), sidecar.display().to_string()),
+    ]
+}
+
+/// A file's identity and write time: changed by every copy that replaces it.
+fn identity(path: &Path) -> (u64, std::time::SystemTime) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    (meta.ino(), meta.modified().expect("a write time"))
+}
+
+/// The `__client` rows file in `dir`, if there is one.
+fn client_rows(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with("__client.jsonl.gz"))
+}
+
+/// carrick#3245: a check that had to walk a service it carries keeps the
+/// walk, so the next check reuses it. The index here stands for a hosted one
+/// (its kept rows are gone), the app is edited, and the client it reads is
+/// carried; the first check walks the client and keeps the rows with the
+/// record of the commit; the second leaves them alone; and rows whose build
+/// stamp, commit or file hash no longer holds are walked and kept again.
+#[test]
+#[serial]
+fn check_changed_keeps_a_carried_walk_for_the_next_check() {
+    if !repo_root().join("src/sidecar/dist/src/index.js").exists() {
+        assert!(
+            std::env::var("CI").is_err(),
+            "the built sidecar is missing in CI"
+        );
+        eprintln!("Skipping: the built sidecar is missing");
+        return;
+    }
+    let workspace = workspace("discovery-siblings", &["repo"]);
+    let root = workspace.path();
+    let env = walking_env(&root.join("repo"));
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    run_with_env(root, &["refresh", "--workspace", "."], &env_refs);
+    let positions = root.join(".carrick/positions");
+    assert!(
+        client_rows(&positions).is_some(),
+        "the refresh kept the client's rows"
+    );
+    // A hosted index has no kept rows.
+    std::fs::remove_dir_all(&positions).expect("remove the kept rows");
+
+    let main = root.join("repo/services/app/src/main.ts");
+    let mut text = std::fs::read_to_string(&main).expect("read the app");
+    text.push_str("\nexport function more(): number {\n  return 1;\n}\n");
+    std::fs::write(&main, text).expect("edit the app");
+    let check = || {
+        let output = Command::new(carrick())
+            .args(["check", "--changed", "--workspace", "."])
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_CHECK_BUDGET_MS", "600000")
+            .envs(env_refs.iter().copied())
+            .output()
+            .expect("spawn carrick");
+        assert!(
+            output.status.code().is_some_and(|code| code <= 1),
+            "check failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    check();
+    let rows = client_rows(&positions).expect("the first check kept the client's rows");
+    let record = {
+        let mut name = rows.clone().into_os_string();
+        name.push(".at");
+        PathBuf::from(name)
+    };
+    let text =
+        std::fs::read_to_string(&record).expect("and the record of what they were walked from");
+    let lines: Vec<&str> = text.lines().collect();
+    let head = git_head(&root.join("repo"));
+    assert_eq!(lines.len(), 2, "{text:?}");
+    assert_eq!(
+        lines[1], head,
+        "the record names the commit it was carried at"
+    );
+    assert!(
+        std::fs::read_dir(&positions).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("__app")),
+        "an analysed service's rows are not kept"
+    );
+
+    check();
+    let kept = identity(&rows);
+    check();
+    assert_eq!(identity(&rows), kept, "the next check reused the walk");
+
+    // Rows that no longer hold are walked again and kept again.
+    let honest = std::fs::read_to_string(&record).unwrap();
+    let tampered: [String; 2] = [
+        format!("0{honest}"),
+        honest.replacen(&head, &"0".repeat(head.len()), 1),
+    ];
+    for bad in tampered {
+        std::fs::write(&record, &bad).unwrap();
+        let before = identity(&rows);
+        check();
+        assert_ne!(identity(&rows), before, "refused rows were walked again");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), honest);
+    }
+}
+
+fn git_head(repo: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
