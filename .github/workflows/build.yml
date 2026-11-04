@@ -13,13 +13,13 @@ name: Build
 #
 # Artifacts, kept 14 days, named by the full commit id <sha>:
 #   carrick-linux-x64-<sha>, carrick-linux-arm64-<sha>, carrick-darwin-arm64-<sha>
-#       one file, `carrick` (artifacts do not keep the executable bit: chmod +x)
+#       the binary, a file named `carrick` at the root (artifacts do not keep the executable bit: chmod +x)
 #   carrick-cli-<sha>
 #       the npm package tarball (`npm pack`; it bundles the type sidecar)
 #   carrick-manifest-<sha>
-#       manifest.json: sha, version, run, and for every artifact above its name
-#       and the sha256 and size of each file in it. Read by carrick-cloud's
-#       scanner-replay/fetch-build.sh.
+#       manifest.json at the artifact root: {sha, version, platforms:
+#       {<platform>: {artifact, files: {<name>: <sha256>}}}, cli: {artifact,
+#       files}}. Read by carrick-cloud's scanner-replay/fetch-build.sh.
 
 on:
   workflow_call:
@@ -206,22 +206,18 @@ jobs:
           for platform in linux-x64 linux-arm64 darwin-arm64 cli; do
             test -d "carrick-$platform-$SHA" || { echo "::error::missing artifact carrick-$platform-$SHA"; exit 1; }
           done
-          entries=$(for dir in carrick-*-"$SHA"; do
-            key=${dir#carrick-}
-            key=${key%-"$SHA"}
-            files=$(cd "$dir" && for f in *; do
-              jq -n --arg name "$f" --arg sha256 "$(sha256sum "$f" | cut -d' ' -f1)" \
-                --argjson bytes "$(wc -c < "$f" | tr -d ' ')" \
-                '{name: $name, sha256: $sha256, bytes: $bytes}'
-            done | jq -s .)
-            jq -n --arg key "$key" --arg artifact "$dir" --argjson files "$files" \
-              '{($key): {artifact: $artifact, files: $files}}'
-          done | jq -s 'add')
+          # {"<filename>": "<sha256>"} for one artifact directory
+          files_of() { (cd "$1" && for f in *; do printf '%s\t%s\n' "$f" "$(sha256sum "$f" | cut -d' ' -f1)"; done) \
+            | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add'; }
+          platforms='{}'
+          for p in linux-x64 linux-arm64 darwin-arm64; do
+            platforms=$(jq -n --argjson acc "$platforms" --arg p "$p" --arg a "carrick-$p-$SHA" --argjson f "$(files_of "carrick-$p-$SHA")" \
+              '$acc + {($p): {artifact: $a, files: $f}}')
+          done
           mkdir -p ../out
-          jq -n --arg sha "$SHA" --arg version "$VERSION" \
-            --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --arg built_at "$(date -u +%FT%TZ)" --argjson artifacts "$entries" \
-            '{sha: $sha, version: $version, run_id: $run_id, run_url: $run_url, built_at: $built_at, artifacts: $artifacts}' \
+          jq -n --arg sha "$SHA" --arg version "$VERSION" --argjson platforms "$platforms" \
+            --arg cli "carrick-cli-$SHA" --argjson cf "$(files_of "carrick-cli-$SHA")" \
+            '{sha: $sha, version: $version, platforms: $platforms, cli: {artifact: $cli, files: $cf}}' \
             > ../out/manifest.json
           cat ../out/manifest.json
 
