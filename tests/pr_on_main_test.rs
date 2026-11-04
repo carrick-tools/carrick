@@ -2203,7 +2203,8 @@ async fn manifest_seed_payload(name: &str) -> serde_json::Value {
         "{name} is retired: drop its tests"
     );
     let repo = entry["repo"].as_str().unwrap().to_string();
-    let payload = seed_payload(&repo, |dir| apply_seed(dir, name)).await;
+    let payload =
+        seed_payload_with(&repo, |dir| apply_seed(dir, name), reach_pair_wanted(name)).await;
     seed_stages::assert_declared_stage(name, &entry, &payload);
     if entry["expect"]["conclusion"] == "success" {
         assert_no_lost_pairing(&payload);
@@ -2570,16 +2571,80 @@ async fn snapshot_from_cache_equals_fresh_scan() {
     assert_eq!(from_cache, from_scan);
 }
 
+/// One seed per protocol that runs the type-reach off/on pair in a PR run
+/// (manifest protocol, seed name). Every other seed runs its own assertions
+/// on the one (on) pass; the nightly workflow sets `CARRICK_PR_SEED_REACH_ALL=1`
+/// and pairs every seed (.github/workflows/nightly-seed-reach.yml).
+const REACH_SAMPLE: [(&str, &str); 5] = [
+    ("http", "http-field-rename"),
+    ("graphql", "graphql-field-rename"),
+    ("pubsub", "pubsub-field-rename"),
+    ("socket", "socket-field-rename"),
+    ("trpc", "trpc-procedure-renamed"),
+];
+
+/// Whether seed `name` runs the type-reach pair on this run.
+fn reach_pair_wanted(name: &str) -> bool {
+    std::env::var("CARRICK_PR_SEED_REACH_ALL").is_ok_and(|v| v.trim() == "1")
+        || REACH_SAMPLE.iter().any(|(_, seed)| *seed == name)
+}
+
+/// A PR run keeps one reach-pair seed for every protocol the manifest holds,
+/// each a live seed with a running test: losing one would leave a protocol
+/// whose type-reach decision no PR run compares.
+#[test]
+fn every_protocol_keeps_a_reach_pair_seed() {
+    let seeds: Vec<serde_json::Value> = seed_manifest()["seeds"].as_array().unwrap().clone();
+    let live: Vec<&serde_json::Value> = seeds
+        .iter()
+        .filter(|s| !seed_stages::is_retired(s))
+        .collect();
+    let protocols: std::collections::BTreeSet<&str> = live
+        .iter()
+        .map(|s| s["protocol"].as_str().unwrap())
+        .collect();
+    let sampled: std::collections::BTreeSet<&str> = REACH_SAMPLE.iter().map(|(p, _)| *p).collect();
+    assert_eq!(protocols, sampled, "a protocol has no reach-pair seed");
+    let source = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/pr_on_main_test.rs"),
+    )
+    .unwrap();
+    let names = REACH_SAMPLE
+        .iter()
+        .map(|(_, n)| n.to_string())
+        .collect::<Vec<_>>();
+    let covered = seed_stages::seeds_with_a_running_test(&source, &names);
+    for (protocol, name) in REACH_SAMPLE {
+        let seed = live
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("reach-pair seed {name} is not a live seed"));
+        assert_eq!(seed["protocol"], protocol, "{name}");
+        assert!(reach_pair_wanted(name));
+        assert!(
+            covered.contains(&name.to_string()),
+            "{name} has no running test"
+        );
+    }
+}
+
 /// The result of scanning `repo_name` of the fixture as a PR that applies
-/// `change` on top of main.
-///
-/// Every seed is also the A/B of carrick#3103: the PR is scanned with the
-/// type-reach decision off (every service re-typed whole) and then on, and
-/// the two posted results must be the same. The on run is last, so a dump
-/// (`CARRICK_TYPE_REACH_DUMP`) reads its decision. A run that turned the
-/// decision off itself is scanned once.
+/// `change` on top of main. One pass, type-reach decision on.
 async fn seed_payload(repo_name: &str, change: impl Fn(&Path)) -> serde_json::Value {
-    if std::env::var("CARRICK_TYPE_REACH").is_ok_and(|value| value.trim() == "off") {
+    seed_payload_with(repo_name, change, reach_pair_wanted("")).await
+}
+
+/// As `seed_payload`; with `pair`, the A/B of carrick#3103 too: the PR is
+/// scanned with the type-reach decision off (every service re-typed whole)
+/// and then on, and the two posted results must be the same. The on run is
+/// last, so a dump (`CARRICK_TYPE_REACH_DUMP`) reads its decision. A run that
+/// turned the decision off itself is scanned once.
+async fn seed_payload_with(
+    repo_name: &str,
+    change: impl Fn(&Path),
+    pair: bool,
+) -> serde_json::Value {
+    if !pair || std::env::var("CARRICK_TYPE_REACH").is_ok_and(|value| value.trim() == "off") {
         return seed_payload_once(repo_name, &change).await;
     }
     let off = {
