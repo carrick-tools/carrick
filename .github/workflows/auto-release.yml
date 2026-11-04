@@ -1,0 +1,59 @@
+name: Auto release
+
+# Marks the open release PR ready and puts it in the merge queue when the
+# release check passed on its base, its diff is version-only and no merged PR
+# since the last tag carries `release-hold`. All logic is in
+# scripts/auto-release.py (tests: scripts/auto-release.test.py); this file only
+# wires it. Plan: speed-cleanup T15.
+#
+# Ships OFF: the job acts only when the repo variable AUTO_RELEASE_ENABLED is
+# 'true'. A workflow_dispatch with dry_run (the default) prints the decision
+# and enqueues nothing, whatever the variable says.
+
+on:
+  status:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the decision and enqueue nothing."
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    # A release PR can open after its base's status was posted; this catches it.
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: read
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    # Status events fire for every context; only the release check matters.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.AUTO_RELEASE_ENABLED == 'true' &&
+       (github.event_name == 'schedule' || github.event.context == 'release-check'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Decide and enqueue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTO_RELEASE_ENABLED: ${{ vars.AUTO_RELEASE_ENABLED }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python3 scripts/auto-release.py --dry-run
+          else
+            python3 scripts/auto-release.py
+          fi
