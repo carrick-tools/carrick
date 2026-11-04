@@ -927,6 +927,30 @@ fn judge(
                 row.path.clone(),
             ))
         });
+        for counterpart in &old.counterparts {
+            if let Some(&(producer_repo, _)) = repo_of.get(counterpart.service.as_str()) {
+                let rows: Vec<String> = indexed_rows(rebuilt, producer_repo, &counterpart.file)
+                    .map(|o| {
+                        format!(
+                            "[{:?} {} {} {} line={:?} src={:?}]",
+                            o.kind, o.service, o.method, o.key, o.line, o.source
+                        )
+                    })
+                    .collect();
+                dbg(format!("  rebuilt rows of {}: {rows:?}", counterpart.file));
+            }
+        }
+        dbg(format!(
+            "  all producers: {:?}",
+            join.operations
+                .iter()
+                .filter(|p| p.role == Role::Producer)
+                .map(|p| format!(
+                    "{} {} {}:{:?} rs={:?}",
+                    p.service, p.key, p.file, p.line, p.resolution_source
+                ))
+                .collect::<Vec<_>>()
+        ));
         let confirmed = moved_to.is_some();
         let reason = match moved_to {
             Some((file, line, path)) => format!(
