@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "carrick": {
+      "type": "http",
       "url": "https://api.carrick.tools/mcp"
     }
   }
