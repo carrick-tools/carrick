@@ -4348,11 +4348,22 @@ fn shared_package_repo(root: &Path) -> PathBuf {
     );
     write(
         "package.json",
-        "{ \"name\": \"monorepo\", \"private\": true }",
+        "{ \"name\": \"monorepo\", \"private\": true, \"workspaces\": [\"packages/*\", \"services/*\"] }",
     );
+    write("package-lock.json", "{ \"lockfileVersion\": 3 }\n");
+    write(
+        "tsconfig.base.json",
+        "{ \"compilerOptions\": { \"strict\": true, \"target\": \"es2022\", \"module\": \"esnext\", \"moduleResolution\": \"bundler\", \"skipLibCheck\": true } }",
+    );
+    for service in ["services/api", "services/client"] {
+        write(
+            &format!("{service}/tsconfig.json"),
+            "{ \"extends\": \"../../tsconfig.base.json\", \"include\": [\"app\", \"src\"] }",
+        );
+    }
     write(
         "packages/contracts/package.json",
-        "{ \"name\": \"contracts\", \"private\": true }",
+        "{ \"name\": \"@acme/contracts\", \"version\": \"0.0.0\", \"main\": \"src/index.ts\" }",
     );
     write(
         "packages/contracts/src/index.ts",
@@ -4360,11 +4371,11 @@ fn shared_package_repo(root: &Path) -> PathBuf {
     );
     write(
         "services/api/package.json",
-        "{ \"name\": \"api\", \"private\": true, \"dependencies\": { \"@remix-run/node\": \"^2.0.0\" } }",
+        "{ \"name\": \"api\", \"private\": true, \"dependencies\": { \"@remix-run/node\": \"^2.0.0\", \"@acme/contracts\": \"*\" } }",
     );
     write(
         "services/api/app/routes/api.v1.widgets.$widgetId.ts",
-        "import type { WidgetDto } from \"../../../../packages/contracts/src/index\";\n\n\
+        "import type { WidgetDto } from \"@acme/contracts\";\n\n\
          function build(id: string): WidgetDto {\n  return { id, activeCount: 3 };\n}\n\n\
          export async function loader({\n  params,\n}: {\n  params: { widgetId: string };\n}): Promise<WidgetDto> {\n  return build(String(params.widgetId));\n}\n",
     );
