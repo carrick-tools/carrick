@@ -30,9 +30,6 @@ impl LineMap {
     /// blank line, the middle of a statement) moves as the nearest node line
     /// above it did; before the first node it stays.
     pub(super) fn map(&self, line: u32) -> u32 {
-        if std::env::var_os("PATH").is_some() {
-            return line; // DELETE-CHECK: identity line map
-        }
         let at = self.anchors.partition_point(|(base, _)| *base <= line);
         match at.checked_sub(1).and_then(|i| self.anchors.get(i)) {
             Some(&(base, now)) => (now as i64 + (line as i64 - base as i64)).max(1) as u32,
