@@ -98,14 +98,16 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-/// A re-scanning `check` (`--changed`, named files, `--recheck`) asks the
+/// A re-scanning `check` (`--changed`, named files, `--recheck`) and the
+/// `refresh` that writes the index it reads (a refresh with no credential
+/// leaves the not-signed-in mark on every service it carries) ask the
 /// library store, and a machine with no credential is refused and not checked
 /// (carrick#3249). These tests are about what a check finds, so they run as a
 /// signed-in machine does: the mock store answers, with no claims, which is
 /// the answer the store gave before. The one test that wants the refusal
 /// builds its own command.
 fn as_signed_in(command: &mut Command, args: &[&str]) {
-    if args.first() == Some(&"check") {
+    if matches!(args.first(), Some(&"check" | &"refresh")) {
         command.env("CARRICK_MOCK_ALL", "1");
     }
 }
