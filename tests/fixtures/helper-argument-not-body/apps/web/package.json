@@ -1,0 +1,6 @@
+{
+  "name": "@fixture/web",
+  "version": "1.0.0",
+  "main": "src/install.ts",
+  "dependencies": { "@fixture/client": "1.0.0" }
+}

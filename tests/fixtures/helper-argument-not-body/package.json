@@ -1,0 +1,8 @@
+{
+  "name": "helper-argument-not-body",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "services/*"
+  ]
+}
