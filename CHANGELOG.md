@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.142](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.141...carrick-v0.3.142) (2026-11-03)
+
+
+### Features
+
+* **call-graph:** every member call the resolver left without a target asks the compiler's call row ([#3210](https://github.com/carrick-tools/carrick/issues/3210)) ([39d066e](https://github.com/carrick-tools/carrick/commit/39d066ee8ebb5f072e24c4ed3e4338ec466db98b))
+* **call-graph:** write the member calls the scan could not follow ([#3218](https://github.com/carrick-tools/carrick/issues/3218)) ([0e69acb](https://github.com/carrick-tools/carrick/commit/0e69acb56b8d92bdeb16ff9208cf5fded134574b))
+* **pr-baseline:** mark the rows of a pairing a PR removed in the real run (part of [#3092](https://github.com/carrick-tools/carrick/issues/3092), S-B) ([#3214](https://github.com/carrick-tools/carrick/issues/3214)) ([1869c03](https://github.com/carrick-tools/carrick/commit/1869c03e5b43e8ec5ac270da43d5732bfcbb3554))
+* **pr-delta:** the same-place passes list nothing for a service whose non-source inputs the PR changes ([#1712](https://github.com/carrick-tools/carrick/issues/1712)) ([#3227](https://github.com/carrick-tools/carrick/issues/3227)) ([3135012](https://github.com/carrick-tools/carrick/commit/3135012e7867ec2466c875c0b693ad8b538ca3a9))
+* **pr-result:** every endpoint-delta row carries edge_source ([#3206](https://github.com/carrick-tools/carrick/issues/3206)) ([12727f1](https://github.com/carrick-tools/carrick/commit/12727f10379f8fc578f2fa11e0b3a11e227070b1))
+
+
+### Bug Fixes
+
+* a route path that writes its first segment keeps the reader's row ([#3237](https://github.com/carrick-tools/carrick/issues/3237)) ([#3238](https://github.com/carrick-tools/carrick/issues/3238)) ([e97d94f](https://github.com/carrick-tools/carrick/commit/e97d94fd2ba1a8552499233854a49414c0714fe3))
+* **cli:** lsp and templates answer --help; check help states what a re-check sends ([#3241](https://github.com/carrick-tools/carrick/issues/3241)) ([11a009f](https://github.com/carrick-tools/carrick/commit/11a009f84f88920bbccb1197722e66ede2d1b2ee))
+* **graphql:** read an operation's selection against its served schema ([#3201](https://github.com/carrick-tools/carrick/issues/3201)) ([55a0b83](https://github.com/carrick-tools/carrick/commit/55a0b83a8272541dbb9355151d954c5e26a9a507))
+* **library-store:** ask about a package a service reaches only through its types ([#2588](https://github.com/carrick-tools/carrick/issues/2588)) ([#3208](https://github.com/carrick-tools/carrick/issues/3208)) ([3a6b5a7](https://github.com/carrick-tools/carrick/commit/3a6b5a7c99b6b16de556cd09deed1704666a6395))
+* **pr-delta:** a removal the PR's rewrite leaves unread is a candidate, not a fact ([#3222](https://github.com/carrick-tools/carrick/issues/3222)) ([#3228](https://github.com/carrick-tools/carrick/issues/3228)) ([7c0c7a9](https://github.com/carrick-tools/carrick/commit/7c0c7a9ccae25e52ca078dc09ee33e89d2960d7c))
+* **trace:** one rule decides which scope labels apply to a host call's receiver ends ([#3207](https://github.com/carrick-tools/carrick/issues/3207)) ([#3212](https://github.com/carrick-tools/carrick/issues/3212)) ([340cdfd](https://github.com/carrick-tools/carrick/commit/340cdfd9ef3cb23683cbb3821bb3b9212eaa05cc))
+
+
+### Documentation
+
+* **hosted:** use a neutral example name in the service-key comment ([#3239](https://github.com/carrick-tools/carrick/issues/3239)) ([7887837](https://github.com/carrick-tools/carrick/commit/788783734b7f0231b798eacd9df74a5e51131023))
+
 ## [0.3.141](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.140...carrick-v0.3.141) (2026-11-02)
 
 
