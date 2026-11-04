@@ -1725,6 +1725,7 @@ pub(super) fn build(
                 directory: service_directory(blob),
                 include: service_include(blob),
                 commit: blob.commit_hash.clone(),
+                dirty: blob.dirty == Some(true),
                 indexed_at: blob.last_updated.to_rfc3339(),
                 boundary: blob.boundary.clone(),
                 routes: blob.endpoints.len(),

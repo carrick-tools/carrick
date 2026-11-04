@@ -163,6 +163,12 @@ pub struct IndexedService {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
     pub commit: String,
+    /// The tree this service was read from carried changes `commit` does not
+    /// describe. `check --changed` answers from the index without a re-scan
+    /// only when it does not (carrick#3245). Absent on an index written
+    /// before the field existed, which reads as clean.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dirty: bool,
     /// RFC 3339, when this service was last indexed or refreshed.
     pub indexed_at: String,
     pub boundary: Option<ServiceBoundary>,

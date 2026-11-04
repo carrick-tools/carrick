@@ -544,7 +544,7 @@ inventory-svc/src/client.ts:13  no route  call GET /api/v1/gadgets/:gadgetId: no
 ```
 
 `--json` prints `carrick.check-changed/0`: `files`, `routes`, `calls`,
-`services`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
+`services`, `repos` (each with `main_branch`, `base`, `files`, `rescan`, or `skipped`),
 `problems` (`kind` `incompatible` | `no_route`, `file`, `line`, `role`,
 `method`, `path`, `other`, `reason`, `source`, `already_indexed`,
 `unconfirmed`, `other_build`, `fails`), `failing`,
@@ -623,6 +623,19 @@ as `not checked:` lines. `--changed` with no changed file asked about nothing
 and exits 0. `carrick hook post-edit` does not run this pass and keeps its
 exit codes.
 The budget is five minutes, `CARRICK_CHECK_BUDGET_MS`.
+
+**Nothing the scan reads moved.** A repo's `rescan` is `not_needed` when every
+file that differs from the commit the index was read at (clean tree, one
+commit for the whole repo) either is not read by the scan's input rule or is a
+source file whose two copies parse, are equal ignoring positions, and hold the
+same `/** */` blocks, `@ts-` / `@jsx` comments and `///` lines in the same
+places. The check then starts no re-scan, says `nothing the scan reads
+changed in <repo>` on stderr, joins the index's own blobs, and moves each
+reported line in those files to where its code now sits. A manifest, lockfile,
+config, test file, added or deleted file, parse failure or missing base commit
+makes it `ran`, as does `CARRICK_CHECK_RESCAN=always`, a support switch that
+forces the re-scan. `rescan` is absent for a repo with no changed file to
+judge.
 
 **Quiet by default.** Only problems that fail the run are listed. The rest
 are counted on the summary line by why they do not fail, `..., plus 2 already

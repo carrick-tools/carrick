@@ -116,9 +116,14 @@ impl ModuleReader {
             return Vec::new();
         };
         let name = FileName::Real(file.to_path_buf());
-        let Some(module) =
-            parse_source(file, name, source.clone(), &self.source_map, &self.handler)
-        else {
+        let Some(module) = parse_source(
+            file,
+            name,
+            source.clone(),
+            &self.source_map,
+            &self.handler,
+            None,
+        ) else {
             return Vec::new();
         };
         reach_of(&module, &source)
@@ -140,6 +145,7 @@ impl ModuleReader {
             text.clone(),
             &self.source_map,
             &self.handler,
+            None,
         )?;
         Some(ModuleShape {
             reach: reach_of(&module, &text).into_iter().collect(),
@@ -383,6 +389,7 @@ pub fn parse_file(
         file_content,
         source_map,
         handler,
+        None,
     )
 }
 
@@ -411,12 +418,17 @@ pub fn read_source(file_path: &Path) -> Option<String> {
 /// path decides the syntax, as it does for a file read from disk; `name` is
 /// what the source map files the text under, so two copies of one path stay
 /// apart.
+///
+/// `comments` receives the file's comments as the lexer meets them. They are
+/// not in the AST, so a reader of `@ts-` lines or JSDoc blocks asks for them
+/// here (carrick#3245); every other caller passes `None`.
 pub fn parse_source(
     file_path: &Path,
     name: FileName,
     file_content: String,
     source_map: &Lrc<SourceMap>,
     handler: &Handler,
+    comments: Option<&dyn swc_common::comments::Comments>,
 ) -> Option<Module> {
     let (syntax, is_typescript) = syntax_for_path(file_path);
 
@@ -428,7 +440,7 @@ pub fn parse_source(
         syntax,
         Default::default(),
         StringInput::from(&*source_file),
-        None,
+        comments,
     );
     let mut parser = Parser::new_from(lexer);
 

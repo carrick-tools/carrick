@@ -3156,6 +3156,174 @@ fn check_changed_does_not_fail_on_a_problem_the_index_already_held() {
     assert_eq!(code, Some(0), "{text}");
 }
 
+/// `check --changed --json` with extra environment: the exit code, the JSON
+/// and stderr, where the narrator says whether a repo was re-read.
+fn check_changed_json_with(
+    workspace: &Path,
+    env: &[(&str, &str)],
+) -> (Option<i32>, serde_json::Value, String) {
+    let mut command = Command::new(carrick());
+    command
+        .args(["check", "--changed", "--workspace", ".", "--json"])
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env_remove("CARRICK_CHECK_RESCAN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run carrick check --changed");
+    let body = String::from_utf8(output.stdout).expect("stdout was not UTF-8");
+    let json = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("check --changed --json was not JSON: {e}\n{body}"));
+    (
+        output.status.code(),
+        json,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// What `rescan` says for the repo whose folder is `name`.
+fn rescan_of(json: &serde_json::Value, name: &str) -> Option<String> {
+    json["repos"]
+        .as_array()?
+        .iter()
+        .find(|repo| repo["repo"].as_str().is_some_and(|r| r.ends_with(name)))?["rescan"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The answer without the two fields that say how it was reached.
+fn without_how(json: &serde_json::Value) -> serde_json::Value {
+    let mut json = json.clone();
+    json.as_object_mut()
+        .expect("an object")
+        .remove("elapsed_ms");
+    for repo in json["repos"].as_array_mut().expect("repos") {
+        repo.as_object_mut().expect("a repo").remove("rescan");
+    }
+    json
+}
+
+/// A branch whose main already holds a type mismatch below a route: the
+/// producer stopped sending a field the consumer reads. The index is built
+/// from that commit, then the work moves to a branch.
+fn a_mismatch_the_index_already_holds() -> (tempfile::TempDir, PathBuf) {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let producer = root.join("catalog-web");
+    let route = producer.join("app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+    commit_all(&producer, "drop activeCount, on main");
+    index(root);
+    git(&producer, &["checkout", "-qb", "feature"]);
+    (workspace, route)
+}
+
+/// carrick#3245: a comment nothing reads, added above the route, starts no
+/// re-scan. The answer is the re-scan's answer, with the mismatch at the line
+/// the code moved to.
+#[test]
+#[serial]
+fn check_changed_answers_a_comment_only_edit_without_a_re_scan() {
+    let (workspace, route) = a_mismatch_the_index_already_holds();
+    let root = workspace.path();
+    edit(
+        &route,
+        "export async function loader",
+        "// A plain note.\nexport async function loader",
+    );
+
+    // Where the route's handler is written, once the note is above it.
+    let loader_line = std::fs::read_to_string(&route)
+        .expect("read the route")
+        .lines()
+        .position(|line| line.starts_with("export async function loader"))
+        .expect("the loader") as u64
+        + 1;
+
+    let (code, json, stderr) = check_changed_json_with(root, &[]);
+    assert_eq!(
+        rescan_of(&json, "catalog-web").as_deref(),
+        Some("not_needed"),
+        "{json:#}"
+    );
+    assert!(
+        stderr.contains("nothing the scan reads changed in catalog-web"),
+        "said so:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("re-reading"),
+        "no re-scan started:\n{stderr}"
+    );
+    let problem = &json["problems"][0];
+    assert_eq!(problem["kind"], "incompatible", "{json:#}");
+    assert_eq!(problem["already_indexed"], true, "{json:#}");
+    assert_eq!(
+        problem["line"], loader_line,
+        "printed at the line the handler moved to, not where the index wrote it:\n{json:#}"
+    );
+    assert_eq!(code, Some(0), "{json:#}");
+
+    let (_, always, stderr) = check_changed_json_with(root, &[("CARRICK_CHECK_RESCAN", "always")]);
+    assert_eq!(
+        rescan_of(&always, "catalog-web").as_deref(),
+        Some("ran"),
+        "{always:#}"
+    );
+    assert!(
+        stderr.contains("re-reading"),
+        "the switch re-scans:\n{stderr}"
+    );
+    assert!(always["problems"][0]["line"].is_u64(), "{always:#}");
+    assert_eq!(
+        without_how(&json),
+        without_how(&always),
+        "the answer without the re-scan is the re-scan's, at the moved line"
+    );
+}
+
+/// A comment the scan reads (`@ts-expect-error`) is not a comment nothing
+/// reads: the repo is re-scanned.
+#[test]
+#[serial]
+fn check_changed_re_scans_a_directive_comment_edit() {
+    let (workspace, route) = a_mismatch_the_index_already_holds();
+    let root = workspace.path();
+    edit(
+        &route,
+        "export async function loader",
+        "// @ts-expect-error\nexport async function loader",
+    );
+    let (_, json, stderr) = check_changed_json_with(root, &[]);
+    assert_eq!(
+        rescan_of(&json, "catalog-web").as_deref(),
+        Some("ran"),
+        "{json:#}"
+    );
+    assert!(stderr.contains("re-reading"), "{stderr}");
+}
+
+/// A string the code states changed: the repo is re-scanned and the answer is
+/// the re-scan's.
+#[test]
+#[serial]
+fn check_changed_re_scans_a_string_edit() {
+    let (workspace, route) = a_mismatch_the_index_already_holds();
+    let root = workspace.path();
+    edit(&route, "\"hex-key\"", "\"allen-key\"");
+    let (_, json, _) = check_changed_json_with(root, &[]);
+    assert_eq!(
+        rescan_of(&json, "catalog-web").as_deref(),
+        Some("ran"),
+        "{json:#}"
+    );
+    let (_, always, _) = check_changed_json_with(root, &[("CARRICK_CHECK_RESCAN", "always")]);
+    assert_eq!(without_how(&json), without_how(&always));
+}
+
 /// A problem that was already on main, in a file the work did not touch, is
 /// not this work's: only the changed file is reported and counted.
 #[test]
