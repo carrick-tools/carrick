@@ -111,6 +111,75 @@ export function surfaceEntryFileName(): string {
   return `${SURFACE_ENTRY_BASENAME}.${process.pid}.${surfaceEntrySequence}`;
 }
 
+/** Entry files this process has written and not yet removed. */
+const liveSurfaceEntries = new Set<string>();
+let exitCleanupInstalled = false;
+
+/**
+ * Removes every surface entry this process still holds. Runs when the process
+ * exits, and the sidecar's SIGTERM and SIGINT handlers exit through it, so a
+ * check killed at its budget does not leave an entry in the user's tree
+ * (carrick#3246). A SIGKILL cannot run it; the next capture's
+ * [`removeStaleSurfaceEntries`] covers that.
+ */
+export function removeLiveSurfaceEntries(): void {
+  for (const entry of liveSurfaceEntries) {
+    try {
+      fs.rmSync(entry, { force: true });
+    } catch {
+      // Best effort at exit: nothing left to report to.
+    }
+  }
+  liveSurfaceEntries.clear();
+}
+
+/** Records `entryPath` as held by this process until it is removed. */
+export function holdSurfaceEntry(entryPath: string): void {
+  liveSurfaceEntries.add(entryPath);
+  if (!exitCleanupInstalled) {
+    exitCleanupInstalled = true;
+    process.on('exit', removeLiveSurfaceEntries);
+  }
+}
+
+const SURFACE_ENTRY_NAME = new RegExp(`^${SURFACE_ENTRY_BASENAME}\\.(\\d+)\\.\\d+\\.(?:d\\.)?ts$`);
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the process exists, owned by someone else.
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Removes surface entries in `dir` left by a process that is no longer running
+ * (a SIGKILLed check), before this capture writes its own (carrick#3246).
+ * An entry of a running process, this one included, is another capture's
+ * live file and stays.
+ */
+export function removeStaleSurfaceEntries(dir: string): void {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const match = SURFACE_ENTRY_NAME.exec(name);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (pid === process.pid || processIsRunning(pid)) continue;
+    try {
+      fs.rmSync(path.join(dir, name), { force: true });
+    } catch {
+      // A file we cannot remove is left for the user; the capture goes on.
+    }
+  }
+}
+
 /** Same normalization intent as bundle_file_stems on the Rust side. */
 export function sanitizeServiceName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
@@ -300,6 +369,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   try {
     guard = guard.with(deno ? { dirs: [deno.cacheDir] } : { files: [entryPath] });
     guard.mkdir(path.dirname(entryPath));
+    removeStaleSurfaceEntries(path.dirname(entryPath));
+    holdSurfaceEntry(entryPath);
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
