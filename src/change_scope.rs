@@ -1136,23 +1136,27 @@ impl<'r> Walks<'r> {
     }
 }
 
-/// For each of `services`, index for index, whether the change since `base`
-/// touches nothing the service reads, by the rule that carries a service
+/// For each of `services`, index for index, the first changed path the
+/// service reads (`None` when the change since `base` touches nothing it
+/// reads), by the rule that carries a service
 /// under `--changed-only` once its stored blob passes the gate
 /// ([`decide`]): its roots and import closure, the workspace packages and
 /// tsconfig chain it reads, its manifest and schemas, and, when the change
 /// is a dependency-only move, the packages it loads
-/// ([`crate::dependency_move`]). `false` whenever git cannot compare. A pull
-/// request's finding whose two sides read nothing it changed is main's
-/// (carrick#3170).
+/// ([`crate::dependency_move`]). Whenever git cannot compare, or the rule
+/// cannot say, the answer is `Some` with the rule's own detail (never a
+/// service proven untouched). A pull request's finding whose two sides read
+/// nothing it changed is main's (carrick#3170); a per-edit re-check names the
+/// services that read the edit and it did not re-read
+/// (`local_mode::recheck`).
 pub fn untouched_since(
     repo_path: &str,
     services: &[Config],
     changes: &ChangedSince,
     base: &str,
-) -> Vec<bool> {
+) -> Vec<Option<String>> {
     let mut walks = Walks::new(repo_path, changes);
-    let untouched: Vec<bool> = services
+    let reads: Vec<Option<String>> = services
         .iter()
         .map(|service| {
             let scope = walks.scope(service, Against::Base(base));
@@ -1170,18 +1174,21 @@ pub fn untouched_since(
                     reason.as_str()
                 ),
             }
-            scope.is_carried()
+            match scope {
+                Scope::Carried { .. } => None,
+                Scope::Analysed { detail, .. } => Some(detail),
+            }
         })
         .collect();
     info!(
         "pr base: {} of {} service(s) read nothing changed since {}; the closure walk took {:.2}s over {} service(s)",
-        untouched.iter().filter(|untouched| **untouched).count(),
-        untouched.len(),
+        reads.iter().filter(|read| read.is_none()).count(),
+        reads.len(),
         short(base),
         walks.closure_took.as_secs_f64(),
         walks.walked
     );
-    untouched
+    reads
 }
 
 /// Whether the rows a change to `path` moves are the ones the diff places by
@@ -3955,7 +3962,10 @@ mod tests {
         commit_all(repo.path(), "move");
         let changes = ChangedSince::new(&path, &services, &[]);
         assert_eq!(
-            untouched_since(&path, &services, &changes, &base),
+            untouched_since(&path, &services, &changes, &base)
+                .iter()
+                .map(Option::is_none)
+                .collect::<Vec<_>>(),
             [true, true, false]
         );
 
@@ -3965,14 +3975,21 @@ mod tests {
         )
         .unwrap();
         let changes = ChangedSince::new(&path, &services, &[]);
+        let reads = untouched_since(&path, &services, &changes, &base);
         assert_eq!(
-            untouched_since(&path, &services, &changes, &base),
+            reads.iter().map(Option::is_none).collect::<Vec<_>>(),
             [false, true, false]
         );
-        let changes = ChangedSince::new(&path, &services, &[]);
         assert_eq!(
-            untouched_since(&path, &services, &changes, "0000000"),
-            [false, false, false],
+            reads[0].as_deref(),
+            Some("apps/api/src/server.ts"),
+            "the service names the changed path it reads"
+        );
+        let changes = ChangedSince::new(&path, &services, &[]);
+        assert!(
+            untouched_since(&path, &services, &changes, "0000000")
+                .iter()
+                .all(Option::is_some),
             "git cannot compare with a commit it does not hold"
         );
     }

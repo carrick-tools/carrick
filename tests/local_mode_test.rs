@@ -41,10 +41,18 @@ fn repo_root() -> PathBuf {
 /// the workspace file. Returns the workspace root, which owns the temp dir for
 /// as long as the test holds it.
 fn workspace(fixture: &str, repos: &[&str]) -> tempfile::TempDir {
+    workspace_prepared(fixture, repos, |_| {})
+}
+
+/// [`workspace`], with `prepare` run on the workspace after the fixture is
+/// copied and before each repo is committed, so a test can add an edge the
+/// fixture does not hold without editing the fixture.
+fn workspace_prepared(fixture: &str, repos: &[&str], prepare: impl Fn(&Path)) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
     let source = repo_root().join("tests/fixtures").join(fixture);
     for repo in repos {
         copy_tree(&source.join(repo), &dir.path().join(repo));
+        prepare(&dir.path().join(repo));
         git(&dir.path().join(repo), &["init", "-q", "."]);
         git(&dir.path().join(repo), &["add", "-A"]);
         git(
@@ -4337,6 +4345,63 @@ fn a_re_check_reads_only_the_edited_files_service_and_judges_against_the_last_re
             .as_array()
             .is_none_or(|stale| stale.is_empty()),
         "{answer:#}"
+    );
+}
+
+/// A service that imports the edited file is never judged unannounced. The
+/// type-use record names only the operations that read a type the file
+/// declares, so a constant the client imports is invisible to it; the import
+/// closure names the reader, the scope calls it stale, and a service that
+/// imports nothing keeps its plain reason (carrick#3198).
+#[test]
+#[serial]
+fn a_re_check_names_a_service_that_reads_the_edited_file() {
+    let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
+        std::fs::write(
+            repo.join("catalog/app/shared.ts"),
+            "export const widgetBase = \"/api/v1/widgets\";\n",
+        )
+        .expect("write the shared module");
+        let client = repo.join("inventory/src/client.ts");
+        edit(
+            &client,
+            "import { send } from \"./send.js\";",
+            "import { send } from \"./send.js\";\nimport { widgetBase } from \"../../catalog/app/shared\";",
+        );
+        edit(
+            &client,
+            "/api/v1/widgets/${encoded}",
+            "${widgetBase}/${encoded}",
+        );
+    });
+    let root = workspace.path();
+    index(root);
+
+    let shared = "shop/catalog/app/shared.ts";
+    edit(&root.join(shared), "/api/v1/widgets", "/api/v2/widgets");
+    let answer = recheck_json(root, shared, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    let reason_of = |service: &str| -> String {
+        answer["recheck"]["scope"]["not_reread"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["service"] == service))
+            .and_then(|entry| entry["reason"].as_str())
+            .unwrap_or_else(|| panic!("{service} is named as not re-read:\n{answer:#}"))
+            .to_string()
+    };
+    assert!(
+        reason_of("inventory").starts_with("reads catalog/app/shared.ts, edited since the index"),
+        "{answer:#}"
+    );
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!(["inventory"]),
+        "{answer:#}"
+    );
+    assert_eq!(
+        reason_of("ledger"),
+        "no edits since the index; judged at its indexed version",
+        "ledger imports nothing, so the edit is none of its business:\n{answer:#}"
     );
 }
 

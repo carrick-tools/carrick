@@ -575,7 +575,8 @@ pub struct RecheckScope {
     /// Every other service, judged at its newest known version.
     pub not_reread: Vec<NotReread>,
     /// The ones of `not_reread` with edits since the index and no re-check copy
-    /// of them, so they are judged against their indexed version.
+    /// of them, or that read a path edited since the index, so they are judged
+    /// against a version that predates the edit.
     pub stale: Vec<String>,
 }
 

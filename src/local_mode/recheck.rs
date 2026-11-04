@@ -242,7 +242,7 @@ pub fn run(
             scope: None,
         }));
     }
-    let plan = Plan::make(workspace, repo, reach, index_generation);
+    let plan = Plan::make(workspace, repo, reach, index_generation, &held);
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
     let outcome = inside(
         workspace,
@@ -457,7 +457,14 @@ struct WorkingCopy {
 }
 
 impl Plan {
-    fn make(workspace: &Workspace, repo: &Path, reach: &Reach, generation: &str) -> Self {
+    fn make(
+        workspace: &Workspace,
+        repo: &Path,
+        reach: &Reach,
+        generation: &str,
+        held: &Held,
+    ) -> Self {
+        let mut readers = readers_of_the_edit(repo, reach, held);
         let mut listings: std::collections::BTreeMap<String, Option<HashSet<String>>> =
             Default::default();
         let mut digests = std::collections::BTreeMap::new();
@@ -482,7 +489,21 @@ impl Plan {
                 continue;
             }
             let operations = service.routes + service.calls;
+            // A service that reads a path edited since its index is judged at
+            // a version that predates the edit, whatever else is known of it:
+            // its own files' digest does not cover the import.
+            let reader = readers.remove(&service.name);
             let reason = match digest {
+                _ if reader.is_some() => {
+                    if let Some(Some(digest)) = digest
+                        && let Some(blob) =
+                            read_working(workspace, generation, &service.name, &digest)
+                    {
+                        working.insert(service.name.clone(), blob);
+                    }
+                    scope.stale.push(service.name.clone());
+                    reader.as_deref().unwrap_or_default()
+                }
                 Some(None) => "no edits since the index; judged at its indexed version",
                 Some(Some(digest)) => {
                     match read_working(workspace, generation, &service.name, &digest) {
@@ -517,7 +538,6 @@ impl Plan {
         }
     }
 
-    /// Every service in the scope, as a miss of this re-check.
     /// The miss to remember when this re-check ran out of time: the edited
     /// file's own service only, never a reader service re-read beside it.
     fn miss_of(&self, owner: &str, elapsed: Duration) -> Vec<(String, Miss)> {
@@ -596,6 +616,66 @@ fn read_working(
     let path = kept_dir(workspace, "working", generation)?.join(working_name(service));
     let copy: WorkingCopy = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     (copy.digest == digest && service_id(&copy.blob) == service).then_some(copy.blob)
+}
+
+/// The reason for each service outside the re-read scope that reads a path
+/// edited since its index, by service name.
+///
+/// The type-use record lists the operations that read a type the edited file
+/// declares; it does not list one that reads a constant, a wrapper or a type
+/// it could not trace. The import closure the change scope already walks
+/// ([`crate::change_scope::untouched_since`]) names those. A service whose
+/// closure cannot be walked (no stored config on this machine) is named too:
+/// it is not known to be untouched.
+fn readers_of_the_edit(
+    repo: &Path,
+    reach: &Reach,
+    held: &Held,
+) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    let repo_path = repo.to_string_lossy().to_string();
+    let mut by_commit: BTreeMap<&str, Vec<(&str, crate::config::Config)>> = BTreeMap::new();
+    let mut readers = BTreeMap::new();
+    for service in reach
+        .services
+        .iter()
+        .filter(|service| !reach.reread.contains(&service.name))
+    {
+        let config = held
+            .local
+            .iter()
+            .find(|blob| service_id(blob) == service.name)
+            .and_then(|blob| blob.config_json.as_deref())
+            .and_then(|json| serde_json::from_str::<crate::config::Config>(json).ok());
+        match config {
+            Some(config) => by_commit
+                .entry(service.commit.as_str())
+                .or_default()
+                .push((service.name.as_str(), config)),
+            None => {
+                readers.insert(
+                    service.name.clone(),
+                    "its config is not on this machine, so what it reads is unknown; judged at its indexed version"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    for (commit, group) in by_commit {
+        let configs: Vec<crate::config::Config> =
+            group.iter().map(|(_, config)| config.clone()).collect();
+        let changes = crate::change_scope::ChangedSince::new(&repo_path, &configs, &[]);
+        let reads = crate::change_scope::untouched_since(&repo_path, &configs, &changes, commit);
+        for ((name, _), read) in group.iter().zip(reads) {
+            if let Some(path) = read {
+                readers.insert(
+                    name.to_string(),
+                    format!("reads {path}, edited since the index; judged at its indexed version"),
+                );
+            }
+        }
+    }
+    readers
 }
 
 /// What the working tree holds, since the index, of the files `service` reads:
