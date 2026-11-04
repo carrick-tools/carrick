@@ -789,6 +789,120 @@ fn judge(
             }
         }
     }
+    // A call in a file the work did not touch, kept alive only by
+    // documentation (carrick#3192). The routes package states its operations
+    // in a handler-less table that the scan folds onto the handler row with
+    // the same method and path. When the work moves the handler's path, the
+    // table row has no partner and stays a route, so the call still matches
+    // and the unmatched loop above sees nothing. The call is named when the
+    // index matched it to producers that all sit in changed files, and every
+    // producer it matches now is a documentation row.
+    for operation in join
+        .operations
+        .iter()
+        .filter(|operation| operation.role == Role::Consumer)
+    {
+        let Some(&(repo, repo_path)) = repo_of.get(operation.service.as_str()) else {
+            continue;
+        };
+        if is_changed(repo, &operation.file) {
+            continue;
+        }
+        let Some(old) = indexed_rows(before, repo, &operation.file).find(|old| {
+            same_operation(old, operation, strict)
+                && old.line == operation.line
+                && !old.counterparts.is_empty()
+        }) else {
+            continue;
+        };
+        let producers_changed = old.counterparts.iter().all(|counterpart| {
+            repo_of
+                .get(counterpart.service.as_str())
+                .is_some_and(|&(producer_repo, _)| is_changed(producer_repo, &counterpart.file))
+        });
+        if !producers_changed {
+            continue;
+        }
+        let served_by: Vec<&JoinedOperation> = join
+            .matches
+            .iter()
+            .filter(|edge| {
+                edge.consumer_service == operation.service
+                    && edge.consumer_key == operation.key
+                    && edge.consumer_file.as_deref() == Some(operation.file.as_str())
+                    && edge.consumer_line == operation.line
+            })
+            .flat_map(|edge| {
+                join.operations.iter().filter(|producer| {
+                    producer.role == Role::Producer
+                        && producer.service == edge.producer_service
+                        && producer.key == edge.producer_key
+                })
+            })
+            .collect();
+        let documentation_only = !served_by.is_empty()
+            && served_by.iter().all(|producer| {
+                crate::agents::FileOrchestrator::is_documentation_route(
+                    producer.resolution_source,
+                    producer.handler.as_deref(),
+                )
+            });
+        if !documentation_only {
+            continue;
+        }
+        let document = served_by[0];
+        let document_at = repo_of.get(document.service.as_str()).map_or_else(
+            || document.file.clone(),
+            |&(_, path)| shown(root, path, &document.file),
+        );
+        let document_line = document.line.map_or(String::new(), |l| format!(":{l}"));
+        // The handler that served this call, read again at the same line and
+        // the same verb under another path: it moved, and the documentation
+        // is all that still states the old route.
+        let moved_to = old.counterparts.iter().find_map(|counterpart| {
+            let &(producer_repo, producer_path) = repo_of.get(counterpart.service.as_str())?;
+            let row = indexed_rows(rebuilt, producer_repo, &counterpart.file).find(|row| {
+                row.kind == super::read_model::ItemKind::Route
+                    && row.source == Source::Fact
+                    && row.line == counterpart.line
+                    && row.method == operation.method
+                    && row.key != operation.key
+            })?;
+            Some((
+                shown(root, producer_path, &counterpart.file),
+                counterpart.line,
+                row.path.clone(),
+            ))
+        });
+        let confirmed = moved_to.is_some();
+        let reason = match moved_to {
+            Some((file, line, path)) => format!(
+                "the handler at {file}{} now serves {path}; only the documentation at \
+                 {document_at}{document_line} still states this route",
+                line.map_or(String::new(), |l| format!(":{l}")),
+            ),
+            None => format!(
+                "the handler that served this call was not read after the change; only the \
+                 documentation at {document_at}{document_line} still states this route"
+            ),
+        };
+        judged.problems.push(Problem {
+            kind: ProblemKind::NoRoute,
+            file: shown(root, repo_path, &operation.file),
+            line: operation.line,
+            role: "call".to_string(),
+            method: operation.method.clone(),
+            path: operation.path.clone(),
+            other: Vec::new(),
+            reason,
+            source: Source::Fact.as_str().to_string(),
+            already_indexed: false,
+            unconfirmed: !confirmed,
+            outside_the_change: true,
+            other_build: false,
+            fails: confirmed,
+        });
+    }
     judged.problems.sort();
     judged.problems.dedup();
     judged.not_type_checked.sort();

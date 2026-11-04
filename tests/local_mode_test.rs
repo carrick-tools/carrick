@@ -4242,3 +4242,186 @@ fn carrying_leaves_a_clean_tree_and_a_model_scan_alone() {
         "the model answered for the edited file again"
     );
 }
+
+// ---------------------------------------------------------------------------
+// carrick#3192: a call whose handler moved, kept alive only by documentation,
+// reaches no route. The routes package states its operations twice: the
+// handlers in `widgets.ts`, and a handler-less table in `openapi.ts` that the
+// scan folds onto them. Move a handler's path and the table row has no
+// partner, stays a route, and keeps the call in `web` matched.
+// ---------------------------------------------------------------------------
+
+const DOC_WIDGETS: &str = "repo/packages/routes/src/widgets.ts";
+const DOC_TABLE: &str = "repo/packages/routes/src/openapi.ts";
+
+/// The fixture's repo, committed and indexed with the library store replayed
+/// from its cassette and no model, so the handlers are read as facts.
+fn documented_route_workspace() -> tempfile::TempDir {
+    let workspace = workspace("documented-route-moved", &["repo"]);
+    let root = workspace.path();
+    let cassettes = root.join(".test-cassettes");
+    std::fs::create_dir_all(cassettes.join("library-claims")).expect("cassette dir");
+    std::fs::copy(
+        repo_root().join("tests/fixtures/documented-route-moved/library-claims.json"),
+        cassettes.join("library-claims/default.json"),
+    )
+    .expect("copy the store cassette");
+    let output = Command::new(carrick())
+        .args(["refresh", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_POSITION_ROWS", "1")
+        .env("CARRICK_SITE_QUESTIONS", "1")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        )
+        .output()
+        .expect("spawn carrick refresh");
+    assert!(
+        output.status.success(),
+        "refresh failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    workspace
+}
+
+/// The problems `check --changed --json` names, as `file:line reason`.
+fn problems_of(json: &str) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .unwrap_or_else(|e| panic!("check --changed --json was not JSON: {e}\n{json}"));
+    value["problems"]
+        .as_array()
+        .map(|problems| {
+            problems
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}:{} {} fails={} unconfirmed={} {}",
+                        p["file"].as_str().unwrap_or_default(),
+                        p["line"],
+                        p["kind"].as_str().unwrap_or_default(),
+                        p["fails"],
+                        p["unconfirmed"],
+                        p["reason"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+#[serial]
+fn check_changed_names_a_call_only_documentation_still_serves_after_its_handler_moved() {
+    let workspace = documented_route_workspace();
+    let root = workspace.path();
+    edit(&root.join(DOC_WIDGETS), "'/widgets'", "'/gadgets'");
+
+    let (code, text) = check_changed(root, true);
+    let problems = problems_of(&text);
+    let named: Vec<&String> = problems
+        .iter()
+        .filter(|p| p.starts_with("repo/packages/web/src/client.ts:") && p.contains("fails=true"))
+        .collect();
+    assert_eq!(named.len(), 1, "{problems:#?}");
+    assert!(
+        named[0].contains("widgets.ts") && named[0].contains("openapi.ts"),
+        "the reason names both places: {}",
+        named[0]
+    );
+    assert_eq!(code, Some(1), "{text}");
+}
+
+/// The known positive: with the table gone the same rename reaches no route
+/// through the unmatched loop already, which proves the harness can fail.
+#[test]
+#[serial]
+fn check_changed_fails_the_moved_handler_with_no_documentation() {
+    let workspace = documented_route_workspace();
+    let root = workspace.path();
+    std::fs::remove_file(root.join(DOC_TABLE)).expect("delete the table");
+    edit(&root.join(DOC_WIDGETS), "'/widgets'", "'/gadgets'");
+
+    let (code, text) = check_changed(root, true);
+    assert!(
+        problems_of(&text)
+            .iter()
+            .any(|p| p.starts_with("repo/packages/web/src/client.ts:") && p.contains("fails=true")),
+        "{text}"
+    );
+    assert_eq!(code, Some(1), "{text}");
+}
+
+/// An edit to the table alone moves no handler: nothing new is named.
+#[test]
+#[serial]
+fn check_changed_does_not_name_a_call_when_only_the_documentation_changed() {
+    let workspace = documented_route_workspace();
+    let root = workspace.path();
+    edit(&root.join(DOC_TABLE), "List widgets", "List every widget");
+
+    let (code, text) = check_changed(root, true);
+    assert!(
+        !problems_of(&text)
+            .iter()
+            .any(|p| p.starts_with("repo/packages/web/src/client.ts:")),
+        "{text}"
+    );
+    assert_ne!(code, Some(1), "{text}");
+}
+
+/// The handler's line moved as well, so the re-read cannot say it is the same
+/// handler: a candidate, which does not fail.
+#[test]
+#[serial]
+fn check_changed_lists_a_moved_handler_it_cannot_find_again_as_a_candidate() {
+    let workspace = documented_route_workspace();
+    let root = workspace.path();
+    let widgets = root.join(DOC_WIDGETS);
+    edit(
+        &widgets,
+        "export async function widgetRoutes",
+        "// A note.\n// Another.\nexport async function widgetRoutes",
+    );
+    edit(&widgets, "'/widgets'", "'/gadgets'");
+
+    let (code, text) = check_changed(root, true);
+    let problems = problems_of(&text);
+    let named: Vec<&String> = problems
+        .iter()
+        .filter(|p| p.starts_with("repo/packages/web/src/client.ts:"))
+        .collect();
+    assert!(
+        named
+            .iter()
+            .all(|p| p.contains("fails=false") && p.contains("unconfirmed=true")),
+        "{problems:#?}"
+    );
+    assert_ne!(code, Some(1), "{text}");
+}
+
+/// A route the model stated and the re-read does not carry is no fact of this
+/// work: the fixture of that case has no failing problem on the untouched
+/// consumer.
+#[test]
+#[serial]
+fn check_changed_does_not_fail_a_model_row_that_was_not_carried_over_documentation() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "'/items/:id/status'",
+        "'/items/:id/state'",
+    );
+
+    let (_, text) = check_changed(root, true);
+    assert!(
+        !problems_of(&text)
+            .iter()
+            .any(|p| p.starts_with("items-web/") && p.contains("fails=true")),
+        "{text}"
+    );
+}
