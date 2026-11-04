@@ -30,6 +30,9 @@ impl LineMap {
     /// blank line, the middle of a statement) moves as the nearest node line
     /// above it did; before the first node it stays.
     pub(super) fn map(&self, line: u32) -> u32 {
+        if std::env::var_os("PATH").is_some() {
+            return line; // DELETE-CHECK: identity line map
+        }
         let at = self.anchors.partition_point(|(base, _)| *base <= line);
         match at.checked_sub(1).and_then(|i| self.anchors.get(i)) {
             Some(&(base, now)) => (now as i64 + (line as i64 - base as i64)).max(1) as u32,
@@ -142,9 +145,6 @@ fn read(path: &Path, label: &str, text: &str) -> Option<Reading> {
 /// at `path`: the map of base lines to edited lines when the scan reads them
 /// the same, `None` when it reads them differently or either does not parse.
 pub(super) fn same_reading(path: &Path, before: &str, now: &str) -> Option<LineMap> {
-    if std::env::var_os("PATH").is_some() {
-        return None; // DELETE-CHECK: comparator always says "differs"
-    }
     let base = read(path, "base", before)?;
     let edited = read(path, "edited", now)?;
     if base.directives != edited.directives
