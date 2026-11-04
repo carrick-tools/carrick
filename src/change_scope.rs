@@ -279,6 +279,22 @@ impl ServiceInputs {
     }
 }
 
+/// The basename a type capture gives the surface entry it places inside the
+/// service's `rootDir` for as long as it runs (the sidecar's
+/// `SURFACE_ENTRY_BASENAME`, `src/sidecar/src/capture/index.ts`).
+const SURFACE_ENTRY_BASENAME: &str = "__carrick_surface__";
+
+/// Whether `path` is a capture's transient surface entry: another scan's
+/// file, never the user's change (carrick#2928, carrick#2931). A run killed
+/// at its budget can leave one behind, and it must not read as an input change
+/// (carrick#3246). The one statement of it: `local_mode::query` filters its
+/// changed-file listing with it too.
+pub(crate) fn is_surface_entry(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(SURFACE_ENTRY_BASENAME))
+}
+
 /// Whether a scan reads `path` under the published input rule
 /// (`carrickInputs`, [`INPUT_RULE`] 1): a repo-input or deploy-config name, a
 /// source, GraphQL or config extension, or no extension. The one statement of
@@ -682,6 +698,13 @@ fn decide_change(
             );
         }
     };
+    // A leftover surface entry is not a change anyone made.
+    let listed: Vec<ChangedPath> = changed
+        .iter()
+        .filter(|change| !is_surface_entry(&change.path))
+        .cloned()
+        .collect();
+    let changed = listed.as_slice();
     let inputs = inputs();
     for unresolved in &inputs.unresolved {
         if let Some(change) = changed
@@ -2059,6 +2082,19 @@ mod tests {
             Scope::Analysed { reason, .. } => Some(*reason),
             Scope::Carried { .. } => None,
         }
+    }
+
+    #[test]
+    fn a_stale_surface_entry_in_a_service_folder_changes_no_scope() {
+        // A check killed at its budget left this in the tree (carrick#3246).
+        let blob = stored("abcdef1234");
+        let changes = changed(&[('A', "apps/api/src/__carrick_surface__.88794.1.ts")]);
+        assert_eq!(
+            decide_with(Some(&blob), Ok(&changes), api_inputs()),
+            Scope::Carried {
+                commit: "abcdef1234".to_string()
+            }
+        );
     }
 
     #[test]

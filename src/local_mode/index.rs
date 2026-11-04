@@ -766,6 +766,31 @@ fn scan_repo(
 /// what it was walked from lands after it, so a reader never pairs new rows
 /// with an old record.
 fn keep_rows(scan_dir: &Path, kept: &Path) {
+    keep_rows_where(scan_dir, kept, |_| true);
+}
+
+/// [`keep_rows`] for the walks of the `carried` services a re-scan had to do
+/// (carrick#3245): a check's scan walks a service it carries when no kept rows
+/// stand in for it, and the scan's store is deleted with its generation. Only
+/// a carried service's rows are kept, and only with the record of the commit
+/// it was carried at; an analysed service's rows are never copied.
+pub(super) fn keep_carried_walks(scan_dir: &Path, kept: &Path, carried: &[CloudRepoData]) {
+    let stems: std::collections::BTreeSet<String> = carried
+        .iter()
+        .map(|blob| crate::cloud_storage::blob_stem(&blob.repo_name, blob.service_name.as_deref()))
+        .collect();
+    keep_rows_where(scan_dir, kept, |path| {
+        let named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".jsonl.gz"))
+            .is_some_and(|stem| stems.contains(stem));
+        named && crate::position_rows::walked_at_path(path).is_file()
+    });
+}
+
+/// [`keep_rows`], for the rows files of `scan_dir` that `wanted` accepts.
+fn keep_rows_where(scan_dir: &Path, kept: &Path, wanted: impl Fn(&Path) -> bool) {
     let Ok(entries) = std::fs::read_dir(scan_dir.join(crate::position_rows::POSITIONS_DIR)) else {
         return;
     };
@@ -779,6 +804,9 @@ fn keep_rows(scan_dir: &Path, kept: &Path) {
         }) else {
             continue;
         };
+        if !wanted(&path) {
+            continue;
+        }
         let to = kept.join(name);
         let record = crate::position_rows::walked_at_path(&to);
         let _ = std::fs::remove_file(&record);
@@ -3264,5 +3292,54 @@ mod tests {
         // A scan that walked nothing leaves what is kept as it was.
         keep_rows(&tmp.path().join("none"), &kept);
         assert_eq!(read("clean.jsonl.gz").as_deref(), Some("new clean"));
+    }
+
+    /// carrick#3245: a check keeps the rows of a carried service it walked, with
+    /// the record of its commit, and nothing else: not an analysed service's
+    /// rows, and not rows with no record.
+    #[test]
+    fn a_check_keeps_only_the_walks_of_the_services_it_carried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scan, kept) = (tmp.path().join("scan"), tmp.path().join("kept"));
+        let walked = scan.join(crate::position_rows::POSITIONS_DIR);
+        std::fs::create_dir_all(&walked).unwrap();
+        let blob = |service: &str| -> CloudRepoData {
+            serde_json::from_value(serde_json::json!({
+                "repo_name": "repo",
+                "service_name": service,
+                "endpoints": [], "calls": [], "mounts": [], "apps": {},
+                "imported_handlers": [], "function_definitions": {},
+                "last_updated": "2026-10-01T00:00:00Z", "commit_hash": "c1",
+                "cache_version": crate::engine::CACHE_VERSION
+            }))
+            .unwrap()
+        };
+        let stem = |service: &str| crate::cloud_storage::blob_stem("repo", Some(service));
+        for service in ["carried", "analysed", "unrecorded"] {
+            std::fs::write(walked.join(format!("{}.jsonl.gz", stem(service))), service).unwrap();
+        }
+        for service in ["carried", "analysed"] {
+            std::fs::write(
+                walked.join(format!("{}.jsonl.gz.at", stem(service))),
+                "stamp\nc1\n",
+            )
+            .unwrap();
+        }
+        keep_carried_walks(&scan, &kept, &[blob("carried"), blob("unrecorded")]);
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&kept),
+            vec![
+                format!("{}.jsonl.gz", stem("carried")),
+                format!("{}.jsonl.gz.at", stem("carried")),
+            ]
+        );
     }
 }
