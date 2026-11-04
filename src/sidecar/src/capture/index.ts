@@ -112,7 +112,7 @@ export function surfaceEntryFileName(): string {
 }
 
 /** Entry files this process has written and not yet removed. */
-const liveSurfaceEntries = new Set<string>();
+const liveSurfaceEntries = new Map<string, WriteGuard>();
 let exitCleanupInstalled = false;
 
 /**
@@ -123,9 +123,9 @@ let exitCleanupInstalled = false;
  * [`removeStaleSurfaceEntries`] covers that.
  */
 export function removeLiveSurfaceEntries(): void {
-  for (const entry of liveSurfaceEntries) {
+  for (const [entry, guard] of liveSurfaceEntries) {
     try {
-      fs.rmSync(entry, { force: true });
+      if (fs.existsSync(entry)) guard.unlink(entry);
     } catch {
       // Best effort at exit: nothing left to report to.
     }
@@ -134,8 +134,8 @@ export function removeLiveSurfaceEntries(): void {
 }
 
 /** Records `entryPath` as held by this process until it is removed. */
-export function holdSurfaceEntry(entryPath: string): void {
-  liveSurfaceEntries.add(entryPath);
+export function holdSurfaceEntry(entryPath: string, guard: WriteGuard): void {
+  liveSurfaceEntries.set(entryPath, guard);
   if (!exitCleanupInstalled) {
     exitCleanupInstalled = true;
     process.on('exit', removeLiveSurfaceEntries);
@@ -160,7 +160,7 @@ function processIsRunning(pid: number): boolean {
  * An entry of a running process, this one included, is another capture's
  * live file and stays.
  */
-export function removeStaleSurfaceEntries(dir: string): void {
+export function removeStaleSurfaceEntries(dir: string, guard: WriteGuard): void {
   let names: string[];
   try {
     names = fs.readdirSync(dir);
@@ -172,8 +172,9 @@ export function removeStaleSurfaceEntries(dir: string): void {
     if (!match) continue;
     const pid = Number(match[1]);
     if (pid === process.pid || processIsRunning(pid)) continue;
+    const stale = path.join(dir, name);
     try {
-      fs.rmSync(path.join(dir, name), { force: true });
+      guard.with({ files: [stale] }).unlink(stale);
     } catch {
       // A file we cannot remove is left for the user; the capture goes on.
     }
@@ -369,8 +370,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   try {
     guard = guard.with(deno ? { dirs: [deno.cacheDir] } : { files: [entryPath] });
     guard.mkdir(path.dirname(entryPath));
-    removeStaleSurfaceEntries(path.dirname(entryPath));
-    holdSurfaceEntry(entryPath);
+    removeStaleSurfaceEntries(path.dirname(entryPath), guard);
+    holdSurfaceEntry(entryPath, guard);
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }

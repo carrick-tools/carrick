@@ -10,7 +10,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { removeStaleSurfaceEntries } from '../src/capture/index.js';
+import { removeStaleSurfaceEntries, WriteGuard } from '../src/capture/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CAPTURE_MODULE = path.join(__dirname, '..', 'src', 'capture', 'index.js');
@@ -30,7 +30,7 @@ describe('surface entry cleanup (carrick#3246)', () => {
     const own = path.join(dir, `__carrick_surface__.${process.pid}.1.ts`);
     const source = path.join(dir, 'index.ts');
     for (const file of [dead, live, own, source]) fs.writeFileSync(file, '');
-    removeStaleSurfaceEntries(dir);
+    removeStaleSurfaceEntries(dir, WriteGuard.of({ dirs: [dir] }));
     assert.ok(!fs.existsSync(dead), 'a dead process\'s entry is removed');
     assert.ok(fs.existsSync(live), 'a running process\'s entry stays');
     assert.ok(fs.existsSync(own), 'this process\'s own entry stays');
@@ -44,10 +44,10 @@ describe('surface entry cleanup (carrick#3246)', () => {
     // The child stands in for the sidecar: it holds an entry and, as the
     // sidecar's SIGTERM handler does, exits through process.exit.
     const script = `
-      import { holdSurfaceEntry } from ${JSON.stringify(CAPTURE_MODULE)};
+      import { holdSurfaceEntry, WriteGuard } from ${JSON.stringify(CAPTURE_MODULE)};
       import * as fs from 'node:fs';
       fs.writeFileSync(${JSON.stringify(entry)}, '');
-      holdSurfaceEntry(${JSON.stringify(entry)});
+      holdSurfaceEntry(${JSON.stringify(entry)}, WriteGuard.of({ files: [${JSON.stringify(entry)}] }));
       process.on('SIGTERM', () => process.exit(0));
       console.log('ready');
       setInterval(() => {}, 1000);
