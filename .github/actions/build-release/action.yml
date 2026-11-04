@@ -1,0 +1,52 @@
+name: Build release
+description: >-
+  Installs the toolchain and compiles the release-profile carrick binary for
+  one target. The one place a release binary is compiled outside release.yml,
+  used by build.yml (every PR head and merge-queue commit) and main-cache.yml
+  (the dependency cache build.yml restores), so the two cannot drift apart.
+  Linux links against glibc 2.28 with `cargo zigbuild` (carrick#2218): a plain
+  `cargo build` links the runner's glibc and the binary then refuses to start
+  on older systems. Keep the floor and the zig pins the same as release.yml's.
+
+inputs:
+  target:
+    description: "the rust target triple, for example x86_64-unknown-linux-gnu"
+    required: true
+  glibc-floor:
+    description: "the oldest glibc the linux binaries run on"
+    required: false
+    default: "2.28"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      with:
+        toolchain: stable
+        targets: ${{ inputs.target }}
+
+    # Pinned: zig 0.16.0 is the release cargo-zigbuild's own CI tests.
+    - name: Install cargo-zigbuild
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        python3 -m venv "$RUNNER_TEMP/zigbuild"
+        "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet ziglang==0.16.0 cargo-zigbuild==0.23.4
+        echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
+    - name: Build binary
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        GLIBC_FLOOR: ${{ inputs.glibc-floor }}
+      run: |
+        set -euo pipefail
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          # The suffix sets the glibc; the binary still lands in
+          # target/$TARGET/release.
+          cargo zigbuild --release --target "$TARGET.$GLIBC_FLOOR"
+        else
+          cargo build --release --target "$TARGET"
+        fi
+        test -f "target/$TARGET/release/carrick"

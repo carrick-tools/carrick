@@ -44,3 +44,66 @@ jobs:
       - uses: ./.github/actions/rust-test-cache-save
         with:
           cache-hit: ${{ steps.setup.outputs.cache-hit }}
+
+  # The release-build dependency cache that build.yml restores, one per
+  # platform build.yml builds. Keyed apart from the test cache above: this one
+  # holds release-profile objects for the shipped targets (linux linked to
+  # glibc 2.28 by zigbuild). The old key `Linux-cargo-ci-release-*` was read by
+  # the merge-queue build and never saved by anything, so that build was cold
+  # on every run (speed clean-up T3).
+  save-build:
+    name: Save release build cache (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: darwin-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      KEY: ${{ runner.os }}-${{ runner.arch }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Restore dependencies
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ env.KEY }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-build-
+      - uses: ./.github/actions/build-release
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          target: ${{ matrix.target }}
+      # Only dependencies are saved. A cached copy of this repo's own output
+      # would carry the commit stamp build.rs wrote for this push.
+      - name: Remove this repo's own build output
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          for d in target/release target/${{ matrix.target }}/release; do
+            rm -rf "$d/carrick" "$d/carrick.d" "$d/incremental"
+            rm -rf "$d"/deps/carrick-* "$d"/deps/libcarrick-* "$d"/deps/carrick_match-* "$d"/deps/libcarrick_match-*
+            rm -rf "$d"/.fingerprint/carrick-* "$d"/build/carrick-*
+          done
+          du -sh target ~/.cargo/registry ~/.cargo/git 2>/dev/null || true
+      - name: Save dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ env.KEY }}

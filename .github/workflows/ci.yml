@@ -299,10 +299,8 @@ jobs:
   # succeeded, so adding a shard needs none. `always()` makes it run (and
   # fail) when a needed job failed or was cancelled instead of being skipped
   # with them. Every other job in this file must be listed in `needs`: the
-  # first step fails and names any that is not (carrick#2196). `build` runs
-  # only in the merge queue (carrick#2176), so on a pull request it is
-  # skipped and the gate accepts that one skip; a skip of any other job, or
-  # of `build` in the merge queue, still fails it.
+  # first step fails and names any that is not (carrick#2196). Every needed
+  # job must succeed: a skip fails the gate.
   ci-result:
     name: CI result
     if: always()
@@ -310,7 +308,7 @@ jobs:
       - rust-tests
       - wired
       - sidecar
-      - build
+      - build-artifacts
       - lint
       - security
       - wasm-match
@@ -357,7 +355,7 @@ jobs:
         run: |
           echo "event: $EVENT"
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          if echo "$NEEDS" | jq -e --arg event "$EVENT" 'to_entries | all(.value.result == "success" or (.key == "build" and .value.result == "skipped" and $event == "pull_request"))' > /dev/null; then
+          if echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null; then
             exit 0
           fi
           echo "::error::a job CI result needs did not succeed (failure, cancelled or skipped)"
@@ -563,65 +561,17 @@ jobs:
           git show "$BASE_SHA:tests/fixtures/pr-seeds/seeds.json" > "$RUNNER_TEMP/base-seeds.json"
           python3 scripts/seed-retirement-check.py "$RUNNER_TEMP/base-seeds.json" tests/fixtures/pr-seeds/seeds.json
 
-  # The release compile (about 140 s) runs in the merge queue only: a pull
-  # request run skips it, and the `ci-result` gate accepts that skip for this
-  # job on `pull_request` alone, so a release-profile break is caught before
-  # the merge and not while a PR waits (carrick#2176).
-  build:
-    name: Build
-    if: github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-
-      - name: Cache dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ci-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ci-release-
-
-      # Release only. The debug build is what every Rust test shard already
-      # compiles; repeating it here doubled this job for nothing.
-      - name: Build release
-        run: cargo build --release --verbose
-
-      # Run the binary this job just built (carrick#2197), so a break that only
-      # a release build has (build.rs stamps the commit only when PROFILE is
-      # release, #2178; debug-only checks compile out) is found in the merge
-      # queue and not at the RC scan. express-single needs no `node_modules`
-      # or sidecar build to be indexed: types degrade, the count does not.
-      # Same scan and grep as the debug Endpoint smoke in `rust-tests`.
-      - name: Smoke the release binary (scan and commit stamp)
-        env:
-          CARRICK_MOCK_ALL: "true"
-          BIN: ./target/release/carrick
-          EXPECTED_ENDPOINTS: "3"
-        run: |
-          out="$RUNNER_TEMP/express-single-release.txt"
-          "$BIN" ./examples/express-single/ > "$out" 2>&1
-          grep -F "Indexed **" "$out" || true
-          if ! grep -q "Indexed \*\*$EXPECTED_ENDPOINTS endpoints\*\*" "$out"; then
-            echo "::error::release binary: expected 'Indexed **$EXPECTED_ENDPOINTS endpoints**' from examples/express-single"
-            cat "$out"
-            exit 1
-          fi
-          # No command prints the stamp (it goes into the uploaded blob), but
-          # `env!` puts the full commit id in the binary's bytes.
-          if [ -z "$GITHUB_SHA" ] || ! grep -aqF "$GITHUB_SHA" "$BIN"; then
-            echo "::error::release binary does not carry the commit it was built from ($GITHUB_SHA)"
-            exit 1
-          fi
-          echo "release binary carries commit $GITHUB_SHA"
+  # The release binaries, built once per pull request head and per merge-queue
+  # commit by the reusable build.yml and uploaded as artifacts named by the
+  # commit (speed clean-up T7). `ref` is the PR head sha, never the synthetic
+  # merge ref: build.rs stamps git HEAD. In the merge queue `github.sha` is the
+  # commit that becomes main. Each leg scans examples/express-single with the
+  # binary it built and checks the commit stamp (carrick#2197, #2176).
+  build-artifacts:
+    name: Build artifacts
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
   security:
     name: Security Audit
