@@ -72,7 +72,8 @@ pub struct ChangedOutput {
     /// exits [`EXIT_NOTHING_COVERED`].
     pub not_type_checked: Vec<NotTypeChecked>,
     /// Rows in files the work did not touch whose verdict this change moved
-    /// to a mismatch, or that had no earlier verdict (carrick#2998). Not part
+    /// from compatible to a mismatch (carrick#2998). Rows with no earlier
+    /// verdict are not counted here. Not part
     /// of `routes`, `calls` or `type_checked`, which stay about the edited
     /// files.
     pub outside_moved: usize,
@@ -602,8 +603,8 @@ struct Judged {
     problems: Vec<Problem>,
     type_checked: usize,
     not_type_checked: Vec<NotTypeChecked>,
-    /// Rows outside the changed files that this change moved to a mismatch,
-    /// or that had no earlier verdict to move from (carrick#2998).
+    /// Rows outside the changed files that this change moved from compatible
+    /// to a mismatch (carrick#2998).
     outside_moved: usize,
 }
 
@@ -834,7 +835,9 @@ fn judge(
             other_build: fact && !already && !same_build && (in_change || moved_here),
             fails: fact && !already && same_build && (in_change || moved_here),
         });
-        if !in_change {
+        // Only a pair the index held compatible moved; one with no earlier
+        // verdict is listed and counted apart, as "not judged before".
+        if moved_here {
             judged.outside_moved += 1;
         }
     }
@@ -1453,6 +1456,61 @@ mod tests {
         let judged = judge(Path::new("/w"), &before, true, &rebuilt, &join, &changed);
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
         judged.problems.into_iter().next().unwrap()
+    }
+
+    /// A row outside the changed files counts as moved only when the index
+    /// held it resolved and compatible. One the index never judged is reported
+    /// and does not fail, and is not "moved" (carrick#2998).
+    #[test]
+    fn only_a_row_the_index_held_compatible_counts_as_moved() {
+        let row = |line: u32, key: &str, verdict: serde_json::Value| {
+            serde_json::json!({
+                "kind": "call", "service": "web", "key": key, "dispatch": null,
+                "method": "GET", "path": key.rsplit('|').next().unwrap(),
+                "line": line, "col": null, "source": "fact",
+                "resolution_source": null, "evidence": null,
+                "counterparts": [{"role": "producer", "service": "api", "file": "h.ts", "line": 1}],
+                "verdict": verdict
+            })
+        };
+        let compatible =
+            serde_json::json!({"state": "resolved", "result": "compatible", "detail": ""});
+        let mismatch = serde_json::json!({"state": "resolved", "result": "type_mismatch", "detail": "differs"});
+        let before = index_of(vec![
+            row(10, "http|GET|/was-fine", compatible),
+            row(20, "http|GET|/never-judged", serde_json::Value::Null),
+        ]);
+        let rebuilt = index_of(vec![
+            row(10, "http|GET|/was-fine", mismatch.clone()),
+            row(20, "http|GET|/never-judged", mismatch),
+        ]);
+        let operation = |line: u32, path: &str| {
+            serde_json::json!({
+                "role": "consumer", "service": "web", "key": format!("http|GET|{path}"),
+                "method": "GET", "path": path, "file": "client.ts", "line": line,
+                "resolution_source": null, "handler": null, "dispatch": null
+            })
+        };
+        let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
+            "scanner_version": "0",
+            "operations": [operation(10, "/was-fine"), operation(20, "/never-judged")],
+            "matches": [], "findings": [], "unmatched": [],
+            "type_check": {"state": "ran"}
+        }))
+        .expect("a join");
+        let edited: BTreeSet<String> = ["edited.ts".to_string()].into();
+        let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();
+
+        let judged = judge(Path::new("/w"), &before, true, &rebuilt, &join, &changed);
+
+        assert_eq!(judged.problems.len(), 2, "{:?}", judged.problems);
+        assert_eq!(judged.outside_moved, 1, "{:?}", judged.problems);
+        let unjudged = judged
+            .problems
+            .iter()
+            .filter(|p| p.not_judged_before)
+            .count();
+        assert_eq!(unjudged, 1, "{:?}", judged.problems);
     }
 
     /// A dispatch case renamed in the handler and the config leaves the call

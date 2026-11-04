@@ -605,8 +605,9 @@ files.
   it: it fails like a problem in a changed file, on a fact. If the index held
   no such row, or an unresolved one, it may have resolved for a reason
   unrelated to the edit, so it never fails: `--all` lists it, and the summary
-  counts it as "not judged before". Both kinds are counted in `outside_moved`
-  and on the summary line.
+  counts it as "not judged before". `outside_moved` and the summary
+  line's "moved" clause count only the first kind, the pairs the index held
+  compatible.
 
 **Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same
 pass over the files named, in any repos of the workspace, instead of the
