@@ -3126,7 +3126,6 @@ async fn seed_socket_emit_rename_marking() {
 // ---- Pub/sub -----------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "carrick#3089: library-stated pub/sub rows have no type manifest entry, so both pairs are not_compared"]
 async fn seed_pubsub_field_rename() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("pubsub-field-rename").await;
@@ -3141,7 +3140,6 @@ async fn seed_pubsub_field_rename() {
 }
 
 #[tokio::test]
-#[ignore = "carrick#3089: library-stated pub/sub rows have no type manifest entry, so both pairs are not_compared"]
 async fn seed_pubsub_field_removal() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("pubsub-field-removal").await;
@@ -3406,9 +3404,8 @@ async fn seed_socket_event_added() {
     assert_manifest_delta(&payload, "socket-event-added");
 }
 
-/// The subscriber's payload type gains an optional field. Until carrick#3089
-/// types library-stated pub/sub rows this passes with no pair compared; it
-/// guards from then on.
+/// The subscriber's payload type gains an optional field: the pair is
+/// compared (carrick#3089) and stays compatible.
 #[tokio::test]
 async fn seed_pubsub_subscriber_field_added() {
     let _serial = SERIAL.lock().await;
@@ -3419,7 +3416,7 @@ async fn seed_pubsub_subscriber_field_added() {
 
 /// carrick#3082: a PR that adds a table of `{ method, path }` bookkeeping
 /// records adds no endpoint, so the delta lists none of its paths.
-// The four seeds whose assertion tests above are `#[ignore]`d for an open
+// The two seeds whose assertion tests above are `#[ignore]`d for an open
 // issue still hold their scanner stage: each runs here, and fails when the run
 // stops at another stage than `known_miss` declares (carrick-cloud#2880).
 
@@ -3433,18 +3430,6 @@ async fn stage_trpc_output_field_removed() {
 async fn stage_socket_field_removal() {
     let _serial = SERIAL.lock().await;
     manifest_seed_payload("socket-field-removal").await;
-}
-
-#[tokio::test]
-async fn stage_pubsub_field_rename() {
-    let _serial = SERIAL.lock().await;
-    manifest_seed_payload("pubsub-field-rename").await;
-}
-
-#[tokio::test]
-async fn stage_pubsub_field_removal() {
-    let _serial = SERIAL.lock().await;
-    manifest_seed_payload("pubsub-field-removal").await;
 }
 
 #[tokio::test]
@@ -3764,14 +3749,10 @@ async fn reach_an_edit_to_the_publisher_reaches_only_pubsub_aliases() {
         )
     })
     .await;
-    // Library-stated pub/sub rows carry no manifest entry yet
-    // (carrick#3089), so the service has no pub/sub alias to reach: the
-    // publisher's file is reached and no other protocol's alias is.
-    let (reached, _) = reached_protocols(&dump);
-    assert!(
-        reached.iter().all(|protocol| protocol == "pubsub"),
-        "{dump:#}"
-    );
+    // Library-stated pub/sub rows carry manifest entries (carrick#3089), so
+    // the publisher's file reaches its pub/sub aliases and no other
+    // protocol's.
+    assert_reached_only(&dump, "pubsub");
     assert!(
         dump["decided"]["reached_files"]
             .as_array()

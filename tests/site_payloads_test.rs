@@ -289,3 +289,102 @@ fn a_borrowed_pubsub_symbol_gives_way_to_the_slot_that_types_the_alias() {
         assert!(shipped.contains("OrderShipped"), "shipped: {shipped}");
     }
 }
+
+/// The fact-layer switches the cloud runner sets for every workspace, beside
+/// `CARRICK_POSITION_ROWS`, which [`scan`] always sets.
+const FACT_LAYER: [(&str, &str); 4] = [
+    ("CARRICK_SITE_QUESTIONS", "1"),
+    ("CARRICK_RECEIVER_TRACE", "1"),
+    ("CARRICK_FACT_FILES", "1"),
+    ("CARRICK_SITE_PAYLOADS", "1"),
+];
+
+/// Every pub/sub entry of `role` at `file:line`.
+fn pubsub_entries<'a>(
+    blob: &'a serde_json::Value,
+    role: &str,
+    file: &str,
+    line: u64,
+) -> Vec<&'a serde_json::Value> {
+    blob["type_manifest"]
+        .as_array()
+        .expect("type_manifest")
+        .iter()
+        .filter(|entry| {
+            entry["role"] == role && entry["file_path"] == file && entry["line_number"] == line
+        })
+        .collect()
+}
+
+/// carrick#3089: `tests/fixtures/site-payloads-pubsub-verified/`, a bus the
+/// library store labels (`publish` sends argument 1, `subscribe` hands
+/// argument 1) whose declarations VERIFY both, so each call is a library
+/// row, not a site row. The reader's cassette states only the `jobs.named`
+/// publish, naming `Job`.
+///
+/// | call | entry | `CARRICK_SITE_PAYLOADS` unset | fact layer on |
+/// |---|---|---|---|
+/// | `jobs.created` publish, `:6` | one consumer, site-id'd | - | the payload's shape |
+/// | `jobs.done` subscribe, `:10` | one producer | - | the handler parameter's shape |
+/// | `jobs.named` publish, `:17` | one consumer, site-id'd | `Job` | `Job` |
+#[test]
+fn a_verified_library_pubsub_call_is_anchored_and_typed_at_its_slot() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/site-payloads-pubsub-verified");
+    let on = scan(&repo, &FACT_LAYER);
+    let off = scan(&repo, &[]);
+    let manifest = &on["type_manifest"];
+
+    let one = |blob: &serde_json::Value, role: &str, line: u64| -> String {
+        let entries = pubsub_entries(blob, role, "src/jobs.ts", line);
+        assert_eq!(
+            entries.len(),
+            1,
+            "one {role} entry at src/jobs.ts:{line}: {manifest:#}"
+        );
+        entries[0]["type_alias"].as_str().unwrap().to_string()
+    };
+
+    let created = one(&on, "consumer", 6);
+    assert!(
+        created.contains("_Call"),
+        "a publisher is site-id'd: {created}"
+    );
+    let created_type = captured_block(&on, &created);
+    assert!(
+        created_type.contains("jobId: string") && created_type.contains("priority: number"),
+        "created: {created_type}"
+    );
+
+    let done = one(&on, "producer", 10);
+    let done_type = captured_block(&on, &done);
+    assert!(
+        done_type.contains("jobId: string") && done_type.contains("ok: boolean"),
+        "done: {done_type}"
+    );
+
+    let named = one(&on, "consumer", 17);
+    let named_type = captured_block(&on, &named);
+    assert!(
+        named_type.contains("Job") || named_type.contains("owner: string"),
+        "named: {named_type}"
+    );
+
+    let aliases: Vec<&str> = manifest
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["type_alias"].as_str())
+        .collect();
+    let unique: std::collections::BTreeSet<&&str> = aliases.iter().collect();
+    assert_eq!(unique.len(), aliases.len(), "no alias twice: {aliases:#?}");
+
+    // T2: with the switch off, the model's symbol still types the folded row.
+    let named_off = one(&off, "consumer", 17);
+    assert_eq!(named_off, named, "one alias whichever switch");
+    let named_off_type = captured_block(&off, &named_off);
+    assert!(
+        named_off_type.contains("Job"),
+        "named, switch off: {named_off_type}"
+    );
+}

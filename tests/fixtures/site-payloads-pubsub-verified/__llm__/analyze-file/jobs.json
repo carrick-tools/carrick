@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_operations": [],
+  "pubsub_operations": [
+    {
+      "topic": "jobs.named",
+      "role": "publisher",
+      "line_number": 17,
+      "primary_type_symbol": "Job",
+      "type_import_source": null,
+      "broker": "bus",
+      "payload_expression_text": null,
+      "payload_expression_line": null
+    }
+  ],
+  "graphql_consumer_locates": [],
+  "dispatch_tables": []
+}

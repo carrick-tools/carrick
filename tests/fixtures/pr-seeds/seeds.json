@@ -588,7 +588,7 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "PUBSUB payments.settled", "site": "src/payments.ts:10"}]
       },
-      "known_miss": {"stage": "judged", "issues": ["carrick#3089"]}
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829"]}
     },
     {
       "name": "pubsub-field-removal",
@@ -604,7 +604,7 @@
         "conclusion": "failure",
         "rows": [{"kind": "risk_introduced", "label": "PUBSUB orders.shipped", "site": "src/events.ts:15"}]
       },
-      "known_miss": {"stage": "judged", "issues": ["carrick#3089"]}
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829"]}
     },
     {
       "name": "pubsub-subscriber-rename",
