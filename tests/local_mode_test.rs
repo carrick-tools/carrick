@@ -4254,6 +4254,38 @@ fn carrying_leaves_a_clean_tree_and_a_model_scan_alone() {
 const DOC_WIDGETS: &str = "repo/packages/routes/src/widgets.ts";
 const DOC_TABLE: &str = "repo/packages/routes/src/openapi.ts";
 
+/// A command in the documented-route workspace with the library store
+/// replayed from the fixture's cassette: the re-scan `check --changed` runs
+/// reads the handlers as facts only when the store answers it too.
+fn documented_command(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(carrick());
+    command
+        .args(args)
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_POSITION_ROWS", "1")
+        .env("CARRICK_SITE_QUESTIONS", "1")
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", root.join(".test-cassettes").display()),
+        );
+    command
+}
+
+/// `check --changed --json` in the documented-route workspace.
+fn documented_check(root: &Path) -> (Option<i32>, String) {
+    let output = documented_command(root, &["check", "--changed", "--workspace", ".", "--json"])
+        .output()
+        .expect("spawn carrick check");
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
 /// The fixture's repo, committed and indexed with the library store replayed
 /// from its cassette and no model, so the handlers are read as facts.
 fn documented_route_workspace() -> tempfile::TempDir {
@@ -4266,18 +4298,7 @@ fn documented_route_workspace() -> tempfile::TempDir {
         cassettes.join("library-claims/default.json"),
     )
     .expect("copy the store cassette");
-    let output = Command::new(carrick())
-        .args(["refresh", "--workspace", "."])
-        .current_dir(root)
-        .env_remove("CARRICK_TOKEN")
-        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
-        .env("CARRICK_MOCK_ALL", "1")
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1")
-        .env(
-            "CARRICK_MOCK_FIXTURE_DIR",
-            format!("{}/", cassettes.display()),
-        )
+    let output = documented_command(root, &["refresh", "--workspace", "."])
         .output()
         .expect("spawn carrick refresh");
     assert!(
@@ -4320,30 +4341,13 @@ fn check_changed_names_a_call_only_documentation_still_serves_after_its_handler_
     let root = workspace.path();
     edit(&root.join(DOC_WIDGETS), "'/widgets'", "'/gadgets'");
 
-    let debug = root.join("debug-3192.txt");
-    let output = Command::new(carrick())
-        .args(["check", "--changed", "--workspace", ".", "--json"])
-        .current_dir(root)
-        .env_remove("CARRICK_TOKEN")
-        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
-        .env("CARRICK_CHECK_BUDGET_MS", "600000")
-        .env("CARRICK_DEBUG_3192_FILE", &debug)
-        .output()
-        .expect("spawn check");
-    let code = output.status.code();
-    let text = String::from_utf8(output.stdout).expect("utf8");
+    let (code, text) = documented_check(root);
     let problems = problems_of(&text);
     let named: Vec<&String> = problems
         .iter()
         .filter(|p| p.starts_with("repo/packages/web/src/client.ts:") && p.contains("fails=true"))
         .collect();
-    assert_eq!(
-        named.len(),
-        1,
-        "{problems:#?}\ncode={code:?}\ndebug:\n{}\nindex:\n{}",
-        std::fs::read_to_string(&debug).unwrap_or_else(|_| "NO DEBUG FILE".into()),
-        std::fs::read_to_string(root.join(".carrick/index.json")).unwrap_or_default()
-    );
+    assert_eq!(named.len(), 1, "{problems:#?}");
     assert!(
         named[0].contains("widgets.ts") && named[0].contains("openapi.ts"),
         "the reason names both places: {}",
@@ -4362,7 +4366,7 @@ fn check_changed_fails_the_moved_handler_with_no_documentation() {
     std::fs::remove_file(root.join(DOC_TABLE)).expect("delete the table");
     edit(&root.join(DOC_WIDGETS), "'/widgets'", "'/gadgets'");
 
-    let (code, text) = check_changed(root, true);
+    let (code, text) = documented_check(root);
     assert!(
         problems_of(&text)
             .iter()
@@ -4380,7 +4384,7 @@ fn check_changed_does_not_name_a_call_when_only_the_documentation_changed() {
     let root = workspace.path();
     edit(&root.join(DOC_TABLE), "List widgets", "List every widget");
 
-    let (code, text) = check_changed(root, true);
+    let (code, text) = documented_check(root);
     assert!(
         !problems_of(&text)
             .iter()
@@ -4405,7 +4409,7 @@ fn check_changed_lists_a_moved_handler_it_cannot_find_again_as_a_candidate() {
     );
     edit(&widgets, "'/widgets'", "'/gadgets'");
 
-    let (code, text) = check_changed(root, true);
+    let (code, text) = documented_check(root);
     let problems = problems_of(&text);
     let named: Vec<&String> = problems
         .iter()

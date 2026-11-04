@@ -808,43 +808,11 @@ fn judge(
         if is_changed(repo, &operation.file) {
             continue;
         }
-        let dbg = |text: String| {
-            if let Ok(path) = std::env::var("CARRICK_DEBUG_3192_FILE") {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    let _ = writeln!(f, "{text}");
-                }
-            }
-        };
-        dbg(format!(
-            "consumer {} {}:{:?} key={} dispatch={:?}",
-            operation.service, operation.file, operation.line, operation.key, operation.dispatch
-        ));
-        let rows: Vec<String> = indexed_rows(before, repo, &operation.file)
-            .map(|o| {
-                format!(
-                    "[{} {:?} {:?} cps={:?}]",
-                    o.key,
-                    o.line,
-                    o.dispatch,
-                    o.counterparts
-                        .iter()
-                        .map(|c| format!("{}:{}:{:?}", c.service, c.file, c.line))
-                        .collect::<Vec<_>>()
-                )
-            })
-            .collect();
-        dbg(format!("  before rows (strict={strict}): {rows:?}"));
         let Some(old) = indexed_rows(before, repo, &operation.file).find(|old| {
             same_operation(old, operation, strict)
                 && old.line == operation.line
                 && !old.counterparts.is_empty()
         }) else {
-            dbg("  no old matched row".to_string());
             continue;
         };
         let producers_changed = old.counterparts.iter().all(|counterpart| {
@@ -852,7 +820,6 @@ fn judge(
                 .get(counterpart.service.as_str())
                 .is_some_and(|&(producer_repo, _)| is_changed(producer_repo, &counterpart.file))
         });
-        dbg(format!("  producers_changed={producers_changed}"));
         if !producers_changed {
             continue;
         }
@@ -873,26 +840,6 @@ fn judge(
                 })
             })
             .collect();
-        dbg(format!(
-            "  served_by={:?}",
-            served_by
-                .iter()
-                .map(|p| format!(
-                    "{} {} {}:{:?} rs={:?} h={:?}",
-                    p.service, p.key, p.file, p.line, p.resolution_source, p.handler
-                ))
-                .collect::<Vec<_>>()
-        ));
-        dbg(format!(
-            "  matches={:?}",
-            join.matches
-                .iter()
-                .map(|m| format!(
-                    "{}>{} {:?}:{:?}",
-                    m.consumer_key, m.producer_key, m.consumer_file, m.consumer_line
-                ))
-                .collect::<Vec<_>>()
-        ));
         let documentation_only = !served_by.is_empty()
             && served_by.iter().all(|producer| {
                 crate::agents::FileOrchestrator::is_documentation_route(
@@ -927,30 +874,6 @@ fn judge(
                 row.path.clone(),
             ))
         });
-        for counterpart in &old.counterparts {
-            if let Some(&(producer_repo, _)) = repo_of.get(counterpart.service.as_str()) {
-                let rows: Vec<String> = indexed_rows(rebuilt, producer_repo, &counterpart.file)
-                    .map(|o| {
-                        format!(
-                            "[{:?} {} {} {} line={:?} src={:?}]",
-                            o.kind, o.service, o.method, o.key, o.line, o.source
-                        )
-                    })
-                    .collect();
-                dbg(format!("  rebuilt rows of {}: {rows:?}", counterpart.file));
-            }
-        }
-        dbg(format!(
-            "  all producers: {:?}",
-            join.operations
-                .iter()
-                .filter(|p| p.role == Role::Producer)
-                .map(|p| format!(
-                    "{} {} {}:{:?} rs={:?}",
-                    p.service, p.key, p.file, p.line, p.resolution_source
-                ))
-                .collect::<Vec<_>>()
-        ));
         let confirmed = moved_to.is_some();
         let reason = match moved_to {
             Some((file, line, path)) => format!(
