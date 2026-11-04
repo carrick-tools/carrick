@@ -14,6 +14,8 @@
 #   release-artifacts.sh upload-lister <tag>   reads LISTER_OK; uploads nothing unless it passed
 #   release-artifacts.sh dispatch <tag>        reads LISTER_OK, LISTER_ATTACHED (the attach step's
 #                                              outcome), SOURCE_SHA; runs `gh api`
+#   release-artifacts.sh main-check <sha> <key>  tells carrick-cloud main's scanner key changed
+#                                              (carrick-main-check); runs `gh api`
 #   release-artifacts.sh announce-cli <tag>    reads SOURCE_SHA; tells carrick-cloud npm now serves
 #                                              this version (carrick-cli-published); runs `gh api`
 #
@@ -95,8 +97,16 @@ case "${1:-}" in
       exit 1
     fi
     ;;
+  main-check)
+    sha="${2:?usage: release-artifacts.sh main-check <sha> <key>}"
+    key="${3:?usage: release-artifacts.sh main-check <sha> <key>}"
+    "$GH" api "repos/carrick-tools/carrick-cloud/dispatches" \
+      -f event_type=carrick-main-check \
+      -f "client_payload[sha]=$sha" \
+      -f "client_payload[key]=$key"
+    ;;
   *)
-    echo "usage: release-artifacts.sh upload-matcher <tag> | lister-status | upload-lister <tag> | dispatch <tag> | announce-cli <tag>" >&2
+    echo "usage: release-artifacts.sh upload-matcher <tag> | lister-status | upload-lister <tag> | dispatch <tag> | announce-cli <tag> | main-check <sha> <key>" >&2
     exit 2
     ;;
 esac

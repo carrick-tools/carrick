@@ -453,6 +453,10 @@ jobs:
       - name: Dry-run the release steps with a failed and a passed lister
         run: bash scripts/release-artifacts.test.sh
 
+      # Which pushes to main start main's check (carrick-cloud#2916).
+      - name: Main's check trigger skips docs and version-only commits
+        run: bash scripts/main-check-trigger.test.sh
+
       # The release's glibc floor check (scripts/glibc-floor.sh, carrick#2218)
       # against stubbed objdump output: it must fail a binary above the floor.
       - name: The glibc floor check fails a binary above the floor

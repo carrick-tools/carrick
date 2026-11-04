@@ -1,0 +1,63 @@
+name: Main check dispatch
+
+# Starts main's check on the replay box when a push to main changes the
+# scanner key (carrick-cloud#2916, sub-ticket A). The key is
+# scripts/scanner-key.sh: a docs merge or a version-only release commit keeps
+# it, so neither starts the box. A changed key sends `carrick-main-check` to
+# carrick-cloud with the commit and the key. carrick-cloud's workflow does
+# nothing until its repo variable MAIN_CHECK_ENABLED is 'true', so this ships
+# switched off. The paths filter only saves a run; the key decides.
+# workflow_dispatch with a sha always dispatches (a manual re-check).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit on main to check"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch main's check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.inputs.sha || github.sha }}
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          if [ "$MANUAL" = "true" ]; then
+            [[ "$AFTER" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be 40 hex characters"; exit 1; }
+            git cat-file -e "$AFTER^{commit}" || { echo "::error::$AFTER is not a commit on this clone"; exit 1; }
+            BEFORE=0000000000000000000000000000000000000000
+          fi
+          out=$(bash scripts/main-check-trigger.sh "$BEFORE" "$AFTER")
+          echo "$out"
+          echo "verdict=${out%% *}" >> "$GITHUB_OUTPUT"
+          echo "key=${out##* }" >> "$GITHUB_OUTPUT"
+          echo "sha=$AFTER" >> "$GITHUB_OUTPUT"
+
+      - name: Tell carrick-cloud
+        if: steps.decide.outputs.verdict == 'dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.CARRICK_CLOUD_DISPATCH_TOKEN }}
+        run: bash scripts/release-artifacts.sh main-check "${{ steps.decide.outputs.sha }}" "${{ steps.decide.outputs.key }}"
