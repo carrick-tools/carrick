@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "target": "/events",
+      "method": "POST",
+      "pattern_matched": "postEvent({ body: event })",
+      "call_expression_text": "postEvent({ body: event })",
+      "call_expression_line": 6,
+      "payload_expression_text": "event",
+      "payload_expression_line": 6,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

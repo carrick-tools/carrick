@@ -1,0 +1,6 @@
+{
+  "frameworks": ["express"],
+  "data_fetchers": ["@fixture/client"],
+  "messaging_clients": [],
+  "notes": "The web app sends through the workspace client package."
+}
