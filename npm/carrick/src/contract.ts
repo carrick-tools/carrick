@@ -191,6 +191,21 @@ export type Recheck = {
    * are the indexed ones until the next `carrick refresh`. Absent otherwise.
    */
   known_miss?: boolean;
+  /** Which services this re-check read and which it judged at another version. */
+  scope?: RecheckScope;
+};
+
+/** The `scope` of a `recheck` block (`docs/local-mode-output.md`, "recheck"). */
+export type RecheckScope = {
+  /** The edited file's service first, then every service reading a type it declares. */
+  reread: string[];
+  /** Every other service, with whose copy its verdicts used. */
+  not_reread: { service: string; operations: number; reason: string }[];
+  /**
+   * The ones of `not_reread` judged at a version that predates the work: edited
+   * since the index with no re-check copy, or reading a path edited since it.
+   */
+  stale: string[];
 };
 
 /** One function the working tree declares and the index does not. */

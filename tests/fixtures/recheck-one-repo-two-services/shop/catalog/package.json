@@ -1,0 +1,7 @@
+{
+  "name": "catalog-web",
+  "private": true,
+  "dependencies": {
+    "@remix-run/node": "^2.0.0"
+  }
+}

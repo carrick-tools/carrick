@@ -113,6 +113,26 @@ test("a re-checked edit with no problem says so in one line", () => {
   );
 });
 
+test("a re-check that judged a service reading the edit at its indexed version never says no contract problem", () => {
+  const result = rechecked();
+  result.items = result.items!.filter((item) => item.verdict?.result == null || item.verdict.result === "compatible");
+  result.recheck = {
+    ran: "extraction+types",
+    elapsed_ms: 900,
+    scope: { reread: ["catalog"], not_reread: [], stale: ["inventory", "billing", "ledger", "search"] },
+  };
+  assert.equal(
+    renderPostToolUse(result),
+    "Carrick re-checked src/routes/users.ts: no contract problem in what it re-read; 4 services that read this edit were judged at their indexed version (inventory, billing, ledger, and 1 more). Run `carrick check --changed` before you finish.",
+  );
+  // With nothing stale, the headline is the plain one.
+  result.recheck.scope = { reread: ["catalog"], not_reread: [], stale: [] };
+  assert.equal(
+    renderPostToolUse(result),
+    "Carrick re-checked src/routes/users.ts after this edit: no contract problem.",
+  );
+});
+
 test("an edit never carries the service-wide boundary", () => {
   for (const name of ["check-mismatch.json", "check-pre-rendered-boundary.json"]) {
     const context = renderPostToolUse(fixture(name)) ?? "";

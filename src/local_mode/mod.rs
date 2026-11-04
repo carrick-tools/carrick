@@ -27,6 +27,7 @@ pub(crate) mod jobs;
 mod join;
 pub(crate) mod query;
 mod read_model;
+mod reads_same;
 pub(crate) mod recheck;
 pub(crate) mod scan_state;
 mod uses;

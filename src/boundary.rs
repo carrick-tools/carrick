@@ -111,6 +111,15 @@ pub struct ServiceBoundary {
     /// previous generation held none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_answers_unavailable: Option<ModelAnswersUnavailable>,
+    /// The scan asked Carrick's library store and got no answer (carrick#3249):
+    /// nothing was sent because this machine is not signed in, or the store
+    /// could not be reached. Every row a library package states is then
+    /// missing from this blob, which is not the store's answer that a package
+    /// labels nothing. Set only on a read-only ask (the no-model local scan);
+    /// absent otherwise, so a signed-in blob and every blob the Action writes
+    /// are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_ask_failed: Option<crate::library_store::AskFailure>,
     /// The commit this service's rows were read at. Already on the blob;
     /// repeated here so the whole boundary is one struct: a count means
     /// nothing without the tree it was counted on.
@@ -328,6 +337,9 @@ impl ServiceBoundary {
             model_rows_carried: None,
             model_rows_not_carried: None,
             model_answers_unavailable: None,
+            library_ask_failed: crate::scan_health::library_ask_failed_for(
+                data.service_name.as_deref(),
+            ),
             commit_hash: data.commit_hash.clone(),
             files_attempted: stats.files_model_dispatched,
             files_lost: Counted::new(stats.files_analysis_failed, lost),

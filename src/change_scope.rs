@@ -66,6 +66,8 @@ pub enum Reason {
     ExtendsUnfollowed,
     RepoInputChanged,
     InputsChanged,
+    /// A per-edit re-check named this service ([`RECHECK_SERVICES_ENV`]).
+    RecheckScope,
 }
 
 impl Reason {
@@ -81,6 +83,7 @@ impl Reason {
             Reason::ExtendsUnfollowed => "extends_unfollowed",
             Reason::RepoInputChanged => "repo_input_changed",
             Reason::InputsChanged => "inputs_changed",
+            Reason::RecheckScope => "recheck_scope",
         }
     }
 }
@@ -877,6 +880,9 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
+/// Whether a changed path is left out of a [`ChangedSince`] listing.
+type DroppedPaths = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// The paths changed since each stored commit, listed once per commit for the
 /// whole run: [`plan`] reads them, and so does a pull request scan's type-reach
 /// decision (carrick#3102), so git is asked once.
@@ -887,6 +893,8 @@ fn short(commit: &str) -> &str {
 pub struct ChangedSince {
     repo_path: String,
     scaffold_config: Option<String>,
+    /// Paths this listing leaves out ([`ChangedSince::without`]).
+    dropped: Option<DroppedPaths>,
     listed: std::sync::Mutex<HashMap<String, Result<Vec<ChangedPath>, String>>>,
     moved: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<DependencyMove>>>>,
 }
@@ -900,9 +908,18 @@ impl ChangedSince {
             scaffold_config: scaffold_config_is_the_stored_one(services, stored_services)
                 .then(|| crate::git_state::untracked_root_config(repo_path))
                 .flatten(),
+            dropped: None,
             listed: Default::default(),
             moved: Default::default(),
         }
+    }
+
+    /// The same listing without the paths `dropped` names: a caller that asks
+    /// what a service reads of the changes other than its own (the per-edit
+    /// re-check, `local_mode::recheck`).
+    pub fn without(mut self, dropped: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.dropped = Some(Box::new(dropped));
+        self
     }
 
     /// What the manifests and lockfiles changed since `commit` moved, read
@@ -938,6 +955,9 @@ impl ChangedSince {
                 let mut paths = crate::git_state::changed_paths(&self.repo_path, commit, None);
                 if let (Ok(paths), Some(config)) = (&mut paths, &self.scaffold_config) {
                     paths.retain(|change| !(change.status == 'A' && &change.path == config));
+                }
+                if let (Ok(paths), Some(dropped)) = (&mut paths, &self.dropped) {
+                    paths.retain(|change| !dropped(&change.path));
                 }
                 paths
             })
@@ -1156,23 +1176,27 @@ impl<'r> Walks<'r> {
     }
 }
 
-/// For each of `services`, index for index, whether the change since `base`
-/// touches nothing the service reads, by the rule that carries a service
+/// For each of `services`, index for index, the first changed path the
+/// service reads (`None` when the change since `base` touches nothing it
+/// reads), by the rule that carries a service
 /// under `--changed-only` once its stored blob passes the gate
 /// ([`decide`]): its roots and import closure, the workspace packages and
 /// tsconfig chain it reads, its manifest and schemas, and, when the change
 /// is a dependency-only move, the packages it loads
-/// ([`crate::dependency_move`]). `false` whenever git cannot compare. A pull
-/// request's finding whose two sides read nothing it changed is main's
-/// (carrick#3170).
+/// ([`crate::dependency_move`]). Whenever git cannot compare, or the rule
+/// cannot say, the answer is `Some` with the rule's own detail (never a
+/// service proven untouched). A pull request's finding whose two sides read
+/// nothing it changed is main's (carrick#3170); a per-edit re-check names the
+/// services that read the edit and it did not re-read
+/// (`local_mode::recheck`).
 pub fn untouched_since(
     repo_path: &str,
     services: &[Config],
     changes: &ChangedSince,
     base: &str,
-) -> Vec<bool> {
+) -> Vec<Option<String>> {
     let mut walks = Walks::new(repo_path, changes);
-    let untouched: Vec<bool> = services
+    let reads: Vec<Option<String>> = services
         .iter()
         .map(|service| {
             let scope = walks.scope(service, Against::Base(base));
@@ -1190,18 +1214,21 @@ pub fn untouched_since(
                     reason.as_str()
                 ),
             }
-            scope.is_carried()
+            match scope {
+                Scope::Carried { .. } => None,
+                Scope::Analysed { detail, .. } => Some(detail),
+            }
         })
         .collect();
     info!(
         "pr base: {} of {} service(s) read nothing changed since {}; the closure walk took {:.2}s over {} service(s)",
-        untouched.iter().filter(|untouched| **untouched).count(),
-        untouched.len(),
+        reads.iter().filter(|read| read.is_none()).count(),
+        reads.len(),
         short(base),
         walks.closure_took.as_secs_f64(),
         walks.walked
     );
-    untouched
+    reads
 }
 
 /// Whether the rows a change to `path` moves are the ones the diff places by
@@ -1341,6 +1368,23 @@ pub fn packages_moved_services(
         .collect()
 }
 
+/// The services a per-edit re-check re-reads, as a JSON list of service ids
+/// (`service_name`, or the repo's directory name for an unnamed one).
+///
+/// Only the per-edit re-check (`local_mode::recheck`) sets it. When it is set,
+/// [`plan`] analyses exactly the listed services and carries every other one
+/// from its stored generation, without computing what it reads. When it is
+/// unset the rule is the change-scope rule above, unchanged: `check --changed`
+/// and the CI runner never set it. Documented in `docs/local-mode-output.md`
+/// ("`recheck`").
+pub const RECHECK_SERVICES_ENV: &str = "CARRICK_RECHECK_SERVICES";
+
+/// The ids [`RECHECK_SERVICES_ENV`] names, or `None` when it is unset or not a
+/// JSON list of strings.
+fn recheck_services() -> Option<BTreeSet<String>> {
+    serde_json::from_str(&std::env::var(RECHECK_SERVICES_ENV).ok()?).ok()
+}
+
 /// Each service's scope, index for index with `services`, logged one line
 /// per service with a summary and the closure walk's wall time. `changes`
 /// lists what changed since each stored commit.
@@ -1351,11 +1395,41 @@ pub fn plan<'a>(
     stored: impl Fn(&Config) -> Option<&'a CloudRepoData>,
     this_run: ThisRun<'_>,
 ) -> Vec<Scope> {
+    plan_in(
+        repo_path,
+        services,
+        changes,
+        stored,
+        this_run,
+        recheck_services().as_ref(),
+    )
+}
+
+/// [`plan`], with the re-check's service list passed rather than read from the
+/// environment.
+fn plan_in<'a>(
+    repo_path: &str,
+    services: &[Config],
+    changes: &ChangedSince,
+    stored: impl Fn(&Config) -> Option<&'a CloudRepoData>,
+    this_run: ThisRun<'_>,
+    rechecking: Option<&BTreeSet<String>>,
+) -> Vec<Scope> {
     let mut walks = Walks::new(repo_path, changes);
+    let repo_label = Path::new(repo_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo_path.to_string());
     let scopes: Vec<Scope> = services
         .iter()
         .map(|service| {
-            let scope = walks.scope(service, Against::Stored(stored(service), this_run));
+            let scope = match rechecking {
+                Some(listed) => {
+                    let id = service.service_name.as_deref().unwrap_or(&repo_label);
+                    recheck_scope(listed.contains(id), stored(service))
+                }
+                None => walks.scope(service, Against::Stored(stored(service), this_run)),
+            };
             let label = service.service_name.as_deref().unwrap_or("(root)");
             match &scope {
                 Scope::Carried { commit } => info!(
@@ -1394,6 +1468,20 @@ pub fn plan<'a>(
         walks.walked
     );
     scopes
+}
+
+/// A service's scope under a per-edit re-check: analysed when the re-check
+/// named it, else carried at the commit its stored generation was written at.
+/// What the service reads is never computed: the re-check carries the newest
+/// known copy of every service it was not asked about.
+fn recheck_scope(listed: bool, stored: Option<&CloudRepoData>) -> Scope {
+    match (listed, stored) {
+        (true, _) => Scope::analysed(Reason::RecheckScope, "the re-check re-reads this service"),
+        (false, Some(stored)) => Scope::Carried {
+            commit: stored.commit_hash.clone(),
+        },
+        (false, None) => Scope::analysed(Reason::NoStored, "no stored index for this service"),
+    }
 }
 
 /// Whether the `carrick.json` an untracked-config run found names the
@@ -2988,6 +3076,55 @@ mod tests {
         std::fs::write(repo.join("carrick.json"), "{ \"services\": [] }").unwrap();
     }
 
+    /// A per-edit re-check analyses the services it names and carries every
+    /// other one, even one that imports the edited file; unset, the rule is the
+    /// change-scope rule (carrick#3198).
+    #[test]
+    fn a_re_check_carries_every_service_it_did_not_name() {
+        let (repo, a, services) = workspace();
+        let blobs = stored_at(&services, &a);
+        std::fs::write(
+            repo.path().join("apps/api/src/types.ts"),
+            "export interface Order { id: number }\n",
+        )
+        .unwrap();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let scopes_with = |listed: Option<&BTreeSet<String>>| {
+            plan_in(
+                &repo_path,
+                &services,
+                &ChangedSince::new(&repo_path, &services, &names_of(&services)),
+                |service| {
+                    blobs
+                        .iter()
+                        .find(|blob| blob.service_name == service.service_name)
+                },
+                this_scanner(),
+                listed,
+            )
+        };
+
+        // Unset: `web` imports the edited file, so it is analysed with `api`.
+        assert_eq!(
+            carried(&scopes_with(None)),
+            [false, false, true],
+            "the change-scope rule is unchanged"
+        );
+
+        let only_api: BTreeSet<String> = ["api".to_string()].into();
+        let scopes = scopes_with(Some(&only_api));
+        assert_eq!(
+            carried(&scopes),
+            [false, true, true],
+            "web imports the edited file and is still carried: {scopes:?}"
+        );
+        assert_eq!(reason(&scopes[0]), Some(Reason::RecheckScope));
+
+        // A listed service with no stored generation is analysed, as ever.
+        let none_stored = recheck_scope(false, None);
+        assert_eq!(reason(&none_stored), Some(Reason::NoStored));
+    }
+
     #[test]
     fn an_untracked_config_naming_the_stored_services_is_no_changed_input() {
         let (repo, a, services) = workspace();
@@ -3878,7 +4015,10 @@ mod tests {
         commit_all(repo.path(), "move");
         let changes = ChangedSince::new(&path, &services, &[]);
         assert_eq!(
-            untouched_since(&path, &services, &changes, &base),
+            untouched_since(&path, &services, &changes, &base)
+                .iter()
+                .map(Option::is_none)
+                .collect::<Vec<_>>(),
             [true, true, false]
         );
 
@@ -3888,14 +4028,21 @@ mod tests {
         )
         .unwrap();
         let changes = ChangedSince::new(&path, &services, &[]);
+        let reads = untouched_since(&path, &services, &changes, &base);
         assert_eq!(
-            untouched_since(&path, &services, &changes, &base),
+            reads.iter().map(Option::is_none).collect::<Vec<_>>(),
             [false, true, false]
         );
-        let changes = ChangedSince::new(&path, &services, &[]);
         assert_eq!(
-            untouched_since(&path, &services, &changes, "0000000"),
-            [false, false, false],
+            reads[0].as_deref(),
+            Some("apps/api/src/server.ts"),
+            "the service names the changed path it reads"
+        );
+        let changes = ChangedSince::new(&path, &services, &[]);
+        assert!(
+            untouched_since(&path, &services, &changes, "0000000")
+                .iter()
+                .all(Option::is_some),
             "git cannot compare with a commit it does not hold"
         );
     }

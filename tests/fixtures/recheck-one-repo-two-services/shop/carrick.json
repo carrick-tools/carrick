@@ -1,0 +1,5 @@
+{ "services": [
+  { "name": "catalog", "directory": "catalog" },
+  { "name": "inventory", "directory": "inventory" },
+  { "name": "ledger", "directory": "ledger" }
+] }

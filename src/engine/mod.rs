@@ -6689,6 +6689,9 @@ fn library_rows(
     // A read-only pass (carrick#2907) started no build, so a package it ends
     // without is unknown, as it was before the pass asked: nothing is
     // pending on its account.
+    if let Some(failure) = settled.failure.filter(|_| ask.read_only) {
+        crate::scan_health::record_library_ask_failed(failure);
+    }
     if !ask.read_only {
         crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
             pending: settled.pending,
@@ -11080,6 +11083,7 @@ fn discover_with_positions(
                     text,
                     &cm,
                     &handler,
+                    None,
                 )
             }),
             None => parse_file(file_path, &cm, &handler),
@@ -13662,7 +13666,7 @@ impl PrChange {
                         .clone()
                         .unwrap_or_else(|| self.repo_name.clone())
                 })
-                .zip(untouched)
+                .zip(untouched.iter().map(Option::is_none))
                 .collect(),
             peers: peers
                 .iter()

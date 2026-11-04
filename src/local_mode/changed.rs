@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::join::{JoinedOperation, Role};
-use super::read_model::{IndexedItem, LocalIndex, Source};
+use super::read_model::{IndexedItem, IndexedRepo, LocalIndex, Source};
+use super::reads_same::{LineMap, same_reading};
 
 pub const SCHEMA: &str = "carrick.check-changed/0";
 
@@ -71,6 +72,12 @@ pub struct ChangedOutput {
     /// When this lists rows, `type_checked` is 0 and nothing fails, the run
     /// exits [`EXIT_NOTHING_COVERED`].
     pub not_type_checked: Vec<NotTypeChecked>,
+    /// Rows in files the work did not touch whose verdict this change moved
+    /// from compatible to a mismatch (carrick#2998). Rows with no earlier
+    /// verdict are not counted here. Not part
+    /// of `routes`, `calls` or `type_checked`, which stay about the edited
+    /// files.
+    pub outside_moved: usize,
     pub elapsed_ms: u64,
     /// Why nothing was checked, when nothing was. The run then exits
     /// [`EXIT_NOTHING_COVERED`].
@@ -105,7 +112,25 @@ pub struct ChangedRepo {
     /// [`EXIT_NOTHING_COVERED`] when no repo covered a file.
     #[serde(skip)]
     pub no_base: bool,
+    /// Whether this repo's changed files were re-read (`ran`), or read the
+    /// same as the index's copy and were answered from it (`not_needed`,
+    /// carrick#3245). Absent for a repo with no changed file to judge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescan: Option<Rescan>,
 }
+
+/// See [`ChangedRepo::rescan`].
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Rescan {
+    Ran,
+    NotNeeded,
+}
+
+/// Set to `always` to re-scan every changed repo even when nothing the scan
+/// reads moved: the answer such a check gives without the re-scan must equal
+/// this one's (carrick#3245).
+pub const RESCAN_ENV: &str = "CARRICK_CHECK_RESCAN";
 
 fn is_zero(count: &usize) -> bool {
     *count == 0
@@ -146,10 +171,15 @@ pub struct Problem {
     /// fails the run.
     pub unconfirmed: bool,
     /// In a file the work did not touch: a call the index matched whose
-    /// route the work took away. Listed when it fails, and with `--all`;
-    /// never counted on the summary line, which is about the edited files.
-    #[serde(skip)]
+    /// route the work took away, or a pair whose verdict the work moved to a
+    /// mismatch. Listed when it fails, and with `--all`; counted on the
+    /// summary line only through `outside_moved`.
     pub outside_the_change: bool,
+    /// Outside the change, and the index held no resolved, compatible row
+    /// to move from: it may have resolved for a reason unrelated to the edit
+    /// (carrick#2961). Never fails.
+    #[serde(skip)]
+    pub not_judged_before: bool,
     /// New only because the index lacks the row, and the index was written by
     /// another scanner build, which may simply not have read it
     /// (carrick#2911). Printed, never fails, and the run exits
@@ -176,6 +206,22 @@ pub struct NotTypeChecked {
 
 /// The words a customer reads about pairs the check could not judge. Kept
 /// here, in one place; they wait on David's approval (carrick#3012).
+/// The words a customer reads about rows outside the changed files whose
+/// verdict the change moved (carrick#2998). In one place; they wait on
+/// David's approval.
+fn outside_moved_clause(count: usize) -> String {
+    format!(
+        "; {} outside the changed files whose verdict this change moved",
+        plural(count, "row", "rows")
+    )
+}
+const OUTSIDE_FAILING_NOTE: &str = " [outside the changed files: this change moved its verdict]";
+const OUTSIDE_NOT_JUDGED_NOTE: &str =
+    " [outside the changed files: not judged before, does not fail]";
+fn outside_not_judged_counted(count: usize) -> String {
+    format!("{count} outside the changed files not judged before")
+}
+
 const NOT_TYPE_CHECKED_SUFFIX: &str = "not type-checked (one side has no usable type)";
 const NOTHING_TYPE_CHECKED: &str = "not checked: no matched route or call in the changed files has a usable type on both sides, so a type change cannot be seen";
 
@@ -287,6 +333,7 @@ fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
         failing: 0,
         type_checked: 0,
         not_type_checked: Vec::new(),
+        outside_moved: 0,
         elapsed_ms: 0,
         not_checked: Some(reason.into()),
         index_scanner: None,
@@ -334,10 +381,56 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
 
     let generation =
         std::env::temp_dir().join(format!("carrick-check-changed-{}", uuid::Uuid::new_v4()));
-    let rescan: Vec<&Path> = changed.values().map(|(path, _)| path.as_path()).collect();
     // Said on stderr while it works: on a large repo the pass runs for
     // minutes, and a caller that reads silence as a hang kills it.
     let narrator = super::recheck::Narrator::to_stderr(started);
+    // A repo whose changed files read the same as the copy the index was
+    // built from is not re-scanned: the index already holds its answer
+    // (carrick#3245).
+    let always = std::env::var(RESCAN_ENV).is_ok_and(|value| value == "always");
+    let mut unmoved: BTreeMap<String, BTreeMap<String, LineMap>> = BTreeMap::new();
+    let mut rescan: Vec<&Path> = Vec::new();
+    let mut rescanned: BTreeSet<&String> = BTreeSet::new();
+    for (name, (path, _)) in &changed {
+        let lines = if always {
+            None
+        } else {
+            index
+                .repos
+                .iter()
+                .find(|indexed| &indexed.name == name)
+                .and_then(|indexed| reads_the_same(path, indexed))
+        };
+        match lines {
+            Some(lines) => {
+                narrator.phase(
+                    Instant::now(),
+                    format!("nothing the scan reads changed in {name}"),
+                );
+                unmoved.insert(name.clone(), lines);
+            }
+            None => {
+                rescan.push(path.as_path());
+                rescanned.insert(name);
+            }
+        }
+    }
+    for entry in &mut output.repos {
+        let name = super::index::repo_label(Path::new(&entry.repo));
+        if changed.contains_key(&name) {
+            entry.rescan = Some(if unmoved.contains_key(&name) {
+                Rescan::NotNeeded
+            } else {
+                Rescan::Ran
+            });
+        }
+    }
+    // With nothing to re-scan this is the join alone, over the index's own
+    // blobs (carrick#3245). The scope names projecting the index's rows
+    // into the join's shape and starting no child at all; the index does not
+    // carry the join's `unmatched.injected` (which call bases are set at run
+    // time), and `judge` prints it, so the join runs, and the answer stays
+    // the re-scan's.
     let rejoined = super::recheck::rejoin(
         &workspace,
         &rescan,
@@ -359,9 +452,17 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     // A re-scan that could not replay the index's model answers has lost every
     // row only the model stated, so what it judged is not the whole service
     // (carrick#3000). That is not a pass.
-    let lost = answers_lost(&rejoined.index, changed.keys());
+    let lost = answers_lost(&rejoined.index, rescanned.iter().copied());
     if !lost.is_empty() {
         output.not_checked = Some(lost.join(" "));
+    } else if let Some(sentence) =
+        super::recheck::library_unavailable(&rejoined.index, changed.keys())
+    {
+        // The re-scan asked the library store and got no answer: a route
+        // registered through a server package is missing, so "checked 0
+        // routes" is not a pass, and a call to it is not a call to no route
+        // (carrick#3249).
+        output.not_checked = Some(sentence.to_string());
     }
 
     let wanted: BTreeMap<String, &BTreeSet<String>> = changed
@@ -380,11 +481,13 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &rejoined.join,
         &wanted,
     );
+    let judged = remap_lines(judged, &root, &rejoined.index, &unmoved);
     output.routes = judged.routes;
     output.calls = judged.calls;
     output.failing = judged.problems.iter().filter(|p| p.fails).count();
     output.type_checked = judged.type_checked;
     output.not_type_checked = judged.not_type_checked;
+    output.outside_moved = judged.outside_moved;
     output.problems = judged.problems;
     output
 }
@@ -410,6 +513,7 @@ fn changed_files(
             skipped: None,
             unchecked: 0,
             no_base: false,
+            rescan: None,
         };
         let Some(indexed) = index.repos.iter().find(|indexed| indexed.name == name) else {
             // The files the work changed here are ones the caller asked
@@ -503,6 +607,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             skipped: Some(format!("{reason}; run `carrick init` or `carrick refresh`")),
             unchecked: 1,
             no_base: false,
+            rescan: None,
         });
     };
     for file in files {
@@ -539,6 +644,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             skipped: None,
             unchecked: 0,
             no_base: false,
+            rescan: None,
         })
         .collect();
     repos.extend(listed);
@@ -568,12 +674,156 @@ fn answers_lost<'a>(
         .collect()
 }
 
+/// For a repo whose every change since the index's commit reads the same to
+/// the scan, where each changed source file's lines went; `None` when any
+/// change could move what the scan reads, or the comparison cannot be made.
+///
+/// The commit is the one every indexed service of the repo was read at, from
+/// a clean tree. A path the published input rule does not read is no change
+/// to the scan. A path it reads must be a source file whose copy at that
+/// commit and whose copy on disk both parse, are equal ignoring positions,
+/// and hold the same type-bearing comments in the same places; a manifest, a
+/// lockfile, a config, a test file, an added or deleted file, or a commit this
+/// clone lacks takes the re-scan (carrick#3245).
+fn reads_the_same(repo: &Path, indexed: &IndexedRepo) -> Option<BTreeMap<String, LineMap>> {
+    // A repo the hosted index stood in for (`read_from_hosted`) is covered
+    // too: its blobs were written beside the scanned ones, so the join below
+    // retains them, and they describe the hosted commit from a clean tree.
+    let commit = &indexed.services.first()?.commit;
+    if commit.is_empty()
+        || indexed
+            .services
+            .iter()
+            .any(|service| &service.commit != commit || service.dirty)
+    {
+        return None;
+    }
+    let text = repo.to_string_lossy();
+    let mut lines = BTreeMap::new();
+    for file in super::query::changed_since(repo, commit)? {
+        if !crate::change_scope::read_by_input_rule(&file) {
+            continue;
+        }
+        if !crate::file_finder::is_scanned_source(&repo.join(&file), repo) {
+            return None;
+        }
+        let before = crate::git_state::file_at_commit(&text, commit, &file)?;
+        let now = std::fs::read_to_string(repo.join(&file)).ok()?;
+        lines.insert(file.clone(), same_reading(Path::new(&file), &before, &now)?);
+    }
+    Some(lines)
+}
+
+/// The judged lines, in the edited files' own numbering. A check answered
+/// from the index reads rows at the lines the index wrote them, which the
+/// edit may have moved; each line in a file that read the same goes where its
+/// node went. Reported lines on the other side (`other`) move the same way.
+fn remap_lines(
+    mut judged: Judged,
+    root: &Path,
+    rebuilt: &LocalIndex,
+    unmoved: &BTreeMap<String, BTreeMap<String, LineMap>>,
+) -> Judged {
+    if unmoved.is_empty() {
+        return judged;
+    }
+    // Workspace-shown file -> its map, and service -> repo, for the `other`
+    // sites that name a service and a repo-relative file.
+    let mut shown_maps: BTreeMap<String, &LineMap> = BTreeMap::new();
+    let mut service_repo: BTreeMap<&str, &str> = BTreeMap::new();
+    for repo in &rebuilt.repos {
+        for service in &repo.services {
+            service_repo.insert(service.name.as_str(), repo.name.as_str());
+        }
+        for (file, map) in unmoved.get(&repo.name).into_iter().flatten() {
+            shown_maps.insert(shown(root, &repo.path, file), map);
+        }
+    }
+    let move_line = |file: &str, line: Option<u32>| match (shown_maps.get(file), line) {
+        (Some(map), Some(line)) => Some(map.map(line)),
+        _ => line,
+    };
+    for problem in &mut judged.problems {
+        problem.line = move_line(&problem.file, problem.line);
+        for other in &mut problem.other {
+            let Some((service, site)) = other.split_once(' ') else {
+                continue;
+            };
+            let (file, line) = super::split_location(site);
+            let Some(map) = service_repo
+                .get(service)
+                .and_then(|repo| unmoved.get(*repo))
+                .and_then(|files| files.get(&file))
+            else {
+                continue;
+            };
+            if let Some(line) = line {
+                *other = format!("{service} {file}:{}", map.map(line));
+            }
+        }
+    }
+    for row in &mut judged.not_type_checked {
+        row.line = move_line(&row.file, row.line);
+    }
+    judged.problems.sort();
+    judged.problems.dedup();
+    judged.not_type_checked.sort();
+    judged.not_type_checked.dedup();
+    judged
+}
+
 struct Judged {
     routes: usize,
     calls: usize,
     problems: Vec<Problem>,
     type_checked: usize,
     not_type_checked: Vec<NotTypeChecked>,
+    /// Rows outside the changed files that this change moved from compatible
+    /// to a mismatch (carrick#2998).
+    outside_moved: usize,
+}
+
+/// What the index held, before this pass, for a mismatching row of a file the
+/// work did not touch.
+enum OutsideBefore {
+    /// The same row carried a mismatch already.
+    Mismatch,
+    /// The same row was resolved and compatible: this change broke the pair.
+    Agreed,
+    /// No such row, no verdict, or an unresolved one: it may have resolved
+    /// for a reason unrelated to the edit (carrick#2961).
+    NotJudged,
+}
+
+/// The earlier state of the row at the same line, in the same file, with the
+/// same key. An untouched file's lines do not move.
+fn outside_before(
+    before: &LocalIndex,
+    strict: bool,
+    repo: &str,
+    operation: &JoinedOperation,
+) -> OutsideBefore {
+    let Some(old) = indexed_rows(before, repo, &operation.file)
+        .find(|old| same_operation(old, operation, strict) && old.line == operation.line)
+    else {
+        return OutsideBefore::NotJudged;
+    };
+    match old.verdict.as_ref() {
+        Some(verdict)
+            if matches!(
+                verdict.result.as_deref(),
+                Some("type_mismatch" | "method_mismatch")
+            ) =>
+        {
+            OutsideBefore::Mismatch
+        }
+        Some(verdict)
+            if verdict.state == "resolved" && verdict.result.as_deref() == Some("compatible") =>
+        {
+            OutsideBefore::Agreed
+        }
+        _ => OutsideBefore::NotJudged,
+    }
 }
 
 /// The problems in the changed files, read off the rebuilt index and the join
@@ -624,17 +874,23 @@ fn judge(
         problems: Vec::new(),
         type_checked: 0,
         not_type_checked: Vec::new(),
+        outside_moved: 0,
     };
     for operation in &join.operations {
         let Some(&(repo, repo_path)) = repo_of.get(operation.service.as_str()) else {
             continue;
         };
-        if !is_changed(repo, &operation.file) {
+        let in_change = is_changed(repo, &operation.file);
+        // A row in a file the work did not touch is read only when its repo
+        // was re-scanned in this run (carrick#2998, rule 1).
+        if !in_change && !changed.contains_key(repo) {
             continue;
         }
-        match operation.role {
-            Role::Producer => judged.routes += 1,
-            Role::Consumer => judged.calls += 1,
+        if in_change {
+            match operation.role {
+                Role::Producer => judged.routes += 1,
+                Role::Consumer => judged.calls += 1,
+            }
         }
         let Some(item) = item_of(repo, operation) else {
             continue;
@@ -645,6 +901,10 @@ fn judge(
                 Some("type_mismatch" | "method_mismatch")
             )
         });
+        // Outside the change only a rebuilt mismatch is a candidate (rule 2).
+        if !in_change && !mismatch {
+            continue;
+        }
         // A matched pair the check could not judge is named, not passed
         // (carrick#3012): no verdict, or a side without a usable type.
         let unjudged = item
@@ -674,7 +934,9 @@ fn judge(
             }
             continue;
         }
-        judged.type_checked += 1;
+        if in_change {
+            judged.type_checked += 1;
+        }
         let finding = super::index::finding_for(operation, &join.findings);
         // A finding resting only on rows the source states, whose verdict was
         // reached or needs none: the rule the cloud enforces on (cloud#599).
@@ -694,6 +956,21 @@ fn judge(
                     .and_then(|verdict| verdict.result.as_deref())
                     .is_some_and(|result| matches!(result, "type_mismatch" | "method_mismatch"))
         });
+        // A row outside the change is the work's only if the index held the
+        // same row, at the same line, with a pair that agreed (rules 3 to 6).
+        let outside = if in_change {
+            None
+        } else {
+            match outside_before(before, strict, repo, operation) {
+                // It carried a mismatch before the change: not this work's.
+                OutsideBefore::Mismatch => continue,
+                other => Some(other),
+            }
+        };
+        let moved_here = matches!(outside, Some(OutsideBefore::Agreed));
+        // Outside the change a sibling's mismatch at another line says
+        // nothing about this row; `outside_before` decided on the line.
+        let already = already && in_change;
         let named: Vec<&String> = finding
             .map(|f| f.call_sites.iter().collect())
             .unwrap_or_default();
@@ -728,10 +1005,16 @@ fn judge(
                 .unwrap_or_else(|| "not_stated".to_string()),
             already_indexed: already,
             unconfirmed: false,
-            outside_the_change: false,
-            other_build: fact && !already && !same_build,
-            fails: fact && !already && same_build,
+            outside_the_change: !in_change,
+            not_judged_before: matches!(outside, Some(OutsideBefore::NotJudged)),
+            other_build: fact && !already && !same_build && (in_change || moved_here),
+            fails: fact && !already && same_build && (in_change || moved_here),
         });
+        // Only a pair the index held compatible moved; one with no earlier
+        // verdict is listed and counted apart, as "not judged before".
+        if moved_here {
+            judged.outside_moved += 1;
+        }
     }
 
     for unmatched in &join.unmatched {
@@ -783,11 +1066,127 @@ fn judge(
                     already_indexed: already,
                     unconfirmed,
                     outside_the_change: !is_changed(repo, &file),
+                    not_judged_before: false,
                     other_build,
                     fails: new_fact && !other_build,
                 });
             }
         }
+    }
+    // A call in a file the work did not touch, kept alive only by
+    // documentation (carrick#3192). The routes package states its operations
+    // in a handler-less table that the scan folds onto the handler row with
+    // the same method and path. When the work moves the handler's path, the
+    // table row has no partner and stays a route, so the call still matches
+    // and the unmatched loop above sees nothing. The call is named when the
+    // index matched it to producers that all sit in changed files, and every
+    // producer it matches now is a documentation row.
+    for operation in join
+        .operations
+        .iter()
+        .filter(|operation| operation.role == Role::Consumer)
+    {
+        let Some(&(repo, repo_path)) = repo_of.get(operation.service.as_str()) else {
+            continue;
+        };
+        if is_changed(repo, &operation.file) {
+            continue;
+        }
+        let Some(old) = indexed_rows(before, repo, &operation.file).find(|old| {
+            same_operation(old, operation, strict)
+                && old.line == operation.line
+                && !old.counterparts.is_empty()
+        }) else {
+            continue;
+        };
+        let producers_changed = old.counterparts.iter().all(|counterpart| {
+            repo_of
+                .get(counterpart.service.as_str())
+                .is_some_and(|&(producer_repo, _)| is_changed(producer_repo, &counterpart.file))
+        });
+        if !producers_changed {
+            continue;
+        }
+        let served_by: Vec<&JoinedOperation> = join
+            .matches
+            .iter()
+            .filter(|edge| {
+                edge.consumer_service == operation.service
+                    && edge.consumer_key == operation.key
+                    && edge.consumer_file.as_deref() == Some(operation.file.as_str())
+                    && edge.consumer_line == operation.line
+            })
+            .flat_map(|edge| {
+                join.operations.iter().filter(|producer| {
+                    producer.role == Role::Producer
+                        && producer.service == edge.producer_service
+                        && producer.key == edge.producer_key
+                })
+            })
+            .collect();
+        let documentation_only = !served_by.is_empty()
+            && served_by.iter().all(|producer| {
+                crate::agents::FileOrchestrator::is_documentation_route(
+                    producer.resolution_source,
+                    producer.handler.as_deref(),
+                )
+            });
+        if !documentation_only {
+            continue;
+        }
+        let document = served_by[0];
+        let document_at = repo_of.get(document.service.as_str()).map_or_else(
+            || document.file.clone(),
+            |&(_, path)| shown(root, path, &document.file),
+        );
+        let document_line = document.line.map_or(String::new(), |l| format!(":{l}"));
+        // The handler that served this call, read again at the same line and
+        // the same verb under another path: it moved, and the documentation
+        // is all that still states the old route.
+        let moved_to = old.counterparts.iter().find_map(|counterpart| {
+            let &(producer_repo, producer_path) = repo_of.get(counterpart.service.as_str())?;
+            let row = indexed_rows(rebuilt, producer_repo, &counterpart.file).find(|row| {
+                row.kind == super::read_model::ItemKind::Route
+                    && row.source == Source::Fact
+                    && row.line == counterpart.line
+                    && row.method == operation.method
+                    && row.key != operation.key
+            })?;
+            Some((
+                shown(root, producer_path, &counterpart.file),
+                counterpart.line,
+                row.path.clone(),
+            ))
+        });
+        let confirmed = moved_to.is_some();
+        let reason = match moved_to {
+            Some((file, line, path)) => format!(
+                "the handler at {file}{} now serves {path}; only the documentation at \
+                 {document_at}{document_line} still states this route",
+                line.map_or(String::new(), |l| format!(":{l}")),
+            ),
+            None => format!(
+                "the handler that served this call was not read after the change; only the \
+                 documentation at {document_at}{document_line} still states this route"
+            ),
+        };
+        judged.problems.push(Problem {
+            kind: ProblemKind::NoRoute,
+            file: shown(root, repo_path, &operation.file),
+            line: operation.line,
+            role: "call".to_string(),
+            method: operation.method.clone(),
+            path: operation.path.clone(),
+            other: Vec::new(),
+            reason,
+            source: Source::Fact.as_str().to_string(),
+            already_indexed: false,
+            unconfirmed: !confirmed,
+            outside_the_change: true,
+            other_build: false,
+            not_judged_before: false,
+            fails: confirmed,
+        });
     }
     judged.problems.sort();
     judged.problems.dedup();
@@ -907,8 +1306,12 @@ impl ChangedOutput {
         // edited files.
         let mut unlisted: BTreeMap<Unlisted, usize> = BTreeMap::new();
         for problem in &self.problems {
-            if let (false, false, Some(why)) = (all, problem.outside_the_change, problem.unlisted())
-            {
+            if let (false, Some(why)) = (all, problem.unlisted()) {
+                // A file the work did not touch counts only when its verdict
+                // was not judged before; the rest lists by failing.
+                if problem.outside_the_change && why != Unlisted::OutsideNotJudged {
+                    continue;
+                }
                 *unlisted.entry(why).or_default() += 1;
             }
         }
@@ -949,6 +1352,9 @@ impl ChangedOutput {
                 self.not_type_checked.len()
             ));
         }
+        if self.outside_moved > 0 {
+            out.push_str(&outside_moved_clause(self.outside_moved));
+        }
         out.push('\n');
         for problem in listed {
             let at = match problem.line {
@@ -966,6 +1372,11 @@ impl ChangedOutput {
             };
             let note = if problem.other_build {
                 " [not checked: the index is from another scanner build]"
+            } else if problem.outside_the_change
+                && problem.kind == ProblemKind::Incompatible
+                && problem.fails
+            {
+                OUTSIDE_FAILING_NOTE
             } else {
                 problem.unlisted().map_or("", Unlisted::note)
             };
@@ -1037,6 +1448,7 @@ enum Unlisted {
     Unconfirmed,
     Candidate,
     NotStated,
+    OutsideNotJudged,
 }
 
 impl Unlisted {
@@ -1046,6 +1458,7 @@ impl Unlisted {
             Unlisted::Unconfirmed => " [unconfirmed: the base is set at run time, does not fail]",
             Unlisted::Candidate => " [model candidate, does not fail]",
             Unlisted::NotStated => " [source not stated, does not fail]",
+            Unlisted::OutsideNotJudged => OUTSIDE_NOT_JUDGED_NOTE,
         }
     }
 
@@ -1055,6 +1468,7 @@ impl Unlisted {
             Unlisted::Unconfirmed => format!("{count} unconfirmed"),
             Unlisted::Candidate => plural(count, "model candidate", "model candidates"),
             Unlisted::NotStated => format!("{count} with no stated source"),
+            Unlisted::OutsideNotJudged => outside_not_judged_counted(count),
         }
     }
 }
@@ -1068,6 +1482,7 @@ impl Problem {
             (true, _) => None,
             // Listed without `--all`: it is why the run exits 2.
             _ if self.other_build => None,
+            _ if self.not_judged_before => Some(Unlisted::OutsideNotJudged),
             _ if self.already_indexed => Some(Unlisted::AlreadyIndexed),
             _ if self.unconfirmed => Some(Unlisted::Unconfirmed),
             (false, "candidate") => Some(Unlisted::Candidate),
@@ -1107,9 +1522,68 @@ mod tests {
             already_indexed: false,
             unconfirmed: false,
             outside_the_change: false,
+            not_judged_before: false,
             other_build: false,
             fails,
         }
+    }
+
+    /// Rows outside the changed files whose verdict the change moved: the
+    /// summary says so, a failing one carries its note, and one not judged
+    /// before adds only to its own count (carrick#2998).
+    #[test]
+    fn outside_rows_are_said_on_the_summary_and_noted() {
+        let mut broken = problem(ProblemKind::Incompatible, true);
+        broken.outside_the_change = true;
+        let mut unjudged = problem(ProblemKind::Incompatible, false);
+        unjudged.outside_the_change = true;
+        unjudged.not_judged_before = true;
+        unjudged.path = "/u".to_string();
+        let output = |problems: Vec<Problem>, failing: usize, moved: usize| ChangedOutput {
+            calls: 1,
+            files: 1,
+            services: 2,
+            problems,
+            failing,
+            outside_moved: moved,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+
+        let text = output(vec![broken.clone(), unjudged.clone()], 1, 2).render(false);
+        let summary = text.lines().next().unwrap();
+        assert!(
+            summary
+                .contains(", plus 1 outside the changed files not judged before, run with --all"),
+            "{text}"
+        );
+        assert!(
+            summary.ends_with("; 2 rows outside the changed files whose verdict this change moved"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[outside the changed files: this change moved its verdict]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("not judged before, does not fail]"),
+            "{text}"
+        );
+
+        let all = output(vec![unjudged.clone()], 0, 1).render(true);
+        assert!(
+            all.contains("[outside the changed files: not judged before, does not fail]"),
+            "{all}"
+        );
+        assert!(
+            all.lines()
+                .next()
+                .unwrap()
+                .ends_with("; 1 row outside the changed files whose verdict this change moved"),
+            "{all}"
+        );
+        let none = output(vec![], 0, 0).render(false);
+        assert!(!none.contains("outside the changed files"), "{none}");
     }
 
     /// A file the work did not touch never adds to the summary of the edited
@@ -1272,6 +1746,61 @@ mod tests {
         let judged = judge(Path::new("/w"), &before, true, &rebuilt, &join, &changed);
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
         judged.problems.into_iter().next().unwrap()
+    }
+
+    /// A row outside the changed files counts as moved only when the index
+    /// held it resolved and compatible. One the index never judged is reported
+    /// and does not fail, and is not "moved" (carrick#2998).
+    #[test]
+    fn only_a_row_the_index_held_compatible_counts_as_moved() {
+        let row = |line: u32, key: &str, verdict: serde_json::Value| {
+            serde_json::json!({
+                "kind": "call", "service": "web", "key": key, "dispatch": null,
+                "method": "GET", "path": key.rsplit('|').next().unwrap(),
+                "line": line, "col": null, "source": "fact",
+                "resolution_source": null, "evidence": null,
+                "counterparts": [{"role": "producer", "service": "api", "file": "h.ts", "line": 1}],
+                "verdict": verdict
+            })
+        };
+        let compatible =
+            serde_json::json!({"state": "resolved", "result": "compatible", "detail": ""});
+        let mismatch = serde_json::json!({"state": "resolved", "result": "type_mismatch", "detail": "differs"});
+        let before = index_of(vec![
+            row(10, "http|GET|/was-fine", compatible),
+            row(20, "http|GET|/never-judged", serde_json::Value::Null),
+        ]);
+        let rebuilt = index_of(vec![
+            row(10, "http|GET|/was-fine", mismatch.clone()),
+            row(20, "http|GET|/never-judged", mismatch),
+        ]);
+        let operation = |line: u32, path: &str| {
+            serde_json::json!({
+                "role": "consumer", "service": "web", "key": format!("http|GET|{path}"),
+                "method": "GET", "path": path, "file": "client.ts", "line": line,
+                "resolution_source": null, "handler": null, "dispatch": null
+            })
+        };
+        let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
+            "scanner_version": "0",
+            "operations": [operation(10, "/was-fine"), operation(20, "/never-judged")],
+            "matches": [], "findings": [], "unmatched": [],
+            "type_check": {"state": "ran"}
+        }))
+        .expect("a join");
+        let edited: BTreeSet<String> = ["edited.ts".to_string()].into();
+        let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();
+
+        let judged = judge(Path::new("/w"), &before, true, &rebuilt, &join, &changed);
+
+        assert_eq!(judged.problems.len(), 2, "{:?}", judged.problems);
+        assert_eq!(judged.outside_moved, 1, "{:?}", judged.problems);
+        let unjudged = judged
+            .problems
+            .iter()
+            .filter(|p| p.not_judged_before)
+            .count();
+        assert_eq!(unjudged, 1, "{:?}", judged.problems);
     }
 
     /// A dispatch case renamed in the handler and the config leaves the call
@@ -1456,6 +1985,7 @@ mod tests {
             skipped: Some("not in a repo of this workspace".to_string()),
             unchecked: 1,
             no_base: false,
+            rescan: None,
         };
         let none = ChangedOutput {
             repos: vec![skipped.clone()],
@@ -1503,6 +2033,7 @@ mod tests {
             skipped: Some(String::new()),
             unchecked: 0,
             no_base: true,
+            rescan: None,
         };
         let output = ChangedOutput {
             repos: vec![bare],

@@ -1,0 +1,8 @@
+{
+  "name": "@fx/server",
+  "version": "1.0.0",
+  "main": "src/main.ts",
+  "dependencies": {
+    "@fx/routes": "workspace:*"
+  }
+}

@@ -208,6 +208,7 @@ fn swc_positions(file: &Path) -> Vec<(Kind, u32, u32)> {
         content.clone(),
         &cm,
         &handler,
+        None,
     )
     .unwrap_or_else(|| panic!("{} parses", file.display()));
     let mut positions = SwcPositions::default();

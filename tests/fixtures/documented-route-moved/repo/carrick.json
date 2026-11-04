@@ -1,0 +1,19 @@
+{
+  "services": [
+    {
+      "serviceName": "routes",
+      "directory": "packages/routes",
+      "tsconfig": "tsconfig.json"
+    },
+    {
+      "serviceName": "server",
+      "directory": "packages/server",
+      "tsconfig": "tsconfig.json"
+    },
+    {
+      "serviceName": "web",
+      "directory": "packages/web",
+      "tsconfig": "tsconfig.json"
+    }
+  ]
+}

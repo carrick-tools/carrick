@@ -41,10 +41,18 @@ fn repo_root() -> PathBuf {
 /// the workspace file. Returns the workspace root, which owns the temp dir for
 /// as long as the test holds it.
 fn workspace(fixture: &str, repos: &[&str]) -> tempfile::TempDir {
+    workspace_prepared(fixture, repos, |_| {})
+}
+
+/// [`workspace`], with `prepare` run on the workspace after the fixture is
+/// copied and before each repo is committed, so a test can add an edge the
+/// fixture does not hold without editing the fixture.
+fn workspace_prepared(fixture: &str, repos: &[&str], prepare: impl Fn(&Path)) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
     let source = repo_root().join("tests/fixtures").join(fixture);
     for repo in repos {
         copy_tree(&source.join(repo), &dir.path().join(repo));
+        prepare(&dir.path().join(repo));
         git(&dir.path().join(repo), &["init", "-q", "."]);
         git(&dir.path().join(repo), &["add", "-A"]);
         git(
@@ -98,16 +106,33 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+/// A re-scanning `check` (`--changed`, named files, `--recheck`) and the
+/// `refresh` that writes the index it reads (a refresh with no credential
+/// leaves the not-signed-in mark on every service it carries) ask the
+/// library store, and a machine with no credential is refused and not checked
+/// (carrick#3249). These tests are about what a check finds, so they run as a
+/// signed-in machine does: the mock store answers, with no claims, which is
+/// the answer the store gave before. The one test that wants the refusal
+/// builds its own command.
+fn as_signed_in(command: &mut Command, args: &[&str]) {
+    if matches!(args.first(), Some(&"check" | &"refresh")) {
+        command.env("CARRICK_MOCK_ALL", "1");
+    }
+}
+
 /// Run a carrick command in the workspace and return its stdout. Read-only
 /// commands must always exit 0, which is asserted here rather than in every
 /// test: a hook that fails an edit because an index is stale is the failure
 /// mode this path exists to avoid.
 fn run(workspace: &Path, args: &[&str]) -> String {
-    let output = Command::new(carrick())
+    let mut command = Command::new(carrick());
+    command
         .args(args)
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
-        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"));
+    as_signed_in(&mut command, args);
+    let output = command
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
     assert!(
@@ -185,6 +210,7 @@ fn run_with_env(workspace: &Path, args: &[&str], env: &[(&str, &str)]) -> String
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"));
+    as_signed_in(&mut command, args);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -2608,6 +2634,7 @@ fn check_changed(workspace: &Path, json: bool) -> (Option<i32>, String) {
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
     (
@@ -2625,6 +2652,7 @@ fn check_changed_all(workspace: &Path) -> (Option<i32>, String) {
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap_or_else(|e| panic!("carrick check --changed --all: {e}"));
     (
@@ -2643,6 +2671,7 @@ fn check_files(workspace: &Path, files: &[&str]) -> (Option<i32>, String) {
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap_or_else(|e| panic!("carrick check {files:?}: {e}"));
     (
@@ -2819,6 +2848,7 @@ fn a_signalled_check_ends_its_re_scan_and_the_re_scans_sidecar() {
         .args(["check", "--changed", "--workspace", "."])
         .current_dir(root)
         .env_remove("CARRICK_TOKEN")
+        .env("CARRICK_MOCK_ALL", "1")
         .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
         .env("CARRICK_SIDECAR_DIR", root.join(".busy-sidecar"))
@@ -2928,6 +2958,7 @@ fn check_changed_keeps_talking_to_a_caller_that_kills_silent_commands() {
         .args(["check", "--changed", "--workspace", ".", "--json"])
         .current_dir(root)
         .env_remove("CARRICK_TOKEN")
+        .env("CARRICK_MOCK_ALL", "1")
         .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
         .env("CARRICK_SIDECAR_DIR", root.join(".stalled-sidecar"))
@@ -3123,6 +3154,188 @@ fn check_changed_does_not_fail_on_a_problem_the_index_already_held() {
         "as one the index held:\n{text}"
     );
     assert_eq!(code, Some(0), "{text}");
+}
+
+/// `check --changed --json` with extra environment: the exit code, the JSON
+/// and stderr, where the narrator says whether a repo was re-read.
+fn check_changed_json_with(
+    workspace: &Path,
+    env: &[(&str, &str)],
+) -> (Option<i32>, serde_json::Value, String) {
+    let mut command = Command::new(carrick());
+    command
+        .args(["check", "--changed", "--workspace", ".", "--json"])
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env_remove("CARRICK_CHECK_RESCAN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run carrick check --changed");
+    let body = String::from_utf8(output.stdout).expect("stdout was not UTF-8");
+    let json = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("check --changed --json was not JSON: {e}\n{body}"));
+    (
+        output.status.code(),
+        json,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// What `rescan` says for the repo whose folder is `name`.
+fn rescan_of(json: &serde_json::Value, name: &str) -> Option<String> {
+    json["repos"]
+        .as_array()?
+        .iter()
+        .find(|repo| repo["repo"].as_str().is_some_and(|r| r.ends_with(name)))?["rescan"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The answer without the two fields that say how it was reached.
+fn without_how(json: &serde_json::Value) -> serde_json::Value {
+    let mut json = json.clone();
+    json.as_object_mut()
+        .expect("an object")
+        .remove("elapsed_ms");
+    for repo in json["repos"].as_array_mut().expect("repos") {
+        repo.as_object_mut().expect("a repo").remove("rescan");
+    }
+    json
+}
+
+/// A branch whose main already holds a type mismatch below a route: the
+/// producer stopped sending a field the consumer reads. The index is built
+/// from that commit, then the work moves to a branch.
+fn a_mismatch_the_index_already_holds() -> (tempfile::TempDir, PathBuf) {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let producer = root.join("catalog-web");
+    let route = producer.join("app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+    commit_all(&producer, "drop activeCount, on main");
+    index(root);
+    git(&producer, &["checkout", "-qb", "feature"]);
+    (workspace, route)
+}
+
+/// carrick#3245: a comment nothing reads, added above the route, starts no
+/// re-scan. The answer is the re-scan's answer, with the mismatch at the line
+/// the code moved to.
+#[test]
+#[serial]
+fn check_changed_answers_a_comment_only_edit_without_a_re_scan() {
+    let (workspace, route) = a_mismatch_the_index_already_holds();
+    let root = workspace.path();
+    edit(
+        &route,
+        "export async function loader",
+        "// A plain note.\nexport async function loader",
+    );
+
+    // Where the route's handler is written, once the note is above it.
+    let loader_line = std::fs::read_to_string(&route)
+        .expect("read the route")
+        .lines()
+        .position(|line| line.starts_with("export async function loader"))
+        .expect("the loader") as u64
+        + 1;
+
+    let (code, json, stderr) = check_changed_json_with(root, &[]);
+    assert_eq!(
+        rescan_of(&json, "catalog-web").as_deref(),
+        Some("not_needed"),
+        "{json:#}"
+    );
+    assert!(
+        stderr.contains("nothing the scan reads changed in catalog-web"),
+        "said so:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("re-reading"),
+        "no re-scan started:\n{stderr}"
+    );
+    let problem = &json["problems"][0];
+    assert_eq!(problem["kind"], "incompatible", "{json:#}");
+    assert_eq!(problem["already_indexed"], true, "{json:#}");
+    assert_eq!(
+        problem["line"], loader_line,
+        "printed at the line the handler moved to, not where the index wrote it:\n{json:#}"
+    );
+    assert_eq!(code, Some(0), "{json:#}");
+
+    let (_, always, stderr) = check_changed_json_with(root, &[("CARRICK_CHECK_RESCAN", "always")]);
+    assert_eq!(
+        rescan_of(&always, "catalog-web").as_deref(),
+        Some("ran"),
+        "{always:#}"
+    );
+    assert!(
+        stderr.contains("re-reading"),
+        "the switch re-scans:\n{stderr}"
+    );
+    assert!(always["problems"][0]["line"].is_u64(), "{always:#}");
+    // This machine is not signed in (carrick#3249), so a forced re-scan says
+    // its library facts were unavailable; the answer from the index has no
+    // such line. What the two must agree on is the problems and their lines.
+    assert!(
+        always["not_checked"]
+            .as_str()
+            .is_some_and(|line| line.contains("not signed in")),
+        "{always:#}"
+    );
+    let mut always = without_how(&always);
+    always
+        .as_object_mut()
+        .expect("an object")
+        .remove("not_checked");
+    assert_eq!(
+        without_how(&json),
+        always,
+        "the answer without the re-scan is the re-scan's, at the moved line"
+    );
+}
+
+/// A comment the scan reads (`@ts-expect-error`) is not a comment nothing
+/// reads: the repo is re-scanned.
+#[test]
+#[serial]
+fn check_changed_re_scans_a_directive_comment_edit() {
+    let (workspace, route) = a_mismatch_the_index_already_holds();
+    let root = workspace.path();
+    edit(
+        &route,
+        "export async function loader",
+        "// @ts-expect-error\nexport async function loader",
+    );
+    let (_, json, stderr) = check_changed_json_with(root, &[]);
+    assert_eq!(
+        rescan_of(&json, "catalog-web").as_deref(),
+        Some("ran"),
+        "{json:#}"
+    );
+    assert!(stderr.contains("re-reading"), "{stderr}");
+}
+
+/// A string the code states changed: the repo is re-scanned and the answer is
+/// the re-scan's.
+#[test]
+#[serial]
+fn check_changed_re_scans_a_string_edit() {
+    let (workspace, route) = a_mismatch_the_index_already_holds();
+    let root = workspace.path();
+    edit(&route, "\"hex-key\"", "\"allen-key\"");
+    let (_, json, _) = check_changed_json_with(root, &[]);
+    assert_eq!(
+        rescan_of(&json, "catalog-web").as_deref(),
+        Some("ran"),
+        "{json:#}"
+    );
+    let (_, always, _) = check_changed_json_with(root, &[("CARRICK_CHECK_RESCAN", "always")]);
+    assert_eq!(without_how(&json), without_how(&always));
 }
 
 /// A problem that was already on main, in a file the work did not touch, is
@@ -3640,13 +3853,16 @@ fn carry_workspace_with(prepare: impl FnOnce(&Path)) -> tempfile::TempDir {
 
 /// A command with its exit code, since a failing check is the point here.
 fn carrick_code(workspace: &Path, args: &[&str]) -> (Option<i32>, String) {
-    let output = Command::new(carrick())
+    let mut command = Command::new(carrick());
+    command
         .args(args)
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
-        .env("CARRICK_RECHECK_BUDGET_MS", "600000")
+        .env("CARRICK_RECHECK_BUDGET_MS", "600000");
+    as_signed_in(&mut command, args);
+    let output = command
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
     (
@@ -4243,6 +4459,414 @@ fn carrying_leaves_a_clean_tree_and_a_model_scan_alone() {
     );
 }
 
+// --- carrick#3198: the per-edit re-check reads the edited file's service ---
+
+const SHOP: &str = "recheck-one-repo-two-services";
+const SHOP_ROUTE: &str = "shop/catalog/app/routes/api.v1.widgets.$widgetId.ts";
+const SHOP_HEALTH: &str = "shop/catalog/app/routes/api.v1.health.ts";
+const SHOP_CLIENT: &str = "shop/inventory/src/client.ts";
+const SHOP_LEDGER: &str = "shop/ledger/app/routes/api.v1.entries.ts";
+
+/// An ample budget, so a re-check that fits is the thing under test.
+const AMPLE: [(&str, &str); 1] = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
+
+fn shop() -> tempfile::TempDir {
+    workspace(SHOP, &["shop"])
+}
+
+/// `check <file> --recheck --json`, parsed.
+fn recheck_json(root: &Path, file: &str, env: &[(&str, &str)]) -> serde_json::Value {
+    let text = run_with_env(
+        root,
+        &["check", file, "--workspace", ".", "--recheck", "--json"],
+        env,
+    );
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
+}
+
+fn reread(answer: &serde_json::Value) -> Vec<String> {
+    answer["recheck"]["scope"]["reread"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no recheck.scope.reread in:\n{answer:#}"))
+        .iter()
+        .map(|id| id.as_str().expect("a service id").to_string())
+        .collect()
+}
+
+/// Append a comment, which moves no type and no row.
+fn comment_in(file: &Path, text: &str) {
+    let existing = std::fs::read_to_string(file).expect("read the file");
+    std::fs::write(file, format!("{existing}\n// {text}\n")).expect("write the comment");
+}
+
+/// A re-check reads the edited file's service and judges every other service
+/// at the newest copy it has: here the client, as the last re-check left it.
+/// Reading the whole repo again would give the same verdict by a different
+/// road, so the scope is what pins this (carrick#3198).
+#[test]
+#[serial]
+fn a_re_check_reads_only_the_edited_files_service_and_judges_against_the_last_re_check() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+
+    // The client now reads a string where the route serves a number.
+    edit(
+        &root.join(SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let client = recheck_json(root, SHOP_CLIENT, &AMPLE);
+    assert_eq!(reread(&client), ["inventory"], "{client:#}");
+    assert_eq!(
+        client["items"][0]["verdict"]["result"],
+        serde_json::json!("type_mismatch"),
+        "{client:#}"
+    );
+
+    // The route is changed to match. The client is NOT re-read: it stands in
+    // at the copy the last re-check left, which already reads a string.
+    let route = root.join(SHOP_ROUTE);
+    edit(&route, "activeCount: number", "activeCount: string");
+    edit(&route, "activeCount: 3", "activeCount: \"3\"");
+    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    assert_eq!(
+        answer["items"][0]["verdict"]["result"],
+        serde_json::json!("compatible"),
+        "judged against the client as the last re-check left it:\n{answer:#}"
+    );
+    let not_reread = answer["recheck"]["scope"]["not_reread"]
+        .as_array()
+        .expect("not_reread");
+    let inventory = not_reread
+        .iter()
+        .find(|entry| entry["service"] == "inventory")
+        .unwrap_or_else(|| panic!("inventory is named as not re-read:\n{answer:#}"));
+    assert_eq!(
+        inventory["reason"],
+        serde_json::json!("judged at your last re-check of it"),
+        "{answer:#}"
+    );
+    assert!(
+        answer["recheck"]["scope"]["stale"]
+            .as_array()
+            .is_none_or(|stale| stale.is_empty()),
+        "{answer:#}"
+    );
+}
+
+/// A service that imports the edited file is never judged unannounced. The
+/// type-use record names only the operations that read a type the file
+/// declares, so a constant the client imports is invisible to it; the import
+/// closure names the reader, the scope calls it stale, and a service that
+/// imports nothing keeps its plain reason (carrick#3198).
+#[test]
+#[serial]
+fn a_re_check_names_a_service_that_reads_the_edited_file() {
+    let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
+        std::fs::write(
+            repo.join("catalog/app/shared.ts"),
+            "export const widgetBase = \"/api/v1/widgets\";\n",
+        )
+        .expect("write the shared module");
+        let client = repo.join("inventory/src/client.ts");
+        edit(
+            &client,
+            "import { send } from \"./send.js\";",
+            "import { send } from \"./send.js\";\nimport { widgetBase } from \"../../catalog/app/shared\";",
+        );
+        edit(
+            &client,
+            "/api/v1/widgets/${encoded}",
+            "${widgetBase}/${encoded}",
+        );
+    });
+    let root = workspace.path();
+    index(root);
+
+    let shared = "shop/catalog/app/shared.ts";
+    edit(&root.join(shared), "/api/v1/widgets", "/api/v2/widgets");
+    let answer = recheck_json(root, shared, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    let reason_of = |service: &str| -> String {
+        answer["recheck"]["scope"]["not_reread"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["service"] == service))
+            .and_then(|entry| entry["reason"].as_str())
+            .unwrap_or_else(|| panic!("{service} is named as not re-read:\n{answer:#}"))
+            .to_string()
+    };
+    assert!(
+        reason_of("inventory").starts_with("reads catalog/app/shared.ts, edited since the index"),
+        "{answer:#}"
+    );
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!(["inventory"]),
+        "{answer:#}"
+    );
+    assert_eq!(
+        reason_of("ledger"),
+        "no edits since the index; judged at its indexed version",
+        "ledger imports nothing, so the edit is none of its business:\n{answer:#}"
+    );
+}
+
+/// A miss in one service leaves the other services of the repo re-checked, and
+/// a new index tries the missed one again.
+#[test]
+#[serial]
+fn a_miss_in_one_service_leaves_the_others_re_checked() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    comment_in(&root.join(SHOP_ROUTE), "catalog edit one");
+    comment_in(&root.join(SHOP_LEDGER), "ledger edit");
+
+    let missed = recheck_json(root, SHOP_ROUTE, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
+    assert_eq!(
+        missed["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{missed:#}"
+    );
+    assert_eq!(
+        missed["recheck"]["known_miss"],
+        serde_json::Value::Null,
+        "{missed:#}"
+    );
+
+    // Another service of the same repo is still re-checked.
+    let ledger = recheck_json(root, SHOP_LEDGER, &AMPLE);
+    assert_ne!(
+        ledger["recheck"]["ran"],
+        serde_json::json!("none"),
+        "one service's miss does not silence the repo:\n{ledger:#}"
+    );
+    assert_eq!(reread(&ledger), ["ledger"], "{ledger:#}");
+
+    // The missed service starts no re-scan, and the reason names it.
+    comment_in(&root.join(SHOP_ROUTE), "catalog edit two");
+    let skipped = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(
+        skipped["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{skipped:#}"
+    );
+    assert_eq!(skipped["recheck"]["known_miss"], serde_json::json!(true));
+    assert!(
+        skipped["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("catalog") && reason.contains("check --changed")),
+        "the reason names the service and the fresh read:\n{skipped:#}"
+    );
+
+    // A new index is a new generation: catalog is re-checked again.
+    std::thread::sleep(Duration::from_millis(1100));
+    index(root);
+    comment_in(&root.join(SHOP_ROUTE), "catalog edit three");
+    let fresh = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_ne!(
+        fresh["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{fresh:#}"
+    );
+}
+
+/// `check --each` reads the memory per file: after a service misses, its other
+/// files answer at once with the reason while another service's file is still
+/// re-checked.
+#[test]
+#[serial]
+fn check_each_answers_a_missed_services_other_files_at_once() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    comment_in(&root.join(SHOP_ROUTE), "catalog route");
+    comment_in(&root.join(SHOP_HEALTH), "catalog health");
+    comment_in(&root.join(SHOP_LEDGER), "ledger");
+
+    let missed = recheck_json(root, SHOP_ROUTE, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
+    assert_eq!(missed["recheck"]["ran"], serde_json::json!("none"));
+
+    let text = run_with_env(
+        root,
+        &[
+            "check",
+            "--each",
+            SHOP_HEALTH,
+            SHOP_LEDGER,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+        &AMPLE,
+    );
+    let answers: Vec<serde_json::Value> =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not a JSON array: {e}\n{text}"));
+    assert_eq!(answers.len(), 2, "{text}");
+    assert_eq!(answers[0]["recheck"]["known_miss"], serde_json::json!(true));
+    assert!(
+        answers[0]["recheck"]["elapsed_ms"].as_u64().unwrap() < 1000,
+        "the missed service's other file answers at once:\n{:#}",
+        answers[0]
+    );
+    assert_ne!(
+        answers[1]["recheck"]["ran"],
+        serde_json::json!("none"),
+        "the other service's file is re-checked:\n{:#}",
+        answers[1]
+    );
+}
+
+/// The type checker's answers are kept per index, and a re-check of an edit
+/// that moves no type reads the index's own answer instead of judging again.
+///
+/// Proved by planting: the one answer `refresh` kept is rewritten to say the
+/// pair is unverifiable, and a comment-only edit's re-check then reports that
+/// verdict, so it can only have come from the kept file. The folder still
+/// holds that one key afterwards, which also shows the capture's stubs are
+/// byte-stable across a re-scan.
+#[test]
+#[serial]
+fn a_type_neutral_edit_reuses_the_indexs_type_check_answer() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+
+    let kept = |root: &Path| -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(generations) = std::fs::read_dir(root.join(".carrick/judged")) else {
+            return found;
+        };
+        for generation in generations.filter_map(Result::ok) {
+            for answer in std::fs::read_dir(generation.path())
+                .expect("read a generation")
+                .filter_map(Result::ok)
+            {
+                found.push(answer.path());
+            }
+        }
+        found
+    };
+    let before = kept(root);
+    assert_eq!(
+        before.len(),
+        1,
+        "`refresh` keeps the one answer its join reached: {before:?}"
+    );
+    let text = std::fs::read_to_string(&before[0]).expect("read the kept answer");
+    assert!(text.contains("\"bucket\":\"compatible\""), "{text}");
+    std::fs::write(
+        &before[0],
+        text.replace("\"bucket\":\"compatible\"", "\"bucket\":\"unverifiable\""),
+    )
+    .expect("plant the answer");
+
+    comment_in(&root.join(SHOP_ROUTE), "moves no type");
+    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(
+        answer["recheck"]["ran"],
+        serde_json::json!("extraction+types")
+    );
+    assert_eq!(
+        answer["items"][0]["verdict"]["state"],
+        serde_json::json!("unresolved"),
+        "the verdict is the kept answer's, not a new judgement:\n{answer:#}"
+    );
+    assert_eq!(kept(root), before, "no second key: the stubs did not move");
+}
+
+/// The consumer's `Widget` type moves into its own file, which `client.ts`
+/// imports. Committed before the index is built, so the edit that follows is
+/// to a file holding no route and no call.
+fn move_the_consumers_type_to_its_own_file(inventory: &Path) {
+    let client = inventory.join("src/client.ts");
+    edit(
+        &client,
+        "export type Widget = {\n  id: string;\n  name: string;\n  activeCount: number;\n};\n",
+        "import type { Widget } from \"./types.js\";\n",
+    );
+    std::fs::write(
+        inventory.join("src/types.ts"),
+        "export type Widget = {\n  id: string;\n  name: string;\n  activeCount: number;\n};\n",
+    )
+    .expect("write types.ts");
+    commit_all(inventory, "move the type");
+}
+
+/// The problem rows of a `--json` answer that sit in a file ending `suffix`.
+fn problems_in(json: &serde_json::Value, suffix: &str) -> Vec<serde_json::Value> {
+    json["problems"]
+        .as_array()
+        .expect("problems")
+        .iter()
+        .filter(|p| p["file"].as_str().is_some_and(|f| f.ends_with(suffix)))
+        .cloned()
+        .collect()
+}
+
+/// A type edited in a file that holds no route and no call breaks the call
+/// that reads it (carrick#2998): the check reports the call in the untouched
+/// file, marked as outside the change, and fails the run.
+#[test]
+#[serial]
+fn a_shared_type_edit_fails_the_rows_it_breaks() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    move_the_consumers_type_to_its_own_file(&root.join("inventory-svc"));
+    index(root);
+    edit(
+        &root.join("inventory-svc/src/types.ts"),
+        "activeCount: number",
+        "activeCount: string",
+    );
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(1), "{json:#}");
+    let call = problems_in(&json, "src/client.ts")
+        .into_iter()
+        .find(|p| p["role"] == "call" && p["kind"] == "incompatible")
+        .unwrap_or_else(|| panic!("the call in client.ts is reported:\n{json:#}"));
+    assert_eq!(call["outside_the_change"], true, "{call:#}");
+    assert_eq!(call["fails"], true, "{call:#}");
+    assert!(json["outside_moved"].as_u64() >= Some(1), "{json:#}");
+    assert_eq!(json["routes"], 0, "the counts stay about the edited file");
+    assert_eq!(json["calls"], 0, "the counts stay about the edited file");
+
+    let (_, text) = check_changed(root, false);
+    assert!(
+        text.contains(" outside the changed files whose verdict this change moved"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[outside the changed files: this change moved its verdict]"),
+        "{text}"
+    );
+}
+
+/// A comment is not a type change: nothing outside the edited file moves.
+#[test]
+#[serial]
+fn a_comment_in_a_shared_type_file_moves_nothing_outside_it() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    move_the_consumers_type_to_its_own_file(&root.join("inventory-svc"));
+    index(root);
+    edit(
+        &root.join("inventory-svc/src/types.ts"),
+        "export type Widget",
+        "// what the catalog sends\nexport type Widget",
+    );
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(0), "{json:#}");
+    assert_eq!(json["outside_moved"], 0, "{json:#}");
+}
+
 /// The environment a check or a refresh needs to walk a repo's services and
 /// read the sibling a service calls into, with the models mocked and the
 /// store's label for the default library coming from the repo's cassette.
@@ -4382,4 +5006,367 @@ fn git_head(repo: &Path) -> String {
         .output()
         .expect("git rev-parse");
     String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// carrick#3249: a machine that is not signed in cannot ask the library
+/// store, so a route registered through a server package does not exist
+/// locally. `check --changed` must not read that as a pass.
+///
+/// The fixture's one route is registered through a package whose claims the
+/// store cassette holds. The index is written with the store answering (the
+/// mock stands for a signed-in machine). Then the route's path is renamed on a
+/// branch and the check runs twice: with no credential, which is a real
+/// `oidc_unavailable` before any request leaves the process, and with the
+/// store answering, which behaves as before.
+#[test]
+#[serial]
+fn check_changed_says_when_the_library_store_cannot_be_asked() {
+    let workspace = workspace("receiver-trace", &["repo"]);
+    let root = workspace.path();
+    let cassettes = root.join("cassettes");
+    std::fs::create_dir_all(cassettes.join("library-claims")).unwrap();
+    std::fs::copy(
+        repo_root().join("tests/fixtures/receiver-trace/library-claims.json"),
+        cassettes.join("library-claims/default.json"),
+    )
+    .unwrap();
+    let cassettes = format!("{}/", cassettes.display());
+    let signed_in = |args: &[&str]| {
+        let output = Command::new(carrick())
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_CHECK_BUDGET_MS", "600000")
+            .env("CARRICK_MOCK_ALL", "1")
+            .env("CARRICK_MOCK_FIXTURE_DIR", &cassettes)
+            .output()
+            .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        )
+    };
+    let repo = root.join("repo");
+    // One root service, found as `carrick init` finds it.
+    git(&repo, &["rm", "-q", "carrick.json"]);
+    commit_all(&repo, "no config");
+    git(&repo, &["branch", "-M", "main"]);
+    let (code, _) = signed_in(&["refresh", "--workspace", "."]);
+    assert_eq!(code, Some(0));
+
+    git(&repo, &["checkout", "-qb", "feature"]);
+    edit(&repo.join("src/routes.ts"), "\"/c\"", "\"/d\"");
+    commit_all(&repo, "rename the route");
+
+    let unsigned = |args: &[&str]| {
+        let output = Command::new(carrick())
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_CHECK_BUDGET_MS", "600000")
+            .env("CARRICK_RECHECK_BUDGET_MS", "600000")
+            .output()
+            .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        )
+    };
+    let (code, text) = unsigned(&["check", "--changed", "--workspace", "."]);
+    assert_eq!(code, Some(2), "not signed in is not a pass:\n{text}");
+    assert_eq!(
+        text,
+        "carrick check: not checked: library facts unavailable: this machine is not signed \
+         in. Run carrick login.\n"
+    );
+    let (_, body) = unsigned(&["check", "--changed", "--workspace", ".", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(
+        json["not_checked"],
+        "library facts unavailable: this machine is not signed in. Run carrick login.",
+        "{json:#}"
+    );
+
+    let (code, text) = unsigned(&[
+        "check",
+        "repo/src/routes.ts",
+        "--recheck",
+        "--workspace",
+        ".",
+        "--json",
+    ]);
+    let json: serde_json::Value = serde_json::from_str(&text).expect("--json is JSON");
+    assert_eq!(json["recheck"]["ran"], "none", "{json:#}");
+    assert_eq!(
+        json["recheck"]["reason"],
+        "library facts unavailable: this machine is not signed in. Run carrick login.",
+        "{json:#}"
+    );
+    assert_eq!(
+        code,
+        Some(2),
+        "a re-check that read nothing exits 2:\n{text}"
+    );
+
+    let (_, text) = signed_in(&["check", "--changed", "--workspace", "."]);
+    assert!(
+        text.starts_with("carrick check: checked 1 route") && !text.contains("not signed in"),
+        "a signed-in run reads the route through the store's claims:\n{text}"
+    );
+
+    // Signed in, and the store cannot be reached: the same refusal to read a
+    // pass, with its own cause. The fixture directory stands in for the dead
+    // network with a message for the store's route.
+    let down = root.join("down");
+    std::fs::create_dir_all(down.join("library-claims")).unwrap();
+    std::fs::write(
+        down.join("library-claims/unreachable.txt"),
+        "network is down",
+    )
+    .unwrap();
+    let offline = |args: &[&str]| {
+        let output = Command::new(carrick())
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_CHECK_BUDGET_MS", "600000")
+            .env("CARRICK_RECHECK_BUDGET_MS", "600000")
+            .env("CARRICK_MOCK_ALL", "1")
+            .env("CARRICK_MOCK_FIXTURE_DIR", format!("{}/", down.display()))
+            .output()
+            .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        )
+    };
+    let (code, text) = offline(&["check", "--changed", "--workspace", "."]);
+    assert_eq!(code, Some(2), "an unreachable store is not a pass:\n{text}");
+    assert_eq!(
+        text,
+        "carrick check: not checked: library facts unavailable: Carrick's library store could \
+         not be reached.\n"
+    );
+    let (code, text) = offline(&[
+        "check",
+        "repo/src/routes.ts",
+        "--recheck",
+        "--workspace",
+        ".",
+        "--json",
+    ]);
+    let json: serde_json::Value = serde_json::from_str(&text).expect("--json is JSON");
+    assert_eq!(
+        json["recheck"]["reason"],
+        "library facts unavailable: Carrick's library store could not be reached.",
+        "{json:#}"
+    );
+    assert_eq!(code, Some(2), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// carrick#3192: a call whose handler moved, kept alive only by documentation,
+// reaches no route. The routes package states its operations twice: the
+// handlers in `widgets.ts`, and a handler-less table in `openapi.ts` that the
+// scan folds onto them. Move a handler's path and the table row has no
+// partner, stays a route, and keeps the call in `web` matched.
+// ---------------------------------------------------------------------------
+
+const DOC_WIDGETS: &str = "repo/packages/routes/src/widgets.ts";
+const DOC_TABLE: &str = "repo/packages/routes/src/openapi.ts";
+
+/// A command in the documented-route workspace with the library store
+/// replayed from the fixture's cassette: the re-scan `check --changed` runs
+/// reads the handlers as facts only when the store answers it too.
+fn documented_command(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(carrick());
+    command
+        .args(args)
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_POSITION_ROWS", "1")
+        .env("CARRICK_SITE_QUESTIONS", "1")
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", root.join(".test-cassettes").display()),
+        );
+    command
+}
+
+/// `check --changed --json` in the documented-route workspace.
+fn documented_check(root: &Path) -> (Option<i32>, String) {
+    let output = documented_command(root, &["check", "--changed", "--workspace", ".", "--json"])
+        .output()
+        .expect("spawn carrick check");
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
+/// The fixture's repo, committed and indexed with the library store replayed
+/// from its cassette and no model, so the handlers are read as facts.
+fn documented_route_workspace() -> tempfile::TempDir {
+    let workspace = workspace("documented-route-moved", &["repo"]);
+    let root = workspace.path();
+    let cassettes = root.join(".test-cassettes");
+    std::fs::create_dir_all(cassettes.join("library-claims")).expect("cassette dir");
+    std::fs::copy(
+        repo_root().join("tests/fixtures/documented-route-moved/library-claims.json"),
+        cassettes.join("library-claims/default.json"),
+    )
+    .expect("copy the store cassette");
+    let output = documented_command(root, &["refresh", "--workspace", "."])
+        .output()
+        .expect("spawn carrick refresh");
+    assert!(
+        output.status.success(),
+        "refresh failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    workspace
+}
+
+/// The problems `check --changed --json` names, as `file:line reason`.
+fn problems_of(json: &str) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .unwrap_or_else(|e| panic!("check --changed --json was not JSON: {e}\n{json}"));
+    value["problems"]
+        .as_array()
+        .map(|problems| {
+            problems
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}:{} {} fails={} unconfirmed={} {}",
+                        p["file"].as_str().unwrap_or_default(),
+                        p["line"],
+                        p["kind"].as_str().unwrap_or_default(),
+                        p["fails"],
+                        p["unconfirmed"],
+                        p["reason"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+#[serial]
+fn check_changed_names_a_call_only_documentation_still_serves_after_its_handler_moved() {
+    let workspace = documented_route_workspace();
+    let root = workspace.path();
+    edit(&root.join(DOC_WIDGETS), "'/widgets'", "'/gadgets'");
+
+    let (code, text) = documented_check(root);
+    let problems = problems_of(&text);
+    let named: Vec<&String> = problems
+        .iter()
+        .filter(|p| p.starts_with("repo/packages/web/src/client.ts:") && p.contains("fails=true"))
+        .collect();
+    assert_eq!(named.len(), 1, "{problems:#?}");
+    assert!(
+        named[0].contains("widgets.ts") && named[0].contains("openapi.ts"),
+        "the reason names both places: {}",
+        named[0]
+    );
+    assert_eq!(code, Some(1), "{text}");
+}
+
+/// The known positive: with the table gone the same rename reaches no route
+/// through the unmatched loop already, which proves the harness can fail.
+#[test]
+#[serial]
+fn check_changed_fails_the_moved_handler_with_no_documentation() {
+    let workspace = documented_route_workspace();
+    let root = workspace.path();
+    std::fs::remove_file(root.join(DOC_TABLE)).expect("delete the table");
+    edit(&root.join(DOC_WIDGETS), "'/widgets'", "'/gadgets'");
+
+    let (code, text) = documented_check(root);
+    assert!(
+        problems_of(&text)
+            .iter()
+            .any(|p| p.starts_with("repo/packages/web/src/client.ts:") && p.contains("fails=true")),
+        "{text}"
+    );
+    assert_eq!(code, Some(1), "{text}");
+}
+
+/// An edit to the table alone moves no handler: nothing new is named.
+#[test]
+#[serial]
+fn check_changed_does_not_name_a_call_when_only_the_documentation_changed() {
+    let workspace = documented_route_workspace();
+    let root = workspace.path();
+    edit(&root.join(DOC_TABLE), "List widgets", "List every widget");
+
+    let (code, text) = documented_check(root);
+    assert!(
+        !problems_of(&text)
+            .iter()
+            .any(|p| p.starts_with("repo/packages/web/src/client.ts:")),
+        "{text}"
+    );
+    assert_ne!(code, Some(1), "{text}");
+}
+
+/// The handler's line moved as well, so the re-read cannot say it is the same
+/// handler: a candidate, which does not fail.
+#[test]
+#[serial]
+fn check_changed_lists_a_moved_handler_it_cannot_find_again_as_a_candidate() {
+    let workspace = documented_route_workspace();
+    let root = workspace.path();
+    let widgets = root.join(DOC_WIDGETS);
+    edit(
+        &widgets,
+        "export async function widgetRoutes",
+        "// A note.\n// Another.\nexport async function widgetRoutes",
+    );
+    edit(&widgets, "'/widgets'", "'/gadgets'");
+
+    let (code, text) = documented_check(root);
+    let problems = problems_of(&text);
+    let named: Vec<&String> = problems
+        .iter()
+        .filter(|p| p.starts_with("repo/packages/web/src/client.ts:"))
+        .collect();
+    assert!(
+        named
+            .iter()
+            .all(|p| p.contains("fails=false") && p.contains("unconfirmed=true")),
+        "{problems:#?}"
+    );
+    assert_ne!(code, Some(1), "{text}");
+}
+
+/// A route the model stated and the re-read does not carry is no fact of this
+/// work: the fixture of that case has no failing problem on the untouched
+/// consumer.
+#[test]
+#[serial]
+fn check_changed_does_not_fail_a_model_row_that_was_not_carried_over_documentation() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "'/items/:id/status'",
+        "'/items/:id/state'",
+    );
+
+    let (_, text) = check_changed(root, true);
+    assert!(
+        !problems_of(&text)
+            .iter()
+            .any(|p| p.starts_with("items-web/") && p.contains("fails=true")),
+        "{text}"
+    );
 }

@@ -9,21 +9,28 @@
 //!
 //! Two phases, both of which already exist:
 //!
-//! 1. **One repo, re-scanned.** The same subprocess `index` runs per repo, with
-//!    no model and no upload: deterministic extraction plus the sidecar's type
-//!    capture, over the working tree. Its one network request is a read-only
-//!    ask to the library store with package names, versions, import
-//!    specifiers and the TypeScript library globals the code uses, no source
-//!    (`engine/mod.rs` `read_from_library_store`, `library_store.rs`
-//!    `RegistryPackage`). The blob the last index
-//!    wrote for that repo is handed in as `previous_data`, so the hosted model
-//!    answers for the files the edit did not touch replay exactly as they do on
-//!    an incremental scan.
+//! 1. **The edited file's service, re-scanned.** The same subprocess `index`
+//!    runs per repo, with no model and no upload: deterministic
+//!    extraction plus the sidecar's type capture, over the working tree. Its one
+//!    network request is a read-only ask to the library store with package
+//!    names, versions, import specifiers and the TypeScript library globals the
+//!    code uses, no source (`engine/mod.rs` `read_from_library_store`,
+//!    `library_store.rs` `RegistryPackage`). It
+//!    re-reads the edited file's own service and the services that hold an
+//!    operation reading a type declared in that file ([`Reach`]); every other
+//!    service stands in at its newest known version, the copy the last
+//!    re-check of it left or else the index's ([`Plan`], carrick#3198). The
+//!    blob the last index wrote for that repo is handed in as `previous_data`,
+//!    so the hosted model answers for the files the edit did not touch replay
+//!    exactly as they do on an incremental scan.
 //! 2. **The join, over blobs.** Every other service comes from the blobs
 //!    already on disk (`.carrick/repos`) and the cached hosted snapshot; the
 //!    join reads them, runs the v2 type check, and hands back the same
-//!    [`LocalJoin`] the indexer folds. Nothing is downloaded and nothing is
-//!    written outside a temporary directory this module deletes.
+//!    [`LocalJoin`] the indexer folds. Nothing is downloaded. The type
+//!    checker's finished answers are kept per index under
+//!    `.carrick/judged/<index generation>/`, and a re-read service's blob under
+//!    `.carrick/working/<index generation>/`; both are replaced by the next
+//!    index, and neither is the index itself.
 //!
 //! It also answers with the functions the edited file declares that the index
 //! does not hold, which is what the end-of-task reuse nudge speaks from
@@ -37,14 +44,16 @@
 //! leaves a scan running behind one.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use super::contract::{NotReread, RecheckScope};
 use super::index::{build, join_command, read_blobs, repo_label, scan_command, service_id};
-use super::read_model::IndexedItem;
+use super::read_model::{IndexedItem, IndexedRepo, IndexedService};
 use super::workspace::Workspace;
 use crate::engine::type_compat_v2::JUDGE_ANSWERS_ENV;
 
@@ -92,6 +101,8 @@ pub struct Fresh {
     pub new_functions: Vec<super::contract::NewFunction>,
     pub ran: Ran,
     pub elapsed: Duration,
+    /// Which services were re-read and which were not.
+    pub scope: RecheckScope,
 }
 
 /// How many new functions one answer carries.
@@ -110,9 +121,12 @@ pub struct Degraded {
     /// at their indexed age, but what the edit added is known either way.
     pub new_functions: Vec<super::contract::NewFunction>,
     pub elapsed: Duration,
-    /// The re-scan was not started, because an earlier one of this repo
-    /// missed its budget against the same index ([`KnownMisses`]).
+    /// The re-scan was not started, because an earlier one of the edited
+    /// file's service missed its budget against the same index
+    /// ([`ServiceMisses`]).
     pub known_miss: bool,
+    /// Which services were to be re-read, once that was decided.
+    pub scope: Option<RecheckScope>,
 }
 
 /// The budget for one re-check.
@@ -128,19 +142,77 @@ fn budget_from(raw: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_BUDGET)
 }
 
+/// The services one re-check reads, decided from the index (carrick#3198).
+///
+/// The edited file's own service, plus every service that holds an operation
+/// reading a type declared in that file (`uses[file].types[].operations`,
+/// same repo only). Every other service of the repo is judged at its newest
+/// known version, never re-read.
+pub struct Reach {
+    /// The service the file belongs to: the one a miss is remembered for.
+    pub owner: String,
+    /// The owner first, then the others, in index order.
+    pub reread: Vec<String>,
+    /// The repo's services as the index lists them.
+    services: Vec<IndexedService>,
+    /// Indexed files per re-read service, for the miss reason.
+    files: std::collections::BTreeMap<String, usize>,
+}
+
+impl Reach {
+    /// `None` when `owner` is no service of this repo: nothing reads the file.
+    pub fn of(repo: &IndexedRepo, relative: &str, owner: &str) -> Option<Self> {
+        repo.services.iter().find(|service| service.name == owner)?;
+        let mut reread = vec![owner.to_string()];
+        let reading = repo
+            .uses
+            .as_ref()
+            .and_then(|uses| uses.get(relative))
+            .into_iter()
+            .flat_map(|uses| &uses.types)
+            .flat_map(|used| &used.operations)
+            .map(|operation| operation.service.as_str());
+        for service in repo.services.iter().map(|service| service.name.as_str()) {
+            let reads = reading.clone().any(|name| name == service);
+            if reads && !reread.iter().any(|known| known == service) {
+                reread.push(service.to_string());
+            }
+        }
+        let files = reread
+            .iter()
+            .filter_map(|name| {
+                let service = repo.services.iter().find(|service| &service.name == name)?;
+                let count = repo
+                    .files
+                    .keys()
+                    .filter(|file| service.covers(file))
+                    .count();
+                Some((name.clone(), count))
+            })
+            .collect();
+        Some(Self {
+            owner: owner.to_string(),
+            reread,
+            services: repo.services.clone(),
+            files,
+        })
+    }
+}
+
 /// Re-extract `relative` in `repo`, re-join it against every blob the index
 /// already holds, and answer with the rows the working tree states.
 ///
 /// `index_generation` names the index this runs against (its `indexed_at`):
-/// a re-scan of `repo` that missed its budget against it is remembered there,
-/// and every later call against the same generation skips the re-scan and
-/// answers at once ([`KnownMisses`]).
+/// a re-scan that missed its budget against it is remembered per service
+/// there, and every later call for a file of the same service against the same
+/// generation skips the re-scan and answers at once ([`ServiceMisses`]).
 pub fn run(
     workspace: &Workspace,
     repo: &Path,
     relative: &str,
     index_generation: &str,
-) -> Result<Fresh, Degraded> {
+    reach: &Reach,
+) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
     let deadline = started + budget();
     // The index is read once, here, and named twice: for what the edit added
@@ -150,26 +222,37 @@ pub fn run(
     let held = match Held::read(workspace) {
         Ok(held) => held,
         Err(reason) => {
-            return Err(Degraded {
+            return Err(Box::new(Degraded {
                 reason,
                 new_functions: Vec::new(),
                 elapsed: started.elapsed(),
                 known_miss: false,
-            });
+                scope: None,
+            }));
         }
     };
     let new_functions = added_functions(&held, repo, relative);
-    let misses = KnownMisses::path(workspace);
-    if KnownMisses::read(&misses).holds(index_generation, repo) {
-        return Err(Degraded {
-            reason: KNOWN_MISS_REASON.to_string(),
+    let misses = ServiceMisses::path(workspace);
+    if let Some(miss) = ServiceMisses::read(&misses).holds(index_generation, &reach.owner) {
+        return Err(Box::new(Degraded {
+            reason: miss_reason(&reach.owner, miss),
             new_functions,
             elapsed: started.elapsed(),
             known_miss: true,
-        });
+            scope: None,
+        }));
     }
+    let plan = Plan::make(workspace, repo, reach, index_generation, &held);
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
-    let outcome = inside(workspace, held, repo, relative, &generation, deadline);
+    let outcome = inside(
+        workspace,
+        held,
+        repo,
+        relative,
+        &generation,
+        deadline,
+        &plan,
+    );
     // The temporary generation goes on every path, including the one where a
     // phase was killed at the deadline: a hook that leaves a directory behind
     // per edit is a hook that fills a disk in an afternoon.
@@ -183,52 +266,83 @@ pub fn run(
         Err(reason) => {
             // Only a miss of the budget is remembered: a phase that failed
             // for another reason before the deadline says nothing about
-            // whether this repo fits, and remembering it would switch the
-            // re-check off on a repo where it does.
+            // whether this service fits, and remembering it would switch the
+            // re-check off on a service where it does. The scan does not say
+            // which of the services it was reading had not finished, so only
+            // the edited file's own service is recorded: a reader service
+            // re-read beside it is tried again on its own next edit, where a
+            // miss is its own. A lost record costs one more re-check; a wrong
+            // one switches a service off for the whole index.
             if Instant::now() >= deadline {
-                KnownMisses::record(&misses, index_generation, repo);
+                ServiceMisses::record(
+                    &misses,
+                    index_generation,
+                    &plan.miss_of(&reach.owner, started.elapsed()),
+                );
             }
-            Err(Degraded {
+            Err(Box::new(Degraded {
                 reason,
                 new_functions,
                 elapsed: started.elapsed(),
                 known_miss: false,
-            })
+                scope: Some(plan.scope.clone()),
+            }))
         }
     }
 }
 
 /// The reason a re-check that skipped its re-scan gives.
-pub const KNOWN_MISS_REASON: &str = "an earlier re-check of this repo ran past its budget against \
-     this index, so this one did not start a re-scan; per-edit verdicts here are the index's \
-     until the next `carrick refresh`, and `carrick check --changed` gives fresh ones";
-
-/// The repos whose re-check missed its budget against one index generation
-/// (`.carrick/recheck-misses.json`).
-///
-/// On a large monorepo the re-scan alone outlasts the budget every time, so
-/// every edit would wait out the whole budget for an answer that never comes.
-/// The first miss is remembered here, keyed to the index it ran against; until
-/// `index` or `refresh` writes a new one, a re-check of that repo skips the
-/// re-scan and answers at once with the parse and the indexed verdicts. A new
-/// generation does not match, so the re-check is tried again after it. A repo
-/// that fits never misses and is never written here. The reader-facing side
-/// (`known_miss` on the `recheck` block) is `docs/local-mode-output.md`.
-#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq, Eq)]
-struct KnownMisses {
-    /// The `indexed_at` of the index the misses were against.
-    generation: String,
-    /// Absolute repo paths, as the workspace names them.
-    repos: Vec<String>,
+fn miss_reason(service: &str, miss: &Miss) -> String {
+    let took = if miss.elapsed_ms >= 1000 {
+        format!("{} s", miss.elapsed_ms / 1000)
+    } else {
+        format!("{} ms", miss.elapsed_ms)
+    };
+    format!(
+        "re-reading {service} ({} indexed files) took longer than {took} against this index, so \
+         edits in {service} are not re-checked until `carrick refresh`. Run `carrick check \
+         --changed` before you finish.",
+        miss.files
+    )
 }
 
-impl KnownMisses {
+/// One service's re-read that missed its budget.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+struct Miss {
+    /// How long the re-check ran before it was stopped.
+    elapsed_ms: u64,
+    /// Indexed files of the service.
+    files: usize,
+}
+
+/// The services whose re-check missed its budget against one index generation
+/// (`.carrick/recheck-misses.json`).
+///
+/// On a large service the re-scan alone outlasts the budget every time, so
+/// every edit would wait out the whole budget for an answer that never comes.
+/// The first miss is remembered here, keyed to the index it ran against; until
+/// `index` or `refresh` writes a new one, a re-check of a file of that service
+/// skips the re-scan and answers at once with the parse and the indexed
+/// verdicts. A miss in one service leaves every other service of the repo
+/// re-checked. A new generation does not match, so the re-check is tried again
+/// after it. A service that fits never misses and is never written here. The
+/// reader-facing side (`known_miss` on the `recheck` block) is
+/// `docs/local-mode-output.md`.
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq, Eq)]
+struct ServiceMisses {
+    /// The `indexed_at` of the index the misses were against.
+    generation: String,
+    /// Service ids, as the index names them.
+    services: std::collections::BTreeMap<String, Miss>,
+}
+
+impl ServiceMisses {
     fn path(workspace: &Workspace) -> std::path::PathBuf {
         workspace.index_dir().join("recheck-misses.json")
     }
 
-    /// Unreadable or absent is "no misses": a lost record costs one more
-    /// re-check, never a wrong answer.
+    /// Unreadable, absent or written in another shape is "no misses": a lost
+    /// record costs one more re-check, never a wrong answer.
     fn read(path: &Path) -> Self {
         std::fs::read_to_string(path)
             .ok()
@@ -236,32 +350,364 @@ impl KnownMisses {
             .unwrap_or_default()
     }
 
-    fn holds(&self, generation: &str, repo: &Path) -> bool {
-        !generation.is_empty()
-            && self.generation == generation
-            && self.repos.iter().any(|known| Path::new(known) == repo)
+    fn holds(&self, generation: &str, service: &str) -> Option<&Miss> {
+        if generation.is_empty() || self.generation != generation {
+            return None;
+        }
+        self.services.get(service)
     }
 
-    /// Add `repo` for `generation`, dropping the misses of any older one.
-    fn record(path: &Path, generation: &str, repo: &Path) {
+    /// Add `misses` for `generation`, dropping the misses of any older one.
+    fn record(path: &Path, generation: &str, misses: &[(String, Miss)]) {
         if generation.is_empty() {
             return;
         }
-        let mut misses = Self::read(path);
-        if misses.generation != generation {
-            misses = Self {
+        let mut held = Self::read(path);
+        if held.generation != generation {
+            held = Self {
                 generation: generation.to_string(),
-                repos: Vec::new(),
+                services: Default::default(),
             };
         }
-        let repo = repo.to_string_lossy().to_string();
-        if !misses.repos.contains(&repo) {
-            misses.repos.push(repo);
+        for (service, miss) in misses {
+            held.services.insert(service.clone(), miss.clone());
         }
-        if let Ok(text) = serde_json::to_string_pretty(&misses) {
+        if let Ok(text) = serde_json::to_string_pretty(&held) {
             let _ = std::fs::write(path, text);
         }
     }
+}
+
+/// The folder a kind of kept state (`judged` or `working`) uses for one index
+/// generation: `.carrick/<kind>/<generation>/`. `None` for an index with no
+/// generation to key it by.
+pub(super) fn kept_dir(
+    workspace: &Workspace,
+    kind: &str,
+    generation: &str,
+) -> Option<std::path::PathBuf> {
+    if generation.is_empty() {
+        return None;
+    }
+    let name: String = generation
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(workspace.index_dir().join(kind).join(name))
+}
+
+/// Remove every generation of `kind` except `keep`: a new index replaces what
+/// the old one left.
+fn prune_other_generations(kind_dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(kind_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if entry.path() != keep {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Put the type-check answers an index build kept in `built` where the
+/// re-check finds them, replacing whatever an older index left, and clear the
+/// older index's re-read services.
+pub(super) fn adopt_index_state(workspace: &Workspace, built: &Path, generation: &str) {
+    let Some(judged) = kept_dir(workspace, "judged", generation) else {
+        return;
+    };
+    if let Some(parent) = judged.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        prune_other_generations(parent, &judged);
+    }
+    if built.is_dir() {
+        let _ = std::fs::remove_dir_all(&judged);
+        let _ = std::fs::rename(built, &judged);
+    }
+    let _ = std::fs::remove_dir_all(workspace.index_dir().join("working"));
+}
+
+/// What one re-check decided before it started: which services it re-reads
+/// and which blob stands in for each of the others.
+struct Plan {
+    generation: String,
+    services: Vec<String>,
+    /// Digest of each re-read service's edits since the index; absent where
+    /// the service has none.
+    digests: std::collections::BTreeMap<String, String>,
+    /// The copy a service's last re-check left, for each service outside the
+    /// scope whose edits since then are exactly the ones it was read for.
+    working: std::collections::BTreeMap<String, crate::cloud_storage::CloudRepoData>,
+    files: std::collections::BTreeMap<String, usize>,
+    scope: RecheckScope,
+}
+
+/// A re-read service's blob, kept with the digest of the edits it was read
+/// for. One file, written whole, so the pair is never torn.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkingCopy {
+    digest: String,
+    blob: crate::cloud_storage::CloudRepoData,
+}
+
+impl Plan {
+    fn make(
+        workspace: &Workspace,
+        repo: &Path,
+        reach: &Reach,
+        generation: &str,
+        held: &Held,
+    ) -> Self {
+        let mut readers = readers_of_the_edit(repo, reach, held);
+        let mut listings: std::collections::BTreeMap<String, Option<HashSet<String>>> =
+            Default::default();
+        let mut digests = std::collections::BTreeMap::new();
+        let mut working = std::collections::BTreeMap::new();
+        let mut scope = RecheckScope {
+            reread: reach.reread.clone(),
+            not_reread: Vec::new(),
+            stale: Vec::new(),
+        };
+        for service in &reach.services {
+            let changed = listings
+                .entry(service.commit.clone())
+                .or_insert_with(|| super::query::changed_since(repo, &service.commit));
+            // `None`: git cannot say what changed. `Some(None)`: nothing did.
+            let digest = changed
+                .as_ref()
+                .map(|changed| service_digest(repo, changed, service, &reach.services));
+            if reach.reread.contains(&service.name) {
+                if let Some(Some(digest)) = digest {
+                    digests.insert(service.name.clone(), digest);
+                }
+                continue;
+            }
+            let operations = service.routes + service.calls;
+            // A service that reads a path edited since its index is judged at
+            // a version that predates the edit, whatever else is known of it:
+            // its own files' digest does not cover the import.
+            let reader = readers.remove(&service.name);
+            let reason = match digest {
+                _ if reader.is_some() => {
+                    if let Some(Some(digest)) = digest
+                        && let Some(blob) =
+                            read_working(workspace, generation, &service.name, &digest)
+                    {
+                        working.insert(service.name.clone(), blob);
+                    }
+                    scope.stale.push(service.name.clone());
+                    reader.as_deref().unwrap_or_default()
+                }
+                Some(None) => "no edits since the index; judged at its indexed version",
+                Some(Some(digest)) => {
+                    match read_working(workspace, generation, &service.name, &digest) {
+                        Some(blob) => {
+                            working.insert(service.name.clone(), blob);
+                            "judged at your last re-check of it"
+                        }
+                        None => {
+                            scope.stale.push(service.name.clone());
+                            "edited since the index and not re-checked; judged against its indexed version"
+                        }
+                    }
+                }
+                None => {
+                    scope.stale.push(service.name.clone());
+                    "git could not say what changed in it; judged against its indexed version"
+                }
+            };
+            scope.not_reread.push(NotReread {
+                service: service.name.clone(),
+                operations,
+                reason: reason.to_string(),
+            });
+        }
+        Self {
+            generation: generation.to_string(),
+            services: reach.reread.clone(),
+            digests,
+            working,
+            files: reach.files.clone(),
+            scope,
+        }
+    }
+
+    /// The miss to remember when this re-check ran out of time: the edited
+    /// file's own service only, never a reader service re-read beside it.
+    fn miss_of(&self, owner: &str, elapsed: Duration) -> Vec<(String, Miss)> {
+        self.services
+            .iter()
+            .filter(|service| service.as_str() == owner)
+            .map(|service| {
+                (
+                    service.clone(),
+                    Miss {
+                        elapsed_ms: elapsed.as_millis() as u64,
+                        files: self.files.get(service).copied().unwrap_or(0),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Keep a re-read service's fresh blob for the next re-check. A service
+    /// with no edits since the index has nothing to keep: its indexed blob is
+    /// the newest there is.
+    fn keep(&self, workspace: &Workspace, blob: &crate::cloud_storage::CloudRepoData) {
+        let id = service_id(blob);
+        let Some(digest) = self.digests.get(&id) else {
+            return;
+        };
+        let Some(dir) = kept_dir(workspace, "working", &self.generation) else {
+            return;
+        };
+        if let Some(parent) = dir.parent() {
+            prune_other_generations(parent, &dir);
+        }
+        let copy = WorkingCopy {
+            digest: digest.clone(),
+            blob: blob.clone(),
+        };
+        let Ok(bytes) = serde_json::to_vec(&copy) else {
+            return;
+        };
+        let kept = dir.join(working_name(&id));
+        let staged = dir.join(format!("{}.{}.tmp", working_name(&id), std::process::id()));
+        let _ = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&staged, bytes))
+            .and_then(|()| std::fs::rename(&staged, &kept));
+    }
+
+    /// Where the type checker keeps its finished answers for this re-check.
+    fn judged_dir(&self, workspace: &Workspace) -> Option<std::path::PathBuf> {
+        kept_dir(workspace, "judged", &self.generation)
+    }
+}
+
+/// The file name a service's re-read copy is kept under.
+fn working_name(service: &str) -> String {
+    let safe: String = service
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{safe}.json")
+}
+
+/// The copy `service`'s last re-check left, when it was read for exactly the
+/// edits `digest` names.
+fn read_working(
+    workspace: &Workspace,
+    generation: &str,
+    service: &str,
+    digest: &str,
+) -> Option<crate::cloud_storage::CloudRepoData> {
+    let path = kept_dir(workspace, "working", generation)?.join(working_name(service));
+    let copy: WorkingCopy = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    (copy.digest == digest && service_id(&copy.blob) == service).then_some(copy.blob)
+}
+
+/// The reason for each service outside the re-read scope that reads a path
+/// edited since its index, by service name.
+///
+/// The type-use record lists the operations that read a type the edited file
+/// declares; it does not list one that reads a constant, a wrapper or a type
+/// it could not trace. The import closure the change scope already walks
+/// ([`crate::change_scope::untouched_since`]) names those. A service's own
+/// edits are left out of the listing: the digest already accounts for them
+/// (its last re-check's copy, or stale). A service whose closure cannot be
+/// walked (no stored config on this machine) is named too: it is not known to
+/// be untouched.
+fn readers_of_the_edit(
+    repo: &Path,
+    reach: &Reach,
+    held: &Held,
+) -> std::collections::BTreeMap<String, String> {
+    let repo_path = repo.to_string_lossy().to_string();
+    let mut readers = std::collections::BTreeMap::new();
+    for service in reach
+        .services
+        .iter()
+        .filter(|service| !reach.reread.contains(&service.name))
+    {
+        let config = held
+            .local
+            .iter()
+            .find(|blob| service_id(blob) == service.name)
+            .and_then(|blob| blob.config_json.as_deref())
+            .and_then(|json| serde_json::from_str::<crate::config::Config>(json).ok());
+        let Some(config) = config else {
+            readers.insert(
+                service.name.clone(),
+                "its config is not on this machine, so what it reads is unknown; judged at its indexed version"
+                    .to_string(),
+            );
+            continue;
+        };
+        let own = service.clone();
+        let changes = crate::change_scope::ChangedSince::new(&repo_path, &[], &[])
+            .without(move |path| own.covers(path));
+        let read = crate::change_scope::untouched_since(
+            &repo_path,
+            std::slice::from_ref(&config),
+            &changes,
+            &service.commit,
+        );
+        if let Some(Some(path)) = read.first() {
+            readers.insert(
+                service.name.clone(),
+                format!("reads {path}, edited since the index; judged at its indexed version"),
+            );
+        }
+    }
+    readers
+}
+
+/// What the working tree holds, since the index, of the files `service` reads:
+/// a hash of each changed file's path and bytes. The changes no service covers
+/// (a root manifest, a tsconfig) are in every service's digest. `None` when
+/// none of its files changed.
+fn service_digest(
+    repo: &Path,
+    changed: &HashSet<String>,
+    service: &IndexedService,
+    all: &[IndexedService],
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut files: Vec<&String> = changed
+        .iter()
+        .filter(|file| service.covers(file) || !all.iter().any(|other| other.covers(file)))
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    files.sort();
+    let mut hash = Sha256::new();
+    for file in files {
+        hash.update((file.len() as u64).to_le_bytes());
+        hash.update(file.as_bytes());
+        match std::fs::read(repo.join(file)) {
+            Ok(bytes) => {
+                hash.update([1u8]);
+                hash.update((bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+            // A deleted file is part of the edit.
+            Err(_) => hash.update([0u8]),
+        }
+    }
+    Some(format!("{:x}", hash.finalize()))
 }
 
 /// What the last `index` left on disk, read once per re-check: the local
@@ -359,9 +805,21 @@ fn inside(
     relative: &str,
     generation: &Path,
     deadline: Instant,
+    plan: &Plan,
 ) -> Result<Fresh, String> {
     let name = repo_label(repo);
-    let rejoined = rejoin_held(workspace, held, &[repo], generation, deadline, None)?;
+    let rejoined = rejoin_held(
+        workspace,
+        held,
+        &[repo],
+        generation,
+        deadline,
+        None,
+        Some(plan),
+    )?;
+    if let Some(sentence) = library_unavailable(&rejoined.index, [&name]) {
+        return Err(sentence.to_string());
+    }
 
     let items = rejoined
         .index
@@ -385,7 +843,51 @@ fn inside(
         new_functions: Vec::new(),
         ran,
         elapsed: Duration::default(),
+        scope: plan.scope.clone(),
     })
+}
+
+/// What a check says when the re-scan could not read the library store
+/// (carrick#3249). The scan then holds no row a library package states, so a
+/// route registered through a server package does not exist locally: a pass
+/// would read "checked 0 routes", or fail every caller of the missing routes
+/// as having no route. The first sentence names the sign-in command
+/// `carrick --help` documents; the second is for a store that could not be
+/// reached (network error, timeout, 5xx). Nothing a signed-in, online run
+/// prints changes, and the CI runner never reaches this: it authenticates with
+/// OIDC and does not run a local-mode check.
+pub const LIBRARY_NOT_SIGNED_IN: &str =
+    "library facts unavailable: this machine is not signed in. Run carrick login.";
+pub const LIBRARY_UNREACHABLE: &str =
+    "library facts unavailable: Carrick's library store could not be reached.";
+
+/// What a re-scan of `repos` could not read of the library store, as the
+/// sentence a check prints. A not-signed-in mark counts only while this
+/// machine still holds no credential: a service carried from an earlier
+/// unsigned `refresh` keeps its mark until the next refresh, and must not
+/// outlive the sign-in.
+pub(super) fn library_unavailable<'a>(
+    rebuilt: &super::read_model::LocalIndex,
+    repos: impl IntoIterator<Item = &'a String>,
+) -> Option<&'static str> {
+    use crate::library_store::AskFailure;
+    let repos: std::collections::BTreeSet<&String> = repos.into_iter().collect();
+    let failures: Vec<AskFailure> = rebuilt
+        .repos
+        .iter()
+        .filter(|repo| repos.contains(&repo.name))
+        .flat_map(|repo| repo.services.iter())
+        .filter_map(|service| service.boundary.as_ref()?.library_ask_failed)
+        .collect();
+    if failures.contains(&AskFailure::NotSignedIn)
+        && crate::credentials::CloudAuth::detect().is_err()
+    {
+        Some(LIBRARY_NOT_SIGNED_IN)
+    } else if failures.contains(&AskFailure::Unreachable) {
+        Some(LIBRARY_UNREACHABLE)
+    } else {
+        None
+    }
 }
 
 /// What one re-extraction of some repos produced, joined against everything
@@ -432,10 +934,17 @@ pub(super) fn rejoin(
         generation,
         deadline,
         narrator,
+        None,
     )
 }
 
 /// [`rejoin`], over an index already read.
+///
+/// `plan` is the per-edit re-check's: it narrows the re-scan to the services
+/// it names, stands the newest known copy in for the rest, keeps what the
+/// scan read, and keeps the type checker's answers per index. `None` is the
+/// several-file check, which re-reads whatever the change scope reaches and
+/// keeps nothing.
 fn rejoin_held(
     workspace: &Workspace,
     held: Held,
@@ -443,13 +952,18 @@ fn rejoin_held(
     generation: &Path,
     deadline: Instant,
     narrator: Option<&Narrator>,
+    plan: Option<&Plan>,
 ) -> Result<Rejoined, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
     let blobs = generation.join("repos");
     // The re-scans and the re-join judge the same stubs and pairs; the folder
-    // is where the first answer waits for the others.
-    let judged = generation.join("judged");
+    // is where the first answer waits for the others. A per-edit re-check
+    // keeps it per index, so an edit that moves no type finds the index's own
+    // answer there.
+    let judged = plan
+        .and_then(|plan| plan.judged_dir(workspace))
+        .unwrap_or_else(|| generation.join("judged"));
     std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
     let names: std::collections::BTreeSet<String> =
         repos.iter().map(|repo| repo_label(repo)).collect();
@@ -504,6 +1018,15 @@ fn rejoin_held(
                 .filter(|blob| !hosted_ids.contains(&service_id(blob)))
                 .map(|blob| (*blob).clone()),
         );
+        // A service outside the scope stands in at the copy its last re-check
+        // left, so this one judges against the edits already made to it.
+        if let Some(plan) = plan {
+            for blob in &mut previous_data {
+                if let Some(newer) = plan.working.get(&service_id(blob)) {
+                    *blob = newer.clone();
+                }
+            }
+        }
         write_json(&staged(generation, "previous", position), &previous_data)?;
     }
     drop(hosted);
@@ -515,6 +1038,12 @@ fn rejoin_held(
         let scan_dir = generation.join(format!("scan-{position}"));
         let mut scan = rescan_command(&exe, repo, &scan_dir, &previous);
         scan.env(JUDGE_ANSWERS_ENV, &judged);
+        if let Some(plan) = plan {
+            scan.env(
+                crate::change_scope::RECHECK_SERVICES_ENV,
+                serde_json::to_string(&plan.services).map_err(|e| e.to_string())?,
+            );
+        }
         // The rows the last `refresh` (or an earlier check, below) kept stand
         // in for a walk of a carried service. The scan only reads them; the
         // walks it had to do are kept after it succeeds.
@@ -530,6 +1059,11 @@ fn rejoin_held(
         }
         bounded(scan, "re-scan", deadline, narrator)?;
         let fresh = read_blobs(&scan_dir)?;
+        if let Some(plan) = plan {
+            for blob in &fresh {
+                plan.keep(workspace, blob);
+            }
+        }
         let hosted_data = read_staged(&staged(generation, "hosted", position))?;
         let previous_data = read_staged(&previous)?;
         let carried = super::index::carried_services(repo, &hosted_data, &previous_data, &fresh)?;
@@ -1252,34 +1786,93 @@ mod tests {
         );
     }
 
-    /// A miss is remembered per repo and per index generation: another repo,
-    /// or the same repo against a newer index, tries the re-check again.
+    fn miss(files: usize) -> Miss {
+        Miss {
+            elapsed_ms: 10_000,
+            files,
+        }
+    }
+
+    /// A miss is remembered per service and per index generation: another
+    /// service of the same repo, or the same service against a newer index,
+    /// tries the re-check again (carrick#3198).
     #[test]
-    fn a_known_miss_holds_for_its_repo_and_generation_only() {
+    fn a_timed_out_re_check_remembers_only_the_edited_files_service() {
+        let plan = Plan {
+            generation: "g1".to_string(),
+            services: vec!["types-owner".to_string(), "big-reader".to_string()],
+            digests: Default::default(),
+            working: Default::default(),
+            files: [
+                ("types-owner".to_string(), 3),
+                ("big-reader".to_string(), 900),
+            ]
+            .into_iter()
+            .collect(),
+            scope: RecheckScope {
+                reread: vec!["types-owner".to_string(), "big-reader".to_string()],
+                not_reread: Vec::new(),
+                stale: Vec::new(),
+            },
+        };
+        let recorded = plan.miss_of("types-owner", Duration::from_millis(10_000));
+        assert_eq!(
+            recorded,
+            vec![(
+                "types-owner".to_string(),
+                Miss {
+                    elapsed_ms: 10_000,
+                    files: 3
+                }
+            )],
+            "a reader re-read beside the edited service is tried again on its own edit"
+        );
+    }
+
+    #[test]
+    fn a_service_miss_holds_for_its_service_and_generation_only() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("recheck-misses.json");
-        let big = Path::new("/w/big");
-        let small = Path::new("/w/small");
 
-        assert!(!KnownMisses::read(&path).holds("g1", big), "nothing yet");
-        KnownMisses::record(&path, "g1", big);
-        KnownMisses::record(&path, "g1", big);
-        let read = KnownMisses::read(&path);
-        assert!(read.holds("g1", big));
-        assert_eq!(read.repos.len(), 1, "recorded once");
-        assert!(!read.holds("g1", small), "a sibling repo still re-checks");
-        assert!(!read.holds("g2", big), "a new index tries again");
+        assert!(ServiceMisses::read(&path).holds("g1", "big").is_none());
+        ServiceMisses::record(&path, "g1", &[("big".to_string(), miss(40))]);
+        ServiceMisses::record(&path, "g1", &[("big".to_string(), miss(40))]);
+        let read = ServiceMisses::read(&path);
+        assert_eq!(read.holds("g1", "big"), Some(&miss(40)));
+        assert_eq!(read.services.len(), 1, "recorded once");
+        assert!(
+            read.holds("g1", "small").is_none(),
+            "a sibling service of the same repo still re-checks"
+        );
+        assert!(read.holds("g2", "big").is_none(), "a new index tries again");
 
         // A miss against a newer index replaces the older generation's.
-        KnownMisses::record(&path, "g2", small);
-        let read = KnownMisses::read(&path);
-        assert!(read.holds("g2", small));
-        assert!(!read.holds("g2", big));
-        assert!(!read.holds("g1", big));
+        ServiceMisses::record(&path, "g2", &[("small".to_string(), miss(3))]);
+        let read = ServiceMisses::read(&path);
+        assert!(read.holds("g2", "small").is_some());
+        assert!(read.holds("g2", "big").is_none());
+        assert!(read.holds("g1", "big").is_none());
 
         // No generation means no record either way.
-        KnownMisses::record(&path, "", big);
-        assert!(!KnownMisses::read(&path).holds("", big));
+        ServiceMisses::record(&path, "", &[("big".to_string(), miss(40))]);
+        assert!(ServiceMisses::read(&path).holds("", "big").is_none());
+
+        // The file the repo-wide rule wrote reads as no misses.
+        std::fs::write(&path, r#"{"generation":"g2","repos":["/w/big"]}"#).unwrap();
+        assert!(ServiceMisses::read(&path).holds("g2", "big").is_none());
+    }
+
+    /// The reason a skipped re-check gives names the service, how much of it
+    /// the index holds, and the command that gives a fresh answer.
+    #[test]
+    fn the_miss_reason_names_the_service_and_the_fresh_read() {
+        let reason = miss_reason("catalog", &miss(12));
+        assert!(
+            reason.contains("re-reading catalog (12 indexed files)"),
+            "{reason}"
+        );
+        assert!(reason.contains("took longer than 10 s"), "{reason}");
+        assert!(reason.contains("check --changed"), "{reason}");
     }
 
     fn write(root: &Path, relative: &str, text: &str) {

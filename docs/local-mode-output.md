@@ -29,7 +29,7 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 | `carrick status [--json]` | local index, credential identity, and Carrick Cloud when a job is recorded | nothing | < 300 ms, plus one network read for each job recorded, in turn |
 | `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
-| `carrick check <file> --recheck` | the same, plus this repo's working tree and the blobs already on disk | nothing outside a temp directory it deletes | 10 s budget |
+| `carrick check <file> --recheck` | the same, plus the file's service in this repo's working tree and the blobs already on disk | `.carrick/working/` and `.carrick/judged/` (replaced by the next index) and a temp directory it deletes | 10 s budget |
 | `carrick refresh [--service <name>]` | local source and authenticated hosted indexes | `<dir>/.carrick/` | seconds |
 
 `status` answers about the workspace and takes no file; it is what a surface
@@ -48,24 +48,34 @@ is missing. The refusal body is printed either way, so a reader parsing the
 JSON is unaffected by the code.
 
 `carrick check --recheck` is the one read that recomputes (carrick#1036). When
-the file has changed since the index, it re-scans **that file's repo only** —
-deterministic extraction and the sidecar's type capture, no model, nothing on
-the wire — and re-runs the join over the blobs already in `.carrick/repos`
-plus the cached hosted snapshot, so the verdicts it prints are about the
-working tree rather than the tree the index was built on. It leaves
-`.carrick/index.json` untouched and deletes the temporary generation on every
-path. The one thing it keeps is the compiler rows of a service it carried and
-had to walk, in `.carrick/positions/`; a later check or re-check reuses them
-only while the build, the commit and every file's hash are the ones they were
-walked at (carrick#3245). The whole re-check has a budget (10 s, `CARRICK_RECHECK_BUDGET_MS`);
-past it the answer is the indexed one, and the `recheck` block below says so.
+the file has changed since the index, it re-scans **the file's own service**
+and the services that hold an operation reading a type declared in that file
+(`recheck.scope.reread`) — deterministic extraction and the sidecar's type
+capture, no model, nothing on the wire — and re-runs the join over the blobs
+already in `.carrick/repos` plus the cached hosted snapshot, so the verdicts it
+prints are about the working tree rather than the tree the index was built on.
+Every other service is judged at its newest known version: the copy the last
+re-check of it left in `.carrick/working/<index generation>/`, when its edits
+since the index are exactly the ones that copy was read for, else the index's
+own (named in `recheck.scope.stale`). It never writes `.carrick/index.json` or
+`.carrick/repos`; the temporary generation is deleted on every path. The one thing
+it keeps is the compiler rows of a service it carried and had to walk, in
+`.carrick/positions/`; a later check or re-check reuses them only while the build,
+the commit and every file's hash are the ones they were walked at (carrick#3245). The type
+checker's finished answers are kept per index in
+`.carrick/judged/<index generation>/`, written by `index` and `refresh` and
+read by every re-check, so an edit that moves no type skips the checker's
+dependency install. A new index replaces both folders. The whole re-check has a
+budget (10 s, `CARRICK_RECHECK_BUDGET_MS`); past it the answer is the indexed
+one, and the `recheck` block below says so.
 A re-check that missed its budget is remembered in
-`.carrick/recheck-misses.json`, per repo and against the index it ran on (its
-`indexed_at`). Until `refresh` or `index` writes a new index, a later
-`--recheck` of a file in that repo starts no re-scan: it answers at once with
+`.carrick/recheck-misses.json`, per service and against the index it ran on
+(its `indexed_at`). Until `refresh` or `index` writes a new index, a later
+`--recheck` of a file in that service starts no re-scan: it answers at once with
 the indexed verdicts and the new functions from the parse, and its block
-carries `known_miss: true`. On such a repo `carrick check --changed` is the
-fresh read. A repo where the re-check fits never misses and is never recorded.
+carries `known_miss: true`. Another service of the same repo is still
+re-checked. On such a service `carrick check --changed` is the fresh read. A
+service where the re-check fits never misses and is never recorded.
 `carrick check --each <file>... --recheck --json` answers several files in one
 process, each element of the printed JSON array the body `check <file>
 --recheck --json` prints for that file alone; the post-edit hook asks it for a
@@ -221,7 +231,8 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `stale_since` | string (RFC 3339) | when the items above were computed. Present only on a `none` — otherwise the answer is now |
 | `reason` | string | why the re-check did not run, in one sentence. Present only on a `none` |
 | `new_functions` | array \| absent | functions this file declares in the working tree that the index does not hold under that name, `{ "name": string, "line": int }`, in line order, at most 20. Named from a parse of the file that does not wait on the re-scan, so it is present on a `none` that missed its budget too. Absent when the edit added no function, and when the index could not be read |
-| `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this repo already missed its budget against this index. Absent otherwise |
+| `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this file's service already missed its budget against this index. Absent otherwise |
+| `scope` | object \| absent | which services this re-check read: `reread` (the file's service first, then every service holding an operation that reads a type declared in the file), `not_reread` (`{ service, operations, reason }` for each other service, saying whose copy its verdicts used), and `stale` (the `not_reread` services judged at a version that predates the work: edited since the index with no copy of the last re-check to stand in, or reading a path edited since the index, which their `reason` names as `reads <path>, edited since the index`). The hook's headline is never "no contract problem" while `stale` is non-empty: it says what it re-read and names up to three of the stale services. Absent on a `none` that decided no scope |
 
 `new_functions` is a NAME comparison against everything the index holds for that
 file — the blobs the last local scan wrote AND the hosted record of the same
@@ -520,9 +531,8 @@ side by side: each one's type sidecar is held to a 3 GB heap (unless
 `CARRICK_SIDECAR_MAX_OLD_SPACE_MB` says otherwise), and the scan runs as many
 at once as the free memory holds at that cap. One join then runs over those
 blobs and every blob the index already holds — the same two phases as
-`check --recheck`, once for all files. Untouched files are
-never reported, even when their service is re-extracted, except a call the index matched
-that now reaches no route (the work removed or moved its route).
+`check --recheck`, once for all files. A row in an untouched file
+is reported only in the two cases under "Files the work did not touch" below.
 
 Human output is one summary line, then one line per problem:
 
@@ -533,10 +543,11 @@ inventory-svc/src/client.ts:13  no route  call GET /api/v1/gadgets/:gadgetId: no
 ```
 
 `--json` prints `carrick.check-changed/0`: `files`, `routes`, `calls`,
-`services`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
+`services`, `repos` (each with `main_branch`, `base`, `files`, `rescan`, or `skipped`),
 `problems` (`kind` `incompatible` | `no_route`, `file`, `line`, `role`,
 `method`, `path`, `other`, `reason`, `source`, `already_indexed`,
-`unconfirmed`, `other_build`, `fails`), `failing`,
+`unconfirmed`, `outside_the_change`, `other_build`, `fails`), `failing`,
+`outside_moved`,
 `elapsed_ms`, `not_checked` when nothing could be checked, and
 `index_scanner` when the index was written by another scanner build.
 
@@ -565,6 +576,34 @@ main branch (on a branch, `refresh` would take the branch's own new problems
 in as already indexed). What the index did read still decides: a call it
 matched that now reaches no route fails whichever build wrote it.
 
+**A library store that cannot be asked** (carrick#3249). The re-scan asks
+Carrick's library store which exports of the installed packages register routes
+and make calls. When the ask gets no answer, every row a library package states
+is missing: a route registered through a server package does not exist locally,
+a pass over it would read "checked 0 routes", and every caller of it would read
+as a call to no route. The check does not pass and does not fail on those
+claims. It prints one line and exits 2. With no credential, nothing is sent:
+
+```
+carrick check: not checked: library facts unavailable: this machine is not signed in. Run carrick login.
+```
+
+With a credential and a store that cannot be reached (a network error, a
+timeout, a 5xx):
+
+```
+carrick check: not checked: library facts unavailable: Carrick's library store could not be reached.
+```
+
+`--json` carries the same sentence as `not_checked`. `check <file> --recheck`
+reports it as `recheck.ran` `none` with it as `recheck.reason`, and exits 2. A
+store that answered, including with no claims for a package, and a signed-in
+run that reaches the store, print and exit as before. The CI runner is
+untouched: it signs in with OIDC, and a local-mode check does not run there.
+The mark is read from the scan of the services re-extracted for the check, and
+a service carried from an index written while offline keeps its mark until the
+next `carrick refresh`.
+
 **Pairs the check could not judge** (carrick#3012). A matched route or call in
 a changed file whose pair has no verdict, or whose verdict is unresolved
 because one side has no usable type, cannot show a type change. It is counted
@@ -585,6 +624,19 @@ and exits 0. `carrick hook post-edit` does not run this pass and keeps its
 exit codes.
 The budget is five minutes, `CARRICK_CHECK_BUDGET_MS`.
 
+**Nothing the scan reads moved.** A repo's `rescan` is `not_needed` when every
+file that differs from the commit the index was read at (clean tree, one
+commit for the whole repo) either is not read by the scan's input rule or is a
+source file whose two copies parse, are equal ignoring positions, and hold the
+same `/** */` blocks, `@ts-` / `@jsx` comments and `///` lines in the same
+places. The check then starts no re-scan, says `nothing the scan reads
+changed in <repo>` on stderr, joins the index's own blobs, and moves each
+reported line in those files to where its code now sits. A manifest, lockfile,
+config, test file, added or deleted file, parse failure or missing base commit
+makes it `ran`, as does `CARRICK_CHECK_RESCAN=always`, a support switch that
+forces the re-scan. `rescan` is absent for a repo with no changed file to
+judge.
+
 **Quiet by default.** Only problems that fail the run are listed. The rest
 are counted on the summary line by why they do not fail, `..., plus 2 already
 in the index and 1 unconfirmed, run with --all to list them`, and `--all`
@@ -595,10 +647,22 @@ A problem the index already held is counted as that, whatever else holds for
 it. `--json` always lists every problem, with its `source`,
 `already_indexed`, `unconfirmed` and `fails`.
 
-**Files the work did not touch.** A call in such a file is reported only when
-the index matched it and no service serves it now. It is listed when it fails,
-and with `--all` otherwise; it is never counted on the summary line, which is
-about the changed files.
+**Files the work did not touch.** A row in such a file, in a repo this run
+re-scanned, is reported in two cases. Both are marked `outside_the_change` and
+never add to `routes`, `calls` or `type_checked`, which are about the changed
+files.
+
+- A call the index matched that now reaches no route. It is listed when it
+  fails, and with `--all` otherwise.
+- A pair whose rebuilt verdict is a mismatch (`type_mismatch` or
+  `method_mismatch`) and that the index did not already hold as a mismatch at
+  the same line. If the index held it resolved and compatible, the work moved
+  it: it fails like a problem in a changed file, on a fact. If the index held
+  no such row, or an unresolved one, it may have resolved for a reason
+  unrelated to the edit, so it never fails: `--all` lists it, and the summary
+  counts it as "not judged before". `outside_moved` and the summary
+  line's "moved" clause count only the first kind, the pairs the index held
+  compatible.
 
 **Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same
 pass over the files named, in any repos of the workspace, instead of the

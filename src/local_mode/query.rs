@@ -117,13 +117,19 @@ pub fn answer(
     // there was nothing to do" are different facts that an absent block cannot
     // tell apart.
     let recheck = match (freshness, mode) {
-        (Freshness::Recheck, Mode::Check) if stale && !deleted => Some(rechecked(
-            workspace_root,
-            &repo_root,
-            &relative,
-            &indexed_at,
-            &index.indexed_at,
-        )),
+        (Freshness::Recheck, Mode::Check) if stale && !deleted => {
+            Some(match super::recheck::Reach::of(repo, &relative, &service) {
+                Some(reach) => rechecked(
+                    workspace_root,
+                    &repo_root,
+                    &relative,
+                    &indexed_at,
+                    &index.indexed_at,
+                    &reach,
+                ),
+                None => (None, not_run("no service reads this file", &indexed_at)),
+            })
+        }
         (Freshness::Recheck, Mode::Check) => Some((
             None,
             not_run(
@@ -355,6 +361,7 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
         reason: Some(reason.to_string()),
         new_functions: Vec::new(),
         known_miss: false,
+        scope: None,
     }
 }
 
@@ -371,6 +378,7 @@ fn rechecked(
     relative: &str,
     indexed_at: &str,
     index_generation: &str,
+    reach: &super::recheck::Reach,
 ) -> (Option<Vec<IndexedItem>>, Recheck) {
     let started = std::time::Instant::now();
     let workspace = match super::workspace::Workspace::load(workspace_root) {
@@ -385,11 +393,12 @@ fn rechecked(
                     reason: Some(reason),
                     new_functions: Vec::new(),
                     known_miss: false,
+                    scope: None,
                 },
             );
         }
     };
-    match super::recheck::run(&workspace, repo_root, relative, index_generation) {
+    match super::recheck::run(&workspace, repo_root, relative, index_generation, reach) {
         Ok(fresh) => (
             Some(fresh.items),
             Recheck {
@@ -399,6 +408,7 @@ fn rechecked(
                 reason: None,
                 new_functions: fresh.new_functions,
                 known_miss: false,
+                scope: Some(fresh.scope),
             },
         ),
         Err(degraded) => (
@@ -413,6 +423,7 @@ fn rechecked(
                 // (carrick#2849).
                 new_functions: degraded.new_functions,
                 known_miss: degraded.known_miss,
+                scope: degraded.scope,
             },
         ),
     }
@@ -1390,6 +1401,7 @@ mod drift_tests {
             directory: directory.map(str::to_string),
             include: Vec::new(),
             commit: commit.to_string(),
+            dirty: false,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             boundary: None,
             routes: 0,

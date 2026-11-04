@@ -1179,6 +1179,16 @@ impl AgentService {
             if !matches!(&injected, Some(Err(error)) if error.code == NOT_ASKED_CODE) {
                 record_request(task_path);
             }
+            // A fixture directory can make one task fail, as a store that
+            // cannot be reached does: a file `<dir>/<task>/unreachable.txt`
+            // holds the message of a call that got no answer. It is how an
+            // integration test, which runs the binary as a child process,
+            // stands in for a network that is down (carrick#3249).
+            if injected.is_none()
+                && let Some(message) = mock_unreachable(task_path)
+            {
+                return Err(AgentCallError::permanent("unreachable", message));
+            }
             if let Some(outcome) = injected {
                 return outcome.map(|text| LambdaOutcome {
                     text,
@@ -2297,6 +2307,18 @@ pub fn inject_mock_budget_refusal(
         "error": { "code": LLM_DISABLED_CODE, "message": message, "retriable": false },
     });
     inject_mock_envelope(task_path, body_contains, times, &envelope.to_string());
+}
+
+/// The message of the failure `CARRICK_MOCK_FIXTURE_DIR` stands in for `task_path`
+/// when its fixture directory holds one.
+fn mock_unreachable(task_path: &str) -> Option<String> {
+    let dir = env::var("CARRICK_MOCK_FIXTURE_DIR").ok()?;
+    std::fs::read_to_string(
+        std::path::Path::new(&dir)
+            .join(task_path.trim_start_matches('/'))
+            .join("unreachable.txt"),
+    )
+    .ok()
 }
 
 fn take_mock_override<B: Serialize + ?Sized>(

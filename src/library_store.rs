@@ -37,7 +37,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -1470,6 +1470,24 @@ where
         .unwrap_or_default()
 }
 
+/// The code of the error `send` gives when this machine holds no usable
+/// credential (`agent_service` `post_to_lambda_keyed`: no `carrick login`, no
+/// Actions OIDC, or a credential file that is not valid). The store did not
+/// refuse the ask; it was never sent (carrick#3249).
+const NOT_SIGNED_IN_CODE: &str = "oidc_unavailable";
+
+/// Why an ask had no answer (carrick#3249): the machine holds no usable
+/// credential, so nothing was sent, or the store could not be reached or
+/// refused (a network error, a timeout, a 5xx). Neither is the store's answer
+/// that a package labels nothing, so a reader of the scan must not take the
+/// missing library rows for that answer.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskFailure {
+    NotSignedIn,
+    Unreachable,
+}
+
 /// [`ask`], saying when there was no answer (a refusal, an error, a timeout
 /// of `limit`) instead of reading it as an answer naming nothing.
 async fn try_ask<G, GateFut, S, Fut>(
@@ -1477,7 +1495,7 @@ async fn try_ask<G, GateFut, S, Fut>(
     gate: G,
     send: S,
     limit: Duration,
-) -> Option<LibraryAnswer>
+) -> Result<LibraryAnswer, AskFailure>
 where
     G: FnOnce(&LibraryClaimsRequest) -> GateFut,
     GateFut: Future,
@@ -1486,14 +1504,18 @@ where
 {
     let _turn = gate(&request).await;
     match tokio::time::timeout(limit, send(request)).await {
-        Ok(Ok(text)) => Some(parse_answer(&text)),
+        Ok(Ok(text)) => Ok(parse_answer(&text)),
         Ok(Err(error)) => {
             warn!(%error, "library store: no claims this scan");
-            None
+            Err(if error.code == NOT_SIGNED_IN_CODE {
+                AskFailure::NotSignedIn
+            } else {
+                AskFailure::Unreachable
+            })
         }
         Err(_) => {
             warn!("library store: no answer in time; no claims this scan");
-            None
+            Err(AskFailure::Unreachable)
         }
     }
 }
@@ -1510,6 +1532,9 @@ pub struct Settled {
     pub build_failed: BTreeSet<String>,
     /// Whether the store was asked at all.
     pub asked: bool,
+    /// Why the first ask went unanswered (carrick#3249). `None` for an answer,
+    /// including one that names nothing.
+    pub failure: Option<AskFailure>,
 }
 
 /// The store's first answer to a scan, sent the moment it arrives while the
@@ -1592,24 +1617,28 @@ where
 {
     let started = tokio::time::Instant::now();
     let deadline = started + wait;
-    let Some(first) = try_ask(asked.request.clone(), &gate, &send, ASK_TIMEOUT).await else {
-        if let Some(early) = early {
-            let _ = early.send(FirstAnswer {
-                exports: Vec::new(),
-                unanswered: asked
-                    .request
-                    .packages
-                    .iter()
-                    .map(|package| package.package.clone())
-                    .collect(),
-                answered: BTreeSet::new(),
-                ask_failed: true,
-            });
+    let first = match try_ask(asked.request.clone(), &gate, &send, ASK_TIMEOUT).await {
+        Ok(first) => first,
+        Err(failed) => {
+            if let Some(early) = early {
+                let _ = early.send(FirstAnswer {
+                    exports: Vec::new(),
+                    unanswered: asked
+                        .request
+                        .packages
+                        .iter()
+                        .map(|package| package.package.clone())
+                        .collect(),
+                    answered: BTreeSet::new(),
+                    ask_failed: true,
+                });
+            }
+            return Settled {
+                asked: true,
+                failure: Some(failed),
+                ..Settled::default()
+            };
         }
-        return Settled {
-            asked: true,
-            ..Settled::default()
-        };
     };
     if let Some(early) = early {
         let _ = early.send(FirstAnswer {
@@ -1636,7 +1665,7 @@ where
         };
         let limit = ASK_TIMEOUT.min(deadline - tokio::time::Instant::now());
         polls += 1;
-        let Some(second) = try_ask(again, &gate, &send, limit).await else {
+        let Ok(second) = try_ask(again, &gate, &send, limit).await else {
             break;
         };
         exports.extend(second.exports);
@@ -1659,6 +1688,7 @@ where
         pending,
         build_failed,
         asked: true,
+        failure: None,
     }
 }
 
@@ -3585,6 +3615,60 @@ mod tests {
         assert!(answer.ask_failed);
         assert!(answer.exports.is_empty());
         assert_eq!(answer.unanswered, specifiers(&["lib", "other"]));
+    }
+
+    /// carrick#3249: an ask never sent because the machine holds no
+    /// credential is its own outcome, not an answer that labels nothing.
+    #[tokio::test(start_paused = true)]
+    async fn an_ask_with_no_credential_settles_as_not_signed_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let settled = ask_until_settled(
+            &asked,
+            |_| async {},
+            |_| async {
+                Err(AgentCallError::permanent(
+                    "oidc_unavailable",
+                    "not signed in".to_string(),
+                ))
+            },
+            None,
+        )
+        .await;
+        assert!(settled.asked);
+        assert_eq!(settled.failure, Some(AskFailure::NotSignedIn));
+        assert!(settled.exports.is_empty());
+    }
+
+    /// carrick#3249: any other failed ask, and an answer naming nothing, are
+    /// not a missing sign-in.
+    #[tokio::test(start_paused = true)]
+    async fn another_failed_ask_is_unreachable_and_an_empty_answer_is_no_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let failed = ask_until_settled(
+            &asked,
+            |_| async {},
+            |_| async {
+                Err(AgentCallError::permanent(
+                    "internal_error",
+                    "boom".to_string(),
+                ))
+            },
+            None,
+        )
+        .await;
+        assert!(failed.asked);
+        assert_eq!(failed.failure, Some(AskFailure::Unreachable));
+        let empty = ask_until_settled(
+            &asked,
+            |_| async {},
+            |_| async { Ok(r#"{"library_claims":[]}"#.to_string()) },
+            None,
+        )
+        .await;
+        assert!(empty.asked);
+        assert_eq!(empty.failure, None);
     }
 
     /// carrick#2725: the first answer names as answered only the packages
