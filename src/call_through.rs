@@ -970,6 +970,7 @@ impl FileCalls {
             content.to_string(),
             &cm,
             &handler,
+            None,
         )?;
         let positions = Positions { cm: &cm };
         let mut every = EveryCall {

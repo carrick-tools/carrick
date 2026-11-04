@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::join::{JoinedOperation, Role};
-use super::read_model::{IndexedItem, LocalIndex, Source};
+use super::read_model::{IndexedItem, IndexedRepo, LocalIndex, Source};
+use super::reads_same::{LineMap, same_reading};
 
 pub const SCHEMA: &str = "carrick.check-changed/0";
 
@@ -105,7 +106,25 @@ pub struct ChangedRepo {
     /// [`EXIT_NOTHING_COVERED`] when no repo covered a file.
     #[serde(skip)]
     pub no_base: bool,
+    /// Whether this repo's changed files were re-read (`ran`), or read the
+    /// same as the index's copy and were answered from it (`not_needed`,
+    /// carrick#3245). Absent for a repo with no changed file to judge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescan: Option<Rescan>,
 }
+
+/// See [`ChangedRepo::rescan`].
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Rescan {
+    Ran,
+    NotNeeded,
+}
+
+/// Set to `always` to re-scan every changed repo even when nothing the scan
+/// reads moved: the answer such a check gives without the re-scan must equal
+/// this one's (carrick#3245).
+pub const RESCAN_ENV: &str = "CARRICK_CHECK_RESCAN";
 
 fn is_zero(count: &usize) -> bool {
     *count == 0
@@ -334,10 +353,56 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
 
     let generation =
         std::env::temp_dir().join(format!("carrick-check-changed-{}", uuid::Uuid::new_v4()));
-    let rescan: Vec<&Path> = changed.values().map(|(path, _)| path.as_path()).collect();
     // Said on stderr while it works: on a large repo the pass runs for
     // minutes, and a caller that reads silence as a hang kills it.
     let narrator = super::recheck::Narrator::to_stderr(started);
+    // A repo whose changed files read the same as the copy the index was
+    // built from is not re-scanned: the index already holds its answer
+    // (carrick#3245).
+    let always = std::env::var(RESCAN_ENV).is_ok_and(|value| value == "always");
+    let mut unmoved: BTreeMap<String, BTreeMap<String, LineMap>> = BTreeMap::new();
+    let mut rescan: Vec<&Path> = Vec::new();
+    let mut rescanned: BTreeSet<&String> = BTreeSet::new();
+    for (name, (path, _)) in &changed {
+        let lines = if always {
+            None
+        } else {
+            index
+                .repos
+                .iter()
+                .find(|indexed| &indexed.name == name)
+                .and_then(|indexed| reads_the_same(path, indexed))
+        };
+        match lines {
+            Some(lines) => {
+                narrator.phase(
+                    Instant::now(),
+                    format!("nothing the scan reads changed in {name}"),
+                );
+                unmoved.insert(name.clone(), lines);
+            }
+            None => {
+                rescan.push(path.as_path());
+                rescanned.insert(name);
+            }
+        }
+    }
+    for entry in &mut output.repos {
+        let name = super::index::repo_label(Path::new(&entry.repo));
+        if changed.contains_key(&name) {
+            entry.rescan = Some(if unmoved.contains_key(&name) {
+                Rescan::NotNeeded
+            } else {
+                Rescan::Ran
+            });
+        }
+    }
+    // With nothing to re-scan this is the join alone, over the index's own
+    // blobs (carrick#3245). The scope names projecting the index's rows
+    // into the join's shape and starting no child at all; the index does not
+    // carry the join's `unmatched.injected` (which call bases are set at run
+    // time), and `judge` prints it, so the join runs, and the answer stays
+    // the re-scan's.
     let rejoined = super::recheck::rejoin(
         &workspace,
         &rescan,
@@ -359,7 +424,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     // A re-scan that could not replay the index's model answers has lost every
     // row only the model stated, so what it judged is not the whole service
     // (carrick#3000). That is not a pass.
-    let lost = answers_lost(&rejoined.index, changed.keys());
+    let lost = answers_lost(&rejoined.index, rescanned.iter().copied());
     if !lost.is_empty() {
         output.not_checked = Some(lost.join(" "));
     }
@@ -380,6 +445,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &rejoined.join,
         &wanted,
     );
+    let judged = remap_lines(judged, &root, &rejoined.index, &unmoved);
     output.routes = judged.routes;
     output.calls = judged.calls;
     output.failing = judged.problems.iter().filter(|p| p.fails).count();
@@ -410,6 +476,7 @@ fn changed_files(
             skipped: None,
             unchecked: 0,
             no_base: false,
+            rescan: None,
         };
         let Some(indexed) = index.repos.iter().find(|indexed| indexed.name == name) else {
             // The files the work changed here are ones the caller asked
@@ -503,6 +570,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             skipped: Some(format!("{reason}; run `carrick init` or `carrick refresh`")),
             unchecked: 1,
             no_base: false,
+            rescan: None,
         });
     };
     for file in files {
@@ -539,6 +607,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             skipped: None,
             unchecked: 0,
             no_base: false,
+            rescan: None,
         })
         .collect();
     repos.extend(listed);
@@ -566,6 +635,104 @@ fn answers_lost<'a>(
         })
         .map(super::query::answers_unavailable_sentence)
         .collect()
+}
+
+/// For a repo whose every change since the index's commit reads the same to
+/// the scan, where each changed source file's lines went; `None` when any
+/// change could move what the scan reads, or the comparison cannot be made.
+///
+/// The commit is the one every indexed service of the repo was read at, from
+/// a clean tree. A path the published input rule does not read is no change
+/// to the scan. A path it reads must be a source file whose copy at that
+/// commit and whose copy on disk both parse, are equal ignoring positions,
+/// and hold the same type-bearing comments in the same places; a manifest, a
+/// lockfile, a config, a test file, an added or deleted file, or a commit this
+/// clone lacks takes the re-scan (carrick#3245).
+fn reads_the_same(repo: &Path, indexed: &IndexedRepo) -> Option<BTreeMap<String, LineMap>> {
+    // A repo the hosted index stood in for (`read_from_hosted`) is covered
+    // too: its blobs were written beside the scanned ones, so the join below
+    // retains them, and they describe the hosted commit from a clean tree.
+    let commit = &indexed.services.first()?.commit;
+    if commit.is_empty()
+        || indexed
+            .services
+            .iter()
+            .any(|service| &service.commit != commit || service.dirty)
+    {
+        return None;
+    }
+    let text = repo.to_string_lossy();
+    let mut lines = BTreeMap::new();
+    for file in super::query::changed_since(repo, commit)? {
+        if !crate::change_scope::read_by_input_rule(&file) {
+            continue;
+        }
+        if !crate::file_finder::is_scanned_source(&repo.join(&file), repo) {
+            return None;
+        }
+        let before = crate::git_state::file_at_commit(&text, commit, &file)?;
+        let now = std::fs::read_to_string(repo.join(&file)).ok()?;
+        lines.insert(file.clone(), same_reading(Path::new(&file), &before, &now)?);
+    }
+    Some(lines)
+}
+
+/// The judged lines, in the edited files' own numbering. A check answered
+/// from the index reads rows at the lines the index wrote them, which the
+/// edit may have moved; each line in a file that read the same goes where its
+/// node went. Reported lines on the other side (`other`) move the same way.
+fn remap_lines(
+    mut judged: Judged,
+    root: &Path,
+    rebuilt: &LocalIndex,
+    unmoved: &BTreeMap<String, BTreeMap<String, LineMap>>,
+) -> Judged {
+    if unmoved.is_empty() {
+        return judged;
+    }
+    // Workspace-shown file -> its map, and service -> repo, for the `other`
+    // sites that name a service and a repo-relative file.
+    let mut shown_maps: BTreeMap<String, &LineMap> = BTreeMap::new();
+    let mut service_repo: BTreeMap<&str, &str> = BTreeMap::new();
+    for repo in &rebuilt.repos {
+        for service in &repo.services {
+            service_repo.insert(service.name.as_str(), repo.name.as_str());
+        }
+        for (file, map) in unmoved.get(&repo.name).into_iter().flatten() {
+            shown_maps.insert(shown(root, &repo.path, file), map);
+        }
+    }
+    let move_line = |file: &str, line: Option<u32>| match (shown_maps.get(file), line) {
+        (Some(map), Some(line)) => Some(map.map(line)),
+        _ => line,
+    };
+    for problem in &mut judged.problems {
+        problem.line = move_line(&problem.file, problem.line);
+        for other in &mut problem.other {
+            let Some((service, site)) = other.split_once(' ') else {
+                continue;
+            };
+            let (file, line) = super::split_location(site);
+            let Some(map) = service_repo
+                .get(service)
+                .and_then(|repo| unmoved.get(*repo))
+                .and_then(|files| files.get(&file))
+            else {
+                continue;
+            };
+            if let Some(line) = line {
+                *other = format!("{service} {file}:{}", map.map(line));
+            }
+        }
+    }
+    for row in &mut judged.not_type_checked {
+        row.line = move_line(&row.file, row.line);
+    }
+    judged.problems.sort();
+    judged.problems.dedup();
+    judged.not_type_checked.sort();
+    judged.not_type_checked.dedup();
+    judged
 }
 
 struct Judged {
@@ -1456,6 +1623,7 @@ mod tests {
             skipped: Some("not in a repo of this workspace".to_string()),
             unchecked: 1,
             no_base: false,
+            rescan: None,
         };
         let none = ChangedOutput {
             repos: vec![skipped.clone()],
@@ -1503,6 +1671,7 @@ mod tests {
             skipped: Some(String::new()),
             unchecked: 0,
             no_base: true,
+            rescan: None,
         };
         let output = ChangedOutput {
             repos: vec![bare],

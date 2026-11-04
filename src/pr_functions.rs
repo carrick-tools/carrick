@@ -61,9 +61,14 @@ pub struct Stated {
 pub fn stated_in(path: &Path, label: String, source: String) -> BTreeMap<String, Stated> {
     let source_map: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_emitter_writer(Box::new(std::io::sink()), None);
-    let Some(module) =
-        crate::parser::parse_source(path, FileName::Custom(label), source, &source_map, &handler)
-    else {
+    let Some(module) = crate::parser::parse_source(
+        path,
+        FileName::Custom(label),
+        source,
+        &source_map,
+        &handler,
+        None,
+    ) else {
         return BTreeMap::new();
     };
     let mut extractor = FunctionDefinitionExtractor::new(path.to_path_buf(), source_map.clone());

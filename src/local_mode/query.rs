@@ -1403,6 +1403,7 @@ mod drift_tests {
             directory: directory.map(str::to_string),
             include: Vec::new(),
             commit: commit.to_string(),
+            dirty: false,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             boundary: None,
             routes: 0,

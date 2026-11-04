@@ -11080,6 +11080,7 @@ fn discover_with_positions(
                     text,
                     &cm,
                     &handler,
+                    None,
                 )
             }),
             None => parse_file(file_path, &cm, &handler),
