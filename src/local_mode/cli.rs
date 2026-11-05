@@ -616,7 +616,7 @@ fn derive(root: Option<&Path>, candidates: bool) -> Result<serde_json::Value, St
                     serde_json::to_value(found).expect("candidates serialize as a JSON object");
             }
         }
-        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": services,"config": derived.config, "warnings": derived.warnings, "notes": derived.notes, "not_installed": not_installed }));
+        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": services,"config": derived.config, "warnings": derived.warnings, "skipped_patterns": derived.skipped_patterns, "notes": derived.notes, "not_installed": not_installed }));
     }
     Ok(
         serde_json::json!({ "schema": "carrick.derive/0", "workspace": workspace.root, "repos_detected_by": workspace.repos_detected_by, "repos_added": workspace.repos_added, "repos_excluded": workspace.repos_excluded, "missing": workspace.missing, "parent_proposal": workspace.parent_proposal, "repos": repos }),

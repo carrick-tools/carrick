@@ -184,7 +184,6 @@ fn malformed_workspace_and_unmatched_members_are_errors() {
     let dir = tempfile::tempdir().unwrap();
     for text in [
         r#"{"workspaces":42}"#,
-        r#"{"workspaces":["missing/*"]}"#,
         r#"{"workspaces":["../outside/*"]}"#,
         r#"{"workspaces":["apps/{one,two}"]}"#,
     ] {
@@ -756,4 +755,60 @@ fn a_declared_path_inside_the_repository_still_resolves() {
     let services = resolve(&root).unwrap().services;
     assert_eq!(services.len(), 2);
     assert_eq!(services[0].include, ["shared"]);
+}
+
+/// A workspace pattern that matches no package (an emptied or optional
+/// folder) is skipped and named once; the other patterns still propose
+/// their services (carrick#3318).
+#[test]
+fn a_workspace_pattern_matching_nothing_is_skipped_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "pnpm-workspace.yaml",
+        "packages:\n  - 'packages/*'\n  - 'tools/*'\n",
+    );
+    for member in ["one", "two"] {
+        write(root, &format!("packages/{member}/package.json"), "{}");
+        write(
+            root,
+            &format!("packages/{member}/index.ts"),
+            "export const x = 1;\n",
+        );
+    }
+    let derived = resolve(root).unwrap();
+    assert_eq!(
+        derived
+            .services
+            .iter()
+            .map(|s| s.directory.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["packages/one", "packages/two"]
+    );
+    assert_eq!(derived.skipped_patterns.len(), 1);
+    assert_eq!(derived.skipped_patterns[0].pattern, "tools/*");
+    assert!(
+        derived.skipped_patterns[0]
+            .reason
+            .contains("matches no package")
+    );
+    assert_eq!(derived.warnings.len(), 1);
+    assert_eq!(
+        derived.warnings[0],
+        "Workspace pattern 'tools/*' matches no package, so Carrick skips it."
+    );
+}
+
+/// When no pattern matches anything there is nothing to propose, and derive
+/// still refuses rather than guessing a service.
+#[test]
+fn every_workspace_pattern_matching_nothing_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "package.json",
+        r#"{"workspaces":["missing/*"]}"#,
+    );
+    assert!(resolve(dir.path()).is_err());
 }
