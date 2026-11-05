@@ -14,8 +14,9 @@
 //!   (`topic` and `socket_event` included); `socket_event` a socket key whose
 //!   direction is read from the label's side: a send on a server's socket
 //!   goes server to client, a send on a client's client to server, and a
-//!   handler the other way. A side the label does not state (`both`, or one
-//!   decided by origin) is `Unknown`.
+//!   handler the other way. A label the store marks `by_origin` takes its side
+//!   from the instance the receiver trace walked to (`socket_side`,
+//!   carrick#1670). A side neither states (`both`, or no trace) is `Unknown`.
 //! - **Provenance** (decided on carrick#2439, 2026-10-16). A row whose every
 //!   slot is forced is a fact: `request_summary` for an HTTP send,
 //!   `library_claim` for the rest. A row with any asked slot is `model`, a
