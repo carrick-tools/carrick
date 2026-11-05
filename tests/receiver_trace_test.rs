@@ -90,6 +90,16 @@ fn scan_runs(
         .collect()
 }
 
+/// The two fact-layer switches [`scan_cmd`] leaves to the caller, on: with
+/// `fact_layer` and the trace, a scan in the form a cloud scan runs.
+const ON_FORM: [(&str, &str); 2] = [("CARRICK_FACT_FILES", "1"), ("CARRICK_SITE_PAYLOADS", "1")];
+
+/// [`scan_fixture_reading`] in the form a cloud scan runs: every fact-layer
+/// switch on.
+fn scan_fixture_on_form(name: &str) -> (Blobs, Fallbacks) {
+    scan_runs_with(name, &[], true, Some("1"), 1, true, &ON_FORM).remove(0)
+}
+
 /// [`scan_runs`], and, with `reading`, each scan's fallbacks lines.
 fn scan_runs_reading(
     name: &str,
@@ -98,6 +108,19 @@ fn scan_runs_reading(
     trace: Option<&str>,
     runs: usize,
     reading: bool,
+) -> Vec<(Blobs, Fallbacks)> {
+    scan_runs_with(name, extra, fact_layer, trace, runs, reading, &[])
+}
+
+/// [`scan_runs_reading`] with `env` set on every scan.
+fn scan_runs_with(
+    name: &str,
+    extra: &[(&str, &str)],
+    fact_layer: bool,
+    trace: Option<&str>,
+    runs: usize,
+    reading: bool,
+    env: &[(&str, &str)],
 ) -> Vec<(Blobs, Fallbacks)> {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
@@ -112,6 +135,7 @@ fn scan_runs_reading(
     std::fs::create_dir_all(&storage).unwrap();
     let home = tmp.path().join("home");
     let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home, fact_layer, trace);
+    cmd.envs(env.iter().copied());
     cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
     if reading {
         cmd.env("CARRICK_PROGRESS", "1");
@@ -1021,9 +1045,16 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
 /// call still records the call-in the routes package's segments join at, so
 /// the plugin's routes take the `/api/v1` scope prefix as `library_claim`
 /// rows, as they do for a host that imports the named export.
+///
+/// Scanned in the form a cloud scan runs (carrick#3283). The reader's answer
+/// for `main.ts` is replayed from the fixture's `__llm__/analyze-file/`: the
+/// route at the line that writes it, folded onto the library row there. With
+/// the mock's own answer instead, the row would land one line low (the mock
+/// numbers the line after the source fence as line 1) on the `register`
+/// candidate the fact files keep at line 8, beside the library row.
 #[test]
 fn a_host_made_through_the_other_export_still_joins_the_plugins_routes() {
-    let (on, _) = scan_fixture_reading("receiver-scopes-default-export", true, Some("1"));
+    let (on, _) = scan_fixture_on_form("receiver-scopes-default-export");
     let (graph, _) = endpoint_rows(&on);
     assert_eq!(
         graph,

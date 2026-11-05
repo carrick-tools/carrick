@@ -475,24 +475,36 @@ fn sourced_call_rows(blob: &serde_json::Value) -> Vec<String> {
     rows
 }
 
+/// The fact-layer switches [`scan_with`] leaves to the caller, on: with the
+/// two it sets, a scan in the form a cloud scan runs (carrick#3283).
+const ON_FORM: [(&str, &str); 3] = [
+    ("CARRICK_RECEIVER_TRACE", "1"),
+    ("CARRICK_FACT_FILES", "1"),
+    ("CARRICK_SITE_PAYLOADS", "1"),
+];
+
 /// carrick#2618, `tests/fixtures/sibling-wrapper/README.md`: every
 /// operation the app reaches through the client ends with exactly one fact
-/// row, at a wrapper's call into the client while no leaf row states it at
-/// the wrapper's caller. Scanned once with no reader answer for `api.ts`
-/// (the reader states nothing there) and once with the reader stating the
-/// wrappers' lines (`reader/analyze-file/api.json`): a site row replaces
-/// the reader's, and no model row is left.
+/// row. Scanned once with no reader answer for `api.ts` (the reader states
+/// nothing there) and once with the reader stating the wrappers' lines
+/// (`reader/analyze-file/api.json`): a site row replaces the reader's, and
+/// no model row is left. In the form a cloud scan runs, call-through states
+/// the leaf row at each call into a wrapper that reaches one request, and
+/// the wrapper's own row goes (ruled on carrick#2448).
 #[test]
 fn each_operation_through_a_client_wrapper_keeps_one_fact_row() {
     if !sidecar_built() {
         return;
     }
     const WRAPPER_ROWS: [&str; 5] = [
-        "services/app/src/api.ts:10 GET /api/status request_summary",
+        // `ItemsApi.both` sends `getVersion()` aside and returns
+        // `getItem("1")`: its caller states the request it returns, and the
+        // aside request keeps the wrapper's row.
         "services/app/src/api.ts:14 GET /api/version request_summary",
-        "services/app/src/api.ts:15 GET /api/items/1 request_summary",
-        "services/app/src/api.ts:6 GET /api/items/:id request_summary",
+        "services/app/src/commands.ts:11 GET /api/status request_summary",
+        "services/app/src/commands.ts:16 GET /api/items/:id request_summary",
         "services/app/src/commands.ts:21 GET /api/health request_summary",
+        "services/app/src/commands.ts:6 GET /api/items/:id request_summary",
     ];
     let reader = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/sibling-wrapper/reader/analyze-file/api.json");
@@ -506,7 +518,7 @@ fn each_operation_through_a_client_wrapper_keeps_one_fact_row() {
             }
         });
         let store = tempfile::tempdir().unwrap();
-        let blobs = scan(&repo, store.path(), &[], true);
+        let (blobs, _) = scan_with(&repo, store.path(), &[], true, &ON_FORM);
         assert_eq!(
             sourced_call_rows(blob_of(&blobs, "app")),
             WRAPPER_ROWS,
