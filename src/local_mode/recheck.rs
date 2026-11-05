@@ -294,8 +294,7 @@ pub fn run(
     let outcome = inside(
         workspace,
         held,
-        repo,
-        relative,
+        (repo, relative),
         &generation,
         deadline,
         &plan,
@@ -855,8 +854,7 @@ fn named_additions(
 fn inside(
     workspace: &Workspace,
     held: Held,
-    repo: &Path,
-    relative: &str,
+    (repo, relative): (&Path, &str),
     generation: &Path,
     deadline: Instant,
     plan: &Plan,
