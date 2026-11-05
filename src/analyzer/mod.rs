@@ -1652,6 +1652,18 @@ fn call_env_var(
         .flatten()
 }
 
+/// Whether a call target opens on an interpolated origin, `${...}/route`.
+///
+/// The origin is a value the key cannot name, so a lookup of the remainder
+/// would pair or miss a call whose host is unknown (carrick#378).
+fn opens_on_interpolated_origin(target: &str) -> bool {
+    target
+        .trim_start_matches(['`', '"', '\''])
+        .strip_prefix("${")
+        .and_then(|rest| rest.split_once('}'))
+        .is_some_and(|(_, after)| after.starts_with('/'))
+}
+
 pub fn is_valid_route_shape(route: &str) -> bool {
     let route = route.trim();
     if route.is_empty() {
@@ -2672,6 +2684,12 @@ impl Analyzer {
                 target,
             );
             let is_env_route = env_var_name.is_some();
+            // A call whose key opens on an interpolated origin the AST stated
+            // no base for names no host to look up and no variable to report:
+            // it is neither an env-var finding nor a missing endpoint.
+            if !is_env_route && opens_on_interpolated_origin(target) {
+                continue;
+            }
             if let Some(env_var_name) = env_var_name {
                 let normalized_path = normalizer.extract_path(target);
                 let canonical_env_var_route =
@@ -5561,6 +5579,61 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f, Finding::EnvVarCall { .. })),
             "a stripped base reports no env-var call: {findings:?}"
+        );
+    }
+
+    /// N14a: a call whose key opens on an origin variable the call's row states
+    /// no base for is neither an env-var finding nor a missing endpoint.
+    #[test]
+    fn a_call_with_no_stated_base_reports_neither_env_var_nor_missing() {
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut graph = MountGraph::new();
+        analyzer.calls.push(http_call(
+            "POST",
+            "${BILLING_API_URL}/usage/ingest",
+            "src/route.ts:12",
+        ));
+        graph.data_calls.push(data_call_in(
+            "POST",
+            "${BILLING_API_URL}/usage/ingest",
+            "src/route.ts:12",
+            "web",
+        ));
+
+        let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f,
+                Finding::EnvVarCall { .. } | Finding::MissingEndpoint { .. }
+            )),
+            "no stated base, so nothing to report: {findings:?}"
+        );
+    }
+
+    /// N14a: a variable read in the PATH of a literal-host call is not the
+    /// call's base. The call names no variable; it is judged by its host like
+    /// any other literal-host call (an undeclared host is a gap, a declared
+    /// one is silent).
+    #[test]
+    fn a_variable_in_the_path_of_a_literal_host_call_names_no_env_var() {
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut graph = MountGraph::new();
+        let route = "https://vendor.test/v1/projects/${PROJECT_ID}/models";
+        analyzer
+            .calls
+            .push(http_call("POST", route, "src/client.ts:9"));
+        let mut row = data_call_in("POST", route, "src/client.ts:9", "web");
+        row.host = Some("vendor.test".to_string());
+        graph.data_calls.push(row);
+
+        let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, Finding::EnvVarCall { .. })),
+            "a path variable is not a base: {findings:?}"
         );
     }
 
