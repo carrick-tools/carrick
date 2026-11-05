@@ -327,7 +327,7 @@ export function drain(sessionId: string, home?: string): Drained | null {
 
 /**
  * The one line the Stop hook hands the model: how many functions, at most two
- * names, and the ask. Short on purpose, and it starts with "Carrick:" so the
+ * names, and the ask with the exact call (`functions: [{ name, file }]`). Short on purpose, and it starts with "Carrick:" so the
  * user can tell where it came from. The two limits on the answer (what the
  * index was taken at, and that the match is on what a function is described as
  * doing) live in the `carrick-reuse` skill, where the answer is read.
@@ -342,5 +342,5 @@ export function nudge(entries: NewFunction[]): string {
       : shown.length === 2
         ? `${shown[0]} and ${shown[1]}`
         : shown[0]!;
-  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, then tell the user in one line what Carrick found.`;
+  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing \`functions: [{ name, file }]\`, one entry per new function. Then tell the user in one line what Carrick found.`;
 }

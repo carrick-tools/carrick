@@ -334,6 +334,65 @@ function deletedLine(result: CheckResult, where: string): string {
 }
 
 /**
+ * Whether the answer says no re-check ran: the file matches the index, or a
+ * warranted re-check did not finish. The CLI sends `recheck` on every
+ * `--recheck` read, so a `none` there is its statement that nothing ran.
+ */
+function recheckDidNotRun(result: CheckResult): boolean {
+  return result.recheck?.ran === "none";
+}
+
+/**
+ * Whether the answer holds a type verdict: a pair the compiler compared, whose
+ * result is `compatible` or a mismatch. `not_checked` and `unresolved` rows
+ * are pairs nobody judged, so a file with only those has no type verdict.
+ */
+function judgedAnyPair(result: CheckResult): boolean {
+  return (result.items ?? []).some(
+    (item) => item.verdict?.state === "resolved" && item.verdict.result != null,
+  );
+}
+
+/** Why no pair was judged, in the words the index recorded, else a plain statement. */
+function notJudgedReason(result: CheckResult): string {
+  const boundary = result.boundary;
+  const degraded = boundary?.types_degraded;
+  if (degraded?.detail) return degraded.detail.replace(/\.+$/, "");
+  if (boundary?.type_extraction_status) return boundary.type_extraction_status.replace(/\.+$/, "");
+  return "no pair in this file was compared";
+}
+
+/**
+ * The first line of an edit's message. It claims only what ran: "re-checked"
+ * only when a re-check ran, and "no contract problem" only when a type pair
+ * was judged and none of the verdicts is a problem.
+ */
+function headline(result: CheckResult, where: string, problems: number): string {
+  const noProblem = judgedAnyPair(result) ? "no contract problem" : null;
+  const unjudged =
+    (result.items ?? []).length === 0
+      ? "no route or call to check"
+      : `types were not checked (${notJudgedReason(result)}), so no contract verdict`;
+  const count = (suffix: string) =>
+    problems > 0 ? `${problems} contract ${problems === 1 ? "problem" : "problems"}${suffix}` : null;
+  if (recheckDidNotRun(result)) {
+    const tail = count("") ?? noProblem ?? unjudged;
+    return `Carrick: ${where} matches the index, so there was nothing to re-check. The index shows: ${tail}.`;
+  }
+  const stale = result.recheck?.scope?.stale ?? [];
+  if (stale.length > 0) {
+    // A service that reads this edit was judged at a version that predates
+    // it, so a bare "no contract problem" would be a claim the check did not
+    // make. Problems found still list below.
+    const tail = count(" in what it re-read") ?? (noProblem ? `${noProblem} in what it re-read` : unjudged);
+    const names = stale.slice(0, MAX_STALE_SERVICES).join(", ");
+    const more = stale.length > MAX_STALE_SERVICES ? `, and ${stale.length - MAX_STALE_SERVICES} more` : "";
+    return `Carrick re-checked ${where}: ${tail}; ${stale.length} ${stale.length === 1 ? "service" : "services"} that read this edit ${stale.length === 1 ? "was" : "were"} judged at their indexed version (${names}${more}). Run \`carrick check --changed\` before you finish.`;
+  }
+  return `Carrick re-checked ${where} after this edit: ${count("") ?? noProblem ?? unjudged}.`;
+}
+
+/**
  * The PostToolUse context, or `null` for an error payload.
  *
  * Only what this edit changed or what needs action, a few lines at most: on a
@@ -370,27 +429,7 @@ export function renderPostToolUse(
     if (result.deleted) {
       lines.push(deletedLine(result, where));
     } else {
-      const stale = result.recheck?.scope?.stale ?? [];
-      if (stale.length > 0) {
-        // A service that reads this edit was judged at a version that
-        // predates it, so "no contract problem" would be a claim the check
-        // did not make. Problems found still list as below.
-        const count =
-          problems.length === 0
-            ? "no contract problem in what it re-read"
-            : `${problems.length} contract ${problems.length === 1 ? "problem" : "problems"} in what it re-read`;
-        const names = stale.slice(0, MAX_STALE_SERVICES).join(", ");
-        const more = stale.length > MAX_STALE_SERVICES ? `, and ${stale.length - MAX_STALE_SERVICES} more` : "";
-        lines.push(
-          `Carrick re-checked ${where}: ${count}; ${stale.length} ${stale.length === 1 ? "service" : "services"} that read this edit ${stale.length === 1 ? "was" : "were"} judged at their indexed version (${names}${more}). Run \`carrick check --changed\` before you finish.`,
-        );
-      } else {
-        const count =
-          problems.length === 0
-            ? "no contract problem"
-            : `${problems.length} contract ${problems.length === 1 ? "problem" : "problems"}`;
-        lines.push(`Carrick re-checked ${where} after this edit: ${count}.`);
-      }
+      lines.push(headline(result, where, problems.length));
     }
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);

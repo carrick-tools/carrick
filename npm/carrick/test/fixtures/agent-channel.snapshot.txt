@@ -1,5 +1,5 @@
 ### check-clean.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no contract problem.
+Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
 
 ### check-counterpart.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: 1 contract problem.
@@ -16,7 +16,7 @@ Carrick: user-service/src/routes/users.ts is gone from disk and the index still 
 Carrick: user-service/src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.
 
 ### check-new-functions.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no contract problem.
+Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
 
 ### check-not-indexed.json :: renderPostToolUse
 (silent)
@@ -25,7 +25,7 @@ Carrick re-checked user-service/src/routes/users.ts after this edit: no contract
 Carrick: user-service/src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.
 
 ### check-silent.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no contract problem.
+Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
 
 ### check-types.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: 2 contract problems.
@@ -33,7 +33,7 @@ Carrick re-checked user-service/src/routes/users.ts after this edit: 2 contract 
 - user-service/src/routes/users.ts:71:5 call POST /api/users [fact, imported_member] request is { name: string }, producer at identity-service src/routes/users.ts:14 expects CreateUser { name: string; email: string }. Property 'email' is missing in type '{ name: string }'. Producers: identity-service src/routes/users.ts:14
 
 ### check-uses.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no contract problem.
+Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
 Other files use what this file declares: `carrick check user-service/src/routes/users.ts` lists the 2 uses; open them if this edit changed a signature or a type.
 
 ### status-not-indexed.json :: renderSessionStart
