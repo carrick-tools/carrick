@@ -11668,4 +11668,36 @@ function build() { return {}; }
         };
         assert!(!base_in_another_file(vec![renamed]));
     }
+
+    /// carrick#2406 (row X1): what the deleted text test (`reads_the_environment`)
+    /// answered on its own cases. A base written as an environment read, in
+    /// each runtime's spelling, reads the same in every file, so a client
+    /// declared in one module states its row at a call in another. A base
+    /// that is a field, a call result or an import does not.
+    #[test]
+    fn an_environment_read_base_reads_the_same_in_another_file() {
+        let in_another_file = |base: &str| {
+            let source =
+                format!("export function list() {{ return fetch(`${{{base}}}/users`); }}\n");
+            let url = request_url(&source, "list");
+            let mut effect = effect(vec![lit("/users")]);
+            effect.base = url[..1].to_vec();
+            effect.base_scope = Some(PathBuf::from("src/client.ts"));
+            (
+                base_reads_the_same_in(&effect, Path::new("src/use.ts")),
+                base_reads_the_same_in(&effect, Path::new("src/client.ts")),
+            )
+        };
+        for base in [
+            "process.env.API",
+            "process.env[\"API\"]",
+            "import.meta.env.VITE_API",
+            "Deno.env.get(\"API\")",
+        ] {
+            assert_eq!(in_another_file(base), (true, true), "{base}");
+        }
+        for base in ["config.apiUrl", "readBase()", "API_BASE"] {
+            assert_eq!(in_another_file(base), (false, true), "{base}");
+        }
+    }
 }

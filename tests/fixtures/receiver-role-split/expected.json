@@ -1,0 +1,10 @@
+{
+  "routes": [
+    "src/app.ts:10 GET /widgets",
+    "src/typed.ts:7 GET /gadgets"
+  ],
+  "requests": [
+    "src/app.ts:11 GET /widgets",
+    "src/typed.ts:11 GET /gadgets"
+  ]
+}
