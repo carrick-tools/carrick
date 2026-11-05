@@ -23062,6 +23062,22 @@ unfollowed_member_calls_total: 0,
         assert_eq!(manifest[0].primary_type_symbol, None);
     }
 
+    /// Blueprint row N8: a service's own payload types named `Context`,
+    /// `Request` or `Router` are its contract. Machinery is decided by where a
+    /// type is declared, so a name alone never keeps it from anchoring a row.
+    #[test]
+    fn a_users_own_type_named_like_machinery_fills_the_anchor() {
+        for name in ["Context", "Request", "Router"] {
+            let mut manifest = vec![consumer_entry("OrderView")];
+            let mut resolution = empty_resolution();
+            resolution.inferred_types.push(inferred_with_symbol(name));
+
+            anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
+
+            assert_eq!(manifest[0].primary_type_symbol.as_deref(), Some(name));
+        }
+    }
+
     // -----------------------------------------------------------------
     // carrick#1819: an anchor the inference fills states its home
     // -----------------------------------------------------------------
