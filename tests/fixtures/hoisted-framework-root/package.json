@@ -1,0 +1,6 @@
+{
+  "name": "hoisted-root",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "dependencies": { "next": "^14.0.0" }
+}

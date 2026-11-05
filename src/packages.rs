@@ -380,6 +380,14 @@ pub struct Packages {
     /// payloads persisted before the field existed.
     #[serde(default)]
     pub internal_names: BTreeSet<String>,
+    /// Package names the service's enclosing workspace root declares (see
+    /// [`workspace_root_dependency_names`]). Kept apart from `package_jsons`
+    /// and `merged_dependencies`: the root's manifest is not the service's,
+    /// so version selection and the manifest hash must not see it. Only
+    /// [`Packages::declared_dependency_names`] reads it. Not serialized: it is
+    /// scan-time input, and the index blob shape is a seam.
+    #[serde(skip)]
+    pub workspace_root_dependencies: BTreeSet<String>,
 }
 
 /// The pnpm catalogs one `pnpm-workspace.yaml` declares (carrick#1156).
@@ -477,6 +485,41 @@ impl PnpmCatalogLookup {
         }
         self.by_dir.get(dir)?.as_ref()
     }
+}
+
+/// The dependency names declared by the workspace root(s) above a service.
+///
+/// A monorepo declares a framework once at its root and hoists it; the member
+/// manifest then names nothing, yet the member runs that framework. A
+/// directory strictly above `service_root` and inside `repo_root` counts when
+/// its `package.json` declares `workspaces` or it holds a
+/// `pnpm-workspace.yaml`. A plain ancestor `package.json` that is neither is
+/// some other project and is not read.
+pub fn workspace_root_dependency_names(repo_root: &Path, service_root: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for dir in service_root.ancestors().skip(1) {
+        if !dir.starts_with(repo_root) {
+            break;
+        }
+        let manifest = dir.join("package.json");
+        let Ok(json) = read_json_config(&manifest) else {
+            continue;
+        };
+        if json.get("workspaces").is_none() && !dir.join("pnpm-workspace.yaml").is_file() {
+            continue;
+        }
+        for key in [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ] {
+            if let Some(map) = json.get(key).and_then(serde_json::Value::as_object) {
+                names.extend(map.keys().cloned());
+            }
+        }
+    }
+    names
 }
 
 /// Directories excluded when walking a repo tree for manifests: dependency
@@ -594,7 +637,9 @@ pub fn collect_internal_package_names(repo_root: &std::path::Path) -> BTreeSet<S
 
 impl Packages {
     /// Every package name this service's own `package.json` files declare, in
-    /// any of the three dependency maps, deduplicated and sorted.
+    /// any of the three dependency maps, plus those its enclosing workspace
+    /// root declares (a hoisted `next` is the service's dependency),
+    /// deduplicated and sorted.
     ///
     /// Read straight off `package_jsons` rather than from
     /// `merged_dependencies`: that map is built through version parsing, and a
@@ -612,6 +657,7 @@ impl Packages {
                     .chain(pkg.peer_dependencies.keys())
             })
             .cloned()
+            .chain(self.workspace_root_dependencies.iter().cloned())
             .collect();
         names.sort();
         names.dedup();
@@ -1122,6 +1168,7 @@ mod tests {
                 .iter()
                 .map(|name| format!("@internal/{name}"))
                 .collect(),
+            ..Default::default()
         }
     }
 

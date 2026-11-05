@@ -232,10 +232,15 @@ pub fn service_reach(repo: &Path, service: &Config, files: &[PathBuf]) -> Servic
         }
     }
 
-    let dependencies: Vec<String> = manifest
+    let mut dependencies: BTreeSet<String> = manifest
         .as_ref()
-        .map(|(_, json)| dependency_names(json).into_iter().collect())
+        .map(|(_, json)| dependency_names(json))
         .unwrap_or_default();
+    dependencies.extend(crate::packages::workspace_root_dependency_names(
+        repo,
+        &service_root,
+    ));
+    let dependencies: Vec<String> = dependencies.into_iter().collect();
     let conventions = crate::file_based_router::builtin_conventions(&dependencies);
     if !conventions.is_empty() {
         for (index, file) in files.iter().enumerate() {

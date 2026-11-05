@@ -11862,6 +11862,15 @@ fn load_packages_for_service(
     // service, but a dependency on it is internal, not a registry package.
     packages.internal_names =
         crate::packages::collect_internal_package_names(std::path::Path::new(repo_path));
+    // A framework hoisted to the workspace root is still this service's
+    // dependency: the file-routing conventions read it from here.
+    packages.workspace_root_dependencies = crate::packages::workspace_root_dependency_names(
+        std::path::Path::new(repo_path),
+        &match &service.directory {
+            Some(dir) => std::path::Path::new(repo_path).join(dir),
+            None => PathBuf::from(repo_path),
+        },
+    );
     Ok(packages)
 }
 
@@ -15313,6 +15322,38 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 "{written}"
             );
         }
+    }
+
+    /// A framework declared only in the workspace root (hoisted) is still the
+    /// member's dependency: the member's own manifest names nothing, and the
+    /// file routes of its `app/` tree must still be derived, by the engine's
+    /// dependency list and by the reach census alike.
+    #[test]
+    fn a_framework_hoisted_to_the_workspace_root_still_gates_file_routes() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/hoisted-framework-root")
+            .canonicalize()
+            .unwrap();
+        let service = Config {
+            directory: Some("apps/web".into()),
+            ..Config::default()
+        };
+        let packages = load_packages_for_service(repo.to_str().unwrap(), &service).unwrap();
+        let declared = packages.declared_dependency_names();
+        assert!(declared.contains(&"next".to_string()), "{declared:?}");
+        let conventions = crate::file_based_router::builtin_conventions(&declared);
+        let route = crate::file_based_router::derive_route(
+            Path::new("app/api/items/route.ts"),
+            &conventions,
+        );
+        assert!(route.is_some(), "no file route from {declared:?}");
+        // The root's dependencies are not merged into the service's own set:
+        // version selection and the manifest hash stay the member's.
+        assert!(!packages.merged_dependencies.contains_key("next"));
+
+        let files = vec![repo.join("apps/web/app/api/items/route.ts")];
+        let reach = crate::derive_reach::service_reach(&repo, &service, &files).reach;
+        assert_eq!(reach.route_roots, 1);
     }
 
     #[test]
