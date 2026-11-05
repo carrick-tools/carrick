@@ -85,10 +85,15 @@
       "line": 11,
       "type_alias": "Endpoint_e8e423d0a20a7bde_Response_At5fc4b8d0dc60fcfa",
       "type_state": "Implicit",
-      "resolved_definition": "export interface User {\n    id: number;\n    name: string;\n    email: string;\n}",
+      "resolved_definition": "export type Endpoint_e8e423d0a20a7bde_Response_At5fc4b8d0dc60fcfa = {\n    id: number;\n    name: string;\n    email: string;\n};",
       "expanded_definition": "{ id: number; name: string; email: string; }",
       "is_explicit": false,
-      "primary_type_symbol": "User"
+      "primary_type_symbol": "User",
+      "defined_in": {
+        "file_path": "src/types.ts",
+        "line_number": 1,
+        "symbol": "User"
+      }
     }
   ],
   "calls": [
