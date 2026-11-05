@@ -117,6 +117,7 @@ pub fn answer(
     // there was nothing to do" are different facts that an absent block cannot
     // tell apart.
     let mut reads_same = false;
+    let mut moved_items: Option<Vec<IndexedItem>> = None;
     let recheck = match (freshness, mode) {
         (Freshness::Recheck, Mode::Check) if stale && !deleted => {
             // An edit the scan reads the same (comments, layout) has nothing
@@ -129,8 +130,10 @@ pub fn answer(
                 });
             reads_same = unchanged.is_some();
             Some(match unchanged {
-                Some(lines) => (
-                    Some(
+                Some(lines) => {
+                    // Nothing re-ran, so the type check stays the index's
+                    // (read below); only the rows move to their new lines.
+                    moved_items = Some(
                         items
                             .iter()
                             .map(|item| IndexedItem {
@@ -138,12 +141,15 @@ pub fn answer(
                                 ..item.clone()
                             })
                             .collect(),
-                    ),
-                    Recheck {
-                        reason: Some(UNREAD_EDIT_REASON.to_string()),
-                        ..not_run("", &indexed_at)
-                    },
-                ),
+                    );
+                    (
+                        None,
+                        Recheck {
+                            reason: Some(UNREAD_EDIT_REASON.to_string()),
+                            ..not_run("", &indexed_at)
+                        },
+                    )
+                }
                 None => match super::recheck::Reach::of(repo, &relative, &service) {
                     Some(reach) => rechecked(
                         workspace_root,
@@ -173,7 +179,7 @@ pub fn answer(
     };
     let items = match &recheck {
         Some((Some((fresh, _)), _)) => fresh.clone(),
-        _ => items,
+        _ => moved_items.unwrap_or(items),
     };
     // The type check the rows above came from: this run's own when a re-check
     // answered, else the index's (carrick#3204).

@@ -966,6 +966,58 @@ fn a_comment_only_edit_is_answered_without_a_re_scan() {
     );
 }
 
+/// carrick#3204: a comment-only edit re-runs nothing, so its `--json` answer
+/// carries the index's own `type_check`, ran or skipped with its reason.
+#[test]
+#[serial]
+fn a_comment_only_edit_answers_with_the_indexs_type_check() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    index(root);
+    let args = ["check", route, "--workspace", ".", "--recheck", "--json"];
+
+    for skipped in [None, Some("type checker not found")] {
+        if let Some(reason) = skipped {
+            let path = root.join(".carrick/index.json");
+            let mut stored: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read the index"))
+                    .expect("the index is JSON");
+            stored["type_check"]["skipped"] = serde_json::json!(reason);
+            std::fs::write(&path, stored.to_string()).expect("write the index");
+        }
+        let indexed: serde_json::Value =
+            serde_json::from_str(&run(root, &["check", route, "--workspace", ".", "--json"]))
+                .expect("JSON");
+        edit(
+            &root.join(route),
+            "export async function",
+            "// a note\nexport async function",
+        );
+        let answered: serde_json::Value = serde_json::from_str(&run(root, &args)).expect("JSON");
+        assert_eq!(answered["recheck"]["ran"], "none", "{answered:#}");
+        assert_eq!(
+            answered["type_check"], indexed["type_check"],
+            "{answered:#}"
+        );
+        assert_eq!(
+            answered["type_check"]["ran"],
+            skipped.is_none(),
+            "{answered:#}"
+        );
+        assert_eq!(
+            answered["type_check"]["reason"],
+            skipped.map_or(serde_json::Value::Null, serde_json::Value::from),
+            "{answered:#}"
+        );
+        edit(
+            &root.join(route),
+            "// a note\nexport async function",
+            "export async function",
+        );
+    }
+}
+
 /// A token the scan reads, or a comment that carries a type, is not an edit
 /// that reads the same: both still take the re-scan.
 #[test]
