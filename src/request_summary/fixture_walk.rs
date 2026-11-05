@@ -267,3 +267,22 @@ pub(crate) fn walked_services(
         inputs,
     })
 }
+
+/// What the real sidecar finds for each call of `walked` through an interface
+/// member, asked as a scan asks it: of a process initialised on the service's
+/// directory (carrick#2432 slice B).
+pub(crate) fn implementations_of(
+    script: &Path,
+    walked: &Walked,
+    service_dir: &str,
+) -> super::implementations::Implementations {
+    let sidecar = crate::services::TypeSidecar::spawn(script).expect("spawn the sidecar");
+    sidecar.set_scan_root(&walked.repo);
+    sidecar.start_init(&walked.repo.join(service_dir), None);
+    sidecar
+        .wait_ready(std::time::Duration::from_secs(900))
+        .expect("the sidecar is ready");
+    super::implementations::implementations_of(&walked.inputs, |queries| {
+        sidecar.implementations(queries, &walked.repo)
+    })
+}

@@ -225,6 +225,10 @@ pub use rows_join::ROWS_JOIN_BUDGET;
 #[allow(dead_code)]
 pub(crate) mod discovery;
 
+// The implementations of an interface member a call goes through, asked of
+// the analysis sidecar and read by discovery (carrick#2432 slice B).
+pub(crate) mod implementations;
+
 // The routes a hand-written dispatch states (carrick#2474 R4a): record-only,
 // logged by a scan with the receiver trace on and dropped.
 pub(crate) mod dispatch;

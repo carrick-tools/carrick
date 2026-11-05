@@ -1,0 +1,11 @@
+{
+  "name": "implementations-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-socket": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

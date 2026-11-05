@@ -69,6 +69,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::implementations::{Followed, Implementations};
 use super::row_calls::Reach;
 use super::values::ValueAt;
 use super::*;
@@ -101,6 +102,29 @@ const SEVERAL_VALUES: &str = "several_values";
 const VALUES_OVER_CAP: &str = "values_over_cap";
 const VALUE_NEVER_BOUND: &str = "value_never_bound";
 const INJECTED_CALLEE: &str = "injected_callee";
+
+/// Why a walk through an interface member's implementations reached no one
+/// labelled export (carrick#2432 slice B): they disagree or one reaches
+/// none, or the sidecar found more than it lists.
+pub(crate) const SEVERAL_IMPLEMENTATIONS: &str = "several_implementations";
+const IMPLEMENTATIONS_OVER_CAP: &str = "implementations_over_cap";
+
+/// The two words [`Walker::agree`] stops with: for several values or
+/// implementations that disagree, and for more of them than it follows.
+#[derive(Clone, Copy)]
+struct Plural {
+    several: &'static str,
+    over_cap: &'static str,
+}
+
+const OF_VALUES: Plural = Plural {
+    several: SEVERAL_VALUES,
+    over_cap: VALUES_OVER_CAP,
+};
+const OF_IMPLEMENTATIONS: Plural = Plural {
+    several: SEVERAL_IMPLEMENTATIONS,
+    over_cap: IMPLEMENTATIONS_OVER_CAP,
+};
 
 /// How many values a callee may hold before the walk stops reading them.
 const MAX_VALUES: usize = 16;
@@ -213,6 +237,9 @@ pub struct Labels<'a> {
     networked: HashSet<&'a str>,
     /// The exports the store labelled with no network role.
     none: HashSet<(&'a str, &'a str)>,
+    /// What the sidecar found for the calls through an interface member
+    /// (carrick#2432 slice B); `None` leaves each one a stop.
+    implementations: Option<&'a Implementations>,
 }
 
 impl<'a> Labels<'a> {
@@ -226,6 +253,7 @@ impl<'a> Labels<'a> {
             exports,
             by_name,
             declarations: None,
+            implementations: None,
             answered: None,
             networked: exports
                 .iter()
@@ -281,6 +309,15 @@ impl<'a> Labels<'a> {
             .as_ref()
             .is_some_and(unanswered)
             .then_some(UNANSWERED_PACKAGE)
+    }
+
+    /// These labels, following a call through an interface member into the
+    /// implementations `implementations` holds for it.
+    pub fn following(self, implementations: &'a Implementations) -> Self {
+        Labels {
+            implementations: Some(implementations),
+            ..self
+        }
     }
 
     /// [`Self::of`], with the receiver trace on.
@@ -885,7 +922,7 @@ struct Found {
     reached: Option<ReachedBy>,
     /// Reached through a callee whose values reach different labelled
     /// exports (carrick#2432): one of several, so no site.
-    several: bool,
+    several: Option<&'static str>,
 }
 
 /// What a call or a body reaches.
@@ -1596,6 +1633,63 @@ impl<'a> Walker<'a> {
         })
     }
 
+    /// What the call `call` through an interface member reaches, read through
+    /// the implementations the sidecar found for it (carrick#2432 slice B):
+    /// each is entered as the definition it is, and they agree on one
+    /// labelled end or the call is a lead. An implementation only tests
+    /// import (a double) is not one. `None` when the sidecar found none to
+    /// follow, or the walk can enter none, so the call stays an
+    /// `interface_member` stop.
+    fn through_implementations(
+        &mut self,
+        file: &'a Path,
+        call: &'a CallIr,
+        invoke: Invoke<'a>,
+    ) -> Option<Outcome<'a>> {
+        let followed = self
+            .labels
+            .implementations?
+            .at(file, call.site.lo, call.site.hi)?;
+        let found = match followed {
+            Followed::OverCap => return Some(Outcome::stopped(IMPLEMENTATIONS_OVER_CAP)),
+            Followed::Found(found) => found,
+        };
+        let positions = self.inputs_for(file).positions.as_ref()?;
+        let mut values = Vec::new();
+        // How many the walk entered. One it cannot enter (no symbol, or a
+        // declaration that is no function: a `.d.ts` or a property) reaches
+        // nothing, so beside an implementation that does reach a labelled
+        // end it is a disagreement and the call is a lead, as for a value
+        // that reaches none. When none can be entered the call keeps the
+        // `interface_member` stop instead of reading as no site.
+        let mut entered = 0;
+        for named in found {
+            let (Some(symbol), Some(decl_file)) =
+                (named.symbol.as_deref(), named.decl_file.as_deref())
+            else {
+                values.push(Held::Reached(Outcome::default()));
+                continue;
+            };
+            let declaring = positions.path_of(decl_file);
+            let holder = self.inputs_for(&declaring);
+            if holder.test_only.contains(&declaring) {
+                continue;
+            }
+            let reached = match holder.definition_at(&declaring, named.decl_line, symbol) {
+                Reach::Function(target, key) => {
+                    entered += 1;
+                    self.enter_value(target, key, invoke)
+                }
+                _ => Outcome::default(),
+            };
+            values.push(Held::Reached(reached));
+        }
+        if entered == 0 {
+            return None;
+        }
+        Some(self.agree(values, invoke, Vec::new(), OF_IMPLEMENTATIONS))
+    }
+
     /// What `call`, written in `body` of `file`, reaches.
     fn call(
         &mut self,
@@ -1612,7 +1706,7 @@ impl<'a> Walker<'a> {
                     end,
                     receiver: traced.then(|| self.receiver_of(file, call)).flatten(),
                     reached: traced.then_some(reached),
-                    several: false,
+                    several: None,
                 }],
                 ..Outcome::default()
             };
@@ -1636,7 +1730,7 @@ impl<'a> Walker<'a> {
             for value in &call.callee_values {
                 values.extend(self.read_value(file, value, invoke, false));
             }
-            return self.agree(values, invoke, Vec::new());
+            return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
         if call.invokes_param.is_some() {
             return Outcome::stopped(INJECTED_CALLEE);
@@ -1679,9 +1773,9 @@ impl<'a> Walker<'a> {
                 out
             }
             Reach::OutsideService(..) => Outcome::default(),
-            Reach::NoFunction if self.interface_member(file, call) => {
-                Outcome::stopped("interface_member")
-            }
+            Reach::NoFunction if self.interface_member(file, call) => self
+                .through_implementations(file, call, invoke)
+                .unwrap_or_else(|| Outcome::stopped("interface_member")),
             // A call into a library whose declaration returns what the
             // function it is handed returns (carrick#2634): the compiler's
             // row says so, and the function written at the call is walked.
@@ -1919,6 +2013,8 @@ impl<'a> Walker<'a> {
                         "interface_member",
                         SEVERAL_VALUES,
                         VALUES_OVER_CAP,
+                        SEVERAL_IMPLEMENTATIONS,
+                        IMPLEMENTATIONS_OVER_CAP,
                         VALUE_NEVER_BOUND,
                     ]
                     .contains(&stop.as_str())
@@ -1952,7 +2048,7 @@ impl<'a> Walker<'a> {
                 }
                 // One of the labelled exports a callee's disagreeing values
                 // reach: the end is kept, with why it is no site.
-                let stop = found.several.then(|| SEVERAL_VALUES.to_string());
+                let stop = found.several.map(str::to_string);
                 let count = match &stop {
                     Some(stop) => format!("stop/{stop}"),
                     None => format!("site/{}", role_key(found.end.role)),
@@ -2054,7 +2150,7 @@ impl<'a> Walker<'a> {
                             end,
                             receiver: None,
                             reached: None,
-                            several: false,
+                            several: None,
                         }],
                         ..Outcome::default()
                     })];
@@ -2333,7 +2429,7 @@ impl<'a> Walker<'a> {
                     open.invoke,
                 ));
             }
-            let settled = self.agree(values, open.invoke, open.chain);
+            let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
             inner.absorb(settled);
         }
         inner
@@ -2352,7 +2448,7 @@ impl<'a> Walker<'a> {
                 }
             }
             if refs.is_empty() {
-                let settled = self.agree(open.known, open.invoke, open.chain);
+                let settled = self.agree(open.known, open.invoke, open.chain, OF_VALUES);
                 inner.absorb(settled);
             } else {
                 open.refs = refs;
@@ -2434,6 +2530,7 @@ impl<'a> Walker<'a> {
         values: Vec<Held<'a>>,
         invoke: Invoke<'a>,
         chain: Vec<ChainHop>,
+        plural: Plural,
     ) -> Outcome<'a> {
         let (refs, known): (Vec<_>, Vec<_>) = values
             .into_iter()
@@ -2460,7 +2557,7 @@ impl<'a> Walker<'a> {
             return Outcome::stopped(VALUE_NEVER_BOUND).below(&chain);
         }
         if known.len() > MAX_VALUES {
-            return Outcome::stopped(VALUES_OVER_CAP).below(&chain);
+            return Outcome::stopped(plural.over_cap).below(&chain);
         }
         if known.iter().all(|value| matches!(value, Held::Callback)) {
             return Outcome::stopped(INJECTED_CALLEE).below(&chain);
@@ -2481,14 +2578,14 @@ impl<'a> Walker<'a> {
         for mut outcome in outcomes {
             if !agree {
                 for found in &mut outcome.ends {
-                    found.several = true;
+                    found.several = Some(plural.several);
                 }
                 outcome.stop = None;
             }
             out.absorb(outcome);
         }
         if !agree && out.ends.is_empty() {
-            out.stop = Some((Vec::new(), SEVERAL_VALUES.to_string()));
+            out.stop = Some((Vec::new(), plural.several.to_string()));
         }
         out.below(&chain)
     }
@@ -2514,7 +2611,7 @@ impl<'a> Walker<'a> {
                     &mut Vec::new(),
                 ));
             }
-            let settled = self.agree(values, open.invoke, open.chain);
+            let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
             outcome.absorb(settled);
         }
         if !outcome.ends.is_empty() {
@@ -2778,6 +2875,117 @@ mod tests {
             let extra: Vec<&String> = got.iter().filter(|s| !want.contains(s)).collect();
             let missing: Vec<&String> = want.iter().filter(|s| !got.contains(s)).collect();
             panic!("extra: {extra:#?}\nmissing: {missing:#?}");
+        }
+    }
+
+    /// carrick#2432 slice B: a call through an interface member is followed
+    /// into the implementations the sidecar finds for it. One implementing
+    /// class sending to a labelled end is a site; two that send to different
+    /// ends are a lead (`several_implementations`, each end kept); a table's
+    /// entry calling a member of a module-level interface-typed value reads
+    /// that member's implementation. Without the ask each call is the
+    /// `interface_member` stop it was.
+    #[test]
+    fn a_call_through_an_interface_member_follows_its_implementations() {
+        let Some(on) = walked("implementations", "services/web", "web", &[], true) else {
+            return;
+        };
+        let script = super::super::fixture_walk::sidecar().expect("built above");
+        let exports = claims();
+        let asked = super::super::fixture_walk::implementations_of(&script, &on, "services/web");
+        let walk = |follow: Option<&Implementations>| {
+            let labels = match follow {
+                Some(found) => Labels::of(&exports).following(found),
+                None => Labels::of(&exports),
+            };
+            discover(&on.inputs, &labels, &on.repo)
+        };
+        // Each record of the call `callee` in `file`, as `end line/stop`.
+        let records = |discovery: &Discovery, file: &str, callee: &str| {
+            let mut out: Vec<String> = discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.callee == callee)
+                .map(|site| {
+                    let end = site.end.as_ref().map_or("-".to_string(), |end| {
+                        format!(
+                            "{}.{}{} @{}",
+                            end.package,
+                            end.export,
+                            end.member
+                                .as_deref()
+                                .map_or(String::new(), |member| format!(".{member}")),
+                            end.line
+                        )
+                    });
+                    format!("{end} / {}", site.stop.as_deref().unwrap_or("site"))
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let with = walk(Some(&asked));
+        assert_eq!(
+            records(&with, "one-impl.ts", "notifier.notify"),
+            ["lib.dom.fetch @7 / site"],
+            "one implementation sending to a labelled end is a site"
+        );
+        assert_eq!(
+            records(&with, "two-impls.ts", "channels[kind].push"),
+            [
+                "fixture-socket.Socket.send @17 / several_implementations",
+                "lib.dom.fetch @9 / several_implementations",
+            ],
+            "two implementations reaching different ends are a lead, each end kept"
+        );
+        assert_eq!(
+            records(&with, "handler-table.ts", "live.send"),
+            ["lib.dom.fetch @7 / site"],
+            "a table entry's call through an interface member is followed"
+        );
+        let without = walk(None);
+        for (file, callee) in [
+            ("one-impl.ts", "notifier.notify"),
+            ("two-impls.ts", "channels[kind].push"),
+            ("handler-table.ts", "live.send"),
+        ] {
+            assert_eq!(
+                records(&without, file, callee),
+                ["- / interface_member"],
+                "without the ask {file} {callee} stops as it did"
+            );
+        }
+    }
+
+    /// carrick#2432 slice B: an implementation the walk cannot enter (one
+    /// only a `.d.ts` declares, or a property that is no function) is not
+    /// silently dropped. A call whose only implementations are like that
+    /// keeps the `interface_member` stop.
+    #[test]
+    fn an_implementation_the_walk_cannot_enter_keeps_the_stop() {
+        let Some(on) = walked("implementations", "services/web", "web", &[], true) else {
+            return;
+        };
+        let script = super::super::fixture_walk::sidecar().expect("built above");
+        let exports = claims();
+        let asked = super::super::fixture_walk::implementations_of(&script, &on, "services/web");
+        let labels = Labels::of(&exports).following(&asked);
+        let with = discover(&on.inputs, &labels, &on.repo);
+        for (file, callee) in [
+            ("declared-only.ts", "sink.emit"),
+            ("property-impl.ts", "hook.fire"),
+        ] {
+            let records: Vec<String> = with
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.callee == callee)
+                .map(|site| site.stop.clone().unwrap_or_else(|| "site".to_string()))
+                .collect();
+            assert_eq!(
+                records,
+                ["interface_member"],
+                "{file} {callee}: the only implementation cannot be entered"
+            );
         }
     }
 
