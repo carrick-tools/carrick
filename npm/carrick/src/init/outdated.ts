@@ -68,7 +68,7 @@ export function outdatedFiles(found: Outdated): string[] {
  * A file holding no entry of ours is not out of date — it is a file init has
  * never written to, which is a different finding and not this one.
  */
-function entriesAreStale(body: string, expected: (prefix: string) => InstalledHook[]): boolean {
+export function entriesAreStale(body: string, expected: (prefix: string) => InstalledHook[]): boolean {
   let installed: InstalledHook[];
   try {
     installed = installedCarrickHooks(body);

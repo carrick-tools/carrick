@@ -25,6 +25,7 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
 import { forwardInBackground, refreshInBackground } from "./refresh.ts";
 import { versionMismatch } from "../init/outdated.ts";
+import { bringUpToDate } from "../init/self-update.ts";
 import { markInvoker } from "./invoker.ts";
 
 const log = createLogger("carrick-session");
@@ -104,6 +105,16 @@ async function main(): Promise<void> {
   // because this runs once per session and the agent about to work here is the
   // reader who can act on it (carrick#1372).
   if (choice.markerFound) {
+    // Claude Code only: Codex hook files are untrusted until the user approves a
+    // changed hash, so nothing here writes for it (`init/self-update.ts`).
+    const projectDir = process.env["CLAUDE_PROJECT_DIR"];
+    if (!codex && projectDir) {
+      try {
+        lines.push(...bringUpToDate(choice.root, projectDir, currentVersion()));
+      } catch (error) {
+        log("self-update failed", String(error));
+      }
+    }
     const mismatch = versionMismatch(choice.root, currentVersion());
     if (mismatch) lines.push(mismatch);
   }
