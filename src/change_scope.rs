@@ -881,6 +881,8 @@ fn short(commit: &str) -> &str {
 }
 
 /// Whether a changed path is left out of a [`ChangedSince`] listing.
+/// The paths changed since each commit, or why git could not list them.
+type ListedByCommit = HashMap<String, Result<Vec<ChangedPath>, String>>;
 type DroppedPaths = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// The paths changed since each stored commit, listed once per commit for the
@@ -894,8 +896,12 @@ pub struct ChangedSince {
     repo_path: String,
     scaffold_config: Option<String>,
     /// Paths this listing leaves out ([`ChangedSince::without`]).
-    dropped: Option<DroppedPaths>,
-    listed: std::sync::Mutex<HashMap<String, Result<Vec<ChangedPath>, String>>>,
+    dropped: Option<std::sync::Arc<DroppedPaths>>,
+    /// The listing per commit before `dropped` applies, shared by every
+    /// [`ChangedSince::view`] of this one.
+    listed: std::sync::Arc<std::sync::Mutex<ListedByCommit>>,
+    /// How many times git was asked for a listing, across every view.
+    listings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     moved: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<DependencyMove>>>>,
 }
 
@@ -910,16 +916,29 @@ impl ChangedSince {
                 .flatten(),
             dropped: None,
             listed: Default::default(),
+            listings: Default::default(),
             moved: Default::default(),
         }
     }
 
-    /// The same listing without the paths `dropped` names: a caller that asks
-    /// what a service reads of the changes other than its own (the per-edit
-    /// re-check, `local_mode::recheck`).
-    pub fn without(mut self, dropped: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
-        self.dropped = Some(Box::new(dropped));
-        self
+    /// The same listing without the paths `dropped` names, sharing this one's
+    /// git listings: a caller that asks what each service reads of the
+    /// changes other than its own (the per-edit re-check,
+    /// `local_mode::recheck`) asks git once, not once per service.
+    pub fn view(&self, dropped: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            repo_path: self.repo_path.clone(),
+            scaffold_config: self.scaffold_config.clone(),
+            dropped: Some(std::sync::Arc::new(Box::new(dropped))),
+            listed: self.listed.clone(),
+            listings: self.listings.clone(),
+            moved: Default::default(),
+        }
+    }
+
+    /// How many git listings this and every view of it have run.
+    pub fn listings_run(&self) -> usize {
+        self.listings.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the manifests and lockfiles changed since `commit` moved, read
@@ -947,21 +966,25 @@ impl ChangedSince {
     /// without the runner's own `carrick.json`. `Err` when git could not
     /// compare.
     pub fn since(&self, commit: &str) -> Result<Vec<ChangedPath>, String> {
-        self.listed
+        let mut paths = self
+            .listed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(commit.to_string())
             .or_insert_with(|| {
+                self.listings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut paths = crate::git_state::changed_paths(&self.repo_path, commit, None);
                 if let (Ok(paths), Some(config)) = (&mut paths, &self.scaffold_config) {
                     paths.retain(|change| !(change.status == 'A' && &change.path == config));
                 }
-                if let (Ok(paths), Some(dropped)) = (&mut paths, &self.dropped) {
-                    paths.retain(|change| !dropped(&change.path));
-                }
                 paths
             })
-            .clone()
+            .clone();
+        if let (Ok(paths), Some(dropped)) = (&mut paths, &self.dropped) {
+            paths.retain(|change| !dropped(&change.path));
+        }
+        paths
     }
 }
 
@@ -4087,6 +4110,51 @@ mod tests {
             moved("0000000"),
             [true, true, true],
             "git cannot compare with a commit it does not hold"
+        );
+    }
+
+    /// carrick#3279 follow-up: the per-edit re-check asks about every service
+    /// of one repository; git lists the change once for all of them, and each
+    /// service's view still drops its own paths.
+    #[test]
+    fn views_of_one_change_listing_share_one_git_listing() {
+        let (repo, base, services) = dependency_workspace(Manager::Npm);
+        assert_eq!(services.len(), 3);
+        let path = repo.path().to_string_lossy().to_string();
+        std::fs::write(
+            repo.path().join("apps/api/src/server.ts"),
+            "export const server = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("apps/web/src/checkout.test.ts"),
+            "export const t = 1;\n",
+        )
+        .unwrap();
+        let listing = ChangedSince::new(&path, &[], &[]);
+        let names = |view: &ChangedSince| -> Vec<String> {
+            let mut names: Vec<String> = view
+                .since(&base)
+                .unwrap()
+                .into_iter()
+                .map(|change| change.path)
+                .collect();
+            names.sort();
+            names
+        };
+        let without_api = listing.view(|path| path.starts_with("apps/api/"));
+        let without_web = listing.view(|path| path.starts_with("apps/web/"));
+        let without_worker = listing.view(|path| path.starts_with("apps/worker/"));
+        assert_eq!(names(&without_api), ["apps/web/src/checkout.test.ts"]);
+        assert_eq!(names(&without_web), ["apps/api/src/server.ts"]);
+        assert_eq!(
+            names(&without_worker),
+            ["apps/api/src/server.ts", "apps/web/src/checkout.test.ts"]
+        );
+        assert_eq!(
+            listing.listings_run(),
+            1,
+            "one git listing for three services"
         );
     }
 
