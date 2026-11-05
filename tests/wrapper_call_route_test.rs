@@ -138,6 +138,9 @@ fn blobs(fixture_dir: &str) -> Vec<serde_json::Value> {
     std::fs::read_dir(storage.path())
         .expect("storage dir")
         .flatten()
+        // The store also writes each service's type-reach record beside its
+        // blob, gzipped: only the blobs are read.
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .map(|entry| {
             serde_json::from_slice(&std::fs::read(entry.path()).expect("read blob"))
                 .expect("parse blob")
