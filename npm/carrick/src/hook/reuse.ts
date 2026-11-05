@@ -53,6 +53,7 @@ export type SessionRecord = {
    * `checked.ts` compares it with the last `carrick check --changed`.
    */
   edited: Record<string, number>;
+  /**
    * How many prompt lookups this session has made (carrick#3375). Counted when
    * the request is sent, so a refused or timed-out one still counts.
    */
