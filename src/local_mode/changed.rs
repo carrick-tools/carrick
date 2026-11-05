@@ -1514,6 +1514,13 @@ impl Problem {
     /// Why this problem is listed only with `--all`; `None` when it fails
     /// the run. A problem the index already held says so first, whatever
     /// else holds for it.
+    /// A problem a plain `check --changed` lists: it fails the run, or rests
+    /// on an index another build wrote. The per-edit re-check states the
+    /// edited file's own no-route calls by this same rule (`recheck.rs`).
+    pub(super) fn listed_without_all(&self) -> bool {
+        self.unlisted().is_none()
+    }
+
     fn unlisted(&self) -> Option<Unlisted> {
         match (self.fails, self.source.as_str()) {
             (true, _) => None,
