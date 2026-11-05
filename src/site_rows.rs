@@ -163,6 +163,14 @@ pub struct SiteRow {
     /// functions in which a reader endpoint row agreeing on its key is the
     /// same route read again, at another line. Empty for a site's row.
     pub within: Vec<crate::request_summary::dispatch::LineRange>,
+    /// The base an HTTP request the site states is written against, read
+    /// from where its leading value ends and never from how the key spells it
+    /// (carrick#3387): what [`crate::url_normalizer::UrlNormalizer::consumer_call_path`]
+    /// keys it with, as it keys every consumer row from `DataCall.base`. Only
+    /// its kind is read, so the defaults beside an environment read are not
+    /// looked up here. `None` on a row that is not an HTTP request, and where
+    /// the answered name is not the one the code writes.
+    pub base: Option<crate::call_base::CallBaseResolution>,
 }
 
 impl SiteRow {
@@ -754,6 +762,30 @@ fn site_of<'d>(decided: &'d Decided, anchors: &TypeAnchors) -> Option<&'d Decide
     })
 }
 
+/// The base of an HTTP request a site states, from where the name's leading
+/// value ends (carrick#3387). `None` for any other row, and where `name` is
+/// not the name the code writes (a model's choice of another option), since
+/// the end describes the written name only.
+fn request_base(
+    site: &DecidedSite,
+    name: &str,
+    key: &OperationKey,
+    side: RowSide,
+) -> Option<crate::call_base::CallBaseResolution> {
+    if side != RowSide::Call || !matches!(key, OperationKey::Http { .. }) {
+        return None;
+    }
+    if site.name_text().as_deref() != Some(name) {
+        return None;
+    }
+    crate::call_base::stated_base(
+        name,
+        site.base_end().as_ref(),
+        &Default::default(),
+        &Default::default(),
+    )
+}
+
 /// Whether the call a site decides is not its labelled end: the labelled call
 /// is written inside a function the decided call enters (carrick#2795).
 fn is_through(site: &DecidedSite) -> bool {
@@ -829,6 +861,7 @@ pub fn of(
             out.routes.push(lead(reason));
             continue;
         }
+        let name_written = name_text.clone();
         let Some((key, name_scope)) = key_of(
             &kind_text,
             name_text,
@@ -840,6 +873,7 @@ pub fn of(
             out.leads.push(lead(UnreadReason::BelowBand));
             continue;
         };
+        let base = request_base(site, &name_written, &key, side);
         let name_scope = in_process_scope(&site.end.role, &key, name_scope);
         let fact = record.bucket == Bucket::Forced;
         // Every slot the model answered that feeds the key or the side:
@@ -878,6 +912,7 @@ pub fn of(
             needs_reader: needs_reader(record),
             through: is_through(site),
             within: Vec::new(),
+            base,
         });
     }
     out
