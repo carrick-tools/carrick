@@ -3561,7 +3561,9 @@ export function listen(): void {
     }
 
     /// carrick#2431: a walk that reaches a definition whose body this pass
-    /// did not read stops there and says so; an optional call is a call.
+    /// did not read stops there and says so; an optional call is a call. A
+    /// constant object's member is a function of the module, read like any
+    /// other, so the walk follows it (carrick#3356).
     #[test]
     fn an_unread_body_is_a_stop_and_an_optional_call_is_a_site() {
         let edit = [
@@ -3585,7 +3587,7 @@ export function listen(): void {
                 "3 fetch -> lib.dom fetch -",
                 "5 loadInner stop no_body",
                 "10 fetch -> lib.dom fetch -",
-                "15 table.load stop no_body",
+                "15 table.load -> lib.dom fetch -",
             ])
         );
         assert_eq!(
