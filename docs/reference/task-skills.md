@@ -137,8 +137,21 @@ workspace keeps the hook entries and skill bodies of whichever version first ran
   `init`, `doctor`, `remove` or `uninstall` (`npm/carrick/src/init/outdated.ts`). The day it
   was last said is `~/.carrick/last-notice`, and it is only spent when there was
   something to say.
-- **`carrick init`, run again**, is the refresh. It rewrites only what is still
-  ours and names what it left, so it is safe to run unattended.
+- **Session start** brings our own files up to date itself, in Claude Code
+  (`npm/carrick/src/init/self-update.ts`): the hook entries in
+  `.claude/settings.json` and `.claude/settings.local.json`, and the task skills
+  still ours under `.claude/skills` and `.agents/skills`. It prints one line for
+  each ("Carrick brought its hook entries in <file> up to date for <version>.")
+  and records the version, so the "run `carrick init`" line is not what an
+  upgrade costs. It skips a file that holds no entry of ours, a settings file
+  that is not JSON, an edited or foreign skill, a skill root that is a link out,
+  and a running version older than `.carrick/cli-version`. A settings file is
+  rewritten once per version (`.carrick/hook-entries-updated.json`), so an entry
+  removed on purpose stays removed until the next upgrade. `.codex/hooks.json`
+  is never written: Codex holds a changed project hook as untrusted until the
+  user approves it, so while it is out of date the "run `carrick init`" line stays.
+- **`carrick init`, run again**, is the full refresh. It rewrites only what is
+  still ours and names what it left, so it is safe to run unattended.
 
 What decides "out of date" is content, never a version number. A skill is
 compared by digest against the body this version renders, and a hook entry by
