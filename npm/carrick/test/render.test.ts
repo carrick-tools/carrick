@@ -185,6 +185,23 @@ test("a re-check that judged no type pair never says no contract problem", () =>
   );
 });
 
+test("a re-check whose pairs were compared but none resolved says so, with the count", () => {
+  const result = rechecked();
+  result.items = connectedRows(3);
+  assert.match(
+    renderPostToolUse(result, "src/routes/users.ts") ?? "",
+    /: types were not checked \(3 pairs were compared but none resolved\), so no contract verdict\.$/,
+  );
+  result.items = connectedRows(1);
+  assert.match(
+    renderPostToolUse(result, "src/routes/users.ts") ?? "",
+    /\(1 pair was compared but did not resolve\)/,
+  );
+  // A stated cause still comes first.
+  result.boundary = { types_degraded: { stage: "type check", detail: "sidecar not found" } };
+  assert.match(renderPostToolUse(result, "src/routes/users.ts") ?? "", /\(sidecar not found\)/);
+});
+
 test("the post-edit line names the reason the whole index was not type-checked", () => {
   const result = unjudged();
   // The boundary says something else: the build's own statement wins.
