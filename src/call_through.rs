@@ -3855,6 +3855,16 @@ mod tests {
     fn settle_wrappers_in_full(
         stated_items: &str,
     ) -> (Vec<(String, String)>, Vec<String>, Settled) {
+        settle_wrappers_written(stated_items, "/api/items/${id}")
+    }
+
+    /// [`settle_wrappers_in_full`], with the path the app's wrapper row at
+    /// `api.ts:6` states: `${id}` where the wrapper passes its parameter on,
+    /// a value where it fills it in.
+    fn settle_wrappers_written(
+        stated_items: &str,
+        wrapper_items: &str,
+    ) -> (Vec<(String, String)>, Vec<String>, Settled) {
         let app_definitions: serde_json::Map<String, serde_json::Value> = [
             definition_json(
                 "ItemsApi.get",
@@ -3877,11 +3887,11 @@ mod tests {
             "app",
             serde_json::Value::Object(app_definitions),
             serde_json::json!([
-                summary_call("GET", "/api/items/${id}", "services/app/src/api.ts:6"),
+                summary_call("GET", wrapper_items, "services/app/src/api.ts:6"),
                 summary_call("GET", "/api/status", "services/app/src/api.ts:10"),
             ]),
             serde_json::json!([
-                wrapper_twin("/api/items/${id}", "services/app/src/api.ts:6"),
+                wrapper_twin(wrapper_items, "services/app/src/api.ts:6"),
                 wrapper_twin("/api/status", "services/app/src/api.ts:10"),
             ]),
         );
@@ -4181,6 +4191,31 @@ mod tests {
                     OperationKey::http("GET", "/api/items/:id").canonical()
                 ),
             ]
+        );
+    }
+
+    /// carrick#3315: where the wrapper fills the request's parameter with a
+    /// value the source states, the leaf row at its caller states that
+    /// path, as the wrapper's own row did; where the wrapper passes its
+    /// parameter on, the callee's template stands.
+    #[test]
+    fn a_leaf_row_states_the_path_the_wrapper_filled_in() {
+        let items = |wrapper: &str| {
+            let (facts, _, settled) = settle_wrappers_written("request_summary", wrapper);
+            assert_eq!(settled.leaf_rows, 1, "{facts:?}");
+            facts
+                .into_iter()
+                .find(|(at, _)| at == "services/app/src/commands.ts:6")
+                .map(|(_, key)| key)
+                .expect("a leaf row at the caller")
+        };
+        assert_eq!(
+            items("/api/items/1"),
+            OperationKey::http("GET", "/api/items/1").canonical()
+        );
+        assert_eq!(
+            items("/api/items/${id}"),
+            OperationKey::http("GET", "/api/items/:id").canonical()
         );
     }
 
