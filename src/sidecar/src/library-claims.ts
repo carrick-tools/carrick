@@ -6008,7 +6008,7 @@ function isNamedPackage(specifier: string, packageName: string | undefined): boo
 }
 
 /** The name a service imports a package by: `@types/scope__name` is `@scope/name`, `@types/name` is `name`. */
-function importedNameOf(installed: string): string {
+export function importedNameOf(installed: string): string {
   if (!installed.startsWith('@types/')) return installed;
   const bare = installed.slice('@types/'.length);
   const scoped = /^([^_]+)__(.+)$/.exec(bare);
@@ -6021,7 +6021,7 @@ function typesPackageOf(named: string): string {
 }
 
 /** The package a specifier names: `@scope/name` or `name`, without a subpath. */
-function packageNameOf(specifier: string): string {
+export function packageNameOf(specifier: string): string {
   const segments = specifier.split('/');
   return specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
 }

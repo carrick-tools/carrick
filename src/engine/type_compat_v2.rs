@@ -5870,6 +5870,8 @@ mod tests {
             absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
         }
     }
 
@@ -7446,6 +7448,8 @@ mod tests {
             absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
         };
 
         let infer = vec![
@@ -7587,6 +7591,8 @@ mod tests {
             absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -8250,6 +8256,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
         };
 
         let explicit = vec![

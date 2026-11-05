@@ -76,7 +76,7 @@ import {
   type IndexedNode,
 } from './node-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
-import type { LabelledMembers } from './library-claims.js';
+import { importedNameOf, packageNameOf, type LabelledMembers } from './library-claims.js';
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
@@ -839,8 +839,12 @@ export class TypeInferrer {
     onRequestDone?: InferRequestDone,
     modelSymbols?: ModelSymbol[],
     labels?: LabelledMembers,
-    onUnwidenedStep?: UnwidenedStepDone
+    onUnwidenedStep?: UnwidenedStepDone,
+    frameworkPackages?: readonly string[]
   ): InferResult {
+    this.frameworkPackages = new Set(
+      (frameworkPackages ?? []).map((specifier) => importedNameOf(packageNameOf(specifier)))
+    );
     this.modelSymbols = new Map((modelSymbols ?? []).map((symbol) => [symbol.alias, symbol]));
     this.statedParams = this.statedParamsFor(labels ?? { sends: new Map(), sets: new Map(), returns: new Map(), bodies: new Set() });
     const inferredTypes: InferredType[] = [];
@@ -1026,6 +1030,11 @@ export class TypeInferrer {
    * members the batch's verified server-framework labels name. Empty when
    * the batch carries no labels, and then it reads nothing.
    */
+  /**
+   * The packages the store labels a server framework for this batch (N8),
+   * by the name a service imports them as.
+   */
+  private frameworkPackages: ReadonlySet<string> = new Set();
   private statedParams = this.statedParamsFor({ sends: new Map(), sets: new Map(), returns: new Map(), bodies: new Set() });
 
   /**
@@ -1806,7 +1815,9 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
-      this.primaryTypeSymbolSource(anchor.element)
+      this.primaryTypeSymbolSource(anchor.element),
+      unwrapResult.wasUnwrapped ? unwrapResult.payloadType : awaitedType,
+      anchor.element
     );
     if (provenance && provenance.length > 0) {
       inferred.any_provenance = provenance;
@@ -1854,7 +1865,12 @@ export class TypeInferrer {
       request,
       typeString,
       isExplicit,
-      this.getNodeLocation(func)
+      this.getNodeLocation(func),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      returnType
     );
   }
 
@@ -1910,7 +1926,9 @@ export class TypeInferrer {
       undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
-      this.primaryTypeSymbolSource(anchor.element)
+      this.primaryTypeSymbolSource(anchor.element),
+      paramType,
+      anchor.element
     );
     // carrick#2814: a subscriber that defaults its payload, or reads it only
     // in ways `undefined` survives, still works when none is sent.
@@ -2314,7 +2332,9 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
-      this.primaryTypeSymbolSource(anchor.element)
+      this.primaryTypeSymbolSource(anchor.element),
+      unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
+      anchor.element
     );
     this.relateModelSymbol(request, inferred, [
       unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
@@ -2643,7 +2663,9 @@ export class TypeInferrer {
       undefined,
       resolvedSymbol ?? writtenAnchor?.symbol,
       writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
-      writtenAnchor ? writtenAnchor.source : resolvedSource
+      writtenAnchor ? writtenAnchor.source : resolvedSource,
+      recovered.anchorType,
+      resolvedSymbol !== undefined ? recoveredAnchor?.element : undefined
     );
     if (recovered.responseModes) inferred.response_modes = recovered.responseModes;
     this.relateModelSymbol(request, inferred, recovered.readTypes);
@@ -3160,7 +3182,9 @@ export class TypeInferrer {
       undefined,
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
       anchor?.depth,
-      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined
+      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined,
+      read.length === 1 ? this.unwrapPromiseType(read[0]) : undefined,
+      anchor?.element
     );
   }
 
@@ -3194,6 +3218,8 @@ export class TypeInferrer {
     const terminalNode = use.terminal;
     const returnType = terminalNode.getType();
     let typeString = typeText(returnType, terminalNode);
+    // Blueprint row N8: the type `typeString` prints, while it prints one.
+    let printedType: Type | undefined = this.unwrapPromiseType(returnType);
     let isExplicit = false;
 
     const unwrapResult = this.unwrapTypeWithConfig(
@@ -3205,6 +3231,7 @@ export class TypeInferrer {
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
       isExplicit = unwrapResult.isExplicit;
+      printedType = unwrapResult.payloadType;
     }
 
     // carrick#3004: around a call whose body a chain callback reshapes, an
@@ -3215,6 +3242,7 @@ export class TypeInferrer {
     if (explicitType) {
       typeString = explicitType;
       isExplicit = true;
+      printedType = undefined;
     }
     // carrick#2714: the body read is cast to a placeholder
     // (`(await res.json()) as { data: Item[] } | { error: unknown }`) and the
@@ -3226,6 +3254,7 @@ export class TypeInferrer {
     if (narrowed) {
       typeString = narrowed.text;
       isExplicit = true;
+      printedType = narrowed.typeNode ? this.unwrapPromiseType(narrowed.typeNode.getType()) : undefined;
     }
 
     // carrick#1843: a rule can now match a thenable or a carrier by its alias,
@@ -3264,6 +3293,7 @@ export class TypeInferrer {
       const yielded = this.awaitedBeyondPromise(returnType);
       if (yielded) {
         typeString = typeText(yielded, terminalNode);
+        printedType = yielded;
       }
     }
 
@@ -3367,6 +3397,7 @@ export class TypeInferrer {
     const carrierPayload = carrierText ? carried : undefined;
     if (carrierPayload && carrierText) {
       typeString = carrierText;
+      printedType = carrierPayload;
     } else if (carrierCandidate) {
       this.log(
         `Call result at ${request.file_path}:${request.line_number} carries a payload with no ` +
@@ -3465,6 +3496,7 @@ export class TypeInferrer {
         );
         typeString = stated.text;
         isExplicit = true;
+        printedType = undefined;
       }
     }
 
@@ -3579,7 +3611,9 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
       anchor?.depth,
-      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined
+      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined,
+      printedType,
+      anchor?.element
     );
     // carrick#1749: say when the text is the source's own statement of the
     // body, and what that statement is rooted at, so the scanner can tell a
@@ -3853,6 +3887,7 @@ export class TypeInferrer {
       ...(source ? { root_source: source } : {}),
       ...depthField,
       ...(typeArguments > 0 ? { root_type_arguments: typeArguments } : {}),
+      ...(this.isFrameworkMachinery(node.getType()) ? { machinery: true as const } : {}),
     };
   }
 
@@ -3897,7 +3932,11 @@ export class TypeInferrer {
       typeString,
       isExplicit,
       this.getNodeLocation(varDecl),
-      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
+      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
+      undefined,
+      undefined,
+      undefined,
+      unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(varType)
     );
   }
 
@@ -3941,7 +3980,9 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
-      this.primaryTypeSymbolSource(anchor.element)
+      this.primaryTypeSymbolSource(anchor.element),
+      this.unwrapPromiseType(anchorSource),
+      anchor.element
     );
   }
 
@@ -4193,7 +4234,12 @@ export class TypeInferrer {
         request,
         this.expandResolvedTypeStructural(inCall.type, typeText(inCall.type, inCall.at)),
         false,
-        this.getNodeLocation(inCall.at)
+        this.getNodeLocation(inCall.at),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        inCall.type
       );
     } else if (inCall.kind === 'abstain') {
       this.log(
@@ -4387,7 +4433,15 @@ export class TypeInferrer {
       typeString,
       isExplicit,
       this.getNodeLocation(node),
-      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined
+      unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
+      undefined,
+      undefined,
+      undefined,
+      explicitType
+        ? undefined
+        : unwrapResult.wasUnwrapped
+          ? unwrapResult.payloadType
+          : this.unwrapPromiseType(payloadType)
     );
   }
 
@@ -5386,7 +5440,9 @@ export class TypeInferrer {
       undefined,
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
       anchor?.depth,
-      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined
+      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined,
+      stated.typeNode ? this.unwrapPromiseType(stated.typeNode.getType()) : undefined,
+      anchor?.element
     );
     if (stated.typeNode) {
       inferred.stated_body = this.statedRoot(stated.typeNode);
@@ -6586,6 +6642,26 @@ export class TypeInferrer {
    * the origin gate makes certain a user's own local type sharing those member
    * names is never mistaken for framework machinery (the advisor's guard).
    */
+  /**
+   * Blueprint row N8: true when `type` is framework machinery by where it is
+   * declared, never by its name. Either it passes the structural test
+   * (`typeIsFrameworkMachinery`: the transport's members, declared by a
+   * library or an installed package), or an installed package the store
+   * labels a server framework declares it (`frameworkPackages`), which also
+   * covers app and router instances that carry no reply members. A
+   * service's own `Context` or `Router` is neither.
+   */
+  private isFrameworkMachinery(type: Type): boolean {
+    if (this.typeIsFrameworkMachinery(type)) {
+      return true;
+    }
+    if (this.frameworkPackages.size === 0) {
+      return false;
+    }
+    const declaring = this.declaringPackageOf(type);
+    return declaring !== undefined && this.frameworkPackages.has(importedNameOf(declaring));
+  }
+
   private typeIsFrameworkMachinery(type: Type): boolean {
     if (!this.hasMachineryIndicatorThreshold(type)) {
       return false;
@@ -8456,7 +8532,12 @@ export class TypeInferrer {
         request,
         typeString,
         false,
-        this.getNodeLocation(receiver)
+        this.getNodeLocation(receiver),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        receiverType
       ),
       declaring_package: this.declaringPackageOf(receiverType),
       member_return_type: this.memberReturnTypeOf(call, receiver),
@@ -12071,7 +12152,9 @@ export class TypeInferrer {
     payloadTypeString?: string,
     primaryTypeSymbol?: string,
     arrayDepth?: number,
-    primaryTypeSymbolSource?: string
+    primaryTypeSymbolSource?: string,
+    printedType?: Type,
+    anchorType?: Type
   ): InferredType {
     const alias =
       request.alias ||
@@ -12093,6 +12176,10 @@ export class TypeInferrer {
       // Same gate: a declaration source without an anchor symbol is useless.
       primary_type_symbol_source:
         primaryTypeSymbol !== undefined ? primaryTypeSymbolSource : undefined,
+      ...(printedType && this.isFrameworkMachinery(printedType) ? { machinery: true as const } : {}),
+      ...(primaryTypeSymbol !== undefined && anchorType && this.isFrameworkMachinery(anchorType)
+        ? { anchor_machinery: true as const }
+        : {}),
     };
   }
 
