@@ -1887,7 +1887,8 @@ mod tests {
             None,
         )
         .expect_err("a failing phase is not a success");
-        assert!(error.contains("exited"), "{error}");
+        // In the words an agent reads, never Rust's `Some(1)` (carrick#3366).
+        assert_eq!(error, "the re-scan stopped (exit status: 1)");
     }
 
     /// What a [`Narrator`] wrote, readable after it wrote it.
