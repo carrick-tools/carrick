@@ -16,7 +16,9 @@
 //! The exit code is the one read in local mode that a verdict moves (see
 //! `docs/local-mode-output.md`, "check --changed"): 1 when a problem is a fact,
 //! 0 otherwise. A problem resting on a model candidate does not fail the run
-//! and is counted on the summary line, listed only with `--all`. A check that
+//! and is counted on the summary line, listed only with `--all`, except a row
+//! outside the changed files that this change moved: listed on a plain run, up
+//! to ten (carrick#2998). A check that
 //! covered none of the files it was asked about, or could not run, exits
 //! [`EXIT_NOTHING_COVERED`] (carrick#2850): a pass it did not look at is not
 //! a pass. So does a run where nothing fails but a problem looks new only
@@ -180,6 +182,11 @@ pub struct Problem {
     /// (carrick#2961). Never fails.
     #[serde(skip)]
     pub not_judged_before: bool,
+    /// Outside the change, and the index held this pair resolved and
+    /// compatible: this change moved it to a mismatch. Listed on a plain
+    /// run, up to [`MAX_MOVED_LISTED`], whether or not it fails.
+    #[serde(skip)]
+    pub moved_outside: bool,
     /// What the pair reads now: the verdict's result (`type_mismatch`,
     /// `method_mismatch`) or `no_route`. Not printed here: the per-edit
     /// re-check's `moved` list states it (`recheck.rs`, `moved_rows`).
@@ -220,6 +227,9 @@ fn outside_moved_clause(count: usize) -> String {
         plural(count, "row", "rows")
     )
 }
+/// How many rows outside the changed files that this change moved are listed
+/// on a plain run; the rest are counted and `--all` lists them.
+const MAX_MOVED_LISTED: usize = 10;
 const OUTSIDE_FAILING_NOTE: &str = " [outside the changed files: this change moved its verdict]";
 const OUTSIDE_NOT_JUDGED_NOTE: &str =
     " [outside the changed files: not judged before, does not fail]";
@@ -1006,6 +1016,7 @@ pub(super) fn judge(
             unconfirmed: false,
             outside_the_change: !in_change,
             not_judged_before: matches!(outside, Some(OutsideBefore::NotJudged)),
+            moved_outside: moved_here,
             after: verdict.result.clone().unwrap_or_default(),
             other_build: fact && !already && !same_build && (in_change || moved_here),
             fails: fact && !already && same_build && (in_change || moved_here),
@@ -1067,6 +1078,7 @@ pub(super) fn judge(
                     unconfirmed,
                     outside_the_change: !is_changed(repo, &file),
                     not_judged_before: false,
+                    moved_outside: false,
                     after: "no_route".to_string(),
                     other_build,
                     fails: new_fact && !other_build,
@@ -1186,6 +1198,7 @@ pub(super) fn judge(
             outside_the_change: true,
             other_build: false,
             not_judged_before: false,
+            moved_outside: false,
             after: "no_route".to_string(),
             fails: confirmed,
         });
@@ -1297,11 +1310,28 @@ impl ChangedOutput {
             out.push_str(&self.skipped_lines());
             return out;
         }
-        let listed: Vec<&Problem> = self
-            .problems
-            .iter()
-            .filter(|problem| all || problem.fails || problem.other_build)
-            .collect();
+        // A row outside the changed files that this change moved is shown
+        // whether or not it fails, so the agent sees every likely break
+        // (carrick#2998). Past the cap the rest are counted, not printed.
+        let mut moved_shown = 0;
+        let mut moved_hidden = 0;
+        let mut counted: Vec<&Problem> = Vec::new();
+        let mut listed: Vec<&Problem> = Vec::new();
+        for problem in &self.problems {
+            let always = all || problem.fails || problem.other_build;
+            if always {
+                counted.push(problem);
+                listed.push(problem);
+            } else if problem.moved_outside {
+                counted.push(problem);
+                if moved_shown < MAX_MOVED_LISTED {
+                    moved_shown += 1;
+                    listed.push(problem);
+                } else {
+                    moved_hidden += 1;
+                }
+            }
+        }
         // Each problem not listed, counted by why, in the order `--all`
         // prints the reasons in. A file the work did not touch adds to this
         // line only by failing, which lists it: the summary is about the
@@ -1317,11 +1347,11 @@ impl ChangedOutput {
                 *unlisted.entry(why).or_default() += 1;
             }
         }
-        let incompatible = listed
+        let incompatible = counted
             .iter()
             .filter(|p| p.kind == ProblemKind::Incompatible)
             .count();
-        let no_route = listed.len() - incompatible;
+        let no_route = counted.len() - incompatible;
         let mut out = format!(
             "carrick check: checked {} and {} in {} against {}: {incompatible} incompatible, {no_route} {}",
             plural(self.routes, "route", "routes"),
@@ -1334,7 +1364,7 @@ impl ChangedOutput {
                 "reach no route"
             },
         );
-        let advisory = listed.len() - self.failing;
+        let advisory = counted.len().saturating_sub(self.failing);
         if advisory > 0 {
             out.push_str(&format!(" ({advisory} of them do not fail the check)"));
         }
@@ -1350,7 +1380,7 @@ impl ChangedOutput {
         }
         if !self.not_type_checked.is_empty() {
             out.push_str(&format!(
-                ", {} {NOT_TYPE_CHECKED_SUFFIX}",
+                ", {} {NOT_TYPE_CHECKED_SUFFIX}, run with --all to list them",
                 self.not_type_checked.len()
             ));
         }
@@ -1385,6 +1415,11 @@ impl ChangedOutput {
             out.push_str(&format!(
                 "{at}  {what}  {} {} {}{with}: {}{note}\n",
                 problem.role, problem.method, problem.path, problem.reason
+            ));
+        }
+        if moved_hidden > 0 {
+            out.push_str(&format!(
+                "and {moved_hidden} more: `carrick check --changed --all` lists them\n"
             ));
         }
         if all {
@@ -1525,6 +1560,7 @@ mod tests {
             unconfirmed: false,
             outside_the_change: false,
             not_judged_before: false,
+            moved_outside: false,
             after: String::new(),
             other_build: false,
             fails,
@@ -1587,6 +1623,167 @@ mod tests {
         );
         let none = output(vec![], 0, 0).render(false);
         assert!(!none.contains("outside the changed files"), "{none}");
+    }
+
+    /// A row outside the changed files that this change moved is listed on a
+    /// plain run with its note even when it does not fail, counted on the
+    /// summary as `--all` counts it, and cut at ten with an overflow line.
+    #[test]
+    fn moved_rows_outside_the_change_are_listed_without_all() {
+        let moved = |n: usize| {
+            let mut row = problem(ProblemKind::Incompatible, false);
+            row.outside_the_change = true;
+            row.moved_outside = true;
+            row.path = format!("/m{n:02}");
+            row
+        };
+        let output = |problems: Vec<Problem>| ChangedOutput {
+            calls: 0,
+            files: 1,
+            services: 2,
+            outside_moved: problems.len(),
+            problems,
+            failing: 0,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+
+        let few = output((0..3).map(moved).collect()).render(false);
+        let summary = few.lines().next().unwrap();
+        assert!(
+            summary.contains("3 incompatible, 0 reach no route (3 of them do not fail the check)"),
+            "{few}"
+        );
+        assert_eq!(
+            few.matches("[model candidate, does not fail]").count(),
+            3,
+            "{few}"
+        );
+        assert!(!few.contains("more:"), "{few}");
+
+        let many = output((0..13).map(moved).collect());
+        let text = many.render(false);
+        assert!(
+            text.lines().next().unwrap().contains("13 incompatible"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("[model candidate, does not fail]").count(),
+            10,
+            "{text}"
+        );
+        assert!(
+            text.contains("and 3 more: `carrick check --changed --all` lists them\n"),
+            "{text}"
+        );
+        let all = many.render(true);
+        assert_eq!(
+            all.matches("[model candidate, does not fail]").count(),
+            13,
+            "{all}"
+        );
+        assert!(!all.contains("more:"), "{all}");
+    }
+
+    /// Every count the plain summary line prints is backed on a plain run:
+    /// the rows are listed, or the output says how to list them. A count
+    /// with no row in this table fails, so a new count must say how its rows
+    /// are reached (carrick#2998).
+    #[test]
+    fn every_summary_count_lists_its_rows_or_says_how() {
+        let mut moved = problem(ProblemKind::Incompatible, false);
+        moved.file = "web/src/other.ts".to_string();
+        moved.outside_the_change = true;
+        moved.moved_outside = true;
+        let mut moved_late = moved.clone();
+        moved_late.path = "/m2".to_string();
+        let mut inside = problem(ProblemKind::Incompatible, true);
+        inside.path = "/i".to_string();
+        let mut no_route = problem(ProblemKind::NoRoute, true);
+        no_route.path = "/n".to_string();
+        let mut unconfirmed = problem(ProblemKind::NoRoute, false);
+        unconfirmed.unconfirmed = true;
+        unconfirmed.path = "/u".to_string();
+        let unchecked = NotTypeChecked {
+            file: "web/src/a.ts".to_string(),
+            line: Some(9),
+            role: "call".to_string(),
+            method: "GET".to_string(),
+            path: "/t".to_string(),
+            reason: "no verdict".to_string(),
+        };
+        let out = ChangedOutput {
+            calls: 1,
+            files: 1,
+            services: 2,
+            problems: vec![inside, no_route, unconfirmed, moved, moved_late],
+            failing: 2,
+            outside_moved: 2,
+            not_type_checked: vec![unchecked],
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        let text = out.render(false);
+        let summary = text.lines().next().unwrap();
+        let counts = summary
+            .split_once(" services: ")
+            .or_else(|| summary.split_once(" service: "));
+        let counts = counts.unwrap_or_else(|| panic!("{summary}")).1;
+        let body: Vec<&str> = text.lines().skip(1).collect();
+        let clauses: Vec<&str> = counts.split([',', ';']).map(str::trim).collect();
+        // (what the clause counts, the rows a plain run lists for it)
+        let table: [(&str, usize); 4] = [
+            (
+                " incompatible",
+                body.iter()
+                    .filter(|l| l.contains("  incompatible  "))
+                    .count(),
+            ),
+            (
+                " reach no route",
+                body.iter().filter(|l| l.contains("  no route  ")).count(),
+            ),
+            (
+                " outside the changed files whose verdict this change moved",
+                body.iter()
+                    .filter(|l| l.starts_with("web/src/other.ts"))
+                    .count()
+                    + body
+                        .iter()
+                        .filter_map(|l| l.strip_prefix("and "))
+                        .filter_map(|l| l.split_whitespace().next()?.parse::<usize>().ok())
+                        .sum::<usize>(),
+            ),
+            (" not type-checked", 0),
+        ];
+        let mut seen = 0;
+        for (at, clause) in clauses.iter().enumerate() {
+            let Some((number, rest)) = clause.split_once(' ') else {
+                continue;
+            };
+            let Ok(count) = number.parse::<usize>() else {
+                continue;
+            };
+            let rest = format!(" {rest}");
+            let Some((_, listed)) = table.iter().find(|(key, _)| {
+                rest.contains(key)
+                    || (key == &" reach no route" && rest.contains(" reaches no route"))
+            }) else {
+                panic!(
+                    "the summary counts `{clause}` with no row in this table: list its rows or point to --all\n{text}"
+                );
+            };
+            seen += 1;
+            // The clause right after it says how to list the rows.
+            let pointer = clauses
+                .get(at + 1)
+                .is_some_and(|next| next.starts_with("run with --all"));
+            assert!(
+                count == 0 || *listed >= count || pointer,
+                "`{clause}`: {listed} listed, no pointer\n{text}"
+            );
+        }
+        assert_eq!(seen, 4, "{text}");
     }
 
     /// A file the work did not touch never adds to the summary of the edited
