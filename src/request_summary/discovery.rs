@@ -1638,7 +1638,8 @@ impl<'a> Walker<'a> {
     /// each is entered as the definition it is, and they agree on one
     /// labelled end or the call is a lead. An implementation only tests
     /// import (a double) is not one. `None` when the sidecar found none to
-    /// follow, so the call stays an `interface_member` stop.
+    /// follow, or the walk can enter none, so the call stays an
+    /// `interface_member` stop.
     fn through_implementations(
         &mut self,
         file: &'a Path,
@@ -1655,6 +1656,13 @@ impl<'a> Walker<'a> {
         };
         let positions = self.inputs_for(file).positions.as_ref()?;
         let mut values = Vec::new();
+        // How many the walk entered. One it cannot enter (no symbol, or a
+        // declaration that is no function: a `.d.ts` or a property) reaches
+        // nothing, so beside an implementation that does reach a labelled
+        // end it is a disagreement and the call is a lead, as for a value
+        // that reaches none. When none can be entered the call keeps the
+        // `interface_member` stop instead of reading as no site.
+        let mut entered = 0;
         for named in found {
             let (Some(symbol), Some(decl_file)) =
                 (named.symbol.as_deref(), named.decl_file.as_deref())
@@ -1668,12 +1676,15 @@ impl<'a> Walker<'a> {
                 continue;
             }
             let reached = match holder.definition_at(&declaring, named.decl_line, symbol) {
-                Reach::Function(target, key) => self.enter_value(target, key, invoke),
+                Reach::Function(target, key) => {
+                    entered += 1;
+                    self.enter_value(target, key, invoke)
+                }
                 _ => Outcome::default(),
             };
             values.push(Held::Reached(reached));
         }
-        if values.is_empty() {
+        if entered == 0 {
             return None;
         }
         Some(self.agree(values, invoke, Vec::new(), OF_IMPLEMENTATIONS))
