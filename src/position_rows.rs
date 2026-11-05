@@ -340,9 +340,8 @@ pub fn destination_from(
     repo_name: &str,
     service_name: Option<&str>,
 ) -> Option<Destination> {
-    if flag != Some("1") {
-        return None;
-    }
+    // carrick#3283 S0 census: always on.
+    let _ = flag;
     let name = format!("{}.jsonl.gz", blob_stem(repo_name, service_name));
     Some(match store.filter(|dir| !dir.as_os_str().is_empty()) {
         Some(store) => Destination {
