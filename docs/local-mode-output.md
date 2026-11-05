@@ -255,6 +255,7 @@ itself are `items`, not here.
 | `counterparts` | string[] | the other side as `service file:line`; empty on `no_route` |
 | `reason` | string | the compiler's or the matcher's sentence |
 | `not_judged_before` | bool | the index never judged the pair, so the edit may not be what moved it: listed, never called a break |
+| `other_build` | bool \| absent | the index was written by another carrick build, so the verdict may have moved because the build changed, not because of the edit. Absent when false |
 
 The post-edit hook prints up to three of them as problem lines after the
 file's own, naming the row and its counterpart.

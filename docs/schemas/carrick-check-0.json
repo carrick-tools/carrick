@@ -231,7 +231,8 @@
               "after": { "type": "string", "enum": ["type_mismatch", "method_mismatch", "no_route"] },
               "counterparts": { "type": "array", "items": { "type": "string" }, "description": "The other side, as `service file:line`. Empty on no_route." },
               "reason": { "type": "string" },
-              "not_judged_before": { "type": "boolean" }
+              "not_judged_before": { "type": "boolean" },
+              "other_build": { "type": "boolean", "description": "The index was written by another carrick build, so the verdict may have moved because the build changed, not because of the edit. Absent when false." }
             },
             "additionalProperties": true
           }

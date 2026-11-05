@@ -5807,12 +5807,8 @@ fn a_route_rename_names_the_callers_it_strands() {
     assert_eq!(stranded["before"], serde_json::json!("matched"));
 }
 
-/// A type moved out of the route file into a types file: editing the type
-/// moves the route's verdict against its consumer, and the re-check of the
-/// types file (which holds no row of its own) names the route.
-#[test]
-#[serial]
-fn a_types_file_edit_names_the_route_and_the_consumer_it_breaks() {
+/// The shop with `Widget` moved out of the route file into `types.ts`.
+fn shop_with_widget_in_a_types_file() -> tempfile::TempDir {
     let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
         let route = repo.join("catalog/app/routes/api.v1.widgets.$widgetId.ts");
         let text = std::fs::read_to_string(&route).expect("read the route");
@@ -5834,6 +5830,16 @@ fn a_types_file_edit_names_the_route_and_the_consumer_it_breaks() {
         )
         .expect("rewrite the route");
     });
+    workspace
+}
+
+/// A type moved out of the route file into a types file: editing the type
+/// moves the route's verdict against its consumer, and the re-check of the
+/// types file (which holds no row of its own) names the route.
+#[test]
+#[serial]
+fn a_types_file_edit_names_the_route_and_the_consumer_it_breaks() {
+    let workspace = shop_with_widget_in_a_types_file();
     let root = workspace.path();
     index(root);
 
@@ -5867,6 +5873,53 @@ fn a_types_file_edit_names_the_route_and_the_consumer_it_breaks() {
                 .is_some_and(|n| n.contains("inventory") && n.contains("client.ts")))),
         "the consumer it breaks is named:\n{answer:#}"
     );
+}
+
+/// The index was written by another carrick build, so a verdict that moved
+/// may have moved because of the build and not the edit: the row says so.
+#[test]
+#[serial]
+fn a_moved_row_of_another_builds_index_says_the_build_may_be_the_cause() {
+    let workspace = shop_with_widget_in_a_types_file();
+    let root = workspace.path();
+    index(root);
+    as_written_by_an_older_scanner(root);
+
+    let types = "shop/catalog/app/types.ts";
+    edit(
+        &root.join(types),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let answer = recheck_json(root, types, &AMPLE);
+    let moved = moved_of(&answer);
+    let route = moved
+        .iter()
+        .find(|row| row["role"] == "route")
+        .unwrap_or_else(|| panic!("the route is named:\n{answer:#}"));
+    assert_eq!(route["other_build"], serde_json::json!(true), "{answer:#}");
+}
+
+/// The same edit against an index this build wrote carries no `other_build`.
+#[test]
+#[serial]
+fn a_moved_row_of_this_builds_index_carries_no_other_build() {
+    let workspace = shop_with_widget_in_a_types_file();
+    let root = workspace.path();
+    index(root);
+
+    let types = "shop/catalog/app/types.ts";
+    edit(
+        &root.join(types),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let answer = recheck_json(root, types, &AMPLE);
+    let route = moved_of(&answer)
+        .into_iter()
+        .find(|row| row["role"] == "route")
+        .unwrap_or_else(|| panic!("the route is named:\n{answer:#}"));
+    assert!(route.get("other_build").is_none(), "{answer:#}");
 }
 
 /// An edit that moves no type and no route moves nothing.

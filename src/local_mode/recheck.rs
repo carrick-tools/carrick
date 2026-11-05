@@ -964,6 +964,7 @@ fn moved_rows(
             counterparts: problem.other,
             reason: problem.reason,
             not_judged_before: problem.not_judged_before,
+            other_build: problem.other_build,
         })
         .collect()
 }

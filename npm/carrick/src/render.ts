@@ -300,9 +300,11 @@ export function movedLines(result: CheckResult): string[] {
       return cutLine(`- ${at}: this ${what} matched a route in the index and this edit left it with none.`);
     }
     const other = row.counterparts.length > 0 ? ` against ${row.counterparts.join(", ")}` : "";
-    const verdict = row.not_judged_before
-      ? `reads ${row.after} now; the index never judged it, so this edit may not be the cause`
-      : `agreed in the index and now reads ${row.after}`;
+    const verdict = row.other_build
+      ? `reads ${row.after} now; the index was built by another carrick version, so this edit may not be the cause`
+      : row.not_judged_before
+        ? `reads ${row.after} now; the index never judged it, so this edit may not be the cause`
+        : `agreed in the index and now reads ${row.after}`;
     return cutLine(`- ${at}: this ${what}${other} ${verdict}.`);
   });
   if (moved.length > MAX_MOVED_ROWS) {

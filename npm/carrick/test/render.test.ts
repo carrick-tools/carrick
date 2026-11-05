@@ -864,3 +864,32 @@ test("an edit names the rows outside the file that it moved, and calls an unjudg
   );
   assert.match(text, /api\/src\/widgets\.ts:9: this route GET .* against web web\/src\/client\.ts:20 reads type_mismatch now; the index never judged it, so this edit may not be the cause\./);
 });
+
+test("a moved row of another build's index says that build may be the cause", () => {
+  const result = rechecked();
+  result.recheck = {
+    ran: "extraction+types",
+    elapsed_ms: 900,
+    moved: [
+      {
+        file: "api/src/widgets.ts",
+        line: 9,
+        role: "route",
+        method: "GET",
+        path: "/api/widgets/:id",
+        before: "compatible",
+        after: "type_mismatch",
+        counterparts: ["web web/src/client.ts:20"],
+        reason: "x",
+        not_judged_before: false,
+        other_build: true,
+      },
+    ],
+  };
+  const text = renderPostToolUse(result) ?? "";
+  assert.match(
+    text,
+    /api\/src\/widgets\.ts:9: this route GET .* against web web\/src\/client\.ts:20 reads type_mismatch now; the index was built by another carrick version, so this edit may not be the cause\./,
+  );
+  assert.doesNotMatch(text, /agreed in the index/);
+});

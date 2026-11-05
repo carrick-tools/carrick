@@ -596,6 +596,11 @@ pub struct MovedRow {
     /// The index held no resolved, compatible pair for this row, so the edit
     /// may not be what moved it.
     pub not_judged_before: bool,
+    /// The index was written by another carrick build, so the verdict may
+    /// have moved because the build changed and not because of the edit
+    /// (carrick#2911, `changed.rs`, `Problem::other_build`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub other_build: bool,
 }
 
 /// The services one re-check re-read, and what it did about the rest.

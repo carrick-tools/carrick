@@ -217,6 +217,11 @@ export type MovedRow = {
   reason: string;
   /** The index held no resolved, compatible pair: never called a break. */
   not_judged_before: boolean;
+  /**
+   * The index was written by another carrick build: the verdict may have moved
+   * because the build changed, not because of the edit. Absent when false.
+   */
+  other_build?: boolean;
 };
 
 /** The `scope` of a `recheck` block (`docs/local-mode-output.md`, "recheck"). */
