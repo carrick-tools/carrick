@@ -1698,17 +1698,16 @@ fn detach_process(command: &mut std::process::Command) {
 ///
 /// `carrick index` is the paid scan and it is meant to run once, so it runs
 /// against a configuration a person has read rather than one a structural pass
-/// guessed (ruling in carrick-cloud#799). `carrick init` no longer writes
-/// `carrick.json`: it derives the proposal into `.carrick/proposal.json` and
-/// prints the prompt that has an agent turn it into a config. A repo that has
-/// not been through that step would be scanned with its service boundaries
-/// unstated, its env vars undeclared, and no second free attempt.
+/// guessed (ruling in carrick-cloud#799). `carrick init` does not write
+/// `carrick.json`: it derives the proposal into `.carrick/proposal.json`, and
+/// the config is written from it by hand (carrick#3300). A repo without one
+/// would be scanned with its service boundaries unstated, its env vars
+/// undeclared, and no second free attempt.
 ///
 /// The refusal names the two things that stand between this machine and the
 /// scan — the config, and the credential — and nothing else. It used to point
 /// at a facts-only pass as a rehearsal; there is no such step in the flow
-/// (carrick#1008, cloud#832), so offering one here would invent a first run
-/// that the scaffold prompt does not describe.
+/// (carrick#1008, cloud#832), so offering one here would invent a first run.
 fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
     let missing: Vec<&PathBuf> = repos
         .iter()
@@ -1725,10 +1724,9 @@ fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
         .join(", ");
     let rest = missing.len().saturating_sub(5);
     Some(format!(
-        "no carrick.json in {named}{}, and `carrick index` is the scan that builds the \
-         index, so it runs after the config exists. `carrick init` wrote the derived services to \
-         .carrick/proposal.json and printed the prompt that has an agent turn it into \
-         carrick.json; read it back against the repo, run `carrick login` if this machine \
+        "no carrick.json in {named}{}, and carrick index is the scan that builds the \
+         index, so it runs after the config exists. Write one from .carrick/proposal.json \
+         (https://docs.carrick.tools/building-the-index), run carrick login if this machine \
          is not signed in, and run this command once.",
         if rest > 0 {
             format!(" and {rest} more")
@@ -2590,8 +2588,8 @@ mod tests {
     }
 
     /// The paid scan runs once, so it runs against a config someone has read.
-    /// A repo that has not been through the scaffold step is named, and the
-    /// refusal says what to do instead of it (carrick-cloud#799). Since
+    /// A repo without a config is named, and the refusal says what to do
+    /// instead (carrick-cloud#799). Since
     /// carrick#1008 this is `carrick index`'s own refusal, not a flag's.
     #[test]
     fn the_index_is_refused_until_every_repo_has_a_config() {
@@ -2618,6 +2616,13 @@ mod tests {
         // nothing else: there is no rehearsal pass in the flow (cloud#832).
         assert!(refusal.contains("carrick login"), "{refusal}");
         assert!(!refusal.contains("carrick refresh"), "{refusal}");
+        // No agent prompt is printed by `carrick init` any more; the page that
+        // gives the manual steps is named instead (carrick#3300).
+        assert!(!refusal.contains("prompt"), "{refusal}");
+        assert!(
+            refusal.contains("https://docs.carrick.tools/building-the-index"),
+            "{refusal}"
+        );
     }
 
     /// `derive` states the install a scan would refuse over, so `carrick init`

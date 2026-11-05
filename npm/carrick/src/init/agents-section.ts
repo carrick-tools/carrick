@@ -8,8 +8,6 @@
 // the file is somebody's and is never read for meaning. The file is created
 // when it is missing, and deleted again on remove only when our section was
 // all it held.
-//
-// carrick-cloud's scaffold (cloud#2289) must write this same block.
 
 import fs from "node:fs";
 import path from "node:path";
