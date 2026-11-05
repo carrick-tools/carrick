@@ -77,56 +77,32 @@ import {
 import { renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
 
 /**
- * The repos this run covers that the scaffold tool still has work in.
- *
- * The two files that tool writes: the `carrick.json` a scan reads, and the
- * workflow that runs the scan. A repo holding both has been scaffolded, and
- * the closing instruction is then an instruction to do nothing — which is what
- * it was on a folder where every repo was already set up (carrick#1365).
+ * The repos this run covers that have no `carrick.json`, which `carrick index`
+ * refuses to scan without (carrick#3300).
  *
  * The repo root only, because that is where the scanner looks for a config
  * (`Config::load_services`): a `carrick.json` deeper in the tree is a fixture
- * or a nested example, not this repo's.
+ * or a nested example, not this repo's. A repo with its config and no workflow
+ * is not named: the workflow belongs to the CI scan, which this lane does not
+ * run.
  */
-export function reposToScaffold(
+export function reposWithoutConfig(
   repos: RepoIdentity[],
   exists: (target: string) => boolean = fs.existsSync,
 ): RepoIdentity[] {
-  return repos.filter(
-    (repo) =>
-      !exists(path.join(repo.path, TEMPLATE_PATHS["carrick.json"])) ||
-      !exists(path.join(repo.path, TEMPLATE_PATHS.workflow)),
-  );
+  return repos.filter((repo) => !exists(path.join(repo.path, TEMPLATE_PATHS["carrick.json"])));
 }
 
 /**
- * The instruction to paste, naming the repos it is about.
- *
- * The scaffold tool's branch turns on `repo` and turns soft without it: with
- * no `repo` the response keeps its default ending and tells the agent to run
- * the scan — on a repo CI already indexes, which is the row the whole
- * workspace reads (carrick-cloud `src/tools/scaffold.ts`, cloud#805 item 1).
- * So the names are in the sentence, one call per repo.
- *
- * One repo whose owner/repo is known is the value of `repo`, said once; the
- * sentence used to name it and then ask for it again (carrick#1574). A repo
- * known here only by its folder still needs the agent to find its owner/repo.
- * The several-repo sentence is carrick-cloud#1404's: the tool now takes them
- * all in one `repos` call.
+ * The warning for repos that have no config: `carrick index` cannot scan them
+ * from this machine until one is written (carrick#3300). It names no tool and
+ * no workflow, and points at the page that gives the manual steps.
  */
-export function scaffoldSentence(repos: RepoIdentity[]): string {
+export function noConfigSentence(repos: RepoIdentity[]): string {
   const names = repos.map((repo) => repo.name ?? path.basename(repo.path));
-  if (names.length === 1) {
-    return repos[0]?.name
-      ? `Run the carrick scaffold tool with \`repo\` set to ${names[0]}, and follow what it returns.`
-      : `Run the carrick scaffold tool for ${names[0]}, passing its owner/repo as \`repo\`, and follow what it returns.`;
-  }
-  const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
-  return `Run the carrick scaffold tool for ${shown}, once each, passing that repo's owner/repo as \`repo\`, and follow what it returns.`;
+  const one = names.length === 1;
+  return `${listed(names, 10)} ${one ? "has" : "have"} no carrick.json, so carrick index cannot scan ${one ? "it" : "them"} from this machine yet: ${DOCS_INDEX}`;
 }
-
-/** The title of the block a run closes on when there is scaffolding left to do. */
-export const NEXT_TITLE = "Next: paste this into a new agent session";
 
 /**
  * The line that tells the agent where the proposal is, for a run that set up
@@ -320,8 +296,7 @@ function help(): string {
     "                         so the agent hooks can run it by name after this run",
     "                         ends. A terminal is asked instead; --yes is not this",
     "        --local          Set up for an index built on this machine: choose the",
-    "                         repos and the project here, and get the scan steps for",
-    "                         your agent",
+    "                         repos and the project here",
     "",
     `What init installs, the hooks included: ${DOCS_INIT_FILES}`,
     `CI and a carrick.json written by hand: ${DOCS_INDEX}`,
@@ -1795,25 +1770,21 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     out.note(CLOUD_NEXT_TITLE, cloudNextLines(codexTrust, cloud.waiting.length > 0 || !downloaded));
     return 0;
   }
-  // The scaffold tool writes the files a repo needs; a repo that has them needs
-  // nothing pasted anywhere. The line used to close every run, including one
-  // where every covered repo already had its config and its workflow, and
-  // "this repo" named nothing in a folder of several (carrick#1365).
+  // A repo with no `carrick.json` cannot be scanned from this machine, so the
+  // run says so and points at the page that gives the steps. The line used to
+  // close every run, including one where every covered repo already had its
+  // config, and "this repo" named nothing in a folder of several (carrick#1365).
   //
-  // An install the first scan would be refused over goes in front of it: the
-  // agent otherwise found out from the refusal (carrick#1489).
-  const unscaffolded = reposToScaffold(selectedRepos);
-  if (unscaffolded.length > 0) {
-    const install = installSentence(installs, "agent");
-    // A new session, because that is the one that loads the MCP server this
-    // run has just added (carrick#1512).
-    out.note(NEXT_TITLE, [
-      ...(install === null ? [] : [install]),
-      scaffoldSentence(unscaffolded),
-      // The scaffold tool reads the proposal from the folder init ran in, and
-      // a run that moved to the folder above did not run where it started.
-      ...(realPath(workspace) === realPath(startedIn) ? [] : [initFolderSentence(workspace)]),
-    ]);
+  // An install the first scan would be refused over goes in front of it
+  // (carrick#1489).
+  const unconfigured = reposWithoutConfig(selectedRepos);
+  if (unconfigured.length > 0) {
+    const install = installSentence(installs, "reader");
+    if (install !== null) out.warn(install);
+    out.warn(noConfigSentence(unconfigured));
+    // The proposal sits in the folder init ran in, and a run that moved to the
+    // folder above did not run where it started.
+    if (realPath(workspace) !== realPath(startedIn)) out.warn(initFolderSentence(workspace));
   } else {
     const install = installSentence(installs, "reader");
     if (install !== null) out.warn(install);

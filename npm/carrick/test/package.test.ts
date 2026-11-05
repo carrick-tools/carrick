@@ -117,9 +117,9 @@ test("the entry point imports the emit, never the TypeScript", () => {
 });
 
 test("the templates are importable by the tool that has to render the same bytes", () => {
-  // The hosted scaffold tool depends on this package at a pinned version and
-  // renders from here. Without an export map it would have to reach into
-  // dist/ by path, which is not a contract anyone should rely on.
+  // A consumer that renders from this package at a pinned version needs an
+  // export map; without one it would have to reach into dist/ by path, which
+  // is not a contract anyone should rely on.
   //
   // And it is a TypeScript consumer, so the export has to carry its types: a
   // subpath with no `types` condition is TS7016 under any strict config, and

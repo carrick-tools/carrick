@@ -43,8 +43,8 @@ import {
   namedButExcluded,
   CANCELLED,
   NOTHING_WRITTEN,
-  scaffoldSentence,
-  reposToScaffold,
+  noConfigSentence,
+  reposWithoutConfig,
   preselectedRepos,
   chooseEditors,
   CLOUD_NEXT_TITLE,
@@ -402,10 +402,13 @@ function fakeClaude(root: string): string {
 // The seam document carrick-cloud#799 pins: the scaffold tool's agent reads
 // it, so what lands on disk has to be the scanner's own bytes, not a
 // re-serialisation of what this client could parse.
-/** The closing instruction for one repo, as the fixtures name it. */
-function scaffoldFor(name: string): string {
-  return scaffoldSentence([{ path: `/repos/${name}`, name, remote: null, problem: null }]);
+/** The closing warning for one repo with no carrick.json, as the fixtures name it. */
+function noConfigFor(name: string): string {
+  return `▲ ${noConfigSentence([{ path: `/repos/${name}`, name, remote: null, problem: null }])}`;
 }
+
+/** What no laptop-lane run says any more: the retired tool and its paste block (carrick#3300). */
+const RETIRED_CLOSING = /scaffold|paste this/i;
 
 test("the proposal is written as the scanner printed it, into an ignored directory", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-"));
@@ -753,7 +756,7 @@ test("init reads its arguments", () => {
   assert.match(help, /--allow-move/);
   assert.match(
     help,
-    / {8}--local {10}Set up for an index built on this machine: choose the\n {25}repos and the project here, and get the scan steps for\n {25}your agent/,
+    / {8}--local {10}Set up for an index built on this machine: choose the\n {25}repos and the project here\n/,
   );
   assert.match(
     help.replace(/\n/g, " "),
@@ -1146,9 +1149,10 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
       assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
       // A repo already in the project is not a project to look up or create.
       assert.doesNotMatch(result.stdout, /Projects in this workspace/);
-      // Setup ends where the dashboard's checklist ends: one sentence naming
-      // the scaffold tool, which carries the instructions (cloud#832).
-      assert.ok(result.stdout.includes(scaffoldFor("acme/api")), result.stdout);
+      // Setup ends on one warning: this repo has no carrick.json, so
+      // carrick index cannot scan it from this machine yet (carrick#3300).
+      assert.ok(result.stdout.includes(noConfigFor("acme/api")), result.stdout);
+      assert.doesNotMatch(result.stdout, RETIRED_CLOSING);
       // `claude` is on PATH and has never run under this home, so there is
       // no ~/.claude: it is still set up, by its own command, and nothing
       // says no agent client was found (carrick#1489). The entry carries
@@ -1261,11 +1265,10 @@ test("the executable CLI reads the hosted index onto an indexed repo and names t
     // is this command's, and `carrick index` stays the only scan in the flow
     // (carrick#1008, cloud#832).
     assert.doesNotMatch(result.stdout, /carrick refresh/);
-    // Both branches end on the same sentence: whether a scan runs at all is
-    // the scaffold tool's to state, from the repo it is asked about
-    // (cloud#832), so the terminal carries no second copy of it.
-    assert.ok(result.stdout.trimEnd().endsWith(scaffoldFor("acme/api")), result.stdout);
-    assert.ok(result.stdout.includes(scaffoldFor("acme/api")), result.stdout);
+    // Both branches end on the same warning: a repo with no carrick.json
+    // cannot be scanned from this machine yet (carrick#3300).
+    assert.ok(result.stdout.trimEnd().endsWith(noConfigFor("acme/api")), result.stdout);
+    assert.doesNotMatch(result.stdout, RETIRED_CLOSING);
     assert.doesNotMatch(result.stdout, /is connected and has no hosted index yet/);
   } finally {
     fixture.cleanup();
@@ -1408,7 +1411,8 @@ test("a hosted read that fails leaves the setup written and says what went wrong
     );
     // A refusal does not end the run: the rest of the setup is written, and
     // the closing block is the one every other branch ends on.
-    assert.ok(result.stdout.trimEnd().endsWith(scaffoldFor("acme/api")), result.stdout);
+    assert.ok(result.stdout.trimEnd().endsWith(noConfigFor("acme/api")), result.stdout);
+    assert.doesNotMatch(result.stdout, RETIRED_CLOSING);
     assert.equal(fs.existsSync(path.join(fixture.repo, PROPOSAL_FILE)), true);
   } finally {
     fixture.cleanup();
@@ -1490,19 +1494,17 @@ test("a first init writes the proposal, its ignore file, the hook settings, the 
     assert.equal(proposal.repos[0].config.services.length, 16);
     assert.equal(proposal.workspace, fixture.repo);
 
-    // And the run ends in three parts (carrick#1489): what is set up, in one
-    // line; what is left to do, a line each; and the one sentence for the
-    // agent. This workspace read reports no services, so there is no index
+    // And the run ends in three parts (carrick#1489, carrick#3300): what is
+    // set up, in one line; what is left to do, a line each; and the warning
+    // that the repo has no carrick.json. This workspace read reports no services, so there is no index
     // step between them. No "Restart Claude Code" line: the block says a NEW
     // agent session, which is the one that loads the server (carrick#1512).
     assert.equal(
-      result.stdout.trimEnd().split("\n").slice(-5).join("\n"),
+      result.stdout.trimEnd().split("\n").slice(-3).join("\n"),
       [
         "◇ Set up in project payments: repo",
         "▲ Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.",
-        "",
-        "Next: paste this into a new agent session",
-        `  ${scaffoldFor("acme/api")}`,
+        noConfigFor("acme/api"),
       ].join("\n"),
       result.stdout,
     );
@@ -2369,16 +2371,13 @@ for (const claims of ["adopts", "before-1359"] as const) {
       // No line of its own for the create: the list said it (carrick#1512).
       assert.doesNotMatch(said, /Created project/);
       // Part 4: one line for what is set up — the project and its repos —
-      // the to-dos, then the prompt; part 5: the install leads it.
+      // the to-dos, then the no-config warning; the install leads it.
       assert.ok(out.lines.includes("◇ Set up in project Acme (acme): acme-api"), said);
-      assert.equal(
-        out.lines.at(-1),
-        [
-          "Next: paste this into a new agent session",
-          "First install dependencies: run `npm install`.",
-          scaffoldFor("acme/acme-api"),
-        ].join("\n"),
-      );
+      assert.deepEqual(out.lines.slice(-2), [
+        "▲ Dependencies are not installed. Run `npm install` before the next scan.",
+        noConfigFor("acme/acme-api"),
+      ]);
+      assert.doesNotMatch(said, RETIRED_CLOSING);
       assert.doesNotMatch(said, /slug|No agent client|Docs:|Restart Claude Code/);
     } finally {
       fixture.restore();
@@ -2407,7 +2406,8 @@ test("a workspace read that fails after the yes leaves the setup written and exi
       ),
       out.lines.join("\n"),
     );
-    assert.equal(out.lines.at(-1)?.startsWith("Next: paste this into a new agent session"), true, out.lines.join("\n"));
+    assert.equal(out.lines.at(-1), noConfigFor("acme/acme-api"), out.lines.join("\n"));
+    assert.doesNotMatch(out.lines.join("\n"), RETIRED_CLOSING);
   } finally {
     fixture.restore();
   }
@@ -2420,15 +2420,15 @@ test("the plain rendering is one line per thing, with no colour and no box", () 
   out.warn("Hosted index is older than this CLI");
   out.refuse("Hosted index could not be read into .carrick/: no reason");
   out.say("Connect repositories in your browser: https://app.carrick.tools/repos");
-  out.note("Next: paste this to your agent", [scaffoldFor("acme/api")]);
+  out.note("Next: ask your agent", ["Use Carrick to list the services in this project."]);
   assert.deepEqual(written.join("").split("\n"), [
     "◇ Repo acme/api connected",
     "▲ Hosted index is older than this CLI",
     "■ Hosted index could not be read into .carrick/: no reason",
     "Connect repositories in your browser: https://app.carrick.tools/repos",
     "",
-    "Next: paste this to your agent",
-    `  ${scaffoldFor("acme/api")}`,
+    "Next: ask your agent",
+    "  Use Carrick to list the services in this project.",
     "",
     "",
   ]);
@@ -3009,11 +3009,11 @@ test("the picker preselects the connected repos of the majority project, and say
   assert.deepEqual([...unread.reasons], [["/w/local", "no GitHub identity"]]);
 });
 
-// The closing instruction is about the repos that still need it. A repo with
-// its config and its workflow is already set up, and telling an agent to
-// scaffold it again is what the run did on a folder where every repo was
-// (carrick#1365).
-test("only a repo missing its config or its workflow is sent to the scaffold tool", () => {
+// The closing warning is about the repos that still need a config. A repo
+// with its carrick.json is not named, whether or not it has a workflow: the
+// workflow belongs to the CI scan, which this lane does not run (carrick#1365,
+// carrick#3300).
+test("only a repo missing its carrick.json is named", () => {
   const repo = (name: string) => ({ path: `/w/${name}`, name: `acme/${name}`, remote: null, problem: null });
   const repos = ["api", "web", "jobs", "docs", "site"].map(repo);
   const present = new Set([
@@ -3021,25 +3021,22 @@ test("only a repo missing its config or its workflow is sent to the scaffold too
     `/w/api/${TEMPLATE_PATHS.workflow}`,
     "/w/web/carrick.json",
   ]);
-  const owed = reposToScaffold(repos, (target) => present.has(target));
-  assert.deepEqual(owed.map((entry) => entry.name), ["acme/web", "acme/jobs", "acme/docs", "acme/site"]);
-  assert.deepEqual(reposToScaffold([repos[0]!], (target) => present.has(target)), []);
+  const owed = reposWithoutConfig(repos, (target) => present.has(target));
+  assert.deepEqual(owed.map((entry) => entry.name), ["acme/jobs", "acme/docs", "acme/site"]);
+  assert.deepEqual(reposWithoutConfig([repos[0]!, repos[1]!], (target) => present.has(target)), []);
 
-  // The owner/repo is the value of `repo`, so it is said once (carrick#1574).
   assert.equal(
-    scaffoldSentence([repos[1]!]),
-    "Run the carrick scaffold tool with `repo` set to acme/web, and follow what it returns.",
+    noConfigSentence([repos[2]!]),
+    "acme/jobs has no carrick.json, so carrick index cannot scan it from this machine yet: https://docs.carrick.tools/building-the-index",
   );
-  // Several repos: carrick-cloud#1404 moves this to one `repos` call.
   assert.equal(
-    scaffoldSentence(owed),
-    "Run the carrick scaffold tool for acme/web, acme/jobs, acme/docs and 1 more, once each, passing that repo's owner/repo as `repo`, and follow what it returns.",
+    noConfigSentence(owed),
+    "acme/jobs, acme/docs and acme/site have no carrick.json, so carrick index cannot scan them from this machine yet: https://docs.carrick.tools/building-the-index",
   );
-  // A repo known here only by its folder: the agent still has to find the
-  // owner/repo, and the sentence still asks it to.
+  // A repo known here only by its folder is named by the folder.
   assert.equal(
-    scaffoldSentence([{ path: "/w/local", name: null, remote: null, problem: "it has no origin remote" }]),
-    "Run the carrick scaffold tool for local, passing its owner/repo as `repo`, and follow what it returns.",
+    noConfigSentence([{ path: "/w/local", name: null, remote: null, problem: "it has no origin remote" }]),
+    "local has no carrick.json, so carrick index cannot scan it from this machine yet: https://docs.carrick.tools/building-the-index",
   );
 });
 
@@ -3402,14 +3399,13 @@ test("inside one repo, init asks which repos beside it belong with it, and a yes
     // The agent is told where the proposal is, because it is not where the
     // reader started.
     assert.equal(
-      out.lines.at(-1),
+      out.lines.slice(-2).join("\n"),
       [
-        "Next: paste this into a new agent session",
-        scaffoldSentence([
+        `▲ ${noConfigSentence([
           { path: fixture.app, name: "example-org/shop-app", remote: null, problem: null },
           { path: fixture.api, name: "example-org/shop-api", remote: null, problem: null },
-        ]),
-        `The init folder is ${fixture.folder}.`,
+        ])}`,
+        `▲ The init folder is ${fixture.folder}.`,
       ].join("\n"),
     );
     assert.doesNotMatch(said, /Restart Claude Code|not on this machine/);
@@ -4096,7 +4092,8 @@ test("--local on that workspace is the run a laptop workspace gets, line for lin
   // A server that does not send the field: today's run.
   const laptop = await run(null, []);
   assert.ok(laptop.questions.includes("Go ahead?"), laptop.questions.join("\n"));
-  assert.match(laptop.text, /Next: paste this into a new agent session\nRun the carrick scaffold tool with `repo` set to acme\/api/);
+  assert.match(laptop.text, /acme\/api has no carrick\.json, so carrick index cannot scan it from this machine yet/);
+  assert.doesNotMatch(laptop.text, RETIRED_CLOSING);
   assert.deepEqual(laptop.asked, ["resolve-repos acme/api", "list-projects", "resolve-repos acme/api"]);
   // The flag on a workspace whose index Carrick builds, and the two values
   // that are not "cloud", one of them a word this build has never seen.

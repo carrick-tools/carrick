@@ -1,9 +1,6 @@
 // The files Carrick asks a repo to hold, as files.
 //
-// One renderer for both of the places that write them: `carrick init` here,
-// and the hosted `scaffold` tool, which depends on this package at a pinned
-// version and renders the same bytes (carrick#710). Scaffold parity used to be
-// a rule and a review check; a shared template makes it structural, and a
+// `carrick templates <name>` prints them, so a file is one command and a
 // public template is one a user can read before running anything.
 //
 // Placeholders are `{{NAME}}`. Not `${{ }}`, which is GitHub Actions'

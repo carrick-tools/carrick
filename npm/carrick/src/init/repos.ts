@@ -26,7 +26,7 @@ export type WorkspaceProposal = z.infer<typeof proposal>;
  *
  * Both halves are kept because they are read by different consumers. `plan` is
  * what this CLI prints and decides on; `document` is what lands in
- * `.carrick/proposal.json` for the scaffold tool's agent, and it has to be the
+ * `.carrick/proposal.json` for whoever writes the config from it, and it has to be the
  * scanner's own bytes — the schema above is not a passthrough at the top level,
  * so parsing and re-serialising would silently drop any field a later
  * `carrick.derive/0` adds.
@@ -125,10 +125,10 @@ const SELF_IGNORE =
   "# hosted index, and `carrick refresh` rebuilds it.\n*\n";
 
 /**
- * Write the derived proposal where the scaffold tool's agent reads it.
+ * Write the derived proposal where `carrick.json` is written from it.
  *
  * This is the whole of what init leaves in the workspace besides the hook
- * settings: the agent seeds `carrick.json` from this document, and nothing
+ * settings: the config is seeded from this document by hand, and nothing
  * this command derived without a model is committed to the repository
  * (carrick-cloud#799). Rewritten on every run rather than created once — it is
  * a derived file in an ignored directory, and a stale one would seed the
