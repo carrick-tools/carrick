@@ -180,6 +180,11 @@ pub struct Problem {
     /// (carrick#2961). Never fails.
     #[serde(skip)]
     pub not_judged_before: bool,
+    /// What the pair reads now: the verdict's result (`type_mismatch`,
+    /// `method_mismatch`) or `no_route`. Not printed here: the per-edit
+    /// re-check's `moved` list states it (`recheck.rs`, `moved_rows`).
+    #[serde(skip)]
+    pub after: String,
     /// New only because the index lacks the row, and the index was written by
     /// another scanner build, which may simply not have read it
     /// (carrick#2911). Printed, never fails, and the run exits
@@ -766,10 +771,10 @@ fn remap_lines(
     judged
 }
 
-struct Judged {
+pub(super) struct Judged {
     routes: usize,
     calls: usize,
-    problems: Vec<Problem>,
+    pub(super) problems: Vec<Problem>,
     type_checked: usize,
     not_type_checked: Vec<NotTypeChecked>,
     /// Rows outside the changed files that this change moved from compatible
@@ -829,7 +834,7 @@ fn outside_before(
 /// only on that silence is marked `other_build` and does not fail. What
 /// `before` did read still decides: a call it matched that now reaches no
 /// route fails whichever build wrote it.
-fn judge(
+pub(super) fn judge(
     root: &Path,
     before: &LocalIndex,
     same_build: bool,
@@ -1001,6 +1006,7 @@ fn judge(
             unconfirmed: false,
             outside_the_change: !in_change,
             not_judged_before: matches!(outside, Some(OutsideBefore::NotJudged)),
+            after: verdict.result.clone().unwrap_or_default(),
             other_build: fact && !already && !same_build && (in_change || moved_here),
             fails: fact && !already && same_build && (in_change || moved_here),
         });
@@ -1061,6 +1067,7 @@ fn judge(
                     unconfirmed,
                     outside_the_change: !is_changed(repo, &file),
                     not_judged_before: false,
+                    after: "no_route".to_string(),
                     other_build,
                     fails: new_fact && !other_build,
                 });
@@ -1179,6 +1186,7 @@ fn judge(
             outside_the_change: true,
             other_build: false,
             not_judged_before: false,
+            after: "no_route".to_string(),
             fails: confirmed,
         });
     }
@@ -1517,6 +1525,7 @@ mod tests {
             unconfirmed: false,
             outside_the_change: false,
             not_judged_before: false,
+            after: String::new(),
             other_build: false,
             fails,
         }

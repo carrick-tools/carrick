@@ -103,6 +103,8 @@ pub struct Fresh {
     pub elapsed: Duration,
     /// Which services were re-read and which were not.
     pub scope: RecheckScope,
+    /// Rows outside the edited file that this edit moved.
+    pub moved: Vec<super::contract::MovedRow>,
 }
 
 /// How many new functions one answer carries.
@@ -243,6 +245,7 @@ pub fn run(
     relative: &str,
     index_generation: &str,
     reach: &Reach,
+    before: &super::read_model::LocalIndex,
 ) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
     if let Ok(mut at) = RUN_STARTED.lock() {
@@ -296,6 +299,7 @@ pub fn run(
         &generation,
         deadline,
         &plan,
+        before,
     );
     // The temporary generation goes on every path, including the one where a
     // phase was killed at the deadline: a hook that leaves a directory behind
@@ -856,6 +860,7 @@ fn inside(
     generation: &Path,
     deadline: Instant,
     plan: &Plan,
+    before: &super::read_model::LocalIndex,
 ) -> Result<Fresh, String> {
     let name = repo_label(repo);
     let rejoined = rejoin_held(
@@ -894,7 +899,75 @@ fn inside(
         ran,
         elapsed: Duration::default(),
         scope: plan.scope.clone(),
+        moved: moved_rows(workspace, before, &rejoined, repo, relative, plan),
     })
+}
+
+/// The rows outside the edited file that this edit moved, by the rule
+/// `check --changed` applies to the files it was given (`changed.rs`,
+/// `judge`; carrick#2998): a pair the index held compatible that now
+/// mismatches, and a call the index matched that now reaches no route. A
+/// pair the index never judged is listed with `not_judged_before` and is not
+/// a break.
+///
+/// Rows of the edited repo and of every repo holding a re-read service are
+/// read; a call in any repo counts when the index matched it. The rows of the
+/// edited file itself are the `items` of the answer, so they are left out.
+fn moved_rows(
+    workspace: &Workspace,
+    before: &super::read_model::LocalIndex,
+    rejoined: &Rejoined,
+    repo: &Path,
+    relative: &str,
+    plan: &Plan,
+) -> Vec<super::contract::MovedRow> {
+    let edited = repo_label(repo);
+    let mut changed: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    changed.insert(edited, std::iter::once(relative.to_string()).collect());
+    for indexed in &rejoined.index.repos {
+        if indexed
+            .services
+            .iter()
+            .any(|service| plan.scope.reread.contains(&service.name))
+        {
+            changed.entry(indexed.name.clone()).or_default();
+        }
+    }
+    let wanted: std::collections::BTreeMap<String, &std::collections::BTreeSet<String>> = changed
+        .iter()
+        .map(|(name, files)| (name.clone(), files))
+        .collect();
+    let judged = super::changed::judge(
+        &workspace.root,
+        before,
+        before.written_by_this_build(),
+        &rejoined.index,
+        &rejoined.join,
+        &wanted,
+    );
+    judged
+        .problems
+        .into_iter()
+        .filter(|problem| problem.outside_the_change)
+        .map(|problem| super::contract::MovedRow {
+            file: problem.file,
+            line: problem.line,
+            role: problem.role,
+            method: problem.method,
+            path: problem.path,
+            before: match (problem.kind, problem.not_judged_before) {
+                (super::changed::ProblemKind::NoRoute, _) => "matched",
+                (_, true) => "not_judged",
+                (_, false) => "compatible",
+            }
+            .to_string(),
+            after: problem.after,
+            counterparts: problem.other,
+            reason: problem.reason,
+            not_judged_before: problem.not_judged_before,
+        })
+        .collect()
 }
 
 /// What a check says when the re-scan could not read the library store

@@ -152,6 +152,7 @@ pub fn answer(
                         &indexed_at,
                         &index.indexed_at,
                         &reach,
+                        &index,
                     ),
                     None => (None, not_run("no service reads this file", &indexed_at)),
                 },
@@ -395,6 +396,7 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
         new_functions: Vec::new(),
         known_miss: false,
         scope: None,
+        moved: Vec::new(),
     }
 }
 
@@ -416,6 +418,7 @@ fn rechecked(
     indexed_at: &str,
     index_generation: &str,
     reach: &super::recheck::Reach,
+    before: &LocalIndex,
 ) -> (Option<Vec<IndexedItem>>, Recheck) {
     let started = std::time::Instant::now();
     let workspace = match super::workspace::Workspace::load(workspace_root) {
@@ -431,11 +434,19 @@ fn rechecked(
                     new_functions: Vec::new(),
                     known_miss: false,
                     scope: None,
+                    moved: Vec::new(),
                 },
             );
         }
     };
-    match super::recheck::run(&workspace, repo_root, relative, index_generation, reach) {
+    match super::recheck::run(
+        &workspace,
+        repo_root,
+        relative,
+        index_generation,
+        reach,
+        before,
+    ) {
         Ok(fresh) => (
             Some(fresh.items),
             Recheck {
@@ -446,6 +457,7 @@ fn rechecked(
                 new_functions: fresh.new_functions,
                 known_miss: false,
                 scope: Some(fresh.scope),
+                moved: fresh.moved,
             },
         ),
         Err(degraded) => (
@@ -461,6 +473,7 @@ fn rechecked(
                 new_functions: degraded.new_functions,
                 known_miss: degraded.known_miss,
                 scope: degraded.scope,
+                moved: Vec::new(),
             },
         ),
     }

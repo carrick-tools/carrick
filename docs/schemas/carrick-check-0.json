@@ -214,6 +214,27 @@
             },
             "additionalProperties": true
           }
+        },
+        "moved": {
+          "type": "array",
+          "description": "Rows outside the edited file whose state this edit moved: a pair that agreed in the index and now mismatches, and a call the index matched that now reaches no route. Absent when the edit moved nothing.",
+          "items": {
+            "type": "object",
+            "required": ["file", "role", "method", "path", "before", "after", "counterparts", "reason", "not_judged_before"],
+            "properties": {
+              "file": { "type": "string", "description": "Relative to the workspace root." },
+              "line": { "type": "integer" },
+              "role": { "type": "string", "enum": ["route", "call"] },
+              "method": { "type": "string" },
+              "path": { "type": "string" },
+              "before": { "type": "string", "enum": ["compatible", "matched", "not_judged"] },
+              "after": { "type": "string", "enum": ["type_mismatch", "method_mismatch", "no_route"] },
+              "counterparts": { "type": "array", "items": { "type": "string" }, "description": "The other side, as `service file:line`. Empty on no_route." },
+              "reason": { "type": "string" },
+              "not_judged_before": { "type": "boolean" }
+            },
+            "additionalProperties": true
+          }
         }
       },
       "additionalProperties": true

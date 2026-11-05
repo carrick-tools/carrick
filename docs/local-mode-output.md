@@ -233,6 +233,31 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `new_functions` | array \| absent | functions this file declares in the working tree that the index does not hold under that name, `{ "name": string, "line": int }`, in line order, at most 20. Named from a parse of the file that does not wait on the re-scan, so it is present on a `none` that missed its budget too. Absent when the edit added no function, and when the index could not be read |
 | `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this file's service already missed its budget against this index. Absent otherwise |
 | `scope` | object \| absent | which services this re-check read: `reread` (the file's service first, then every service holding an operation that reads a type declared in the file), `not_reread` (`{ service, operations, reason }` for each other service, saying whose copy its verdicts used), and `stale` (the `not_reread` services judged at a version that predates the work: edited since the index with no copy of the last re-check to stand in, or reading a path edited since the index, which their `reason` names as `reads <path>, edited since the index`). The hook's headline is never "no contract problem" while `stale` is non-empty: it says what it re-read and names up to three of the stale services. Absent on a `none` that decided no scope |
+| `moved` | array \| absent | rows outside the edited file whose state this edit moved (below). Absent when the edit moved nothing |
+
+### `recheck.moved`
+
+The rule is `carrick check --changed`'s (carrick#2998), applied to the rows of
+the edited file's repo and of every repo holding a re-read service: a row
+counts when the index held the same row at the same line with a resolved,
+compatible pair and the re-join now mismatches it, or when the index matched a
+call to a route and the re-join finds none. A route renamed in its own file
+lists the callers it strands, wherever they are. The rows of the edited file
+itself are `items`, not here.
+
+| field | type | meaning |
+|---|---|---|
+| `file`, `line` | string, int | where the row is, relative to the workspace root |
+| `role` | string | `route` or `call` |
+| `method`, `path` | string | the operation |
+| `before` | string | `compatible`; `matched` for a call that had a route; `not_judged` when the index held no resolved, compatible pair |
+| `after` | string | `type_mismatch`, `method_mismatch` or `no_route` |
+| `counterparts` | string[] | the other side as `service file:line`; empty on `no_route` |
+| `reason` | string | the compiler's or the matcher's sentence |
+| `not_judged_before` | bool | the index never judged the pair, so the edit may not be what moved it: listed, never called a break |
+
+The post-edit hook prints up to three of them as problem lines after the
+file's own, naming the row and its counterpart.
 
 `new_functions` is a NAME comparison against everything the index holds for that
 file — the blobs the last local scan wrote AND the hosted record of the same
