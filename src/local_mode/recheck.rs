@@ -226,7 +226,7 @@ fn took(phase: &str, began: Instant) {
     );
     tracing::debug!("{line}");
     if std::env::var_os(TIMING_ENV).is_some() {
-        eprintln!("carrick: {line}");
+        crate::errln!("carrick: {line}");
     }
 }
 
