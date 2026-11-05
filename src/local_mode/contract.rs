@@ -52,7 +52,7 @@ impl ReadError {
             }
             ReadError::IndexUnreadable => {
                 "the local index could not be read. Run `carrick refresh --workspace <dir>` to \
-                 read it in again."
+                 download it again."
             }
         }
     }

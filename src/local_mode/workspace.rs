@@ -536,7 +536,7 @@ pub fn write_self_ignore(index_dir: &Path) -> std::io::Result<()> {
         // (carrick#1023 item 5, carrick#1020). `refresh` is the free pass that
         // rebuilds this directory from the source and the hosted index.
         "# Written by Carrick. Everything here is derived from your source and the\n\
-         # hosted index, and `carrick refresh` rebuilds it.\n*\n",
+         # hosted index, and `carrick refresh` downloads it again.\n*\n",
     )
 }
 
