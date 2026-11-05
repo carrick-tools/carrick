@@ -2115,6 +2115,25 @@ impl TaggedTplVisitor<'_> {
     }
 }
 
+/// Whether a template's tag is named for GraphQL (`gql`, `graphql`). The one
+/// reader of a tag's name: any other tag is read by its text
+/// ([`is_graphql_document_text`]). The `{ ... }` shorthand parses as a
+/// document from plenty of text that is not GraphQL, so the name still decides
+/// it; the shorthand can read the store's labels instead once this module can
+/// (N17).
+fn is_graphql_tag_name(tag: &Expr) -> bool {
+    matches!(tag, Expr::Ident(ident) if matches!(ident.sym.as_ref(), "gql" | "graphql"))
+}
+
+/// Whether the text of a template under any tag is a GraphQL document: an
+/// executable one with a named operation or a fragment, or SDL with at least
+/// one definition.
+fn is_graphql_document_text(text: &str) -> bool {
+    crate::graphql_document_sites::is_executable_document(text)
+        || graphql_parser::parse_schema::<String>(text)
+            .is_ok_and(|schema| !schema.definitions.is_empty())
+}
+
 impl Visit for TaggedTplVisitor<'_> {
     fn visit_import_decl(&mut self, node: &ImportDecl) {
         // Record every named import's local name → module specifier (copy of the
@@ -2134,9 +2153,7 @@ impl Visit for TaggedTplVisitor<'_> {
         // from that one parse, rather than parsing the text a second time here.
         let mut stashed = false;
         if let (swc_ecma_ast::Pat::Ident(binding), Some(init)) = (&node.name, node.init.as_deref())
-            && let Expr::TaggedTpl(tpl) = init
-            && let Expr::Ident(tag) = &*tpl.tag
-            && matches!(tag.sym.as_ref(), "gql" | "graphql")
+            && matches!(init, Expr::TaggedTpl(_))
         {
             self.pending_gql_binding = Some(binding.id.sym.to_string());
             stashed = true;
@@ -2150,16 +2167,18 @@ impl Visit for TaggedTplVisitor<'_> {
     }
 
     fn visit_tagged_tpl(&mut self, node: &TaggedTpl) {
-        if let Expr::Ident(tag) = &*node.tag
-            && matches!(tag.sym.as_ref(), "gql" | "graphql")
-        {
-            let text = tagged_tpl_text(node);
+        // The binding stashed for this template (the declarator's init is the
+        // first tagged template under it); taken now so a rejected template
+        // cannot leave it for one nested inside.
+        let binding = self.pending_gql_binding.take();
+        let text = tagged_tpl_text(node);
+        if is_graphql_tag_name(&node.tag) || is_graphql_document_text(&text) {
             let base_line = self.cm.lookup_char_pos(node.span().lo).line as u32;
             let parsed = extract_from_document_text(&text, self.file_path, base_line);
             // Reuse this single parse to record the const→key association for the
-            // enclosing `const NAME = gql\`...\`` declarator (set in
+            // enclosing `const NAME = <tag>\`...\`` declarator (set in
             // `visit_var_declarator`), so the document is parsed only once.
-            if let Some(binding) = self.pending_gql_binding.take()
+            if let Some(binding) = binding
                 && let Some(key) = single_operation_key(&parsed)
             {
                 self.gql_const_key.insert(binding, key.canonical());

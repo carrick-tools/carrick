@@ -69,3 +69,58 @@ fn scan_repo_extracts_schema_and_documents() {
     assert!(order_producer.file_path.ends_with("schema.graphql"));
     assert!(order_producer.line > 1);
 }
+
+/// What a service file's tagged templates extract, whatever the tag is named.
+fn tagged(source: &str) -> (Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("docs.ts");
+    std::fs::write(&file, source).expect("write source");
+    let extraction = scan_repo(&[], &[], std::slice::from_ref(&file));
+    let keys = |ops: &[carrick::graphql::GraphqlOp]| {
+        let mut keys: Vec<String> = ops.iter().map(|op| op.key.canonical()).collect();
+        keys.sort();
+        keys
+    };
+    (keys(&extraction.producers), keys(&extraction.consumers))
+}
+
+/// A tag is a GraphQL tag by what it holds, not by what it is called (N17):
+/// a member tag and an aliased import both extract, a template that is no
+/// GraphQL does not, and the SDL branch still reads SDL.
+#[test]
+fn a_template_is_read_by_its_text_at_any_tag() {
+    let (_, consumers) = tagged("docs.fetch`query Orders { orders { id } }`;\n");
+    assert_eq!(consumers, vec!["graphql|query|orders"]);
+
+    let (_, consumers) = tagged("import { gql as q } from 'lib';\nconst A = q`query A { a }`;\n");
+    assert_eq!(consumers, vec!["graphql|query|a"]);
+
+    let (producers, consumers) = tagged("css`.a { color: red }`;\n");
+    assert!(producers.is_empty() && consumers.is_empty());
+
+    let (producers, _) = tagged("sdl`type Query { a: Int }`;\n");
+    assert_eq!(producers, vec!["graphql|query|a"]);
+
+    // The `{ ... }` shorthand parses as a document from plenty of text, so at
+    // a tag not named for GraphQL it still extracts nothing.
+    let (_, consumers) = tagged("styled`{ color }`;\n");
+    assert!(consumers.is_empty());
+}
+
+/// The binding of `const NAME = <tag>\`...\`` is recorded at any tag, so a
+/// `client.request(NAME)` call can name its operation.
+#[test]
+fn a_const_bound_to_any_tag_records_its_operation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("docs.ts");
+    std::fs::write(
+        &file,
+        "const ORDERS = docs.fetch`query Orders { orders { id } }`;\n",
+    )
+    .expect("write source");
+    let keys = carrick::graphql::document_operation_keys(&file);
+    assert_eq!(
+        keys.get("ORDERS").map(String::as_str),
+        Some("graphql|query|orders")
+    );
+}
