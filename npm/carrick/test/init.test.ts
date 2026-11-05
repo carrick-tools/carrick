@@ -47,6 +47,9 @@ import {
   reposToScaffold,
   preselectedRepos,
   chooseEditors,
+  CLOUD_NEXT_TITLE,
+  cloudNextLines,
+  ASK_YOUR_AGENT_PROMPT,
   type InitOptions,
 } from "../src/init/run.ts";
 import { inspectTaskSkills, removeTaskSkills, taskSkillPaths, taskSkillWarnings, writeTaskSkills } from "../src/init/task-skills.ts";
@@ -3925,6 +3928,18 @@ test("the workspace read says who builds the index, and only cloud is the cloud 
   assert.equal((await resolveRepos("t", [], answer({ index_builder: 7 }))).workspace.index_builder, undefined);
 });
 
+test("the cloud lane's closing block is the prompt plus only the steps still open", () => {
+  assert.equal(CLOUD_NEXT_TITLE, "Done. Open a new agent session in this folder, then ask it:");
+  assert.deepEqual(cloudNextLines(false, false), [`${ASK_YOUR_AGENT_PROMPT}.`]);
+  assert.deepEqual(cloudNextLines(true, true), [
+    `${ASK_YOUR_AGENT_PROMPT}.`,
+    "",
+    "The index is not on this machine yet: `carrick refresh` reads it in once Carrick has built it.",
+    "",
+    "Codex: open `codex` here once and trust the project's hooks, or it skips them.",
+  ]);
+});
+
 test("where Carrick builds the index, init asks nothing, installs everything and reads the index in", posixNativeFixture, async () => {
   // With a terminal and without one: neither is asked anything, and neither
   // needs --yes.
@@ -3942,7 +3957,17 @@ test("where Carrick builds the index, init asks nothing, installs everything and
       assert.match(text, /Next:\n {2}Add Carrick's hooks and skills to \.claude\/, \.agents\/ and \.codex\//);
       assert.ok(out.lines.includes("◇ Set up in project Shop (shop): api"), text);
       assert.match(text, /^Hosted index for 1 service read into \.carrick\/ in \d/m);
-      assert.equal(out.lines.at(-1), `◇ ${READY}`);
+      assert.ok(out.lines.includes(`◇ ${READY}`), text);
+      // The run closes on the new-session step, the prompt and, on a first
+      // write of the Codex hooks, the trust step, said once and last
+      // (carrick#3286); the laptop lane's paste-this block never appears.
+      const closing = text.slice(text.indexOf(CLOUD_NEXT_TITLE));
+      assert.ok(closing.includes(`${ASK_YOUR_AGENT_PROMPT}.`), closing);
+      assert.match(closing, /Codex: open `codex` here once and trust the project's hooks, or it skips them\./);
+      assert.doesNotMatch(closing, /Written here|so it loads the MCP server|socket events and queues/);
+      assert.doesNotMatch(text, /choose to trust the project's hooks/);
+      // The index is on this machine, so refresh is not offered.
+      assert.doesNotMatch(closing, /carrick refresh/);
       // Nobody scaffolds here: no instruction for an agent, no config, no
       // workflow, no scan command.
       assert.doesNotMatch(text, /scaffold|carrick\.json|carrick index|workflow|paste this/i);
@@ -3979,7 +4004,9 @@ test("a folder is set up for the repos the workspace holds, and the rest are nam
     assert.ok(first.lines.includes(`▲ ${NOT_IN_WORKSPACE("acme/notes", "is", "it")}`), first.lines.join("\n"));
     assert.ok(first.lines.includes(`▲ ${NO_INDEX_YET}`), first.lines.join("\n"));
     assert.ok(first.lines.includes("◇ Set up in project Shop (shop): api, web"), first.lines.join("\n"));
-    assert.equal(first.lines.at(-1), `◇ ${READY}`);
+    assert.ok(first.lines.includes(`◇ ${READY}`), first.lines.join("\n"));
+    // A repo has no index yet: the closing block says refresh reads it in.
+    assert.match(first.lines.join("\n"), /`carrick refresh` reads it in once Carrick has built it/);
     // The repo the workspace does not hold is out of the file every later
     // command reads, recorded as this command's, and holds nothing of ours.
     assert.deepEqual(JSON.parse(fs.readFileSync(workspaceFile, "utf8")), {

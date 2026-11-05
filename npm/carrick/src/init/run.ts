@@ -140,6 +140,28 @@ export function initFolderSentence(workspace: string): string {
 export const READY_SENTENCE =
   "The index is on this machine: `carrick check <file>` answers for a file, and your agent can ask who calls an operation.";
 
+/** The title of the block a cloud-lane run closes on (carrick#3286). */
+export const CLOUD_NEXT_TITLE = "Done. Open a new agent session in this folder, then ask it:";
+
+/** The question the ready email also carries, so both say the same first thing. */
+export const ASK_YOUR_AGENT_PROMPT =
+  "Use Carrick to list every service in our project and the number of endpoints each one exposes";
+
+/**
+ * What a cloud-lane run closes on, under CLOUD_NEXT_TITLE: the first question
+ * to ask, then only the steps still open. What init wrote is already listed
+ * while it runs, and a failed step warns where it fails, so neither is
+ * repeated here. Nobody scaffolds on this lane, so there is no instruction to
+ * paste (carrick#3286).
+ */
+export function cloudNextLines(codexTrust: boolean, indexPending: boolean): string[] {
+  return [
+    `${ASK_YOUR_AGENT_PROMPT}.`,
+    ...(indexPending ? ["", "The index is not on this machine yet: `carrick refresh` reads it in once Carrick has built it."] : []),
+    ...(codexTrust ? ["", "Codex: open `codex` here once and trust the project's hooks, or it skips them."] : []),
+  ];
+}
+
 export type InitOptions = {
   workspace: string;
   /** Put the selected repos in this project, moving them where `allowMove` says. */
@@ -1465,6 +1487,9 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // What the reader still has to do, said once at the end rather than between
   // the steps (carrick#1489).
   const todo: string[] = [];
+  // Whether the cloud lane's closing block carries the Codex trust step: only
+  // when this run wrote the Codex hooks for the first time (carrick#3286).
+  let codexTrust = false;
   let projectExists = decision.exists;
   try {
     if (decision.create && project !== null) {
@@ -1551,8 +1576,14 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // (carrick#1335): which agent opens this workspace is not a thing init can
   // know, and a hook file for a host nobody runs costs nothing.
   try {
-    if (writeCodexHooks(workspace, command.command) === "written") {
-      todo.push("Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.");
+    const codex = writeCodexHooks(workspace, command.command);
+    if (codex === "written") {
+      // The cloud lane says it once, last, in its closing block.
+      if (cloud === null) {
+        todo.push("Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.");
+      } else {
+        codexTrust = true;
+      }
     }
   } catch (error) {
     out.refuse(
@@ -1761,6 +1792,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     const install = installSentence(installCommands(plan, readFromHosted), "cloud");
     if (install !== null) out.warn(install);
     if (downloaded) out.done(READY_SENTENCE);
+    out.note(CLOUD_NEXT_TITLE, cloudNextLines(codexTrust, cloud.waiting.length > 0 || !downloaded));
     return 0;
   }
   // The scaffold tool writes the files a repo needs; a repo that has them needs
