@@ -690,6 +690,15 @@ files.
   line's "moved" clause count only the first kind, the pairs the index held
   compatible.
 
+A pair the work moved is listed on a plain run even when it does not fail (a
+model candidate, for one), with its usual note such as `[model candidate, does
+not fail]`, and the summary counts it as `--all` does, under "do not fail the
+check". Up to 10 are listed; the rest end in `and N more: carrick check
+--changed --all lists them`. Exit codes and `--json` are unchanged. Every
+count on the summary line is either backed by listed rows or followed by
+`run with --all to list them`; the "not type-checked" count carries that
+pointer too.
+
 **Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same
 pass over the files named, in any repos of the workspace, instead of the
 files git says changed: always re-extracted (`--recheck` is accepted and
