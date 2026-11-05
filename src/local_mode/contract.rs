@@ -564,6 +564,43 @@ pub struct Recheck {
     /// a `none` that had no service to name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<RecheckScope>,
+    /// Rows outside the edited file whose state this edit moved: a pair that
+    /// agreed in the index and now mismatches, and a call the index matched to
+    /// a route that now reaches none. The rule is `check --changed`'s
+    /// (`changed.rs`, `judge`). Absent when the edit moved nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moved: Vec<MovedRow>,
+}
+
+/// One row outside the edited file that the edit moved
+/// (`docs/local-mode-output.md`, "`recheck.moved`").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MovedRow {
+    /// Relative to the workspace root, so it opens from where the command ran.
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// `route` or `call`.
+    pub role: String,
+    pub method: String,
+    pub path: String,
+    /// What the index held: `compatible`, `matched` (a call that had a
+    /// route), or `not_judged` when it held no resolved, compatible pair
+    /// (never called a break).
+    pub before: String,
+    /// `type_mismatch`, `method_mismatch` or `no_route`.
+    pub after: String,
+    /// The other side of the pair, as `service file:line`. Empty on `no_route`.
+    pub counterparts: Vec<String>,
+    pub reason: String,
+    /// The index held no resolved, compatible pair for this row, so the edit
+    /// may not be what moved it.
+    pub not_judged_before: bool,
+    /// The index was written by another carrick build, so the verdict may
+    /// have moved because the build changed and not because of the edit
+    /// (carrick#2911, `changed.rs`, `Problem::other_build`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub other_build: bool,
 }
 
 /// The services one re-check re-read, and what it did about the rest.
@@ -1298,6 +1335,7 @@ mod tests {
             new_functions: Vec::new(),
             known_miss: false,
             scope: None,
+            moved: Vec::new(),
         });
         let text = fresh.render();
         assert!(
@@ -1319,6 +1357,7 @@ mod tests {
             new_functions: Vec::new(),
             known_miss: false,
             scope: None,
+            moved: Vec::new(),
         });
         let text = degraded.render();
         assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");
@@ -1339,6 +1378,7 @@ mod tests {
             new_functions: Vec::new(),
             known_miss: false,
             scope: None,
+            moved: Vec::new(),
         });
         let text = unchanged.render();
         assert!(

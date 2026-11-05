@@ -824,3 +824,72 @@ test("the session-start check line is short and names both exit codes", () => {
     "Before you call a change done, run `carrick check --changed`. Exit 1 is a contract problem; exit 2 means nothing could be checked.",
   );
 });
+
+test("an edit names the rows outside the file that it moved, and calls an unjudged one no break", () => {
+  const result = rechecked();
+  result.recheck = {
+    ran: "extraction+types",
+    elapsed_ms: 900,
+    moved: [
+      {
+        file: "web/src/client.ts",
+        line: 14,
+        role: "call",
+        method: "GET",
+        path: "/api/v2/widgets/:id",
+        before: "matched",
+        after: "no_route",
+        counterparts: [],
+        reason: "the index matched this call, and no service serves it now",
+        not_judged_before: false,
+      },
+      {
+        file: "api/src/widgets.ts",
+        line: 9,
+        role: "route",
+        method: "GET",
+        path: "/api/widgets/:id",
+        before: "not_judged",
+        after: "type_mismatch",
+        counterparts: ["web web/src/client.ts:20"],
+        reason: "x",
+        not_judged_before: true,
+      },
+    ],
+  };
+  const text = renderPostToolUse(result) ?? "";
+  assert.match(
+    text,
+    /- web\/src\/client\.ts:14: this call GET \/api\/v2\/widgets\/:id matched a route in the index and this edit left it with none\./,
+  );
+  assert.match(text, /api\/src\/widgets\.ts:9: this route GET .* against web web\/src\/client\.ts:20 reads type_mismatch now; the index never judged it, so this edit may not be the cause\./);
+});
+
+test("a moved row of another build's index says that build may be the cause", () => {
+  const result = rechecked();
+  result.recheck = {
+    ran: "extraction+types",
+    elapsed_ms: 900,
+    moved: [
+      {
+        file: "api/src/widgets.ts",
+        line: 9,
+        role: "route",
+        method: "GET",
+        path: "/api/widgets/:id",
+        before: "compatible",
+        after: "type_mismatch",
+        counterparts: ["web web/src/client.ts:20"],
+        reason: "x",
+        not_judged_before: false,
+        other_build: true,
+      },
+    ],
+  };
+  const text = renderPostToolUse(result) ?? "";
+  assert.match(
+    text,
+    /api\/src\/widgets\.ts:9: this route GET .* against web web\/src\/client\.ts:20 reads type_mismatch now; the index was built by another carrick version, so this edit may not be the cause\./,
+  );
+  assert.doesNotMatch(text, /agreed in the index/);
+});

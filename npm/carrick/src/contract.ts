@@ -193,6 +193,35 @@ export type Recheck = {
   known_miss?: boolean;
   /** Which services this re-check read and which it judged at another version. */
   scope?: RecheckScope;
+  /**
+   * Rows outside the edited file whose state this edit moved: a pair that
+   * agreed in the index and now mismatches, and a call the index matched that
+   * now reaches no route. Absent when the edit moved nothing.
+   */
+  moved?: MovedRow[];
+};
+
+/** One row of `recheck.moved` (`docs/local-mode-output.md`, "`recheck.moved`"). */
+export type MovedRow = {
+  /** Relative to the workspace root. */
+  file: string;
+  line?: number;
+  role: "route" | "call";
+  method: string;
+  path: string;
+  /** `compatible`, `matched` (a call that had a route) or `not_judged`. */
+  before: "compatible" | "matched" | "not_judged";
+  after: "type_mismatch" | "method_mismatch" | "no_route";
+  /** The other side, as `service file:line`. Empty on `no_route`. */
+  counterparts: string[];
+  reason: string;
+  /** The index held no resolved, compatible pair: never called a break. */
+  not_judged_before: boolean;
+  /**
+   * The index was written by another carrick build: the verdict may have moved
+   * because the build changed, not because of the edit. Absent when false.
+   */
+  other_build?: boolean;
 };
 
 /** The `scope` of a `recheck` block (`docs/local-mode-output.md`, "recheck"). */

@@ -282,6 +282,36 @@ export function itemLine(
 
 /** Problem lines one edit's message carries before it counts the rest. */
 export const MAX_EDIT_PROBLEMS = 3;
+
+/** Rows outside the edited file that one edit may name (`recheck.moved`). */
+export const MAX_MOVED_ROWS = 3;
+
+/**
+ * The rows outside the edited file that this edit moved (`recheck.moved`):
+ * one line each, naming the row and, for a pair, its counterpart. A row the
+ * index never judged is not called a break.
+ */
+export function movedLines(result: CheckResult): string[] {
+  const moved = result.recheck?.moved ?? [];
+  const lines = moved.slice(0, MAX_MOVED_ROWS).map((row) => {
+    const at = `${row.file}${row.line ? `:${row.line}` : ""}`;
+    const what = `${row.role} ${row.method} ${row.path}`;
+    if (row.after === "no_route") {
+      return cutLine(`- ${at}: this ${what} matched a route in the index and this edit left it with none.`);
+    }
+    const other = row.counterparts.length > 0 ? ` against ${row.counterparts.join(", ")}` : "";
+    const verdict = row.other_build
+      ? `reads ${row.after} now; the index was built by another carrick version, so this edit may not be the cause`
+      : row.not_judged_before
+        ? `reads ${row.after} now; the index never judged it, so this edit may not be the cause`
+        : `agreed in the index and now reads ${row.after}`;
+    return cutLine(`- ${at}: this ${what}${other} ${verdict}.`);
+  });
+  if (moved.length > MAX_MOVED_ROWS) {
+    lines.push(`- and ${moved.length - MAX_MOVED_ROWS} more rows outside this file moved: \`carrick check --changed\` lists them.`);
+  }
+  return lines;
+}
 /** How long one problem line of an edit's message may run before it is cut. */
 export const MAX_EDIT_LINE_CHARS = 400;
 
@@ -434,6 +464,7 @@ export function renderPostToolUse(
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);
     if (hidden > 0) lines.push(`- and ${hidden} more: \`carrick check ${where}\` lists them.`);
+    lines.push(...movedLines(result));
   }
   const uses = options.uses === false ? 0 : (result.uses_lines ?? []).length;
   if (uses > 0) {

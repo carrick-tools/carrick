@@ -5765,3 +5765,177 @@ fn a_shared_package_with_no_install_is_named_not_type_checked() {
         "{json:#}"
     );
 }
+
+// --- carrick#1049: a re-check names the rows outside the edited file that the
+// edit moved ---
+
+fn moved_of(answer: &serde_json::Value) -> Vec<serde_json::Value> {
+    answer["recheck"]["moved"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Renaming a route in its own file leaves its callers, in another service,
+/// reaching no route. The re-check of the route file names them.
+#[test]
+#[serial]
+fn a_route_rename_names_the_callers_it_strands() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+
+    // A flat route's path is its file name.
+    let renamed = "shop/catalog/app/routes/api.v2.widgets.$widgetId.ts";
+    std::fs::rename(root.join(SHOP_ROUTE), root.join(renamed)).expect("rename the route file");
+    let answer = recheck_json(root, renamed, &AMPLE);
+    assert_ne!(
+        answer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answer:#}"
+    );
+    let moved = moved_of(&answer);
+    let stranded = moved
+        .iter()
+        .find(|row| row["after"] == "no_route")
+        .unwrap_or_else(|| panic!("the inventory call is named:\n{answer:#}"));
+    assert_eq!(stranded["role"], serde_json::json!("call"), "{answer:#}");
+    assert_eq!(
+        stranded["file"],
+        serde_json::json!("shop/inventory/src/client.ts"),
+        "{answer:#}"
+    );
+    assert!(stranded["line"].as_u64().is_some(), "{answer:#}");
+    assert_eq!(stranded["before"], serde_json::json!("matched"));
+}
+
+/// The shop with `Widget` moved out of the route file into `types.ts`.
+fn shop_with_widget_in_a_types_file() -> tempfile::TempDir {
+    workspace_prepared(SHOP, &["shop"], |repo| {
+        let route = repo.join("catalog/app/routes/api.v1.widgets.$widgetId.ts");
+        let text = std::fs::read_to_string(&route).expect("read the route");
+        let (types, rest) = text
+            .split_once("export type Widget = {")
+            .expect("the route declares Widget");
+        let (body, rest) = rest.split_once("};\n").expect("the type ends");
+        let _ = types;
+        std::fs::write(
+            repo.join("catalog/app/types.ts"),
+            format!("export type Widget = {{{body}}};\n"),
+        )
+        .expect("write the types file");
+        std::fs::write(
+            &route,
+            format!(
+                "import type {{ Widget }} from \"../types\";\nexport type {{ Widget }};\n{rest}"
+            ),
+        )
+        .expect("rewrite the route");
+    })
+}
+
+/// A type moved out of the route file into a types file: editing the type
+/// moves the route's verdict against its consumer, and the re-check of the
+/// types file (which holds no row of its own) names the route.
+#[test]
+#[serial]
+fn a_types_file_edit_names_the_route_and_the_consumer_it_breaks() {
+    let workspace = shop_with_widget_in_a_types_file();
+    let root = workspace.path();
+    index(root);
+
+    let types = "shop/catalog/app/types.ts";
+    edit(
+        &root.join(types),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let answer = recheck_json(root, types, &AMPLE);
+    let moved = moved_of(&answer);
+    let route = moved
+        .iter()
+        .find(|row| row["role"] == "route")
+        .unwrap_or_else(|| panic!("the route is named:\n{answer:#}"));
+    assert_eq!(
+        route["after"],
+        serde_json::json!("type_mismatch"),
+        "{answer:#}"
+    );
+    assert_eq!(
+        route["before"],
+        serde_json::json!("compatible"),
+        "{answer:#}"
+    );
+    assert!(
+        route["counterparts"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|n| n
+                .as_str()
+                .is_some_and(|n| n.contains("inventory") && n.contains("client.ts")))),
+        "the consumer it breaks is named:\n{answer:#}"
+    );
+}
+
+/// The index was written by another carrick build, so a verdict that moved
+/// may have moved because of the build and not the edit: the row says so.
+#[test]
+#[serial]
+fn a_moved_row_of_another_builds_index_says_the_build_may_be_the_cause() {
+    let workspace = shop_with_widget_in_a_types_file();
+    let root = workspace.path();
+    index(root);
+    as_written_by_an_older_scanner(root);
+
+    let types = "shop/catalog/app/types.ts";
+    edit(
+        &root.join(types),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let answer = recheck_json(root, types, &AMPLE);
+    let moved = moved_of(&answer);
+    let route = moved
+        .iter()
+        .find(|row| row["role"] == "route")
+        .unwrap_or_else(|| panic!("the route is named:\n{answer:#}"));
+    assert_eq!(route["other_build"], serde_json::json!(true), "{answer:#}");
+}
+
+/// The same edit against an index this build wrote carries no `other_build`.
+#[test]
+#[serial]
+fn a_moved_row_of_this_builds_index_carries_no_other_build() {
+    let workspace = shop_with_widget_in_a_types_file();
+    let root = workspace.path();
+    index(root);
+
+    let types = "shop/catalog/app/types.ts";
+    edit(
+        &root.join(types),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let answer = recheck_json(root, types, &AMPLE);
+    let route = moved_of(&answer)
+        .into_iter()
+        .find(|row| row["role"] == "route")
+        .unwrap_or_else(|| panic!("the route is named:\n{answer:#}"));
+    assert!(route.get("other_build").is_none(), "{answer:#}");
+}
+
+/// An edit the scan reads differently that moves no type and no route moves nothing.
+#[test]
+#[serial]
+fn a_type_neutral_edit_moves_no_row() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    statement_in(&root.join(SHOP_ROUTE), "no contract change");
+    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_ne!(
+        answer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answer:#}"
+    );
+    assert!(moved_of(&answer).is_empty(), "{answer:#}");
+}
