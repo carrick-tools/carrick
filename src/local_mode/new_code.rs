@@ -462,12 +462,11 @@ struct TableBuilder<'a>(HashMap<BindingKey, Binding<'a>>);
 
 impl<'a> TableBuilder<'a> {
     fn insert(&mut self, ident: &Ident, binding: Binding<'a>) {
-        let key = ident_key(ident);
-        if self.0.contains_key(&key) {
-            self.0.insert(key, Binding::Other);
-        } else {
-            self.0.insert(key, binding);
-        }
+        // A name bound twice is neither binding.
+        self.0
+            .entry(ident_key(ident))
+            .and_modify(|bound| *bound = Binding::Other)
+            .or_insert(binding);
     }
 
     fn param(&mut self, pat: &'a Pat) {
@@ -1114,14 +1113,13 @@ pub(super) fn import_words(file: &str) -> BTreeSet<String> {
     let mut words = BTreeSet::new();
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
         words.insert(stem.to_string());
-        if stem == "index" {
-            if let Some(folder) = path
+        if stem == "index"
+            && let Some(folder) = path
                 .parent()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
-            {
-                words.insert(folder.to_string());
-            }
+        {
+            words.insert(folder.to_string());
         }
     }
     words
