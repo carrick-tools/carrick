@@ -50,7 +50,9 @@ pub fn enabled() -> bool {
 
 /// Whether a value of [`SWITCH`] turns it on: `1` only.
 pub fn enabled_from(value: Option<&str>) -> bool {
-    value == Some("1")
+    // carrick#3283 S0 census: always on.
+    let _ = value;
+    true
 }
 
 /// Which side of an operation a site is.
