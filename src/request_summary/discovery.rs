@@ -2946,6 +2946,38 @@ mod tests {
         }
     }
 
+    /// carrick#2432 slice B: an implementation the walk cannot enter (one
+    /// only a `.d.ts` declares, or a property that is no function) is not
+    /// silently dropped. A call whose only implementations are like that
+    /// keeps the `interface_member` stop.
+    #[test]
+    fn an_implementation_the_walk_cannot_enter_keeps_the_stop() {
+        let Some(on) = walked("implementations", "services/web", "web", &[], true) else {
+            return;
+        };
+        let script = super::super::fixture_walk::sidecar().expect("built above");
+        let exports = claims();
+        let asked = super::super::fixture_walk::implementations_of(&script, &on, "services/web");
+        let labels = Labels::of(&exports).following(&asked);
+        let with = discover(&on.inputs, &labels, &on.repo);
+        for (file, callee) in [
+            ("declared-only.ts", "sink.emit"),
+            ("property-impl.ts", "hook.fire"),
+        ] {
+            let records: Vec<String> = with
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.callee == callee)
+                .map(|site| site.stop.clone().unwrap_or_else(|| "site".to_string()))
+                .collect();
+            assert_eq!(
+                records,
+                ["interface_member"],
+                "{file} {callee}: the only implementation cannot be entered"
+            );
+        }
+    }
+
     /// carrick#2613 (T2): a call that reached nothing and entered no code says
     /// why, on `unfollowed`: a function a factory returns, an in-repo
     /// function outside the service, a member of a package the store answered
