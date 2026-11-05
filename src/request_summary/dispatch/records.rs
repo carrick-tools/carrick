@@ -323,7 +323,22 @@ pub fn handler_records(
                 }
             }
         }
-        if guard.position == GuardPosition::StartsWith {
+        // A `startsWith` prefix tested with one method on every handler
+        // that reaches it states a route under the prefix; tested with no
+        // method, it states a scope.
+        let prefix_with_method = guard.position == GuardPosition::StartsWith
+            && !arms.is_empty()
+            && arms.iter().all(|(handler, arm)| {
+                arm_method(*node, guard, *handler, arm, &methods, &method_handlers).is_some()
+            });
+        if prefix_with_method {
+            compared.push(Compared {
+                node: *node,
+                guard,
+                literal: prefix_route(text),
+                arms,
+            });
+        } else if guard.position == GuardPosition::StartsWith {
             if !reached.is_empty() {
                 scopes.push(Stated {
                     node: *node,
@@ -454,6 +469,40 @@ fn stated_where<'g>(
 /// A guard's identity while this pass runs.
 fn address(guard: &GuardIr) -> usize {
     guard as *const GuardIr as usize
+}
+
+/// The one method the code compares for `guard`'s comparison on `handler`'s
+/// `arm`, when exactly one qualifies.
+fn arm_method(
+    node: usize,
+    guard: &GuardIr,
+    handler: usize,
+    arm: &Arm,
+    methods: &HashMap<usize, Vec<MethodGuard<'_>>>,
+    method_handlers: &HashMap<usize, BTreeSet<usize>>,
+) -> Option<String> {
+    match arm {
+        Arm::Proven(reached, facts) | Arm::Entry(reached, facts) => {
+            method_of(node, guard, facts, reached, methods)
+        }
+        Arm::Unread(facts) | Arm::Hole { facts, .. } => {
+            method_reaching(node, guard, facts, methods, &|candidate: &MethodGuard<
+                '_,
+            >| {
+                method_handlers
+                    .get(&address(candidate.guard))
+                    .is_some_and(|reached| reached.contains(&handler))
+            })
+        }
+    }
+}
+
+/// The route a `startsWith` prefix states when a method is compared with
+/// it: the prefix and one trailing parameter segment (`/items/` and
+/// `/items` both state `/items/:param`).
+fn prefix_route(prefix: &str) -> String {
+    let base = prefix.strip_suffix('/').unwrap_or(prefix);
+    format!("{base}/:param")
 }
 
 /// The record counts, and the handlers the records name.
@@ -719,42 +768,16 @@ impl Builder<'_, '_> {
         handler: usize,
         arm: &Arm,
     ) -> (Option<String>, Option<String>) {
-        let by_handler = |facts: &ChainFacts| {
-            method_reaching(
-                comparison.node,
-                comparison.guard,
-                facts,
-                self.methods,
-                &|candidate: &MethodGuard<'_>| {
-                    self.method_handlers
-                        .get(&address(candidate.guard))
-                        .is_some_and(|reached| reached.contains(&handler))
-                },
-            )
-        };
-        match arm {
-            Arm::Proven(reached, facts) => (
-                Some(comparison.literal.clone()),
-                method_of(
-                    comparison.node,
-                    comparison.guard,
-                    facts,
-                    reached,
-                    self.methods,
-                ),
-            ),
-            Arm::Entry(reached, facts) => (
-                None,
-                method_of(
-                    comparison.node,
-                    comparison.guard,
-                    facts,
-                    reached,
-                    self.methods,
-                ),
-            ),
-            Arm::Unread(facts) | Arm::Hole { facts, .. } => (None, by_handler(facts)),
-        }
+        let path = matches!(arm, Arm::Proven(..)).then(|| comparison.literal.clone());
+        let method = arm_method(
+            comparison.node,
+            comparison.guard,
+            handler,
+            arm,
+            self.methods,
+            self.method_handlers,
+        );
+        (path, method)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1073,6 +1096,15 @@ impl Builder<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prefix states one trailing parameter segment, with or without its
+    /// own trailing slash.
+    #[test]
+    fn a_prefix_route_is_the_prefix_and_one_parameter_segment() {
+        assert_eq!(prefix_route("/items/"), "/items/:param");
+        assert_eq!(prefix_route("/items"), "/items/:param");
+        assert_eq!(prefix_route("/"), "/:param");
+    }
 
     /// A function under 120 lines is shown whole; a longer one as its first
     /// line and 4 lines before and 2 after each comparison, overlapping

@@ -222,14 +222,59 @@ fn routes_that_echo_a_listed_call_keep_their_rows() {
 }
 
 /// carrick#2474 R4 (row R4, the deleted route-literal witness, #2717): the
-/// four routes the file compares the request path against are stated with
-/// the model's ids made up, now by the guard chain's dispatch rows and the
-/// handler answers (the narrower model question), at their own lines. The
-/// two the file states in no comparison (`GET /metrics`, `POST /audit`, a
-/// request only) are no routes.
+/// routes the file compares the request path against are stated with the
+/// model's ids made up, now by the guard chain's dispatch rows and the
+/// handler answers (the narrower model question), at their own lines, as
+/// the code states them (`expected-dispatched.json`): a `startsWith`
+/// prefix tested with a method is the prefix and a parameter segment, and
+/// the `case "/health":` no method is tested around is a `no_method`
+/// possible call, never a guessed method. `POST /audit`, a request only, is
+/// no route.
 #[test]
 fn routes_with_made_up_ids_are_stated_by_the_dispatch_rows() {
+    let key: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture_dir().join("expected-dispatched.json"))
+            .expect("read the dispatched answer key"),
+    )
+    .expect("the answer key is JSON");
     let scan = scan("dispatched", true);
+    let leads: BTreeSet<(String, u64)> = scan.blob["possible_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|call| call["unread"]["reason"] == "no_method")
+        .map(|call| {
+            (
+                call["file_path"].as_str().unwrap().to_string(),
+                call["line_number"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let expected_leads: BTreeSet<(String, u64)> = key["no_method_leads"]
+        .as_array()
+        .expect("a no_method_leads array")
+        .iter()
+        .map(|lead| {
+            (
+                lead["file"].as_str().unwrap().to_string(),
+                lead["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(leads, expected_leads);
+    let expected: BTreeSet<Row> = key["endpoints"]
+        .as_array()
+        .expect("an endpoints array")
+        .iter()
+        .map(|row| {
+            (
+                row["file"].as_str().unwrap().to_string(),
+                row["line"].as_u64().unwrap(),
+                row["method"].as_str().unwrap().to_string(),
+                row["path"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
     let flat: BTreeSet<Row> = scan.blob["endpoints"]
         .as_array()
         .expect("the blob holds endpoint rows")
@@ -245,5 +290,5 @@ fn routes_with_made_up_ids_are_stated_by_the_dispatch_rows() {
             )
         })
         .collect();
-    assert_eq!(flat, expected_routes());
+    assert_eq!(flat, expected);
 }
