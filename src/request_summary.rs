@@ -8650,9 +8650,6 @@ pub struct RequestSummaryIndex {
     /// What the requests whose method is a parameter declared as a set of
     /// verbs wait on (carrick#2049).
     methods: Box<DeclaredMethods>,
-    /// The calls whose every request has its verb settled at the call but
-    /// its URL still open (carrick#2676), by file.
-    verbs: HashMap<PathBuf, Vec<StatedVerb>>,
 }
 
 /// The verb a call settles for the requests it reaches, where none of their
@@ -8714,6 +8711,9 @@ struct DeclaredMethods {
     /// The rows a request line states for a method declared as a set of
     /// verbs, kept until every call of it has been read.
     pending: Vec<DeclaredRows>,
+    /// The calls whose every request has its verb settled at the call but
+    /// its URL still open ([`StatedVerb`], carrick#2676), by file.
+    stated: HashMap<PathBuf, Vec<StatedVerb>>,
 }
 
 /// One row per verb a request's method parameter is declared with.
@@ -8808,7 +8808,11 @@ impl RequestSummaryIndex {
     /// The verbs the calls of `file` settle for requests whose URL they
     /// leave open ([`StatedVerb`], carrick#2676).
     pub fn verbs(&self, file: &Path) -> &[StatedVerb] {
-        self.verbs.get(file).map(Vec::as_slice).unwrap_or_default()
+        self.methods
+            .stated
+            .get(file)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn row_count(&self) -> usize {
@@ -9385,7 +9389,8 @@ fn emit(
                 }
                 if let Some(method) = open_verbs.verb() {
                     index
-                        .verbs
+                        .methods
+                        .stated
                         .entry(file.to_path_buf())
                         .or_default()
                         .push(StatedVerb {
