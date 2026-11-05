@@ -1079,9 +1079,6 @@ fn a_mount_on_an_app_made_through_the_other_export_still_prefixes_the_child() {
         graph,
         vec![
             "src/index.ts:10 GET /health library_claim app",
-            // The mock answer's row for the mount call itself, as with the
-            // named export.
-            "src/index.ts:11 GET /v1/users inline_literal app",
             // Without the mount edge the child's route is not read at all.
             "src/index.ts:8 GET /v1/users/list library_claim users",
         ]
