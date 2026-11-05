@@ -1763,7 +1763,7 @@ export class TypeInferrer {
             kind: awaitedType.isAny() ? 'any' : 'unknown',
             reason: 'no_payload_evidence',
             detail:
-              "the handler returns a call whose callee has no resolvable declaration, and nothing states what it is: no returned sibling call hands it a body plus a status, and no returned argument carries a 'satisfies'/'as' annotation",
+              "the handler returns a call whose callee has no resolvable declaration, and nothing states what it is: the compiler cannot resolve the callee, no labelled response send names the payload, and no returned argument carries a 'satisfies'/'as' annotation",
           },
         ];
       }

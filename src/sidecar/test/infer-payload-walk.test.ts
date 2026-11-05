@@ -253,6 +253,12 @@ describe('carrick#707 payload-argument walk', () => {
     assert.strictEqual(provenance[0].path, '');
     assert.strictEqual(provenance[0].kind, 'any');
     assert.strictEqual(provenance[0].reason, 'no_payload_evidence');
+    // The detail names what the code decides now, not the sibling-call
+    // evidence carrick#2472 C6d removed.
+    assert.strictEqual(
+      provenance[0].detail,
+      "the handler returns a call whose callee has no resolvable declaration, and nothing states what it is: the compiler cannot resolve the callee, no labelled response send names the payload, and no returned argument carries a 'satisfies'/'as' annotation"
+    );
   });
 
   it('does not read a status field in first position as evidence', async () => {
