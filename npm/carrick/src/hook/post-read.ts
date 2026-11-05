@@ -21,6 +21,7 @@ import { renderPostRead } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { markRead, markTold, toldKey, wasRead } from "./reuse.ts";
 import { markInvoker } from "./invoker.ts";
+import { deliverLate } from "./late.ts";
 
 const log = createLogger("carrick-hook");
 /** The files the index has rows for. */
@@ -40,6 +41,16 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** The one JSON object this hook prints, or nothing when there are no lines. */
+function emit(contexts: string[]): void {
+  if (contexts.length === 0) return;
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: contexts.join("\n\n") },
+    }),
+  );
+}
+
 async function main(): Promise<void> {
   markInvoker("post-read");
   // Only `hook` prints from here; `lsp` and `off` start nothing and write
@@ -56,11 +67,14 @@ async function main(): Promise<void> {
     log("unparseable payload", String(error));
     return;
   }
-  const named = payload.tool_input?.file_path;
-  if (!named || !CHECKED.test(named)) return;
-  const file = path.isAbsolute(named) ? named : path.resolve(payload.cwd ?? process.cwd(), named);
+  // A finished background re-check is owed to the model whatever this Read
+  // is: delivered before the early returns below, in the same one object.
   const session = payload.session_id;
-  if (session && wasRead(session, file)) return;
+  const late = deliverLate(session);
+  const named = payload.tool_input?.file_path;
+  if (!named || !CHECKED.test(named)) return emit(late);
+  const file = path.isAbsolute(named) ? named : path.resolve(payload.cwd ?? process.cwd(), named);
+  if (session && wasRead(session, file)) return emit(late);
 
   const choice = resolveRoot({
     clientRoot: payload.cwd ?? null,
@@ -77,17 +91,12 @@ async function main(): Promise<void> {
   if (session) markRead(session, file);
   if (!outcome.result) {
     log("no answer for", relative, outcome.failure ?? "");
-    return;
+    return emit(late);
   }
 
   const context = renderPostRead(outcome.result, relative);
   log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${outcome.ms}ms`);
-  if (!context) return;
-  process.stdout.write(
-    JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: context },
-    }),
-  );
+  emit(context ? [...late, context] : late);
   // The post-edit hook that follows prints this file's header and items but
   // not the uses lines it was just shown.
   if (session && outcome.result.uses_lines?.length) {

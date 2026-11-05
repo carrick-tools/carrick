@@ -6,7 +6,8 @@ import {
   MAX_EDIT_LINE_CHARS,
   CHECK_BEFORE_DONE,
   answersTheEdit,
-  notedLine,
+  notRecheckedLine,
+  pendingLine,
   boundaryFor,
   boundaryLines,
   itemLine,
@@ -44,6 +45,10 @@ function connectedRows(count: number): CheckItem[] {
   }));
 }
 
+function expectedNotRechecked(reason?: string): string {
+  return `Carrick: src/routes/users.ts was not re-checked: ${reason ?? "no re-check of it ran"}. Run \`carrick check --changed\` before you finish.`;
+}
+
 test("an edit the hook could not re-check lists none of the index's verdicts", () => {
   const stale = fixture("check-mismatch.json");
   stale.items = [...(stale.items ?? []), ...connectedRows(40)];
@@ -59,7 +64,7 @@ test("an edit the hook could not re-check lists none of the index's verdicts", (
   ]) {
     assert.equal(
       renderPostToolUse({ ...stale, recheck }),
-      "Carrick: src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.",
+      expectedNotRechecked(recheck?.reason),
     );
   }
 });
@@ -76,19 +81,26 @@ test("an edit the scan reads the same gets no not-re-checked line", () => {
   assert.doesNotMatch(renderPostToolUse(same) ?? "", /not re-checked/);
 });
 
-test("files a patch left un-checked share one line that names at most five", () => {
-  const files = Array.from({ length: 8 }, (_, n) => `src/f${n}.ts`);
+test("a file left un-checked says why, and the pending and late lines read as pinned", () => {
   assert.equal(
-    notedLine(files),
-    "Carrick: src/f0.ts, src/f1.ts, src/f2.ts, src/f3.ts, src/f4.ts and 3 more were not re-checked here. Run `carrick check --changed` before you finish.",
+    notRecheckedLine("src/a.ts", "an earlier re-check of this repo ran past its budget"),
+    "Carrick: src/a.ts was not re-checked: an earlier re-check of this repo ran past its budget. Run `carrick check --changed` before you finish.",
+  );
+  // A reason that already names the command is not told to run it twice.
+  assert.equal(
+    notRecheckedLine("src/a.ts", "too big; run `carrick check --changed`"),
+    "Carrick: src/a.ts was not re-checked: too big; run `carrick check --changed`.",
   );
   assert.equal(
-    notedLine(files.slice(0, 2)),
-    "Carrick: src/f0.ts and src/f1.ts were not re-checked here. Run `carrick check --changed` before you finish.",
+    pendingLine("src/a.ts", "user-service"),
+    "Carrick is re-checking src/a.ts in the background (re-reading user-service). Its answer comes with the next Carrick line, and before you finish.",
   );
-  // The caller that states the line itself asks the file's render to leave it out.
-  const stale = fixture("check-mismatch.json");
-  assert.equal(renderPostToolUse(stale, undefined, { noted: false }), "");
+  assert.equal(
+    pendingLine("src/a.ts"),
+    "Carrick is re-checking src/a.ts in the background. Its answer comes with the next Carrick line, and before you finish.",
+  );
+  const late = renderPostToolUse(rechecked(), "src/a.ts", { late: true }) ?? "";
+  assert.match(late, /^Carrick re-checked src\/a\.ts after your earlier edit to it: 2 contract problems\.\n/);
 });
 
 test("a re-checked edit lists its problems and nothing that is fine", () => {

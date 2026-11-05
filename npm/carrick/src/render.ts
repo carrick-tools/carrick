@@ -333,26 +333,25 @@ export function answersTheEdit(result: CheckResult): boolean {
 /** Services a stale re-check line names before it counts the rest. */
 const MAX_STALE_SERVICES = 3;
 
-/** Files one "not re-checked" line names before it counts the rest. */
-const MAX_NOTED_FILES = 5;
+/** What a "not re-checked" line says when the binary gave no reason. */
+const NO_RECHECK_REASON = "no re-check of it ran";
 
 /**
- * The one line for edited files the re-check did not answer for: the index's
- * verdicts describe them before the edit, so none is printed, and the reader
- * is sent to the command that answers.
+ * The line for an edited file that no re-check answered for: the index's
+ * verdicts describe the file before the edit, so none is printed, and the
+ * reader is told why and sent to the command that answers. Said on every
+ * such edit, with that edit's own reason.
  */
-export function notedLine(files: string[]): string {
+export function notRecheckedLine(file: string, reason?: string | null): string {
   const run = "Run `carrick check --changed` before you finish.";
-  if (files.length === 1) {
-    return `Carrick: ${files[0]} was not re-checked here. ${run}`;
-  }
-  const shown = files.slice(0, MAX_NOTED_FILES);
-  const rest = files.length - shown.length;
-  const named =
-    rest > 0
-      ? `${shown.join(", ")} and ${rest} more`
-      : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
-  return `Carrick: ${named} were not re-checked here. ${run}`;
+  const said = (reason?.trim() || NO_RECHECK_REASON).replace(/\.+$/, "");
+  return `Carrick: ${file} was not re-checked: ${said}.${said.includes("carrick check --changed") ? "" : ` ${run}`}`;
+}
+
+/** The line for an edit queued for the background re-check. */
+export function pendingLine(file: string, service?: string | null): string {
+  const reading = service ? ` (re-reading ${service})` : "";
+  return `Carrick is re-checking ${file} in the background${reading}. Its answer comes with the next Carrick line, and before you finish.`;
 }
 
 function deletedLine(result: CheckResult, where: string): string {
@@ -401,7 +400,7 @@ function notJudgedReason(result: CheckResult): string {
  * only when a re-check ran, and "no contract problem" only when a type pair
  * was judged and none of the verdicts is a problem.
  */
-function headline(result: CheckResult, where: string, problems: number): string {
+function headline(result: CheckResult, where: string, problems: number, late = false): string {
   const noProblem = judgedAnyPair(result) ? "no contract problem" : null;
   const unjudged =
     (result.items ?? []).length === 0
@@ -423,7 +422,7 @@ function headline(result: CheckResult, where: string, problems: number): string 
     const more = stale.length > MAX_STALE_SERVICES ? `, and ${stale.length - MAX_STALE_SERVICES} more` : "";
     return `Carrick re-checked ${where}: ${tail}; ${stale.length} ${stale.length === 1 ? "service" : "services"} that read this edit ${stale.length === 1 ? "was" : "were"} judged at their indexed version (${names}${more}). Run \`carrick check --changed\` before you finish.`;
   }
-  return `Carrick re-checked ${where} after this edit: ${count("") ?? noProblem ?? unjudged}.`;
+  return `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}: ${count("") ?? noProblem ?? unjudged}.`;
 }
 
 /**
@@ -448,7 +447,7 @@ function headline(result: CheckResult, where: string, problems: number): string 
 export function renderPostToolUse(
   result: CheckResult,
   displayFile?: string,
-  options: { uses?: boolean; noted?: boolean } = {},
+  options: { uses?: boolean; late?: boolean } = {},
 ): string | null {
   if (result.error) return null;
   // `result.file` is relative to the repo that owns it, so the caller's own
@@ -456,14 +455,13 @@ export function renderPostToolUse(
   const where = displayFile ?? result.file ?? "this file";
   const lines: string[] = [];
   if (!answersTheEdit(result)) {
-    // A patch of several files states this once for all of them (`notedLine`).
-    if (options.noted !== false) lines.push(notedLine([where]));
+    lines.push(notRecheckedLine(where, result.recheck?.reason));
   } else {
     const problems = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
     if (result.deleted) {
       lines.push(deletedLine(result, where));
     } else {
-      lines.push(headline(result, where, problems.length));
+      lines.push(headline(result, where, problems.length, options.late === true));
     }
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);

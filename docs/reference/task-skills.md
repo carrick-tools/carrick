@@ -236,8 +236,10 @@ skill, where the answer is read.
 **No check line at Stop.** The Stop hook does not ask for `carrick check
 --changed`: a 1-3 minute check at every turn end is the user's cost, so the
 check is left to the agent's guidance (the AGENTS.md section, the session-start
-line and the post-edit "not re-checked here" line: "Carrick: <file> was not
-re-checked here. Run `carrick check --changed` before you finish.").
+line and the post-edit "not re-checked" line: "Carrick: <file> was not
+re-checked: <reason>. Run `carrick check --changed` before you finish."). An
+edit that needs a re-scan is queued for a background runner instead and its
+answer is delivered by the next hook that speaks (`npm/carrick/src/hook/late.ts`).
 
 `carrick uninstall` deletes the session records; `carrick doctor` reports a missing
 Stop entry with the other two, because both read `expectedCarrickHooks`.

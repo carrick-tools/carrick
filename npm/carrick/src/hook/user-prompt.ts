@@ -25,6 +25,7 @@
 
 import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
+import { deliverLate } from "./late.ts";
 import { drain } from "./reuse.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
@@ -77,8 +78,10 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Finished background re-checks first (Codex has no Stop to carry them),
+  // then the reuse nudge, which is about what the whole task added.
+  const parts: string[] = [...deliverLate(session)];
   const spoken = drain(session);
-  const parts: string[] = [];
   if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
   else parts.push(spoken.line);
 
