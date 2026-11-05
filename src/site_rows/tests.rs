@@ -726,6 +726,78 @@ fn a_stated_fact_keeps_its_site() {
     assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
 }
 
+/// carrick#3283: a row an old-path pass states at the site, naming another
+/// operation, gives way to a fact site row there, as the reader's does, and
+/// is counted as replaced by
+/// a fact so the graph's copy goes too.
+#[test]
+fn a_fact_replaces_an_old_path_row_at_its_site() {
+    let file = "src/forced-http.ts";
+    for source in [
+        ResolutionSource::ImportedMember,
+        ResolutionSource::SameFileWrapper,
+        ResolutionSource::NewUrl,
+    ] {
+        let old = OperationKey::http("POST", "${BASE}/items");
+        let mut calls = vec![blob_row(old.clone(), file, LINE, Some(source))];
+        let fold = fold_one(file, &mut calls, &mut Vec::new());
+        assert_eq!(
+            at_site(&calls, file),
+            vec![(
+                OperationKey::http("POST", "/v1/items"),
+                Some(ResolutionSource::RequestSummary),
+                None
+            )],
+            "{source:?}"
+        );
+        assert_eq!(
+            fold.replaced_by_fact,
+            vec![(file.to_string(), LINE, old)],
+            "{source:?}"
+        );
+    }
+}
+
+/// An old-path row stating the fact's own operation keeps the site: there
+/// is nothing to correct, and the row stays as it was.
+#[test]
+fn an_old_path_row_stating_the_facts_operation_keeps_its_site() {
+    let file = "src/forced-http.ts";
+    let same = OperationKey::http("POST", "/v1/items");
+    let mut calls = vec![blob_row(
+        same.clone(),
+        file,
+        LINE,
+        Some(ResolutionSource::ImportedMember),
+    )];
+    let fold = fold_one(file, &mut calls, &mut Vec::new());
+    assert_eq!(
+        at_site(&calls, file),
+        vec![(same, Some(ResolutionSource::ImportedMember), None)]
+    );
+    assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
+}
+
+/// An answer in the band is no fact: an old-path row at its site keeps the
+/// site, and the answer states nothing there.
+#[test]
+fn an_answer_in_the_band_leaves_an_old_path_row_standing() {
+    let file = "src/topic.ts";
+    let old = OperationKey::pubsub("orders");
+    let mut calls = vec![blob_row(
+        old.clone(),
+        file,
+        LINE,
+        Some(ResolutionSource::ImportedMember),
+    )];
+    let fold = fold_one(file, &mut calls, &mut Vec::new());
+    assert_eq!(
+        at_site(&calls, file),
+        vec![(old, Some(ResolutionSource::ImportedMember), None)]
+    );
+    assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
+}
+
 /// An answer in the band replaces the reader's row and carries its answer.
 #[test]
 fn an_answer_in_the_band_replaces_the_readers_row() {

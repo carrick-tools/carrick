@@ -943,9 +943,12 @@ pub fn fold(
         // reader stated (carrick#2795): the cross-service pass and the cloud
         // read the graph's HTTP rows, and a fact held only in `calls` is
         // invisible to them while the reader's stale row there stands.
+        // An old-path row a fact replaced goes from the graph as the
+        // reader's does (carrick#3283).
         let is_model_row_of =
             |call: &DataFetchingCall, file: &str, line: u32, key: &OperationKey| {
-                call.resolution_source == Some(ResolutionSource::Model)
+                (call.resolution_source == Some(ResolutionSource::Model)
+                    || call.resolution_source.is_some_and(is_old_path_source))
                     && call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
                         relative(root, f) == file && l.parse::<u32>().ok() == Some(line)
                     })
@@ -1073,8 +1076,15 @@ pub fn fold_rows(
             })
             .map(|(index, _)| index)
             .collect();
-        // A fact the scan states keeps the site.
-        if here.iter().any(|&index| !is_reader(&rows[index])) {
+        // A fact the scan states keeps the site. An old-path row that states
+        // another operation than a fact site row does not: the fact
+        // replaces it as it replaces the reader's row (carrick#3283). One
+        // that states the same operation keeps the site, which then changes
+        // nothing.
+        let gives_way = |existing: &ApiEndpointDetails| {
+            is_reader(existing) || (row.fact() && is_old_path(existing) && existing.key != row.key)
+        };
+        if here.iter().any(|&index| !gives_way(&rows[index])) {
             continue;
         }
         let readers: Vec<usize> = here;
@@ -1222,6 +1232,26 @@ fn is_fact(row: &ApiEndpointDetails) -> bool {
 /// A row the file reader stated, which no site answer has touched.
 fn is_reader(row: &ApiEndpointDetails) -> bool {
     row.resolution_source == Some(ResolutionSource::Model) && row.inference.is_none()
+}
+
+/// Whether `row` is one an old-path pass states ([`is_old_path_source`]).
+fn is_old_path(row: &ApiEndpointDetails) -> bool {
+    row.resolution_source.is_some_and(is_old_path_source)
+}
+
+/// Whether `source` is a pass of the old path, frozen until it is deleted
+/// (carrick#1561): an imported request member (`imported_request_member`),
+/// a same-file wrapper (`local_http_wrapper`) or a `new URL` target
+/// (`new_url_target`). The fact layer's site row at the same call is the
+/// reading that replaces each: an imported member's row, for one, leaves a
+/// base its module composes from a constant unread.
+fn is_old_path_source(source: ResolutionSource) -> bool {
+    matches!(
+        source,
+        ResolutionSource::ImportedMember
+            | ResolutionSource::SameFileWrapper
+            | ResolutionSource::NewUrl
+    )
 }
 
 pub mod dispatch;

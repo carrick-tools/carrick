@@ -75,7 +75,8 @@ fn committed_copy_of(tmp: &Path, fixture: &str, edit: impl FnOnce(&Path)) -> Pat
     repo
 }
 
-/// One scan of `repo` as the Action runs it, into `store`, with `flags`; the
+/// One scan of `repo` as the Action runs it, with every fact-layer switch on
+/// as a cloud scan runs (carrick#3283), into `store`, with `flags`; the
 /// stored blob of each service by name. A store shared by two scans lets the
 /// second read the first's generation, so `isolated` is off for those.
 fn scan(
@@ -118,7 +119,10 @@ fn scan_with(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
         )
         .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1");
+        .env("CARRICK_SITE_QUESTIONS", "1")
+        .env("CARRICK_RECEIVER_TRACE", "1")
+        .env("CARRICK_FACT_FILES", "1")
+        .env("CARRICK_SITE_PAYLOADS", "1");
     if isolated {
         cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
     } else {
@@ -135,7 +139,6 @@ fn scan_with(
         "CI",
         "CARRICK_NO_MODEL",
         "CARRICK_ALLOW_MISSING_TYPES",
-        "CARRICK_FACT_FILES",
         "CARRICK_OUTPUT_JSON",
         "CARRICK_SERVICE_CONCURRENCY",
         "RUST_LOG",
@@ -211,6 +214,23 @@ const APP_ROWS: [&str; 3] = [
 fn assert_app_rows(blobs: &[(String, serde_json::Value)]) {
     let app = call_rows(blob_of(blobs, "app"));
     assert_eq!(app, APP_ROWS, "the app states the client's requests");
+    // The graph the cross-service pass reads holds the same rows, with no
+    // old-path row the facts replaced left beside them (carrick#3283).
+    let mut graph: Vec<String> = blob_of(blobs, "app")["mount_graph"]["data_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|call| {
+            format!(
+                "{} {} {}",
+                call["file_location"].as_str().unwrap_or_default(),
+                call["method"].as_str().unwrap_or_default(),
+                call["canonical_path"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    graph.sort();
+    assert_eq!(graph, APP_ROWS, "the graph holds the facts only");
     // A run states a request only at a call of its own service's files.
     let client = call_rows(blob_of(blobs, "client"));
     assert!(
