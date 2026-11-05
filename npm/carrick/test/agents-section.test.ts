@@ -25,8 +25,10 @@ test("a missing AGENTS.md is created holding the check section", () => {
     assert.equal(writeAgentsSection(dir), "written");
     const body = fs.readFileSync(file, "utf8");
     assert.equal(body, CHECK_SECTION);
-    assert.ok(body.includes("## Carrick check\n\nBefore you say a change is done, run `carrick check --changed` alongside the tests. The per-edit check covers only the file each edit touched;"));
+    assert.ok(body.includes("## Carrick check\n\nWhen your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you say it is done. The per-edit check covers only the file each edit touched;"));
     assert.ok(body.includes("use the carrick-reuse skill on them."));
+    assert.ok(!body.includes("allow up to five"));
+    assert.ok(!body.includes("Before you say a change is done"));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

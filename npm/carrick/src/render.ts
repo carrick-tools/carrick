@@ -353,7 +353,7 @@ export function notRecheckedLine(file: string, reason?: string | null, settled =
  * from `hook/checked.ts`), because the agent would only repeat it.
  */
 export function runClause(settled: boolean): string {
-  return settled ? "" : " Run `carrick check --changed` before you finish.";
+  return settled ? "" : " If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.";
 }
 
 /** The line for an edit queued for the background re-check. */
@@ -707,7 +707,7 @@ export function renderSessionStart(status: StatusResult): string {
  * AGENTS.md section alone did not get the check run (proof run: 1 of 6).
  */
 export const CHECK_BEFORE_DONE =
-  "Before you call a change done, run `carrick check --changed`. Exit 1 is a contract problem; exit 2 means nothing could be checked.";
+  "When your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done. Exit 1 is a contract problem; exit 2 means nothing could be checked.";
 
 /** Up to this many services, a session start states every one of them. */
 export const DETAILED_SERVICES = 3;
