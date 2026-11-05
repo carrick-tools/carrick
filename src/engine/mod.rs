@@ -1501,9 +1501,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             }
             // Each walk sized by the walk peak its previous generation stored
             // (carrick#3085); a generation stored before walks were measured
-            // has its analysis peak only, which a walk never exceeds, so the
-            // walk starts under that rather than at the blind walk cap
-            // (carrick#3283).
+            // has its analysis peak only. How far a walk stays under that is
+            // unmeasured, so the walk starts at it rather than at the blind
+            // walk cap, and a death below the run's cap is walked again
+            // alone (carrick#3283).
             let walk_memories = services
                 .iter()
                 .map(|service| {
