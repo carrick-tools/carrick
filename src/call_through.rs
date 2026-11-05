@@ -1691,7 +1691,8 @@ fn state_leaves<'g>(
         if !written.insert((format!("{}:{}", leaf.file, leaf.line), operation)) {
             continue;
         }
-        if state_leaf(service.data, leaf, request) {
+        let filled = filled_request(service.data, held, callee, request);
+        if state_leaf(service.data, leaf, filled.as_ref().unwrap_or(request)) {
             outcome.own += 1;
             through.push((
                 callee.clone(),
@@ -1786,6 +1787,56 @@ fn state_leaves<'g>(
     }
     outcome.withdrawn = withdraw_wrapped(service.data, held, &through);
     outcome
+}
+
+/// The request a wrapper's own fact row states where it fills the callee's
+/// parameter with a value the source writes (carrick#3315): `getItem("1")`
+/// states `/api/items/1` where the callee's route is `/api/items/:id`. The
+/// leaf row at the wrapper's caller takes that path, as the row it stands in
+/// for did. Only when exactly one of the first `held` rows inside the
+/// wrapper states the operation, the callee's path matches it, and it holds
+/// more literal segments than the callee's: a wrapper that passes its own
+/// parameter on writes `${id}`, a template it has no value for, and the
+/// callee's template stands.
+fn filled_request(
+    data: &CloudRepoData,
+    held: usize,
+    callee: &DefinitionSite,
+    request: &Reached,
+) -> Option<Reached> {
+    let definition = data.function_definitions.values().find(|definition| {
+        definition.line_number == callee.line
+            && definition.file_path.to_string_lossy() == callee.file
+    })?;
+    let last = definition.end_line.max(callee.line);
+    let key = OperationKey::http(&request.method, request.canonical_path.clone());
+    let mut inside = data.calls.iter().take(held).filter(|call| {
+        call.resolution_source == Some(ResolutionSource::RequestSummary)
+            && call
+                .file_path
+                .to_str()
+                .and_then(|text| text.rsplit_once(':'))
+                .and_then(|(file, line)| Some((file, line.parse::<u32>().ok()?)))
+                .is_some_and(|(file, line)| {
+                    file == callee.file
+                        && (callee.line..=last).contains(&line)
+                        && crate::site_rows::agrees(&call.key, &key)
+                })
+    });
+    let call = inside.next()?;
+    if inside.next().is_some() {
+        return None;
+    }
+    let (_, path) = call.key.as_http()?;
+    let filled = !path.contains("${")
+        && carrick_match::path_literal_specificity(path)
+            > carrick_match::path_literal_specificity(&request.canonical_path)
+        && carrick_match::paths_match(&request.canonical_path, path);
+    filled.then(|| Reached {
+        target_url: path.to_string(),
+        canonical_path: path.to_string(),
+        ..request.clone()
+    })
 }
 
 /// Withdraw each fact row a service's site questions stated inside a callee
@@ -3855,6 +3906,16 @@ mod tests {
     fn settle_wrappers_in_full(
         stated_items: &str,
     ) -> (Vec<(String, String)>, Vec<String>, Settled) {
+        settle_wrappers_written(stated_items, "/api/items/${id}")
+    }
+
+    /// [`settle_wrappers_in_full`], with the path the app's wrapper row at
+    /// `api.ts:6` states: `${id}` where the wrapper passes its parameter on,
+    /// a value where it fills it in.
+    fn settle_wrappers_written(
+        stated_items: &str,
+        wrapper_items: &str,
+    ) -> (Vec<(String, String)>, Vec<String>, Settled) {
         let app_definitions: serde_json::Map<String, serde_json::Value> = [
             definition_json(
                 "ItemsApi.get",
@@ -3877,11 +3938,11 @@ mod tests {
             "app",
             serde_json::Value::Object(app_definitions),
             serde_json::json!([
-                summary_call("GET", "/api/items/${id}", "services/app/src/api.ts:6"),
+                summary_call("GET", wrapper_items, "services/app/src/api.ts:6"),
                 summary_call("GET", "/api/status", "services/app/src/api.ts:10"),
             ]),
             serde_json::json!([
-                wrapper_twin("/api/items/${id}", "services/app/src/api.ts:6"),
+                wrapper_twin(wrapper_items, "services/app/src/api.ts:6"),
                 wrapper_twin("/api/status", "services/app/src/api.ts:10"),
             ]),
         );
@@ -4181,6 +4242,31 @@ mod tests {
                     OperationKey::http("GET", "/api/items/:id").canonical()
                 ),
             ]
+        );
+    }
+
+    /// carrick#3315: where the wrapper fills the request's parameter with a
+    /// value the source states, the leaf row at its caller states that
+    /// path, as the wrapper's own row did; where the wrapper passes its
+    /// parameter on, the callee's template stands.
+    #[test]
+    fn a_leaf_row_states_the_path_the_wrapper_filled_in() {
+        let items = |wrapper: &str| {
+            let (facts, _, settled) = settle_wrappers_written("request_summary", wrapper);
+            assert_eq!(settled.leaf_rows, 1, "{facts:?}");
+            facts
+                .into_iter()
+                .find(|(at, _)| at == "services/app/src/commands.ts:6")
+                .map(|(_, key)| key)
+                .expect("a leaf row at the caller")
+        };
+        assert_eq!(
+            items("/api/items/1"),
+            OperationKey::http("GET", "/api/items/1").canonical()
+        );
+        assert_eq!(
+            items("/api/items/${id}"),
+            OperationKey::http("GET", "/api/items/:id").canonical()
         );
     }
 

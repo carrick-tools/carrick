@@ -11,7 +11,7 @@ The app reaches them three ways:
 |---|---|---|
 | `api.ts:6` | `ItemsApi.get` calls `getItem(id)`; `commands.ts:6` calls `ItemsApi.get` | A site, `/api/items/${id}`. Call-through states the request at `commands.ts:6` (the leaf row, ruled on carrick#2448), and the wrapper's row is withdrawn, so the request keeps exactly one fact row |
 | `api.ts:10` | `ItemsApi.status` calls `getStatus()`; `commands.ts:11` calls it | A site, `/api/status`, on the same terms: the row is at `commands.ts:11` |
-| `api.ts:14`, `api.ts:15` | `ItemsApi.both` calls `getVersion()` aside and returns `getItem("1")` | A site each. Its caller, `commands.ts:16`, states the request `both` returns, the one `getItem` writes (`/api/items/:id`), and `api.ts:15` is withdrawn; the aside request keeps its row at `api.ts:14` |
+| `api.ts:14`, `api.ts:15` | `ItemsApi.both` calls `getVersion()` aside and returns `getItem("1")` | A site each. Its caller, `commands.ts:16`, states the request `both` returns, the one `getItem` writes, with the value `both` fills in (`/api/items/1`), and `api.ts:15` is withdrawn; the aside request keeps its row at `api.ts:14` |
 | `commands.ts:21` | `health()` calls `getHealth()` itself | A site, `/api/health` |
 
 No site and no lead is in a file under `packages/`: a run states a request
