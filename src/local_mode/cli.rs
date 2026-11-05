@@ -2642,12 +2642,14 @@ mod tests {
             !refusal.contains(&configured.display().to_string()),
             "the configured repo is not: {refusal}"
         );
-        assert!(refusal.contains(".carrick/proposal.json"), "{refusal}");
         assert!(refusal.contains("carrick index"), "{refusal}");
-        // The two things that stand between this machine and the scan, and
-        // nothing else: there is no rehearsal pass in the flow (cloud#832).
+        // The config comes only from Carrick (carrick#3361): nobody is told
+        // to write one, and there is no proposal to write it from. What the
+        // reader can do instead is read the index Carrick built.
+        assert!(!refusal.contains("proposal"), "{refusal}");
+        assert!(!refusal.to_lowercase().contains("write one"), "{refusal}");
         assert!(refusal.contains("carrick login"), "{refusal}");
-        assert!(!refusal.contains("carrick refresh"), "{refusal}");
+        assert!(refusal.contains("carrick refresh"), "{refusal}");
         // No agent prompt is printed by `carrick init` any more; the page that
         // gives the manual steps is named instead (carrick#3300).
         assert!(!refusal.contains("prompt"), "{refusal}");

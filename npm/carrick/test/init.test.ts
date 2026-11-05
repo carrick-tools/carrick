@@ -4203,6 +4203,117 @@ test("on that workspace an editor found on this machine gets its entry unasked, 
   }
 });
 
+// carrick#3361: there is one lane. The laptop lane saved the derive output to
+// `.carrick/proposal.json` for a local agent to write carrick.json from, and
+// the config now comes only from Carrick, so nothing of that lane is left to
+// reach: not by a flag, not by a workspace read that does not say "cloud", not
+// by a read that fails, and not by a folder whose repos name no GitHub repo.
+test("init has one lane: --local and --allow-move are unknown, and the help names no proposal or config to write", () => {
+  assert.equal(parseArgs(["--local"]), "unknown option for `carrick init`: --local");
+  assert.equal(parseArgs(["--allow-move"]), "unknown option for `carrick init`: --allow-move");
+  // Still accepted, for the scripts that pass it; init asks nothing after
+  // sign-in, so it answers nothing.
+  assert.equal(typeof parseArgs(["--yes"]), "object");
+  const help = parseArgs(["--help"]);
+  assert.equal(typeof help, "string");
+  assert.doesNotMatch(String(help), /proposal|carrick\.json|--local|--allow-move|--yes|agent turns/);
+});
+
+test("init on a fresh workspace writes no proposal and prints no instruction to write a config", posixNativeFixture, async () => {
+  for (const interactive of [true, false]) {
+    const fixture = cloudWorkspace({ repos: { api: "connected" } });
+    const out = silentTerminal();
+    try {
+      assert.equal(await initWith([fixture.repo("api")], out, interactive), 0, out.lines.join("\n"));
+      assert.deepEqual(out.questions, []);
+      const text = out.lines.join("\n");
+      assert.doesNotMatch(text, /proposal|carrick\.json|carrick index|scaffold|paste this|agent (writes|turns)/i);
+      const repo = fixture.repo("api");
+      assert.equal(fs.existsSync(path.join(repo, ".carrick", "proposal.json")), false);
+      assert.equal(fs.existsSync(path.join(repo, "carrick.json")), false);
+      // The local tools are still installed.
+      assert.equal(fs.existsSync(path.join(repo, CODEX_HOOKS_FILE)), true);
+      for (const file of taskSkillPaths()) assert.equal(fs.existsSync(path.join(repo, file)), true, file);
+    } finally {
+      fixture.restore();
+    }
+  }
+});
+
+test("a workspace read that does not say cloud is the same one run, line for line and request for request", posixNativeFixture, async () => {
+  const run = async (builder: string | null): Promise<{ text: string; asked: string[]; questions: string[]; commands: string[] }> => {
+    const fixture = cloudWorkspace({ repos: { api: "indexed" }, builder });
+    const out = silentTerminal();
+    try {
+      assert.equal(await initWith([fixture.repo("api")], out, true), 0, out.lines.join("\n"));
+      return { text: printed(out, fixture.root), asked: [...fixture.asked], questions: out.questions, commands: fixture.commands() };
+    } finally {
+      fixture.restore();
+    }
+  };
+  const cloud = await run("cloud");
+  assert.deepEqual(cloud.questions, []);
+  // A server older than the field, the value one excluded workspace is
+  // answered with, and a word this build has never seen.
+  for (const builder of [null, "laptop", "someday"]) assert.deepEqual(await run(builder), cloud, String(builder));
+});
+
+test("a folder whose repos name no GitHub repository stops before any request, and writes nothing", posixNativeFixture, async () => {
+  const fixture = cloudWorkspace({ repos: { api: "indexed" } });
+  try {
+    execFileSync("git", ["-C", fixture.repo("api"), "remote", "remove", "origin"]);
+    const out = silentTerminal();
+    assert.equal(await initWith(["--yes", fixture.repo("api")], out, false), 1, out.lines.join("\n"));
+    assert.deepEqual(fixture.asked, []);
+    assert.match(out.lines.join("\n"), /Carrick has nothing to connect it to/);
+    assert.deepEqual(fs.readdirSync(fixture.repo("api")).sort(), [".git", "package.json"]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("a workspace read that fails stops the run and writes nothing", posixNativeFixture, async () => {
+  const fixture = cloudWorkspace({ repos: { api: "indexed" } });
+  try {
+    globalThis.fetch = (async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch;
+    const out = silentTerminal();
+    assert.equal(await initWith([fixture.repo("api")], out, true), 1, out.lines.join("\n"));
+    assert.deepEqual(out.questions, []);
+    assert.deepEqual(fs.readdirSync(fixture.repo("api")).sort(), [".git", "package.json"]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+// carrick#1512 without the proposal file it used to read: a run inside one
+// repo of a folder init has set up sets up the folder again.
+test("inside a repo of a folder init set up, the run sets up the folder again, and no proposal is written anywhere", posixNativeFixture, async () => {
+  const fixture = cloudWorkspace({ repos: { api: "indexed", web: "indexed" } });
+  try {
+    const first = silentTerminal();
+    assert.equal(await initWith([fixture.folder], first, true), 0, first.lines.join("\n"));
+    const again = silentTerminal();
+    assert.equal(await initWith([fixture.repo("api")], again, true), 0, again.lines.join("\n"));
+    assert.ok(
+      again.lines.includes(` api is set up with the repos in ${fixture.folder}, so this run sets up ${fixture.folder}.`),
+      again.lines.join("\n"),
+    );
+    assert.ok(again.lines.includes("◇ Set up in project Shop (shop): api, web"), again.lines.join("\n"));
+    for (const dir of [fixture.folder, fixture.repo("api"), fixture.repo("web")]) {
+      assert.equal(fs.existsSync(path.join(dir, ".carrick", "proposal.json")), false, dir);
+    }
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("a hosted index another release built names no scan to run, on every workspace", () => {
+  assert.equal(hostedReport({ kind: "version_mismatch", services: 2, reread: true }).text, BUILT_BY_ANOTHER_RELEASE);
+  assert.equal(hostedReport({ kind: "version_mismatch", services: 2, reread: true }, 3).text, BUILT_BY_ANOTHER_RELEASE);
+});
+
 // A team can point `.claude/skills` at its own product's `skills/` folder. A
 // skill written through that link lands in the product, so init writes none
 // there, says so in one line, and carries on with the rest.

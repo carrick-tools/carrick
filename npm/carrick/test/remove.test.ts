@@ -456,7 +456,7 @@ test("remove asks for the folder's name on a terminal, and only that name delete
 
   const right = await ask("repo");
   assert.equal(right.code, 0, right.written);
-  assert.ok(right.written.includes("◇ .carrick removed, with the proposal and the index in it"), right.written);
+  assert.ok(right.written.includes("◇ .carrick removed, with the index in it"), right.written);
   assert.equal(fs.existsSync(path.join(state.workspace, ".carrick")), false);
 });
 
@@ -469,7 +469,7 @@ test("remove takes back what init wrote in this folder, and nothing of the machi
     `Carrick's hook entries in ${SETTINGS_FILES[0]}`,
     `Carrick's hook entries in ${CODEX_HOOKS_FILE}`,
     `web from the exclude list in ${WORKSPACE_FILE}`,
-    ".carrick, with the proposal and the index in it",
+    ".carrick, with the index in it",
   ]);
 
   const run = (): Run => carrick(state, "remove", "--workspace", state.workspace, "--confirm", "repo");
@@ -484,7 +484,7 @@ test("remove takes back what init wrote in this folder, and nothing of the machi
   for (const line of [
     `◇ Carrick hook entries removed from ${SETTINGS_FILES[0]}`,
     `◇ Carrick hook entries removed from ${CODEX_HOOKS_FILE}`,
-    "◇ .carrick removed, with the proposal and the index in it",
+    "◇ .carrick removed, with the index in it",
     `  git rm ${[".github/workflows/carrick.yml", ".claude/skills/carrick/SKILL.md", "carrick.json"].join(" ")}`,
     '  by hand — AGENTS.md: the "## Carrick" section',
     "The MCP server, the install id and the sign-in belong to this machine and stay: carrick uninstall removes them.",

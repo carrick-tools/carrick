@@ -164,6 +164,35 @@ test("a missing service directory, a config that is not JSON, and a workspace wi
   for (const root of [gone, broken, bare]) fs.rmSync(root, { recursive: true, force: true });
 });
 
+// carrick#3361: the config comes from Carrick, so a workspace with no
+// carrick.json is the ordinary one, and doctor says where the config is
+// rather than sending anyone to write one.
+test("a workspace with no carrick.json is no finding, and the line names the config Carrick holds", () => {
+  const root = workspace({ ".git/HEAD": "ref: refs/heads/main\n", "src/index.ts": "export {};\n" });
+  const lines = checkDeclaredPaths(configuredRepos(root));
+  assert.equal(findingCount(lines), 0, texts(lines).join("\n"));
+  assert.deepEqual(texts(lines), ["done: Service config: Carrick holds it for this project, so no repo here needs a carrick.json."]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("the workflow check has one lane: no workflow is no line, and a workflow is told it can go", () => {
+  const none = workspace({ "carrick.json": JSON.stringify({ serviceName: "api" }) });
+  assert.deepEqual(checkWorkflow(configuredRepos(none)), []);
+  // A workflow is named whether or not the repo commits a config.
+  const kept = workspace({ [workflowPath]: renderTemplate("workflow") });
+  const keptLines = checkWorkflow(configuredRepos(kept));
+  assert.equal(findingCount(keptLines), 0, texts(keptLines).join("\n"));
+  assert.equal(keptLines.length, 1, texts(keptLines).join("\n"));
+  assert.match(keptLines[0]!.text, /no longer needed/);
+  for (const root of [none, kept]) fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("doctor's help names no template to match and no config to write", () => {
+  const help = parseArgs(["--help"]);
+  assert.equal(typeof help, "string");
+  assert.doesNotMatch(String(help), /current template|derives one|for your agent to write/);
+});
+
 test("a sibling repo with no carrick.json is reported as a fact, not as a finding", () => {
   const root = workspace({
     "carrick.json": JSON.stringify({ serviceName: "api" }),
