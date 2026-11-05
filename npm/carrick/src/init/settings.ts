@@ -99,6 +99,14 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
         hooks: [{ type: "command", command: `${command} hook session-start`, timeout: 30 }],
       },
     ],
+    // The prompt lookup: names up to three existing functions for the ask
+    // (carrick#3375). It prints nothing past its 3 s budget, so the hook's own
+    // timeout sits just above it.
+    UserPromptSubmit: [
+      {
+        hooks: [{ type: "command", command: `${command} hook user-prompt`, timeout: 5 }],
+      },
+    ],
     // The end of a task, which is the only moment a reuse check is worth a
     // model turn: the post-edit hook records what each edit added and this
     // names the lot once (carrick#1330). It reads one small file and prints

@@ -309,6 +309,33 @@ the Claude ones, and only where the workspace holds a `.codex/` directory — th
 folder is Codex's project config layer and the one init writes into, so its
 absence means Codex is not set up here and doctor says nothing about it.
 
+## The prompt lookup (carrick#3375)
+
+Governed code: `npm/carrick/src/hook/lookup.ts`, run by `carrick hook
+user-prompt` (`npm/carrick/src/hook/user-prompt.ts`) on Claude Code and Codex.
+
+On a prompt of 12 words or more, the hook asks the project's index which
+functions already do part of the task and hands the model up to three of them,
+as `name (file:line)`, with the line "If one does the job, import it and call it
+rather than writing your own." It makes at most 10 lookups per session, waits at
+most 3 seconds, and prints nothing on any failure, so it never holds a prompt
+past that.
+
+**What is sent.** The first 1,000 characters of the prompt, once, in the body of
+one `search-by-intent` request to the same endpoint the Carrick MCP tool uses,
+with your stored credential and the project id from
+`.carrick/hosted/snapshot.json`. Nothing else leaves the machine.
+
+**What is stored.** The prompt is stored and logged nowhere: not in the session
+record, not in a log, not on stdout. The session record keeps only how many
+lookups were made and the `file::name` of the functions shown, and the hook's
+one log line is counts (`lookup words=<n> ms=<n> rows=<n> status=<code>`). The
+server logs counts only.
+
+**Turning it off.** `CARRICK_CHANNEL=off` silences every Carrick surface,
+including this one. With no stored credential, no hosted snapshot, or a
+snapshot that names more than one project, the hook does nothing.
+
 ## Ordering against the cloud
 
 The bodies name MCP tools, and a skill that names a tool the deployed server

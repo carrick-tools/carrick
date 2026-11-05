@@ -53,6 +53,16 @@ export type SessionRecord = {
    * `checked.ts` compares it with the last `carrick check --changed`.
    */
   edited: Record<string, number>;
+   * How many prompt lookups this session has made (carrick#3375). Counted when
+   * the request is sent, so a refused or timed-out one still counts.
+   */
+  lookups: number;
+  /**
+   * `file::name` of the functions a prompt lookup showed the model. Names and
+   * paths only, never the prompt; the edit-time check reads it so it does not
+   * name the same function twice.
+   */
+  named_by_lookup: string[];
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -89,6 +99,8 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     told: [],
     read: [],
     edited: {},
+    lookups: 0,
+    named_by_lookup: [],
     updated: "",
   };
   const file = sessionFile(sessionId, home);
@@ -124,6 +136,13 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
           (entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]),
         ),
       ),
+      lookups:
+        typeof record.lookups === "number" && Number.isFinite(record.lookups) && record.lookups > 0
+          ? Math.floor(record.lookups)
+          : 0,
+      named_by_lookup: Array.isArray(record.named_by_lookup)
+        ? record.named_by_lookup.filter((entry): entry is string => typeof entry === "string")
+        : [],
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -320,6 +339,24 @@ export function markRead(sessionId: string, file: string, home?: string): void {
   const current = readSession(sessionId, home);
   if (current.read.includes(file)) return;
   current.read.push(file);
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** Count one prompt lookup against this session, and return the new count. */
+export function countLookup(sessionId: string, home?: string): number {
+  const current = readSession(sessionId, home);
+  current.lookups += 1;
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+  return current.lookups;
+}
+
+/** Remember which functions a prompt lookup showed, as `file::name`. */
+export function markNamedByLookup(sessionId: string, keys: string[], home?: string): void {
+  if (keys.length === 0) return;
+  const current = readSession(sessionId, home);
+  current.named_by_lookup = [...new Set([...current.named_by_lookup, ...keys])];
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }
