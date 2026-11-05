@@ -5,7 +5,7 @@
 //! 2. Env-var bases aliased through local consts or imported config objects resolve
 //!    back to the real `process.env` name so classification and cross-repo matching work
 
-use carrick::call_site_extractor::{CallSite, CallSiteExtractor};
+use carrick::url_normalizer::UrlNormalizer;
 use std::fs;
 use std::io::Write;
 use swc_common::{
@@ -16,78 +16,25 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 use tempfile::tempdir;
 
-/// Helper function to parse TypeScript code and extract call sites
-fn parse_and_extract_call_sites(code: &str, filename: &str) -> Vec<CallSite> {
-    use carrick::parser::parse_file;
-
-    let temp_dir = tempdir().expect("Failed to create temp dir");
-    let file_path = temp_dir.path().join(filename);
-    let mut file = fs::File::create(&file_path).expect("Failed to create temp file");
-    file.write_all(code.as_bytes())
-        .expect("Failed to write temp file");
-
-    let cm: Lrc<SourceMap> = Default::default();
-    let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
-
-    let module = parse_file(&file_path, &cm, &handler).expect("Failed to parse file");
-    let mut extractor = CallSiteExtractor::new(file_path.clone(), cm.clone());
-    module.visit_with(&mut extractor);
-
-    extractor.call_sites
-}
-
-/// Test that the SWC extractor normalizes template literals to :param style
+/// The production path turns template-literal path parameters into `:param`
+/// segments: the normalizer every call target passes through. (The retired
+/// call-site extractor did this beside it and nothing reached it.)
 #[test]
-fn test_swc_extractor_normalizes_template_params() {
-    let code = r#"
-interface User {
-    id: number;
-    name: string;
-}
-
-async function fetchUser(userId: string) {
-    const resp = await fetch(`${process.env.API_URL}/users/${userId}`);
-    const user: User = await resp.json();
-    return user;
-}
-"#;
-
-    let call_sites = parse_and_extract_call_sites(code, "test_template.ts");
-
-    let json_call = call_sites
-        .iter()
-        .find(|cs| cs.callee_object == "resp" && cs.callee_property == "json")
-        .expect("Should find resp.json() call");
+fn test_normalizer_turns_template_params_into_path_params() {
+    let normalizer = UrlNormalizer::default_permissive();
+    let normalized = normalizer.normalize("${process.env.API_URL}/users/${userId}");
 
     assert!(
-        json_call.correlated_call.is_some(),
-        "Should have correlated call info"
+        !normalized.path.contains("${"),
+        "path should not contain template literal syntax. Got: {}",
+        normalized.path
     );
-
-    let info = json_call.correlated_call.as_ref().unwrap();
-    let url = info.url.as_ref().expect("Should have URL");
-
-    // The URL should be normalized to :param style
-    assert!(
-        !url.contains("${"),
-        "URL should not contain template literal syntax. Got: {}",
-        url
-    );
-    assert!(
-        url.contains(":userId") || url.contains(":param"),
-        "URL should have :param style path parameters. Got: {}",
-        url
+    assert_eq!(
+        normalized.path, "/users/:userId",
+        "path parameter should be :param style"
     );
 }
 
-/// Issue #218 end-to-end: a call whose URL base is an env var aliased through a
-/// local const must resolve to the *real* `process.env` name so internal/external
-/// classification (and cross-repo matching, which keys on the same name) works.
-///
-/// Drives the full chain the orchestrator runs: build the per-file alias map →
-/// rewrite the call target → normalize against a config that declares the real
-/// env var. Before the fix, the target carried the local const `ORDERS_BASE` and
-/// `is_internal` was false; after, it carries `ORDERS_SERVICE_URL` and matches.
 #[test]
 fn test_const_aliased_env_var_resolves_to_real_name() {
     use carrick::config::Config;
