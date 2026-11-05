@@ -56,7 +56,7 @@ export type SessionRecord = {
 const KEEP_DAYS = 7;
 
 /** A file name a session id can never escape from. */
-function safeId(sessionId: string): string | null {
+export function safeId(sessionId: string): string | null {
   return /^[A-Za-z0-9._-]{1,128}$/.test(sessionId) ? sessionId : null;
 }
 
@@ -122,9 +122,11 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
   }
 }
 
-function write(sessionId: string, record: SessionRecord, home?: string): void {
-  const file = sessionFile(sessionId, home);
-  if (file === null) return;
+/**
+ * Write `body` to `file` complete or not at all, creating the directory.
+ * Returns whether it landed; never throws.
+ */
+export function writeAtomic(file: string, body: string): boolean {
   // Written beside the record and renamed over it: Claude Code runs Reads in
   // parallel, so several hook processes read, change and write one file at
   // once, and a writer that empties the file first lets a reader parse an
@@ -134,8 +136,9 @@ function write(sessionId: string, record: SessionRecord, home?: string): void {
   const temp = `${file}.${process.pid}.tmp`;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(temp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(temp, body, { mode: 0o600 });
     fs.renameSync(temp, file);
+    return true;
   } catch {
     // Nothing to do and nothing to say: the nudge is a nicety and the edit it
     // rides behind is not.
@@ -144,7 +147,14 @@ function write(sessionId: string, record: SessionRecord, home?: string): void {
     } catch {
       // No temp file was left.
     }
+    return false;
   }
+}
+
+function write(sessionId: string, record: SessionRecord, home?: string): void {
+  const file = sessionFile(sessionId, home);
+  if (file === null) return;
+  writeAtomic(file, `${JSON.stringify(record, null, 2)}\n`);
   prune(home);
 }
 
@@ -180,7 +190,11 @@ export function prune(home?: string, now: number = Date.now()): void {
  */
 export function sessionRecords(home?: string): number {
   try {
-    return fs.readdirSync(sessionsDir(home)).length;
+    // Only `<id>.json`: the flat `<id>.recheck.<seq>.*` files beside it
+    // belong to one record and are not records of their own.
+    return fs
+      .readdirSync(sessionsDir(home))
+      .filter((name) => name.endsWith(".json") && !name.includes(".recheck.")).length;
   } catch {
     return 0;
   }

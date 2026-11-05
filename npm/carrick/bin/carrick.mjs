@@ -38,6 +38,7 @@ if (nodeMajor() < NODE_FLOOR) {
 const HOOKS = {
   "post-edit": "../dist/hook/post-edit.js",
   "post-read": "../dist/hook/post-read.js",
+  "recheck-run": "../dist/hook/recheck-run.js",
   "session-start": "../dist/hook/session-start.js",
   stop: "../dist/hook/stop.js",
   "user-prompt": "../dist/hook/user-prompt.js",
