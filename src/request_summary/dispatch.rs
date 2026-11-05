@@ -23,8 +23,10 @@
 //! operand of the same test, or a guard (an `if` test operand or a `case`)
 //! whose branch holds the path comparison. For a
 //! predicate the comparison is first looked for in the predicate, then at
-//! the caller's call that tests it. A `startsWith` literal states a scope,
-//! never a route. Every comparison that reaches no handler is counted by a
+//! the caller's call that tests it. A `startsWith` literal with a method
+//! that qualifies for it states a route, the prefix and one trailing
+//! parameter segment (`/items/:param`); with none, it states a scope. Every
+//! comparison that reaches no handler is counted by a
 //! reason from a closed list.
 //!
 //! [`handler_records`] (in `dispatch/records.rs`) groups the comparisons by

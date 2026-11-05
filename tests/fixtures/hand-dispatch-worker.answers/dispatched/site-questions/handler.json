@@ -1,0 +1,5 @@
+{"question_set":"57923ce53f90f7c0","answers":[{"site_id":"handler:entry:src/worker.ts:20:default.fetch","ok":true,"routes":[
+{"id":0,"choice":"route","method":"GET","path":"/items","confidence":1,"orders_agree":true},
+{"id":1,"choice":"route","method":"POST","path":"/items","confidence":1,"orders_agree":true},
+{"id":2,"choice":"route","method":"DELETE","path":"/items/:param","confidence":1,"orders_agree":true},
+{"id":3,"choice":"route","method":null,"path":"/health","confidence":1,"orders_agree":true}]}]}
