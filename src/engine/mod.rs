@@ -1500,14 +1500,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 }
             }
             // Each walk sized by the walk peak its previous generation stored
-            // (carrick#3085).
+            // (carrick#3085); a generation stored before walks were measured
+            // has its analysis peak only, which a walk never exceeds, so the
+            // walk starts under that rather than at the blind walk cap
+            // (carrick#3283).
             let walk_memories = services
                 .iter()
                 .map(|service| {
                     let stored_peak = (!no_cache)
                         .then(|| previous_generation(previous_generations, &repo_name, service))
                         .flatten()
-                        .and_then(|generation| generation.memory_peaks.as_ref()?.walk_mb);
+                        .and_then(|generation| {
+                            let peaks = generation.memory_peaks.as_ref()?;
+                            peaks.walk_mb.or(peaks.analysis_mb)
+                        });
                     service_workers::ServiceMemory::for_walk(stored_peak, run_cap_mb)
                 })
                 .collect();
@@ -1532,7 +1538,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 ended,
                 std::sync::Arc::clone(slots),
                 reaches_of,
-                std::sync::Arc::new(crate::position_rows::destination),
+                std::sync::Arc::new(move |repo: &str, service: Option<&str>| {
+                    crate::position_rows::destination(should_upload, repo, service)
+                }),
             );
             scan.walk_and_analyze(jobs, &plan, lane).await
         }

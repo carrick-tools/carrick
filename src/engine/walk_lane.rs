@@ -299,6 +299,14 @@ impl Lane {
                 reservation_mb: alone.reservation_mb,
             };
         }
+        if done.died {
+            // At the run's cap already, or walked again once: its rows are
+            // lost, and the log says so (carrick#3283).
+            info!(
+                "Walk {label} died of memory at a heap cap of {}; its rows are lost",
+                cap_text(walked_at)
+            );
+        }
         if let Some(by) = self.reached_by[service] {
             info!(
                 "Walked carried service {label} for {} in {:.1} s",
@@ -341,13 +349,19 @@ impl Lane {
 }
 
 /// The files a walk of `service` sends, sorted, each under `scan_root`.
+///
+/// Quiet: the scan's own file walk says which symbolic links an untrusted
+/// tree left out, once (carrick#3283); this one reads the same files again.
 fn service_files(repo_path: &str, service: &Config, scan_root: &std::path::Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> =
-        super::walk_service(repo_path, service, &super::service_ignore_patterns(service))
-            .files
-            .iter()
-            .map(|file| scan_root.join(file.strip_prefix(repo_path).unwrap_or(file)))
-            .collect();
+    let mut files: Vec<PathBuf> = crate::file_finder::walk_service_quietly(
+        repo_path,
+        service,
+        &super::service_ignore_patterns(service),
+    )
+    .files
+    .iter()
+    .map(|file| scan_root.join(file.strip_prefix(repo_path).unwrap_or(file)))
+    .collect();
     files.sort();
     files
 }

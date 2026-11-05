@@ -402,6 +402,9 @@ enum BetaDies {
     /// The first, the one that finds no `died` file. A run that writes
     /// `died` beforehand has a `beta` that lives.
     Once,
+    /// Only the compiler walk's record-only process, every time; the
+    /// analysis process lives.
+    Walk,
 }
 
 /// The stand-in, and with `alpha_waits` its `alpha` process holds its first
@@ -444,7 +447,8 @@ process.stdin.on("data", (chunk) => {{
       Atomics.wait(pause, 0, 0, 2000);
       waited = true;
     }}
-    if (root.endsWith("beta") && dies) {{
+    const walking = request.action === "position_rows";
+    if (root.endsWith("beta") && (walking ? {walk_dies} : !{walk_only} && dies)) {{
       fs.writeFileSync({died:?}, request.action);
       fs.writeSync(2, "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n");
       process.abort();
@@ -470,6 +474,8 @@ process.stdin.resume();
             died = died.to_string_lossy(),
             alpha_waits = alpha_waits,
             always = matches!(beta_dies, BetaDies::Always),
+            walk_dies = matches!(beta_dies, BetaDies::Walk),
+            walk_only = matches!(beta_dies, BetaDies::Walk),
             argv = home.join("argv").to_string_lossy(),
         ),
     )
@@ -844,4 +850,33 @@ fn stored_blob_file(store: &Path, service: &str) -> (PathBuf, serde_json::Value)
             (blob["service_name"] == service).then_some((path, blob))
         })
         .unwrap_or_else(|| panic!("{service}'s blob is stored"))
+}
+
+/// carrick#3283: a compiler walk that dies of memory, at the walk's cap and
+/// again at the run's, loses that service's rows, and the run log says so;
+/// the analysis is untouched and the run lands every service.
+#[test]
+fn a_walk_that_dies_of_memory_is_stated_in_the_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = service_repo(tmp.path(), &["alpha", "beta"]);
+    let home = tmp.path().join("home");
+    let died = tmp.path().join("died");
+    let store = tmp.path().join("store");
+    sidecar_stand_in(&home, &died, false, BetaDies::Walk);
+    let run = typed_scan_into(
+        &repo,
+        &home,
+        &died,
+        false,
+        &[("CARRICK_POSITION_ROWS", "1")],
+        Some(&store),
+    );
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
+    assert!(
+        run.log
+            .contains("Walk beta died of memory at a heap cap of")
+            && run.log.contains("its rows are lost"),
+        "{}",
+        run.log
+    );
 }

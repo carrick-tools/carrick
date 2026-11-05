@@ -309,11 +309,21 @@ impl Drop for Destination {
 }
 
 /// Where a service's rows go this run, or `None` when the flag is unset.
-pub fn destination(repo_name: &str, service_name: Option<&str>) -> Option<Destination> {
+///
+/// `uploads` is whether the run writes an index (`--upload`, a main push, the
+/// laptop indexer into its store). A run that writes nothing (`--no-upload`,
+/// a PR scan) leaves the local store untouched too, so its rows go under the
+/// per-run temp directory like the Action's (carrick#3283).
+pub fn destination(
+    uploads: bool,
+    repo_name: &str,
+    service_name: Option<&str>,
+) -> Option<Destination> {
     destination_from(
         std::env::var(POSITION_ROWS_ENV).ok().as_deref(),
         std::env::var_os(CACHE_DIR_ENV)
             .map(PathBuf::from)
+            .filter(|_| uploads)
             .as_deref(),
         &std::env::temp_dir(),
         repo_name,
