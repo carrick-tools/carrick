@@ -27,7 +27,7 @@ SCAN:
                    do not need to run it.
 
 WORKSPACE:
-    init       Set up this folder: sign in, read in the index Carrick builds
+    init       Set up this folder: sign in, download the index Carrick builds
                for your repos, and wire up your editor and agent. The command
                the first run starts with. Installed by the npm package.
     doctor     Re-check the setup init wrote, and exit non-zero on anything it
@@ -41,7 +41,7 @@ WORKSPACE:
                Carrick Cloud classifies what the deterministic passes could
                not. Each repo needs a carrick.json. Carrick builds the index
                of the repos in your workspace itself, and `carrick refresh`
-               reads it in. With --dispatch it builds every prompt and hands
+               downloads it. With --dispatch it builds every prompt and hands
                them to Carrick Cloud. The analysis then runs whether or not
                this machine is on, and `carrick resume` collects it.
     resume     Collect a dispatched analysis and finish the index. Files that

@@ -1156,7 +1156,7 @@ mod tests {
     }
 
     /// A repo connected and not yet indexed is told the index is Carrick's to
-    /// build and how this machine reads it in, never to scan it here
+    /// build and how this machine downloads it, never to scan it here
     /// (carrick#3361).
     #[test]
     fn a_connected_repo_with_no_hosted_index_is_told_to_read_it_in_not_to_scan_it() {

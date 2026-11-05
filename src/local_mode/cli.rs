@@ -1871,7 +1871,7 @@ fn no_index_here(root: Option<&Path>, scans: &[super::scan_state::ScanState]) ->
             .to_string();
     }
     match root {
-        // Carrick builds the index; what this machine can do is read it in
+        // Carrick builds the index; what this machine can do is download it
         // (carrick#3361).
         Some(root) => format!(
             "no index in {}. Run `carrick init` in {} to download your index.",
