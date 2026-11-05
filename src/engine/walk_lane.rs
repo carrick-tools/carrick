@@ -306,6 +306,9 @@ impl Lane {
                 "Walk {label} died of memory at a heap cap of {}; its rows are lost",
                 cap_text(walked_at)
             );
+            crate::scan_health::record_walk_rows_lost(
+                self.services[service].service_name.as_deref(),
+            );
         }
         if let Some(by) = self.reached_by[service] {
             info!(
