@@ -406,7 +406,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
             {
                 skipped_patterns.push(SkippedPattern {
                     pattern: raw.clone(),
-                    reason: "matched no package manifests".into(),
+                    reason: "matches no package".into(),
                 });
             }
         }
@@ -495,7 +495,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         .iter()
         .map(|skipped| {
             format!(
-                "Workspace pattern '{}' {}, so it proposes no service.",
+                "Workspace pattern '{}' {}, so Carrick skips it.",
                 skipped.pattern, skipped.reason
             )
         })

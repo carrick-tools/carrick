@@ -791,13 +791,12 @@ fn a_workspace_pattern_matching_nothing_is_skipped_and_named() {
     assert!(
         derived.skipped_patterns[0]
             .reason
-            .contains("matched no package")
+            .contains("matches no package")
     );
     assert_eq!(derived.warnings.len(), 1);
-    assert!(
-        derived.warnings[0].contains("tools/*"),
-        "{:?}",
-        derived.warnings
+    assert_eq!(
+        derived.warnings[0],
+        "Workspace pattern 'tools/*' matches no package, so Carrick skips it."
     );
 }
 
