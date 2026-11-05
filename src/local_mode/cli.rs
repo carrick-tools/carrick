@@ -1874,13 +1874,12 @@ fn no_index_here(root: Option<&Path>, scans: &[super::scan_state::ScanState]) ->
         // Carrick builds the index; what this machine can do is read it in
         // (carrick#3361).
         Some(root) => format!(
-            "no index in {}. Run `carrick init` in {}: it reads in the index Carrick builds for \
-             your repos.",
+            "no index in {}. Run `carrick init` in {} to download your index.",
             root.join(super::workspace::INDEX_DIR).display(),
             root.display()
         ),
         None => "no index above this directory. Run `carrick init` in the folder holding your \
-                 repos: it reads in the index Carrick builds for them."
+                 repos to download your index."
             .to_string(),
     }
 }

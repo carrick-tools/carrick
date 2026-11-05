@@ -44,7 +44,7 @@ impl ReadError {
         match self {
             ReadError::NotIndexed => {
                 "no local index for this file. Run `carrick init` in the folder holding your \
-                 repos: it reads in the index Carrick builds for them."
+                 repos to download your index."
             }
             ReadError::NotInWorkspace => {
                 "this file is not under any repo this workspace covers. Check the repos and \
@@ -1838,7 +1838,7 @@ mod hosted_wire_tests {
         let detailed = ReadFailure::detailed(
             ReadError::IndexUnreadable,
             "/w/.carrick/index.json was written by a different scanner (index format 2, this \
-             build reads 3). Run `carrick refresh` to rebuild it.",
+             build reads 3). Run `carrick refresh` to download it again.",
         );
         let json = serde_json::to_value(ErrorOutput::new(&detailed, SCHEMA)).unwrap();
         assert_eq!(json["error"], "index_unreadable");

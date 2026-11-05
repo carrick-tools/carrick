@@ -649,7 +649,7 @@ test("the whole command, on a workspace with exactly three findings", () => {
           calls: 1,
           changed_since_index: 0,
           hosted_state: "no_index_yet",
-          boundary_note: "api is connected and has no hosted index yet. Carrick builds it in the cloud, and `carrick refresh` reads it in once it is ready.",
+          boundary_note: "api is connected and has no hosted index yet. Carrick builds it in the cloud, and `carrick refresh` downloads it once it is ready.",
         },
       ],
     }),
@@ -693,7 +693,7 @@ test("the whole command, on a workspace with exactly three findings", () => {
     "▲ 8 of the 8 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
     // Found with no ~/.claude at all: the command is the detection.
     "◇ MCP server connected for Claude Code.",
-    "▲ api: api is connected and has no hosted index yet. Carrick builds it in the cloud, and `carrick refresh` reads it in once it is ready. (hosted state: no_index_yet)",
+    "▲ api: api is connected and has no hosted index yet. Carrick builds it in the cloud, and `carrick refresh` downloads it once it is ready. (hosted state: no_index_yet)",
     "",
     "3 finding(s) above, marked ▲ or ■. Nothing here was changed; `carrick doctor` exits non-zero while any of them stand.",
   ]);

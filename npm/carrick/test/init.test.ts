@@ -2185,7 +2185,7 @@ const NONE_IN_WORKSPACE =
 const NO_INDEX_YET =
   "Carrick has no index for acme/web yet. It builds it in the cloud, and https://app.carrick.tools/w/acme/repos shows where it is. Run carrick refresh here once it is ready.";
 const BUILT_BY_ANOTHER_RELEASE =
-  "Hosted index was built by a different Carrick release than this CLI, so it was not read into .carrick/. Your agent still reads it through Carrick's MCP server.";
+  "Hosted index was built by a different Carrick release than this CLI, so it isn't downloaded here. Your agent still reads it through Carrick's MCP server.";
 const READ_WITHOUT_TYPES =
   "Dependencies are not installed, so the index here was read without their types. Run `npm install` in api, then carrick refresh.";
 const SYSTEM_ON_DASHBOARD =

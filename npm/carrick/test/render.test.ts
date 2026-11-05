@@ -616,11 +616,11 @@ test("a session start states the refusal's own sentence, not its wire code (carr
     schema: "carrick.status/0",
     error: "index_unreadable",
     message:
-      "/w/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Run `carrick refresh` to rebuild it.",
+      "/w/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Run `carrick refresh` to download it again.",
     services: [],
   });
   assert.match(refused, /index format 2, this build reads 3/);
-  assert.match(refused, /Run `carrick refresh` to rebuild it/);
+  assert.match(refused, /Run `carrick refresh` to download it again/);
 
   // With nothing more specific to say, the code is still the answer.
   assert.match(

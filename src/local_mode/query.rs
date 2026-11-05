@@ -1011,7 +1011,7 @@ pub fn enrichment_note(
         // (carrick#997, carrick#3361).
         (HostedState::NoIndexYet, _) => format!(
             "{}; {remote} is connected and has no hosted index yet. Carrick builds it in the \
-             cloud, and `carrick refresh` reads it in once it is ready.",
+             cloud, and `carrick refresh` downloads it once it is ready.",
             super::NOT_CLASSIFIED_LOCALLY
         ),
         (HostedState::NotConnected, _) => format!(
@@ -1064,7 +1064,7 @@ pub fn enrichment_note(
     if enrichment.hosted_state == HostedState::VersionMismatch {
         note.push_str(
             " The hosted index was built by a different Carrick release than this CLI, so it \
-             was not read in here. Your agent still reads it through Carrick's MCP server.",
+             isn't downloaded here. Your agent still reads it through Carrick's MCP server.",
         );
     }
     if let Some(lost) = boundary.and_then(|b| b.model_answers_unavailable.as_ref()) {
@@ -1145,7 +1145,7 @@ mod tests {
         assert!(
             note.contains(
                 "The hosted index was built by a different Carrick release than this CLI, so it \
-                 was not read in here. Your agent still reads it through Carrick's MCP server."
+                 isn't downloaded here. Your agent still reads it through Carrick's MCP server."
             ),
             "{note}"
         );

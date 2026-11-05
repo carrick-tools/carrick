@@ -596,7 +596,7 @@ export function hostedReport(outcome: HostedDownload, seconds: number | null = n
     case "version_mismatch":
       return {
         kind: "warn",
-        text: "Hosted index was built by a different Carrick release than this CLI, so it was not read into .carrick/. Your agent still reads it through Carrick's MCP server.",
+        text: "Hosted index was built by a different Carrick release than this CLI, so it isn't downloaded here. Your agent still reads it through Carrick's MCP server.",
       };
     // The failure first, then what moves it, then what `.carrick/` holds in
     // the meantime: the line used to open on the holdings and end on the
