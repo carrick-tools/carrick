@@ -267,6 +267,13 @@ export interface InferRequest extends BaseRequest {
    * receive op's `request.body` path names. Absent or empty, nothing is read.
    */
   server_claims?: ServerClaims;
+  /**
+   * Blueprint row N8: the packages the store labels `server_framework` for
+   * this service, as the service imports them. A type one of them declares is
+   * framework machinery (`InferredType.machinery`). Absent or empty, only the
+   * structural test decides.
+   */
+  framework_packages?: string[];
 }
 
 /** The server-framework claims an `infer` request reads handler parameters through (carrick#2674). */
@@ -1644,6 +1651,20 @@ export interface InferredType {
    */
   primary_type_symbol_source?: string;
   /**
+   * Blueprint row N8: the type `type_string` prints is framework machinery,
+   * decided by where it is declared (a library or installed package with the
+   * transport's members, or a package the store labels a server framework),
+   * never by its name. The scanner reads such a text as `unknown`. Absent
+   * otherwise.
+   */
+  machinery?: true;
+  /**
+   * Blueprint row N8: the type `primary_type_symbol` names is framework
+   * machinery, by the same test. Machinery never anchors a row. Absent
+   * otherwise.
+   */
+  anchor_machinery?: true;
+  /**
    * Why this inference carries `any`/`unknown` (carrick#376), recorded at the
    * decision point that produced it rather than reconstructed downstream.
    *
@@ -1750,6 +1771,11 @@ export interface StatedBody {
    * `root` alone does not name the body such a statement states.
    */
   root_type_arguments?: number;
+  /**
+   * Blueprint row N8: `root` is framework machinery, decided by where it is
+   * declared, as `InferredType.machinery`. Absent otherwise.
+   */
+  machinery?: true;
 }
 
 /**

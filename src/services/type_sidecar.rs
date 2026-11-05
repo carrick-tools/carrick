@@ -13,7 +13,7 @@
 //! - **JSON message protocol**: All communication is via stdin/stdout JSON messages
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -1665,6 +1665,10 @@ enum SidecarRequest {
         /// through.
         #[serde(skip_serializing_if = "Option::is_none")]
         server_claims: Option<ServerClaims>,
+        /// Blueprint row N8: the packages the store labels `server_framework`
+        /// for this service; a type one of them declares is machinery.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        framework_packages: Vec<String>,
     },
     #[serde(rename = "capture_v2")]
     CaptureV2 {
@@ -1897,6 +1901,17 @@ pub struct InferredType {
     /// of an anchor it fills (carrick#1819).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol_source: Option<String>,
+    /// Blueprint row N8: the type `type_string` prints is framework
+    /// machinery, decided by the sidecar from where it is declared (a library
+    /// or installed package carrying the transport's members, or a package
+    /// the store labels a server framework), never from its name. Such a text
+    /// is read as `unknown`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub machinery: bool,
+    /// Blueprint row N8: the type `primary_type_symbol` names is framework
+    /// machinery, by the same test. Machinery never anchors a row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anchor_machinery: bool,
     /// Why this inference carries `any`/`unknown` (carrick#376), recorded by
     /// the inferrer at the decision point that produced it. The inferrer is the
     /// only layer that can tell "the compiler resolved this to `any`" from
@@ -2110,6 +2125,10 @@ pub struct StatedBody {
     /// `root` alone does not name the body such a statement states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_type_arguments: Option<u32>,
+    /// Blueprint row N8: `root` is framework machinery, decided by where it
+    /// is declared, as `InferredType::machinery`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub machinery: bool,
 }
 
 /// Information about a symbol that failed to resolve
@@ -3785,6 +3804,7 @@ impl TypeSidecar {
                     ..claims.clone()
                 }
             }),
+            framework_packages: framework_packages(server_claims),
         };
 
         self.send_request(&request)?;
@@ -4413,7 +4433,7 @@ impl TypeSidecar {
         let mut inferred_aliases = HashSet::new();
         for inferred in &result.inferred_types {
             inferred_aliases.insert(inferred.alias.clone());
-            let type_string = if Self::is_untyped_response_type(&inferred.type_string) {
+            let type_string = if inferred.machinery {
                 "unknown"
             } else {
                 inferred.type_string.as_str()
@@ -4422,9 +4442,10 @@ impl TypeSidecar {
         }
 
         // Scrub inferred_types so downstream consumers (enrich_manifest_with_type_resolution)
-        // see "unknown" for framework types and leave type_state as Unknown.
+        // see "unknown" for a text the sidecar marked as framework machinery
+        // (blueprint row N8) and leave type_state as Unknown.
         for inferred in &mut result.inferred_types {
-            if Self::is_untyped_response_type(&inferred.type_string) {
+            if inferred.machinery {
                 inferred.type_string = "unknown".to_string();
             }
         }
@@ -4477,32 +4498,6 @@ impl TypeSidecar {
         let mut counter = self.request_counter.lock().unwrap();
         *counter += 1;
         format!("req-{}", counter)
-    }
-
-    pub(crate) fn is_untyped_response_type(type_string: &str) -> bool {
-        let trimmed = type_string.trim().trim_end_matches(';');
-        if trimmed.is_empty() {
-            return false;
-        }
-        let base = trimmed.rsplit('.').next().unwrap_or(trimmed);
-        matches!(
-            base,
-            // Express
-            "Response" | "Request" | "NextFunction" |
-            "Express" | "Application" | "Router" |
-            // Fastify
-            "Context" | "FastifyInstance" | "FastifyReply" | "FastifyRequest" |
-            // Koa
-            "Koa" | "ParameterizedContext" |
-            // Hapi
-            "ResponseToolkit" | "ResponseObject" | "Lifecycle" |
-            // NestJS
-            "ExecutionContext" | "ArgumentsHost" | "CallHandler" | "HttpException" |
-            // Hono
-            "Hono" | "HonoRequest" |
-            // Node.js HTTP core
-            "IncomingMessage" | "ServerResponse"
-        )
     }
 
     fn ensure_ready(&self) -> Result<(), SidecarError> {
@@ -4810,7 +4805,7 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
                 return Some(req.clone());
             };
             // Never install machinery as a payload.
-            if TypeSidecar::is_untyped_response_type(root) {
+            if inf.anchor_machinery {
                 return Some(req.clone());
             }
             // The inference must BE the bare named form of its root (modulo
@@ -4931,6 +4926,27 @@ fn claims_for_route_rows<'a>(
     })
 }
 
+/// Blueprint row N8: the packages the store labels a server framework for
+/// the service, with the type-only packages it says their surfaces re-export.
+/// Sent with every infer batch, whatever its rows: a type one of them
+/// declares is framework machinery wherever it is read.
+fn framework_packages(server_claims: Option<&ServerClaims>) -> Vec<String> {
+    let Some(claims) = server_claims else {
+        return Vec::new();
+    };
+    let mut packages: BTreeSet<String> = BTreeSet::new();
+    for check in &claims.checks {
+        if check.role != LibraryRole::ServerFramework {
+            continue;
+        }
+        packages.insert(check.package.clone());
+        if let Some(types) = claims.type_packages.get(&check.package) {
+            packages.extend(types.iter().cloned());
+        }
+    }
+    packages.into_iter().collect()
+}
+
 /// An infer kind that reads what a producer sends (carrick#2111). Not a
 /// `call_result`, whose text can be a later expression of the caller's, and
 /// not a request body or a pub/sub payload.
@@ -5030,7 +5046,7 @@ fn arbitrate_stated_body(
     }
     if let (Some(root), Some(root_source)) = (stated.root.as_deref(), stated.root_source.as_deref())
         && named_form == root
-        && !TypeSidecar::is_untyped_response_type(root)
+        && !stated.machinery
     {
         info!(
             alias = %alias,
@@ -6001,6 +6017,10 @@ mod tests {
                         vec!["@fixture/server-core".to_string()],
                     )]),
                 }),
+                framework_packages: vec![
+                    "@fixture/server".to_string(),
+                    "@fixture/server-core".to_string(),
+                ],
             },
             SidecarRequest::CaptureV2 {
                 request_id: id(),
@@ -7351,6 +7371,8 @@ mod tests {
             absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
         }
     }
 
@@ -7623,13 +7645,17 @@ mod tests {
             ),
             // No declaration source: the bundler could not resolve the root.
             inferred_with_anchor("Alias_Response", Some("OrderPlaced"), "OrderPlaced", None),
-            // Framework machinery root.
-            inferred_with_anchor(
-                "Alias_Response",
-                Some("FastifyReply"),
-                "FastifyReply",
-                Some("/repo/node_modules/fastify/types.d.ts"),
-            ),
+            // Framework machinery root, as the sidecar marks it by where it
+            // is declared (blueprint row N8).
+            InferredType {
+                anchor_machinery: true,
+                ..inferred_with_anchor(
+                    "Alias_Response",
+                    Some("FastifyReply"),
+                    "FastifyReply",
+                    Some("/repo/node_modules/fastify/types.d.ts"),
+                )
+            },
         ];
         for inf in cases {
             let explicit = vec![witnessed(symbol_request(
@@ -7739,6 +7765,7 @@ mod tests {
                 root_source: Some("/repo/src/search.ts".to_string()),
                 array_depth: None,
                 root_type_arguments: None,
+                machinery: false,
             },
         )];
 
@@ -7761,6 +7788,7 @@ mod tests {
                 root_source: Some("/repo/src/members.ts".to_string()),
                 array_depth: None,
                 root_type_arguments: None,
+                machinery: false,
             },
         )];
 
@@ -7785,6 +7813,7 @@ mod tests {
                 root_source: Some("/repo/src/pages.ts".to_string()),
                 array_depth: Some(1),
                 root_type_arguments: None,
+                machinery: false,
             },
         )];
 
@@ -7811,6 +7840,7 @@ mod tests {
                 root_source: Some("/repo/node_modules/types/fetch.d.ts".to_string()),
                 array_depth: None,
                 root_type_arguments: None,
+                machinery: true,
             },
         )];
 
@@ -7908,6 +7938,7 @@ mod tests {
                 root_source: Some("/repo/src/pages.ts".to_string()),
                 array_depth: Some(1),
                 root_type_arguments: None,
+                machinery: false,
             },
         );
         let borrowed = inferred_with_anchor(
@@ -7967,6 +7998,7 @@ mod tests {
                     root_source: Some("/repo/src/members.ts".to_string()),
                     array_depth: None,
                     root_type_arguments: None,
+                    machinery: false,
                 },
             ),
             stated_call_result(
@@ -8267,15 +8299,6 @@ mod tests {
     fn test_dts_defines_alias_matches_enum() {
         let dts = "export enum Status { Active, Inactive }\n";
         assert!(crate::type_manifest::dts_defines_alias(dts, "Status"));
-    }
-
-    #[test]
-    fn test_is_untyped_response_type() {
-        assert!(TypeSidecar::is_untyped_response_type("Response"));
-        assert!(TypeSidecar::is_untyped_response_type("express.Response"));
-        assert!(TypeSidecar::is_untyped_response_type("FastifyReply"));
-        assert!(!TypeSidecar::is_untyped_response_type("{ id: string }"));
-        assert!(!TypeSidecar::is_untyped_response_type("UserResponse"));
     }
 
     /// Verify that resolve_all_types does not append `type X = unknown` when

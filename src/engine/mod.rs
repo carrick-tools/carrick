@@ -12696,7 +12696,7 @@ fn anchor_stated_body_roots(
         else {
             continue;
         };
-        if TypeSidecar::is_untyped_response_type(root) {
+        if stated.machinery {
             continue;
         }
         let root = crate::services::type_sidecar::AnchorRoot {
@@ -12752,7 +12752,7 @@ fn anchor_inferred_symbols(
         if let Some(symbol) = inf
             .primary_type_symbol
             .as_deref()
-            .filter(|symbol| !TypeSidecar::is_untyped_response_type(symbol))
+            .filter(|_| !inf.anchor_machinery)
         {
             named
                 .entry(inf.alias.as_str())
@@ -22885,6 +22885,8 @@ unfollowed_member_calls_total: 0,
             absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -22957,6 +22959,8 @@ unfollowed_member_calls_total: 0,
             absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -22997,6 +23001,8 @@ unfollowed_member_calls_total: 0,
             absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
         }
     }
 
@@ -23053,9 +23059,12 @@ unfollowed_member_calls_total: 0,
     fn inferred_symbol_never_fills_an_anchor_with_transport_machinery() {
         let mut manifest = vec![consumer_entry("OrderView")];
         let mut resolution = empty_resolution();
-        resolution
-            .inferred_types
-            .push(inferred_with_symbol("Response"));
+        // The sidecar marks the anchor as machinery by where `Response` is
+        // declared (blueprint row N8).
+        resolution.inferred_types.push(InferredType {
+            anchor_machinery: true,
+            ..inferred_with_symbol("Response")
+        });
 
         anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
 
@@ -23225,7 +23234,11 @@ unfollowed_member_calls_total: 0,
 
         let entry = filled(
             vec![
-                inferred_from("Response", Some(&events)),
+                // Marked by the sidecar as machinery (blueprint row N8).
+                InferredType {
+                    anchor_machinery: true,
+                    ..inferred_from("Response", Some(&events))
+                },
                 inferred_from("OrderPlaced", Some(&events)),
             ],
             repo.path(),
@@ -23643,6 +23656,9 @@ unfollowed_member_calls_total: 0,
     /// text is the statement, its own anchor is the call's type (`Response`).
     fn stated_call(alias: &str, stated: crate::services::type_sidecar::StatedBody) -> InferredType {
         let mut inferred = inferred_with_symbol("Response");
+        // The call's own anchor is the platform `Response`, which the sidecar
+        // marks as machinery by where it is declared (blueprint row N8).
+        inferred.anchor_machinery = true;
         inferred.alias = alias.to_string();
         inferred.infer_kind = InferKind::CallResult;
         inferred.type_string = "{ members: { id: string; }[]; }".to_string();
@@ -23657,6 +23673,7 @@ unfollowed_member_calls_total: 0,
             root_source: Some(source.to_string()),
             array_depth: None,
             root_type_arguments: None,
+            machinery: false,
         }
     }
 
@@ -23847,8 +23864,13 @@ unfollowed_member_calls_total: 0,
                 stated_root("MembersPage", &declaring),
             ),
             (
+                // The sidecar marks a stated root as machinery by where it is
+                // declared (blueprint row N8), never by its name.
                 "transport machinery",
-                stated_root("Response", &transport.to_string_lossy()),
+                crate::services::type_sidecar::StatedBody {
+                    machinery: true,
+                    ..stated_root("Response", &transport.to_string_lossy())
+                },
             ),
             (
                 "rooted at no name",

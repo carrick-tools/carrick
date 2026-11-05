@@ -480,7 +480,8 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
           () => {
             readingSteps += 1;
             report();
-          }
+          },
+          request.framework_packages
         );
       }
     );

@@ -321,6 +321,8 @@ export const InferRequestSchema = BaseRequestSchema.extend({
     .optional(),
   // Declared below with the library claims; read lazily (carrick#2674).
   server_claims: z.lazy(() => ServerClaimsSchema).optional(),
+  // Blueprint row N8: the packages the store labels a server framework.
+  framework_packages: z.array(z.string().min(1)).optional(),
 });
 
 export const HealthRequestSchema = BaseRequestSchema.extend({
