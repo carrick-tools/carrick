@@ -605,7 +605,7 @@ test("no index gives one line and the command that reads one in", () => {
   const rendered = renderSessionStart(statusFixture("status-not-indexed.json"));
   assert.match(rendered, /^Carrick has no index for this workspace/);
   // Carrick builds it; this machine reads it in, and never scans (carrick#3361).
-  assert.match(rendered, /`carrick refresh --workspace <dir>` reads in the index Carrick builds for these repos\.$/);
+  assert.match(rendered, /`carrick refresh --workspace <dir>` downloads the index\.$/);
   assert.doesNotMatch(rendered, /carrick index/);
 });
 

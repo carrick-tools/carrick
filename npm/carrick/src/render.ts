@@ -631,7 +631,7 @@ export function renderSessionStart(status: StatusResult): string {
     }
     // Carrick builds the index in the cloud; what this machine can do is read
     // it in (carrick#3361).
-    return "Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick refresh --workspace <dir>` reads in the index Carrick builds for these repos.";
+    return "Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick refresh --workspace <dir>` downloads the index.";
   }
   if (status.error) {
     // The CLI's own sentence, which names the move: a format mismatch says
