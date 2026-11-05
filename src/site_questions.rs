@@ -110,7 +110,9 @@ fn asks_with(enabled: bool, no_model: bool) -> bool {
 
 /// Whether a value of [`SWITCH`] turns site questions on: `1` only.
 pub fn enabled_from(value: Option<&str>) -> bool {
-    value == Some("1")
+    // carrick#3283 S0 census: always on.
+    let _ = value;
+    true
 }
 
 /// A slot the record can ask or state.
