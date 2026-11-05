@@ -809,13 +809,13 @@ fn service_digest(
 /// blobs (`.carrick/repos`) and the cached hosted snapshot. Nothing is
 /// downloaded: a re-check that waited on the network would miss its budget on
 /// the wire rather than on the work.
-struct Held {
-    local: Vec<crate::cloud_storage::CloudRepoData>,
-    hosted: super::hosted::HostedInput,
+pub(super) struct Held {
+    pub(super) local: Vec<crate::cloud_storage::CloudRepoData>,
+    pub(super) hosted: super::hosted::HostedInput,
 }
 
 impl Held {
-    fn read(workspace: &Workspace) -> Result<Self, String> {
+    pub(super) fn read(workspace: &Workspace) -> Result<Self, String> {
         Ok(Self {
             local: read_blobs(&workspace.blobs_dir())?,
             hosted: super::hosted::cached(workspace),
