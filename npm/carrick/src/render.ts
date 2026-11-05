@@ -392,6 +392,13 @@ function notJudgedReason(result: CheckResult): string {
   const degraded = boundary?.types_degraded;
   if (degraded?.detail) return degraded.detail.replace(/\.+$/, "");
   if (boundary?.type_extraction_status) return boundary.type_extraction_status.replace(/\.+$/, "");
+  // Pairs the index compared whose sides did not resolve to a usable type.
+  const unresolved = (result.items ?? []).filter((item) => item.verdict?.state === "unresolved").length;
+  if (unresolved > 0) {
+    return unresolved === 1
+      ? "1 pair was compared but did not resolve"
+      : `${unresolved} pairs were compared but none resolved`;
+  }
   return "no pair in this file was compared";
 }
 
