@@ -1817,7 +1817,16 @@ export interface SymbolFailure {
   source_file: string;
   /** Reason for the failure */
   reason: string;
+  /** What kind of failure, where the bundler states one (read by the scanner) */
+  kind?: SymbolFailureKind;
 }
+
+/**
+ * `not_a_type`: the symbol is declared as a value (a variable or a function),
+ * not as a type, so it never defines the alias it was asked for (blueprint
+ * row N10c).
+ */
+export type SymbolFailureKind = 'not_a_type';
 
 // ============================================================================
 // Bundle Result (internal)

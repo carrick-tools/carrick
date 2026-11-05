@@ -2140,6 +2140,20 @@ pub struct SymbolFailure {
     pub source_file: String,
     /// Reason for the failure
     pub reason: String,
+    /// What kind of failure, where the bundler states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SymbolFailureKind>,
+}
+
+/// A failure kind the bundler states (`SymbolFailure.kind` in the sidecar's
+/// `types.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolFailureKind {
+    /// The symbol is declared, but as a value (a variable or a function), not
+    /// as a type: it is not a payload type, and the inference asked for the
+    /// same alias defines it (blueprint row N10c).
+    NotAType,
 }
 
 /// Response from the sidecar
