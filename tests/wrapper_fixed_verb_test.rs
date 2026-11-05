@@ -5,8 +5,8 @@
 //! index as a GET.
 //!
 //! - Every row for the route carries the helper's POST.
-//! - The call and the request its helper issues are one operation, so the
-//!   route has one row.
+//! - The screen's row is a call through the helper that names the request the
+//!   helper issues (`role` and `reaches_request`), not a second request.
 //!
 //! See `tests/fixtures/wrapper-fixed-verb/README.md` for the answer key.
 
@@ -76,16 +76,78 @@ fn a_call_through_a_helper_that_fixes_the_verb_is_not_indexed_as_a_get() {
     );
 }
 
+/// The mount graph's call rows of the service after one offline scan, with the
+/// storage dir holding the blob.
+fn mount_graph_calls() -> Vec<serde_json::Value> {
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let fixture = format!("{repo}/tests/fixtures/wrapper-fixed-verb");
+    let storage = tempfile::tempdir().expect("temp storage dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(&fixture)
+        .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
+        .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env("CARRICK_CACHE_DIR", cache.path())
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_MOCK_FIXTURE_DIR", format!("{fixture}/__llm__/"))
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env("CARRICK_ALLOW_MISSING_TYPES", "1");
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_REF",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_SHA",
+        "GITHUB_RUN_ID",
+        "GITHUB_ACTIONS",
+        "GITHUB_WORKSPACE",
+        "CI",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("failed to spawn carrick");
+    assert!(
+        output.status.success(),
+        "scan exited non-zero:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entry = std::fs::read_dir(storage.path())
+        .expect("storage dir")
+        .flatten()
+        // Blobs only: a type-reach record sits beside each (carrick#3101).
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .expect("one blob");
+    let blob: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(entry.path()).expect("read blob"))
+            .expect("parse blob");
+    blob["mount_graph"]["data_calls"]
+        .as_array()
+        .expect("the blob holds a mount graph")
+        .clone()
+}
+
 #[test]
-fn a_call_through_a_helper_and_the_helper_s_request_are_one_operation() {
-    let rows = rows();
-    let on_route: Vec<_> = rows
-        .iter()
-        .filter(|(_, _, _, path)| path == "/catalog/sync")
-        .collect();
+fn a_call_through_a_helper_reaches_the_request_its_helper_issues() {
+    let calls = mount_graph_calls();
+    let at = |site: &str| -> &serde_json::Value {
+        calls
+            .iter()
+            .find(|call| call["file_location"] == site)
+            .unwrap_or_else(|| panic!("a row at {site}: {calls:?}"))
+    };
+    let request = at("src/lib/catalog.ts:2");
+    assert_ne!(
+        request["role"], "wrapper_call",
+        "the helper's own line is the request: {request}"
+    );
+    let call = at("src/screens/sync-screen.ts:3");
     assert_eq!(
-        on_route.len(),
-        1,
-        "the screen's call and the helper's request are one row: {rows:?}"
+        call["role"], "wrapper_call",
+        "the screen's row is a call through the helper, not a second request: {call}"
+    );
+    assert_eq!(
+        call["reaches_request"], "src/lib/catalog.ts:2",
+        "the screen's row names the request it reaches: {call}"
     );
 }
