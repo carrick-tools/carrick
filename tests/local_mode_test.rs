@@ -3845,6 +3845,179 @@ fn check_changed_re_scans_new_code_that_may_reach_a_contract() {
     assert!(wrong.is_empty(), "not re-scanned:\n{}", wrong.join("\n\n"));
 }
 
+/// [`a_workspace_with_a_text_helper`], with `files` (workspace-relative)
+/// committed on main as well before the index is built.
+fn a_workspace_holding(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let workspace = workspace_prepared(
+        "local-mode-workspace",
+        &["catalog-web", "inventory-svc"],
+        |repo| {
+            let name = repo
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name == "inventory-svc" {
+                std::fs::write(repo.join("src/text.ts"), TEXT_HELPER).expect("write the helper");
+            }
+            for (file, text) in files {
+                if let Some(inside) = file.strip_prefix(&format!("{name}/")) {
+                    let path = repo.join(inside);
+                    std::fs::create_dir_all(path.parent().expect("a folder"))
+                        .expect("make the folder");
+                    std::fs::write(path, text).expect("write the file");
+                }
+            }
+        },
+    );
+    index(workspace.path());
+    workspace
+}
+
+/// Writes `files` and asserts the repo of the first one takes the re-scan;
+/// the JSON answer, for what the re-scan states.
+fn assert_re_scanned_after(workspace: &Path, files: &[(&str, &str)]) -> serde_json::Value {
+    for (file, text) in files {
+        let path = workspace.join(file);
+        std::fs::create_dir_all(path.parent().expect("a folder")).expect("make the folder");
+        std::fs::write(path, text).expect("write the change");
+    }
+    let (_, json, text, stderr) = check_changed_twice(workspace, &[]);
+    let repo = files[0].0.split('/').next().unwrap();
+    assert_eq!(
+        rescan_of(&json, repo).as_deref(),
+        Some("ran"),
+        "{json:#}\n{text}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("changes reaches a route, a call"),
+        "not answered as no contract:\n{stderr}"
+    );
+    json
+}
+
+/// carrick#3364 review: a route table written as data states its routes with
+/// no call, so an added file declaring one is re-scanned, and the route is
+/// read.
+#[test]
+#[serial]
+fn check_changed_re_scans_an_added_route_table() {
+    let workspace = a_workspace_with_a_text_helper();
+    let json = assert_re_scanned_after(
+        workspace.path(),
+        &[(
+            "inventory-svc/src/gadget-routes.ts",
+            "export function readGadget(gadgetId: string): string {\n  return gadgetId;\n}\n\nexport const gadgetRoutes = [\n  { method: \"GET\", path: \"/api/v1/gadgets/:gadgetId\", handler: readGadget },\n];\n",
+        )],
+    );
+    assert_eq!(json["routes"], 1, "{json:#}");
+}
+
+/// carrick#3364 review: the first handler appended to a file at a file-based
+/// route path that held no row is a route, so it is re-scanned and read.
+#[test]
+#[serial]
+fn check_changed_re_scans_the_first_handler_appended_to_a_route_file() {
+    let route = "catalog-web/app/routes/api.v1.ping.ts";
+    let workspace = a_workspace_holding(&[(route, "export const PING_VERSION = 1;\n")]);
+    let json = assert_re_scanned_after(
+        workspace.path(),
+        &[(
+            route,
+            "export const PING_VERSION = 1;\n\nexport async function action(): Promise<{ ok: boolean }> {\n  return { ok: true };\n}\n",
+        )],
+    );
+    assert_eq!(json["routes"], 1, "{json:#}");
+}
+
+/// carrick#3364 review: a package's export reached through a relative barrel
+/// is the package's, so new code calling it is re-scanned and the call read.
+/// The same holds for a barrel that imports the binding and exports it on.
+#[test]
+#[serial]
+fn check_changed_re_scans_a_package_call_through_a_barrel() {
+    let added = (
+        "inventory-svc/src/gadget-query.ts",
+        "import { useQuery } from \"./lib.js\";\n\nconst GadgetsDocument = {\"kind\":\"Document\",\"definitions\":[{\"kind\":\"OperationDefinition\",\"operation\":\"query\",\"name\":{\"kind\":\"Name\",\"value\":\"Gadgets\"},\"selectionSet\":{\"kind\":\"SelectionSet\",\"selections\":[{\"kind\":\"Field\",\"name\":{\"kind\":\"Name\",\"value\":\"gadgets\"},\"selectionSet\":{\"kind\":\"SelectionSet\",\"selections\":[{\"kind\":\"Field\",\"name\":{\"kind\":\"Name\",\"value\":\"id\"}}]}}]}}]} as unknown;\n\nexport function useGadgets(): unknown {\n  return useQuery(GadgetsDocument);\n}\n",
+    );
+    for (shape, barrel) in [
+        (
+            "export from",
+            "export { useQuery } from \"@apollo/client\";\n",
+        ),
+        (
+            "import, then export",
+            "import { useQuery } from \"@apollo/client\";\n\nexport { useQuery };\n",
+        ),
+    ] {
+        let workspace = a_workspace_holding(&[("inventory-svc/src/lib.ts", barrel)]);
+        let json = assert_re_scanned_after(workspace.path(), &[added]);
+        if shape == "export from" {
+            assert_eq!(json["calls"], 1, "{shape}: {json:#}");
+        }
+    }
+}
+
+/// carrick#3364 review: a repo wrapper reached through a relative barrel
+/// (`export { .. } from`, `export *`) is followed to the file that sends.
+#[test]
+#[serial]
+fn check_changed_re_scans_a_wrapper_reached_through_a_barrel() {
+    let client = "import { send } from \"./send.js\";\n\nexport class GadgetClient {\n  readGadget(gadgetId: string): Promise<unknown> {\n    return send<unknown>(`/api/v1/gadgets/${gadgetId}`, { method: \"GET\" });\n  }\n}\n";
+    let function = "import { send } from \"./send.js\";\n\nexport function getGadget(gadgetId: string): Promise<unknown> {\n  return send<unknown>(`/api/v1/gadgets/${gadgetId}`, { method: \"GET\" });\n}\n";
+    for (base, added) in [
+        (
+            vec![
+                ("inventory-svc/src/gadgets.ts", client),
+                (
+                    "inventory-svc/src/clients.ts",
+                    "export { GadgetClient } from \"./gadgets.js\";\n",
+                ),
+            ],
+            "import { GadgetClient } from \"./clients.js\";\n\nexport async function gadgetLabel(gadgetId: string): Promise<unknown> {\n  const client = new GadgetClient();\n  return client.readGadget(gadgetId);\n}\n",
+        ),
+        (
+            vec![
+                ("inventory-svc/src/gadget-api.ts", function),
+                (
+                    "inventory-svc/src/api.ts",
+                    "export * from \"./gadget-api.js\";\n",
+                ),
+            ],
+            "import { getGadget } from \"./api.js\";\n\nexport async function gadgetLabel(gadgetId: string): Promise<unknown> {\n  return getGadget(gadgetId);\n}\n",
+        ),
+    ] {
+        let workspace = a_workspace_holding(&base);
+        assert_re_scanned_after(
+            workspace.path(),
+            &[("inventory-svc/src/gadget-label.ts", added)],
+        );
+    }
+}
+
+/// carrick#3364 review: new code calling a member of an existing object in
+/// the same file reads the member's body, which sends a request.
+#[test]
+#[serial]
+fn check_changed_re_scans_a_call_through_an_existing_object_member() {
+    let method = "// A request helper written as an object: the caller states the path.\nexport const api = {\n  get(path: string): Promise<Response> {\n    return fetch(path, { method: \"GET\" });\n  },\n};\n";
+    let arrow = "import { send } from \"./send.js\";\n\nexport const gadgets = {\n  readGadget: (gadgetId: string): Promise<unknown> =>\n    send<unknown>(`/api/v1/gadgets/${gadgetId}`, { method: \"GET\" }),\n};\n";
+    for (file, base, appended) in [
+        (
+            "inventory-svc/src/api.ts",
+            method,
+            "\nexport function readGadget(gadgetId: string): Promise<Response> {\n  return api.get(`/api/v1/gadgets/${gadgetId}`);\n}\n",
+        ),
+        (
+            "inventory-svc/src/gadget-api.ts",
+            arrow,
+            "\nexport async function gadgetLabel(gadgetId: string): Promise<unknown> {\n  return gadgets.readGadget(gadgetId);\n}\n",
+        ),
+    ] {
+        let workspace = a_workspace_holding(&[(file, base)]);
+        assert_re_scanned_after(workspace.path(), &[(file, &format!("{base}{appended}"))]);
+    }
+}
+
 /// A problem that was already on main, in a file the work did not touch, is
 /// not this work's: only the changed file is reported and counted.
 #[test]

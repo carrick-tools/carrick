@@ -813,8 +813,8 @@ enum Reading {
 /// to the scan. A path it reads must be a source file whose copy at that
 /// commit and whose copy on disk both parse, are equal ignoring positions,
 /// and hold the same type-bearing comments in the same places
-/// (carrick#3245), or new code ([`super::new_code`]): an added file no
-/// file-based routing convention routes and no other file names, or items
+/// (carrick#3245), or new code ([`super::new_code`]) in a file no file-based
+/// routing convention routes: an added file no other file names, or items
 /// appended to a file the index holds no row for, whose exports no other file
 /// names, calling only into files the index holds no row for (carrick#3364).
 /// A manifest, a lockfile, a config, a test file, a deleted file, an edit to
@@ -852,13 +852,13 @@ fn reading_since(repo: &Path, indexed: &IndexedRepo, index: &LocalIndex) -> Opti
     let conventions = crate::file_based_router::all_builtin_conventions();
     let mut lead_free = BTreeSet::new();
     for (file, code) in new {
+        // A file at a routed path states a route for each handler it exports,
+        // whether it is added or gains its first handler.
+        if routed(&file, &conventions) {
+            return None;
+        }
         let words = match code.shape {
-            Shape::Added => {
-                if routed(&file, &conventions) {
-                    return None;
-                }
-                super::new_code::import_words(&file)
-            }
+            Shape::Added => super::new_code::import_words(&file),
             Shape::Extended(map) => {
                 if !rowless(&file) {
                     return None;

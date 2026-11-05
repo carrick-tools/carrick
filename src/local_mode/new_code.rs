@@ -27,7 +27,14 @@
 //! function or class of the same file whose body passes, or a binding imported
 //! from a relative file whose whole module passes in turn; so does every value
 //! handed to the call. A free identifier (a global), a package import, `this`
-//! and `super` do not pass.
+//! and `super` do not pass. A local's value passes with every call written
+//! inside it (an object's methods). A reached module also passes only when
+//! every value it exports does, and every re-export leads to a file of the
+//! repo that passes; a re-exported package does not.
+//!
+//! Last, the scan's own per-file readers run over the new code
+//! ([`stated_by_the_scan`]): any call site, route table or event they state
+//! is a re-scan, whatever the rules above read.
 //!
 //! The rules that read the index (no row in an extended or reached file, no
 //! file-based route for an added one) and the workspace (no other file names
@@ -91,6 +98,11 @@ pub(super) enum Refusal {
     Form(&'static str),
     /// A relative import whose module does not pass.
     Reached(String),
+    /// A re-export of a package, or of a file the check cannot read.
+    ReExport(String),
+    /// One of the scan's own per-file readers states something in the new
+    /// code: a call site, a route table, a wrapper call, an event.
+    Stated(&'static str),
 }
 
 /// Read file `file` of `repo` against its copy at `commit`.
@@ -180,6 +192,7 @@ fn pure_module(repo: &Path, file: &str) -> Result<BTreeSet<String>, Refusal> {
         memo: RefCell::new(HashMap::new()),
     };
     leg.walk(&parsed.module, false)?;
+    leg.exports(&parsed.module)?;
     Ok(reaches.into_inner())
 }
 
@@ -315,11 +328,69 @@ fn classify(
     for item in added {
         leg.walk(item, true)?;
     }
+    if let Some(reader) = stated_by_the_scan(path, now, cut) {
+        return Err(Refusal::Stated(reader));
+    }
     Ok(NewCode {
         shape,
         exported,
         reaches: BTreeSet::new(),
     })
+}
+
+/// The first of the scan's own per-file readers that states something in the
+/// text after byte `cut` of `now` (all of it for an added file): a call site
+/// it would hand on, a same-file wrapper call, a pub/sub operation, a route
+/// table, a route bound to an imported handler, a decorator route. The rules
+/// above cover what reaches a contract through a call; this covers what the
+/// scan states with no call to follow, read by the same code the scan runs.
+fn stated_by_the_scan(path: &Path, now: &str, cut: usize) -> Option<&'static str> {
+    use crate::swc_scanner::{SWC_SPAN_BASE, SwcScanner};
+    let from = SWC_SPAN_BASE.saturating_add(u32::try_from(cut).unwrap_or(u32::MAX));
+    // A pub/sub operation carries its line only: the cut's line counts as new.
+    let from_line = now
+        .get(..cut)
+        .map_or(1, |head| head.matches('\n').count() + 1);
+    let new = |start: u32| start >= from;
+    let scanner = SwcScanner::new();
+    let scan = scanner.scan_content(path, now, &[], &[]);
+    if scan.parse_failed {
+        return Some("a file the scan cannot parse");
+    }
+    if scan.candidates.iter().any(|c| new(c.span_start)) {
+        return Some("a call site");
+    }
+    if scan.local_wrapper_calls.iter().any(|c| new(c.span_start)) {
+        return Some("a call through a wrapper in the file");
+    }
+    if scan
+        .pubsub_anchor_ops
+        .iter()
+        .any(|op| op.line_number >= from_line)
+    {
+        return Some("a pub/sub operation");
+    }
+    let tables = scanner.route_descriptor_endpoints(path, now);
+    if tables.endpoints.iter().any(|e| new(e.span_start))
+        || tables.data_spans().any(|(start, _)| new(start))
+    {
+        return Some("a route table");
+    }
+    if scanner
+        .controller_route_bindings(path, now)
+        .iter()
+        .any(|b| new(b.span_start))
+    {
+        return Some("a route bound to an imported handler");
+    }
+    if scanner
+        .decorator_routes(path, now)
+        .iter()
+        .any(|r| new(r.span_start))
+    {
+        return Some("a decorator route");
+    }
+    None
 }
 
 fn is_string_statement(item: &ModuleItem) -> bool {
@@ -822,7 +893,9 @@ impl Leg<'_, '_> {
                 (None, Some(init @ (Expr::Arrow(_) | Expr::Fn(_)))) => {
                     self.memoized(key, || self.walk(*init, false))
                 }
-                (None, Some(init)) => roots_of(init).iter().try_for_each(|root| self.root(root)),
+                // An object's methods and arrow members are bodies its callers
+                // run: `api.get(path)` reads `get`'s body.
+                (None, Some(init)) => self.memoized(key, || self.value(init)),
                 _ => refused(),
             },
             Binding::Param(Some(annotation)) if is_primitive(annotation) => Ok(()),
@@ -839,6 +912,81 @@ impl Leg<'_, '_> {
             _ => refused(),
         }
     }
+
+    /// A value another piece of code may call into: its roots pass, and so
+    /// does every call written inside it (an object's methods, an arrow's
+    /// body).
+    fn value(&self, value: &Expr) -> Result<(), Refusal> {
+        let mut roots = Vec::new();
+        value_roots(value, &mut roots);
+        roots.iter().try_for_each(|root| self.root(root))?;
+        self.walk(value, false)
+    }
+
+    /// What a reached module hands to the code that imports it, beyond the
+    /// calls the whole-module walk reads: every exported value passes as a
+    /// callee root does, and every re-export is followed to a file of the
+    /// repo, which must pass in turn. A package's export, re-exported
+    /// (`export { useQuery } from "<package>"`, or imported and exported on),
+    /// is the package's.
+    fn exports(&self, module: &Module) -> Result<(), Refusal> {
+        for item in &module.body {
+            let ModuleItem::ModuleDecl(decl) = item else {
+                continue;
+            };
+            match decl {
+                ModuleDecl::ExportNamed(NamedExport { src: Some(src), .. })
+                | ModuleDecl::ExportAll(ExportAll { src, .. }) => {
+                    let specifier = src.value.to_string_lossy().into_owned();
+                    match (self.reached)(&specifier) {
+                        Some(file) => {
+                            self.reaches.borrow_mut().insert(file);
+                        }
+                        None => return Err(Refusal::ReExport(specifier)),
+                    }
+                }
+                ModuleDecl::ExportNamed(named) => {
+                    if named.type_only {
+                        continue;
+                    }
+                    for specifier in &named.specifiers {
+                        match specifier {
+                            ExportSpecifier::Named(ExportNamedSpecifier {
+                                orig: ModuleExportName::Ident(orig),
+                                is_type_only: false,
+                                ..
+                            }) => self.ident(orig)?,
+                            ExportSpecifier::Named(ExportNamedSpecifier {
+                                is_type_only: true,
+                                ..
+                            }) => {}
+                            _ => return Err(Refusal::Item("export list")),
+                        }
+                    }
+                }
+                ModuleDecl::ExportDecl(ExportDecl {
+                    decl: Decl::Var(var),
+                    ..
+                }) => {
+                    // The value is the initialiser's, whatever the annotation.
+                    for declarator in &var.decls {
+                        match &declarator.init {
+                            Some(init) => self.value(init)?,
+                            None => return Err(Refusal::Item("exported variable without a value")),
+                        }
+                    }
+                }
+                ModuleDecl::ExportDecl(_) | ModuleDecl::ExportDefaultDecl(_) => {}
+                ModuleDecl::ExportDefaultExpr(export) => self.value(&export.expr)?,
+                ModuleDecl::TsExportAssignment(export) => self.value(&export.expr)?,
+                ModuleDecl::Import(_) => {}
+                ModuleDecl::TsImportEquals(_) | ModuleDecl::TsNamespaceExport(_) => {
+                    return Err(Refusal::Item("module declaration"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What a callee is rooted at, past calls, `await`, member access, `new`,
@@ -854,12 +1002,6 @@ enum Root {
 /// adds its arguments' roots, and an array or object literal its elements':
 /// `pick(client).get('/x')` and `[client][0].get('/x')` reach `client`, which
 /// must pass as well.
-fn roots_of(expr: &Expr) -> Vec<Root> {
-    let mut roots = Vec::new();
-    collect_roots(expr, &mut roots);
-    roots
-}
-
 fn collect_roots(expr: &Expr, roots: &mut Vec<Root>) {
     let arguments = |args: &[ExprOrSpread], roots: &mut Vec<Root>| {
         for arg in args {
@@ -1422,6 +1564,37 @@ mod tests {
             Err(Refusal::Directive),
             "a JSDoc type in a JavaScript file"
         );
+    }
+
+    #[test]
+    fn a_route_table_the_scan_reads_is_refused() {
+        // The scan reads the record as a call-site candidate and as a route.
+        let stated = |result: Result<NewCode, Refusal>| matches!(result, Err(Refusal::Stated(_)));
+        assert!(stated(rules(
+            None,
+            "export function read(id: string): string {\n  return id;\n}\n\nexport const routes = [\n  { method: \"GET\", path: \"/api/v1/things/:id\", handler: read },\n];\n",
+        )));
+        // Appended after a kept part, too.
+        assert!(stated(appended(
+            "export const routes = [\n  { method: \"GET\", path: \"/api/v1/things/:id\", handler: trimmed },\n];"
+        )));
+    }
+
+    #[test]
+    fn a_member_of_an_existing_object_is_read() {
+        let base = "export const api = {\n  get(path: string): Promise<Response> {\n    return fetch(path);\n  },\n  put: (path: string): Promise<Response> => fetch(path, { method: \"PUT\" }),\n};\n";
+        for call in ["api.get(id)", "api.put(id)"] {
+            assert_eq!(
+                rules(
+                    Some(base),
+                    &format!(
+                        "{base}\nexport function read(id: string): Promise<Response> {{\n  return {call};\n}}\n"
+                    )
+                ),
+                Err(Refusal::Callee("fetch".to_string())),
+                "{call}"
+            );
+        }
     }
 
     #[test]
