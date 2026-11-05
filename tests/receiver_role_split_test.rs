@@ -51,6 +51,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 /// The rows one scan left in the service's mount graph, each as
 /// `file:line METHOD path source`.
+#[derive(Debug)]
 struct Rows {
     routes: BTreeSet<String>,
     requests: BTreeSet<String>,
