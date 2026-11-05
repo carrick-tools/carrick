@@ -15,7 +15,8 @@ import { fakeEnv, fixture, makeWorkspace, pluginDir, type HookRun } from "./help
 import type { CheckResult } from "../src/contract.ts";
 import { BACKGROUND_CAP_MS, enqueue, lockPath, STOP_TIMEOUT_S, STOP_WAIT_S } from "../src/hook/rechecks.ts";
 import type { Answer, QueueEntry } from "../src/hook/rechecks.ts";
-import { record, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
+import { checkMarkerPath } from "../src/hook/checked.ts";
+import { record, recordEdit, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
 import { stopAnswers, waitSeconds } from "../src/hook/stop-wait.ts";
 import { carrickHooks } from "../src/init/settings.ts";
 
@@ -204,4 +205,79 @@ test("the wait is read from the command and defaults to 3 s", () => {
   assert.equal(waitSeconds(["hook", "stop", "--wait-s", "200"]), 200);
   assert.equal(waitSeconds(["--wait-s=7"]), 7);
   assert.equal(waitSeconds(["hook", "stop"]), 3);
+});
+
+// A `carrick check --changed` that ran after the session's last edit has
+// already said what the clause "Run `carrick check --changed` before you
+// finish" asks for (carrick#3357): the agent ran it twice, 137 s then 133 s.
+
+const CLAUSE = /Run `carrick check --changed` before you finish/;
+
+/** What `carrick check --changed` leaves in the workspace when it ends. */
+function marker(root: string, startedMs: number, exit: number): void {
+  writeAtomic(
+    checkMarkerPath(root),
+    `${JSON.stringify({ started_at_ms: startedMs, finished_at_ms: startedMs + 1000, exit })}\n`,
+  );
+}
+
+/** A re-check the runner gave up on: the line that carries the clause. */
+function stopped(home: string, entry: QueueEntry): void {
+  const body: Answer = {
+    seq: entry.seq,
+    session: entry.session,
+    file: entry.file,
+    relative: entry.relative,
+    root: entry.root,
+    state: "stopped",
+    enqueued_at: entry.enqueued_at,
+    started_at: null,
+    finished_at: new Date().toISOString(),
+    failure: "the re-check ran past its budget",
+  };
+  writeAtomic(path.join(sessionsDir(home), `${entry.session}.recheck.${entry.seq}.answer.json`), `${JSON.stringify(body)}\n`);
+}
+
+test("stop drops the check clause when a clean check --changed ran after the last edit", async (t) => {
+  const { workspace, home } = setup(t);
+  const entry = queue(workspace.root, home, workspace.file);
+  recordEdit(SESSION, workspace.root, 1_000_000, home);
+  marker(workspace.root, 2_000_000, 0);
+  stopped(home, entry);
+  const text = (await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n");
+  assert.match(text, /was not re-checked: the re-check ran past its budget\./);
+  assert.doesNotMatch(text, CLAUSE);
+});
+
+test("stop keeps the check clause when an edit came after the check", async (t) => {
+  const { workspace, home } = setup(t);
+  const entry = queue(workspace.root, home, workspace.file);
+  marker(workspace.root, 2_000_000, 0);
+  recordEdit(SESSION, workspace.root, 3_000_000, home);
+  stopped(home, entry);
+  assert.match((await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n"), CLAUSE);
+});
+
+test("stop keeps the check clause when no check --changed ran, or the one that ran failed", async (t) => {
+  const { workspace, home } = setup(t);
+  const entry = queue(workspace.root, home, workspace.file);
+  recordEdit(SESSION, workspace.root, 1_000_000, home);
+  stopped(home, entry);
+  assert.match((await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n"), CLAUSE, "no check");
+
+  const again = queue(workspace.root, home, workspace.file);
+  marker(workspace.root, 2_000_000, 2);
+  stopped(home, again);
+  assert.match((await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n"), CLAUSE, "exit 2 checked nothing");
+});
+
+test("stop drops the clause from the still-running line when a clean check followed the last edit", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  queue(workspace.root, home, workspace.file);
+  recordEdit(SESSION, workspace.root, 1_000_000, home);
+  marker(workspace.root, 2_000_000, 0);
+  const text = (await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n");
+  assert.match(text, /is still running after \d+ s\.$/);
+  assert.doesNotMatch(text, CLAUSE);
 });

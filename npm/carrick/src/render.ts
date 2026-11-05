@@ -342,10 +342,18 @@ const NO_RECHECK_REASON = "no re-check of it ran";
  * reader is told why and sent to the command that answers. Said on every
  * such edit, with that edit's own reason.
  */
-export function notRecheckedLine(file: string, reason?: string | null): string {
-  const run = "Run `carrick check --changed` before you finish.";
+export function notRecheckedLine(file: string, reason?: string | null, settled = false): string {
   const said = (reason?.trim() || NO_RECHECK_REASON).replace(/\.+$/, "");
-  return `Carrick: ${file} was not re-checked: ${said}.${said.includes("carrick check --changed") ? "" : ` ${run}`}`;
+  return `Carrick: ${file} was not re-checked: ${said}.${said.includes("carrick check --changed") ? "" : runClause(settled)}`;
+}
+
+/**
+ * The clause that sends the reader to `carrick check --changed`, with its
+ * leading space; empty when one already ran after the last edit (`settled`,
+ * from `hook/checked.ts`), because the agent would only repeat it.
+ */
+export function runClause(settled: boolean): string {
+  return settled ? "" : " Run `carrick check --changed` before you finish.";
 }
 
 /** The line for an edit queued for the background re-check. */
@@ -407,7 +415,7 @@ function notJudgedReason(result: CheckResult): string {
  * only when a re-check ran, and "no contract problem" only when a type pair
  * was judged and none of the verdicts is a problem.
  */
-function headline(result: CheckResult, where: string, problems: number, late = false): string {
+function headline(result: CheckResult, where: string, problems: number, late = false, settled = false): string {
   const noProblem = judgedAnyPair(result) ? "no contract problem" : null;
   const unjudged =
     (result.items ?? []).length === 0
@@ -427,7 +435,7 @@ function headline(result: CheckResult, where: string, problems: number, late = f
     const tail = count(" in what it re-read") ?? (noProblem ? `${noProblem} in what it re-read` : unjudged);
     const names = stale.slice(0, MAX_STALE_SERVICES).join(", ");
     const more = stale.length > MAX_STALE_SERVICES ? `, and ${stale.length - MAX_STALE_SERVICES} more` : "";
-    return `Carrick re-checked ${where}: ${tail}; ${stale.length} ${stale.length === 1 ? "service" : "services"} that read this edit ${stale.length === 1 ? "was" : "were"} judged at their indexed version (${names}${more}). Run \`carrick check --changed\` before you finish.`;
+    return `Carrick re-checked ${where}: ${tail}; ${stale.length} ${stale.length === 1 ? "service" : "services"} that read this edit ${stale.length === 1 ? "was" : "were"} judged at their indexed version (${names}${more}).${runClause(settled)}`;
   }
   return `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}: ${count("") ?? noProblem ?? unjudged}.`;
 }
@@ -454,7 +462,7 @@ function headline(result: CheckResult, where: string, problems: number, late = f
 export function renderPostToolUse(
   result: CheckResult,
   displayFile?: string,
-  options: { uses?: boolean; late?: boolean } = {},
+  options: { uses?: boolean; late?: boolean; settled?: boolean } = {},
 ): string | null {
   if (result.error) return null;
   // `result.file` is relative to the repo that owns it, so the caller's own
@@ -462,13 +470,13 @@ export function renderPostToolUse(
   const where = displayFile ?? result.file ?? "this file";
   const lines: string[] = [];
   if (!answersTheEdit(result)) {
-    lines.push(notRecheckedLine(where, result.recheck?.reason));
+    lines.push(notRecheckedLine(where, result.recheck?.reason, options.settled === true));
   } else {
     const problems = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
     if (result.deleted) {
       lines.push(deletedLine(result, where));
     } else {
-      lines.push(headline(result, where, problems.length, options.late === true));
+      lines.push(headline(result, where, problems.length, options.late === true, options.settled === true));
     }
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);

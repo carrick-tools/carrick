@@ -15,6 +15,7 @@ import {
   testDir,
 } from "./helpers.ts";
 import { invokerValue } from "../src/hook/invoker.ts";
+import { readSession } from "../src/hook/reuse.ts";
 
 test("an edit gets its problems as additionalContext", async (t) => {
   const workspace = makeWorkspace();
@@ -341,7 +342,8 @@ test("an edit that adds a function records it and says nothing about it", async 
     env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: without }),
   });
   assert.equal(withNew.stdout, withoutNew.stdout, "the new functions changed no printed byte");
-  assert.equal(fs.existsSync(path.join(home, ".carrick", "sessions", "sess-2.json")), false);
+  // The edit stamp is the only thing a session with no new function holds.
+  assert.deepEqual(sessionRecord(home, "sess-2").found, []);
 });
 
 test("the stop hook names a task's new functions to the model, once", async (t) => {
@@ -1126,6 +1128,19 @@ test("the late answer arrives on the next post-edit, once, naming the earlier fi
   });
   assert.equal(contextOf(third.stdout).includes(LATE_USERS), false, "the first answer is printed once");
   await waitForAnswers(home, "sess-b2", 3);
+});
+
+test("a post-edit stamps the session's newest edit in its workspace, for the check clause", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = deferredEnv(home, { CARRICK_FAKE_FULL_DELAY_MS: "100" });
+  const before = Date.now();
+  await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: "sess-stamp" }, env });
+  await waitForAnswers(home, "sess-stamp", 1);
+  const stamps = Object.values(readSession("sess-stamp", home).edited);
+  assert.equal(stamps.length, 1);
+  assert.ok(stamps[0]! >= before && stamps[0]! <= Date.now());
 });
 
 test("a Read delivers a finished answer, of a non-TypeScript file and of one already read", async (t) => {

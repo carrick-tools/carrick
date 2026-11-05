@@ -952,3 +952,19 @@ test("a moved row of another build's index says that build may be the cause", ()
   );
   assert.doesNotMatch(text, /agreed in the index/);
 });
+
+test("a check --changed that ran after the last edit drops the clause that sends the reader to it", () => {
+  assert.equal(
+    notRecheckedLine("src/a.ts", "an earlier re-check of this repo ran past its budget", true),
+    "Carrick: src/a.ts was not re-checked: an earlier re-check of this repo ran past its budget.",
+  );
+  const result = rechecked();
+  result.items = result.items!.filter((item) => item.verdict?.result == null || item.verdict.result === "compatible");
+  result.recheck = {
+    ran: "extraction+types",
+    elapsed_ms: 900,
+    scope: { reread: ["catalog"], not_reread: [], stale: ["inventory"] },
+  };
+  assert.match(renderPostToolUse(result) ?? "", /Run `carrick check --changed` before you finish\.$/);
+  assert.doesNotMatch(renderPostToolUse(result, undefined, { settled: true }) ?? "", /check --changed/);
+});
