@@ -25,6 +25,7 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
 import { forwardInBackground, refreshInBackground } from "./refresh.ts";
 import { versionMismatch } from "../init/outdated.ts";
+import { markInvoker } from "./invoker.ts";
 
 const log = createLogger("carrick-session");
 
@@ -77,6 +78,7 @@ export function codexEmission(context: string): string {
 }
 
 async function main(): Promise<void> {
+  markInvoker("session-start");
   if (resolveChannel({ hooksInstalled: true }).channel === "off") {
     log("CARRICK_CHANNEL=off; printing nothing");
     return;

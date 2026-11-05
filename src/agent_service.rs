@@ -1927,7 +1927,8 @@ impl AgentService {
             .timeout(self.timeout_for(path))
             .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
             .header("X-Carrick-Run-Id", crate::logging::run_id())
-            .header(ATTEMPT_HEADER, lambda_attempt.to_string());
+            .header(ATTEMPT_HEADER, lambda_attempt.to_string())
+            .header(crate::invoker::HEADER, crate::invoker::current());
         // Which tree of a monorepo is spending. Log-only on the cloud
         // side: it is read where `ctx` is built and reaches no cache key,
         // so two services asking about the same file still share one
@@ -4781,6 +4782,7 @@ pub(crate) mod tests {
             );
             assert!(header_of(request, "x-carrick-scanner-version").is_some());
             assert!(header_of(request, "x-carrick-attempt").is_some());
+            assert!(header_of(request, crate::invoker::HEADER).is_some());
         }
 
         let plain = runner_service(None, None);

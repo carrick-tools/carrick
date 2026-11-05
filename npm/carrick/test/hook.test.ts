@@ -14,6 +14,7 @@ import {
   runHook,
   testDir,
 } from "./helpers.ts";
+import { invokerValue } from "../src/hook/invoker.ts";
 
 test("an edit gets its problems as additionalContext", async (t) => {
   const workspace = makeWorkspace();
@@ -995,4 +996,36 @@ test("the lsp and off channels print nothing from a Read and write no session fi
   }
   assert.equal(runCount(argvLog), 0);
   assert.equal(fs.existsSync(path.join(home, ".carrick", "sessions")), false);
+});
+
+test("a hook marks the binary it spawns with who started it", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const invokerLog = path.join(workspace.root, "invoker.log");
+  const calledAs = () => fs.readFileSync(invokerLog, "utf8").trim().split("\n");
+
+  // A value already in the environment is the hook's to replace: the hook is
+  // what ran the binary.
+  await runHook("post-edit.ts", {
+    payload: editPayload(workspace),
+    env: fakeEnv({ CARRICK_FAKE_INVOKER_LOG: invokerLog, CARRICK_INVOKER: "cli" }),
+  });
+  assert.deepEqual(calledAs(), ["hook:post-edit"]);
+
+  fs.rmSync(invokerLog);
+  await runHook("session-start.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
+      CARRICK_FAKE_INVOKER_LOG: invokerLog,
+    }),
+  });
+  assert.deepEqual(calledAs(), ["hook:session-start"]);
+});
+
+test("invokerValue names every hook the cloud log tells apart", () => {
+  assert.deepEqual(
+    (["post-edit", "stop", "session-start", "post-read"] as const).map(invokerValue),
+    ["hook:post-edit", "hook:stop", "hook:session-start", "hook:post-read"],
+  );
 });

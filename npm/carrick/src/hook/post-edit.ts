@@ -30,6 +30,7 @@ import { currentVersion } from "../update.ts";
 import { markTold, NOTED_KEY, record, toldKey, wasTold } from "./reuse.ts";
 import type { CheckResult } from "../contract.ts";
 import type { NewFunction } from "./reuse.ts";
+import { markInvoker } from "./invoker.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -180,6 +181,7 @@ async function readStdin(): Promise<string> {
 }
 
 async function main(): Promise<void> {
+  markInvoker("post-edit");
   // `off` stops the work as well as the printing. `lsp` stops only the
   // printing: it decides which surface delivers a verdict, and the reuse
   // record below is not a verdict — it is what the Stop hook speaks from, and

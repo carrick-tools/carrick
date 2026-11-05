@@ -16,6 +16,9 @@
 //   CARRICK_FAKE_DELAY_MS milliseconds to wait before printing
 //   CARRICK_FAKE_EXIT     exit code to use, with nothing on stdout
 //   CARRICK_FAKE_ARGV_LOG file to append the argv and cwd of every call to
+//   CARRICK_FAKE_INVOKER_LOG
+//                         file to append the CARRICK_INVOKER of every call to
+//                         ("" when unset), to read what a hook marked itself as
 //   CARRICK_FAKE_REBASE   "1" rewrites the fixtures' `/workspace` prefix to the
 //                         working directory, so the absolute `repo` paths a
 //                         payload carries point at the throwaway workspace an
@@ -31,6 +34,11 @@ const argv = process.argv.slice(2);
 const argvLog = process.env.CARRICK_FAKE_ARGV_LOG;
 if (argvLog) {
   fs.appendFileSync(argvLog, `${JSON.stringify({ argv, cwd: process.cwd() })}\n`);
+}
+
+const invokerLog = process.env.CARRICK_FAKE_INVOKER_LOG;
+if (invokerLog) {
+  fs.appendFileSync(invokerLog, `${process.env.CARRICK_INVOKER ?? ""}\n`);
 }
 
 const exitCode = process.env.CARRICK_FAKE_EXIT ? Number(process.env.CARRICK_FAKE_EXIT) : 0;
