@@ -19,7 +19,7 @@ npm install -g carrick
 carrick init
 ```
 
-`carrick init` signs you in, connects your agent, and reads in the index Carrick builds for the repositories you added through its GitHub App. The [quick start](https://docs.carrick.tools/quickstart) has the details (Node 24 or newer).
+`carrick init` signs you in, connects your agent and downloads your index. The [quick start](https://docs.carrick.tools/quickstart) has the details (Node 24 or newer).
 
 ## One index, three surfaces
 

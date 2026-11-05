@@ -31,8 +31,7 @@ npm install -g carrick
 In the folder that holds your repositories:
 
 ```bash
-# Signs you in, wires up the hooks and reads in the index Carrick builds for
-# the repos you added through its GitHub App. Runs no scan.
+# Signs you in, wires up the hooks and downloads your index. Runs no scan.
 carrick init
 ```
 
