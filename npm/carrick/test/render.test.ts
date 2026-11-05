@@ -5,6 +5,7 @@ import {
   LISTED_SERVICES,
   MAX_EDIT_LINE_CHARS,
   CHECK_BEFORE_DONE,
+  answersTheEdit,
   notedLine,
   boundaryFor,
   boundaryLines,
@@ -61,6 +62,18 @@ test("an edit the hook could not re-check lists none of the index's verdicts", (
       "Carrick: src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.",
     );
   }
+});
+
+test("an edit the scan reads the same gets no not-re-checked line", () => {
+  const same = fixture("check-mismatch.json");
+  same.stale = false;
+  same.recheck = {
+    ran: "none",
+    elapsed_ms: 0,
+    reason: "the edit changed nothing the scan reads (comments or layout); verdicts are the index's",
+  };
+  assert.equal(answersTheEdit(same), true);
+  assert.doesNotMatch(renderPostToolUse(same) ?? "", /not re-checked/);
 });
 
 test("files a patch left un-checked share one line that names at most five", () => {

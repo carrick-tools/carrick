@@ -929,7 +929,11 @@ fn a_comment_only_edit_is_answered_without_a_re_scan() {
 
     let before = recheck_temp_dirs();
     let answered: serde_json::Value = serde_json::from_str(&run(root, &args)).expect("JSON");
-    assert_eq!(answered["stale"], serde_json::json!(true), "{answered:#}");
+    assert_eq!(answered["stale"], serde_json::json!(false), "{answered:#}");
+    assert!(
+        answered["changed_since_index"].as_u64() >= Some(1),
+        "the tree did move: {answered:#}"
+    );
     assert_eq!(
         answered["recheck"]["ran"],
         serde_json::json!("none"),
@@ -950,6 +954,10 @@ fn a_comment_only_edit_is_answered_without_a_re_scan() {
     assert_eq!(
         answered["items"][0]["verdict"]["state"], indexed["items"][0]["verdict"]["state"],
         "{answered:#}"
+    );
+    assert_eq!(
+        answered["items"][0]["verdict"]["detail"], indexed["items"][0]["verdict"]["detail"],
+        "no \"unresolved since your edit\" caveat on an unmoved row: {answered:#}"
     );
     assert_eq!(
         recheck_temp_dirs(),

@@ -208,7 +208,7 @@ stored index.
 | `hosted_state` | string | `enriched`, `no_index_yet`, `not_connected`, `remote_unnamed`, `not_signed_in`, `version_mismatch`, `commit_missing`, or `read_failed`; the boundary explains any failed refresh alongside a retained copy. `not_connected` is the cloud's answer about a repo it was asked about; `remote_unnamed` is this machine unable to read `owner/repo` from the repo's git remote, so it asked about nothing |
 | `hosted_checked_at` | string \| null | when repository metadata last answered for this workspace; absent when no authenticated copy exists |
 | `changed_since_index` | int | files changed since `index_commit`: `git diff --name-only <commit>` plus what git does not track. Where git cannot answer at all (no repository, a commit a rebase dropped, no `git`), it falls back to whether the queried file's own mtime is newer than the index, and counts only that file. A rewrite that changes no bytes is not a change |
-| `stale` | bool | this file is one of them, so its rows may not describe what is on disk now |
+| `stale` | bool | this file is one of them, so its rows may not describe what is on disk now. False for an edit the scan reads the same (comments, layout): the rows stand, `changed_since_index` still counts the file, and `recheck.reason` says why |
 | `deleted` | bool | the file is in the index and no longer on disk |
 | `items` | array | routes and calls the index holds for this file, in line order |
 | `boundary` | object \| null | what this service's scan could not classify (`ServiceBoundary`, `src/boundary.rs`), verbatim |

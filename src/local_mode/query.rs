@@ -116,6 +116,7 @@ pub fn answer(
     // not changed — and "no re-check was asked for" and "one was asked for and
     // there was nothing to do" are different facts that an absent block cannot
     // tell apart.
+    let mut reads_same = false;
     let recheck = match (freshness, mode) {
         (Freshness::Recheck, Mode::Check) if stale && !deleted => {
             // An edit the scan reads the same (comments, layout) has nothing
@@ -126,6 +127,7 @@ pub fn answer(
                 .and_then(|service| {
                     super::reads_same::reads_same_since(&repo_root, &service.commit, &relative)
                 });
+            reads_same = unchanged.is_some();
             Some(match unchanged {
                 Some(lines) => (
                     Some(
@@ -175,6 +177,12 @@ pub fn answer(
     // Rows this run computed are not "unresolved since your edit": they ARE
     // the edit. The file is still reported as changed at the top level, which
     // is a fact about the tree either way.
+    //
+    // An edit the scan reads the same moved nothing the rows describe, so the
+    // file is not stale: `stale` says whether the indexed rows may differ from
+    // the tree, and for such an edit they cannot. `changed_since_index` still
+    // counts the file, and `recheck.reason` says why it is not stale.
+    let stale = stale && !reads_same;
     let rows_are_indexed = stale && !matches!(&recheck, Some((Some(_), _)));
     let recheck = recheck.map(|(_, block)| block);
 
