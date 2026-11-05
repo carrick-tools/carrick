@@ -14,7 +14,8 @@
 import type { CheckResult } from "../contract.ts";
 import { problemItems } from "../contract.ts";
 import { createLogger } from "../log.ts";
-import { answersTheEdit, movedLines, renderPostToolUse } from "../render.ts";
+import { answersTheEdit, movedLines, renderPostToolUse, runClause } from "../render.ts";
+import { checkedSinceLastEdit } from "./checked.ts";
 import {
   claimDelivery,
   ensureRunner,
@@ -31,8 +32,6 @@ const log = createLogger("carrick-stop");
 export const DEFAULT_WAIT_S = 3;
 
 const POLL_MS = 250;
-
-const RUN = "Run `carrick check --changed` before you finish.";
 
 /** The `--wait-s <n>` (or `--wait-s=<n>`) in an argument list, else the default. */
 export function waitSeconds(argv: readonly string[]): number {
@@ -57,20 +56,20 @@ function actionable(answer: Answer): boolean {
 }
 
 /** One answer's lines, for a reader who was not told this edit was being re-checked. */
-function render(answer: Answer): string {
+function render(answer: Answer, settled: boolean): string {
   const where = answer.relative;
   const result: CheckResult | undefined = answer.result;
   if (answer.state !== "answered" || result === undefined || result.error) {
     const reason = answer.failure ?? "the re-check gave no answer";
-    return `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}. ${RUN}`;
+    return `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.${runClause(settled)}`;
   }
   if (!answersTheEdit(result)) {
     const reason = result.recheck?.reason;
     return reason
-      ? `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}. ${RUN}`
-      : `Carrick: ${where} was not re-checked here. ${RUN}`;
+      ? `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.${runClause(settled)}`
+      : `Carrick: ${where} was not re-checked here.${runClause(settled)}`;
   }
-  return renderPostToolUse(result, where, { uses: false, late: true }) ?? "";
+  return renderPostToolUse(result, where, { uses: false, late: true, settled }) ?? "";
 }
 
 export type StopOptions = {
@@ -127,7 +126,7 @@ export async function stopAnswers(session: string, options: StopOptions): Promis
   const lines: string[] = [];
   if (delivered.some(actionable)) {
     for (const answer of delivered) {
-      const text = render(answer);
+      const text = render(answer, checkedSinceLastEdit(session, answer.root, home));
       if (text) lines.push(text);
     }
   }
@@ -140,8 +139,9 @@ export async function stopAnswers(session: string, options: StopOptions): Promis
     const files = [...new Set(running.map((entry) => entry.relative))];
     const oldest = Math.max(...running.map((entry) => at - Date.parse(entry.enqueued_at)));
     const seconds = Math.max(0, Math.round(oldest / 1000));
+    const settled = running.every((entry) => checkedSinceLastEdit(session, entry.root, home));
     lines.push(
-      `Carrick: the re-check of ${files.join(", ")} is still running after ${seconds} s. ${RUN}`,
+      `Carrick: the re-check of ${files.join(", ")} is still running after ${seconds} s.${runClause(settled)}`,
     );
   }
   return { lines };

@@ -48,6 +48,11 @@ export type SessionRecord = {
    * asks once per file per session, whatever the answer was.
    */
   read: string[];
+  /**
+   * Workspace root -> epoch ms of this session's newest recorded edit there.
+   * `checked.ts` compares it with the last `carrick check --changed`.
+   */
+  edited: Record<string, number>;
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -83,6 +88,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     nudged: [],
     told: [],
     read: [],
+    edited: {},
     updated: "",
   };
   const file = sessionFile(sessionId, home);
@@ -113,6 +119,11 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       read: Array.isArray(record.read)
         ? record.read.filter((entry): entry is string => typeof entry === "string")
         : [],
+      edited: Object.fromEntries(
+        Object.entries(record.edited ?? {}).filter(
+          (entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]),
+        ),
+      ),
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -287,6 +298,14 @@ export function markTold(sessionId: string, keys: string[], home?: string): void
   const told = new Set(current.told);
   for (const key of keys) told.add(key);
   current.told = [...told];
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** Remember that this session edited a file in the workspace at `root` at `at` (epoch ms). */
+export function recordEdit(sessionId: string, root: string, at: number, home?: string): void {
+  const current = readSession(sessionId, home);
+  current.edited[root] = Math.max(at, current.edited[root] ?? 0);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

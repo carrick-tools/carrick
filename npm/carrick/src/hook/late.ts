@@ -11,23 +11,24 @@ import { createLogger } from "../log.ts";
 import { answersTheEdit, notRecheckedLine, renderPostToolUse } from "../render.ts";
 import { claimDelivery, finishedFor } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
+import { checkedSinceLastEdit } from "./checked.ts";
 import { markTold, toldKey, wasTold } from "./reuse.ts";
 
 const log = createLogger("carrick-late");
 
 /** The words for one finished answer, or null when there is nothing to say. */
-export function lateContext(answer: Answer, uses: boolean): string | null {
+export function lateContext(answer: Answer, uses: boolean, settled = false): string | null {
   if (!answer.result) {
     // An internal failure is logged, never shown: the reader needs the next step.
     const reason =
       answer.state === "stopped" ? (answer.failure ?? "the background re-check stopped") : "the background re-check gave no answer";
-    return notRecheckedLine(answer.relative, reason);
+    return notRecheckedLine(answer.relative, reason, settled);
   }
   if (answer.result.error) return null;
   if (!answersTheEdit(answer.result)) {
-    return notRecheckedLine(answer.relative, answer.result.recheck?.reason);
+    return notRecheckedLine(answer.relative, answer.result.recheck?.reason, settled);
   }
-  return renderPostToolUse(answer.result, answer.relative, { uses, late: true });
+  return renderPostToolUse(answer.result, answer.relative, { uses, late: true, settled });
 }
 
 /**
@@ -43,7 +44,7 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
       if (answer.failure) log("background re-check failed", answer.relative, answer.failure);
       const key = answer.result ? toldKey(answer.result, answer.relative) : null;
       const uses = key === null || !wasTold(session, key);
-      const context = lateContext(answer, uses);
+      const context = lateContext(answer, uses, checkedSinceLastEdit(session, answer.root));
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
       if (!context) continue;

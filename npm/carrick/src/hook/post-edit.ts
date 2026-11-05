@@ -27,7 +27,7 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { markTold, record, toldKey, wasTold } from "./reuse.ts";
+import { markTold, record, recordEdit, toldKey, wasTold } from "./reuse.ts";
 import type { NewFunction } from "./reuse.ts";
 import { checkoutRelative, newFunctions } from "./edited.ts";
 import { markInvoker } from "./invoker.ts";
@@ -136,6 +136,9 @@ async function main(): Promise<void> {
   });
   const note = rootNote(choice);
   if (note) log(note);
+  // Stamped before any line is built: a `carrick check --changed` that began
+  // earlier did not read this edit (`checked.ts`).
+  if (session) recordEdit(session, choice.root, Date.now());
 
   const found: NewFunction[] = [];
   const contexts: string[] = [];

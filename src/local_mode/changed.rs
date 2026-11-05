@@ -322,6 +322,7 @@ impl ChangedOutput {
 /// `--json` always lists every problem, each with its `source` and `fails`.
 pub fn run(root: Option<&Path>, selection: Selection, json: bool, all: bool) -> i32 {
     let started = Instant::now();
+    let started_at_ms = now_ms();
     let mut output = answer(root, started, selection);
     output.elapsed_ms = started.elapsed().as_millis() as u64;
     if json {
@@ -332,7 +333,47 @@ pub fn run(root: Option<&Path>, selection: Selection, json: bool, all: bool) -> 
     } else {
         crate::out!("{}", output.render(all));
     }
-    output.exit_code()
+    let exit = output.exit_code();
+    if matches!(selection, Selection::Changed) && !output.workspace.is_empty() {
+        record_check_marker(Path::new(&output.workspace), started_at_ms, now_ms(), exit);
+    }
+    exit
+}
+
+/// Where `check --changed` leaves its marker, under the workspace's `.carrick/`.
+const CHECK_MARKER_FILE: &str = "last-check-changed.json";
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// Leave the time a `check --changed` began and ended, and its exit code, in
+/// `<root>/.carrick/last-check-changed.json`, written whole or not at all. The
+/// npm hooks read it (`npm/carrick/src/hook/checked.ts`, same file name and
+/// fields) so a late line stops telling an agent to run the command it has
+/// just run (carrick#3357). Only a workspace that already has a `.carrick/`
+/// gets one; a failed write is not a failure of the check.
+fn record_check_marker(root: &Path, started_at_ms: u64, finished_at_ms: u64, exit: i32) {
+    let dir = root.join(".carrick");
+    if !dir.is_dir() {
+        return;
+    }
+    let body = serde_json::json!({
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": finished_at_ms,
+        "exit": exit,
+    });
+    let Ok(json) = serde_json::to_vec_pretty(&body) else {
+        return;
+    };
+    let file = dir.join(CHECK_MARKER_FILE);
+    let pending = file.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&pending, json).is_ok() {
+        let _ = std::fs::rename(&pending, &file);
+    }
+    let _ = std::fs::remove_file(pending);
 }
 
 fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
@@ -1551,6 +1592,28 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_check_leaves_its_times_and_exit_where_the_hooks_read_them() {
+        let root = tempfile::tempdir().unwrap();
+        record_check_marker(root.path(), 10, 20, 0);
+        assert!(
+            !root.path().join(".carrick").exists(),
+            "a workspace with no .carrick/ is not given one"
+        );
+        std::fs::create_dir(root.path().join(".carrick")).unwrap();
+        record_check_marker(root.path(), 10, 20, 1);
+        let body =
+            std::fs::read_to_string(root.path().join(".carrick/last-check-changed.json")).unwrap();
+        let marker: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(marker["started_at_ms"], 10);
+        assert_eq!(marker["finished_at_ms"], 20);
+        assert_eq!(marker["exit"], 1);
+        let left: Vec<_> = std::fs::read_dir(root.path().join(".carrick"))
+            .unwrap()
+            .collect();
+        assert_eq!(left.len(), 1, "no temp file is left beside it");
+    }
 
     fn problem(kind: ProblemKind, fails: bool) -> Problem {
         Problem {
