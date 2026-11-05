@@ -7173,7 +7173,8 @@ fn site_records_of(
         unbased,
         ran = decided.ran.len(),
         reserved = decided.reserved.len(),
-        "site questions: sites left to the summaries, sites with an unstated instance base, calls that hand a maker its function, sites named a reserved name"
+        unplaced = decided.unplaced.len(),
+        "site questions: sites left to the summaries, sites with an unstated instance base, calls that hand a maker its function, sites named a reserved name, labelled calls the call index holds no call for"
     );
     let records =
         crate::request_summary::site_record::site_records(inputs, root, &decided, &labels);

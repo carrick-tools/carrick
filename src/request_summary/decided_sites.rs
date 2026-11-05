@@ -1075,7 +1075,17 @@ impl<'a> Calls<'a> {
             } else {
                 ir.written_in.as_ref()
             };
-            for call in ir.calls.iter().chain(&ir.constructions) {
+            // An optional call (`sock?.emit(…)`) is placed as the plain call
+            // is (carrick#3389); only the call graph's resolution of a callee
+            // stays with plain calls, as an optional call carries no
+            // arguments to walk up through.
+            let optional = ir.optional_calls.iter().map(|call| (call, true));
+            let plain = ir
+                .calls
+                .iter()
+                .chain(&ir.constructions)
+                .map(|call| (call, false));
+            for (call, is_optional) in plain.chain(optional) {
                 let placed = Placed {
                     file,
                     key,
@@ -1093,12 +1103,12 @@ impl<'a> Calls<'a> {
                 if let Some(key) = key {
                     out.by_owner.entry((file, key)).or_default().push(placed);
                 }
-                if let Some(target) = (at.target)(at.source, file, call) {
+                if !is_optional && let Some(target) = (at.target)(at.source, file, call) {
                     out.callers.entry(target).or_default().push(placed);
                 }
             }
             for (index, inner) in ir.nested.iter().enumerate() {
-                let host = ir.calls.iter().find(|call| {
+                let host = ir.calls.iter().chain(&ir.optional_calls).find(|call| {
                     call.args
                         .iter()
                         .any(|arg| matches!(arg, Value::Callback(at) if *at == index))
@@ -3943,6 +3953,52 @@ pub(crate) mod tests {
             }
         }
         (sites, labels)
+    }
+
+    /// carrick#3389: an optional call (`wire?.emit(…)`) is placed as its
+    /// plain twin is: a discovery site whose labelled call it is decides
+    /// into a site with the same name and payload, and is not left in
+    /// `unplaced`.
+    #[test]
+    fn an_optional_call_is_placed_as_its_plain_twin_is() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let file = "src/slots/optional.ts";
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let send = wire_label("emit", "send", Some(1), None);
+        let on = wire_label("on", "receive", None, Some(1));
+        let calls = [
+            ("wire.emit(\"tick\", { at: 1 })", "wire.emit", &send),
+            ("wire?.emit(\"tick\", { at: 1 })", "wire?.emit", &send),
+            (
+                "wire?.on(\"user.joined\", (data) => {\n    console.log(data);\n  })",
+                "wire?.on",
+                &on,
+            ),
+        ];
+        let sites: Vec<DiscoverySite> = calls
+            .iter()
+            .map(|(call, callee, label)| bottom(&end_for(label, file, &text, call), callee))
+            .collect();
+        let labels = vec![send.clone(), on.clone()];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        assert!(decided.unplaced.is_empty(), "{:?}", decided.unplaced);
+        let found: Vec<(u32, Option<String>)> = decided
+            .sites
+            .iter()
+            .filter(|site| site.file == file)
+            .map(|site| (site.line, site.name_text()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (line_of(&text, "wire.emit"), Some("tick".to_string())),
+                (line_of(&text, "wire?.emit"), Some("tick".to_string())),
+                (line_of(&text, "wire?.on"), Some("user.joined".to_string())),
+            ],
+            "{:?}",
+            decided.sites
+        );
     }
 
     /// A call the call graph leaves unresolved (a log line, a global

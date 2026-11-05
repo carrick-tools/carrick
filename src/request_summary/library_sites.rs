@@ -105,7 +105,7 @@ use super::row_links::{RowLink, RowLinks};
 use super::{
     BindingUse, BindingUses, ClassFields, ClientBinding, ClientInstance, ClientRef, FileIr, FnIr,
     LinkedClients, MadeBy, ModuleScope, OwnCallee, Reader, RequestSummaryInputs, Scope, Site,
-    member_prop, prop_name, this_field,
+    as_member, member_prop, prop_name, this_field,
 };
 use crate::binding_scope::{BindingKey, ident_key, pat_key};
 use crate::graphql_document_sites::unwrap_expression;
@@ -2053,8 +2053,9 @@ impl Reader<'_> {
                     ident.span,
                 ));
             }
-            Expr::Member(outer) => outer,
-            _ => return None,
+            // `sock.on(…)` and `sock?.on(…)` name the same receiver: the
+            // `?.` only guards a missing one (carrick#3389).
+            _ => as_member(callee)?,
         };
         if let Expr::This(_) = &*outer.obj {
             return Some((
@@ -2075,14 +2076,6 @@ impl Reader<'_> {
                     let binding = SiteBinding::Client(Box::new(scope.call_binding(ident)?));
                     return Some((binding, path, Some(member), named));
                 }
-                Expr::Member(inner) if matches!(&*inner.obj, Expr::This(_)) => {
-                    path.reverse();
-                    return Some((field_binding(inner, scope)?, path, Some(member), named));
-                }
-                Expr::Member(inner) => {
-                    path.push(member_prop(inner)?);
-                    obj = unwrap_expression(&inner.obj);
-                }
                 Expr::Call(_) | Expr::New(_) | Expr::Await(_) => {
                     path.reverse();
                     let client = self.written_instance(obj, scope)?;
@@ -2093,7 +2086,16 @@ impl Reader<'_> {
                         named,
                     ));
                 }
-                _ => return None,
+                // A hop, plain or optional (`this.a?.b.on(…)`).
+                _ => {
+                    let inner = as_member(obj)?;
+                    if matches!(&*inner.obj, Expr::This(_)) {
+                        path.reverse();
+                        return Some((field_binding(inner, scope)?, path, Some(member), named));
+                    }
+                    path.push(member_prop(inner)?);
+                    obj = unwrap_expression(&inner.obj);
+                }
             }
         }
     }
@@ -3569,7 +3571,7 @@ mod tests {
 
     /// A manifest declaring every package the tests import, so no specifier
     /// reads as one the scan cannot follow unless a test means it to.
-    const MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/jobs\": \"^1.0.0\", \"@fixture/queue\": \"^2.0.0\", \"@fixture/bus\": \"^1.0.0\", \"fixture-bus\": \"^1.0.0\", \"@fixture/socket\": \"^1.0.0\" } }\n";
+    const MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/jobs\": \"^1.0.0\", \"@fixture/queue\": \"^2.0.0\", \"@fixture/bus\": \"^1.0.0\", \"fixture-bus\": \"^1.0.0\", \"@fixture/socket\": \"^1.0.0\", \"@fixture/http\": \"^1.0.0\" } }\n";
 
     /// The library sites discovery reads in a service of `files`.
     fn sites_of(files: &[(&str, &str)]) -> Vec<LibrarySite> {
@@ -4275,6 +4277,70 @@ mod tests {
         assert_eq!(maker(field).line, 7);
         assert_eq!(maker(field).args[0].text.as_deref(), Some("emails"));
         assert_eq!(field.contest(on_wire), None);
+    }
+
+    /// carrick#3389: `x?.member(…)` is the library site `x.member(…)` is, on
+    /// every protocol: a socket listener named by a literal or an enum
+    /// member, a queue client, an HTTP client, on a class field and on a
+    /// local. A field used only through `?.` is still a receiver.
+    #[test]
+    fn an_optional_call_is_the_site_its_plain_twin_is() {
+        let source = "import { io } from \"@fixture/socket\";\n\
+             import { Queue } from \"@fixture/queue\";\n\
+             import { createClient } from \"@fixture/http\";\n\
+             enum Ev { Ready = \"ready\" }\n\
+             export class Live {\n\
+             \x20 #sock = io(\"wss://x\");\n\
+             \x20 private queue = new Queue(\"jobs\");\n\
+             \x20 plain(h: () => void) {\n\
+             \x20   this.#sock.on(\"literal\", h);\n\
+             \x20   this.#sock.on(Ev.Ready, h);\n\
+             \x20   this.queue.add(\"a\", {});\n\
+             \x20 }\n\
+             \x20 optional(h: () => void) {\n\
+             \x20   this.#sock?.on(\"literal\", h);\n\
+             \x20   this.#sock?.on(Ev.Ready, h);\n\
+             \x20   this.queue?.add(\"a\", {});\n\
+             \x20 }\n\
+             }\n\
+             export class OnlyOptional {\n\
+             \x20 #sock = io(\"wss://x\");\n\
+             \x20 listen(h: () => void) { this.#sock?.on(Ev.Ready, h); }\n\
+             }\n\
+             export function local() {\n\
+             \x20 const http = createClient(\"https://api.example\");\n\
+             \x20 http.get(\"/items\");\n\
+             \x20 http?.get(\"/items\");\n\
+             }\n";
+        let sites = sites_of(&[("src/live.ts", source)]);
+        let at = |line: u32| {
+            let found: Vec<&LibrarySite> = sites
+                .iter()
+                .filter(|site| site.file.ends_with("src/live.ts") && site.line == line)
+                .collect();
+            match found.as_slice() {
+                [one] => *one,
+                _ => panic!("expected one site at line {line}, got {sites:#?}"),
+            }
+        };
+        for (plain, optional) in [(9, 14), (10, 15), (11, 16), (25, 26)] {
+            let (plain, optional) = (at(plain), at(optional));
+            assert_eq!(optional.member, plain.member, "{optional:#?}");
+            assert_eq!(optional.receiver_ids(), plain.receiver_ids());
+            assert_eq!(optional.path, plain.path);
+            assert_eq!(optional.args, plain.args);
+            assert_eq!(optional.specifier, plain.specifier);
+            assert_eq!(optional.export, plain.export);
+            assert!(!optional.contested && !plain.contested, "{optional:#?}");
+        }
+        // The enum member and the literal stay the arguments they are.
+        assert_eq!(at(14).args[0].text.as_deref(), Some("literal"));
+        assert_eq!(at(15).member.as_deref(), Some("on"));
+        // A field every use of which is optional is a receiver all the same.
+        let only = at(21);
+        assert_eq!(only.member.as_deref(), Some("on"));
+        assert_eq!(maker(only).holder, Holder::Field);
+        assert!(!only.contested, "{only:#?}");
     }
 
     /// The service the class-field tests read: `body` is a class (or
