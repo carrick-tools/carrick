@@ -5370,3 +5370,218 @@ fn check_changed_does_not_fail_a_model_row_that_was_not_carried_over_documentati
         "{text}"
     );
 }
+
+/// One repo, three services: `contracts` holds a type and no route or call,
+/// `api` serves a route whose handler returns it through a helper, and
+/// `client` keeps its own copy of the type and calls the route.
+///
+/// `linked` writes the link a pnpm install makes for a workspace dependency:
+/// `services/api/node_modules/@acme/contracts` pointing at the package, with
+/// `node_modules` ignored by git. Without it the tree is a bare checkout, and
+/// the route's import of `@acme/contracts` resolves for no compiler (carrick#3261).
+fn shared_package_repo(root: &Path, linked: bool) -> PathBuf {
+    let repo = root.join("monorepo");
+    let write = |relative: &str, contents: &str| {
+        let path = repo.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(
+        "carrick.json",
+        "{ \"services\": [\n  { \"name\": \"contracts\", \"directory\": \"packages/contracts\" },\n  { \"name\": \"api\", \"directory\": \"services/api\" },\n  { \"name\": \"client\", \"directory\": \"services/client\" }\n] }",
+    );
+    write(
+        "package.json",
+        "{ \"name\": \"monorepo\", \"private\": true, \"workspaces\": [\"packages/*\", \"services/*\"] }",
+    );
+    write(
+        "pnpm-workspace.yaml",
+        "packages:\n  - \"packages/*\"\n  - \"services/*\"\n",
+    );
+    write(".gitignore", "node_modules\n");
+    write(
+        "tsconfig.base.json",
+        "{ \"compilerOptions\": { \"strict\": true, \"target\": \"es2022\", \"module\": \"esnext\", \"moduleResolution\": \"bundler\", \"skipLibCheck\": true } }",
+    );
+    for service in ["services/api", "services/client"] {
+        write(
+            &format!("{service}/tsconfig.json"),
+            "{ \"extends\": \"../../tsconfig.base.json\", \"include\": [\"app\", \"src\"] }",
+        );
+    }
+    write(
+        "packages/contracts/package.json",
+        "{ \"name\": \"@acme/contracts\", \"version\": \"0.0.0\", \"main\": \"src/index.ts\" }",
+    );
+    write(
+        "packages/contracts/src/index.ts",
+        "export type WidgetDto = { id: string; activeCount: number };\n",
+    );
+    write(
+        "services/api/package.json",
+        "{ \"name\": \"api\", \"private\": true, \"dependencies\": { \"@remix-run/node\": \"^2.0.0\", \"@acme/contracts\": \"*\" } }",
+    );
+    write(
+        "services/api/app/routes/api.v1.widgets.$widgetId.ts",
+        "import type { WidgetDto } from \"@acme/contracts\";\n\n\
+         function build(id: string): WidgetDto {\n  return { id, activeCount: 3 };\n}\n\n\
+         export async function loader({\n  params,\n}: {\n  params: { widgetId: string };\n}): Promise<WidgetDto> {\n  return build(String(params.widgetId));\n}\n",
+    );
+    write(
+        "services/client/package.json",
+        "{ \"name\": \"client\", \"private\": true, \"dependencies\": { \"undici\": \"^6.0.0\" } }",
+    );
+    write(
+        "services/client/src/send.ts",
+        "export type RequestOptions = {\n  method: string;\n  headers?: Record<string, string>;\n};\n\n\
+         export async function send<T>(url: string, options: RequestOptions): Promise<T> {\n  const response = await fetch(url, options);\n  return (await response.json()) as T;\n}\n",
+    );
+    write(
+        "services/client/src/inventory.ts",
+        "import type { CatalogClient } from \"./client.js\";\n\n\
+         export async function countActive(\n  widgetId: string,\n  client: CatalogClient\n): Promise<number> {\n  const widget = await client.readWidget(widgetId);\n  return widget.activeCount;\n}\n",
+    );
+    write(
+        "services/client/src/client.ts",
+        "import { send } from \"./send.js\";\n\n\
+         export type WidgetDto = { id: string; activeCount: number };\n\n\
+         export class CatalogClient {\n  constructor(private readonly baseUrl: string) {}\n\n\
+         \x20 readWidget(widgetId: string): Promise<WidgetDto> {\n    const encoded = encodeURIComponent(widgetId);\n    return send<WidgetDto>(`${this.baseUrl}/api/v1/widgets/${encoded}`, {\n      method: \"GET\",\n    });\n  }\n}\n",
+    );
+    if linked {
+        let scope = repo.join("services/api/node_modules/@acme");
+        std::fs::create_dir_all(&scope).expect("the package scope directory");
+        std::os::unix::fs::symlink("../../../../packages/contracts", scope.join("contracts"))
+            .expect("link the workspace package");
+    }
+    std::fs::write(
+        root.join("carrick-workspace.json"),
+        "{ \"repos\": [\"./monorepo\"] }\n",
+    )
+    .expect("write the workspace file");
+    git(&repo, &["init", "-q", "."]);
+    commit_all(&repo, "fixture");
+    repo
+}
+
+const SHARED_PACKAGE_ROUTE: &str = "monorepo/services/api/app/routes/api.v1.widgets.$widgetId.ts";
+const SHARED_PACKAGE_CALL: &str = "monorepo/services/client/src/client.ts";
+const SHARED_PACKAGE_TYPE: &str = "monorepo/packages/contracts/src/index.ts";
+
+/// The customer shape of carrick#2998: the edit is in a package holding no
+/// route and no call, and the pair it breaks is a route and a call in other
+/// services, neither in a changed file.
+#[test]
+#[serial]
+fn a_shared_package_edit_fails_the_pair_it_breaks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    shared_package_repo(root, true);
+    index(root);
+
+    let (code, body) = check_files(root, &[SHARED_PACKAGE_ROUTE, SHARED_PACKAGE_CALL, "--json"]);
+    let pair: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(
+        code,
+        Some(0),
+        "the fixture's pair must type before the edit means anything (carrick#3261):\n{pair:#}"
+    );
+    assert_eq!(pair["type_checked"], 2, "{pair:#}");
+    assert!(
+        pair["not_type_checked"]
+            .as_array()
+            .is_none_or(|rows| rows.is_empty()),
+        "{pair:#}"
+    );
+
+    edit(
+        &root.join(SHARED_PACKAGE_TYPE),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(1), "{json:#}");
+    for (suffix, role) in [
+        ("api.v1.widgets.$widgetId.ts", "route"),
+        ("src/client.ts", "call"),
+    ] {
+        let row = problems_in(&json, suffix)
+            .into_iter()
+            .find(|p| p["role"] == role && p["kind"] == "incompatible")
+            .unwrap_or_else(|| panic!("the {role} in {suffix} is reported:\n{json:#}"));
+        assert_eq!(row["outside_the_change"], true, "{row:#}");
+        assert_eq!(row["fails"], true, "{row:#}");
+    }
+    assert!(json["outside_moved"].as_u64() >= Some(2), "{json:#}");
+    assert_eq!(json["routes"], 0, "the counts stay about the edited file");
+    assert_eq!(json["calls"], 0, "the counts stay about the edited file");
+}
+
+/// A comment in the shared package is not a type change: nothing outside it
+/// moves, even when the repo is re-read.
+#[test]
+#[serial]
+fn a_comment_in_a_shared_package_moves_nothing_outside_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    shared_package_repo(root, true);
+    index(root);
+    edit(
+        &root.join(SHARED_PACKAGE_TYPE),
+        "export type",
+        "// the widget\nexport type",
+    );
+
+    let (code, json, _) = check_changed_json_with(
+        root,
+        &[
+            ("CARRICK_MOCK_ALL", "1"),
+            ("CARRICK_CHECK_RESCAN", "always"),
+        ],
+    );
+    assert_eq!(code, Some(0), "{json:#}");
+    assert_eq!(json["outside_moved"], 0, "{json:#}");
+    assert!(
+        json["problems"]
+            .as_array()
+            .is_none_or(|rows| rows.is_empty()),
+        "{json:#}"
+    );
+    assert_eq!(
+        rescan_of(&json, "monorepo").as_deref(),
+        Some("ran"),
+        "{json:#}"
+    );
+}
+
+/// The same repo without the install's link is a bare checkout: the pair is
+/// named not type-checked, never called compatible (carrick#3261).
+#[test]
+#[serial]
+fn a_shared_package_with_no_install_is_named_not_type_checked() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    shared_package_repo(root, false);
+    index(root);
+
+    let (code, body) = check_files(root, &[SHARED_PACKAGE_ROUTE, SHARED_PACKAGE_CALL, "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(code, Some(2), "{json:#}");
+    assert_eq!(json["type_checked"], 0, "{json:#}");
+    assert!(
+        json["problems"]
+            .as_array()
+            .is_none_or(|rows| rows.is_empty()),
+        "{json:#}"
+    );
+    let rows = json["not_type_checked"]
+        .as_array()
+        .expect("not_type_checked");
+    assert_eq!(rows.len(), 2, "{json:#}");
+    let text = json["not_type_checked"].to_string();
+    assert!(
+        text.contains("api.v1.widgets.$widgetId.ts") && text.contains("client.ts"),
+        "{json:#}"
+    );
+}
