@@ -49,7 +49,7 @@ use crate::{
     operation::{OperationKey, Protocol},
     parser::parse_file,
     receiver_origin::{ReceiverOrigins, collect_receiver_origins},
-    request_summary::{RequestSummaryIndex, SummaryRow},
+    request_summary::{RequestSummaryIndex, StatedVerb, SummaryRow},
     services::type_sidecar::{
         ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
         TypeSidecar,
@@ -709,6 +709,10 @@ pub struct ProcessingStats {
     /// states at the same span (carrick-cloud#1365). Without it the row would
     /// have been indexed as a GET, the default for a missing method.
     pub model_methods_supplied: usize,
+    /// Model data-call rows whose verb the calls they make settle for the
+    /// requests they reach, and that disagreed with it (carrick#2676). The
+    /// row keeps its target.
+    pub model_methods_from_reached_requests: usize,
     /// Model endpoint rows discarded because they joined no convention row in
     /// a file a routing convention CLAIMED (carrick#703). In such a file the
     /// route set is the module's exported handlers, so a row the model states
@@ -4622,6 +4626,7 @@ impl FileOrchestrator {
                         model,
                         &pf.candidate_map,
                         &overrules,
+                        summaries.verbs(Path::new(&pf.path_str)),
                         &pf.path_str,
                         pf.route_module_claimed,
                         &mut stats,
@@ -4833,6 +4838,10 @@ impl FileOrchestrator {
         debug!(
             "  - Model calls given the method the source states: {}",
             stats.model_methods_supplied
+        );
+        debug!(
+            "  - Model calls given the verb the requests they reach settle: {}",
+            stats.model_methods_from_reached_requests
         );
         debug!(
             "  - Model endpoints discarded in convention-claimed modules: {}",
@@ -9200,6 +9209,7 @@ impl FileOrchestrator {
         model: FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
         overrules: &[Resolved],
+        stated_verbs: &[StatedVerb],
         file_path: &str,
         route_module_claimed: bool,
         stats: &mut ProcessingStats,
@@ -9712,6 +9722,8 @@ impl FileOrchestrator {
                 .find(|entry| entry.span.map(|(start, _)| start) == span)
             {
                 Self::overrule_model_call(&mut call, overrule, file_path, stats);
+            } else if let Some(stated) = Self::stated_verb_at(&call, stated_verbs) {
+                Self::take_stated_verb(&mut call, stated, file_path, stats);
             }
             call.resolution_source = Some(ResolutionSource::Model);
             result.data_calls.push(call);
@@ -9906,6 +9918,48 @@ impl FileOrchestrator {
             } else {
                 Self::settle_dispatch(&deterministic.body_literals, model.dispatch)
             };
+    }
+
+    /// The verb the request summaries settle at the model row's call
+    /// ([`StatedVerb`], carrick#2676): the one at its span, or, for a row
+    /// with no span (a file read with no candidate to join on), the one call
+    /// on its line that settles a verb. Two such calls on the line, and the
+    /// row is not placed.
+    fn stated_verb_at<'v>(
+        call: &DataCallResult,
+        stated_verbs: &'v [StatedVerb],
+    ) -> Option<&'v StatedVerb> {
+        if let Some(span) = call.call_expression_span_start {
+            return stated_verbs.iter().find(|stated| stated.span_start == span);
+        }
+        let mut on_line = stated_verbs.iter().filter(|stated| {
+            i32::try_from(stated.line).is_ok_and(|line| {
+                call.line_number == line || call.call_expression_line == Some(line)
+            })
+        });
+        let one = on_line.next()?;
+        on_line.next().is_none().then_some(one)
+    }
+
+    /// Give the model row the verb its call settles for the requests it
+    /// reaches (carrick#2676). The target stays the model's: the request
+    /// summaries could not state it at this call.
+    fn take_stated_verb(
+        call: &mut DataCallResult,
+        stated: &StatedVerb,
+        file_path: &str,
+        stats: &mut ProcessingStats,
+    ) {
+        let model = call.method.as_deref().map(str::trim).unwrap_or_default();
+        if model.eq_ignore_ascii_case(&stated.method) {
+            return;
+        }
+        debug!(
+            "Taking the verb the requests reached settle for the model's call at {file_path}:{}: {:?} (the model stated {model:?})",
+            call.line_number, stated.method
+        );
+        stats.model_methods_from_reached_requests += 1;
+        call.method = Some(stated.method.clone());
     }
 
     /// Apply a statement that is not a row of its own to the model row at its
@@ -14693,6 +14747,7 @@ export * from "./aFetch.js";"#,
             },
             &HashMap::new(),
             &[],
+            &[],
             "src/client.ts",
             false,
             &mut stats,
@@ -14714,6 +14769,48 @@ export * from "./aFetch.js";"#,
             primary_type_symbol: Some(symbol.to_string()),
             ..call_with_span(10, target, Some(span))
         }
+    }
+
+    fn stated_verb(line: u32, span_start: u32, method: &str) -> StatedVerb {
+        StatedVerb {
+            span_start,
+            span_end: span_start + 40,
+            line,
+            method: method.to_string(),
+        }
+    }
+
+    /// The verb a call settles for the requests it reaches is placed on the
+    /// model's row by span, or by line for a row with no span, and only where
+    /// one call on that line settles one (carrick#2676).
+    #[test]
+    fn a_stated_verb_is_placed_by_span_or_by_its_one_call_on_the_line() {
+        let spanned = model_call("DELETE", "/api/jobs/:id", 500, "Job");
+        let verbs = [stated_verb(10, 500, "GET"), stated_verb(10, 600, "POST")];
+        assert_eq!(
+            FileOrchestrator::stated_verb_at(&spanned, &verbs).map(|v| v.method.as_str()),
+            Some("GET")
+        );
+
+        let spanless = DataCallResult {
+            method: Some("DELETE".to_string()),
+            ..call_with_span(10, "/api/jobs/:id", None)
+        };
+        assert_eq!(
+            FileOrchestrator::stated_verb_at(&spanless, &verbs[..1]).map(|v| v.method.as_str()),
+            Some("GET")
+        );
+        assert!(FileOrchestrator::stated_verb_at(&spanless, &verbs).is_none());
+        assert!(
+            FileOrchestrator::stated_verb_at(&spanless, &[stated_verb(11, 500, "GET")]).is_none()
+        );
+
+        let mut row = spanless.clone();
+        let mut stats = ProcessingStats::default();
+        FileOrchestrator::take_stated_verb(&mut row, &verbs[0], "src/job.ts", &mut stats);
+        assert_eq!(row.method.as_deref(), Some("GET"));
+        assert_eq!(row.target, "/api/jobs/:id");
+        assert_eq!(stats.model_methods_from_reached_requests, 1);
     }
 
     /// A site the source states as several requests holds several rows. A
@@ -14834,6 +14931,7 @@ export * from "./aFetch.js";"#,
                 ..Default::default()
             },
             &candidate_map,
+            &[],
             &[],
             "src/client.ts",
             false,
@@ -19460,6 +19558,7 @@ export { routes };
             model,
             candidate_map,
             &overrules,
+            &[],
             file_path,
             route_module_claimed,
             &mut stats,

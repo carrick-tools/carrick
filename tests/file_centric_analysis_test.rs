@@ -328,6 +328,7 @@ fn test_processing_stats_tracking() {
         model_routes_kept_without_a_site: 0,
         model_contradictions_discarded: 0,
         model_methods_supplied: 0,
+        model_methods_from_reached_requests: 0,
         model_endpoints_discarded_in_claimed_modules: 0,
         model_endpoints_dropped_unanchored: 0,
         model_endpoints_dropped_unanchored_sites: Vec::new(),
