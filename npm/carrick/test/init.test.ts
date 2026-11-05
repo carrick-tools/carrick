@@ -48,6 +48,7 @@ import {
   preselectedRepos,
   chooseEditors,
   CLOUD_NEXT_TITLE,
+  cloudNextLines,
   ASK_YOUR_AGENT_PROMPT,
   type InitOptions,
 } from "../src/init/run.ts";
@@ -3927,6 +3928,18 @@ test("the workspace read says who builds the index, and only cloud is the cloud 
   assert.equal((await resolveRepos("t", [], answer({ index_builder: 7 }))).workspace.index_builder, undefined);
 });
 
+test("the cloud lane's closing block is the prompt plus only the steps still open", () => {
+  assert.equal(CLOUD_NEXT_TITLE, "Done. Open a new agent session in this folder, then ask it:");
+  assert.deepEqual(cloudNextLines(false, false), [`${ASK_YOUR_AGENT_PROMPT}.`]);
+  assert.deepEqual(cloudNextLines(true, true), [
+    `${ASK_YOUR_AGENT_PROMPT}.`,
+    "",
+    "The index is not on this machine yet: `carrick refresh` reads it in once Carrick has built it.",
+    "",
+    "Codex: open `codex` here once and trust the project's hooks, or it skips them.",
+  ]);
+});
+
 test("where Carrick builds the index, init asks nothing, installs everything and reads the index in", posixNativeFixture, async () => {
   // With a terminal and without one: neither is asked anything, and neither
   // needs --yes.
@@ -3945,17 +3958,14 @@ test("where Carrick builds the index, init asks nothing, installs everything and
       assert.ok(out.lines.includes("◇ Set up in project Shop (shop): api"), text);
       assert.match(text, /^Hosted index for 1 service read into \.carrick\/ in \d/m);
       assert.ok(out.lines.includes(`◇ ${READY}`), text);
-      // The run closes on what it wrote, the new-session step and the prompt
+      // The run closes on the new-session step, the prompt and, on a first
+      // write of the Codex hooks, the trust step, said once and last
       // (carrick#3286); the laptop lane's paste-this block never appears.
       const closing = text.slice(text.indexOf(CLOUD_NEXT_TITLE));
-      assert.match(closing, /Written here:/);
-      assert.match(closing, /Claude Code hooks in \.claude\/settings(\.local)?\.json/);
-      assert.match(closing, /Codex hooks in \S+ \(open `codex` here once and trust the project's hooks, or Codex skips them\)/);
-      assert.match(closing, /Carrick task skills/);
-      assert.match(closing, /The Carrick MCP server for Claude Code/);
-      assert.match(closing, /Open a new agent session in this folder, so it loads the MCP server and the hooks\./);
-      assert.ok(closing.includes(`Then ask it: ${ASK_YOUR_AGENT_PROMPT}.`), closing);
-      assert.match(closing, /HTTP, GraphQL, socket events and queues/);
+      assert.ok(closing.includes(`${ASK_YOUR_AGENT_PROMPT}.`), closing);
+      assert.match(closing, /Codex: open `codex` here once and trust the project's hooks, or it skips them\./);
+      assert.doesNotMatch(closing, /Written here|so it loads the MCP server|socket events and queues/);
+      assert.doesNotMatch(text, /choose to trust the project's hooks/);
       // The index is on this machine, so refresh is not offered.
       assert.doesNotMatch(closing, /carrick refresh/);
       // Nobody scaffolds here: no instruction for an agent, no config, no
