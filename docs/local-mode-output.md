@@ -226,7 +226,7 @@ has not moved past: nothing needed re-judging, so nothing was.
 
 | field | type | meaning |
 |---|---|---|
-| `ran` | string | `extraction+types`: the file was re-extracted, re-joined against the blobs the index holds, and at least one of its rows carries a type verdict. `extraction`: the same, and no row of this file carries one — nothing here pairs with anything, or its pairs were not both resolved, and each row's own `verdict.detail` says which. `none`: the items above are the indexed ones |
+| `ran` | string | `extraction+types`: the file was re-extracted, re-joined against the blobs the index holds, and at least one of its rows carries a type verdict. `extraction`: the same, and no row of this file carries one — nothing here pairs with anything, or its pairs were not both resolved, and each row's own `verdict.detail` says which. `none`: the items above are the indexed ones (when the edit changed nothing the scan reads, a comment or layout, no re-scan starts and each row's `line` is moved to where its node now sits) |
 | `elapsed_ms` | int | wall time of the re-check, including one that missed its budget |
 | `stale_since` | string (RFC 3339) | when the items above were computed. Present only on a `none` — otherwise the answer is now |
 | `reason` | string | why the re-check did not run, in one sentence. Present only on a `none` |

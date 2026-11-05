@@ -905,6 +905,91 @@ fn check_each_answers_every_file_in_one_call() {
     }
 }
 
+/// An edit the scan reads the same as the indexed file (a comment, a reflow)
+/// is answered from the index at once: no re-scan starts, the rows keep their
+/// verdicts, and each row's line follows its node.
+#[test]
+#[serial]
+fn a_comment_only_edit_is_answered_without_a_re_scan() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+
+    index(root);
+    let args = ["check", route, "--workspace", ".", "--recheck", "--json"];
+    let indexed: serde_json::Value = serde_json::from_str(&run(root, &args)).expect("JSON");
+    let line = indexed["items"][0]["line"].as_u64().expect("a row line");
+
+    edit(
+        &route_file,
+        "export async function",
+        "// a note\nexport async function",
+    );
+
+    let before = recheck_temp_dirs();
+    let answered: serde_json::Value = serde_json::from_str(&run(root, &args)).expect("JSON");
+    assert_eq!(answered["stale"], serde_json::json!(true), "{answered:#}");
+    assert_eq!(
+        answered["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answered:#}"
+    );
+    assert_eq!(
+        answered["recheck"]["reason"],
+        serde_json::json!(
+            "the edit changed nothing the scan reads (comments or layout); verdicts are the index's"
+        ),
+        "{answered:#}"
+    );
+    assert_eq!(
+        answered["items"][0]["line"].as_u64(),
+        Some(line + 1),
+        "{answered:#}"
+    );
+    assert_eq!(
+        answered["items"][0]["verdict"]["state"], indexed["items"][0]["verdict"]["state"],
+        "{answered:#}"
+    );
+    assert_eq!(
+        recheck_temp_dirs(),
+        before,
+        "no re-scan generation was started"
+    );
+}
+
+/// A token the scan reads, or a comment that carries a type, is not an edit
+/// that reads the same: both still take the re-scan.
+#[test]
+#[serial]
+fn an_edit_the_scan_reads_differently_is_still_re_scanned() {
+    for (from, to) in [
+        ("hex-key", "other-key"),
+        (
+            "export async function",
+            "/** @type {number} */\nexport async function",
+        ),
+    ] {
+        let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+        let root = workspace.path();
+        let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+
+        index(root);
+        edit(&root.join(route), from, to);
+        let answered: serde_json::Value = serde_json::from_str(&run_with_env(
+            root,
+            &["check", route, "--workspace", ".", "--recheck", "--json"],
+            &[("CARRICK_RECHECK_BUDGET_MS", "600000")],
+        ))
+        .expect("JSON");
+        assert_ne!(
+            answered["recheck"]["ran"],
+            serde_json::json!("none"),
+            "{to:?} must re-scan:\n{answered:#}"
+        );
+    }
+}
+
 /// Temporary generations a re-check has left in the system temp directory.
 /// Compared before and after rather than required to be empty: another test
 /// binary may be running one of its own (carrick#592).

@@ -118,16 +118,41 @@ pub fn answer(
     // tell apart.
     let recheck = match (freshness, mode) {
         (Freshness::Recheck, Mode::Check) if stale && !deleted => {
-            Some(match super::recheck::Reach::of(repo, &relative, &service) {
-                Some(reach) => rechecked(
-                    workspace_root,
-                    &repo_root,
-                    &relative,
-                    &indexed_at,
-                    &index.indexed_at,
-                    &reach,
+            // An edit the scan reads the same (comments, layout) has nothing
+            // to re-scan: the indexed rows stand, each at the line its node
+            // moved to. Every other edit takes the re-scan below.
+            let unchanged = service_row
+                .filter(|service| !service.dirty && !service.commit.is_empty())
+                .and_then(|service| {
+                    super::reads_same::reads_same_since(&repo_root, &service.commit, &relative)
+                });
+            Some(match unchanged {
+                Some(lines) => (
+                    Some(
+                        items
+                            .iter()
+                            .map(|item| IndexedItem {
+                                line: item.line.map(|line| lines.map(line)),
+                                ..item.clone()
+                            })
+                            .collect(),
+                    ),
+                    Recheck {
+                        reason: Some(UNREAD_EDIT_REASON.to_string()),
+                        ..not_run("", &indexed_at)
+                    },
                 ),
-                None => (None, not_run("no service reads this file", &indexed_at)),
+                None => match super::recheck::Reach::of(repo, &relative, &service) {
+                    Some(reach) => rechecked(
+                        workspace_root,
+                        &repo_root,
+                        &relative,
+                        &indexed_at,
+                        &index.indexed_at,
+                        &reach,
+                    ),
+                    None => (None, not_run("no service reads this file", &indexed_at)),
+                },
             })
         }
         (Freshness::Recheck, Mode::Check) => Some((
@@ -364,6 +389,10 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
         scope: None,
     }
 }
+
+/// Said when an edit changed nothing the scan reads. Agent-facing.
+const UNREAD_EDIT_REASON: &str =
+    "the edit changed nothing the scan reads (comments or layout); verdicts are the index's";
 
 /// One indexed row, in the contract's shape.
 /// Re-judge one file from the working tree, and say what happened either way.
