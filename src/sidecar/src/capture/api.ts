@@ -220,8 +220,8 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    capture walk's budget, so it is reported unverified rather than clean.
  *  - `no_payload_evidence`: a handler returned a call whose callee has no
  *    resolvable declaration, and nothing in the handler states what the callee
- *    is — no returned sibling call hands it a body plus a status, and the
- *    argument carries no `satisfies`/`as` annotation. Reading its argument
+ *    is — the compiler cannot resolve the callee, no labelled response send
+ *    names the payload, and the argument carries no `satisfies`/`as` annotation. Reading its argument
  *    anyway would publish a query or a parameter bag as the endpoint's
  *    contract.
  *  - `machinery_envelope`: the return resolved to transport (a
