@@ -213,7 +213,12 @@ fn graph_calls(blob: &serde_json::Value) -> Vec<String> {
 /// `src/screens.ts` a hook calls `listItems` from a query package's
 /// callback, and three functions call the others. The reader's cassette
 /// names each caller's request wrongly: `GET /api/list`, `PATCH`, `POST
-/// /api/save`, and `GET /api/all`.
+/// /api/save`, and `GET /api/all`. Its `tag` row at `src/screens.ts:25`
+/// echoes an id no candidate lists (`unlisted:tag`): the scan lists only the
+/// `listItems()` site on that line, so the mock's `@line:25` placeholder
+/// would name that call (`agent_service::substitute_candidate_placeholders`)
+/// and state the `tag` row as a second reading of `listItems()`, which the
+/// call-through pass then corrects to `GET /api/items`.
 ///
 /// | line | reader states | the scan |
 /// |---|---|---|

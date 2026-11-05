@@ -8,6 +8,14 @@
     "names": [
       { "arg": 0, "from": "argument", "text": "/lookup/:id", "shape": "path" }
     ],
+    "library": [
+      {
+        "specifier": "invented-router",
+        "export": "Router",
+        "member": "get",
+        "receivers": ["instance:()"]
+      }
+    ],
     "chains": [
       {
         "hops": [],

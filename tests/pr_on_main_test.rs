@@ -605,10 +605,16 @@ async fn a_pr_result_names_the_index_it_compared_with_and_counts_what_it_checked
         }),
         "{payload:#}"
     );
+    // Two pairs: the imported-member pass's rows at `src/inventory.ts:9` and
+    // `:17`. With no sidecar the walk writes no rows, and its index is all
+    // holes (`walk_lane::Walked::index`, `PositionIndex::missing`): the
+    // request summaries state no row (`rows_missing` at every site the call
+    // graph follows), so their three rows, `src/client.ts:14` among them,
+    // are gone, as with 0.3.143 and the fact-layer switches on.
     assert_eq!(
         payload["checked"],
         serde_json::json!({
-            "pairs": { "compatible": 0, "unverifiable": 0, "incompatible": 0, "not_compared": 3 },
+            "pairs": { "compatible": 0, "unverifiable": 0, "incompatible": 0, "not_compared": 2 },
             "dependencies": { "shared": 1, "changed": 1 },
         }),
         "{payload:#}"

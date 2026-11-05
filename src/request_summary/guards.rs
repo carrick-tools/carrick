@@ -3363,6 +3363,10 @@ mod tests {
 
     /// A route registered under an imported constant with spread handlers
     /// states the constant's text and reads the arguments before the spread.
+    /// The call is a library site of the package's `Router` instance: a call
+    /// with a spread argument is one, its later positions unread
+    /// (`library_sites::Reader::library_site`; only a `new` with a spread is
+    /// none).
     #[test]
     fn a_route_registered_under_an_imported_constant_states_its_text() {
         assert_named_calls("receive-guards/constant-routes", "constant-routes");

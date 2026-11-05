@@ -2006,9 +2006,8 @@ type LibraryReceiver = (SiteBinding, Vec<String>, Option<String>, Span);
 impl Reader<'_> {
     /// The library site a call or a `new` writes, when its callee names a
     /// library client. A spread argument moves every position after it, and
-    /// the claims say what a position means: with the receiver trace on, a
-    /// call carries them unread ([`site_args`]); otherwise such a call is no
-    /// site. A `new` with a spread is never a site.
+    /// the claims say what a position means: a call carries them unread
+    /// ([`site_args`]). A `new` with a spread is never a site.
     pub(super) fn library_site(
         &self,
         span: Span,
@@ -2017,9 +2016,7 @@ impl Reader<'_> {
         args: &[ExprOrSpread],
         scope: &Scope<'_>,
     ) -> Option<LibrarySiteIr> {
-        if args.iter().any(|arg| arg.spread.is_some())
-            && (form == MakerForm::New || spread_from(args).is_none())
-        {
+        if form == MakerForm::New && spread_from(args).is_some() {
             return None;
         }
         let (binding, path, member, named) = self.library_receiver(callee, scope)?;
