@@ -881,6 +881,8 @@ fn short(commit: &str) -> &str {
 }
 
 /// Whether a changed path is left out of a [`ChangedSince`] listing.
+/// The paths changed since each commit, or why git could not list them.
+type ListedByCommit = HashMap<String, Result<Vec<ChangedPath>, String>>;
 type DroppedPaths = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// The paths changed since each stored commit, listed once per commit for the
@@ -897,7 +899,7 @@ pub struct ChangedSince {
     dropped: Option<std::sync::Arc<DroppedPaths>>,
     /// The listing per commit before `dropped` applies, shared by every
     /// [`ChangedSince::view`] of this one.
-    listed: std::sync::Arc<std::sync::Mutex<HashMap<String, Result<Vec<ChangedPath>, String>>>>,
+    listed: std::sync::Arc<std::sync::Mutex<ListedByCommit>>,
     /// How many times git was asked for a listing, across every view.
     listings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     moved: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<DependencyMove>>>>,
