@@ -31,12 +31,8 @@ npm install -g carrick
 In the folder that holds your repositories:
 
 ```bash
-# Finds the repos, writes the service proposal, wires up the hooks. Runs no scan.
+# Signs you in, wires up the hooks and downloads your index. Runs no scan.
 carrick init
-
-# Builds the index: Carrick classifies what the deterministic passes could not.
-# This is the scan, and it runs once. Your agent writes carrick.json first.
-carrick index
 ```
 
 > **Note:** If the CLI is installed somewhere that is not on `PATH`, point the `carrick.binary` setting at it. Without a usable binary or an index, the server publishes nothing and says why in the **Carrick** output channel.

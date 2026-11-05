@@ -522,13 +522,13 @@ impl ServiceBoundary {
     /// service holds no API at all and when every candidate in it is waiting
     /// for the paid scan. This is the number that tells those two apart
     /// (carrick#997 item 8), and the summary tables print it beside the route
-    /// and call counts. It names the command that resolves them, which since
-    /// carrick#1008 is `carrick index` itself rather than a flag on it.
+    /// and call counts. It names what resolves them: Carrick's own scan in
+    /// the cloud, never a command to run here (carrick#3361).
     pub fn awaiting_model(&self) -> Option<String> {
         match self.candidates_awaiting_model {
-            Some(count) if count > 0 => {
-                Some(format!("{count} candidate(s) waiting for `carrick index`"))
-            }
+            Some(count) if count > 0 => Some(format!(
+                "{count} candidate(s) waiting for Carrick's cloud scan"
+            )),
             _ => None,
         }
     }
@@ -1530,7 +1530,7 @@ mod tests {
         boundary.candidates_awaiting_model = Some(8);
         assert_eq!(
             boundary.awaiting_model().as_deref(),
-            Some("8 candidate(s) waiting for `carrick index`")
+            Some("8 candidate(s) waiting for Carrick's cloud scan")
         );
     }
 

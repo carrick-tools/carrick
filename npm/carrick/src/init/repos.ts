@@ -3,6 +3,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { z } from "zod";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
+import { versionFile } from "./outdated.ts";
+import { excludedRepos } from "./workspace-file.ts";
 
 const service = z.object({ serviceName: z.string().nullable(), directory: z.string().optional(), tsconfig: z.string().optional() }).passthrough();
 const proposal = z.object({
@@ -18,23 +20,16 @@ const proposal = z.object({
     not_installed: z.array(z.object({ service: z.string(), directory: z.string(), command: z.string() })),
   })),
 });
+/**
+ * One `carrick derive` run, parsed: the repos of this folder, the folder above
+ * a single repository, and what a scan of each would refuse over. Nothing of
+ * it is written anywhere: the config every scan runs under is Carrick's, held
+ * for the project and derived in the cloud (carrick#3361).
+ */
 export type WorkspaceProposal = z.infer<typeof proposal>;
 
-/**
- * One `carrick derive` run: the document as the scanner printed it, and the
- * same document parsed.
- *
- * Both halves are kept because they are read by different consumers. `plan` is
- * what this CLI prints and decides on; `document` is what lands in
- * `.carrick/proposal.json` for whoever writes the config from it, and it has to be the
- * scanner's own bytes — the schema above is not a passthrough at the top level,
- * so parsing and re-serialising would silently drop any field a later
- * `carrick.derive/0` adds.
- */
-export type DerivedWorkspace = { plan: WorkspaceProposal; document: string };
-
-/** Rust owns service selection, tsconfig precedence and configuration validation. */
-export function deriveWorkspace(workspace: string): DerivedWorkspace {
+/** Rust owns repo discovery, service selection and configuration validation. */
+export function deriveWorkspace(workspace: string): WorkspaceProposal {
   const native = resolveNativeBinary();
   if (!native.binary) throw new Error(native.problem ?? "The Carrick scanner is not installed.");
   const result = spawnSync(native.binary, ["derive", "--workspace", workspace, "--json"], {
@@ -47,100 +42,61 @@ export function deriveWorkspace(workspace: string): DerivedWorkspace {
   // failures and hides the sentence that matters.
   if (result.status !== 0) throw new Error(result.stderr.trim().replace(/^carrick derive: /, "") || "The scanner could not derive the workspace.");
   const parsed = proposal.safeParse(JSON.parse(result.stdout));
-  if (!parsed.success) throw new Error("The scanner returned an unsupported workspace proposal. Install matching Carrick CLI and scanner versions.");
-  return { plan: parsed.data, document: result.stdout };
+  if (!parsed.success) throw new Error("The scanner described this workspace in a shape this CLI cannot read. Install matching Carrick CLI and scanner versions.");
+  return parsed.data;
 }
 
-/**
- * The same derivation with the repos this install does not cover taken out.
- *
- * A folder routinely holds a repo that must not be indexed — private data, a
- * throwaway fixture — and the proposal is what an agent turns into
- * `carrick.json`, so a repo left in it is a repo that gets scanned
- * (carrick#1338). The filtering is done on the scanner's own JSON rather than
- * on the parsed shape, so a field this client's schema does not know survives
- * it, and a selection that keeps everything returns the scanner's bytes
- * untouched.
- *
- * The dropped repos are named in `repos_excluded`, which is the field the
- * workspace file's own `exclude` list lands in: the agent reading this
- * document then sees which repos were left out rather than a shorter list with
- * nothing to explain it.
- */
-export function selectedProposal(derived: DerivedWorkspace, keep: string[]): DerivedWorkspace {
+/** The same derivation with only these repos in it, by path. */
+export function keepRepos(derived: WorkspaceProposal, keep: string[]): WorkspaceProposal {
   const kept = new Set(keep);
-  const dropped = derived.plan.repos.filter((repo) => !kept.has(repo.path));
-  if (dropped.length === 0) return derived;
-  const document = JSON.parse(derived.document) as Record<string, unknown>;
-  const repos = Array.isArray(document["repos"]) ? (document["repos"] as Array<Record<string, unknown>>) : [];
-  document["repos"] = repos.filter((repo) => kept.has(String(repo["path"])));
-  const excluded = Array.isArray(document["repos_excluded"]) ? (document["repos_excluded"] as unknown[]) : [];
-  document["repos_excluded"] = [...excluded, ...dropped.map((repo) => path.basename(repo.path))];
-  return {
-    plan: { ...derived.plan, repos: derived.plan.repos.filter((repo) => kept.has(repo.path)), repos_excluded: document["repos_excluded"] as string[] },
-    document: JSON.stringify(document),
-  };
+  return { ...derived, repos: derived.repos.filter((repo) => kept.has(repo.path)) };
 }
-
-/** The seam document, relative to the workspace root (carrick-cloud#799). */
-export const PROPOSAL_FILE = path.join(".carrick", "proposal.json");
 
 /**
  * The folder above this repo, where an earlier `carrick init` there set this
  * repo up with the others; null otherwise.
  *
  * Run inside one repo of a folder that is already set up, init used to offer
- * this repo on its own, which is a second setup beside the first. The
- * folder's proposal names the repos that setup covers, so a repo it names is
- * set up from the folder again (carrick#1512, orchestrator ruling).
+ * this repo on its own, which is a second setup beside the first, so a repo
+ * that setup covers is set up from the folder again (carrick#1512,
+ * orchestrator ruling). The folder's own record of that run is the version
+ * file init writes into its `.carrick/` (`versionFile`); the repos it covers
+ * are the git repositories in it, holding a JavaScript or TypeScript
+ * manifest, that its workspace file does not leave out. A folder that is
+ * itself a repository is not a folder of repos (carrick#3361: this used to
+ * read a proposal file that init no longer writes).
  */
 export function initFolderAbove(repo: string): string | null {
   const here = realPath(repo);
   const folder = path.dirname(here);
   if (folder === here) return null;
-  let document: unknown;
-  try {
-    document = JSON.parse(fs.readFileSync(path.join(folder, PROPOSAL_FILE), "utf8"));
-  } catch {
-    return null;
-  }
-  const repos = (document as { repos?: unknown } | null)?.repos;
-  if (!Array.isArray(repos)) return null;
-  const covered = repos.some(
-    (entry) => typeof (entry as { path?: unknown } | null)?.path === "string" && realPath((entry as { path: string }).path) === here,
-  );
-  return covered ? folder : null;
+  if (!fs.existsSync(versionFile(folder)) || fs.existsSync(path.join(folder, ".git"))) return null;
+  if (!fs.existsSync(path.join(here, ".git")) || !JS_MANIFESTS.some((manifest) => fs.existsSync(path.join(here, manifest)))) return null;
+  const excluded = new Set(excludedRepos(folder).map((name) => name.toLowerCase()));
+  return excluded.has(path.basename(here).toLowerCase()) ? null : folder;
 }
 
 /**
  * Byte-identical to `write_self_ignore` in `src/local_mode/workspace.rs`.
  *
  * Two writers, because either command can be the first to create the
- * directory: `carrick index` writes it on every build, and `carrick init` now
- * writes the proposal before any index exists. Same bytes so neither rewrites
- * the other's file. Keep the two in step.
+ * directory: `carrick index` writes it on every build, and `carrick init`
+ * records its version there before any index exists. Same bytes so neither
+ * rewrites the other's file. Keep the two in step.
  */
 const SELF_IGNORE =
   "# Written by Carrick. Everything here is derived from your source and the\n" +
   "# hosted index, and `carrick refresh` rebuilds it.\n*\n";
 
 /**
- * Write the derived proposal where `carrick.json` is written from it.
- *
- * This is the whole of what init leaves in the workspace besides the hook
- * settings: the config is seeded from this document by hand, and nothing
- * this command derived without a model is committed to the repository
- * (carrick-cloud#799). Rewritten on every run rather than created once — it is
- * a derived file in an ignored directory, and a stale one would seed the
- * config from a workspace that has since changed.
+ * Create the workspace's `.carrick/`, ignored by git through its own
+ * `.gitignore`, so nothing init or a later read keeps there is ever offered
+ * to a commit.
  */
-export function writeProposal(workspace: string, derived: DerivedWorkspace): string {
+export function ensureIndexDir(workspace: string): void {
   const directory = path.join(workspace, ".carrick");
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, ".gitignore"), SELF_IGNORE);
-  const document = derived.document.endsWith("\n") ? derived.document : `${derived.document}\n`;
-  fs.writeFileSync(path.join(workspace, PROPOSAL_FILE), document);
-  return PROPOSAL_FILE;
 }
 
 /**
@@ -176,9 +132,6 @@ export function repoRoots(workspace: string): string[] {
  * already been set up for Carrick.
  */
 const JS_MANIFESTS = ["package.json", "deno.json", "deno.jsonc", "pnpm-workspace.yaml", "carrick.json"];
-
-/** The most sibling repos `carrick init` lists to choose from (carrick#1512). */
-export const MAX_SIBLINGS = 15;
 
 /**
  * The other repos in the folder above this one, where there are any.
@@ -281,7 +234,7 @@ export function selectRepos(
     matched.set(taken.path, taken);
   }
   // Workspace order, whatever order the flags came in: everything downstream
-  // reads this list, and the scanner's order is the one the proposal is in.
+  // reads this list, and the scanner's order is the one the derivation is in.
   return { repos: candidates.map((repo) => matched.get(repo.path)).filter((repo): repo is RepoIdentity => repo !== undefined), taken };
 }
 

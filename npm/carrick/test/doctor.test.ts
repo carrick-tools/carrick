@@ -29,11 +29,7 @@ import {
   configuredRepos,
   declaredServices,
   findingCount,
-  functionalLines,
   parseArgs,
-  pinnedActionRef,
-  templateDrift,
-  workflowVariables,
   type GitReader,
   type HookMachine,
   type Line,
@@ -145,7 +141,7 @@ test("a declared GraphQL schema is found through its glob, even under a build fo
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("a missing service directory, a config that is not JSON, and a workspace with no config at all", () => {
+test("a missing service directory, and a config that is not JSON", () => {
   const gone = workspace({ "carrick.json": JSON.stringify({ serviceName: "api", directory: "api" }) });
   assert.match(checkDeclaredPaths(configuredRepos(gone))[0]!.text, /declares directory "api"/);
 
@@ -156,15 +152,39 @@ test("a missing service directory, a config that is not JSON, and a workspace wi
   assert.equal(brokenLines[0]!.level, "refuse");
   assert.match(brokenLines[0]!.text, /not valid JSON/);
 
-  const bare = workspace({ "src/index.ts": "export {};\n" });
-  const bareLines = checkDeclaredPaths(configuredRepos(bare));
-  assert.equal(findingCount(bareLines), 1);
-  assert.match(bareLines.at(-1)!.text, /No carrick.json anywhere in this workspace/);
-
-  for (const root of [gone, broken, bare]) fs.rmSync(root, { recursive: true, force: true });
+  for (const root of [gone, broken]) fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("a sibling repo with no carrick.json is reported as a fact, not as a finding", () => {
+// carrick#3361: the config comes from Carrick, so a workspace with no
+// carrick.json is the ordinary one, and doctor says where the config is
+// rather than sending anyone to write one.
+test("a workspace with no carrick.json is no finding, and the line names the config Carrick holds", () => {
+  const root = workspace({ ".git/HEAD": "ref: refs/heads/main\n", "src/index.ts": "export {};\n" });
+  const lines = checkDeclaredPaths(configuredRepos(root));
+  assert.equal(findingCount(lines), 0, texts(lines).join("\n"));
+  assert.deepEqual(texts(lines), ["done: Service config: Carrick holds it for this project, so no repo here needs a carrick.json."]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("the workflow check has one lane: no workflow is no line, and a workflow is told it can go", () => {
+  const none = workspace({ "carrick.json": JSON.stringify({ serviceName: "api" }) });
+  assert.deepEqual(checkWorkflow(configuredRepos(none)), []);
+  // A workflow is named whether or not the repo commits a config.
+  const kept = workspace({ [workflowPath]: renderTemplate("workflow") });
+  const keptLines = checkWorkflow(configuredRepos(kept));
+  assert.equal(findingCount(keptLines), 0, texts(keptLines).join("\n"));
+  assert.equal(keptLines.length, 1, texts(keptLines).join("\n"));
+  assert.match(keptLines[0]!.text, /no longer needed/);
+  for (const root of [none, kept]) fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("doctor's help names no template to match and no config to write", () => {
+  const help = parseArgs(["--help"]);
+  assert.equal(typeof help, "string");
+  assert.doesNotMatch(String(help), /current template|derives one|for your agent to write/);
+});
+
+test("a sibling repo with no carrick.json is no line at all: its config is Carrick's", () => {
   const root = workspace({
     "carrick.json": JSON.stringify({ serviceName: "api" }),
     "notes/.git": "gitdir: elsewhere\n",
@@ -172,7 +192,7 @@ test("a sibling repo with no carrick.json is reported as a fact, not as a findin
   });
   const lines = checkDeclaredPaths(configuredRepos(root));
   assert.equal(findingCount(lines), 0, texts(lines).join("\n"));
-  assert.ok(lines.some((line) => line.level === "say" && line.text.includes("notes has no carrick.json")));
+  assert.ok(!texts(lines).some((line) => line.includes("notes")), texts(lines).join("\n"));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -228,98 +248,6 @@ test("the services a config declares, flat and as an array", () => {
   assert.deepEqual(declaredServices({ internalEnvVars: ["API_URL"] }), [{ name: "service 1", include: [], graphqlSchemas: [] }]);
 });
 
-test("comments and blank lines are not drift", () => {
-  const template = renderTemplate("workflow");
-  const stripped = template
-    .split("\n")
-    .filter((line) => line.trim() !== "" && !line.trim().startsWith("#"))
-    .join("\n");
-  const drift = templateDrift(stripped, template);
-  assert.deepEqual(drift.missing, []);
-  assert.deepEqual(drift.added, []);
-  assert.ok(functionalLines(template).every((line) => !line.trim().startsWith("#")));
-});
-
-test("a diff names the template lines that are gone and the lines that are yours", () => {
-  const template = renderTemplate("workflow");
-  const withoutDispatch = template
-    .split("\n")
-    .filter((line) => !line.includes("repository_dispatch"))
-    .join("\n");
-  const missing = templateDrift(withoutDispatch, template);
-  assert.deepEqual(missing.missing, ["  repository_dispatch:"]);
-  assert.ok(missing.diff.includes("-   repository_dispatch:"));
-
-  const withStep = `${template}\n      - run: ./deploy.sh\n`;
-  const added = templateDrift(withStep, template);
-  assert.deepEqual(added.missing, []);
-  assert.deepEqual(added.added, ["      - run: ./deploy.sh"]);
-});
-
-test("a workflow's own action ref and branch are read back, so neither is drift", () => {
-  const pinned = renderTemplate("workflow", { ACTION_REF: "carrick-tools/carrick@v1.4.2", DEFAULT_BRANCH: "trunk" });
-  assert.deepEqual(workflowVariables(pinned), {
-    variables: { ACTION_REF: "carrick-tools/carrick@v1.4.2", DEFAULT_BRANCH: "trunk" },
-    unread: [],
-  });
-  const root = workspace({
-    "carrick.json": JSON.stringify({ serviceName: "api" }),
-    [workflowPath]: `${pinned}      - run: ./deploy.sh\n`,
-  });
-  const lines = checkWorkflow(configuredRepos(root));
-  // Filling the template's variables in is not drift, and a line of your own is
-  // not drift. A ref that cannot move IS a finding, and a separate one: the
-  // Action resolves the scanner from the Cargo.toml beside it in the action
-  // checkout, so a pinned ref freezes the scanner this repo indexes with.
-  assert.equal(findingCount(lines), 1, texts(lines).join("\n"));
-  assert.ok(texts(lines).some((text) => text.includes("pins `carrick-tools/carrick@v1.4.2`")));
-  assert.ok(lines.some((line) => line.text.includes("plus 1 line(s) of your own")));
-  fs.rmSync(root, { recursive: true, force: true });
-
-  // A branch list written as a YAML sequence cannot be read, and the line says so.
-  const sequence = renderTemplate("workflow").replace(/branches: \[main\]/g, "branches:\n      - main");
-  assert.deepEqual(workflowVariables(sequence).unread, ["DEFAULT_BRANCH"]);
-});
-
-test("only @v1 keeps a workflow on the current scanner", () => {
-  assert.equal(pinnedActionRef("carrick-tools/carrick@v1"), null);
-  assert.equal(pinnedActionRef(undefined), null, "no carrick step at all is the workflow check's own finding");
-  for (const ref of [
-    "carrick-tools/carrick@v1.4.2",
-    "carrick-tools/carrick@main",
-    "carrick-tools/carrick@9632e686e6bc5f9786b750a22450240460f2bded",
-  ]) {
-    const line = pinnedActionRef(ref);
-    assert.ok(line, ref);
-    assert.match(line, /never a newer one/);
-    assert.ok(line.includes("carrick-tools/carrick@v1`"), line);
-  }
-});
-
-test("a repo with no workflow, and one the current template has grown past", () => {
-  const none = workspace({ "carrick.json": JSON.stringify({ serviceName: "api" }) });
-  const noneLines = checkWorkflow(configuredRepos(none));
-  assert.equal(findingCount(noneLines), 1);
-  assert.match(noneLines[0]!.text, /no \.github\/workflows\/carrick\.yml/);
-
-  const behind = workspace({
-    "carrick.json": JSON.stringify({ serviceName: "api" }),
-    [workflowPath]: renderTemplate("workflow")
-      .split("\n")
-      .filter((line) => !line.includes("repository_dispatch") && !line.includes("carrick-sibling-updated"))
-      .join("\n"),
-  });
-  const behindLines = checkWorkflow(configuredRepos(behind));
-  assert.equal(findingCount(behindLines), 1);
-  assert.match(behindLines[0]!.text, /missing 2 line\(s\) of the current template/);
-  assert.match(behindLines[0]!.text, /- {3}repository_dispatch:/);
-
-  // A repo Carrick does not index is not asked for a workflow.
-  const unconfigured = workspace({ "src/index.ts": "export {};\n" });
-  assert.deepEqual(checkWorkflow(configuredRepos(unconfigured)), []);
-
-  for (const root of [none, behind, unconfigured]) fs.rmSync(root, { recursive: true, force: true });
-});
 
 /** A machine where `carrick` is wherever the test says it is. */
 function hookMachine(overrides: Partial<HookMachine> = {}): HookMachine {
@@ -721,7 +649,7 @@ test("the whole command, on a workspace with exactly three findings", () => {
           calls: 1,
           changed_since_index: 0,
           hosted_state: "no_index_yet",
-          boundary_note: "api is connected and has no hosted index yet. Run `carrick index` once to classify them.",
+          boundary_note: "api is connected and has no hosted index yet. Carrick builds it in the cloud, and `carrick refresh` downloads it once it is ready.",
         },
       ],
     }),
@@ -760,12 +688,12 @@ test("the whole command, on a workspace with exactly three findings", () => {
   const lines = run.stdout.trimEnd().split("\n");
   assert.deepEqual(lines, [
     `■ ${path.basename(root)}: service "api" includes "packages/shared", which is not a directory in this repo.`,
-    `◇ CI workflow matches the current template in 1 repo(s).`,
+    `${path.basename(root)}: Carrick now scans this repo in its own cloud runners on every push, so .github/workflows/carrick.yml is no longer needed and only uses CI minutes. You can delete it.`,
     `◇ Agent hooks are installed here and run this package (${entry}).`,
     "▲ 8 of the 8 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
     // Found with no ~/.claude at all: the command is the detection.
     "◇ MCP server connected for Claude Code.",
-    "▲ api: api is connected and has no hosted index yet. Run `carrick index` once to classify them. (hosted state: no_index_yet)",
+    "▲ api: api is connected and has no hosted index yet. Carrick builds it in the cloud, and `carrick refresh` downloads it once it is ready. (hosted state: no_index_yet)",
     "",
     "3 finding(s) above, marked ▲ or ■. Nothing here was changed; `carrick doctor` exits non-zero while any of them stand.",
   ]);

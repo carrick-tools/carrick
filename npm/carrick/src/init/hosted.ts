@@ -120,8 +120,8 @@ const ANSWERED_BY_A_REREAD = new Set([
  * file: `changed_since_index` per service and `outside_every_service` per repo
  * are the scanner's own count of source that has moved since the index was
  * built, and both are filtered to files a scan reads — which matters here,
- * because `carrick init` writes `carrick.json`, the hooks and the skills, and
- * none of those is a reason to spend minutes (carrick#1007 item 5).
+ * because `carrick init` writes the hooks and the skills, and neither is a
+ * reason to spend minutes (carrick#1007 item 5).
  *
  * `repos` is the workspace's repo list as `carrick derive` gave it, so a repo
  * this folder holds and the index does not is a re-read and not a silent gap.
@@ -393,7 +393,7 @@ export function nativeRunner(quiet: boolean, progress: StepProgress | null = nul
  * Put the hosted index on this machine, and say what is there afterwards.
  *
  * `workspace` is the derived workspace root — the directory `carrick init`
- * wrote the proposal into — so the index this reads is the one every later
+ * set up — so the index this reads is the one every later
  * read of that workspace finds. `repos` is that workspace's repo list, which
  * [`localIndexState`] needs to tell "indexed" from "indexes some of this".
  *
@@ -575,15 +575,11 @@ function commitCause(missing: MissingCommit[]): { failure: string; action: strin
  * who cannot tell them apart cannot tell whether their next `carrick init` is
  * a wait (carrick#1373).
  *
- * `lane` is who builds this workspace's index. Where Carrick builds it, no
- * command on a laptop clears a version mismatch, so the line says what still
- * answers instead (carrick#2219).
+ * Carrick builds every index, so no command on this machine clears a version
+ * mismatch, and that line says what still answers instead (carrick#2219,
+ * carrick#3361).
  */
-export function hostedReport(
-  outcome: HostedDownload,
-  seconds: number | null = null,
-  lane: "cloud" | "laptop" = "laptop",
-): StepReport {
+export function hostedReport(outcome: HostedDownload, seconds: number | null = null): StepReport {
   const plural = (count: number): string => `${count} service${count === 1 ? "" : "s"}`;
   // The total and the time, on the line that stays once the ticking one is
   // gone: a wait of minutes that ends on a line with no duration leaves the
@@ -600,10 +596,7 @@ export function hostedReport(
     case "version_mismatch":
       return {
         kind: "warn",
-        text:
-          lane === "cloud"
-            ? "Hosted index was built by a different Carrick release than this CLI, so it was not read into .carrick/. Your agent still reads it through Carrick's MCP server."
-            : "Hosted index is older than this CLI: run `carrick index --detach` once from main",
+        text: "Hosted index was built by a different Carrick release than this CLI, so it isn't downloaded here. Your agent still reads it through Carrick's MCP server.",
       };
     // The failure first, then what moves it, then what `.carrick/` holds in
     // the meantime: the line used to open on the holdings and end on the

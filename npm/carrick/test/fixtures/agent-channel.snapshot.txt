@@ -40,7 +40,7 @@ Carrick re-checked user-service/src/routes/users.ts after this edit: no route or
 Other files use what this file declares: `carrick check user-service/src/routes/users.ts` lists the 2 uses; open them if this edit changed a signature or a type.
 
 ### status-not-indexed.json :: renderSessionStart
-Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index --workspace <dir>` builds one.
+Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick refresh --workspace <dir>` downloads the index.
 
 ### status-workspace.json :: renderSessionStart
 Carrick indexed 3 service(s) in /workspace at 2026-09-06T21:14:03Z, scanner 0.3.41.

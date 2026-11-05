@@ -1,10 +1,11 @@
-// Re-checking, on demand, what the first run decided once.
+// Re-checking, on demand, what `carrick init` set up on this machine.
 //
-// Everything the index's accuracy depends on is settled at setup time by an
-// agent following prose: which directories are services, which env vars name a
-// URL, which files the scan reads. The index itself does not decay — CI
-// re-scans the default branch on every push — but the configuration does, and
-// nothing re-reads it (carrick#1035). `carrick doctor` is that second read.
+// The config the index is built under is Carrick's, held for each project and
+// derived in the cloud, and Carrick re-scans every push itself (carrick#3361).
+// What can still go wrong here is local: hooks that name a carrick that is
+// gone, skills an older version wrote, an MCP entry pointing elsewhere, an
+// index this machine has not read in, and the paths a committed carrick.json
+// still declares (carrick#1035). `carrick doctor` is that read.
 //
 // Three rules hold the whole command together:
 //
@@ -14,14 +15,13 @@
 //     thing they are inspecting.
 //  2. **A finding is something that is wrong**, not something that is unusual.
 //     Exit is non-zero on any finding, so a check that fires on a healthy repo
-//     costs the whole command its meaning: the drift check reports lines the
-//     template has and yours does not, never lines you added; a local index
-//     behind the working tree is a note, because that is what an index looks
-//     like while someone is working.
+//     costs the whole command its meaning: a workspace with no committed
+//     config is the ordinary one, a workflow left behind is a note, and a
+//     local index behind the working tree is a note, because that is what an
+//     index looks like while someone is working.
 //  3. **Each check lives with what it checks.** The hook and MCP readers are
 //     in the same files as the writers whose work they audit, so the audit and
-//     the install cannot drift; the workflow is compared against the template
-//     this package renders, not against a copy.
+//     the install cannot drift.
 //
 // What is NOT here, and where it is: the scaffold's hook-pack scripts
 // (`.claude/*.sh`) are the cloud's bytes and are compared by its own
@@ -34,7 +34,7 @@ import { spawnSync } from "node:child_process";
 
 import { status as runStatus } from "../cli.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
-import { DEFAULTS, renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
+import { TEMPLATE_PATHS } from "../templates.ts";
 import { inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
 import { readInstallId } from "./install-id.ts";
 import { createOutput, DOCS_INIT_FILES, type InitOutput } from "./output.ts";
@@ -50,9 +50,7 @@ import {
 } from "../update.ts";
 import { findCarrick, globalCommand, installedVersion, type GlobalCarrick } from "../global-install.ts";
 import { recordedCliVersion } from "./outdated.ts";
-import { repoIdentity, repoRoots } from "./repos.ts";
-import { readCredential } from "../auth/credentials.ts";
-import { resolveRepos } from "../auth/read.ts";
+import { repoRoots } from "./repos.ts";
 import { excludedRepos } from "./workspace-file.ts";
 import {
   expectedCarrickHooks,
@@ -96,10 +94,11 @@ function help(): string {
   return [
     "carrick doctor [DIRECTORY]",
     "",
-    "Re-check the setup a first run decided once: the paths every carrick.json",
-    "declares, the CI workflow against the current template, the agent hooks and",
-    "the MCP connection on this machine, and how far the index is behind. It",
-    "writes nothing, runs no scan, and exits non-zero when it finds something.",
+    "Re-check what carrick init set up here: the agent hooks, the task skills and",
+    "the MCP connection on this machine, and how far the index is behind. It also",
+    "checks the paths a committed carrick.json declares, and names a Carrick CI",
+    "workflow that is no longer needed. It writes nothing, runs no scan, and exits",
+    "non-zero when it finds something.",
     "",
     "    -w, --workspace DIR  The folder init was run in (default: this one)",
     "",
@@ -244,10 +243,8 @@ export function checkDeclaredPaths(repos: ConfiguredRepo[]): Line[] {
       lines.push(refuse(`${repo.label}: ${repo.problem}`));
       continue;
     }
-    if (repo.config === null) {
-      lines.push(say(`${repo.label} has no carrick.json, so nothing in it is indexed.`));
-      continue;
-    }
+    // The ordinary repo: its config is the one Carrick holds (carrick#3361).
+    if (repo.config === null) continue;
     files += 1;
     configs += 1;
     for (const service of declaredServices(repo.config)) {
@@ -299,12 +296,12 @@ export function checkDeclaredPaths(repos: ConfiguredRepo[]): Line[] {
       }
     }
   }
+  // Carrick holds each project's config and derives it in the cloud, so a
+  // workspace with no committed one is the ordinary state, and the line says
+  // where the config is rather than sending anyone to write one
+  // (carrick#3361).
   if (files === 0) {
-    lines.push(
-      refuse(
-        "No carrick.json anywhere in this workspace, so no service is declared. `carrick init` derives one for your agent to write.",
-      ),
-    );
+    lines.push(done("Service config: Carrick holds it for this project, so no repo here needs a carrick.json."));
     return lines;
   }
   if (findingCount(lines) === 0) {
@@ -340,241 +337,26 @@ function matchesAFile(root: string, pattern: string): boolean {
   }
 }
 
-/** The lines of a file that state behaviour: no comments, no blank lines. */
-export function functionalLines(body: string): string[] {
-  return body
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .filter((line) => line.trim() !== "" && !line.trim().startsWith("#"));
-}
-
-export type Drift = {
-  /** Template lines this file does not have. The finding. */
-  missing: string[];
-  /** Lines this file has that the template does not. Context, never a finding. */
-  added: string[];
-  /** Both, interleaved in file order, as `-`/`+` lines. */
-  diff: string[];
-};
-
-/**
- * What one file differs from a rendered template by, comment-insensitively.
- *
- * Comments and blank lines are dropped from both sides first. The template is
- * two fifths comment, so comparing them would report a finding for every line
- * a reader trimmed and for every rewording of an explanation — neither of
- * which changes what CI runs.
- *
- * Only `missing` is a finding. A workflow with steps of its own is the case
- * the template itself invites ("If you add deploy steps to this file..."), so
- * added lines are printed as context and fail nothing.
- */
-export function templateDrift(actual: string, expected: string): Drift {
-  const have = functionalLines(actual);
-  const want = functionalLines(expected);
-  // Longest common subsequence over lines: small inputs, and the alignment is
-  // what makes the printed diff readable rather than "these two files differ".
-  const table: number[][] = Array.from({ length: want.length + 1 }, () =>
-    new Array<number>(have.length + 1).fill(0),
-  );
-  for (let w = want.length - 1; w >= 0; w -= 1) {
-    for (let h = have.length - 1; h >= 0; h -= 1) {
-      table[w]![h] = want[w] === have[h]
-        ? table[w + 1]![h + 1]! + 1
-        : Math.max(table[w + 1]![h]!, table[w]![h + 1]!);
-    }
-  }
-  const missing: string[] = [];
-  const added: string[] = [];
-  const diff: string[] = [];
-  let w = 0;
-  let h = 0;
-  while (w < want.length && h < have.length) {
-    if (want[w] === have[h]) {
-      w += 1;
-      h += 1;
-    } else if (table[w + 1]![h]! >= table[w]![h + 1]!) {
-      missing.push(want[w]!);
-      diff.push(`- ${want[w]}`);
-      w += 1;
-    } else {
-      added.push(have[h]!);
-      diff.push(`+ ${have[h]}`);
-      h += 1;
-    }
-  }
-  for (; w < want.length; w += 1) {
-    missing.push(want[w]!);
-    diff.push(`- ${want[w]}`);
-  }
-  for (; h < have.length; h += 1) {
-    added.push(have[h]!);
-    diff.push(`+ ${have[h]}`);
-  }
-  return { missing, added, diff };
-}
-
 const WORKFLOW_PATH = TEMPLATE_PATHS.workflow;
 
 /**
- * The variables a workflow on disk states, so the comparison is about drift
- * rather than about the two values the template exists to parameterise.
+ * A Carrick workflow left in a repo, which nothing needs any more.
  *
- * A repo pinned to an older action ref, or building on a branch that is not
- * `main`, is not drift: it is the template with its variables filled in. Both
- * are read back out of the file, and where one cannot be read the default is
- * used and the caller says so.
+ * Carrick scans every repo in its own runners on every push (carrick#2219),
+ * so a workflow file only spends CI minutes, and a missing one is the
+ * expected state. Every repo is read, with or without a committed config: the
+ * workflow and the config were written together by the old scaffold, and
+ * either can be left behind. A note, never a finding (carrick#3361).
  */
-export function workflowVariables(body: string): { variables: Record<string, string>; unread: string[] } {
-  const variables: Record<string, string> = {};
-  const unread: string[] = [];
-  const uses = /^\s*-?\s*uses:\s*(\S*carrick-tools\/carrick@\S+)\s*$/m.exec(body);
-  if (uses) variables["ACTION_REF"] = uses[1]!;
-  else unread.push("ACTION_REF");
-  const branches = new Set<string>();
-  for (const match of body.matchAll(/^\s*branches:\s*\[([^\]]*)\]\s*$/gm)) {
-    for (const name of match[1]!.split(",")) {
-      const trimmed = name.trim().replace(/^["']|["']$/g, "");
-      if (trimmed !== "") branches.add(trimmed);
-    }
-  }
-  if (branches.size === 1) variables["DEFAULT_BRANCH"] = [...branches][0]!;
-  else unread.push("DEFAULT_BRANCH");
-  return { variables, unread };
-}
-
-/**
- * The only action ref that keeps a repository on the current scanner.
- *
- * `action.yml` reads the version out of the Cargo.toml sitting beside it in the
- * action checkout, and `v1` is force-moved onto every release commit, so a
- * workflow that says `@v1` picks up each release without anybody touching it.
- * Any other ref — a tag, a branch, a commit SHA — freezes the scanner at
- * whatever shipped with that ref, for as long as the workflow stands.
- *
- * `docs/reference/update-check.md` has the whole picture, including the npm
- * half of it.
- */
-const FLOATING_ACTION_REF = "carrick-tools/carrick@v1";
-
-/**
- * A ref that will never move, said plainly.
- *
- * A finding rather than a note, by the rule at the top of this file: a
- * repository whose CI is frozen on an old scanner keeps re-indexing itself with
- * defects that are already fixed, and the whole point of the index is that it
- * is current. The way out is one token in one line.
- */
-export function pinnedActionRef(ref: string | undefined): string | null {
-  if (!ref || ref === FLOATING_ACTION_REF) return null;
-  return (
-    `${WORKFLOW_PATH} pins \`${ref}\`, so every run here uses the scanner that shipped with that ref ` +
-    `and never a newer one. Use \`${FLOATING_ACTION_REF}\`, which moves to each release.`
-  );
-}
-
-/** Who builds this workspace's index. Only a read that says "cloud" is cloud. */
-export type IndexLane = "cloud" | "laptop";
-
-/** What the lane read needs; every part is replaceable so a test reaches no network. */
-export type LaneDeps = {
-  credential: () => { token: string } | null;
-  resolve: typeof resolveRepos;
-  repoName: (root: string) => string | null;
-};
-
-const realLaneDeps: LaneDeps = {
-  credential: () => readCredential(),
-  resolve: resolveRepos,
-  repoName: (root) => repoIdentity(root).name,
-};
-
-/**
- * The lane of the signed-in workspace, from one `resolve-repos` read.
- *
- * No credential, no repo with a GitHub remote, a failed read, a missing field
- * or any other value is the laptop lane: doctor then prints what it always
- * has. The read never fails doctor. Only the names of the repos Carrick
- * indexes here are sent (carrick#1338).
- */
-export async function readLane(repos: ConfiguredRepo[], deps: LaneDeps = realLaneDeps): Promise<IndexLane> {
-  try {
-    const saved = deps.credential();
-    if (saved === null) return "laptop";
-    const names = repos.filter((repo) => repo.config !== null).map((repo) => deps.repoName(repo.root));
-    const here = names.filter((name): name is string => name !== null);
-    if (here.length === 0) return "laptop";
-    const identity = await deps.resolve(saved.token, here);
-    return identity.workspace.index_builder === "cloud" ? "cloud" : "laptop";
-  } catch {
-    return "laptop";
-  }
-}
-
-/**
- * The CI workflow of every configured repo, against the template this package
- * renders.
- *
- * Only repos with a `carrick.json` are asked for one: a sibling clone that
- * Carrick does not index owes CI nothing.
- */
-export function checkWorkflow(repos: ConfiguredRepo[], lane: IndexLane = "laptop"): Line[] {
+export function checkWorkflow(repos: ConfiguredRepo[]): Line[] {
   const lines: Line[] = [];
-  let matched = 0;
   for (const repo of repos) {
-    if (repo.config === null) continue;
-    const file = path.join(repo.root, WORKFLOW_PATH);
-    let body: string;
-    try {
-      body = fs.readFileSync(file, "utf8");
-    } catch {
-      // Where Carrick rescans every push itself, a missing workflow is the
-      // expected state (carrick#2219).
-      if (lane === "cloud") continue;
-      lines.push(
-        warn(
-          `${repo.label}: no ${WORKFLOW_PATH}, so pushes to the default branch do not re-index it. Write one with \`carrick templates workflow\`.`,
-        ),
-      );
-      continue;
-    }
-    if (lane === "cloud") {
-      lines.push(
-        say(
-          `${repo.label}: Carrick now scans this repo in its own cloud runners on every push, so ${WORKFLOW_PATH} is no longer needed and only uses CI minutes. You can delete it.`,
-        ),
-      );
-      continue;
-    }
-    const { variables, unread } = workflowVariables(body);
-    const pin = pinnedActionRef(variables["ACTION_REF"]);
-    if (pin) lines.push(warn(`${repo.label}: ${pin}`));
-    const drift = templateDrift(body, renderTemplate("workflow", variables));
-    if (drift.missing.length === 0) {
-      matched += 1;
-      if (drift.added.length > 0) {
-        lines.push(
-          say(
-            `${repo.label}: ${WORKFLOW_PATH} has the current template in it, plus ${drift.added.length} line(s) of your own.`,
-          ),
-        );
-      }
-      continue;
-    }
-    const caveat = unread.includes("ACTION_REF")
-      ? " No step in it runs the Carrick action."
-      : unread.includes("DEFAULT_BRANCH")
-        ? ` Its branch list could not be read, so it was compared against ${DEFAULTS["DEFAULT_BRANCH"]}.`
-        : "";
+    if (!isFile(path.join(repo.root, WORKFLOW_PATH))) continue;
     lines.push(
-      warn(
-        `${repo.label}: ${WORKFLOW_PATH} is missing ${drift.missing.length} line(s) of the current template.${caveat} Comments are not compared; \`-\` is the template's, \`+\` is yours:\n${drift.diff.map((line) => `    ${line}`).join("\n")}`,
+      say(
+        `${repo.label}: Carrick now scans this repo in its own cloud runners on every push, so ${WORKFLOW_PATH} is no longer needed and only uses CI minutes. You can delete it.`,
       ),
     );
-  }
-  if (matched > 0 && findingCount(lines) === 0) {
-    lines.push(done(`CI workflow matches the current template in ${matched} repo(s).`));
   }
   return lines;
 }
@@ -1141,7 +923,6 @@ function print(out: InitOutput, lines: Line[]): void {
 export async function doctor(
   argv: string[],
   out: InitOutput = createOutput(),
-  laneDeps: LaneDeps = realLaneDeps,
 ): Promise<number> {
   const parsed = parseArgs(argv);
   if (typeof parsed === "string") {
@@ -1155,12 +936,11 @@ export async function doctor(
   }
 
   const repos = configuredRepos(workspace);
-  const lane = await readLane(repos, laneDeps);
   const lines: Line[] = [
     ...(await checkVersion()),
     ...checkPathVersion(workspace, pathCarrick()),
     ...checkDeclaredPaths(repos),
-    ...checkWorkflow(repos, lane),
+    ...checkWorkflow(repos),
     ...checkHooks(workspace, realMachine()),
     ...checkCodexHooks(workspace),
     ...checkTaskSkills(inspectTaskSkills(workspace)),

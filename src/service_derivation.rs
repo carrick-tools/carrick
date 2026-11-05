@@ -18,13 +18,13 @@ pub struct ServiceDerivation {
     pub members: Vec<MemberFacts>,
     /// The exact proposal init may create with exclusive-create semantics.
     pub config: serde_json::Value,
-    /// What THIS derivation found that the reader has to act on. Printed by
-    /// `carrick init`, one line each, so anything here has to be a fact about
-    /// this workspace rather than advice that holds for every workspace.
+    /// What THIS derivation found that the reader has to act on, one line
+    /// each, so anything here has to be a fact about this workspace rather
+    /// than advice that holds for every workspace.
     pub warnings: Vec<String>,
     /// Standing advice about a proposal of this shape: true of every Deno
     /// repo, or every workspace with more than one member, whatever this run
-    /// found. It rides in `.carrick/proposal.json` and the quickstart, and the
+    /// found. It rides in the derive document and the quickstart, and the
     /// terminal never prints it — printed, it was a warning marker on a first
     /// run that had raised no warning at all (carrick#1032).
     pub notes: Vec<String>,

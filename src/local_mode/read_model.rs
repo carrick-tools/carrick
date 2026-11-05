@@ -460,7 +460,7 @@ impl LocalIndex {
         if index.version != READ_MODEL_VERSION {
             return Err(format!(
                 "{} was written by a different scanner (index format {}, this build reads {}). \
-                 Re-run `carrick index`.",
+                 Run `carrick refresh` to download it again.",
                 path.display(),
                 index.version,
                 READ_MODEL_VERSION

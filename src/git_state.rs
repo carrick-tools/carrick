@@ -1428,7 +1428,7 @@ pub(crate) mod tests {
             // The Codex half of the same install (carrick#1335).
             ".codex/hooks.json",
             ".carrick/.gitignore",
-            ".carrick/proposal.json",
+            ".carrick/cli-version",
         ] {
             let path = dir.join(file);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

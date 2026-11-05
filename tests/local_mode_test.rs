@@ -1899,7 +1899,7 @@ fn the_free_pass_counts_what_is_waiting_for_the_paid_one() {
     let map = index(root);
     let waiting = map
         .lines()
-        .find(|line| line.contains("candidate(s) waiting for `carrick index`"))
+        .find(|line| line.contains("candidate(s) waiting for Carrick's cloud scan"))
         .unwrap_or_else(|| panic!("no service line states what is waiting:\n{map}"));
     assert!(
         waiting.contains("route(s)") && waiting.contains("call(s)"),
@@ -1908,7 +1908,7 @@ fn the_free_pass_counts_what_is_waiting_for_the_paid_one() {
 
     let status = run(root, &["status", "--workspace", "."]);
     assert!(
-        status.contains("candidate(s) waiting for `carrick index`"),
+        status.contains("candidate(s) waiting for Carrick's cloud scan"),
         "and the session answer says it too:\n{status}"
     );
 }

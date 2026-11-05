@@ -1006,13 +1006,12 @@ pub fn enrichment_note(
                 hosted.commit.chars().take(7).collect::<String>()
             )
         }
-        // The writer named here is the one the ruled first run uses
-        // (carrick-cloud#799): the user's own `carrick index`, not a CI run
-        // that may be days away or may never be wired up. A CI run on main
-        // writes the same index, and says so when it does; what this sentence
-        // owes the reader is the next move available to them (carrick#997).
+        // Carrick builds the index in the cloud, so the next move available
+        // to the reader is the read that brings it here once it exists
+        // (carrick#997, carrick#3361).
         (HostedState::NoIndexYet, _) => format!(
-            "{}; {remote} is connected and has no hosted index yet. Run `carrick index` once to classify them.",
+            "{}; {remote} is connected and has no hosted index yet. Carrick builds it in the \
+             cloud, and `carrick refresh` downloads it once it is ready.",
             super::NOT_CLASSIFIED_LOCALLY
         ),
         (HostedState::NotConnected, _) => format!(
@@ -1059,13 +1058,13 @@ pub fn enrichment_note(
     // Not "install the version that wrote the blob": `CACHE_VERSION` moves
     // most weeks, so a hosted blob is behind the installed CLI far more often
     // than the CLI is wrong, and asking for a downgrade asks the reader to
-    // give up every fix since. The move available to them is to write a newer
-    // blob, from main, where a laptop scan replaces nobody else's row
-    // (carrick#1012 item 1, carrick#1020).
+    // give up every fix since (carrick#1012 item 1). Carrick writes the newer
+    // blob itself, so no command here moves it; the line says what still
+    // answers, in the words `carrick init` uses (carrick#2219, carrick#3361).
     if enrichment.hosted_state == HostedState::VersionMismatch {
         note.push_str(
-            " The hosted index is older than this CLI; run `carrick index --detach` once from \
-             main to refresh it.",
+            " The hosted index was built by a different Carrick release than this CLI, so it \
+             isn't downloaded here. Your agent still reads it through Carrick's MCP server.",
         );
     }
     if let Some(lost) = boundary.and_then(|b| b.model_answers_unavailable.as_ref()) {
@@ -1098,8 +1097,8 @@ pub fn enrichment_note(
             note.push_str(
                 " Written from a tree with uncommitted changes: it is stored at a commit that \
                  does not describe it, and this machine cannot replay its answers, so the next \
-                 scan analyses the changed files again. Commit them and run `carrick index` \
-                 again, or let a CI scan of main replace it.",
+                 scan analyses the changed files again. Commit them; the next scan of main \
+                 replaces it.",
             );
         } else if let Some(failure) = &enrichment.failure {
             note.push_str(&format!(
@@ -1137,7 +1136,7 @@ mod tests {
     /// blob is behind the installed CLI far more often than the CLI is wrong,
     /// and the sentence that named a version asked the reader to downgrade.
     #[test]
-    fn a_hosted_index_behind_this_cli_asks_for_a_newer_blob_not_an_older_cli() {
+    fn a_hosted_index_behind_this_cli_names_no_older_cli_and_no_scan_to_run() {
         let enrichment = crate::local_mode::hosted::ServiceEnrichment {
             hosted_state: crate::local_mode::hosted::HostedState::VersionMismatch,
             ..Default::default()
@@ -1145,12 +1144,30 @@ mod tests {
         let note = enrichment_note(&enrichment, None, "api");
         assert!(
             note.contains(
-                "The hosted index is older than this CLI; run `carrick index --detach` once from \
-                 main to refresh it."
+                "The hosted index was built by a different Carrick release than this CLI, so it \
+                 isn't downloaded here. Your agent still reads it through Carrick's MCP server."
             ),
             "{note}"
         );
         assert!(!note.contains("npm i -g carrick@"), "{note}");
+        // Carrick builds the index, so nothing here tells the reader to run a
+        // scan (carrick#3361).
+        assert!(!note.contains("carrick index"), "{note}");
+    }
+
+    /// A repo connected and not yet indexed is told the index is Carrick's to
+    /// build and how this machine reads it in, never to scan it here
+    /// (carrick#3361).
+    #[test]
+    fn a_connected_repo_with_no_hosted_index_is_told_to_read_it_in_not_to_scan_it() {
+        let enrichment = crate::local_mode::hosted::ServiceEnrichment {
+            hosted_state: crate::local_mode::hosted::HostedState::NoIndexYet,
+            ..Default::default()
+        };
+        let note = enrichment_note(&enrichment, None, "api");
+        assert!(note.contains("has no hosted index yet"), "{note}");
+        assert!(note.contains("`carrick refresh` downloads it"), "{note}");
+        assert!(!note.contains("carrick index"), "{note}");
     }
 
     #[test]
@@ -1290,7 +1307,7 @@ mod hosted_change_tests {
         assert!(note.contains("uncommitted changes"), "{note}");
         assert!(!note.contains("retained"), "{note}");
         assert!(
-            note.contains("Commit them and run `carrick index` again"),
+            note.contains("Commit them; the next scan of main replaces it"),
             "{note}"
         );
     }

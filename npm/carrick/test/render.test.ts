@@ -561,13 +561,14 @@ test("a service line names its own count, and what is waiting for a paid scan", 
   assert.ok(service);
   assert.match(serviceLine(service), /changed since index: 7/);
   assert.equal(
-    serviceLine(service).includes("waiting for `carrick index`"),
+    serviceLine(service).includes("waiting for"),
     false,
     "a service with nothing waiting says nothing",
   );
+  // The scan they wait for is Carrick's, never one to run here (carrick#3361).
   assert.match(
     serviceLine({ ...service, boundary: { ...service.boundary, candidates_awaiting_model: 8 } }),
-    /8 candidate\(s\) waiting for `carrick index`$/,
+    /8 candidate\(s\) waiting for Carrick's cloud scan$/,
   );
 });
 
@@ -600,10 +601,12 @@ test("files outside every service are the repo's line, not each service's", () =
   );
 });
 
-test("no index gives one line and the command that builds one", () => {
+test("no index gives one line and the command that reads one in", () => {
   const rendered = renderSessionStart(statusFixture("status-not-indexed.json"));
   assert.match(rendered, /^Carrick has no index for this workspace/);
-  assert.match(rendered, /`carrick index --workspace <dir>` builds one\.$/);
+  // Carrick builds it; this machine reads it in, and never scans (carrick#3361).
+  assert.match(rendered, /`carrick refresh --workspace <dir>` downloads the index\.$/);
+  assert.doesNotMatch(rendered, /carrick index/);
 });
 
 test("a session start states the refusal's own sentence, not its wire code (carrick#1009)", () => {
@@ -613,11 +616,11 @@ test("a session start states the refusal's own sentence, not its wire code (carr
     schema: "carrick.status/0",
     error: "index_unreadable",
     message:
-      "/w/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Re-run `carrick index`.",
+      "/w/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Run `carrick refresh` to download it again.",
     services: [],
   });
   assert.match(refused, /index format 2, this build reads 3/);
-  assert.match(refused, /Re-run `carrick index`/);
+  assert.match(refused, /Run `carrick refresh` to download it again/);
 
   // With nothing more specific to say, the code is still the answer.
   assert.match(

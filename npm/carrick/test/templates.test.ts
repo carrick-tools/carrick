@@ -1,6 +1,5 @@
-// The templates, which two writers render: `carrick init` and the hosted
-// scaffold tool. A placeholder left unrendered is the failure that looks like
-// success, so it is the one asserted hardest.
+// The template `carrick templates` prints. A placeholder left unrendered is
+// the failure that looks like success, so it is the one asserted hardest.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -9,7 +8,6 @@ import {
   TEMPLATE_NAMES,
   TEMPLATE_PATHS,
   renderTemplate,
-  scaffoldFiles,
   templateSource,
 } from "../src/templates.ts";
 
@@ -51,27 +49,14 @@ test("the workflow asks for OIDC and no secret", () => {
   assert.match(rendered, /fetch-depth: 0/);
 });
 
-test("carrick.json is the flat single-service skeleton, and valid JSON", () => {
-  const rendered = renderTemplate("carrick.json");
-  assert.deepEqual(JSON.parse(rendered), {
-    serviceName: "",
-    internalEnvVars: [],
-    externalEnvVars: [],
-    internalDomains: [],
-    externalDomains: [],
-  });
-});
-
-test("every template renders and lands somewhere named", () => {
+// carrick#3361: the config comes only from Carrick, so there is no carrick.json
+// for anyone to print and commit.
+test("the workflow is the one template, and it lands somewhere named", () => {
+  assert.deepEqual(TEMPLATE_NAMES, ["workflow"]);
   for (const name of TEMPLATE_NAMES) {
     assert.ok(templateSource(name).length > 0, `${name} is empty`);
     assert.ok(TEMPLATE_PATHS[name], `${name} has no path`);
   }
-  const files = scaffoldFiles();
-  assert.deepEqual(
-    files.map((file) => file.path).sort(),
-    [".github/workflows/carrick.yml", "carrick.json"],
-  );
 });
 
 test("a template that still holds a placeholder is an error, not a file", () => {
