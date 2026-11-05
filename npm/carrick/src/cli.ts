@@ -37,7 +37,20 @@ export type RunOptions = {
   env?: NodeJS.ProcessEnv;
   /** Injectable for tests; defaults to the real `carrick` binary. */
   bin?: string;
+  /**
+   * The limit for this call in ms, used when `CARRICK_TIMEOUT_MS` is not set
+   * (the environment's own value always wins). Absent: five seconds.
+   */
+  limitMs?: number;
 };
+
+/**
+ * What a `--recheck` call must state: its own limit. There is no default,
+ * because the right one depends on who is asking (a hook's probe, or the
+ * background runner), and a wrong one kills the call before it answers.
+ * `noRescan` is the probe: it answers at once, or says `recheck.deferred`.
+ */
+export type RecheckOptions = RunOptions & { recheck: true; limitMs: number; noRescan?: boolean };
 
 async function run<T>(
   args: string[],
@@ -54,7 +67,7 @@ async function run<T>(
       {
         cwd: options.cwd,
         env,
-        timeout: timeoutMs(env),
+        timeout: env["CARRICK_TIMEOUT_MS"] ? timeoutMs(env) : (options.limitMs ?? timeoutMs(env)),
         maxBuffer: 32 * 1024 * 1024,
         encoding: "utf8",
       },
@@ -79,37 +92,22 @@ async function run<T>(
  *
  * `recheck` asks the binary to re-extract the file and re-judge it against the
  * index before answering, which costs a scan of that file's repo. It is passed
- * by the post-edit hook and by nothing else: the language server runs this on
- * every save, and a file being edited is always newer than the index
- * (carrick#1036). The binary's own budget is ten seconds, so the call is given
- * more than that before it is killed — a re-check cut off by this timeout would
- * print nothing at all, where one cut off by its own budget still answers.
+ * by the post-edit hook, by the background runner and by nothing else: the
+ * language server runs this on every save, and a file being edited is always
+ * newer than the index (carrick#1036). A re-check states its own `limitMs`:
+ * one cut off by this timeout prints nothing at all, where one cut off by the
+ * binary's own budget still answers, so the caller sizes the limit above it.
  */
 export async function check(
   file: string,
-  options: RunOptions & { recheck?: boolean },
+  options: RunOptions | RecheckOptions,
 ): Promise<RunOutcome<CheckResult>> {
-  const args = options.recheck ? ["check", file, "--json", "--recheck"] : ["check", file, "--json"];
-  const env = options.recheck
-    ? { ...(options.env ?? process.env), CARRICK_TIMEOUT_MS: recheckTimeoutMs(options.env) }
-    : options.env;
-  return await run(args, { ...options, env }, parseCheckResult);
-}
-
-/**
- * The limit for a `--recheck` call: the caller's own if it set one, and
- * otherwise long enough to outlast the binary's budget and still return inside
- * the hook's fifteen seconds.
- *
- * A call about several files (`files` > 1, only ever a Codex patch) gets ten
- * more seconds per further file, inside the 60 s Codex gives the hook. The
- * binary stops re-checking a repo after its first miss, so a patch on a repo
- * where the re-check does not fit waits out one budget, not one per file.
- */
-export function recheckTimeoutMs(env: NodeJS.ProcessEnv = process.env, files = 1): string {
-  const own = env["CARRICK_TIMEOUT_MS"];
-  if (own) return own;
-  return String(Math.min(12000 + 10000 * Math.max(files - 1, 0), 55000));
+  const args = ["check", file, "--json"];
+  if ("recheck" in options && options.recheck) {
+    args.push("--recheck");
+    if (options.noRescan) args.push("--no-rescan");
+  }
+  return await run(args, options, parseCheckResult);
 }
 
 /**
@@ -120,17 +118,11 @@ export function recheckTimeoutMs(env: NodeJS.ProcessEnv = process.env, files = 1
  */
 export async function checkEach(
   files: string[],
-  options: RunOptions,
+  options: Omit<RecheckOptions, "recheck">,
 ): Promise<RunOutcome<Array<CheckResult | null>>> {
-  const env = {
-    ...(options.env ?? process.env),
-    CARRICK_TIMEOUT_MS: recheckTimeoutMs(options.env, files.length),
-  };
-  return await run(
-    ["check", "--each", ...files, "--json", "--recheck"],
-    { ...options, env },
-    parseCheckResults,
-  );
+  const args = ["check", "--each", ...files, "--json", "--recheck"];
+  if (options.noRescan) args.push("--no-rescan");
+  return await run(args, options, parseCheckResults);
 }
 
 /**

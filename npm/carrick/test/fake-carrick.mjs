@@ -14,6 +14,13 @@
 //                         test that needs the two sides of one contract to
 //                         answer differently says only what differs
 //   CARRICK_FAKE_DELAY_MS milliseconds to wait before printing
+//   CARRICK_FAKE_PROBE_FIXTURE
+//                         path to the JSON that answers a call carrying
+//                         `--no-rescan` (the post-edit probe); every other
+//                         call is answered as above
+//   CARRICK_FAKE_FULL_DELAY_MS
+//                         milliseconds to wait before printing, on calls
+//                         WITHOUT `--no-rescan` only (the full re-check)
 //   CARRICK_FAKE_EXIT     exit code to use, with nothing on stdout
 //   CARRICK_FAKE_ARGV_LOG file to append the argv and cwd of every call to
 //   CARRICK_FAKE_INVOKER_LOG
@@ -60,9 +67,13 @@ if (exitCode !== 0) {
   process.exit(exitCode);
 }
 
-const fallbackFixture = process.env.CARRICK_FAKE_FIXTURE
-  ? path.resolve(process.env.CARRICK_FAKE_FIXTURE)
-  : path.join(here, "fixtures", "check-mismatch.json");
+const probe = argv.includes("--no-rescan");
+const fallbackFixture =
+  probe && process.env.CARRICK_FAKE_PROBE_FIXTURE
+    ? path.resolve(process.env.CARRICK_FAKE_PROBE_FIXTURE)
+    : process.env.CARRICK_FAKE_FIXTURE
+      ? path.resolve(process.env.CARRICK_FAKE_FIXTURE)
+      : path.join(here, "fixtures", "check-mismatch.json");
 
 /** The files this call is about: `check <file> --json`, so the non-flags. */
 const files = argv.slice(1).filter((value) => !value.startsWith("--"));
@@ -79,7 +90,9 @@ const answer = (file) => {
   return body;
 };
 
-const delay = process.env.CARRICK_FAKE_DELAY_MS ? Number(process.env.CARRICK_FAKE_DELAY_MS) : 0;
+const delay =
+  (process.env.CARRICK_FAKE_DELAY_MS ? Number(process.env.CARRICK_FAKE_DELAY_MS) : 0) +
+  (!probe && process.env.CARRICK_FAKE_FULL_DELAY_MS ? Number(process.env.CARRICK_FAKE_FULL_DELAY_MS) : 0);
 const print = () => {
   // `check --each a b --json`: one array, one answer per file, in order.
   const body = argv.includes("--each")

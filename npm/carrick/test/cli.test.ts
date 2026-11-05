@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { binary, check, recheckTimeoutMs, status, timeoutMs } from "../src/cli.ts";
+import { binary, check, status, timeoutMs } from "../src/cli.ts";
 import { fakeBin, fakeEnv, firstCall, fixturePath, makeWorkspace } from "./helpers.ts";
 
 test("the binary is `carrick` on PATH unless CARRICK_BIN names another", () => {
@@ -34,20 +34,30 @@ test("check runs the binary from the workspace root and parses its answer", asyn
   assert.deepEqual(call.argv, ["check", "user-service/src/routes/users.ts", "--json"]);
 });
 
-test("a re-check asks for one and outlives the binary's own budget", async (t) => {
+test("a re-check asks for one and states its own limit", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const argvLog = path.join(workspace.root, "argv.log");
 
-  // The binary stops itself at ten seconds and still answers; a five-second
-  // limit here would kill it first and print nothing at all (carrick#1036).
+  // A re-check has no default limit: the caller sizes it above the binary's
+  // own budget, or the call is killed and prints nothing (carrick#1036).
   const outcome = await check("user-service/src/routes/users.ts", {
     cwd: workspace.root,
-    env: fakeEnv({ CARRICK_FAKE_ARGV_LOG: argvLog }),
+    env: fakeEnv({ CARRICK_FAKE_ARGV_LOG: argvLog, CARRICK_FAKE_DELAY_MS: "600" }),
     bin: fakeBin,
     recheck: true,
+    limitMs: 100,
   });
-  assert.equal(outcome.failure, null);
+  assert.equal(outcome.result, null, "the stated limit ended the call");
+  const longer = await check("user-service/src/routes/users.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CARRICK_FAKE_ARGV_LOG: argvLog, CARRICK_FAKE_DELAY_MS: "600" }),
+    bin: fakeBin,
+    recheck: true,
+    noRescan: true,
+    limitMs: 10_000,
+  });
+  assert.equal(longer.failure, null);
   const call = firstCall(argvLog);
   assert.ok(call);
   assert.deepEqual(call.argv, [
@@ -56,8 +66,14 @@ test("a re-check asks for one and outlives the binary's own budget", async (t) =
     "--json",
     "--recheck",
   ]);
-  assert.equal(recheckTimeoutMs({}), "12000");
-  assert.equal(recheckTimeoutMs({ CARRICK_TIMEOUT_MS: "300" }), "300");
+  const probeCall = fs.readFileSync(argvLog, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { argv: string[] })[1];
+  assert.deepEqual(probeCall?.argv, [
+    "check",
+    "user-service/src/routes/users.ts",
+    "--json",
+    "--recheck",
+    "--no-rescan",
+  ]);
 });
 
 test("status asks about the workspace and takes no file", async (t) => {

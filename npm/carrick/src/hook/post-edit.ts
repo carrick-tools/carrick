@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // PostToolUse hook for a file edit, on either host.
 //
-// Reads the tool payload on stdin, runs `carrick check <file> --json` from the
-// workspace root and prints what the edit needs acted on (`renderPostToolUse`:
-// its problems, or a pointer to `carrick check --changed` when the file could
-// not be re-checked) as `additionalContext`, which the host
-// attaches to the tool result. Attaching to the result rather than to the next
+// Reads the tool payload on stdin and asks the binary once, from the workspace
+// root, with a probe that never starts a re-scan (`probe.ts`). An answer in
+// hand prints what the edit needs acted on (`renderPostToolUse`: its problems,
+// or why it was not re-checked); an edit that needs a re-scan is queued for the
+// background runner (`rechecks.ts`), prints one pending line, and its answer is
+// delivered by the next carrier (`late.ts`). Output is `additionalContext`,
+// which the host attaches to the tool result. Attaching to the result rather than to the next
 // turn is why this channel has no "the run ended on the edit" hole.
 //
 // Two payload shapes reach it, because the two hosts edit differently
@@ -18,24 +20,25 @@
 // to say, could not find its binary, or timed out.
 
 import path from "node:path";
-import { check, checkEach } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { answersTheEdit, notedLine, renderPostToolUse } from "../render.ts";
+import { answersTheEdit, notRecheckedLine, pendingLine, renderPostToolUse } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { markTold, NOTED_KEY, record, toldKey, wasTold } from "./reuse.ts";
-import type { CheckResult } from "../contract.ts";
+import { markTold, record, toldKey, wasTold } from "./reuse.ts";
 import type { NewFunction } from "./reuse.ts";
 import { checkoutRelative, newFunctions } from "./edited.ts";
 import { markInvoker } from "./invoker.ts";
+import { deliverLate } from "./late.ts";
+import { needsBackground, probeEdits } from "./probe.ts";
+import { enqueue, ensureRunner } from "./rechecks.ts";
 
 const log = createLogger("carrick-hook");
 
 /** The files the index has rows for. */
-const CHECKED = /\.(ts|tsx|mts|cts)$/;
+const CHECKED = /\.(ts|tsx|mts|cts|graphql|gql)$/;
 
 type Payload = {
   cwd?: string;
@@ -68,23 +71,6 @@ export function filesFromPayload(payload: Payload): string[] {
   const named = input.file_path ?? input.filePath ?? input.edits?.[0]?.file_path ?? null;
   if (named) return [named];
   return typeof input.command === "string" ? patchedFiles(input.command) : [];
-}
-
-/**
- * Every edited file's answer, in order, from one binary call: the
- * single-file `check` for one file (what Claude Code's edits always are), and
- * `check --each` for a patch that touches several.
- */
-async function answersFor(
-  relatives: string[],
-  cwd: string,
-): Promise<{ results: Array<CheckResult | null>; failure: string | null; ms: number }> {
-  if (relatives.length === 1) {
-    const outcome = await check(relatives[0]!, { cwd, recheck: true });
-    return { results: [outcome.result], failure: outcome.failure, ms: outcome.ms };
-  }
-  const outcome = await checkEach(relatives, { cwd });
-  return { results: outcome.result ?? [], failure: outcome.failure, ms: outcome.ms };
 }
 
 function emit(context: string): void {
@@ -130,7 +116,16 @@ async function main(): Promise<void> {
   const edited = filesFromPayload(payload)
     .filter((file) => CHECKED.test(file))
     .map((file) => (path.isAbsolute(file) ? file : path.resolve(cwd ?? process.cwd(), file)));
-  if (edited.length === 0) return;
+  const session = payload.session_id;
+  if (edited.length === 0) {
+    // Nothing of ours to check in this edit, but a finished background answer
+    // is still owed to the model (B3: every carrier delivers).
+    if (channel.channel === "hook") {
+      const late = deliverLate(session);
+      if (late.length > 0) emit(late.join("\n\n"));
+    }
+    return;
+  }
 
   // One root for the call: every file in one patch is in the workspace the tool
   // ran in, and resolving it per file would ask the same question repeatedly.
@@ -149,45 +144,64 @@ async function main(): Promise<void> {
   const told: string[] = [];
   const relatives = edited.map((file) => path.relative(choice.root, file));
   // The edit just landed, so the index describes the file as it was before
-  // it. This is the one surface that asks for the file to be re-judged from
-  // the working tree; it fires once per completed edit, where the language
-  // server fires on every save (carrick#1036). A patch of several files is
-  // one binary call, not one per file: each call re-reads the index and, on a
-  // repo whose re-check does not fit, would wait out a budget of its own.
-  const answers = await answersFor(relatives, choice.root);
-  // Files of this call the re-check did not answer for: one line names them
-  // all, rather than the same sentence once per file of a patch.
-  const unchecked: string[] = [];
+  // it. The hook asks the binary once, with a probe that never starts a
+  // re-scan: an answer that needs none (the file reads the same, no service
+  // reads it, a known miss) comes back at once and prints below. Every other
+  // file is queued for the background runner (carrick#3198).
+  const answers = await probeEdits(relatives, choice.root);
+  const queueable = channel.channel === "hook" && Boolean(session);
+  const toQueue: number[] = [];
+  const rendered = new Map<number, string>();
   for (const [index, relative] of relatives.entries()) {
     const result = answers.results[index] ?? null;
     if (!result) {
-      // One unreadable file in a patch of four is not a reason to say nothing
-      // about the other three.
+      // A probe with no answer queues every file; one unreadable file in a
+      // patch of four is no reason to say nothing about the other three.
       log("no answer for", relative, answers.failure ?? "");
+      if (queueable) toQueue.push(index);
       continue;
     }
     found.push(...newFunctions(result, checkoutRelative(choice.root, edited[index]!)));
+    if (queueable && needsBackground(result)) {
+      toQueue.push(index);
+      continue;
+    }
     const key = toldKey(result, relative);
-    const show = !payload.session_id || !wasTold(payload.session_id, key);
+    const show = !session || !wasTold(session, key);
     if (show && result.uses_lines?.length) told.push(key);
-    if (!result.error && !answersTheEdit(result)) unchecked.push(relative);
-    const context = renderPostToolUse(result, relative, { uses: show, noted: false });
+    const context = renderPostToolUse(result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
-    if (context) contexts.push(context);
+    if (context) rendered.set(index, context);
   }
-  // Said once per session: the sentence is the same on every edit, and the
-  // Stop hook asks again if the check never ran.
-  const notedAlready = payload.session_id ? wasTold(payload.session_id, NOTED_KEY) : false;
-  if (unchecked.length > 0 && !notedAlready) {
-    contexts.unshift(notedLine(unchecked));
-    told.push(NOTED_KEY);
+
+  if (toQueue.length > 0 && session) {
+    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), Date.now());
+    if (entries.length > 0) ensureRunner(choice.root);
+    const queued = new Set(entries.map((entry) => entry.file));
+    for (const index of toQueue) {
+      const result = answers.results[index] ?? null;
+      if (queued.has(edited[index]!)) {
+        rendered.set(index, pendingLine(relatives[index]!, result?.service));
+      } else {
+        // The queue refused it: say what is true rather than nothing.
+        rendered.set(index, notRecheckedLine(relatives[index]!, result?.recheck?.reason));
+      }
+    }
+  }
+  // Delivered after this edit is queued, so an older answer for a file this
+  // edit queues again is skipped (the newer entry carries it).
+  const late = channel.channel === "hook" ? deliverLate(session) : [];
+  contexts.push(...late);
+  for (const index of relatives.keys()) {
+    const context = rendered.get(index);
+    if (context) contexts.push(context);
   }
 
   // Silent and local: the names go to a file under the user's home directory
   // and nothing about them is printed here.
-  if (found.length > 0 && payload.session_id) {
-    record(payload.session_id, found);
-    log(`recorded ${found.length} new function(s) for ${payload.session_id}`);
+  if (found.length > 0 && session) {
+    record(session, found);
+    log(`recorded ${found.length} new function(s) for ${session}`);
   }
 
   if (channel.channel !== "hook") {
@@ -201,7 +215,7 @@ async function main(): Promise<void> {
   // stdout line, which this host reads as a malformed hook response.
   const mismatch = throttledVersionMismatch(choice.root, currentVersion());
   if (mismatch) contexts.push(mismatch);
-  if (told.length > 0 && payload.session_id) markTold(payload.session_id, told);
+  if (told.length > 0 && session) markTold(session, told);
   if (contexts.length > 0) emit(contexts.join("\n\n"));
 }
 

@@ -23,6 +23,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { binary, check } from "../cli.ts";
 import type { CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
@@ -284,13 +285,15 @@ export type EnsureOptions = {
   start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
 };
 
-/** The command that runs `runQueue` for a workspace, as this process was started. */
+/**
+ * The command that runs `runQueue` for a workspace: the runner script beside
+ * this module (`.js` in the package, `.ts` when a hook is run from source), so
+ * it does not depend on which script started this process.
+ */
 function runnerCommand(root: string): { command: string; args: string[] } {
-  const script = process.argv[1];
-  return {
-    command: process.execPath,
-    args: script ? [script, "hook", "recheck-run", root] : ["hook", "recheck-run", root],
-  };
+  const here = fileURLToPath(import.meta.url);
+  const script = path.join(path.dirname(here), `recheck-run${path.extname(here)}`);
+  return { command: process.execPath, args: [script, root] };
 }
 
 /**
@@ -494,7 +497,13 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
       }
       touchLock(root, pid, clock());
       const startedAt = clock();
-      const outcome = await check(entry.relative, { cwd: root, recheck: true, env: callEnv, bin });
+      const outcome = await check(entry.relative, {
+        cwd: root,
+        recheck: true,
+        limitMs: cap + CALL_SLACK_MS,
+        env: callEnv,
+        bin,
+      });
       const finishedAt = clock();
       if (outcome.result) {
         writeAnswer(entry, "answered", startedAt, finishedAt, { result: outcome.result }, options.home);

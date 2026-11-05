@@ -551,6 +551,7 @@ test("a Codex patch is re-checked in one call, and the deleted file is not asked
     "billing-service/src/lookup.ts",
     "--json",
     "--recheck",
+    "--no-rescan",
   ]);
   const asked = calls[0]!;
   // The deleted file is gone from disk, so asking about it would be asking
@@ -596,15 +597,20 @@ test("a three-file patch is one binary call, and every file gets its answer", as
     .split("\n")
     .filter((line) => line.trim().length > 0);
   assert.equal(calls.length, 1, calls.join("\n"));
-  // None of the three was re-checked: one line names all three, in the order
-  // the patch names them, rather than the same sentence three times.
+  // None of the three was re-checked: each gets its own line, in the order
+  // the patch names them.
   assert.equal(
     contextOf(run.stdout),
-    "Carrick: order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts were not re-checked here. Run `carrick check --changed` before you finish.",
+    files
+      .map(
+        (file) =>
+          `Carrick: ${file} was not re-checked: no re-check of it ran. Run \`carrick check --changed\` before you finish.`,
+      )
+      .join("\n\n"),
   );
 });
 
-test("a repo whose re-check is known not to fit gets one pointer line per session and still records", async (t) => {
+test("a repo whose re-check is known not to fit gets a line with its reason on every edit and still records", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
@@ -632,11 +638,11 @@ test("a repo whose re-check is known not to fit gets one pointer line per sessio
   const second = contextOf((await edit("sess-km")).stdout);
   // The index's verdicts describe the file before the edit, so none is
   // printed: one line that sends the reader to the command that answers.
-  const pointer =
-    "Carrick: user-service/src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.";
-  assert.equal(first, pointer);
-  // Said once per session: the second edit's line would be the same sentence.
-  assert.equal(second, "");
+  const line =
+    "Carrick: user-service/src/routes/users.ts was not re-checked: an earlier re-check of this repo ran past its budget against this index. Run `carrick check --changed` before you finish.";
+  assert.equal(first, line);
+  // Every edit is answered, the second one included (B3).
+  assert.equal(second, line);
   // The new function is recorded on every edit, the skipped re-scan or not.
   assert.deepEqual(
     sessionRecord(home, "sess-km").found.map((entry) => (entry as { name: string }).name),
@@ -1028,4 +1034,210 @@ test("invokerValue names every hook the cloud log tells apart", () => {
     (["post-edit", "stop", "session-start", "post-read"] as const).map(invokerValue),
     ["hook:post-edit", "hook:stop", "hook:session-start", "hook:post-read"],
   );
+});
+
+// ---------------------------------------------------------------------------
+// The background re-check (B3): the hook asks a probe, queues what needs a
+// re-scan, and the answer is delivered by whichever hook speaks next.
+
+const PENDING_USERS =
+  "Carrick is re-checking user-service/src/routes/users.ts in the background (re-reading user-service). Its answer comes with the next Carrick line, and before you finish.";
+const LATE_USERS =
+  "Carrick re-checked user-service/src/routes/users.ts after your earlier edit to it: 1 contract problem.";
+
+/** Env for a workspace whose probe defers and whose full re-check finds one problem. */
+function deferredEnv(home: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  return fakeEnv({
+    HOME: home,
+    CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred.json"),
+    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+    ...extra,
+  });
+}
+
+function answerFiles(home: string, session: string): string[] {
+  const dir = path.join(home, ".carrick", "sessions");
+  try {
+    return fs.readdirSync(dir).filter((name) => name.startsWith(`${session}.recheck.`) && name.endsWith(".answer.json"));
+  } catch {
+    return [];
+  }
+}
+
+/** Wait until the runner has written `count` answers for the session (so no runner outlives its test). */
+async function waitForAnswers(home: string, session: string, count: number): Promise<void> {
+  const until = Date.now() + 20_000;
+  while (Date.now() < until) {
+    if (answerFiles(home, session).length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(`the runner wrote fewer than ${count} answer(s) for ${session}`);
+}
+
+function secondFile(workspace: { root: string }): string {
+  return path.join(workspace.root, "order-service", "src", "server.ts");
+}
+
+test("a deferred edit returns at once with one pending line while the re-check runs behind it", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+
+  const run = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-b1" },
+    env: deferredEnv(home, { CARRICK_FAKE_FULL_DELAY_MS: "5000" }),
+  });
+  assert.equal(run.code, 0);
+  assert.ok(run.ms < 1500, `the hook waited ${run.ms}ms for a re-check that takes 5 s`);
+  // Exactly one JSON object: parse the whole of stdout.
+  assert.equal(contextOf(run.stdout), PENDING_USERS);
+  await waitForAnswers(home, "sess-b1", 1);
+});
+
+test("the late answer arrives on the next post-edit, once, naming the earlier file", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = deferredEnv(home, { CARRICK_FAKE_FULL_DELAY_MS: "200" });
+
+  await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: "sess-b2" }, env });
+  await waitForAnswers(home, "sess-b2", 1);
+
+  const next = await runHook("post-edit.ts", {
+    payload: {
+      ...editPayload(workspace),
+      session_id: "sess-b2",
+      tool_input: { file_path: secondFile(workspace) },
+    },
+    env,
+  });
+  const lines = contextOf(next.stdout).split("\n\n");
+  assert.ok(lines[0]?.startsWith(LATE_USERS), contextOf(next.stdout));
+  assert.ok(lines.some((line) => line.startsWith("Carrick is re-checking order-service/src/server.ts")));
+  await waitForAnswers(home, "sess-b2", 2);
+
+  const third = await runHook("post-edit.ts", {
+    payload: {
+      ...editPayload(workspace),
+      session_id: "sess-b2",
+      tool_input: { file_path: path.join(workspace.root, "billing-service", "src", "lookup.ts") },
+    },
+    env,
+  });
+  assert.equal(contextOf(third.stdout).includes(LATE_USERS), false, "the first answer is printed once");
+  await waitForAnswers(home, "sess-b2", 3);
+});
+
+test("a Read delivers a finished answer, of a non-TypeScript file and of one already read", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = deferredEnv(home, { CARRICK_FAKE_FULL_DELAY_MS: "100" });
+  const read = (file: string) =>
+    runHook("post-read.ts", {
+      payload: { hook_event_name: "PostToolUse", tool_name: "Read", cwd: workspace.root, session_id: "sess-b3", tool_input: { file_path: file } },
+      env,
+    });
+
+  await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: "sess-b3" }, env });
+  await waitForAnswers(home, "sess-b3", 1);
+  const md = await read(path.join(workspace.root, "README.md"));
+  assert.ok(contextOf(md.stdout).startsWith(LATE_USERS), md.stdout);
+
+  // A file read once is not asked about again, but a finished answer is still owed.
+  const target = path.join(workspace.root, "order-service", "src", "clients", "users.ts");
+  await read(target);
+  await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-b3", tool_input: { file_path: secondFile(workspace) } },
+    env,
+  });
+  await waitForAnswers(home, "sess-b3", 2);
+  const again = await read(target);
+  assert.ok(contextOf(again.stdout).startsWith("Carrick re-checked order-service/src/server.ts after your earlier edit to it"), again.stdout);
+});
+
+test("the Codex prompt hook delivers a finished answer", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = deferredEnv(home, { CARRICK_FAKE_FULL_DELAY_MS: "100" });
+
+  await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: "codex-b4" }, env });
+  await waitForAnswers(home, "codex-b4", 1);
+  const prompt = await runHook("user-prompt.ts", {
+    payload: { hook_event_name: "UserPromptSubmit", session_id: "codex-b4", cwd: workspace.root },
+    env,
+  });
+  const parsed = JSON.parse(prompt.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+  assert.equal(parsed.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+  assert.ok(parsed.hookSpecificOutput.additionalContext.startsWith(LATE_USERS));
+});
+
+test("an answer in hand prints at once and starts no runner", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const argvLog = path.join(workspace.root, "argv.log");
+
+  const run = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-b5" },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_ARGV_LOG: argvLog, CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+  });
+  assert.match(contextOf(run.stdout), /^Carrick re-checked user-service\/src\/routes\/users\.ts after this edit: 1 contract problem\./);
+  const calls = fs.readFileSync(argvLog, "utf8").trim().split("\n").map((l) => (JSON.parse(l) as { argv: string[] }).argv);
+  assert.equal(calls.length, 1);
+  assert.ok(calls.every((argv) => argv.includes("--no-rescan")), "every call is a probe");
+  assert.equal(fs.existsSync(path.join(workspace.root, ".carrick", "rechecks")), false);
+});
+
+test("a GraphQL schema edit runs the probe", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const argvLog = path.join(workspace.root, "argv.log");
+  const schema = path.join(workspace.service, "schema.graphql");
+  fs.writeFileSync(schema, "type Query { me: String }\n");
+
+  await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), tool_input: { file_path: schema } },
+    env: fakeEnv({ CARRICK_FAKE_ARGV_LOG: argvLog }),
+  });
+  const call = firstCall(argvLog);
+  assert.deepEqual(call?.argv, ["check", "user-service/schema.graphql", "--json", "--recheck", "--no-rescan"]);
+});
+
+test("a probe that fails still queues the edit", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+
+  const run = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-b8" },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_EXIT: "3" }),
+  });
+  assert.equal(
+    contextOf(run.stdout),
+    "Carrick is re-checking user-service/src/routes/users.ts in the background. Its answer comes with the next Carrick line, and before you finish.",
+  );
+  await waitForAnswers(home, "sess-b8", 1);
+});
+
+test("on the lsp channel nothing is queued and new functions are still recorded; with no session the probe answer prints", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+
+  const lsp = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-b9" },
+    env: deferredEnv(home, { CARRICK_CHANNEL: "lsp" }),
+  });
+  assert.equal(lsp.stdout, "");
+  assert.equal(fs.existsSync(path.join(workspace.root, ".carrick", "rechecks")), false);
+  assert.equal(sessionRecord(home, "sess-b9").found.length, 1);
+
+  const none = await runHook("post-edit.ts", { payload: editPayload(workspace), env: deferredEnv(home) });
+  assert.equal(
+    contextOf(none.stdout),
+    "Carrick: user-service/src/routes/users.ts was not re-checked: this edit needs a re-scan, which this call was asked not to start. Run `carrick check --changed` before you finish.",
+  );
+  assert.equal(fs.existsSync(path.join(workspace.root, ".carrick", "rechecks")), false);
 });
