@@ -686,6 +686,8 @@ fn readers_of_the_edit(
 ) -> std::collections::BTreeMap<String, String> {
     let repo_path = repo.to_string_lossy().to_string();
     let mut readers = std::collections::BTreeMap::new();
+    // One listing of what changed, shared by every service's view of it.
+    let listing = crate::change_scope::ChangedSince::new(&repo_path, &[], &[]);
     for service in reach
         .services
         .iter()
@@ -706,8 +708,7 @@ fn readers_of_the_edit(
             continue;
         };
         let own = service.clone();
-        let changes = crate::change_scope::ChangedSince::new(&repo_path, &[], &[])
-            .without(move |path| own.covers(path));
+        let changes = listing.view(move |path| own.covers(path));
         let read = crate::change_scope::untouched_since(
             &repo_path,
             std::slice::from_ref(&config),
