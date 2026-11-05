@@ -33,6 +33,17 @@ pub struct ServiceDerivation {
     /// its closing lines; the derive document carries them in `notes`.
     #[serde(skip)]
     pub without_source: Vec<String>,
+    /// Workspace patterns that matched no package and were skipped
+    /// (carrick#3318). The derive document carries them as `skipped_patterns`.
+    #[serde(skip)]
+    pub skipped_patterns: Vec<SkippedPattern>,
+}
+
+/// A workspace pattern derive left out, and why.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct SkippedPattern {
+    pub pattern: String,
+    pub reason: String,
 }
 
 /// The manifest facts that decide application from library.
@@ -293,6 +304,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 warnings: Vec::new(),
                 notes: Vec::new(),
                 without_source: Vec::new(),
+                skipped_patterns: Vec::new(),
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -301,6 +313,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let sources = workspace_patterns(&root)?;
     let mut members: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut skipped_patterns: Vec<SkippedPattern> = Vec::new();
     let mut reasons = sources
         .iter()
         .map(|(name, _)| name.clone())
@@ -384,10 +397,17 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
             }
         }
         for (raw, _, seen) in positive {
-            if !seen {
-                return Err(format!(
-                    "Workspace pattern '{raw}' matched no package manifests; correct it or declare services in carrick.json."
-                ));
+            // A folder emptied or optional in a real monorepo: nothing to
+            // propose for it, which is not a reason to refuse the rest.
+            if !seen
+                && !skipped_patterns
+                    .iter()
+                    .any(|skipped| skipped.pattern == *raw)
+            {
+                skipped_patterns.push(SkippedPattern {
+                    pattern: raw.clone(),
+                    reason: "matched no package manifests".into(),
+                });
             }
         }
     }
@@ -471,7 +491,15 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     // something this run found, so they are notes rather than warnings: they
     // belong to the document the agent reads and to the quickstart, not to a
     // terminal line with a warning marker on it (carrick#1032).
-    let warnings = Vec::new();
+    let warnings: Vec<String> = skipped_patterns
+        .iter()
+        .map(|skipped| {
+            format!(
+                "Workspace pattern '{}' {}, so it proposes no service.",
+                skipped.pattern, skipped.reason
+            )
+        })
+        .collect();
     let mut notes = Vec::new();
     if services.len() > 1 {
         notes.push("Workspace packages are proposed as services. Review service boundaries and shared source includes in carrick.json.".into());
@@ -497,6 +525,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         warnings,
         notes,
         without_source,
+        skipped_patterns,
     })
 }
 
