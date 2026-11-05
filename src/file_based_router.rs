@@ -685,6 +685,8 @@ const REMIX_PACKAGES: &[&str] = &[
 /// *server* a service runs (an app served by Express reports Express), which
 /// says nothing about whether that app also declares its routes by file
 /// location. The manifest does say so, deterministically, with no LLM call.
+///
+/// A convention added here goes in [`all_builtin_conventions`] too.
 pub fn builtin_conventions(
     frameworks: &[String],
     dependency_names: &[String],
@@ -706,6 +708,18 @@ pub fn builtin_conventions(
         out.push(RoutingConvention::flat_routes());
     }
     out
+}
+
+/// Every bootstrap convention, whatever the service declares: for a reader
+/// that must not miss a file some service may route by its path
+/// (`check --changed`'s no-contract rule, carrick#3364).
+pub fn all_builtin_conventions() -> Vec<RoutingConvention> {
+    vec![
+        RoutingConvention::nextjs_app(),
+        RoutingConvention::nextjs_pages(),
+        RoutingConvention::astro(),
+        RoutingConvention::flat_routes(),
+    ]
 }
 
 #[cfg(test)]

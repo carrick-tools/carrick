@@ -71,7 +71,7 @@ impl Visit for Spans {
 
 /// A comment the scan reads: a `/** */` block, one that names `@ts-` or
 /// `@jsx`, or a `///` line.
-fn is_directive(comment: &Comment) -> bool {
+pub(super) fn is_directive(comment: &Comment) -> bool {
     let marked = comment.text.contains("@ts-") || comment.text.contains("@jsx");
     match comment.kind {
         CommentKind::Block => comment.text.starts_with('*') || marked,

@@ -675,6 +675,28 @@ makes it `ran`, as does `CARRICK_CHECK_RESCAN=always`, a support switch that
 forces the re-scan. `rescan` is absent for a repo with no changed file to
 judge.
 
+**New code that reaches no contract.** A repo's `rescan` is `no_contract`
+when every other changed file reads the same and each changed source file is
+new code: a file added since that commit, or items appended after a file's
+existing ones, with every existing item unchanged. The new items declare new
+names only (functions, classes, variables, types, interfaces, enums, and in an
+added file imports with bindings), and every call, `new` and tagged template
+in them goes to a literal, a parameter or variable typed as a primitive, a
+function of the same file that passes the same rule, or a function imported
+from a relative file of the repo whose whole module passes it, and every value
+handed to a call passes the same rule. An appended-to
+file must hold no row in the index, an added one must not be a route by a
+file-based routing convention, no other file in the repo may spell the added
+file's name or a new export, and no file the new code reaches may hold a row
+or a possible call. JSX, decorators, dynamic `import()`, directive strings,
+GraphQL text, comments the scan reads, a global, a package import, `this` and
+an edit to existing code all make it `ran`. The check starts no re-scan, says
+`nothing in <repo>'s changes reaches a route, a call, an event or a type
+another service reads` on stderr, and when every changed repo is
+`no_contract` and no changed file holds a row it answers from the index with
+no join and no type check (`routes` and `calls` 0, `services` the services
+the index's blobs hold). `CARRICK_CHECK_RESCAN=always` forces the re-scan.
+
 **Quiet by default.** Only problems that fail the run are listed. The rest
 are counted on the summary line by why they do not fail, `..., plus 2 already
 in the index and 1 unconfirmed, run with --all to list them`, and `--all`

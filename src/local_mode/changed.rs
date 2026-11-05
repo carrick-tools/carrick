@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::join::{JoinedOperation, Role};
+use super::new_code::Shape;
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex, Source};
 use super::reads_same::{LineMap, reads_same_since};
 
@@ -114,9 +115,11 @@ pub struct ChangedRepo {
     /// [`EXIT_NOTHING_COVERED`] when no repo covered a file.
     #[serde(skip)]
     pub no_base: bool,
-    /// Whether this repo's changed files were re-read (`ran`), or read the
+    /// Whether this repo's changed files were re-read (`ran`), read the
     /// same as the index's copy and were answered from it (`not_needed`,
-    /// carrick#3245). Absent for a repo with no changed file to judge.
+    /// carrick#3245), or only added code that reaches no contract and were
+    /// answered from it (`no_contract`, carrick#3364). Absent for a repo with
+    /// no changed file to judge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescan: Option<Rescan>,
 }
@@ -127,6 +130,10 @@ pub struct ChangedRepo {
 pub enum Rescan {
     Ran,
     NotNeeded,
+    /// What changed is new code that reaches no contract
+    /// ([`super::new_code`], carrick#3364), and the rest reads the same: the
+    /// index already holds this repo's answer.
+    NoContract,
 }
 
 /// Set to `always` to re-scan every changed repo even when nothing the scan
@@ -445,41 +452,93 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     // (carrick#3245).
     let always = std::env::var(RESCAN_ENV).is_ok_and(|value| value == "always");
     let mut unmoved: BTreeMap<String, BTreeMap<String, LineMap>> = BTreeMap::new();
-    let mut rescan: Vec<&Path> = Vec::new();
     let mut rescanned: BTreeSet<&String> = BTreeSet::new();
+    // Repos whose change is new code that reaches no contract (carrick#3364),
+    // with the files the index's possible calls must not name.
+    let mut no_contract: BTreeMap<&String, BTreeSet<String>> = BTreeMap::new();
     for (name, (path, _)) in &changed {
-        let lines = if always {
+        let reading = if always {
             None
         } else {
             index
                 .repos
                 .iter()
                 .find(|indexed| &indexed.name == name)
-                .and_then(|indexed| reads_the_same(path, indexed))
+                .and_then(|indexed| reading_since(path, indexed, &index))
         };
-        match lines {
-            Some(lines) => {
+        match reading {
+            Some(Reading::Same(lines)) => {
                 narrator.phase(
                     Instant::now(),
                     format!("nothing the scan reads changed in {name}"),
                 );
                 unmoved.insert(name.clone(), lines);
             }
+            Some(Reading::NoContract { lines, lead_free }) => {
+                unmoved.insert(name.clone(), lines);
+                no_contract.insert(name, lead_free);
+            }
             None => {
-                rescan.push(path.as_path());
                 rescanned.insert(name);
             }
         }
     }
+    // The last leg reads the index's blobs: a possible call the scan recorded
+    // in a file the new code extends or calls into is a call the new code may
+    // name. Read once, and only when some repo got this far.
+    let held = if no_contract.is_empty() {
+        None
+    } else {
+        super::recheck::Held::read(&workspace).ok()
+    };
+    no_contract.retain(|name, lead_free| {
+        let (path, _) = &changed[*name];
+        let free = held
+            .as_ref()
+            .is_some_and(|held| !holds_a_possible_call(held, path, lead_free));
+        if free {
+            narrator.phase(Instant::now(), no_contract_line(name));
+        } else {
+            unmoved.remove(*name);
+            rescanned.insert(*name);
+        }
+        free
+    });
+    // In the workspace's repo order, as the re-scan has always run them.
+    let rescan: Vec<&Path> = changed
+        .iter()
+        .filter(|(name, _)| rescanned.contains(name))
+        .map(|(_, (path, _))| path.as_path())
+        .collect();
     for entry in &mut output.repos {
         let name = super::index::repo_label(Path::new(&entry.repo));
         if changed.contains_key(&name) {
-            entry.rescan = Some(if unmoved.contains_key(&name) {
+            entry.rescan = Some(if no_contract.contains_key(&name) {
+                Rescan::NoContract
+            } else if unmoved.contains_key(&name) {
                 Rescan::NotNeeded
             } else {
                 Rescan::Ran
             });
         }
+    }
+    // Every changed repo is new code that reaches no contract, and no changed
+    // file holds a row: the answer is the index's, with nothing in it to
+    // judge, so no join, no type check and no sidecar runs (carrick#3364).
+    let rowless = changed.iter().all(|(name, (_, files))| {
+        files
+            .iter()
+            .all(|file| indexed_rows(&index, name, file).next().is_none())
+    });
+    if no_contract.len() == changed.len()
+        && rowless
+        && let Some(held) = &held
+    {
+        output.services = join_services(held);
+        if !index.written_by_this_build() {
+            output.index_scanner = Some(index.scanner_shown());
+        }
+        return output;
     }
     // With nothing to re-scan this is the join alone, over the index's own
     // blobs (carrick#3245). The scope names projecting the index's rows
@@ -730,18 +789,37 @@ fn answers_lost<'a>(
         .collect()
 }
 
-/// For a repo whose every change since the index's commit reads the same to
-/// the scan, where each changed source file's lines went; `None` when any
-/// change could move what the scan reads, or the comparison cannot be made.
+/// What a repo's changes since the index's commit are to the scan, when the
+/// index already holds its answer. `None` takes the re-scan.
+enum Reading {
+    /// Every change reads the same: where each changed source file's lines
+    /// went (carrick#3245).
+    Same(BTreeMap<String, LineMap>),
+    /// Some changes are new code that reaches no contract and the rest read
+    /// the same (carrick#3364). `lead_free` are the files the index's
+    /// possible calls must not name, which only the blobs can say.
+    NoContract {
+        lines: BTreeMap<String, LineMap>,
+        lead_free: BTreeSet<String>,
+    },
+}
+
+/// How a repo's changes since the index's commit read to the scan; `None`
+/// when any change could move what the scan reads, or the comparison cannot
+/// be made.
 ///
 /// The commit is the one every indexed service of the repo was read at, from
 /// a clean tree. A path the published input rule does not read is no change
 /// to the scan. A path it reads must be a source file whose copy at that
 /// commit and whose copy on disk both parse, are equal ignoring positions,
-/// and hold the same type-bearing comments in the same places; a manifest, a
-/// lockfile, a config, a test file, an added or deleted file, or a commit this
-/// clone lacks takes the re-scan (carrick#3245).
-fn reads_the_same(repo: &Path, indexed: &IndexedRepo) -> Option<BTreeMap<String, LineMap>> {
+/// and hold the same type-bearing comments in the same places
+/// (carrick#3245), or new code ([`super::new_code`]) in a file no file-based
+/// routing convention routes: an added file no other file names, or items
+/// appended to a file the index holds no row for, whose exports no other file
+/// names, calling only into files the index holds no row for (carrick#3364).
+/// A manifest, a lockfile, a config, a test file, a deleted file, an edit to
+/// existing code, or a commit this clone lacks takes the re-scan.
+fn reading_since(repo: &Path, indexed: &IndexedRepo, index: &LocalIndex) -> Option<Reading> {
     // A repo the hosted index stood in for (`read_from_hosted`) is covered
     // too: its blobs were written beside the scanned ones, so the join below
     // retains them, and they describe the hosted commit from a clean tree.
@@ -755,13 +833,113 @@ fn reads_the_same(repo: &Path, indexed: &IndexedRepo) -> Option<BTreeMap<String,
         return None;
     }
     let mut lines = BTreeMap::new();
+    let mut new = BTreeMap::new();
     for file in super::query::changed_since(repo, commit)? {
         if !crate::change_scope::read_by_input_rule(&file) {
             continue;
         }
-        lines.insert(file.clone(), reads_same_since(repo, commit, &file)?);
+        if let Some(map) = reads_same_since(repo, commit, &file) {
+            lines.insert(file, map);
+            continue;
+        }
+        let code = super::new_code::read(repo, commit, &file).ok()?;
+        new.insert(file, code);
     }
-    Some(lines)
+    if new.is_empty() {
+        return Some(Reading::Same(lines));
+    }
+    let rowless = |file: &str| indexed_rows(index, &indexed.name, file).next().is_none();
+    let conventions = crate::file_based_router::all_builtin_conventions();
+    let mut lead_free = BTreeSet::new();
+    for (file, code) in new {
+        // A file at a routed path states a route for each handler it exports,
+        // whether it is added or gains its first handler.
+        if routed(&file, &conventions) {
+            return None;
+        }
+        let words = match code.shape {
+            Shape::Added => super::new_code::import_words(&file),
+            Shape::Extended(map) => {
+                if !rowless(&file) {
+                    return None;
+                }
+                lead_free.insert(file.clone());
+                lines.insert(file.clone(), map);
+                code.exported.clone()
+            }
+        };
+        if !code.reaches.iter().all(|reached| rowless(reached)) {
+            return None;
+        }
+        // Another file that names the added file or a new export may have
+        // imported it before it existed, and reads it differently now.
+        if super::new_code::spelled_elsewhere(repo, &words, std::slice::from_ref(&file)) {
+            return None;
+        }
+        lead_free.extend(code.reaches);
+    }
+    Some(Reading::NoContract { lines, lead_free })
+}
+
+/// Whether any built-in file-based routing convention routes `file`, rooted
+/// at the repo or at any folder in it: which folder a service starts at is
+/// the service's, so every one is tried.
+fn routed(file: &str, conventions: &[crate::file_based_router::RoutingConvention]) -> bool {
+    let mut rest = file;
+    loop {
+        if crate::file_based_router::derive_route(Path::new(rest), conventions).is_some() {
+            return true;
+        }
+        match rest.split_once('/') {
+            Some((_, deeper)) => rest = deeper,
+            None => return false,
+        }
+    }
+}
+
+/// Whether the index's blobs for `repo` record a possible call in any of
+/// `files`, or left some out (`possible_calls_omitted`), which may be one.
+fn holds_a_possible_call(
+    held: &super::recheck::Held,
+    repo: &Path,
+    files: &BTreeSet<String>,
+) -> bool {
+    let name = super::index::repo_label(repo);
+    let hosted = held.hosted.local_blobs(repo);
+    held.local
+        .iter()
+        .filter(|blob| blob.repo_name == name)
+        .chain(hosted.iter())
+        .any(|blob| {
+            blob.possible_calls_omitted.unwrap_or(0) > 0
+                || blob
+                    .possible_calls
+                    .iter()
+                    .flatten()
+                    .any(|call| files.contains(&call.file_path))
+        })
+}
+
+/// How many services a join over the index's own blobs reads: every local
+/// blob and every hosted one, as [`super::recheck::rejoin`] counts them.
+fn join_services(held: &super::recheck::Held) -> usize {
+    let mut services: BTreeSet<String> = held.local.iter().map(super::index::service_id).collect();
+    services.extend(
+        held.hosted
+            .remote_blobs()
+            .iter()
+            .map(|(_, blob)| super::index::service_id(blob)),
+    );
+    services.len()
+}
+
+/// The words a customer reads when a repo's change reaches no contract. In
+/// one place; they wait on David's approval (carrick#3364).
+fn no_contract_line(repo: &str) -> String {
+    format!(
+        "nothing in {repo}'s changes reaches a route, a call, an event or a type another \
+         service reads"
+    )
 }
 
 /// The judged lines, in the edited files' own numbering. A check answered
@@ -1613,6 +1791,54 @@ mod tests {
             .unwrap()
             .collect();
         assert_eq!(left.len(), 1, "no temp file is left beside it");
+    }
+
+    /// A file-based route is found whichever folder its service starts at
+    /// (carrick#3364).
+    #[test]
+    fn a_route_file_is_routed_below_any_folder() {
+        let conventions = crate::file_based_router::all_builtin_conventions();
+        assert!(routed("app/api/users/route.ts", &conventions));
+        assert!(routed("apps/web/app/api/users/route.ts", &conventions));
+        assert!(routed("packages/site/src/pages/api/users.ts", &conventions));
+        assert!(!routed("apps/web/src/lib/slug.ts", &conventions));
+    }
+
+    fn blob_with(possible: serde_json::Value) -> crate::cloud_storage::CloudRepoData {
+        let mut blob = serde_json::json!({"repo_name":"api", "service_name":"api", "endpoints":[],"calls":[],"mounts":[],"apps":{},"imported_handlers":[],"function_definitions":{},"last_updated":"2026-09-09T10:00:00Z","commit_hash":"abcdef", "file_results":{},"cache_version":crate::engine::CACHE_VERSION});
+        blob.as_object_mut()
+            .expect("an object")
+            .extend(possible.as_object().expect("an object").clone());
+        serde_json::from_value(blob).expect("a blob")
+    }
+
+    /// The blobs' possible calls refuse the files they name, and a blob that
+    /// left some out refuses every file (carrick#3364).
+    #[test]
+    fn a_possible_call_in_a_file_the_new_code_reaches_refuses_it() {
+        let held = |possible: serde_json::Value| super::super::recheck::Held {
+            local: vec![blob_with(possible)],
+            hosted: Default::default(),
+        };
+        let files = BTreeSet::from(["src/wrap.ts".to_string()]);
+        let call = serde_json::json!({"possible_calls": [{"file_path": "src/wrap.ts", "line_number": 3, "span_start": 10, "span_end": 20, "kind": "http", "role": "consumer", "labelled_end": null, "unread": {"slot": "path", "reason": "name_never_bound"}, "trace_depth": 0}]});
+        let repo = Path::new("/w/api");
+        assert!(holds_a_possible_call(&held(call.clone()), repo, &files));
+        assert!(!holds_a_possible_call(
+            &held(call),
+            repo,
+            &BTreeSet::from(["src/other.ts".to_string()])
+        ));
+        assert!(holds_a_possible_call(
+            &held(serde_json::json!({"possible_calls_omitted": 1})),
+            repo,
+            &files
+        ));
+        assert!(!holds_a_possible_call(
+            &held(serde_json::json!({})),
+            repo,
+            &files
+        ));
     }
 
     fn problem(kind: ProblemKind, fails: bool) -> Problem {
