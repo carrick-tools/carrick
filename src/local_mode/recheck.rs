@@ -129,6 +129,10 @@ pub struct Degraded {
     /// file's service missed its budget against the same index
     /// ([`ServiceMisses`]).
     pub known_miss: bool,
+    /// The re-scan was not started because this call was asked not to start
+    /// one (`check --recheck --no-rescan`): the edit needs a re-scan, and the
+    /// caller will make it later, under its own budget.
+    pub deferred: bool,
     /// Which services were to be re-read, once that was decided.
     pub scope: Option<RecheckScope>,
 }
@@ -241,6 +245,11 @@ fn took(phase: &str, began: Instant) {
 /// a re-scan that missed its budget against it is remembered per service
 /// there, and every later call for a file of the same service against the same
 /// generation skips the re-scan and answers at once ([`ServiceMisses`]).
+///
+/// `rescan: false` is the probe: after the known-miss gate and before
+/// [`Plan::make`] it returns a [`Degraded`] marked `deferred`, so it reads the
+/// index and parses the one file and starts no scan, no temporary generation
+/// and records no miss. A miss that holds still answers as a known miss.
 pub fn run(
     workspace: &Workspace,
     repo: &Path,
@@ -248,12 +257,14 @@ pub fn run(
     index_generation: &str,
     reach: &Reach,
     before: &super::read_model::LocalIndex,
+    rescan: bool,
 ) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
     if let Ok(mut at) = RUN_STARTED.lock() {
         *at = Some(started);
     }
-    let deadline = started + budget();
+    let budget = budget();
+    let deadline = started + budget;
     // The index is read once, here, and named twice: for what the edit added
     // and for the re-join. What the edit added does not wait on the re-scan
     // (carrick#2849): on a large repo the re-scan alone outlasts the budget,
@@ -269,6 +280,7 @@ pub fn run(
                 new_functions: Vec::new(),
                 elapsed: started.elapsed(),
                 known_miss: false,
+                deferred: false,
                 scope: None,
             }));
         }
@@ -280,12 +292,23 @@ pub fn run(
     let misses = ServiceMisses::path(workspace);
     let known = ServiceMisses::read(&misses);
     took("known-miss-read", began);
-    if let Some(miss) = known.holds(index_generation, &reach.owner) {
+    if let Some(miss) = known.holds(index_generation, &reach.owner, budget) {
         return Err(Box::new(Degraded {
             reason: miss_reason(&reach.owner, miss),
             new_functions,
             elapsed: started.elapsed(),
             known_miss: true,
+            deferred: false,
+            scope: None,
+        }));
+    }
+    if !rescan {
+        return Err(Box::new(Degraded {
+            reason: DEFERRED_REASON.to_string(),
+            new_functions,
+            elapsed: started.elapsed(),
+            known_miss: false,
+            deferred: true,
             scope: None,
         }));
     }
@@ -328,7 +351,7 @@ pub fn run(
                 ServiceMisses::record(
                     &misses,
                     index_generation,
-                    &plan.miss_of(&reach.owner, started.elapsed()),
+                    &plan.miss_of(&reach.owner, started.elapsed(), budget),
                 );
             }
             Err(Box::new(Degraded {
@@ -336,11 +359,16 @@ pub fn run(
                 new_functions,
                 elapsed: started.elapsed(),
                 known_miss: false,
+                deferred: false,
                 scope: Some(plan.scope.clone()),
             }))
         }
     }
 }
+
+/// Said when a probe found an edit that needs a re-scan. Agent-facing, though
+/// a caller that asked for the probe replaces it with its own line.
+const DEFERRED_REASON: &str = "this edit needs a re-scan, which this call was asked not to start";
 
 /// The reason a re-check that skipped its re-scan gives.
 fn miss_reason(service: &str, miss: &Miss) -> String {
@@ -362,6 +390,11 @@ fn miss_reason(service: &str, miss: &Miss) -> String {
 struct Miss {
     /// How long the re-check ran before it was stopped.
     elapsed_ms: u64,
+    /// The budget the re-check ran under. A caller with a longer budget than
+    /// this one's is not told the service does not fit: it may. No default:
+    /// a file written before this field existed fails to parse and reads as no
+    /// misses (carrick#3198).
+    budget_ms: u64,
     /// Indexed files of the service.
     files: usize,
 }
@@ -401,11 +434,16 @@ impl ServiceMisses {
             .unwrap_or_default()
     }
 
-    fn holds(&self, generation: &str, service: &str) -> Option<&Miss> {
+    /// The miss that silences a re-check under `budget`: one recorded under
+    /// a budget at least as long. A miss at 10 s says nothing about a call
+    /// that has 180 s.
+    fn holds(&self, generation: &str, service: &str, budget: Duration) -> Option<&Miss> {
         if generation.is_empty() || self.generation != generation {
             return None;
         }
-        self.services.get(service)
+        self.services
+            .get(service)
+            .filter(|miss| u128::from(miss.budget_ms) >= budget.as_millis())
     }
 
     /// Add `misses` for `generation`, dropping the misses of any older one.
@@ -595,7 +633,7 @@ impl Plan {
 
     /// The miss to remember when this re-check ran out of time: the edited
     /// file's own service only, never a reader service re-read beside it.
-    fn miss_of(&self, owner: &str, elapsed: Duration) -> Vec<(String, Miss)> {
+    fn miss_of(&self, owner: &str, elapsed: Duration, budget: Duration) -> Vec<(String, Miss)> {
         self.services
             .iter()
             .filter(|service| service.as_str() == owner)
@@ -604,6 +642,7 @@ impl Plan {
                     service.clone(),
                     Miss {
                         elapsed_ms: elapsed.as_millis() as u64,
+                        budget_ms: budget.as_millis() as u64,
                         files: self.files.get(service).copied().unwrap_or(0),
                     },
                 )
@@ -1960,9 +1999,12 @@ mod tests {
     fn miss(files: usize) -> Miss {
         Miss {
             elapsed_ms: 10_000,
+            budget_ms: 10_000,
             files,
         }
     }
+
+    const TEN_S: Duration = Duration::from_millis(10_000);
 
     /// A miss is remembered per service and per index generation: another
     /// service of the same repo, or the same service against a newer index,
@@ -1986,13 +2028,14 @@ mod tests {
                 stale: Vec::new(),
             },
         };
-        let recorded = plan.miss_of("types-owner", Duration::from_millis(10_000));
+        let recorded = plan.miss_of("types-owner", TEN_S, TEN_S);
         assert_eq!(
             recorded,
             vec![(
                 "types-owner".to_string(),
                 Miss {
                     elapsed_ms: 10_000,
+                    budget_ms: 10_000,
                     files: 3
                 }
             )],
@@ -2005,32 +2048,96 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("recheck-misses.json");
 
-        assert!(ServiceMisses::read(&path).holds("g1", "big").is_none());
+        assert!(
+            ServiceMisses::read(&path)
+                .holds("g1", "big", TEN_S)
+                .is_none()
+        );
         ServiceMisses::record(&path, "g1", &[("big".to_string(), miss(40))]);
         ServiceMisses::record(&path, "g1", &[("big".to_string(), miss(40))]);
         let read = ServiceMisses::read(&path);
-        assert_eq!(read.holds("g1", "big"), Some(&miss(40)));
+        assert_eq!(read.holds("g1", "big", TEN_S), Some(&miss(40)));
         assert_eq!(read.services.len(), 1, "recorded once");
         assert!(
-            read.holds("g1", "small").is_none(),
+            read.holds("g1", "small", TEN_S).is_none(),
             "a sibling service of the same repo still re-checks"
         );
-        assert!(read.holds("g2", "big").is_none(), "a new index tries again");
+        assert!(
+            read.holds("g2", "big", TEN_S).is_none(),
+            "a new index tries again"
+        );
 
         // A miss against a newer index replaces the older generation's.
         ServiceMisses::record(&path, "g2", &[("small".to_string(), miss(3))]);
         let read = ServiceMisses::read(&path);
-        assert!(read.holds("g2", "small").is_some());
-        assert!(read.holds("g2", "big").is_none());
-        assert!(read.holds("g1", "big").is_none());
+        assert!(read.holds("g2", "small", TEN_S).is_some());
+        assert!(read.holds("g2", "big", TEN_S).is_none());
+        assert!(read.holds("g1", "big", TEN_S).is_none());
 
         // No generation means no record either way.
         ServiceMisses::record(&path, "", &[("big".to_string(), miss(40))]);
-        assert!(ServiceMisses::read(&path).holds("", "big").is_none());
+        assert!(ServiceMisses::read(&path).holds("", "big", TEN_S).is_none());
 
         // The file the repo-wide rule wrote reads as no misses.
         std::fs::write(&path, r#"{"generation":"g2","repos":["/w/big"]}"#).unwrap();
-        assert!(ServiceMisses::read(&path).holds("g2", "big").is_none());
+        assert!(
+            ServiceMisses::read(&path)
+                .holds("g2", "big", TEN_S)
+                .is_none()
+        );
+    }
+
+    /// A miss records the budget it ran under, and silences only a call whose
+    /// budget is no longer: a 10 s miss must not switch off the 180 s runner.
+    #[test]
+    fn a_miss_under_a_shorter_budget_does_not_hold_for_a_longer_call() {
+        let long = Duration::from_millis(180_000);
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("recheck-misses.json");
+        ServiceMisses::record(&path, "g1", &[("big".to_string(), miss(40))]);
+        let read = ServiceMisses::read(&path);
+        assert!(read.holds("g1", "big", TEN_S).is_some());
+        assert!(
+            read.holds("g1", "big", Duration::from_millis(5_000))
+                .is_some()
+        );
+        assert!(
+            read.holds("g1", "big", long).is_none(),
+            "a miss at 10 s says nothing about a call with 180 s"
+        );
+        let at_cap = Miss {
+            budget_ms: 180_000,
+            ..miss(40)
+        };
+        ServiceMisses::record(&path, "g1", &[("big".to_string(), at_cap)]);
+        assert!(
+            ServiceMisses::read(&path)
+                .holds("g1", "big", long)
+                .is_some()
+        );
+        assert!(
+            ServiceMisses::read(&path)
+                .holds("g1", "big", TEN_S)
+                .is_some()
+        );
+    }
+
+    /// A file written before misses named their budget has no `budget_ms`; it
+    /// reads as no misses rather than guessing one.
+    #[test]
+    fn a_miss_file_without_budgets_reads_as_no_misses() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("recheck-misses.json");
+        std::fs::write(
+            &path,
+            r#"{"generation":"g1","services":{"big":{"elapsed_ms":10000,"files":40}}}"#,
+        )
+        .unwrap();
+        assert!(
+            ServiceMisses::read(&path)
+                .holds("g1", "big", TEN_S)
+                .is_none()
+        );
     }
 
     /// The reason a skipped re-check gives names the service, how much of it

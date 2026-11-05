@@ -591,6 +591,13 @@ pub struct Recheck {
     /// every other answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub known_miss: bool,
+    /// True on a `none` from `check --recheck --no-rescan` for an edit that
+    /// needs a re-scan: the call was asked not to start one, so the rows are
+    /// the indexed ones and a later `check --recheck` gives the answer. Absent
+    /// on every other answer, including a re-check that did run and missed
+    /// its budget (`known_miss`, `reason`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
     /// Which services this re-check read, and which it judged against their
     /// newest known copy (`docs/local-mode-output.md`, "`recheck`"). Absent on
     /// a `none` that had no service to name.
@@ -1386,6 +1393,7 @@ mod tests {
             reason: None,
             new_functions: Vec::new(),
             known_miss: false,
+            deferred: false,
             scope: None,
             moved: Vec::new(),
         });
@@ -1408,6 +1416,7 @@ mod tests {
             reason: Some("the re-scan ran past the budget".to_string()),
             new_functions: Vec::new(),
             known_miss: false,
+            deferred: false,
             scope: None,
             moved: Vec::new(),
         });
@@ -1429,6 +1438,7 @@ mod tests {
             reason: Some("the file has not changed since the index".to_string()),
             new_functions: Vec::new(),
             known_miss: false,
+            deferred: false,
             scope: None,
             moved: Vec::new(),
         });

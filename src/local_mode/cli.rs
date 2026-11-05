@@ -74,6 +74,10 @@ pub enum LocalCommand {
         /// answering, when the tree has moved past the index (carrick#1036).
         /// The post-edit hook asks for this; nothing else does.
         recheck: bool,
+        /// With `recheck`: answer at once from the index when the file needs
+        /// no re-scan, and say `deferred` when it does, without starting one
+        /// (`recheck.rs`, "deferred"). Never set without `recheck`.
+        no_rescan: bool,
     },
     /// Every file changed since the repo's main branch, re-extracted and
     /// judged against the index in one pass. The one read whose exit code a
@@ -100,6 +104,8 @@ pub enum LocalCommand {
         workspace: Option<PathBuf>,
         json: bool,
         recheck: bool,
+        /// As on [`LocalCommand::Check`], for every file named.
+        no_rescan: bool,
     },
     /// Collect a dispatched job's analysis and finish the index.
     ///
@@ -159,6 +165,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut detach = false;
     let mut dispatch = false;
     let mut recheck = false;
+    let mut no_rescan = false;
     let mut changed = false;
     let mut all = false;
     let mut each = false;
@@ -189,6 +196,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             "--candidates" => candidates = true,
             "--hosted-only" => hosted_only = true,
             "--recheck" => recheck = true,
+            "--no-rescan" => no_rescan = true,
             "--changed" => changed = true,
             "--all" => all = true,
             "--each" => each = true,
@@ -252,6 +260,14 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     if recheck && name != "check" {
         return Err(format!("unknown option for `carrick {name}`: --recheck"));
     }
+    // A probe for "does this edit need a re-scan" is a question about a
+    // re-check; without one it would have nothing to defer.
+    if no_rescan && !recheck {
+        return Err(format!(
+            "unknown option for `carrick {name}`: --no-rescan (it belongs to `carrick check \
+             <file> --recheck`)"
+        ));
+    }
     if changed && name != "check" {
         return Err(format!("unknown option for `carrick {name}`: --changed"));
     }
@@ -286,7 +302,16 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             workspace,
             json,
             recheck,
+            no_rescan,
         });
+    }
+    // The several-file pass always re-extracts, so there is no re-scan to
+    // decline.
+    if no_rescan && positional.len() > 1 {
+        return Err(
+            "`--no-rescan` goes with `carrick check <file> --recheck` or `carrick check --each`."
+                .to_string(),
+        );
     }
     // `--all` widens the list of the two passes that quiet their output: the
     // changed pass and the several-file pass.
@@ -397,6 +422,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                     workspace,
                     json,
                     recheck,
+                    no_rescan,
                 })
             }
         }
@@ -511,31 +537,25 @@ pub fn run(command: LocalCommand) -> i32 {
             workspace,
             json,
             recheck,
+            no_rescan,
         } => read(
             &file,
             workspace.as_deref(),
             json,
             Mode::Check,
-            if recheck {
-                Freshness::Recheck
-            } else {
-                Freshness::Indexed
-            },
+            freshness_of(recheck, no_rescan),
         ),
         LocalCommand::CheckEach {
             files,
             workspace,
             json,
             recheck,
+            no_rescan,
         } => read_each(
             &files,
             workspace.as_deref(),
             json,
-            if recheck {
-                Freshness::Recheck
-            } else {
-                Freshness::Indexed
-            },
+            freshness_of(recheck, no_rescan),
         ),
         LocalCommand::CheckChanged {
             workspace,
@@ -1872,6 +1892,15 @@ fn no_index_here(root: Option<&Path>, scans: &[super::scan_state::ScanState]) ->
 /// (carrick#1023 item 2). A VERDICT never moves the exit code — the command is
 /// advisory and nothing blocks — and `touch`, the editor's read, still exits 0
 /// whatever it finds, because an edit must never fail on a missing index.
+/// What `--recheck` and `--no-rescan` ask for, as the one value `query` reads.
+fn freshness_of(recheck: bool, no_rescan: bool) -> Freshness {
+    if recheck {
+        Freshness::Recheck { rescan: !no_rescan }
+    } else {
+        Freshness::Indexed
+    }
+}
+
 fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Freshness) -> i32 {
     let refused = match mode {
         Mode::Check => 1,
@@ -2023,9 +2052,9 @@ USAGE:
     carrick resume  [--workspace <dir>]
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
-    carrick check   <file> [--workspace <dir>] [--json] [--recheck]
+    carrick check   <file> [--workspace <dir>] [--json] [--recheck [--no-rescan]]
     carrick check   <file> <file>... [--workspace <dir>] [--json] [--all]
-    carrick check   --each <file>... [--workspace <dir>] [--json] [--recheck]
+    carrick check   --each <file>... [--workspace <dir>] [--json] [--recheck [--no-rescan]]
     carrick check   --changed [--workspace <dir>] [--json] [--all]
     carrick refresh [--service <name>] [--workspace <dir>]
 
@@ -2075,6 +2104,9 @@ USAGE:
                remembered against that index (.carrick/recheck-misses.json):
                later re-checks there answer at once from the index until the
                next `carrick refresh`.
+               --no-rescan (with --recheck) never starts that re-scan: a file
+               that needs none is answered as usual, and one that does comes
+               back with `recheck.deferred` true and the indexed rows.
                --each answers several files one by one, each as `check <file>`
                would, in one process (with --json, one array of answers).
                --changed takes no file: it checks every file changed since
@@ -2713,8 +2745,76 @@ mod tests {
                 workspace: Some(PathBuf::from("/w")),
                 json: false,
                 recheck: false,
+                no_rescan: false,
             }
         );
+    }
+
+    /// `--no-rescan` is a question about a re-check: alone it is refused, with
+    /// `--recheck` it parses for one file and for `--each`, and the passes
+    /// that always re-extract refuse it (B3-R).
+    #[test]
+    fn no_rescan_belongs_to_a_recheck() {
+        assert!(matches!(
+            parse(&args(&["check", "a.ts", "--no-rescan"])),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse(&args(&["touch", "a.ts", "--recheck", "--no-rescan"])),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse(&args(&["check", "--changed", "--recheck", "--no-rescan"])),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse(&args(&[
+                "check",
+                "a.ts",
+                "b.ts",
+                "--recheck",
+                "--no-rescan"
+            ])),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse(&args(&[
+                "check",
+                "a.ts",
+                "--recheck",
+                "--no-rescan",
+                "--json"
+            ])),
+            Some(Ok(LocalCommand::Check {
+                recheck: true,
+                no_rescan: true,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse(&args(&[
+                "check",
+                "--each",
+                "a.ts",
+                "b.ts",
+                "--recheck",
+                "--no-rescan"
+            ])),
+            Some(Ok(LocalCommand::CheckEach {
+                recheck: true,
+                no_rescan: true,
+                ..
+            }))
+        ));
+        assert_eq!(
+            freshness_of(true, true),
+            Freshness::Recheck { rescan: false }
+        );
+        assert_eq!(
+            freshness_of(true, false),
+            Freshness::Recheck { rescan: true }
+        );
+        assert_eq!(freshness_of(false, false), Freshness::Indexed);
     }
 
     #[test]

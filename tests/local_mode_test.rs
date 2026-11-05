@@ -4736,6 +4736,96 @@ fn a_re_check_reads_only_the_edited_files_service_and_judges_against_the_last_re
     );
 }
 
+/// `check --recheck --no-rescan` is the probe the post-edit hook asks first:
+/// what needs no re-scan is answered as before, and an edit that does comes
+/// back `deferred` at once with the indexed rows, no re-scan started and no
+/// miss remembered (B3-R).
+#[test]
+#[serial]
+fn a_no_rescan_recheck_answers_at_once_and_starts_nothing() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    let probe = |file: &str| -> serde_json::Value {
+        let text = run_with_env(
+            root,
+            &[
+                "check",
+                file,
+                "--workspace",
+                ".",
+                "--recheck",
+                "--no-rescan",
+                "--json",
+            ],
+            &AMPLE,
+        );
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
+    };
+
+    // A comment-only edit reads the same: answered from the index, as B5 does.
+    edit(&root.join(SHOP_HEALTH), "export", "// a note\nexport");
+    let same = probe(SHOP_HEALTH);
+    assert_eq!(
+        same["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{same:#}"
+    );
+    assert!(
+        same["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("changed nothing the scan reads")),
+        "{same:#}"
+    );
+    assert!(same["recheck"].get("deferred").is_none(), "{same:#}");
+    // Put the file back, so the full re-check below judges a clean sibling.
+    edit(&root.join(SHOP_HEALTH), "// a note\nexport", "export");
+
+    // An edit that moves a type needs a re-scan: the probe starts none.
+    let indexed_items = check_json(root, SHOP_CLIENT)["items"].clone();
+    edit(
+        &root.join(SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let before = recheck_temp_dirs();
+    let deferred = probe(SHOP_CLIENT);
+    assert_eq!(
+        deferred["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{deferred:#}"
+    );
+    assert_eq!(
+        deferred["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{deferred:#}"
+    );
+    assert!(
+        deferred["recheck"]["scope"].is_null(),
+        "no service was read: {deferred:#}"
+    );
+    assert_eq!(
+        deferred["items"], indexed_items,
+        "the rows are the indexed ones, not a re-check's:\n{deferred:#}"
+    );
+    assert_eq!(recheck_temp_dirs(), before, "no staged generation was left");
+    for kept in ["recheck-misses.json", "working"] {
+        assert!(
+            !root.join(".carrick").join(kept).exists(),
+            "the probe left .carrick/{kept}"
+        );
+    }
+
+    // The same edit through a full re-check still re-scans and answers.
+    let full = recheck_json(root, SHOP_CLIENT, &AMPLE);
+    assert!(full["recheck"].get("deferred").is_none(), "{full:#}");
+    assert_ne!(
+        full["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{full:#}"
+    );
+}
+
 /// A re-check says how long each phase before, around and after its re-scan
 /// took, when asked to, and says nothing more when not. The lines are what
 /// names the cut that makes the pre-scan cost small, so each phase the cost
