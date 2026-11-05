@@ -783,6 +783,10 @@ pub enum Undecided {
     /// The callee is a value whose values reach different labelled exports,
     /// or one of them none (carrick#2432): which one runs is the caller's.
     SeveralValues,
+    /// The call goes through an interface member whose implementations reach
+    /// different labelled exports, or one of them none (carrick#2432 slice
+    /// B): which one runs is the receiver's.
+    SeveralImplementations,
     /// Walks from different branches of one function reach the same labelled
     /// call and settle at this one, each with a different operation
     /// (carrick#2816): which runs depends on the call's arguments.
@@ -2266,7 +2270,13 @@ fn decide(
             if let Some(placed) =
                 calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
             {
-                walk.lead(&placed, end, Undecided::SeveralValues);
+                let reason =
+                    if site.stop.as_deref() == Some(super::discovery::SEVERAL_IMPLEMENTATIONS) {
+                        Undecided::SeveralImplementations
+                    } else {
+                        Undecided::SeveralValues
+                    };
+                walk.lead(&placed, end, reason);
             }
             continue;
         }

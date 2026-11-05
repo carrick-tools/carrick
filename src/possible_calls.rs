@@ -197,6 +197,9 @@ fn reason_of_undecided(reason: Undecided) -> UnreadReason {
         // A value passed in from elsewhere, and its values disagree on which
         // labelled export runs.
         Undecided::SeveralValues => UnreadReason::InjectedCallee,
+        // An interface member whose implementations reach different
+        // labelled exports.
+        Undecided::SeveralImplementations => UnreadReason::SeveralImplementations,
     }
 }
 

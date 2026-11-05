@@ -3638,6 +3638,10 @@ impl ServiceScan {
         let (early, first_answer) = tokio::sync::oneshot::channel();
         let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
         let sibling_inputs = siblings.inputs();
+        // No type checker is held here: the lane's walk reads no implementations,
+        // so a service with a call through an interface member may select other
+        // files than its analysis does (carrick#2432).
+        let implementations = crate::request_summary::implementations::Implementations::default();
         let orchestrator = FileOrchestrator::new(AgentService::new())
             .with_fact_files(crate::agents::file_orchestrator::FactFileSource::later(
                 fact_files,
@@ -3673,6 +3677,7 @@ impl ServiceScan {
                 &request_inputs,
                 &sibling_inputs,
                 Path::new(repo_path),
+                &implementations,
                 fact_sender,
             ),
         );
@@ -5281,6 +5286,8 @@ async fn analyze_current_repo_incremental(
             // asked (carrick#1564).
             let semantics_root = service_scan_root(repo_path, config);
             let sibling_inputs = siblings.inputs();
+            let implementations =
+                implementations_for(&request_inputs, sidecar, Path::new(repo_path));
             let library_ask = LibraryAsk::start(
                 &request_inputs,
                 &siblings,
@@ -5360,6 +5367,7 @@ async fn analyze_current_repo_incremental(
                     &request_inputs,
                     &sibling_inputs,
                     Path::new(repo_path),
+                    &implementations,
                     fact_sender,
                 ),
             );
@@ -5454,6 +5462,7 @@ async fn analyze_current_repo_incremental(
                 SiteContext {
                     prior: first_discovery.as_ref(),
                     declarations: declarations.as_ref(),
+                    implementations: Some(&implementations),
                     siblings: &sibling_inputs,
                     ..SiteContext::default()
                 },
@@ -5472,6 +5481,7 @@ async fn analyze_current_repo_incremental(
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     prior: first_discovery.as_ref(),
                     declarations: declarations.as_ref(),
+                    implementations: Some(&implementations),
                     siblings: &sibling_inputs,
                 },
             )
@@ -5487,6 +5497,7 @@ async fn analyze_current_repo_incremental(
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     prior: first_discovery.as_ref(),
                     declarations: declarations.as_ref(),
+                    implementations: Some(&implementations),
                     siblings: &sibling_inputs,
                 },
             );
@@ -6603,6 +6614,7 @@ async fn fact_files_of(
     inputs: &crate::request_summary::RequestSummaryInputs,
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     root: &Path,
+    implementations: &crate::request_summary::implementations::Implementations,
     sender: tokio::sync::oneshot::Sender<Option<crate::request_summary::fact_files::FactFiles>>,
 ) -> Option<FirstDiscovery> {
     let recorded = match ask {
@@ -6615,7 +6627,8 @@ async fn fact_files_of(
         let _ = sender.send(None);
         return None;
     };
-    let (facts, first) = first_discovery(&ask.sites, answer, inputs, siblings, root);
+    let (facts, first) =
+        first_discovery(&ask.sites, answer, inputs, siblings, root, implementations);
     let _ = sender.send(Some(facts));
     Some(first)
 }
@@ -6628,6 +6641,7 @@ fn first_discovery(
     inputs: &crate::request_summary::RequestSummaryInputs,
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     root: &Path,
+    implementations: &crate::request_summary::implementations::Implementations,
 ) -> (
     crate::request_summary::fact_files::FactFiles,
     FirstDiscovery,
@@ -6636,7 +6650,8 @@ fn first_discovery(
     // answered is told apart (`unanswered_package`) from a call it answered
     // with nothing to label.
     let labels =
-        crate::request_summary::discovery::Labels::of_answered(&answer.exports, &answer.answered);
+        crate::request_summary::discovery::Labels::of_answered(&answer.exports, &answer.answered)
+            .following(implementations);
     let discovery =
         crate::request_summary::discovery::discover_with(inputs, siblings, &labels, root);
     let decided = crate::request_summary::decided_sites::decided_sites_with(
@@ -6864,6 +6879,9 @@ struct SiteContext<'a> {
     /// The other services of the run the service's walk may enter
     /// (carrick#2618); none when it calls into no other.
     siblings: &'a [&'a crate::request_summary::RequestSummaryInputs],
+    /// What the sidecar found for the calls through an interface member
+    /// (carrick#2432 slice B, [`implementations_for`]).
+    implementations: Option<&'a crate::request_summary::implementations::Implementations>,
 }
 
 /// Discovery run on the library store's first answer, before the file reader
@@ -6873,6 +6891,35 @@ struct SiteContext<'a> {
 struct FirstDiscovery {
     exports: Vec<crate::library_claims::ExportClaims>,
     discovery: crate::request_summary::discovery::Discovery,
+}
+
+/// What the analysis sidecar finds for each call of the service through an
+/// interface member (carrick#2432 slice B), asked once, before the walks that
+/// read it. Empty unless site questions are on and the service has rows and a
+/// type checker; a failed ask leaves each call the `interface_member` stop it
+/// was. The ask waits on the service's analysis and runs under the sidecar's
+/// own silence deadline.
+fn implementations_for(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    sidecar: Option<&TypeSidecar>,
+    scan_root: &Path,
+) -> crate::request_summary::implementations::Implementations {
+    use crate::request_summary::implementations::{Implementations, implementations_of};
+    let Some(sidecar) = sidecar else {
+        return Implementations::default();
+    };
+    if !crate::site_questions::enabled() || inputs.positions.is_none() {
+        return Implementations::default();
+    }
+    let found = implementations_of(inputs, |queries| {
+        sidecar.implementations(queries, scan_root)
+    });
+    debug!(
+        asked = found.asked,
+        answered = found.answered(),
+        "implementations: interface members read through the sidecar"
+    );
+    found
 }
 
 /// The receiver trace's member declarations (carrick#2474 R1): one more
@@ -6973,6 +7020,10 @@ fn discovery_of<'a>(
                     crate::request_summary::discovery::Labels::traced(claims, declarations)
                 }
                 None => crate::request_summary::discovery::Labels::of(claims),
+            };
+            let labels = match context.implementations {
+                Some(implementations) => labels.following(implementations),
+                None => labels,
             };
             walked.insert(crate::request_summary::discovery::discover_with(
                 inputs,
@@ -13151,6 +13202,7 @@ async fn analyze_current_repo(
     // (carrick#1564).
     let service_root_text = service_root.to_string_lossy().into_owned();
     let sibling_inputs = siblings.inputs();
+    let implementations = implementations_for(&request_inputs, sidecar, Path::new(repo_path));
     let library_ask = LibraryAsk::start(
         &request_inputs,
         siblings,
@@ -13188,6 +13240,7 @@ async fn analyze_current_repo(
             &request_inputs,
             &sibling_inputs,
             Path::new(repo_path),
+            &implementations,
             fact_sender,
         ),
     );
@@ -13262,6 +13315,7 @@ async fn analyze_current_repo(
         SiteContext {
             prior: first_discovery.as_ref(),
             declarations: declarations.as_ref(),
+            implementations: Some(&implementations),
             siblings: &sibling_inputs,
             ..SiteContext::default()
         },
@@ -13279,6 +13333,7 @@ async fn analyze_current_repo(
             library: library_ask.as_ref().map(|ask| &ask.sites),
             prior: first_discovery.as_ref(),
             declarations: declarations.as_ref(),
+            implementations: Some(&implementations),
             siblings: &sibling_inputs,
         },
     )
@@ -13294,6 +13349,7 @@ async fn analyze_current_repo(
             library: library_ask.as_ref().map(|ask| &ask.sites),
             prior: first_discovery.as_ref(),
             declarations: declarations.as_ref(),
+            implementations: Some(&implementations),
             siblings: &sibling_inputs,
         },
     );
@@ -26075,7 +26131,14 @@ unfollowed_member_calls_total: 0,
         .await;
         let first = first.await.expect("the first answer is sent");
         assert_eq!(first.exports, settled.exports, "the settle added nothing");
-        let (facts, prior) = super::first_discovery(&ask.sites, first, &on.inputs, &[], &on.repo);
+        let (facts, prior) = super::first_discovery(
+            &ask.sites,
+            first,
+            &on.inputs,
+            &[],
+            &on.repo,
+            &Default::default(),
+        );
         let why = facts
             .files
             .get(LIB_FETCH_FILE)
