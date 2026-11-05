@@ -1,0 +1,201 @@
+// The Stop hook waits for the background re-check of a session's last edit
+// (`src/hook/stop-wait.ts`, B3). The runner is stood in for by the test: it
+// writes the answer file the real runner would, at the moment the test names,
+// and a live lock keeps the hook from starting a runner of its own.
+
+import assert from "node:assert/strict";
+import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { spawn } from "node:child_process";
+
+import { fakeEnv, fixture, makeWorkspace, pluginDir, type HookRun } from "./helpers.ts";
+import type { CheckResult } from "../src/contract.ts";
+import { BACKGROUND_CAP_MS, enqueue, lockPath, STOP_TIMEOUT_S, STOP_WAIT_S } from "../src/hook/rechecks.ts";
+import type { Answer, QueueEntry } from "../src/hook/rechecks.ts";
+import { record, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
+import { stopAnswers, waitSeconds } from "../src/hook/stop-wait.ts";
+import { carrickHooks } from "../src/init/settings.ts";
+
+const SESSION = "stop-sess";
+
+function setup(t: { after: (fn: () => void) => void }) {
+  const workspace = makeWorkspace();
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-home-")));
+  t.after(() => {
+    workspace.cleanup();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  return { workspace, home };
+}
+
+/** A live process holding the runner lock: the hook starts no runner of its own. */
+function liveRunner(root: string): void {
+  fs.mkdirSync(path.dirname(lockPath(root)), { recursive: true });
+  const now = new Date().toISOString();
+  fs.writeFileSync(lockPath(root), `${JSON.stringify({ pid: process.pid, started: now, touched: now })}\n`);
+}
+
+function queue(root: string, home: string, file: string, session = SESSION): QueueEntry {
+  return enqueue(root, session, [file], Date.now(), { home })[0]!;
+}
+
+/** What the runner writes when a call ends. */
+function answer(home: string, entry: QueueEntry, result: CheckResult): void {
+  const body: Answer = {
+    seq: entry.seq,
+    session: entry.session,
+    file: entry.file,
+    relative: entry.relative,
+    root: entry.root,
+    state: "answered",
+    enqueued_at: entry.enqueued_at,
+    started_at: entry.enqueued_at,
+    finished_at: new Date().toISOString(),
+    result,
+  };
+  writeAtomic(path.join(sessionsDir(home), `${entry.session}.recheck.${entry.seq}.answer.json`), `${JSON.stringify(body)}\n`);
+}
+
+/** A mismatch the re-check answered for: its problems print. */
+function problem(): CheckResult {
+  return { ...fixture("check-mismatch.json"), recheck: { ran: "extraction+types", elapsed_ms: 1 } };
+}
+
+function clean(): CheckResult {
+  return fixture("check-clean.json");
+}
+
+/** Run the Stop hook the way the settings entry does: `stop.ts --wait-s <n>`. */
+function stopWith(home: string, waitS: number, payload: Record<string, unknown> = {}): Promise<HookRun> {
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [path.join(pluginDir, "src", "hook", "stop.ts"), "--wait-s", String(waitS)], {
+      env: fakeEnv({ HOME: home }),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf8")));
+    child.on("close", (code) => resolve({ stdout, stderr: "", code, ms: Date.now() - started }));
+    child.stdin.end(JSON.stringify({ hook_event_name: "Stop", session_id: SESSION, ...payload }));
+  });
+}
+
+function context(stdout: string): string {
+  return (JSON.parse(stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput
+    .additionalContext;
+}
+
+test("stop waits for a re-check that finishes inside the wait and prints its problem", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const entry = queue(workspace.root, home, workspace.file);
+  setTimeout(() => answer(home, entry, problem()), 2000);
+
+  const run = await stopWith(home, 20);
+  assert.equal(run.code, 0);
+  assert.ok(run.ms >= 1800 && run.ms < 8000, `waited for the answer, not the whole wait (${run.ms} ms)`);
+  const text = context(run.stdout);
+  assert.match(text, /contract problem/);
+  assert.doesNotMatch(text, /still running/);
+});
+
+test("stop with nothing pending returns at once and leaves the nudge as it was", async (t) => {
+  const { workspace, home } = setup(t);
+  record(SESSION, [{ name: "slugify", file: "src/a.ts", indexCommit: "abc" }], home);
+  const run = await stopWith(home, 20);
+  assert.ok(run.ms < 1500, `no wait (${run.ms} ms)`);
+  assert.match(context(run.stdout), /^Carrick: this task added 1 new function \(slugify\)/);
+  void workspace;
+});
+
+test("stop says the re-check is still running when it outlives the wait, once, and delivers the answer later", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const entry = queue(workspace.root, home, workspace.file);
+
+  const first = await stopWith(home, 1);
+  assert.ok(first.ms < 2500, `returned inside its wait (${first.ms} ms)`);
+  assert.match(
+    context(first.stdout),
+    /^Carrick: the re-check of user-service\/src\/routes\/users\.ts is still running after \d+ s\. Run `carrick check --changed` before you finish\.$/,
+  );
+
+  const second = await stopWith(home, 20, { stop_hook_active: true });
+  assert.ok(second.ms < 1500, `a second Stop never waits twice for one entry (${second.ms} ms)`);
+  assert.equal(second.stdout, "");
+
+  answer(home, entry, problem());
+  const third = await stopWith(home, 20);
+  assert.match(context(third.stdout), /contract problem/);
+  const fourth = await stopWith(home, 20);
+  assert.equal(fourth.stdout, "", "delivered once");
+});
+
+test("a clean late answer alone prints nothing and is marked delivered; beside a problem both print", async (t) => {
+  const { workspace, home } = setup(t);
+  const entry = queue(workspace.root, home, workspace.file);
+  answer(home, entry, clean());
+  const alone = await stopWith(home, 5);
+  assert.equal(alone.stdout, "");
+  assert.ok(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.delivered`)));
+
+  const other = path.join(workspace.service, "src", "routes", "orders.ts");
+  fs.writeFileSync(other, "export {};\n");
+  const a = queue(workspace.root, home, workspace.file);
+  const b = queue(workspace.root, home, other);
+  answer(home, a, clean());
+  answer(home, b, problem());
+  const both = context((await stopWith(home, 5)).stdout);
+  assert.match(both, /contract problem/);
+  assert.match(both, /no contract problem|re-checked/, "the clean answer rides along");
+  assert.ok(both.split("\n").some((line) => line.includes("users.ts")));
+  assert.ok(both.split("\n").some((line) => line.includes("orders.ts")));
+});
+
+test("functions the runner records during the wait are named in the nudge", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const entry = queue(workspace.root, home, workspace.file);
+  setTimeout(() => {
+    record(SESSION, [{ name: "lateName", file: "src/a.ts", indexCommit: "abc" }], home);
+    answer(home, entry, clean());
+  }, 1000);
+  const run = await stopWith(home, 20);
+  assert.match(context(run.stdout), /lateName/);
+});
+
+test("a dead runner lock with queued entries: stop starts a runner before it waits", async (t) => {
+  const { workspace, home } = setup(t);
+  const entry = queue(workspace.root, home, workspace.file);
+  const started: string[] = [];
+  const result = await stopAnswers(SESSION, {
+    waitS: 5,
+    home,
+    ensure: (root) => {
+      started.push(root);
+      answer(home, entry, problem());
+      return true;
+    },
+  });
+  assert.deepEqual(started, [workspace.root]);
+  assert.ok(result.lines.some((line) => /contract problem/.test(line)));
+});
+
+test("the Stop entry waits as long as the cap says, and its timeout sits above the wait", () => {
+  const entry = carrickHooks("carrick").Stop![0]!.hooks[0]!;
+  assert.equal(STOP_WAIT_S, BACKGROUND_CAP_MS / 1000 + 20);
+  assert.equal(STOP_TIMEOUT_S, STOP_WAIT_S + 10);
+  assert.equal(entry.command, `carrick hook stop --wait-s ${STOP_WAIT_S}`);
+  assert.equal(entry.timeout, STOP_TIMEOUT_S);
+  assert.ok(entry.timeout! > waitSeconds(entry.command.split(" ")));
+  assert.equal(entry.statusMessage, "Carrick: waiting for the re-check of your last edit");
+});
+
+test("the wait is read from the command and defaults to 3 s", () => {
+  assert.equal(waitSeconds(["hook", "stop", "--wait-s", "200"]), 200);
+  assert.equal(waitSeconds(["--wait-s=7"]), 7);
+  assert.equal(waitSeconds(["hook", "stop"]), 3);
+});

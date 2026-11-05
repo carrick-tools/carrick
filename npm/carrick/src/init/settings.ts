@@ -17,6 +17,7 @@ import path from "node:path";
 
 import { sameText } from "./files.ts";
 import { packageRoot } from "../native.ts";
+import { STOP_TIMEOUT_S, STOP_WAIT_S } from "../hook/rechecks.ts";
 
 /**
  * The entry point in this package, for a settings file that must name a path.
@@ -65,7 +66,13 @@ export function hookCommand(options: {
   return { command: /\s/.test(entry) ? `"${entry}"` : entry, bare: false };
 }
 
-export type HookEntry = { type: "command"; command: string; timeout?: number };
+export type HookEntry = {
+  type: "command";
+  command: string;
+  timeout?: number;
+  /** What Claude Code shows while the hook runs. */
+  statusMessage?: string;
+};
 export type HookGroup = { matcher?: string; hooks: HookEntry[] };
 
 /** What this package registers, and the only entries it will ever remove. */
@@ -95,10 +102,20 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
     // The end of a task, which is the only moment a reuse check is worth a
     // model turn: the post-edit hook records what each edit added and this
     // names the lot once (carrick#1330). It reads one small file and prints
-    // nothing when the task added no function, so the timeout is the short one.
+    // nothing when the task added no function. It also waits for a background
+    // re-check of the last edit (B3, carrick#3198), so its timeout sits above
+    // that wait (`STOP_WAIT_S`): a hook that reaches its timeout is cancelled
+    // and its output dropped.
     Stop: [
       {
-        hooks: [{ type: "command", command: `${command} hook stop`, timeout: 5 }],
+        hooks: [
+          {
+            type: "command",
+            command: `${command} hook stop --wait-s ${STOP_WAIT_S}`,
+            timeout: STOP_TIMEOUT_S,
+            statusMessage: "Carrick: waiting for the re-check of your last edit",
+          },
+        ],
       },
     ],
   };
