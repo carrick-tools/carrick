@@ -130,7 +130,7 @@ describe('an absolute source_file outside the service root resolves as itself', 
         const abs = run.records.get('Abs_Literal')!;
         const rel = run.records.get('Rel_Literal')!;
         assert.strictEqual(abs.capture_failure_reason, rel.capture_failure_reason);
-        assert.deepStrictEqual(abs.unresolved, rel.unresolved);
+        assert.strictEqual(abs.self_check, rel.self_check);
         assert.strictEqual(
           surfaceLine(run.surface, 'Abs_Literal').replace('Abs_Literal', 'X'),
           surfaceLine(run.surface, 'Rel_Literal').replace('Rel_Literal', 'X')
