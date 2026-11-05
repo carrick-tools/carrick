@@ -437,8 +437,25 @@ describe('the unwidened reading in the probe and the classifier (carrick#1538)',
     });
 
     it('a mismatch that is not a fact stays the mismatch it was', () => {
-      // The consumer holds a member that accepts anything, so the reading
-      // fitting it proves nothing.
+      // The consumer holds a top type at its root (no named member is open),
+      // so the reading fitting it proves nothing.
+      const v = classifyPair({
+        plan,
+        probeDiags: [mismatch],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: {
+          sent: [],
+          expected: [{ kind: 'unknown', path: '', reason: 'declared' }],
+          sentUnwidened: [],
+        },
+      });
+      assert.strictEqual(v.bucket, 'incompatible');
+      assert.strictEqual(v.resolved, false);
+      assert.strictEqual(v.unresolved_side, 'consumer');
+    });
+
+    it('a declared open unknown member on the receiving side is open like an any one (A2-1)', () => {
       const v = classifyPair({
         plan,
         probeDiags: [mismatch],
@@ -451,8 +468,7 @@ describe('the unwidened reading in the probe and the classifier (carrick#1538)',
         },
       });
       assert.strictEqual(v.bucket, 'incompatible');
-      assert.strictEqual(v.resolved, false);
-      assert.strictEqual(v.unresolved_side, 'consumer');
+      assert.strictEqual(v.resolved, true);
     });
 
     it('a declared open any member on a published side does not let the reading clear a mismatch (carrick#2591)', () => {
