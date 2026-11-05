@@ -1762,9 +1762,9 @@ impl<'a> Walker<'a> {
                 out
             }
             Reach::OutsideService(..) => Outcome::default(),
-            Reach::NoFunction if self.interface_member(file, call) => {
-                Outcome::stopped("interface_member")
-            }
+            Reach::NoFunction if self.interface_member(file, call) => self
+                .through_implementations(file, call, invoke)
+                .unwrap_or_else(|| Outcome::stopped("interface_member")),
             // A call into a library whose declaration returns what the
             // function it is handed returns (carrick#2634): the compiler's
             // row says so, and the function written at the call is walked.
