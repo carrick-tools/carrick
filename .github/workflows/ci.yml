@@ -197,7 +197,7 @@ jobs:
               fi
               ;;
             cargo)
-              cargo test --no-fail-fast --verbose $TARGETS || rc=$?
+              cargo test --verbose $TARGETS || rc=$?
               ;;
             steps)
               for t in ${TARGETS//--test /}; do
