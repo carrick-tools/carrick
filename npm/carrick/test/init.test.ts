@@ -47,6 +47,8 @@ import {
   reposToScaffold,
   preselectedRepos,
   chooseEditors,
+  CLOUD_NEXT_TITLE,
+  ASK_YOUR_AGENT_PROMPT,
   type InitOptions,
 } from "../src/init/run.ts";
 import { inspectTaskSkills, removeTaskSkills, taskSkillPaths, taskSkillWarnings, writeTaskSkills } from "../src/init/task-skills.ts";
@@ -3942,7 +3944,20 @@ test("where Carrick builds the index, init asks nothing, installs everything and
       assert.match(text, /Next:\n {2}Add Carrick's hooks and skills to \.claude\/, \.agents\/ and \.codex\//);
       assert.ok(out.lines.includes("◇ Set up in project Shop (shop): api"), text);
       assert.match(text, /^Hosted index for 1 service read into \.carrick\/ in \d/m);
-      assert.equal(out.lines.at(-1), `◇ ${READY}`);
+      assert.ok(out.lines.includes(`◇ ${READY}`), text);
+      // The run closes on what it wrote, the new-session step and the prompt
+      // (carrick#3286); the laptop lane's paste-this block never appears.
+      const closing = text.slice(text.indexOf(CLOUD_NEXT_TITLE));
+      assert.match(closing, /Written here:/);
+      assert.match(closing, /Claude Code hooks in \.claude\/settings(\.local)?\.json/);
+      assert.match(closing, /Codex hooks in /);
+      assert.match(closing, /Carrick task skills/);
+      assert.match(closing, /The Carrick MCP server for Claude Code/);
+      assert.match(closing, /Open a new agent session in this folder, so it loads the MCP server and the hooks\./);
+      assert.ok(closing.includes(`Then ask it: ${ASK_YOUR_AGENT_PROMPT}.`), closing);
+      assert.match(closing, /HTTP, GraphQL, socket events and queues/);
+      // The index is on this machine, so refresh is not offered.
+      assert.doesNotMatch(closing, /carrick refresh/);
       // Nobody scaffolds here: no instruction for an agent, no config, no
       // workflow, no scan command.
       assert.doesNotMatch(text, /scaffold|carrick\.json|carrick index|workflow|paste this/i);
@@ -3979,7 +3994,9 @@ test("a folder is set up for the repos the workspace holds, and the rest are nam
     assert.ok(first.lines.includes(`▲ ${NOT_IN_WORKSPACE("acme/notes", "is", "it")}`), first.lines.join("\n"));
     assert.ok(first.lines.includes(`▲ ${NO_INDEX_YET}`), first.lines.join("\n"));
     assert.ok(first.lines.includes("◇ Set up in project Shop (shop): api, web"), first.lines.join("\n"));
-    assert.equal(first.lines.at(-1), `◇ ${READY}`);
+    assert.ok(first.lines.includes(`◇ ${READY}`), first.lines.join("\n"));
+    // A repo has no index yet: the closing block says refresh reads it in.
+    assert.match(first.lines.join("\n"), /`carrick refresh` reads it in once Carrick has built it/);
     // The repo the workspace does not hold is out of the file every later
     // command reads, recorded as this command's, and holds nothing of ours.
     assert.deepEqual(JSON.parse(fs.readFileSync(workspaceFile, "utf8")), {
