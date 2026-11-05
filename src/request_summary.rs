@@ -8650,6 +8650,55 @@ pub struct RequestSummaryIndex {
     /// What the requests whose method is a parameter declared as a set of
     /// verbs wait on (carrick#2049).
     methods: Box<DeclaredMethods>,
+    /// The calls whose every request has its verb settled at the call but
+    /// its URL still open (carrick#2676), by file.
+    verbs: HashMap<PathBuf, Vec<StatedVerb>>,
+}
+
+/// The verb a call settles for the requests it reaches, where none of their
+/// URLs is closed at the call (carrick#2676): `openPoll({ url, request })`
+/// into `fetch(options.url, { ...options.request, method: "GET" })`, with
+/// the URL left to a caller this pass does not see.
+///
+/// It is no row of its own: the URL is not the source's to state here. It
+/// says only what the request's verb is, so the model's row at the same
+/// call takes it and keeps its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatedVerb {
+    pub span_start: u32,
+    pub span_end: u32,
+    pub line: u32,
+    pub method: String,
+}
+
+/// The verbs one call settles for the requests whose URL it leaves open.
+///
+/// One verb only where every request the call reaches is still open, none
+/// is a verb call (whose role nothing here states), and every one of them
+/// has a literal verb at the call, the same one. Anything else states none.
+#[derive(Debug, Default)]
+struct OpenVerbs {
+    verbs: BTreeSet<String>,
+    unread: bool,
+    closed: bool,
+}
+
+impl OpenVerbs {
+    fn read(&mut self, effect: &Effect, method: &MethodValue) {
+        match method {
+            MethodValue::Lit(verb) if !effect.verb && is_http_method(&verb.to_uppercase()) => {
+                self.verbs.insert(verb.to_uppercase());
+            }
+            _ => self.unread = true,
+        }
+    }
+
+    fn verb(self) -> Option<String> {
+        if self.unread || self.closed || self.verbs.len() != 1 {
+            return None;
+        }
+        self.verbs.into_iter().next()
+    }
 }
 
 /// What the requests whose method is a parameter declared as a set of verbs
@@ -8754,6 +8803,12 @@ impl RequestSummaryIndex {
     /// start.
     pub fn silent(&self, file: &Path) -> Option<&BTreeSet<u32>> {
         self.silent.get(file)
+    }
+
+    /// The verbs the calls of `file` settle for requests whose URL they
+    /// leave open ([`StatedVerb`], carrick#2676).
+    pub fn verbs(&self, file: &Path) -> &[StatedVerb] {
+        self.verbs.get(file).map(Vec::as_slice).unwrap_or_default()
     }
 
     pub fn row_count(&self) -> usize {
@@ -9243,6 +9298,7 @@ fn emit(
                 let callee_ir = composer
                     .target(file, call)
                     .and_then(|(target, key)| files.get(&target)?.functions.get(&key));
+                let mut open_verbs = OpenVerbs::default();
                 for effect in &callee.effects {
                     // A JSX element states only what its props fill in
                     // (carrick#1949).
@@ -9268,9 +9324,12 @@ fn emit(
                         }
                     }
                     if instantiated.has_params() {
-                        // Still open: a caller further up fills it.
+                        // Still open: a caller further up fills it. The verb
+                        // may be settled here all the same (carrick#2676).
+                        open_verbs.read(effect, &instantiated.method);
                         continue;
                     }
+                    open_verbs.closed = true;
                     let reaches = if effect.has_params() {
                         // The last hole is filled here: this site states the
                         // request. Not for a verb call, whose role nothing
@@ -9323,6 +9382,18 @@ fn emit(
                             index.undetermined += 1;
                         }
                     }
+                }
+                if let Some(method) = open_verbs.verb() {
+                    index
+                        .verbs
+                        .entry(file.to_path_buf())
+                        .or_default()
+                        .push(StatedVerb {
+                            span_start: call.site.span_start,
+                            span_end: call.site.span_end,
+                            line: call.site.line,
+                            method,
+                        });
                 }
                 if is_silent(composer, file, ir, call, &callee) {
                     index
