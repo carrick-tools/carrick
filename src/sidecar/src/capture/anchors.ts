@@ -93,13 +93,23 @@ export interface ResolvedAnchor {
  * module setting maps back to the source and, in the stub, to its
  * declaration.
  */
+/**
+ * The absolute path of an anchor's `source_file`. The scanner sends a file
+ * outside the service root as an absolute path; `path.join` would nest it
+ * under the root, so a source file resolves with `path.resolve`: absolute
+ * stays absolute, relative is taken from the root.
+ */
+export function resolveSourceFile(repoRoot: string, sourceFile: string): string {
+  return path.resolve(repoRoot, sourceFile);
+}
+
 export function entryRelativeSpecifier(
   entryDir: string,
   repoRoot: string,
   sourceFile: string,
   resolveFromEntry?: (specifier: string) => string | undefined
 ): string {
-  const target = path.join(repoRoot, sourceFile);
+  const target = resolveSourceFile(repoRoot, sourceFile);
   const from = (file: string): string => {
     const rel = path.relative(entryDir, file).split(path.sep).join('/');
     return rel.startsWith('.') ? rel : `./${rel}`;
@@ -214,7 +224,7 @@ export function resolveAnchor(
     };
   }
 
-  const sourceAbs = path.join(args.repoRoot, request.source_file);
+  const sourceAbs = resolveSourceFile(args.repoRoot, request.source_file);
   const sourceFile = program.getSourceFile(sourceAbs);
   if (!sourceFile) {
     return demote(`source file not in program: ${request.source_file}`);
@@ -629,7 +639,7 @@ function unresolvedSpecifiersForLiteral(
   repoRoot: string
 ): string[] {
   if (!sourceFileRel) return [];
-  const sourceFile = program.getSourceFile(path.join(repoRoot, sourceFileRel));
+  const sourceFile = program.getSourceFile(resolveSourceFile(repoRoot, sourceFileRel));
   return sourceFile ? unresolvedSpecifiersReachableFrom(program, sourceFile) : [];
 }
 
@@ -704,7 +714,7 @@ function qualifyNamesFromSource(
   }
 ): string | undefined {
   if (!sourceFileRel) return undefined;
-  const source = program.getSourceFile(path.join(args.repoRoot, sourceFileRel));
+  const source = program.getSourceFile(resolveSourceFile(args.repoRoot, sourceFileRel));
   const parsed = parseLiteralAnchor(text);
   if (!source || !parsed) return undefined;
   const checker = program.getTypeChecker();
