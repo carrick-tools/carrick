@@ -5809,7 +5809,7 @@ fn a_route_rename_names_the_callers_it_strands() {
 
 /// The shop with `Widget` moved out of the route file into `types.ts`.
 fn shop_with_widget_in_a_types_file() -> tempfile::TempDir {
-    let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
+    workspace_prepared(SHOP, &["shop"], |repo| {
         let route = repo.join("catalog/app/routes/api.v1.widgets.$widgetId.ts");
         let text = std::fs::read_to_string(&route).expect("read the route");
         let (types, rest) = text
@@ -5829,8 +5829,7 @@ fn shop_with_widget_in_a_types_file() -> tempfile::TempDir {
             ),
         )
         .expect("rewrite the route");
-    });
-    workspace
+    })
 }
 
 /// A type moved out of the route file into a types file: editing the type
