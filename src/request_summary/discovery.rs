@@ -503,7 +503,8 @@ pub const RECEIVER_TRACE_SWITCH: &str = "CARRICK_RECEIVER_TRACE";
 
 /// Whether the receiver trace is on in this process.
 pub fn receiver_trace_enabled() -> bool {
-    std::env::var(RECEIVER_TRACE_SWITCH).ok().as_deref() == Some("1")
+    // carrick#3283 S0 census: always on.
+    true
 }
 
 /// What holds the receiver a labelled call is made on.
