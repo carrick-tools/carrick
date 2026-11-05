@@ -19,6 +19,8 @@
 //   CARRICK_FAKE_INVOKER_LOG
 //                         file to append the CARRICK_INVOKER of every call to
 //                         ("" when unset), to read what a hook marked itself as
+//   CARRICK_FAKE_ENV_LOG  file to append {budget, timeout} (CARRICK_RECHECK_BUDGET_MS
+//                         and CARRICK_TIMEOUT_MS) of every call to
 //   CARRICK_FAKE_REBASE   "1" rewrites the fixtures' `/workspace` prefix to the
 //                         working directory, so the absolute `repo` paths a
 //                         payload carries point at the throwaway workspace an
@@ -39,6 +41,17 @@ if (argvLog) {
 const invokerLog = process.env.CARRICK_FAKE_INVOKER_LOG;
 if (invokerLog) {
   fs.appendFileSync(invokerLog, `${process.env.CARRICK_INVOKER ?? ""}\n`);
+}
+
+const envLog = process.env.CARRICK_FAKE_ENV_LOG;
+if (envLog) {
+  fs.appendFileSync(
+    envLog,
+    `${JSON.stringify({
+      budget: process.env.CARRICK_RECHECK_BUDGET_MS ?? null,
+      timeout: process.env.CARRICK_TIMEOUT_MS ?? null,
+    })}\n`,
+  );
 }
 
 const exitCode = process.env.CARRICK_FAKE_EXIT ? Number(process.env.CARRICK_FAKE_EXIT) : 0;
