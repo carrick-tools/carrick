@@ -1307,6 +1307,67 @@ mod tests {
         );
     }
 
+    /// carrick#3356: a function written as a member of a module `const`
+    /// object nothing writes through (a method, an arrow or a function
+    /// expression, one object down too) is a function of the module, keyed
+    /// as the extractor keys it. A call through the imported object reaches
+    /// it, and the request inside it is stated at the call, with and
+    /// without rows.
+    #[test]
+    fn a_call_through_an_object_member_reaches_the_member() {
+        let object = [
+            (
+                "src/catalog-object.ts",
+                "export const catalog = {\n  async search(): Promise<Response> {\n    return fetch(\"/catalog/search\");\n  },\n  list: (): Promise<Response> => fetch(\"/catalog\"),\n  v1: {\n    read: function (): Promise<Response> {\n      return fetch(\"/catalog/v1\");\n    },\n  },\n};\n",
+            ),
+            (
+                "src/catalog-user.ts",
+                "import { catalog } from \"./catalog-object\";\n\nexport function searchCatalog(): Promise<Response> {\n  return catalog.search();\n}\n\nexport function listCatalog(): Promise<Response> {\n  return catalog.list();\n}\n\nexport function readCatalog(): Promise<Response> {\n  return catalog.v1.read();\n}\n",
+            ),
+        ];
+        let Some(on) = calls(&object, true) else {
+            return;
+        };
+        let off = calls(&object, false).unwrap();
+        let user = "services/calls/src/catalog-user.ts";
+        let at = |n: u32, text: &str| (n, vec![text.to_string()]);
+        let reached = BTreeMap::from([
+            at(4, "catalog-object.ts:catalog.search"),
+            at(8, "catalog-object.ts:catalog.list"),
+            at(12, "catalog-object.ts:catalog.v1.read"),
+        ]);
+        // Without rows the call graph follows no call through a nested
+        // object (`catalog.v1.read()`): its gap, not the summaries'.
+        let mut graph = reached.clone();
+        graph.insert(12, vec!["no_function".to_string()]);
+        assert_eq!(
+            (reached_in(&off, user), reached_in(&on, user)),
+            (graph, reached),
+            "(without rows, with rows)"
+        );
+        let stated = BTreeMap::from([
+            line(4, "/catalog/search"),
+            line(8, "/catalog"),
+            line(12, "/catalog/v1"),
+        ]);
+        let mut graph = stated.clone();
+        graph.remove(&12);
+        assert_eq!(
+            (stated_in(&off, user), stated_in(&on, user)),
+            (graph, stated),
+            "(without rows, with rows)"
+        );
+        // A member's own request writes its URL inline: the call site is the
+        // extractor's row, never a second one from the summaries.
+        let own = BTreeMap::new();
+        let declaring = "services/calls/src/catalog-object.ts";
+        assert_eq!(
+            (stated_in(&off, declaring), stated_in(&on, declaring)),
+            (own.clone(), own),
+            "(without rows, with rows)"
+        );
+    }
+
     /// A walk that produced no rows is a scan-level fact, not a call left
     /// open: no call is written as unfollowed (fix G).
     #[test]

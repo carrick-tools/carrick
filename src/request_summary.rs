@@ -10522,6 +10522,83 @@ export async function opened(op: string, rest: object, late: object) {
     /// carrick#2740: a module-scope arrow under a wrapper that only states a
     /// type is the binding's function, read once: its call is the function's,
     /// and module scope does not read the same body again.
+    /// carrick#3356: each function member of a module `const` object nothing
+    /// writes through is a function of the module under the extractor's key,
+    /// read once: module scope does not read its body again, and still reads
+    /// every other entry of the object.
+    #[test]
+    fn an_object_members_function_is_read_once_under_its_key() {
+        let source = r#"
+export const catalog = {
+  async search(q: string) {
+    return fetch(`https://api.example.com/catalog?q=${q}`);
+  },
+  list: () => fetch("https://api.example.com/catalog"),
+  v1: { read: function () { return fetch("https://api.example.com/v1"); } },
+  ready: warm(),
+};
+function warm() { return true; }
+export const written = { send() { return fetch("https://api.example.com/w"); } };
+written.send = () => Promise.resolve(new Response());
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(&path, source).expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let keys: HashSet<String> = [
+            "catalog.search",
+            "catalog.list",
+            "catalog.v1.read",
+            "written.send",
+            "warm",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let file = extract_file_ir(&module, &cm, &keys);
+        for key in ["catalog.search", "catalog.list", "catalog.v1.read"] {
+            let member = file
+                .functions
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} is a function: {:?}", file.functions.keys()));
+            assert_eq!(member.calls.len(), 1, "{key}: {:#?}", member.calls);
+            assert!(
+                member.calls[0].request.is_some(),
+                "{key}: {:#?}",
+                member.calls
+            );
+        }
+        assert!(
+            !file.functions.contains_key("written.send"),
+            "an object the file writes through holds no function of the module"
+        );
+        let module_calls: Vec<&str> = file
+            .module_level
+            .calls
+            .iter()
+            .map(|call| call.callee.as_str())
+            .collect();
+        assert_eq!(module_calls, vec!["warm"], "{:#?}", file.module_level);
+        assert!(
+            file.module_level.nested.is_empty(),
+            "module scope read a member's body again: {:#?}",
+            file.module_level
+        );
+        assert_eq!(
+            file.module_level.detached.len(),
+            2,
+            "only the written-through object's two functions stay detached: {:#?}",
+            file.module_level.detached
+        );
+    }
+
     #[test]
     fn a_type_wrapped_module_arrow_is_its_bindings_function_read_once() {
         let source = r#"
