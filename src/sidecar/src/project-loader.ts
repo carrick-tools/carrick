@@ -74,12 +74,19 @@ const DEFAULT_SOURCE_PATTERNS = [
 ];
 
 /**
- * Default compiler options used when no tsconfig.json is found
+ * Default compiler options used when no tsconfig.json is found.
+ *
+ * Resolution is `Bundler` (carrick#3313), as capture's synthesized defaults
+ * are: a relative import without an extension (`./config`) or naming a
+ * directory (`./lib`) resolves, `exports` maps are honoured, and `.js`
+ * specifiers still reach their `.ts` source. `NodeNext` read every `import`
+ * as ESM and resolved none of the first two (and TypeScript 6 rejects it
+ * beside `module: ESNext`, TS5110).
  */
 const DEFAULT_COMPILER_OPTIONS: CompilerOptions = {
   target: 99, // ESNext
   module: 99, // ESNext
-  moduleResolution: 99, // NodeNext
+  moduleResolution: 100, // Bundler
   strict: true,
   esModuleInterop: true,
   skipLibCheck: true,
