@@ -818,6 +818,17 @@ fn last_literal_segment(path: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// Whether a path's last segment, past any query, is not literal text: a
+/// parameter, a wildcard or a template hole (`/v1/files/${name}`). A caller
+/// of a helper whose request ends so can fill that segment with its argument.
+fn ends_in_hole(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    path.split('/')
+        .map(str::trim)
+        .rfind(|segment| !segment.is_empty())
+        .is_some_and(|segment| last_literal_segment(segment).is_none())
+}
+
 /// A row this pass may settle: the model's own reading, with nothing linking
 /// it to a request already.
 fn is_model_row(call: &DataCallResult) -> bool {
@@ -1694,7 +1705,10 @@ fn own_helper<'r>(
 ///   states, not through a side call, written inside that function;
 /// - that row's last literal path segment is written in the function's
 ///   strings, and the calling row's is not: a function that writes both may
-///   request both.
+///   request both;
+/// - that row's path does not end in a parameter or a template hole
+///   ([`ends_in_hole`]): the calling row may name the path its argument
+///   fills in, a segment the function's strings never write.
 ///
 /// The request then has its row at the line that writes it, and the calling
 /// row names a route its call never reaches.
@@ -1724,6 +1738,9 @@ fn helper_row<'g>(
         .unstated
         .get(helper)
         .is_some_and(|rows| rows.iter().any(|inside| inside.site == first.site));
+    if ends_in_hole(&first.target_url) {
+        return None;
+    }
     let written = decider.graph.written.get(helper)?;
     let requested = last_literal_segment(&first.target_url)?;
     let named = last_literal_segment(&row.target)?;
