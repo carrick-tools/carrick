@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.3.144](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.143...carrick-v0.3.144) (2026-11-05)
+
+
+### Features
+
+* **check:** --no-rescan probe and per-budget re-check misses (B3-R) ([#3294](https://github.com/carrick-tools/carrick/issues/3294)) ([0da87eb](https://github.com/carrick-tools/carrick/commit/0da87ebf2f1a6c9993f6bdeb1e8ebac4906500ea))
+* **discovery:** follow a call through an interface member into its implementations (refs [#2432](https://github.com/carrick-tools/carrick/issues/2432)) ([#3347](https://github.com/carrick-tools/carrick/issues/3347)) ([7045b64](https://github.com/carrick-tools/carrick/commit/7045b64edcd44edd79cf5daae1027b7041e71451))
+* **init:** stop naming the scaffold tool in the laptop closing ([#3300](https://github.com/carrick-tools/carrick/issues/3300)) ([#3305](https://github.com/carrick-tools/carrick/issues/3305)) ([fe59711](https://github.com/carrick-tools/carrick/commit/fe597115c70a19d0aa83819a9c6645e10cb87a6e))
+* **local-mode:** a re-check names the rows outside the edited file that the edit moved ([#1049](https://github.com/carrick-tools/carrick/issues/1049)) ([#3280](https://github.com/carrick-tools/carrick/issues/3280)) ([d3f5c75](https://github.com/carrick-tools/carrick/commit/d3f5c75055732471e2e2b551b7232c8431e245bf))
+* **local-mode:** list the rows a change moved outside the changed files on a plain check ([#2998](https://github.com/carrick-tools/carrick/issues/2998)) ([#3308](https://github.com/carrick-tools/carrick/issues/3308)) ([2e0b239](https://github.com/carrick-tools/carrick/commit/2e0b239602164c2dfbb3a897ceeb5da728ff3349))
+* **local-mode:** state whether the index was type-checked ([#3204](https://github.com/carrick-tools/carrick/issues/3204)) ([#3217](https://github.com/carrick-tools/carrick/issues/3217)) ([e4bbaf6](https://github.com/carrick-tools/carrick/commit/e4bbaf6645a7fff012c8ca502920c5a7b7741400))
+* **npm:** background re-check queue and its runner (B3-N1) ([#3293](https://github.com/carrick-tools/carrick/issues/3293)) ([e9bae1d](https://github.com/carrick-tools/carrick/commit/e9bae1d4ac413e3ccf5d264e5297b9b2bc492840))
+* **npm:** post-edit queues re-checks that need a re-scan and delivers answers late (B3-N2a) ([#3296](https://github.com/carrick-tools/carrick/issues/3296)) ([8852755](https://github.com/carrick-tools/carrick/commit/8852755c01b30fcfe8e5abf1a5d34f352a7fb5f0))
+* **npm:** session start brings Carrick's hook entries and task skills up to date (B3-N3) ([#3292](https://github.com/carrick-tools/carrick/issues/3292)) ([7401865](https://github.com/carrick-tools/carrick/commit/7401865225678ac5ce2b10ea462ccfd9f08cde08))
+* **npm:** Stop waits for the background re-check of the last edit (B3-N2b) ([#3295](https://github.com/carrick-tools/carrick/issues/3295)) ([0e4e683](https://github.com/carrick-tools/carrick/commit/0e4e683c50e80bea8492497e16d8f50e3aa2af7a))
+* **scanner:** a call's result request takes the store's result label ([#2910](https://github.com/carrick-tools/carrick/issues/2910) slice 1) ([#2988](https://github.com/carrick-tools/carrick/issues/2988)) ([7c316fe](https://github.com/carrick-tools/carrick/commit/7c316fe2e02a711ede8dfcfe0d2a66d741faa993))
+
+
+### Bug Fixes
+
+* **call-through:** a leaf row states the path the wrapper filled in ([#3322](https://github.com/carrick-tools/carrick/issues/3322)) ([a02f9f5](https://github.com/carrick-tools/carrick/commit/a02f9f5c8f245f32e24979c8e5a62366b18340d0))
+* **check:** the per-edit re-check states the edited file's no-route call ([#3352](https://github.com/carrick-tools/carrick/issues/3352)) ([b60abed](https://github.com/carrick-tools/carrick/commit/b60abed342e63a6e2296a1cb7568b5359c106a5c))
+* derive skips a workspace pattern that matches no package ([#3319](https://github.com/carrick-tools/carrick/issues/3319)) ([7944b4e](https://github.com/carrick-tools/carrick/commit/7944b4ef8991d7bf1b5b5e8889d307d5b0af83d6))
+* **dispatch:** a startsWith prefix tested with a method states a route (moves row R4) ([#3344](https://github.com/carrick-tools/carrick/issues/3344)) ([a1c3a2c](https://github.com/carrick-tools/carrick/commit/a1c3a2c1ecd9d9c6684b5b5d39a1ec6a6dd5c64f))
+* **hooks:** drop the "run check --changed" clause once one ran after the last edit ([#3363](https://github.com/carrick-tools/carrick/issues/3363)) ([c1c0559](https://github.com/carrick-tools/carrick/commit/c1c055936ae4d0e882f0861b9ba9b6f2778e0c9d))
+* **hook:** the post-edit line and the Stop nudge claim only what ran ([#3203](https://github.com/carrick-tools/carrick/issues/3203)) ([32c9dae](https://github.com/carrick-tools/carrick/commit/32c9daee674c05385fd720f97a12f128278733ac))
+* **init:** remove the laptop lane; config comes only from Carrick ([#3361](https://github.com/carrick-tools/carrick/issues/3361)) ([#3368](https://github.com/carrick-tools/carrick/issues/3368)) ([a834e92](https://github.com/carrick-tools/carrick/commit/a834e92f1944842ec3b97344aaa86889d0dc54aa))
+* **local:** the join reads its first repo's previous generation ([#3366](https://github.com/carrick-tools/carrick/issues/3366)) ([#3380](https://github.com/carrick-tools/carrick/issues/3380)) ([0ce1dd8](https://github.com/carrick-tools/carrick/commit/0ce1dd8310c7a391132818354548a0b02358323b))
+* **mock:** the mock reader numbers source lines as the source does ([#3320](https://github.com/carrick-tools/carrick/issues/3320)) ([3accd0c](https://github.com/carrick-tools/carrick/commit/3accd0cf6b7de3ae21f75344d87e6d44c041b214))
+* **npm:** ask for check --changed only when the change touches a contract ([#3402](https://github.com/carrick-tools/carrick/issues/3402)) ([#3403](https://github.com/carrick-tools/carrick/issues/3403)) ([2f7f15b](https://github.com/carrick-tools/carrick/commit/2f7f15ba5b1a755388eb51f57ef52c4d0fb1bfd7))
+* **npm:** post-edit headline says when pairs were compared but none resolved ([#3349](https://github.com/carrick-tools/carrick/issues/3349)) ([f09e84d](https://github.com/carrick-tools/carrick/commit/f09e84deb47770fb899d10a61ce2382ea4256f3f))
+* **scan:** a model call takes the verb the helper it reaches settles (C9, [#2676](https://github.com/carrick-tools/carrick/issues/2676)) ([#3354](https://github.com/carrick-tools/carrick/issues/3354)) ([893e203](https://github.com/carrick-tools/carrick/commit/893e203aba0916311c8ea6648568dc3c7bb6a35c))
+* **scan:** on-path defects from the switch census (B11, B14) ([#3310](https://github.com/carrick-tools/carrick/issues/3310)) ([3a1dfba](https://github.com/carrick-tools/carrick/commit/3a1dfbacda052e82053075144b52ffc98670c9f3))
+* **scan:** request summaries read a constant object's member functions ([#3356](https://github.com/carrick-tools/carrick/issues/3356)) ([#3369](https://github.com/carrick-tools/carrick/issues/3369)) ([9de7bc9](https://github.com/carrick-tools/carrick/commit/9de7bc92f686a7f3d44899bf5194ceb4c006c1cd))
+* **sidecar:** decide framework machinery by declaration, not name (N8) ([#3324](https://github.com/carrick-tools/carrick/issues/3324)) ([476a82d](https://github.com/carrick-tools/carrick/commit/476a82d65dffd288878c22dd960990af9cd83989))
+* **sidecar:** name the Deno cache folder from the workspace-relative path (cloud[#2928](https://github.com/carrick-tools/carrick/issues/2928)) ([#3353](https://github.com/carrick-tools/carrick/issues/3353)) ([f0e0f02](https://github.com/carrick-tools/carrick/commit/f0e0f0256f0eb4e0794410887767147fbf71351a))
+* **sidecar:** no_payload_evidence detail names what the code decides now (carrick[#2472](https://github.com/carrick-tools/carrick/issues/2472) S7) ([#3303](https://github.com/carrick-tools/carrick/issues/3303)) ([b7691f6](https://github.com/carrick-tools/carrick/commit/b7691f632679e833954a216534a23177ea80136f))
+* **sidecar:** no-tsconfig defaults resolve extensionless relative imports ([#3313](https://github.com/carrick-tools/carrick/issues/3313)) ([#3316](https://github.com/carrick-tools/carrick/issues/3316)) ([973eae8](https://github.com/carrick-tools/carrick/commit/973eae8d1e05c98e5178ad27532a5a45fe86f93d))
+* **site-rows:** a fact site row replaces an old-path row at its call (refs [#3283](https://github.com/carrick-tools/carrick/issues/3283)) ([#3312](https://github.com/carrick-tools/carrick/issues/3312)) ([98d52c7](https://github.com/carrick-tools/carrick/commit/98d52c71bfd29eda3bb2ea2489d7e3754bde1780))
+
+
+### Refactoring
+
+* **analyzer:** delete the name-keyed body readers (N9) ([#3385](https://github.com/carrick-tools/carrick/issues/3385)) ([36941a5](https://github.com/carrick-tools/carrick/commit/36941a515fd6cfcdf1f065628b84f27be98bce0e))
+* **analyzer:** read an env-var base off DataCall.base, delete the text recognisers (N14a) ([#3388](https://github.com/carrick-tools/carrick/issues/3388)) ([3b0a066](https://github.com/carrick-tools/carrick/commit/3b0a066f0f5171e517c083a377cdfd72879746a2))
+* **scanner:** delete the unreachable call-site extractor (N23) ([#3382](https://github.com/carrick-tools/carrick/issues/3382)) ([05528cf](https://github.com/carrick-tools/carrick/commit/05528cf64f363a1fe35666aa4146b5e8e6dfe6d7))
+
+
+### Performance
+
+* **recheck:** one change listing shared by every service's reader check ([#3291](https://github.com/carrick-tools/carrick/issues/3291)) ([885d404](https://github.com/carrick-tools/carrick/commit/885d404c86f53dec73b85e5368c130ba9a0617c1))
+
+
+### Documentation
+
+* **site-rows:** module doc says a by-origin socket side is read from the instance (refs [#2439](https://github.com/carrick-tools/carrick/issues/2439)) ([#3298](https://github.com/carrick-tools/carrick/issues/3298)) ([3b11b4a](https://github.com/carrick-tools/carrick/commit/3b11b4a0a55f400c82ba4810f6bd5dd4729262fc))
+
+
+### CI/CD
+
+* auto-release workflow, off behind AUTO_RELEASE_ENABLED (T15) ([#3270](https://github.com/carrick-tools/carrick/issues/3270)) ([8f637d3](https://github.com/carrick-tools/carrick/commit/8f637d382c7f76fabbec9654c9380984d1b380d7))
+* dispatch main's check when a push to main changes the scanner key ([#3271](https://github.com/carrick-tools/carrick/issues/3271)) ([2f6c05d](https://github.com/carrick-tools/carrick/commit/2f6c05dca610a6725020f7b5586b65b9c5589887))
+* one build path (build.yml builds every PR head and merge-queue commit) ([#3269](https://github.com/carrick-tools/carrick/issues/3269)) ([ba63d40](https://github.com/carrick-tools/carrick/commit/ba63d40f16905be099dad7ba236932b85f20ea6f))
+* same-key commits on main inherit the release-check verdict (carrick-cloud[#2916](https://github.com/carrick-tools/carrick/issues/2916) B) ([#3272](https://github.com/carrick-tools/carrick/issues/3272)) ([cd6f1e6](https://github.com/carrick-tools/carrick/commit/cd6f1e6b7f7630897b5c270bb55e0d6924c1755c))
+* scanner key and version-only release-diff check (T12) ([#3268](https://github.com/carrick-tools/carrick/issues/3268)) ([12a3e55](https://github.com/carrick-tools/carrick/commit/12a3e55f70c67368fb5ecee61d87b57d44fb13cf))
+
 ## [0.3.143](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.142...carrick-v0.3.143) (2026-11-04)
 
 
