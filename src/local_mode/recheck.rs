@@ -1325,10 +1325,13 @@ fn rejoin_held(
 
     // Phase 2. The join reads the blobs back and runs the type check over
     // them; it analyses no source, so its cost is the workspace's pairs. The
-    // repo it is pointed at only names the run: every blob is in `blobs`.
+    // repo it is pointed at names the run, and reads its services from the
+    // previous generation its own re-scan read (carrick#3366): every blob is
+    // in `blobs`.
     let anchor = repos.first().copied().unwrap_or(&workspace.root);
+    let anchor_previous = (!repos.is_empty()).then(|| staged(generation, "previous", 0));
     let out = generation.join("join.json");
-    let mut join = join_command(&exe, anchor, &blobs, &out);
+    let mut join = join_command(&exe, anchor, &blobs, &out, anchor_previous.as_deref());
     join.env(JUDGE_ANSWERS_ENV, &judged);
     join.env_remove(crate::progress::PROGRESS_ENV);
     if let Some(narrator) = narrator {
@@ -1548,7 +1551,9 @@ fn wait_within(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
-                return Err(format!("the {what} exited {:?}", status.code()));
+                // `ExitStatus`'s own words ("exit status: 1", or the
+                // signal), never Rust's `Some(1)` (carrick#3366).
+                return Err(format!("the {what} stopped ({status})"));
             }
             Ok(None) => {}
             Err(e) => return Err(format!("could not wait for the {what}: {e}")),
