@@ -4578,10 +4578,12 @@ fn reread(answer: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Append a comment, which moves no type and no row.
-fn comment_in(file: &Path, text: &str) {
+/// Append a statement that moves no type and no row. Not a comment: an edit
+/// the scan reads the same is answered from the index with no re-check, and
+/// these tests are about the re-check.
+fn statement_in(file: &Path, text: &str) {
     let existing = std::fs::read_to_string(file).expect("read the file");
-    std::fs::write(file, format!("{existing}\n// {text}\n")).expect("write the comment");
+    std::fs::write(file, format!("{existing}\nvoid {text:?};\n")).expect("write the statement");
 }
 
 /// A re-check reads the edited file's service and judges every other service
@@ -4706,8 +4708,8 @@ fn a_miss_in_one_service_leaves_the_others_re_checked() {
     let workspace = shop();
     let root = workspace.path();
     index(root);
-    comment_in(&root.join(SHOP_ROUTE), "catalog edit one");
-    comment_in(&root.join(SHOP_LEDGER), "ledger edit");
+    statement_in(&root.join(SHOP_ROUTE), "catalog edit one");
+    statement_in(&root.join(SHOP_LEDGER), "ledger edit");
 
     let missed = recheck_json(root, SHOP_ROUTE, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
     assert_eq!(
@@ -4731,7 +4733,7 @@ fn a_miss_in_one_service_leaves_the_others_re_checked() {
     assert_eq!(reread(&ledger), ["ledger"], "{ledger:#}");
 
     // The missed service starts no re-scan, and the reason names it.
-    comment_in(&root.join(SHOP_ROUTE), "catalog edit two");
+    statement_in(&root.join(SHOP_ROUTE), "catalog edit two");
     let skipped = recheck_json(root, SHOP_ROUTE, &AMPLE);
     assert_eq!(
         skipped["recheck"]["ran"],
@@ -4749,7 +4751,7 @@ fn a_miss_in_one_service_leaves_the_others_re_checked() {
     // A new index is a new generation: catalog is re-checked again.
     std::thread::sleep(Duration::from_millis(1100));
     index(root);
-    comment_in(&root.join(SHOP_ROUTE), "catalog edit three");
+    statement_in(&root.join(SHOP_ROUTE), "catalog edit three");
     let fresh = recheck_json(root, SHOP_ROUTE, &AMPLE);
     assert_ne!(
         fresh["recheck"]["ran"],
@@ -4767,9 +4769,9 @@ fn check_each_answers_a_missed_services_other_files_at_once() {
     let workspace = shop();
     let root = workspace.path();
     index(root);
-    comment_in(&root.join(SHOP_ROUTE), "catalog route");
-    comment_in(&root.join(SHOP_HEALTH), "catalog health");
-    comment_in(&root.join(SHOP_LEDGER), "ledger");
+    statement_in(&root.join(SHOP_ROUTE), "catalog route");
+    statement_in(&root.join(SHOP_HEALTH), "catalog health");
+    statement_in(&root.join(SHOP_LEDGER), "ledger");
 
     let missed = recheck_json(root, SHOP_ROUTE, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
     assert_eq!(missed["recheck"]["ran"], serde_json::json!("none"));
@@ -4849,7 +4851,7 @@ fn a_type_neutral_edit_reuses_the_indexs_type_check_answer() {
     )
     .expect("plant the answer");
 
-    comment_in(&root.join(SHOP_ROUTE), "moves no type");
+    statement_in(&root.join(SHOP_ROUTE), "moves no type");
     let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
     assert_eq!(
         answer["recheck"]["ran"],
