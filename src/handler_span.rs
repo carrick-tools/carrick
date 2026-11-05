@@ -160,7 +160,14 @@ fn registration_calls(
             ) else {
                 continue;
             };
-            let key = (normalize(file), line, endpoint.method.to_ascii_lowercase());
+            // The graph row's method is this one trimmed and upper-cased
+            // (`FileOrchestrator`'s mount-graph build), its location
+            // `<this key>:<line_number>`.
+            let key = (
+                normalize(file),
+                line,
+                endpoint.method.trim().to_ascii_lowercase(),
+            );
             calls
                 .entry(key)
                 .and_modify(|held| {
