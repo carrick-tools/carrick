@@ -1,24 +1,15 @@
-// What `carrick init` does with a server that may not have the project
-// actions yet (carrick#955).
+// The workspace's projects, read so init prints each one as the dashboard
+// shows it (carrick#955, carrick#1338). Read only: projects are created and
+// filled on the dashboard (carrick#3361).
 //
-// The case that decides the release is the first one: today's API answers an
-// action it does not know with the credential-kind gate, which is a 403 and
-// not a 404, and every one of those has to read as "fall back to the browser"
-// rather than as a failure.
+// The case that matters most is the first one: an API that has never heard of
+// the action answers the credential-kind gate, which is a 403 and not a 404,
+// and every one of those has to read as "slugs alone" rather than as a
+// failure.
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  listProjects,
-  createProject,
-  assignRepos,
-  projectLines,
-  projectOptions,
-  nameProblem,
-  slugFromName,
-  NEW_PROJECT,
-  DASHBOARD,
-} from "../src/init/projects.ts";
+import { listProjects, projectLabel } from "../src/init/projects.ts";
 
 const TOKEN = "test-token";
 
@@ -30,19 +21,9 @@ function answering(reply: (body: Record<string, unknown>) => Response): typeof f
   }) as typeof fetch;
 }
 
-const KIND_GATE = Response.json(
-  { error: "MCP keys cannot authenticate scan traffic." },
-  { status: 403 },
-);
-
 test("the deployed server's answer to an action it has never heard of is a fallback", async () => {
-  const request = answering(() => KIND_GATE);
+  const request = answering(() => Response.json({ error: "MCP keys cannot authenticate scan traffic." }, { status: 403 }));
   assert.equal(await listProjects(TOKEN, request), null);
-  assert.deepEqual(await createProject(TOKEN, "payments", "payments", request), { kind: "absent" });
-  // The one that decides this release: `assign-repos` is served by a lambda
-  // that is merged and not deployed, so every workspace answers the gate until
-  // the apply lands (carrick#999).
-  assert.deepEqual(await assignRepos(TOKEN, "payments", ["acme/api"], request), { kind: "absent" });
 });
 
 test("a 404, an unreadable body and an unknown schema are all absences", async () => {
@@ -54,21 +35,11 @@ test("a 404, an unreadable body and an unknown schema are all absences", async (
   ]) {
     assert.equal(await listProjects(TOKEN, answering(reply)), null);
   }
-  for (const reply of [
-    () => new Response("", { status: 404 }),
-    () => new Response("not json", { status: 200 }),
-    () => Response.json({ schema: "carrick.create-project/1", project: {} }),
-  ]) {
-    assert.deepEqual(await createProject(TOKEN, "payments", "payments", answering(reply)), {
-      kind: "absent",
-    });
-  }
 });
 
 test("a rejected credential is never read as a missing feature", async () => {
   const request = answering(() => Response.json({ error: "no" }, { status: 401 }));
   await assert.rejects(listProjects(TOKEN, request), /Run carrick login/);
-  await assert.rejects(createProject(TOKEN, "payments", "payments", request), /Run carrick login/);
 });
 
 test("an unreachable API falls back rather than failing the run", async () => {
@@ -76,10 +47,9 @@ test("an unreachable API falls back rather than failing the run", async () => {
     throw new Error("offline");
   }) as typeof fetch;
   assert.equal(await listProjects(TOKEN, request), null);
-  assert.deepEqual(await createProject(TOKEN, "payments", "payments", request), { kind: "absent" });
 });
 
-test("the workspace's projects come back when the action exists", async () => {
+test("the workspace's projects come back when the action exists, and print by name and slug", async () => {
   const projects = await listProjects(
     TOKEN,
     answering((body) => {
@@ -94,212 +64,12 @@ test("the workspace's projects come back when the action exists", async () => {
     }),
   );
   assert.equal(projects?.length, 2);
-  // Display name and slug, in every line that names a project: the dashboard
-  // shows the name, every CLI line showed the slug, and nothing connected the
-  // two (carrick#1338).
-  assert.deepEqual(projectLines(projects!), [
-    "  Default (default)  3 repos",
-    "  Old (old)  0 repos  (archived)",
-  ]);
-  // A project whose display name IS its slug is printed once, not twice.
-  assert.deepEqual(projectLines([{ slug: "payments", name: "payments", archived: false, repo_count: 1 }]), [
-    "  payments  1 repo",
-  ]);
-});
-
-test("a create sends the slug it was given, and reports what came back", async () => {
-  const created = await createProject(
-    TOKEN,
-    "payments",
-    "Payments",
-    answering((body) => {
-      assert.equal(body["action"], "create-project");
-      assert.equal(body["slug"], "payments");
-      assert.equal(body["name"], "Payments");
-      return Response.json({
-        schema: "carrick.create-project/0",
-        project: { slug: "payments", name: "Payments", archived: false, repo_count: 0 },
-      });
-    }),
-  );
-  assert.equal(created.kind, "created");
-  assert.equal(created.kind === "created" ? created.project.slug : null, "payments");
-});
-
-// carrick-cloud#1359: a workspace's first project takes the repos the GitHub
-// App install staged, and the create answer says how many. A server from
-// before that answers without the field, or a hard 0; both mean none.
-test("a create reports the repos the new project already holds, and none where the server does not say", async () => {
-  const answer = (project: Record<string, unknown>) =>
-    answering(() => Response.json({ schema: "carrick.create-project/0", project }));
-  const base = { slug: "acme", name: "Acme", archived: false };
-  for (const [project, count] of [
-    [{ ...base, repo_count: 2 }, 2],
-    [{ ...base, repo_count: 0 }, 0],
-    [{ ...base, repo_count: null }, 0],
-    [base, 0],
-  ] as const) {
-    const outcome = await createProject(TOKEN, "acme", "Acme", answer(project));
-    assert.equal(outcome.kind === "created" ? outcome.project.repo_count : "not created", count, JSON.stringify(project));
-  }
-});
-
-// carrick#1489: a new project is asked for by name, and the slug is the one
-// the dashboard's form derives from the same name.
-test("the slug is derived from the name exactly as the dashboard derives it", () => {
-  for (const [name, slug] of [
-    ["Acme", "acme"],
-    ["Acme API", "acme-api"],
-    ["  Payments & Billing!  ", "payments-billing"],
-    ["--Search--", "search"],
-    ["Café Orders", "caf-orders"],
-    ["A".repeat(40), "a".repeat(32)],
-    // Cut at 32, then a trailing hyphen the cut left is dropped.
-    [`${"x".repeat(31)} y`, "x".repeat(31)],
-    ["日本", ""],
-  ] as const) {
-    assert.equal(slugFromName(name), slug, name);
-  }
-});
-
-test("a name is refused before anything is sent when the dashboard would refuse it", () => {
-  const projects = [
-    { slug: "payments", name: "Payments", archived: false, repo_count: 1 },
-    { slug: "old-search", name: "Old Search", archived: true, repo_count: 0 },
-  ];
-  assert.equal(nameProblem("Acme", projects), null);
-  assert.equal(nameProblem("ab", projects), "A project name needs at least 3 letters or digits.");
-  assert.equal(nameProblem("日本", projects), "A project name needs at least 3 letters or digits.");
-  assert.equal(nameProblem("Default", projects), '"Default" is reserved. Pick another name.');
-  assert.equal(nameProblem("payments", projects), "Project Payments (payments) already exists. Pick another name.");
-  // An archived project still holds its slug.
-  assert.equal(nameProblem("Old search", projects), "Project Old Search (old-search) already exists, archived. Pick another name.");
-  assert.match(nameProblem("n".repeat(65), projects) ?? "", /64 characters or fewer/);
-});
-
-test("the project question lists each active project, then a new one, then the dashboard", () => {
-  const options = projectOptions([
-    { slug: "zeta", name: "Zeta", archived: false, repo_count: 3 },
-    { slug: "gone", name: "Gone", archived: true, repo_count: 1 },
-    { slug: "alpha", name: "alpha", archived: false, repo_count: 1 },
-    { slug: "unknown", name: "Unknown", archived: false, repo_count: null },
-  ]);
-  assert.deepEqual(options, [
-    { value: "project:alpha", label: "alpha", hint: "1 repo" },
-    { value: "project:unknown", label: "Unknown (unknown)" },
-    { value: "project:zeta", label: "Zeta (zeta)", hint: "3 repos" },
-    { value: NEW_PROJECT, label: "New project" },
-    { value: DASHBOARD, label: "Choose on the dashboard" },
-  ]);
-  // No row is labelled with the word the old question used.
-  assert.ok(options.every((option) => !/slug/i.test(option.label)));
-});
-
-// A refusal is the server stating a rule. It is the one non-2xx that must not
-// read as an absence, because falling back would hide the reason.
-test("a slug the server refuses is reported with its reason", async () => {
-  for (const status of [400, 409]) {
-    const outcome = await createProject(
-      TOKEN,
-      "payments",
-      "payments",
-      answering(() => Response.json({ error: "That slug is taken." }, { status })),
-    );
-    assert.deepEqual(outcome, { kind: "refused", message: "That slug is taken." });
-  }
-  // A refusal status with nothing to say is not a sentence worth printing.
-  assert.deepEqual(
-    await createProject(
-      TOKEN,
-      "payments",
-      "payments",
-      answering(() => new Response("", { status: 409 })),
-    ),
-    { kind: "absent" },
-  );
-});
-
-// carrick#999. The action the GitHub App grant used to hand to a second
-// browser page. What matters on this side is the three-way read of the answer:
-// a 200 carries a per-repo outcome and is never a refusal, a 400 or a 409
-// carries a sentence to print, and everything else sends the run back to the
-// browser it was written to remove.
-test("an assignment sends the repos and reads back what each one did", async () => {
-  const outcome = await assignRepos(
-    TOKEN,
-    "payments",
-    ["acme/api", "acme/web"],
-    answering((body) => {
-      assert.equal(body["action"], "assign-repos");
-      assert.equal(body["project"], "payments");
-      assert.deepEqual(body["repos"], ["acme/api", "acme/web"]);
-      return Response.json({
-        schema: "carrick.assign-repos/0",
-        project_slug: "payments",
-        repos: [
-          { full_name: "acme/api", assigned: true, moved: true, project_slug: "payments", reason: null },
-          {
-            full_name: "acme/web",
-            assigned: false,
-            moved: false,
-            project_slug: null,
-            reason: "not connected to this Carrick workspace. Install the Carrick GitHub App on it first.",
-          },
-        ],
-      });
-    }),
-  );
-  assert.equal(outcome.kind, "placed");
-  // A repo that could not be placed rides inside the 200: a partial result is
-  // reported, never discarded.
-  assert.deepEqual(
-    outcome.kind === "placed" ? outcome.repos.map((repo) => [repo.full_name, repo.assigned, repo.moved]) : [],
-    [
-      ["acme/api", true, true],
-      ["acme/web", false, false],
-    ],
-  );
-});
-
-test("an assignment refusal is printed, and everything else is an absence", async () => {
-  for (const status of [400, 409]) {
-    assert.deepEqual(
-      await assignRepos(
-        TOKEN,
-        "payments",
-        ["acme/api"],
-        answering(() => Response.json({ error: "project \"payments\" is archived.", code: "project_archived" }, { status })),
-      ),
-      { kind: "refused", message: 'project "payments" is archived.' },
-    );
-  }
-  // The two statuses the server sends on purpose outside the refusal pair, and
-  // the shapes this client cannot read: all of them mean the browser.
-  for (const reply of [
-    () => new Response("", { status: 404 }),
-    () => Response.json({ error: "could not check your role.", code: "role_unverified" }, { status: 503 }),
-    () => new Response("", { status: 500 }),
-    () => new Response("not json", { status: 200 }),
-    () => Response.json({ schema: "carrick.assign-repos/1", project_slug: "payments", repos: [] }),
-    // An answer about another project is not an answer about this one.
-    () => Response.json({ schema: "carrick.assign-repos/0", project_slug: "default", repos: [] }),
-  ]) {
-    assert.deepEqual(await assignRepos(TOKEN, "payments", ["acme/api"], answering(reply)), {
-      kind: "absent",
-    });
-  }
-  // And a credential the server rejects is never a missing feature.
-  await assert.rejects(
-    assignRepos(TOKEN, "payments", ["acme/api"], answering(() => Response.json({ error: "no" }, { status: 401 }))),
-    /Run carrick login/,
-  );
-});
-
-test("the list prints active projects before archived ones", () => {
-  const lines = projectLines([
-    { slug: "zeta", name: "zeta", archived: false, repo_count: null },
-    { slug: "alpha", name: "alpha", archived: true, repo_count: 1 },
-    { slug: "beta", name: "beta", archived: false, repo_count: 1 },
-  ]);
-  assert.deepEqual(lines, ["  beta  1 repo", "  zeta", "  alpha  1 repo  (archived)"]);
+  // Display name and slug: the dashboard shows the name, every CLI line
+  // showed the slug, and nothing connected the two (carrick#1338).
+  assert.equal(projectLabel("default", projects!), "Default (default)");
+  // A project whose display name IS its slug is printed once, and a slug the
+  // list does not hold, or no list at all, is the slug alone.
+  assert.equal(projectLabel("payments", [{ slug: "payments", name: "payments", archived: false, repo_count: 1 }]), "payments");
+  assert.equal(projectLabel("missing", projects!), "missing");
+  assert.equal(projectLabel("default", null), "default");
 });

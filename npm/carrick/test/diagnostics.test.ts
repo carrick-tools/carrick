@@ -563,7 +563,7 @@ test("a refused check publishes the CLI's own sentence on line 1 (carrick#1009)"
       schema: "carrick.check/0",
       error: "index_unreadable",
       message:
-        "/workspace/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Re-run `carrick index`.",
+        "/workspace/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Run `carrick refresh` to rebuild it.",
     },
     ROOT,
     CHECKED,

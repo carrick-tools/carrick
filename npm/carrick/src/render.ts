@@ -558,7 +558,7 @@ export function candidatesWaiting(service: StatusService): number {
 export function serviceLine(service: StatusService): string {
   const head = `- ${service.service} at ${shortHash(service.index_commit)}: ${service.routes} route(s), ${service.calls} call(s)`;
   const waiting = candidatesWaiting(service);
-  const awaiting = waiting ? `, ${waiting} candidate(s) waiting for \`carrick index\`` : "";
+  const awaiting = waiting ? `, ${waiting} candidate(s) waiting for Carrick's cloud scan` : "";
   return `${head}, changed since index: ${service.changed_since_index}${staleText(service)}${awaiting}`;
 }
 
@@ -629,12 +629,15 @@ export function renderSessionStart(status: StatusResult): string {
         ...scans,
       ].join("\n");
     }
-    return "Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index --workspace <dir>` builds one.";
+    // Carrick builds the index in the cloud; what this machine can do is read
+    // it in (carrick#3361).
+    return "Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick refresh --workspace <dir>` reads in the index Carrick builds for these repos.";
   }
   if (status.error) {
     // The CLI's own sentence, which names the move: a format mismatch says
-    // which scanner wrote the index and that `carrick index` rebuilds it. The
-    // wire code alone told a reader nothing they could act on (carrick#1009).
+    // which scanner wrote the index and that `carrick refresh` rebuilds it.
+    // The wire code alone told a reader nothing they could act on
+    // (carrick#1009).
     return `Carrick could not read its index for this workspace: ${status.message ?? status.error}`;
   }
   if (!status.services.length) {

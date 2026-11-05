@@ -1717,16 +1717,17 @@ fn detach_process(command: &mut std::process::Command) {
 /// Why this workspace may not be indexed yet, if it may not.
 ///
 /// `carrick index` is the paid scan and it is meant to run once, so it runs
-/// against a configuration a person has read rather than one a structural pass
-/// guessed (ruling in carrick-cloud#799). `carrick init` does not write
-/// `carrick.json`: it derives the proposal into `.carrick/proposal.json`, and
-/// the config is written from it by hand (carrick#3300). A repo without one
-/// would be scanned with its service boundaries unstated, its env vars
-/// undeclared, and no second free attempt.
+/// against a configuration that is stated rather than one a structural pass
+/// guessed (ruling in carrick-cloud#799). The config a customer's index is
+/// built under is the one Carrick holds for the project, and the cloud runner
+/// writes it into its own clone before it scans; `carrick init` writes none
+/// and nobody is asked to (carrick#3361). So a repo here without one is a repo
+/// whose index Carrick builds, and the refusal says how to read that index
+/// rather than how to write a config. Our own harnesses run this command over
+/// trees that carry their config.
 ///
-/// The refusal names the two things that stand between this machine and the
-/// scan — the config, and the credential — and nothing else. It used to point
-/// at a facts-only pass as a rehearsal; there is no such step in the flow
+/// It names the credential too, and nothing else. It used to point at a
+/// facts-only pass as a rehearsal; there is no such step in the flow
 /// (carrick#1008, cloud#832), so offering one here would invent a first run.
 fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
     let missing: Vec<&PathBuf> = repos
@@ -1744,10 +1745,10 @@ fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
         .join(", ");
     let rest = missing.len().saturating_sub(5);
     Some(format!(
-        "no carrick.json in {named}{}, and carrick index is the scan that builds the \
-         index, so it runs after the config exists. Write one from .carrick/proposal.json \
-         (https://docs.carrick.tools/building-the-index), run carrick login if this machine \
-         is not signed in, and run this command once.",
+        "no carrick.json in {named}{}, and carrick index scans only a repo that has one. \
+         Carrick builds the index for your repos itself \
+         (https://docs.carrick.tools/building-the-index): run carrick login if this machine \
+         is not signed in, then carrick refresh to read that index onto this machine.",
         if rest > 0 {
             format!(" and {rest} more")
         } else {
@@ -1870,13 +1871,16 @@ fn no_index_here(root: Option<&Path>, scans: &[super::scan_state::ScanState]) ->
             .to_string();
     }
     match root {
+        // Carrick builds the index; what this machine can do is read it in
+        // (carrick#3361).
         Some(root) => format!(
-            "no index in {}. Run `carrick index --workspace {}` in the folder holding your repos.",
+            "no index in {}. Run `carrick init` in {}: it reads in the index Carrick builds for \
+             your repos.",
             root.join(super::workspace::INDEX_DIR).display(),
             root.display()
         ),
-        None => "no index above this directory. Run `carrick index --workspace <dir>` in the \
-                 folder holding your repos."
+        None => "no index above this directory. Run `carrick init` in the folder holding your \
+                 repos: it reads in the index Carrick builds for them."
             .to_string(),
     }
 }

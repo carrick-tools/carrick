@@ -691,7 +691,7 @@ fn repo_for_service(workspace: &Workspace, blobs: &Path, service: &str) -> Resul
         return Err(format!(
             "no indexed service named '{service}'. This workspace holds: {}",
             if names.is_empty() {
-                "nothing yet — run `carrick index` first".to_string()
+                "nothing yet — run `carrick init` first".to_string()
             } else {
                 names.join(", ")
             }

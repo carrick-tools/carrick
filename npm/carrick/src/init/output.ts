@@ -40,7 +40,6 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import * as clack from "@clack/prompts";
-import { MultiSelectPrompt } from "@clack/core";
 import pc from "picocolors";
 
 export const DONE = "◇";
@@ -50,7 +49,6 @@ export const REFUSE = "■";
 export const DOCS = "https://docs.carrick.tools/quickstart";
 /** What `init` writes on this machine, file by file: the page `doctor`, `remove` and `uninstall` point at. */
 export const DOCS_INIT_FILES = "https://docs.carrick.tools/cli#workspace-initialisation";
-export const DOCS_INDEX = "https://docs.carrick.tools/building-the-index";
 export const DOCS_EDITOR = "https://docs.carrick.tools/editor";
 
 /**
@@ -106,34 +104,6 @@ export function wrapped(text: string, width: number = NEXT_WIDTH): string[] {
  */
 export function listBlock(heading: string, lines: string[]): string {
   return [heading, ...lines.flatMap((line) => wrapped(line).map((part) => `  ${part}`))].join("\n");
-}
-
-/** One row of a `choose`: what it is called, and what it is worth knowing. */
-export type Choice = { value: string; label: string; hint?: string };
-
-/**
- * How a `choose` opens, and whether it may be answered with nothing.
- *
- * `initial` is the set that starts selected, and it is a parameter rather than
- * "all of them" because a default is a claim: the repos this install covers
- * are preselected where something already says so, and an editor's
- * configuration file outside the workspace is not preselected on the strength
- * of a directory (carrick#1365).
- */
-export type ChoiceSet = { initial: string[]; required: boolean };
-
-/**
- * The line that says what the keys do and where the answer stands.
- *
- * Said in words because the glyphs cannot say it: clack 1.8.1 draws the row
- * under the cursor and an unselected row with the SAME character
- * (`S_CHECKBOX_ACTIVE` and `S_CHECKBOX_INACTIVE` are both `◻`), so "the
- * highlighted one" and "the ones that are in" are told apart by fill and
- * colour alone. The picker below marks every row `[x]` or `[ ]` instead, and
- * this line carries the count (carrick#1365).
- */
-export function chooseSentence(noun: string, selected: number, total: number): string {
-  return `Space toggles ${noun}, Enter confirms. ${selected} of ${total} selected.`;
 }
 
 /**
@@ -195,17 +165,6 @@ export type InitOutput = {
   confirm(question: string): Promise<boolean>;
   /** A typed answer, for the questions whose answer is not yes or no. */
   ask(question: string): Promise<string>;
-  /**
-   * Which of these, opening on the set `config.initial` names.
-   *
-   * `config.required` decides whether an empty answer is one: the repos this
-   * install covers must include one repo, and "no editors" is an ordinary
-   * answer (carrick#1338, carrick#1365). `noun` is what a row is, for the
-   * sentence that says what the keys do.
-   */
-  choose(question: string, noun: string, options: Choice[], config: ChoiceSet): Promise<string[]>;
-  /** Exactly one of these, answered with its `value` (carrick#1489). */
-  pick(question: string, options: Choice[]): Promise<string>;
   /** Dim a fragment, where this rendering has colour to dim it with. */
   accent(text: string): string;
   /** Whether the work under `step` may write to the terminal itself. */
@@ -240,36 +199,6 @@ async function askOnce(input: Readable, output: Writable, text: string): Promise
   } finally {
     rl.close();
   }
-}
-
-/**
- * The numbers an answer names, or null when it names none of them.
- *
- * Empty is the marked set, not "all of them": the marks are what the rows
- * above the question already state, and a reader pressing Enter is accepting
- * what they can see (carrick#1365). `all` and `none` are the two words that
- * say the whole and the empty set; `none` is refused where an empty answer is
- * not one, which is the same refusal an out-of-range number gets.
- */
-export function chosenNumbers(
-  answer: string,
-  count: number,
-  config: { initial: number[]; required: boolean },
-): number[] | null {
-  const trimmed = answer.trim();
-  if (trimmed === "") {
-    return config.required && config.initial.length === 0 ? null : config.initial;
-  }
-  if (/^all$/i.test(trimmed)) return Array.from({ length: count }, (_, index) => index);
-  if (/^none$/i.test(trimmed)) return config.required ? null : [];
-  const picked: number[] = [];
-  for (const part of trimmed.split(/[\s,]+/)) {
-    if (!/^\d+$/.test(part)) return null;
-    const index = Number(part) - 1;
-    if (index < 0 || index >= count) return null;
-    if (!picked.includes(index)) picked.push(index);
-  }
-  return picked.length > 0 ? picked : null;
 }
 
 /** Plain text: the same lines, no spinner, no colour, no gutter. */
@@ -329,104 +258,8 @@ export function plainOutput(
       return answer === "" || /^y(es)?$/i.test(answer);
     },
     ask: async (question) => (await askOnce(input, echo, `${question}\n> `)).trim(),
-    // The list, then the numbers to keep. Every row is printed with its own
-    // number because this rendering has no cursor to move: the question a
-    // reader answers has to carry the whole choice. The `[x]`/`[ ]` marker is
-    // the same one the terminal picker draws, so what an answer of Enter
-    // accepts is on the screen in both renderings (carrick#1365).
-    choose: async (question, noun, options, config) => {
-      const initial = options
-        .map((option, index) => (config.initial.includes(option.value) ? index : -1))
-        .filter((index) => index >= 0);
-      write(`${question}\n`);
-      options.forEach((option, index) => {
-        const mark = initial.includes(index) ? "[x]" : "[ ]";
-        write(`  ${index + 1}. ${mark} ${option.label}${option.hint === undefined ? "" : `  (${option.hint})`}\n`);
-      });
-      write(`${chooseSentence(noun, initial.length, options.length)}\n`);
-      const accepts = config.required && initial.length === 0 ? "" : ", or Enter for the marked set";
-      const empties = config.required ? "" : `, or "none"`;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const answer = await askOnce(
-          input,
-          echo,
-          `Numbers to include, separated by commas${empties}${accepts}\n> `,
-        );
-        const picked = chosenNumbers(answer, options.length, { initial, required: config.required });
-        if (picked) return picked.map((index) => options[index]!.value);
-        write(`${REFUSE} Not a number between 1 and ${options.length}: "${answer.trim()}"\n`);
-      }
-      throw new PromptCancelled();
-    },
-    // The same numbered list, and one number. There is no marked set, so an
-    // empty answer is not one.
-    pick: async (question, options) => {
-      write(`${question}\n`);
-      options.forEach((option, index) => {
-        write(`  ${index + 1}. ${option.label}${option.hint === undefined ? "" : `  (${option.hint})`}\n`);
-      });
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const answer = (await askOnce(input, echo, "Number\n> ")).trim();
-        const index = /^\d+$/.test(answer) ? Number(answer) - 1 : -1;
-        if (index >= 0 && index < options.length) return options[index]!.value;
-        write(`${REFUSE} Not a number between 1 and ${options.length}: "${answer}"\n`);
-      }
-      throw new PromptCancelled();
-    },
     quiet: false,
   };
-}
-
-/** The gutter clack draws its own prompts in, so this one sits in the block. */
-const BAR = "│";
-
-/**
- * The multi-select this package asks with, drawn rather than borrowed.
- *
- * `@clack/prompts`' own `multiselect` is the prompt the owner could not read:
- * its cursor glyph and its unselected glyph are the same character, so the row
- * under the cursor and the rows that are in are distinguished by fill and
- * colour. This is the same prompt object underneath — `MultiSelectPrompt` from
- * `@clack/core`, which is what `@clack/prompts` builds on, at the version it
- * pins — with a body that states each row's state as `[x]` or `[ ]`, the
- * cursor as `>`, and the count in the header (carrick#1365).
- *
- * `input` and `output` are threaded for the same reason every other prompt
- * here threads them: a terminal's own bytes are not capturable, and a test
- * that drives this one with a stream is the only thing that sees these markers
- * at all.
- */
-function pickMany(
-  question: string,
-  noun: string,
-  options: Choice[],
-  config: ChoiceSet,
-  output: Writable,
-  input: Readable,
-): Promise<string[] | symbol> {
-  const prompt = new MultiSelectPrompt<Choice>({
-    options,
-    initialValues: options.filter((option) => config.initial.includes(option.value)).map((option) => option.value),
-    required: config.required,
-    output,
-    input,
-    render() {
-      const chosen = new Set((this.value as string[] | undefined) ?? []);
-      const rows = this.options.map((option, index) => {
-        const mark = chosen.has(option.value) ? "[x]" : "[ ]";
-        const cursor = index === this.cursor ? ">" : " ";
-        const label = index === this.cursor ? pc.cyan(option.label) : option.label;
-        const hint = option.hint === undefined ? "" : pc.dim(`  (${option.hint})`);
-        return `${BAR} ${cursor} ${mark} ${label}${hint}`;
-      });
-      const header = `${BAR}  ${pc.dim(chooseSentence(noun, chosen.size, this.options.length))}`;
-      if (this.state === "submit" || this.state === "cancel") {
-        return `${pc.dim(question)}\n${BAR}  ${chosen.size} of ${this.options.length} selected`;
-      }
-      return [question, header, ...rows].join("\n");
-    },
-  });
-  return prompt.prompt() as Promise<string[] | symbol>;
 }
 
 /**
@@ -491,16 +324,6 @@ export function interactiveOutput(output: Writable = process.stdout, keys: Reada
       const answer = await clack.text({ message: question, output, input: keys });
       if (clack.isCancel(answer)) throw new PromptCancelled();
       return answer.trim();
-    },
-    choose: async (question, noun, options, config) => {
-      const answer = await pickMany(question, noun, options, config, output, keys);
-      if (clack.isCancel(answer) || !Array.isArray(answer)) throw new PromptCancelled();
-      return answer;
-    },
-    pick: async (question, options) => {
-      const answer = await clack.select({ message: question, options, output, input: keys });
-      if (clack.isCancel(answer)) throw new PromptCancelled();
-      return answer;
     },
     accent: (text) => pc.dim(text),
     quiet: true,

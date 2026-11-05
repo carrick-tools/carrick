@@ -18,8 +18,7 @@
 // ahead?", and deletes nothing until it has a typed answer: the folder's name
 // for `remove`, the word `uninstall` for `uninstall`, as the dashboard's
 // project delete asks for the slug. Without a terminal the answer is
-// `--confirm <answer>`, never `--yes`: to `init`, `--yes` means "take the
-// proposal", and an agent adds it by reflex.
+// `--confirm <answer>`, never `--yes`: an agent adds `--yes` by reflex.
 //
 // Every step here is the inverse of a writer in this folder, and each pair
 // lives in one file so the two cannot drift: `mergeCarrickHooks` /
@@ -27,7 +26,7 @@
 // `removeTaskSkills` in `task-skills.ts`, `mergeServerEntry` /
 // `removeServerEntry` and `connectMcpClients` / `disconnectMcpClients` in
 // `mcp.ts`, `ensureInstallId` / `removeInstallId` in `install-id.ts`,
-// `writeProposal` / the `.carrick` removal below, `saveCredential` /
+// `ensureIndexDir` / the `.carrick` removal below, `saveCredential` /
 // `removeCredential` in `../auth/credentials.ts`. The list each command prints
 // is made by the read half of the same pairs (`recordedRepoCopy`,
 // `inspectTaskSkills`, `withoutOurExclusions`, `inspectMcpClients`), and the
@@ -424,7 +423,7 @@ export function folderLines(plan: FolderPlan): string[] {
         : `${plan.selection.names.join(", ")} from the exclude list in ${WORKSPACE_FILE}`,
     );
   }
-  if (plan.carrick) lines.push(".carrick, with the proposal and the index in it");
+  if (plan.carrick) lines.push(".carrick, with the index in it");
   return lines;
 }
 
@@ -532,7 +531,7 @@ function removeFolder(plan: FolderPlan, out: InitOutput): void {
     const carrick = path.join(workspace, ".carrick");
     try {
       fs.rmSync(carrick, { recursive: true, force: true });
-      out.done(".carrick removed, with the proposal and the index in it");
+      out.done(".carrick removed, with the index in it");
     } catch (error) {
       out.refuse(`Could not remove ${carrick}: ${(error as Error).message}`);
     }

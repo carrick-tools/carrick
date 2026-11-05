@@ -5,20 +5,21 @@
 //
 // Placeholders are `{{NAME}}`. Not `${{ }}`, which is GitHub Actions'
 // own syntax and appears in the workflow this renders.
+//
+// There is no carrick.json template: the config every scan runs under is the
+// one Carrick holds for the project (carrick#3361).
 
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export type TemplateName = "workflow" | "carrick.json";
+export type TemplateName = "workflow";
 
 type Template = { file: string; variables: string[] };
 
 const TEMPLATES: Record<TemplateName, Template> = {
   // Written to .github/workflows/carrick.yml.
   workflow: { file: "carrick.yml", variables: ["ACTION_REF", "DEFAULT_BRANCH"] },
-  // Written to the repo root, for the scanning agent to fill in.
-  "carrick.json": { file: "carrick.json", variables: [] },
 };
 
 export const TEMPLATE_NAMES = Object.keys(TEMPLATES) as TemplateName[];
@@ -26,7 +27,6 @@ export const TEMPLATE_NAMES = Object.keys(TEMPLATES) as TemplateName[];
 /** Where a repo puts each one. */
 export const TEMPLATE_PATHS: Record<TemplateName, string> = {
   workflow: ".github/workflows/carrick.yml",
-  "carrick.json": "carrick.json",
 };
 
 export const DEFAULTS: Record<string, string> = {
@@ -72,14 +72,4 @@ export function renderTemplate(
   const left = /\{\{([A-Z_]+)\}\}/.exec(rendered);
   if (left) throw new Error(`${name} still holds ${left[0]} after rendering`);
   return rendered;
-}
-
-/** Every file, ready to write, for a repo in a project. */
-export function scaffoldFiles(
-  variables: Record<string, string> = {},
-): Array<{ path: string; contents: string }> {
-  return TEMPLATE_NAMES.map((name) => ({
-    path: TEMPLATE_PATHS[name],
-    contents: renderTemplate(name, variables),
-  }));
 }

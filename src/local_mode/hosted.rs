@@ -3013,7 +3013,7 @@ mod tests {
             "{note}"
         );
         assert!(
-            note.contains("Commit them and run `carrick index` again"),
+            note.contains("Commit them; the next scan of main replaces it"),
             "{note}"
         );
     }

@@ -265,8 +265,7 @@ fn no_service_string_is_an_absolute_path() {
 }
 
 /// Without `--candidates` the document is the one derive printed before the
-/// flag existed, byte for byte: `carrick init` writes it to
-/// `.carrick/proposal.json`.
+/// flag existed, byte for byte: `carrick init` and the cloud runner read it.
 ///
 /// `services/docs` holds no source file, so since carrick#2298 it is no
 /// service: the document names it in `notes` and nowhere else.

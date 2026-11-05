@@ -1,6 +1,5 @@
-// The templates, which two writers render: `carrick init` and the hosted
-// scaffold tool. A placeholder left unrendered is the failure that looks like
-// success, so it is the one asserted hardest.
+// The template `carrick templates` prints. A placeholder left unrendered is
+// the failure that looks like success, so it is the one asserted hardest.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -9,7 +8,6 @@ import {
   TEMPLATE_NAMES,
   TEMPLATE_PATHS,
   renderTemplate,
-  scaffoldFiles,
   templateSource,
 } from "../src/templates.ts";
 

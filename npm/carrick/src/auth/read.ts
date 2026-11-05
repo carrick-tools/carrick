@@ -12,17 +12,9 @@ const response = z.object({
     slug: z.string().regex(/^[a-zA-Z0-9_-]+$/),
     billing_tier: z.enum(["free", "cross_repo", "paid"]),
     installed: z.boolean(),
-    // The signed-in user's role in this workspace, where the server states it
-    // (carrick-cloud#1426). Absent means unknown, and `carrick init` then says
-    // nothing about who can finish a browser step (carrick#1512). A value
-    // outside the pinned three reads as unknown too, rather than failing the
-    // whole read.
-    role: z.enum(["owner", "admin", "member"]).optional().catch(undefined),
-    // Who builds this workspace's index (carrick-cloud#1969). Only "cloud"
-    // changes what `carrick init` does: absent, "laptop" and a value this
-    // build does not know all read as the laptop lane, never as a failed read
-    // (carrick#2219).
-    index_builder: z.enum(["cloud", "laptop"]).optional().catch(undefined),
+    // No `role` and no `index_builder`: `carrick init` has one run whatever
+    // the server says, waits on no browser step, and reads neither
+    // (carrick#3361).
   }),
   allowance_sentence: z.string().nullable(),
   repos: z.array(repository),
