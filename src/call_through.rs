@@ -148,6 +148,13 @@ pub struct CallThroughSites {
     /// stored: it decides only for a row whose helper is in the row's own
     /// service, and a carried service's blob already holds what it decided.
     pub written: HashMap<DefinitionSite, HashSet<String>>,
+    /// The rows (repository-relative file and line) whose call is a direct
+    /// call of a binding (`loadStats(id)`), not a member called on a value
+    /// (`api.load(id)`, where the value can be any object of its type).
+    /// [`settle`] reads a helper's route only for these. Read only in the
+    /// run that analyses the service, so never stored, like
+    /// [`Self::written`].
+    pub direct: HashSet<(String, u32)>,
 }
 
 impl CallThroughSites {
@@ -277,6 +284,7 @@ impl StoredCallThrough {
         CallThroughSites {
             leaves: Vec::new(),
             written: HashMap::new(),
+            direct: HashSet::new(),
             rows: self.rows.clone(),
             return_shapes: self
                 .return_shapes
@@ -360,6 +368,7 @@ pub fn read_sites(
             side_calls,
             leaves,
             written,
+            direct: HashSet::new(),
         };
     }
 
@@ -367,6 +376,7 @@ pub fn read_sites(
     // not always the spelling a row's key joins to.
     let mut walked: Option<HashMap<PathBuf, &PathBuf>> = None;
     let mut rows = Vec::new();
+    let mut direct = HashSet::new();
     for key in keys {
         let absolute = if Path::new(key).is_absolute() {
             PathBuf::from(key)
@@ -442,7 +452,7 @@ pub fn read_sites(
             }
         }
         let relative = crate::engine::repo_relative(key, root);
-        rows.extend(read_file_sites(
+        let (read, lines) = read_file_sites(
             &absolute,
             &relative,
             &file_results[key],
@@ -450,7 +460,9 @@ pub fn read_sites(
                 resolved: &resolved,
                 outside: &outside,
             },
-        ));
+        );
+        rows.extend(read);
+        direct.extend(lines.into_iter().map(|line| (relative.clone(), line)));
     }
     CallThroughSites {
         rows,
@@ -458,6 +470,7 @@ pub fn read_sites(
         side_calls,
         leaves,
         written,
+        direct,
     }
 }
 
@@ -858,11 +871,11 @@ fn read_file_sites(
     relative: &str,
     result: &FileAnalysisResult,
     resolution: &Resolution<'_>,
-) -> Vec<SiteRow> {
+) -> (Vec<SiteRow>, Vec<u32>) {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let Some(module) = parse_file(absolute, &cm, &handler) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let positions = Positions { cm: &cm };
 
@@ -881,8 +894,13 @@ fn read_file_sites(
         .filter_map(|call| Some((call, place(&every.calls, call)?)))
         .collect();
     if placed.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
+    let mut direct_calls = DirectCalls {
+        positions: &positions,
+        spans: HashSet::new(),
+    };
+    module.visit_with(&mut direct_calls);
 
     let mut reader = SiteReader {
         positions: &positions,
@@ -892,6 +910,7 @@ fn read_file_sites(
     module.visit_with(&mut reader);
 
     let mut rows = Vec::new();
+    let mut direct = Vec::new();
     for (call, extent) in placed {
         let Some(site) = reader.read.get(&extent.span()) else {
             continue;
@@ -936,8 +955,28 @@ fn read_file_sites(
             receiver: resolution.receiver(extent.span(), &site.receivers),
             callbacks,
         });
+        if direct_calls.spans.contains(&extent.span()) {
+            direct.push(line);
+        }
     }
-    rows
+    (rows, direct)
+}
+
+/// The spans of every call whose callee is a bare name (`loadStats(id)`).
+struct DirectCalls<'a> {
+    positions: &'a Positions<'a>,
+    spans: HashSet<(u32, u32)>,
+}
+
+impl Visit for DirectCalls<'_> {
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        if let Callee::Expr(callee) = &node.callee
+            && matches!(unwrap_expression(callee), Expr::Ident(_))
+        {
+            self.spans.insert(self.positions.extent(node.span).span());
+        }
+        node.visit_children_with(self);
+    }
 }
 
 /// Whether a deterministic row of the file sits inside the call expression:
@@ -1511,6 +1550,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                         service.data,
                         row,
                         &graph,
+                        &service.sites.direct,
                         &owners,
                         index,
                     ));
@@ -1520,7 +1560,8 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     settled.reaches_several += 1;
                 }
                 Reach::Unstated => {
-                    if let Some(request) = helper_row(&decider, row, &owners, index)
+                    if let Some(request) =
+                        helper_row(&decider, row, &service.sites.direct, &owners, index)
                         && withdraw_at_helper_call(service.data, row, request)
                     {
                         withdrawn_at_helper += 1;
@@ -1532,6 +1573,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                         service.data,
                         row,
                         &graph,
+                        &service.sites.direct,
                         &owners,
                         index,
                     ));
@@ -1616,13 +1658,18 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     settled
 }
 
-/// The one helper of `row`'s own service its own callee reaches, when that is
-/// one definition of the service at `index`.
+/// The one helper of `row`'s own service its own callee reaches, when the
+/// row's call is a direct call of a binding ([`CallThroughSites::direct`]) and
+/// its callee is one definition of the service at `index`.
 fn own_helper<'r>(
     row: &'r SiteRow,
+    direct: &HashSet<(String, u32)>,
     owners: &HashMap<String, usize>,
     index: usize,
 ) -> Option<&'r DefinitionSite> {
+    if !direct.contains(&(row.file.clone(), row.line)) {
+        return None;
+    }
     match row.steps.first().map(Vec::as_slice) {
         Some([helper]) if owners.get(&helper.file) == Some(&index) => Some(helper),
         _ => None,
@@ -1640,7 +1687,9 @@ fn own_helper<'r>(
 /// otherwise, so every guard here reads the source and says nothing when it
 /// cannot:
 ///
-/// - the row's own callee is ONE function of the row's own service;
+/// - the row's call is a direct call of a binding (`loadStats(id)`), not a
+///   member called on a value that can be any object of its type, and its own
+///   callee is ONE function of the row's own service;
 /// - the walk from it reaches no fact and exactly one row only the model
 ///   states, not through a side call, written inside that function;
 /// - that row's last literal path segment is written in the function's
@@ -1652,10 +1701,11 @@ fn own_helper<'r>(
 fn helper_row<'g>(
     decider: &Decider<'g>,
     row: &SiteRow,
+    direct: &HashSet<(String, u32)>,
     owners: &HashMap<String, usize>,
     index: usize,
 ) -> Option<&'g Unstated> {
-    let helper = own_helper(row, owners, index)?;
+    let helper = own_helper(row, direct, owners, index)?;
     let (reached, unstated) = decider.reached_by(row, std::slice::from_ref(helper));
     if !reached.is_empty() || unstated.len() != 1 {
         return None;
@@ -1718,7 +1768,7 @@ fn withdraw_at_helper_call(data: &mut CloudRepoData, row: &SiteRow, request: &Un
 }
 
 /// Drop the consumer response entry at the model's row `row` names, where the
-/// row's own callee is one helper of its service that writes the row's route
+/// row's call is a direct call of one helper of its service that writes the row's route
 /// and does not hand back the request's parsed body (carrick#1801): the call
 /// is worth what the helper returns (a mapped copy, a wrapper, a flag), not
 /// the response, so no response type is the caller's. The request entry
@@ -1727,10 +1777,11 @@ fn drop_copied_response(
     data: &mut CloudRepoData,
     row: &SiteRow,
     graph: &ReachGraph,
+    direct: &HashSet<(String, u32)>,
     owners: &HashMap<String, usize>,
     index: usize,
 ) -> bool {
-    let Some(helper) = own_helper(row, owners, index) else {
+    let Some(helper) = own_helper(row, direct, owners, index) else {
         return false;
     };
     let writes_route = last_literal_segment(&row.target).is_some_and(|named| {
@@ -3443,6 +3494,7 @@ mod tests {
                 side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
                 leaves: Vec::new(),
                 written: HashMap::new(),
+                direct: HashSet::new(),
             }
         };
         let sites = facts(&[0, 1]);
@@ -3574,6 +3626,7 @@ mod tests {
                 outside: &outside(),
             },
         )
+        .0
     }
 
     /// [`read_rows`] as (line, steps).
