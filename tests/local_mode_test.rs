@@ -3004,6 +3004,65 @@ fn check_changed_fails_on_a_new_call_to_a_route_that_does_not_exist() {
     assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
 }
 
+/// The per-edit re-check states the same no-route call `check --changed`
+/// lists for the same edit: the edited file's call gets `no_route`, not a null
+/// verdict that the hook then prints nothing for.
+#[test]
+#[serial]
+fn a_re_check_states_a_new_call_to_a_route_that_does_not_exist_as_no_route() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+    // The call is resolved where the wrapper is used: the caller's file.
+    let client = "inventory-svc/src/inventory.ts";
+    let budget = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
+
+    let (_, changed) = check_changed(root, false);
+    assert!(
+        changed
+            .lines()
+            .any(|line| line.starts_with("inventory-svc/src/inventory.ts:")
+                && line.contains("  no route  ")),
+        "check --changed lists the call:\n{changed}"
+    );
+
+    let fresh: serde_json::Value = serde_json::from_str(&run_with_env(
+        root,
+        &["check", client, "--workspace", ".", "--recheck", "--json"],
+        &budget,
+    ))
+    .expect("check --recheck --json was not JSON");
+    let gadget = fresh["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["path"] == "/api/v1/gadgets/:gadgetId")
+        .unwrap_or_else(|| panic!("the new call is an item:\n{fresh:#}"));
+    assert_eq!(
+        gadget["verdict"]["result"],
+        serde_json::json!("no_route"),
+        "the edited file's call reaching no route is stated:\n{fresh:#}"
+    );
+    assert_eq!(gadget["verdict"]["state"], serde_json::json!("not_checked"));
+    assert!(
+        gadget["verdict"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no service in this workspace serves it")),
+        "with judge's reason:\n{fresh:#}"
+    );
+    // The calls that match keep what they had.
+    assert!(
+        fresh["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .filter(|item| item["path"] != "/api/v1/gadgets/:gadgetId")
+            .all(|item| item["verdict"]["result"] != serde_json::json!("no_route")),
+        "no other row is stated as no route:\n{fresh:#}"
+    );
+}
+
 /// A `check --changed` stopped by SIGTERM takes its re-scan and the re-scan's
 /// type sidecar with it, even a sidecar too busy to hear a signal. Before,
 /// only the check ended: the re-scan was a process of its own that nothing

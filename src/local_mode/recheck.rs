@@ -916,7 +916,7 @@ fn inside(
         return Err(sentence.to_string());
     }
 
-    let items = rejoined
+    let mut items = rejoined
         .index
         .repos
         .iter()
@@ -924,6 +924,8 @@ fn inside(
         .and_then(|rebuilt| rebuilt.files.get(relative))
         .cloned()
         .unwrap_or_default();
+    let (moved, no_route) = judge_edit(workspace, before, &rejoined, repo, relative, plan);
+    state_no_route(&mut items, &no_route);
     // No rows where the index held some is an answer, not a failure: the edit
     // took the last route out of this file, and the fresh (empty) list is what
     // says so.
@@ -944,8 +946,37 @@ fn inside(
         ),
         elapsed: Duration::default(),
         scope: plan.scope.clone(),
-        moved: moved_rows(workspace, before, &rejoined, repo, relative, plan),
+        moved,
     })
+}
+
+/// Say, on the edited file's own call rows, that no service serves them: the
+/// rows `check --changed` lists for this file without `--all`. The rebuilt
+/// index stores no verdict for a call with no counterpart, so the item would
+/// read `result: null`, "nothing pairs", and the answer `judge` computed
+/// would be dropped. The shape is `producer_removed`'s: `not_checked` for the
+/// type layer, `no_route` for the routing fact.
+fn state_no_route(items: &mut [IndexedItem], no_route: &[super::changed::Problem]) {
+    for problem in no_route {
+        for item in items.iter_mut().filter(|item| {
+            item.kind == super::read_model::ItemKind::Call
+                && item.verdict.is_none()
+                && item.line == problem.line
+                && item.method == problem.method
+                && item.path == problem.path
+        }) {
+            let note = if problem.other_build {
+                " (not checked: the index is from another scanner build)"
+            } else {
+                ""
+            };
+            item.verdict = Some(super::read_model::StoredVerdict {
+                state: "not_checked".to_string(),
+                result: Some("no_route".to_string()),
+                detail: format!("{}{note}", problem.reason),
+            });
+        }
+    }
 }
 
 /// The rows outside the edited file that this edit moved, by the rule
@@ -957,15 +988,17 @@ fn inside(
 ///
 /// Rows of the edited repo and of every repo holding a re-read service are
 /// read; a call in any repo counts when the index matched it. The rows of the
-/// edited file itself are the `items` of the answer, so they are left out.
-fn moved_rows(
+/// edited file itself are the `items` of the answer, so they are left out of
+/// the moved list; its calls that reach no route and that a plain
+/// `check --changed` lists come back apart, for [`state_no_route`].
+fn judge_edit(
     workspace: &Workspace,
     before: &super::read_model::LocalIndex,
     rejoined: &Rejoined,
     repo: &Path,
     relative: &str,
     plan: &Plan,
-) -> Vec<super::contract::MovedRow> {
+) -> (Vec<super::contract::MovedRow>, Vec<super::changed::Problem>) {
     let edited = repo_label(repo);
     let mut changed: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
@@ -991,10 +1024,18 @@ fn moved_rows(
         &rejoined.join,
         &wanted,
     );
-    judged
+    let (outside, inside): (Vec<_>, Vec<_>) = judged
         .problems
         .into_iter()
-        .filter(|problem| problem.outside_the_change)
+        .partition(|problem| problem.outside_the_change);
+    let no_route = inside
+        .into_iter()
+        .filter(|problem| {
+            problem.kind == super::changed::ProblemKind::NoRoute && problem.listed_without_all()
+        })
+        .collect();
+    let moved = outside
+        .into_iter()
         .map(|problem| super::contract::MovedRow {
             file: problem.file,
             line: problem.line,
@@ -1013,7 +1054,8 @@ fn moved_rows(
             not_judged_before: problem.not_judged_before,
             other_build: problem.other_build,
         })
-        .collect()
+        .collect();
+    (moved, no_route)
 }
 
 /// What a check says when the re-scan could not read the library store
