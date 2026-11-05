@@ -115,6 +115,31 @@ test("answers land in queue order and the lock is gone once the queue is empty",
   }
 });
 
+test("an entry whose claim fails for good is answered once with a failure and the runner ends", async () => {
+  const s = scratch();
+  try {
+    const [entry] = enqueue(s.root, "s1", [s.file("a.ts")], Date.now(), { home: s.home });
+    enqueue(s.root, "s1", [s.file("b.ts")], Date.now() + 1, { home: s.home });
+    // A file where the runner's taken folder must go: every claim fails and the queue file stays.
+    fs.writeFileSync(path.dirname(takenDir(s.root, process.pid)), "");
+    let reads = 0;
+    const now = () => {
+      // A runner that spins reads the clock without end; fail instead of hanging.
+      if (++reads > 2000) throw new Error("runner is spinning on an entry it cannot claim");
+      return Date.now();
+    };
+    await runQueue(s.root, { env: env(s), home: s.home, now });
+    assert.deepEqual(calls(s.log), []);
+    const answers = finishedFor("s1", s.home);
+    assert.equal(answers.length, 2);
+    assert.ok(answers.every((a) => typeof a.failure === "string" && a.failure.length > 0));
+    assert.equal(answers.filter((a) => a.seq === entry!.seq).length, 1);
+    assert.equal(fs.existsSync(lockPath(s.root)), false);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("an entry queued after the runner released its lock is still run", async () => {
   const s = scratch();
   try {

@@ -407,9 +407,16 @@ function recoverTaken(root: string, self: number, now: number, home?: string): v
  * Settle the queue's bookkeeping, then name the entry to run next: entries
  * past their expiry are answered "stopped" unrun, an older entry of the same
  * session and file is answered "superseded" (silently), and what is left runs
- * in queue order. Null when nothing is left.
+ * in queue order. Null when nothing is left. Entries in `skip` (a claim of
+ * theirs failed for good) are left where they are and never chosen.
  */
-function nextEntry(root: string, now: number, cap: number, home?: string): QueueEntry | null {
+function nextEntry(
+  root: string,
+  now: number,
+  cap: number,
+  skip: ReadonlySet<string>,
+  home?: string,
+): QueueEntry | null {
   const live: Array<{ name: string; entry: QueueEntry }> = [];
   for (const name of names(queueDir(root))) {
     if (!name.endsWith(".json")) continue;
@@ -432,7 +439,7 @@ function nextEntry(root: string, now: number, cap: number, home?: string): Queue
       remove(path.join(queueDir(root), name));
       continue;
     }
-    chosen ??= entry;
+    if (!skip.has(entry.seq)) chosen ??= entry;
   }
   return chosen;
 }
@@ -467,13 +474,24 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
     CARRICK_TIMEOUT_MS: String(cap + CALL_SLACK_MS),
   };
   const bin = options.bin ?? binary(env);
+  // Entries this runner could not claim although their file stayed (a disk
+  // that refuses the rename): answered once, then left alone for its life.
+  const unclaimable = new Set<string>();
+  const waiting = () => names(queueDir(root)).filter((name) => !unclaimable.has(name.replace(/\.json$/, "")));
   for (;;) {
     recoverTaken(root, pid, clock(), options.home);
     for (;;) {
-      const entry = nextEntry(root, clock(), cap, options.home);
+      const entry = nextEntry(root, clock(), cap, unclaimable, options.home);
       if (entry === null) break;
       const taken = take(root, entry, pid);
-      if (taken === null) continue;
+      if (taken === null) {
+        if (fs.existsSync(path.join(queueDir(root), `${entry.seq}.json`))) {
+          unclaimable.add(entry.seq);
+          const failure = "the background re-check could not claim this edit";
+          writeAnswer(entry, "stopped", null, clock(), { failure }, options.home);
+        }
+        continue;
+      }
       touchLock(root, pid, clock());
       const startedAt = clock();
       const outcome = await check(entry.relative, { cwd: root, recheck: true, env: callEnv, bin });
@@ -492,7 +510,7 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
     await options.afterRelease?.();
     // Anything queued between the last look and the release would otherwise
     // wait for the next hook to notice: look once more, and go on if so.
-    if (names(queueDir(root)).length === 0) return;
+    if (waiting().length === 0) return;
     if (!takeLock(root, pid, clock(), cap)) return;
   }
 }
