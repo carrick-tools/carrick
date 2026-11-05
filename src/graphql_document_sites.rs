@@ -1413,7 +1413,7 @@ fn template_text(tpl: &swc_ecma_ast::Tpl) -> String {
 /// Does `text` parse as an executable GraphQL document with at least one
 /// named operation keyword or fragment? The bare `{ ... }` shorthand is not
 /// enough on its own: plenty of non-GraphQL text parses as one.
-fn is_executable_document(text: &str) -> bool {
+pub(crate) fn is_executable_document(text: &str) -> bool {
     use graphql_parser::query::{Definition, OperationDefinition};
     let Ok(document) = graphql_parser::parse_query::<String>(text) else {
         return false;
