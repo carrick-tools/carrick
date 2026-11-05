@@ -14,11 +14,11 @@
 //! or by `carrick.json` overrides them. This keeps framework knowledge out of
 //! the scanner core while still shipping value today.
 //!
-//! The bootstrap is selected from the service's *declared dependencies* as well
-//! as from detection's framework labels, so it does not depend on an LLM having
-//! named the file-router framework. Detection classifies the HTTP server a
-//! service runs; a file-routed app fronted by a generic HTTP server reports
-//! only that server, and the manifest is the reliable witness.
+//! The bootstrap is selected from the service's *declared dependencies* only,
+//! so it does not depend on an LLM having named the file-router framework.
+//! Detection classifies the HTTP server a service runs; a file-routed app
+//! fronted by a generic HTTP server reports only that server, and the manifest
+//! is the reliable witness.
 
 use crate::type_manifest::is_http_method;
 use serde::{Deserialize, Serialize};
@@ -666,43 +666,35 @@ const REMIX_PACKAGES: &[&str] = &[
     "@remix-run/react",
 ];
 
-/// Bootstrap conventions for a service, selected from the frameworks reported
-/// by detection *and* the package names the service declares as dependencies.
+/// Bootstrap conventions for a service, selected from the package names it
+/// declares as dependencies.
 /// This is the *only* place a framework name appears in the scanner; a
 /// convention supplied by detection or `carrick.json` should be preferred over
 /// these (see module docs).
 ///
-/// Two inputs, two matching rules, deliberately:
+/// `dependency_names` are npm package names, chosen by whoever published
+/// them, so they are matched by lowercased **exact equality** against the
+/// per-convention lists above. Substring matching here would claim any
+/// package that happens to contain "next" or "remix" in its name.
 ///
-/// * `frameworks` are free-text labels an LLM produced ("Next.js", "Remix v2"),
-///   so they are matched by lowercased **substring**.
-/// * `dependency_names` are npm package names, chosen by whoever published
-///   them, so they are matched by lowercased **exact equality** against the
-///   per-convention lists above. Substring matching here would claim any
-///   package that happens to contain "next" or "remix" in its name.
-///
-/// The dependency path exists because framework detection classifies the HTTP
-/// *server* a service runs (an app served by Express reports Express), which
-/// says nothing about whether that app also declares its routes by file
-/// location. The manifest does say so, deterministically, with no LLM call.
-pub fn builtin_conventions(
-    frameworks: &[String],
-    dependency_names: &[String],
-) -> Vec<RoutingConvention> {
-    let frameworks_lower: Vec<String> = frameworks.iter().map(|f| f.to_lowercase()).collect();
+/// Detection's free-text framework labels do not select a convention: they
+/// classify the HTTP *server* a service runs (an app served by Express reports
+/// Express), which says nothing about whether that app also declares its
+/// routes by file location. The manifest does, deterministically, with no LLM
+/// call.
+pub fn builtin_conventions(dependency_names: &[String]) -> Vec<RoutingConvention> {
     let deps_lower: std::collections::HashSet<String> =
         dependency_names.iter().map(|d| d.to_lowercase()).collect();
-    let mentions = |needle: &str| frameworks_lower.iter().any(|f| f.contains(needle));
     let declares = |names: &[&str]| names.iter().any(|n| deps_lower.contains(*n));
     let mut out = Vec::new();
-    if mentions("next") || declares(NEXTJS_PACKAGES) {
+    if declares(NEXTJS_PACKAGES) {
         out.push(RoutingConvention::nextjs_app());
         out.push(RoutingConvention::nextjs_pages());
     }
-    if mentions("astro") || declares(ASTRO_PACKAGES) {
+    if declares(ASTRO_PACKAGES) {
         out.push(RoutingConvention::astro());
     }
-    if mentions("remix") || declares(REMIX_PACKAGES) {
+    if declares(REMIX_PACKAGES) {
         out.push(RoutingConvention::flat_routes());
     }
     out
@@ -894,9 +886,9 @@ mod tests {
     }
 
     #[test]
-    fn astro_gated_on_framework_detection() {
-        assert!(builtin_conventions(&["express".to_string()], &[]).is_empty());
-        let astro = builtin_conventions(&["Astro".to_string()], &[]);
+    fn astro_gated_on_declared_dependency() {
+        assert!(builtin_conventions(&[]).is_empty());
+        let astro = builtin_conventions(&["astro".to_string()]);
         assert_eq!(astro.len(), 1);
         assert_eq!(astro[0].name, "astro");
     }
@@ -1055,8 +1047,8 @@ mod tests {
 
     #[test]
     fn flat_routes_gated_on_framework_detection() {
-        assert!(builtin_conventions(&["express".to_string()], &[]).is_empty());
-        let flat = builtin_conventions(&["Remix".to_string()], &[]);
+        assert!(builtin_conventions(&[]).is_empty());
+        let flat = builtin_conventions(&["remix".to_string()]);
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0].name, "remix-flat");
     }
@@ -1070,20 +1062,19 @@ mod tests {
     }
 
     #[test]
-    fn declared_dependencies_activate_conventions_without_the_framework_label() {
+    fn declared_dependencies_activate_conventions() {
         // The reported framework is the HTTP server the app is served by; the
         // manifest is what says the app declares its routes by file location.
-        let express = vec!["express".to_string()];
         assert_eq!(
-            names(&builtin_conventions(&express, &deps(&["@remix-run/node"]))),
+            names(&builtin_conventions(&deps(&["@remix-run/node"]))),
             vec!["remix-flat"]
         );
         assert_eq!(
-            names(&builtin_conventions(&express, &deps(&["next"]))),
+            names(&builtin_conventions(&deps(&["next"]))),
             vec!["nextjs-app", "nextjs-pages"]
         );
         assert_eq!(
-            names(&builtin_conventions(&express, &deps(&["astro"]))),
+            names(&builtin_conventions(&deps(&["astro"]))),
             vec!["astro"]
         );
     }
@@ -1092,7 +1083,7 @@ mod tests {
     fn every_listed_dependency_activates_its_convention() {
         for dep in REMIX_PACKAGES {
             assert_eq!(
-                names(&builtin_conventions(&[], &deps(&[dep]))),
+                names(&builtin_conventions(&deps(&[dep]))),
                 vec!["remix-flat"],
                 "{dep} should activate the flat-route convention"
             );
@@ -1111,7 +1102,7 @@ mod tests {
             "eslint-plugin-next",
         ] {
             assert!(
-                builtin_conventions(&[], &deps(&[dep])).is_empty(),
+                builtin_conventions(&deps(&[dep])).is_empty(),
                 "{dep} must not activate a convention"
             );
         }
@@ -1121,20 +1112,20 @@ mod tests {
     fn remix_scope_alone_does_not_activate_flat_routes() {
         // React Router's data router ships under the Remix scope and appears in
         // SPAs with no `app/routes` tree.
-        assert!(builtin_conventions(&[], &deps(&["@remix-run/router"])).is_empty());
+        assert!(builtin_conventions(&deps(&["@remix-run/router"])).is_empty());
     }
 
     #[test]
     fn dependency_matching_is_case_insensitive() {
         assert_eq!(
-            names(&builtin_conventions(&[], &deps(&["@Remix-Run/Node"]))),
+            names(&builtin_conventions(&deps(&["@Remix-Run/Node"]))),
             vec!["remix-flat"]
         );
     }
 
     #[test]
     fn a_service_declaring_nothing_relevant_gets_no_conventions() {
-        assert!(builtin_conventions(&[], &deps(&["express", "zod", "pino"])).is_empty());
+        assert!(builtin_conventions(&deps(&["express", "zod", "pino"])).is_empty());
     }
 
     /// Guard-free lookup: the shape every test predating carrick#601 exercised.
@@ -1362,9 +1353,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_conventions_gated_on_framework() {
-        assert!(builtin_conventions(&["express".to_string()], &[]).is_empty());
-        let next = builtin_conventions(&["Next.js".to_string()], &[]);
+    fn builtin_conventions_gated_on_declared_dependency() {
+        assert!(builtin_conventions(&[]).is_empty());
+        let next = builtin_conventions(&["next".to_string()]);
         assert_eq!(next.len(), 2);
     }
 
