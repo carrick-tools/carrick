@@ -1607,6 +1607,61 @@ fn is_plain_interpolation(inner: &str) -> bool {
         && !inner.contains('\'')
 }
 
+/// Each consumer call's resolved base (carrick#649), keyed the way the matcher
+/// keys a call: its canonical key and its file location.
+fn bases_by_call(
+    graph: &MountGraph,
+) -> HashMap<(String, String), &crate::call_base::CallBaseResolution> {
+    graph
+        .get_data_calls()
+        .iter()
+        .filter_map(|c| {
+            Some((
+                (
+                    OperationKey::http(&c.method, c.canonical_path.clone()).canonical(),
+                    c.file_location.clone(),
+                ),
+                c.base.as_ref()?,
+            ))
+        })
+        .collect()
+}
+
+/// The environment variable a call's base reads, when its canonical key still
+/// carries that base (carrick N14a).
+///
+/// Read off the base the AST stated (`CallBase`), not off the spelling of the
+/// key. A base the key stripped (declared internal, or an injected base) is not
+/// the key's base any more and states no variable here.
+fn call_env_var(
+    bases: &HashMap<(String, String), &crate::call_base::CallBaseResolution>,
+    key: &str,
+    file: &str,
+    target: &str,
+) -> Option<String> {
+    let base = bases.get(&(key.to_string(), file.to_string()))?;
+    if base.kind != crate::call_base::CallBaseKind::Env {
+        return None;
+    }
+    let opens = target.trim_start_matches(['`', '"', '\'']);
+    opens
+        .starts_with(&base.written)
+        .then(|| base.env_var.clone())
+        .flatten()
+}
+
+/// Whether a call target opens on an interpolated origin, `${...}/route`.
+///
+/// The origin is a value the key cannot name, so a lookup of the remainder
+/// would pair or miss a call whose host is unknown (carrick#378).
+fn opens_on_interpolated_origin(target: &str) -> bool {
+    target
+        .trim_start_matches(['`', '"', '\''])
+        .strip_prefix("${")
+        .and_then(|rest| rest.split_once('}'))
+        .is_some_and(|(_, after)| after.starts_with('/'))
+}
+
 pub fn is_valid_route_shape(route: &str) -> bool {
     let route = route.trim();
     if route.is_empty() {
@@ -1647,7 +1702,7 @@ pub fn is_valid_route_shape(route: &str) -> bool {
     };
 
     // Explicit `ENV_VAR:NAME:/path` form (the analyzer's canonical env-var
-    // route; see `is_env_var_base_url` / `extract_env_var_name`).
+    // route; the matcher reads the variable off the call's stated base).
     if let Some(rest) = route.strip_prefix("ENV_VAR:") {
         let mut parts = rest.splitn(2, ':');
         let name = parts.next().unwrap_or("");
@@ -2220,145 +2275,6 @@ impl Analyzer {
         result
     }
 
-    /// Extract environment variable name from a route
-    /// Examples:
-    /// - "ENV_VAR:API_URL:/users" -> "API_URL"
-    /// - "${process.env.SERVICE_URL}/orders" -> "SERVICE_URL"
-    /// - "${API_BASE}/users" -> "API_BASE"
-    /// - "unknown" -> "UNKNOWN_API"
-    pub(crate) fn extract_env_var_name(route: &str) -> String {
-        // Handle ENV_VAR:NAME:/path format
-        if route.starts_with("ENV_VAR:") {
-            let parts: Vec<&str> = route.splitn(3, ':').collect();
-            if parts.len() >= 2 {
-                return parts[1].to_string();
-            }
-        }
-
-        // Handle ${process.env.VAR} or ${VAR} patterns
-        if let Some(start) = route.find("${")
-            && let Some(end) = route[start..].find('}')
-        {
-            let inner = &route[start + 2..start + end];
-            // Handle process.env.VAR -> VAR
-            if let Some(last_dot) = inner.rfind('.') {
-                return inner[last_dot + 1..].to_string();
-            }
-            return inner.to_string();
-        }
-
-        // Handle process.env.VAR patterns (without ${})
-        if let Some(idx) = route.find("process.env.") {
-            let after = &route[idx + 12..];
-            let end = after
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            if end > 0 {
-                return after[..end].to_string();
-            }
-        }
-
-        // Handle start-of-string variable (e.g. API_URL + "/path")
-        if let Some(first_char) = route.chars().next()
-            && first_char.is_uppercase()
-        {
-            let end = route
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(route.len());
-            if end > 0 {
-                return route[..end].to_string();
-            }
-        }
-
-        "UNKNOWN_API".to_string()
-    }
-
-    /// Check if a route represents an environment variable base URL.
-    ///
-    /// Returns true for:
-    /// - "ENV_VAR:API_URL:/users" (explicit ENV_VAR format)
-    /// - "${process.env.API_URL}/users" (process.env pattern at start)
-    /// - "${API_BASE_URL}/users" (UPPER_CASE var at start)
-    /// - "${authHost}/oauth/token" (ANY leading variable followed by a path)
-    ///
-    /// Returns false for:
-    /// - "/users/${userId}" (path parameter, not base URL)
-    /// - "/api/${version}/data" (path parameter in middle)
-    /// - "${userId}" (whole-URL opaque variable — no path to classify)
-    pub(crate) fn is_env_var_base_url(route: &str) -> bool {
-        // Check for explicit ENV_VAR: prefix format
-        if route.starts_with("ENV_VAR:") {
-            return true;
-        }
-
-        // Check for process.env pattern
-        if route.contains("process.env.") {
-            return true;
-        }
-
-        // Check for ${...} at the START of the route (not in the middle)
-        if route.starts_with("${")
-            && let Some(end) = route.find('}')
-        {
-            let var_name = &route[2..end];
-            // If it contains a dot (like process.env.X) or is UPPER_CASE, it's an env var
-            if var_name.contains('.')
-                || var_name
-                    .chars()
-                    .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
-            {
-                return true;
-            }
-            // #378: casing is not identity. ANY leading variable followed by
-            // a path remainder is structurally a base URL — the call cannot
-            // be located without knowing it, so it must be classified
-            // (internalEnvVars/externalEnvVars) before it may match;
-            // previously the matcher silently stripped lowercase bases and
-            // paired third-party calls with in-org producers that happened to
-            // share a generic path.
-            //
-            // #467 narrowed the persisted consumer key: `consumer_call_path`
-            // now keeps only an ENV-VAR-SHAPED undeclared base
-            // (`process.env.*` / `SCREAMING_SNAKE`) verbatim and strips an
-            // injected one (`${this.apiUrl}/…`), because no `internalEnvVars`
-            // entry could ever classify a class property. This gate is
-            // deliberately left as-is: it runs on the ALREADY-canonicalized
-            // key, so an injected base no longer reaches it as a `${var}`
-            // prefix, and the branch still guards any other route shape that
-            // does.
-            if route[end + 1..].starts_with('/') {
-                return true;
-            }
-        }
-
-        // Check for start-of-string variables (e.g. API_URL + "/path")
-        // If it starts with an uppercase letter and is not a path (doesn't start with /),
-        // we treat it as a potential environment variable or constant base URL.
-        if let Some(first_char) = route.chars().next()
-            && first_char.is_uppercase()
-        {
-            // Extract the first identifier
-            let end = route
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(route.len());
-
-            // If the identifier is non-empty and looks like a constant (mostly uppercase/digits/underscore)
-            // we treat it as an env var.
-            // We verify it's at least 2 chars to avoid single letters being treated as vars excessively
-            if end >= 2 {
-                let ident = &route[..end];
-                if ident
-                    .chars()
-                    .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
-                {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
     /// Helper to process a TsTypeAnn and produce a TypeReference.
     /// This function encapsulates the logic to find the correct span,
     /// calculate the UTF-16 offset, and build the TypeReference struct.
@@ -2648,6 +2564,7 @@ impl Analyzer {
 
         // Create URL normalizer once for all calls
         let normalizer = UrlNormalizer::new(&self.config);
+        let call_bases = bases_by_call(mount_graph);
 
         // For each call, try to find matching endpoint using mount graph.
         // This is the HTTP matcher: non-HTTP operations are dispatched to
@@ -2671,9 +2588,20 @@ impl Analyzer {
             // false positives on path parameters) look up by their canonical
             // `ENV_VAR:` route; everything else looks up the raw target.
             let (lookup_url, miss_path);
-            let is_env_route = Self::is_env_var_base_url(target);
-            if is_env_route {
-                let env_var_name = Self::extract_env_var_name(target);
+            let env_var_name = call_env_var(
+                &call_bases,
+                &call.key.canonical(),
+                &call.file_path.display().to_string(),
+                target,
+            );
+            let is_env_route = env_var_name.is_some();
+            // A call whose key opens on an interpolated origin the AST stated
+            // no base for names no host to look up and no variable to report:
+            // it is neither an env-var finding nor a missing endpoint.
+            if !is_env_route && opens_on_interpolated_origin(target) {
+                continue;
+            }
+            if let Some(env_var_name) = env_var_name {
                 let normalized_path = normalizer.extract_path(target);
                 let canonical_env_var_route =
                     format!("ENV_VAR:{}:{}", env_var_name, normalized_path);
@@ -4614,8 +4542,8 @@ mod tests {
     }
 
     /// Acceptance from carrick#399: feeding the run-29677844107 verbatim target
-    /// through the consumer-call path yields canonical `/audit/events` with
-    /// env-var base `AUDIT_WEBHOOK_URL` — byte-identical to the clean
+    /// through the consumer-call path yields canonical `/audit/events` —
+    /// byte-identical to the clean
     /// `${AUDIT_WEBHOOK_URL}/audit/events` rendering's key.
     #[test]
     fn normalized_fallback_target_produces_the_clean_canonical_key() {
@@ -4638,10 +4566,6 @@ mod tests {
             normalizer.consumer_call_path(clean)
         );
         assert_eq!(normalizer.consumer_call_path(&normalized), "/audit/events");
-        assert_eq!(
-            Analyzer::extract_env_var_name(&normalized),
-            "AUDIT_WEBHOOK_URL"
-        );
     }
 
     /// carrick#1150: a query string appended only when there is one is the
@@ -4841,79 +4765,6 @@ mod tests {
         assert_eq!(Analyzer::to_pascal_case(""), "");
     }
 
-    #[test]
-    fn test_extract_env_var_name() {
-        // ENV_VAR:NAME:/path format
-        assert_eq!(
-            Analyzer::extract_env_var_name("ENV_VAR:API_URL:/users"),
-            "API_URL"
-        );
-        assert_eq!(
-            Analyzer::extract_env_var_name("ENV_VAR:ORDER_SERVICE_URL:/orders"),
-            "ORDER_SERVICE_URL"
-        );
-
-        // ${process.env.VAR} format
-        assert_eq!(
-            Analyzer::extract_env_var_name("${process.env.SERVICE_URL}/orders"),
-            "SERVICE_URL"
-        );
-        assert_eq!(
-            Analyzer::extract_env_var_name("${process.env.API_BASE}/users/123"),
-            "API_BASE"
-        );
-
-        // ${VAR} format (without process.env)
-        assert_eq!(
-            Analyzer::extract_env_var_name("${BASE_URL}/orders"),
-            "BASE_URL"
-        );
-
-        // process.env.VAR without ${}
-        assert_eq!(
-            Analyzer::extract_env_var_name("process.env.MY_API_URL + \"/data\""),
-            "MY_API_URL"
-        );
-
-        // Unknown/fallback
-        assert_eq!(Analyzer::extract_env_var_name("unknown"), "UNKNOWN_API");
-        assert_eq!(Analyzer::extract_env_var_name("/users"), "UNKNOWN_API");
-    }
-
-    #[test]
-    fn test_is_env_var_base_url() {
-        // Should return true for env var base URLs
-        assert!(Analyzer::is_env_var_base_url("ENV_VAR:API_URL:/users"));
-        assert!(Analyzer::is_env_var_base_url(
-            "ENV_VAR:ORDER_SERVICE_URL:/orders"
-        ));
-        assert!(Analyzer::is_env_var_base_url(
-            "${process.env.API_URL}/users"
-        ));
-        assert!(Analyzer::is_env_var_base_url(
-            "${process.env.SERVICE_URL}/orders"
-        ));
-        assert!(Analyzer::is_env_var_base_url("${API_BASE_URL}/users"));
-        assert!(Analyzer::is_env_var_base_url("${ORDER_SERVICE}/orders"));
-        assert!(Analyzer::is_env_var_base_url(
-            "process.env.API_URL + \"/data\""
-        ));
-
-        // Should return false for path parameters (not base URL env vars)
-        assert!(!Analyzer::is_env_var_base_url("/users/${userId}"));
-        assert!(!Analyzer::is_env_var_base_url("/api/${version}/data"));
-        assert!(!Analyzer::is_env_var_base_url("/orders/${orderId}/items"));
-        assert!(!Analyzer::is_env_var_base_url("/users/:id"));
-        assert!(!Analyzer::is_env_var_base_url("/api/users"));
-
-        // Edge cases
-        assert!(!Analyzer::is_env_var_base_url("${userId}")); // whole-URL opaque var, no path to classify
-        // #378: a leading variable followed by a path is a base regardless of
-        // casing — it must be classified before the path may match anything.
-        assert!(Analyzer::is_env_var_base_url("${camelCase}/path"));
-        assert!(Analyzer::is_env_var_base_url("${authHost}/oauth/token"));
-        assert!(Analyzer::is_env_var_base_url("${API_V2}/users")); // UPPER_CASE with digit
-    }
     fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
             view_module: false,
@@ -5549,6 +5400,154 @@ mod tests {
         assert!(verified.is_empty());
     }
 
+    /// A consumer call whose key still carries an env-var base, with the base
+    /// the AST stated for it on the mount graph's row: `(call, graph row)`.
+    fn env_base_call(
+        key: &str,
+        written: &str,
+        env_var: &str,
+        file: &str,
+    ) -> (ApiEndpointDetails, crate::mount_graph::DataFetchingCall) {
+        let mut call = op_details_in_repo(OperationKey::http("GET", key), file, "repo");
+        call.repo_name = None;
+        let row = crate::mount_graph::DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: key.to_string(),
+            canonical_path: key.to_string(),
+            client: "fetch".to_string(),
+            file_location: file.to_string(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: None,
+            base: Some(crate::call_base::CallBaseResolution {
+                written: written.to_string(),
+                kind: crate::call_base::CallBaseKind::Env,
+                env_var: Some(env_var.to_string()),
+                fallback: None,
+                fallback_is_loopback: false,
+                declared_optional: None,
+            }),
+            consumers_not_resolved: None,
+            resolution_source: None,
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+            own_route: false,
+        };
+        (call, row)
+    }
+
+    /// N14a: the variable an env-var finding names is the one the call's base
+    /// READS, not text cut from the key. `${config.apiUrl}` is a property that
+    /// holds `process.env.ORDERS_URL`; the old reading named it `apiUrl`.
+    #[test]
+    fn the_env_var_finding_names_the_variable_the_base_reads() {
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut graph = MountGraph::new();
+        let (call, row) = env_base_call(
+            "${config.apiUrl}/orders",
+            "${config.apiUrl}",
+            "ORDERS_URL",
+            "src/client.ts:7",
+        );
+        analyzer.calls.push(call);
+        graph.data_calls.push(row);
+
+        let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+        assert!(
+            findings.iter().any(|f| matches!(
+                f,
+                Finding::EnvVarCall { env_var, path, .. }
+                    if env_var == "ORDERS_URL" && path == "/orders"
+            )),
+            "the finding names the variable the base reads: {findings:?}"
+        );
+    }
+
+    /// N14a: a base the canonical key no longer carries (declared internal, so
+    /// the key is the bare path) is not an env-var call, whatever the base reads.
+    #[test]
+    fn a_stripped_base_is_not_an_env_var_call() {
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut graph = MountGraph::new();
+        let (call, row) = env_base_call(
+            "/orders",
+            "${process.env.ORDERS_URL}",
+            "ORDERS_URL",
+            "src/client.ts:7",
+        );
+        analyzer.calls.push(call);
+        graph.data_calls.push(row);
+
+        let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, Finding::EnvVarCall { .. })),
+            "a stripped base reports no env-var call: {findings:?}"
+        );
+    }
+
+    /// N14a: a call whose key opens on an origin variable the call's row states
+    /// no base for is neither an env-var finding nor a missing endpoint.
+    #[test]
+    fn a_call_with_no_stated_base_reports_neither_env_var_nor_missing() {
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut graph = MountGraph::new();
+        analyzer.calls.push(http_call(
+            "POST",
+            "${BILLING_API_URL}/usage/ingest",
+            "src/route.ts:12",
+        ));
+        graph.data_calls.push(data_call_in(
+            "POST",
+            "${BILLING_API_URL}/usage/ingest",
+            "src/route.ts:12",
+            "web",
+        ));
+
+        let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f,
+                Finding::EnvVarCall { .. } | Finding::MissingEndpoint { .. }
+            )),
+            "no stated base, so nothing to report: {findings:?}"
+        );
+    }
+
+    /// N14a: a variable read in the PATH of a literal-host call is not the
+    /// call's base. The call names no variable; it is judged by its host like
+    /// any other literal-host call (an undeclared host is a gap, a declared
+    /// one is silent).
+    #[test]
+    fn a_variable_in_the_path_of_a_literal_host_call_names_no_env_var() {
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut graph = MountGraph::new();
+        let route = "https://vendor.test/v1/projects/${PROJECT_ID}/models";
+        analyzer
+            .calls
+            .push(http_call("POST", route, "src/client.ts:9"));
+        let mut row = data_call_in("POST", route, "src/client.ts:9", "web");
+        row.host = Some("vendor.test".to_string());
+        graph.data_calls.push(row);
+
+        let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, Finding::EnvVarCall { .. })),
+            "a path variable is not a base: {findings:?}"
+        );
+    }
+
     #[test]
     fn test_analyze_matches_with_mount_graph_env_vars() {
         // Setup config with internal env vars
@@ -5557,112 +5556,31 @@ mod tests {
             ..Config::default()
         };
 
-        // Create analyzer with dummy source map (not used for this analysis)
         let mut analyzer = Analyzer::new(config);
+        let mut mount_graph = MountGraph::new();
 
-        // Add calls that use env vars
-        // 1. Valid internal call (should match if endpoint exists, or report missing)
-        analyzer.calls.push(ApiEndpointDetails {
-            view_module: false,
-            owner: None,
-            key: OperationKey::http("GET", "ENV_VAR:API_URL:/users"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from("test.ts"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
-        });
-
-        // 2. Unclassified env var (not in internal/external list)
-        analyzer.calls.push(ApiEndpointDetails {
-            view_module: false,
-            owner: None,
-            key: OperationKey::http("GET", "ENV_VAR:UNKNOWN_VAR:/posts"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from("test.ts"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
-        });
-
-        // 3. Process.env pattern (should be detected as env var)
-        analyzer.calls.push(ApiEndpointDetails {
-            view_module: false,
-            owner: None,
-            key: OperationKey::http("GET", "${process.env.OTHER_VAR}/comments"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from("test.ts"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
-        });
+        // 1. Valid internal call (should match if endpoint exists, or report
+        // missing): its base was declared, so the key is the bare path.
+        // 2. Unclassified env var (not in internal/external list).
+        // 3. Process.env pattern (detected as an env var by its stated base).
+        for (key, written, env_var) in [
+            ("/users", "${process.env.API_URL}", "API_URL"),
+            ("${UNKNOWN_VAR}/posts", "${UNKNOWN_VAR}", "UNKNOWN_VAR"),
+            (
+                "${process.env.OTHER_VAR}/comments",
+                "${process.env.OTHER_VAR}",
+                "OTHER_VAR",
+            ),
+        ] {
+            let (call, row) = env_base_call(key, written, env_var, "test.ts");
+            analyzer.calls.push(call);
+            mount_graph.data_calls.push(row);
+        }
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
-        // e.g. LEGACY_API_URL + "/users"
-        analyzer.calls.push(ApiEndpointDetails {
-            view_module: false,
-            owner: None,
-            key: OperationKey::http("GET", "LEGACY_API_URL + \"/users\""),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from("test.ts"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
-        });
-
-        let mount_graph = MountGraph::new(); // Empty graph
+        // e.g. LEGACY_API_URL + "/users": no base was stated for it.
+        let (call, _) = env_base_call("LEGACY_API_URL + \"/users\"", "", "", "test.ts");
+        analyzer.calls.push(call);
 
         // Run analysis
         let (findings, _verified, _cross_repo_matches) =
@@ -5715,37 +5633,18 @@ mod tests {
             ..Config::default()
         };
         let mut analyzer = Analyzer::new(config);
-        for route in [
-            "ENV_VAR:BILLING_API:/invoices",
-            "ENV_VAR:UNKNOWN_API:/posts",
+        let mut graph = MountGraph::new();
+        for (route, written, env_var) in [
+            ("${BILLING_API}/invoices", "${BILLING_API}", "BILLING_API"),
+            ("${UNKNOWN_API}/posts", "${UNKNOWN_API}", "UNKNOWN_API"),
         ] {
-            analyzer.calls.push(ApiEndpointDetails {
-                view_module: false,
-                owner: None,
-                key: OperationKey::http("GET", route),
-                params: vec![],
-                request_body: None,
-                response_body: None,
-                handler_name: None,
-                request_type: None,
-                response_type: None,
-                file_path: PathBuf::from("src/client.ts"),
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
-                resolution_source: None,
-                dispatch: None,
-                schema_binding: None,
-                undeclared_selection: None,
-                handler_span: None,
-                name_scope: None,
-                library_semantics: Vec::new(),
-                inference: None,
-            });
+            let (call, row) = env_base_call(route, written, env_var, "src/client.ts:3");
+            analyzer.calls.push(call);
+            graph.data_calls.push(row);
         }
 
         let (findings, verified, cross_repo_matches) =
-            analyzer.analyze_matches_with_mount_graph(&MountGraph::new());
+            analyzer.analyze_matches_with_mount_graph(&graph);
 
         assert!(
             !findings.iter().any(|f| matches!(
@@ -9407,7 +9306,7 @@ mod tests {
     /// KILL (#378): a consumer call whose base is an UNDECLARED template
     /// variable (`${authHost}/oauth/token`) must not silently strip the base
     /// and pair with an in-org producer that happens to serve the same
-    /// generic path. The call surfaces as an env-var advisory (declare the
+    /// generic path. The call (its base read from the AST as `AUTH_HOST`) surfaces as an env-var advisory (declare the
     /// base in carrick.json) and the producer keeps its honest orphan state.
     #[test]
     fn unknown_template_base_is_advisory_not_match() {
@@ -9415,7 +9314,7 @@ mod tests {
 
         analyzer.calls.push(http_call(
             "POST",
-            "${authHost}/oauth/token",
+            "${AUTH_HOST}/oauth/token",
             "billing-svc/src/auth.ts:21",
         ));
 
@@ -9423,12 +9322,21 @@ mod tests {
         mount_graph
             .endpoints
             .push(resolved_in("POST", "/oauth/token", "auth-shim"));
-        mount_graph.data_calls.push(data_call_in(
+        let mut stated = data_call_in(
             "POST",
-            "${authHost}/oauth/token",
+            "${AUTH_HOST}/oauth/token",
             "billing-svc/src/auth.ts:21",
             "billing-svc",
-        ));
+        );
+        stated.base = Some(crate::call_base::CallBaseResolution {
+            written: "${AUTH_HOST}".to_string(),
+            kind: crate::call_base::CallBaseKind::Env,
+            env_var: Some("AUTH_HOST".to_string()),
+            fallback: None,
+            fallback_is_loopback: false,
+            declared_optional: None,
+        });
+        mount_graph.data_calls.push(stated);
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
 
@@ -9444,7 +9352,7 @@ mod tests {
                 Finding::env_var_call(
                     "POST",
                     "/oauth/token",
-                    "authHost",
+                    "AUTH_HOST",
                     vec!["billing-svc/src/auth.ts:21".into()],
                 ),
             ],

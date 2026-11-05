@@ -125,7 +125,6 @@
 //! package the constructing expression names. Ownership is about which code
 //! the call goes through, not about which account it reaches.
 
-use crate::analyzer::Analyzer;
 use crate::config::Config;
 use crate::file_finder::find_files;
 use crate::mount_graph::DataFetchingCall;
@@ -500,13 +499,20 @@ fn classify_data_call(
             .is_external_host(host)
             .then(|| (host.clone(), CallMechanism::ExternalHttp));
     }
-    // The env-var check runs on `canonical_path` — the key the matcher itself
-    // classifies on — so this row names the variable the matcher excluded the
-    // call for, not a differently-derived one.
-    if !Analyzer::is_env_var_base_url(&call.canonical_path) {
+    // The variable the base READS, as the AST stated it (`DataCall.base`): the
+    // same fact the matcher names the call's env-var by, so this row names the
+    // variable the matcher excluded the call for. A base the canonical key
+    // stripped (declared internal) is not an env-var call here either.
+    let base = call.base.as_ref()?;
+    if base.kind != crate::call_base::CallBaseKind::Env
+        || !call
+            .canonical_path
+            .trim_start_matches(['`', '"', '\''])
+            .starts_with(&base.written)
+    {
         return None;
     }
-    let env_var = Analyzer::extract_env_var_name(&call.canonical_path);
+    let env_var = base.env_var.clone()?;
     config
         .is_external_env_var(&env_var)
         .then_some((env_var, CallMechanism::EnvVarUrl))
@@ -3848,6 +3854,18 @@ mod tests {
             }
         }
 
+        /// The base the AST states for a call that reads `env_var`.
+        fn env_base(written: &str, env_var: &str) -> crate::call_base::CallBaseResolution {
+            crate::call_base::CallBaseResolution {
+                written: written.to_string(),
+                kind: crate::call_base::CallBaseKind::Env,
+                env_var: Some(env_var.to_string()),
+                fallback: None,
+                fallback_is_loopback: false,
+                declared_optional: None,
+            }
+        }
+
         /// A consumer call as the mount-graph builder records one: the host and
         /// the typed line are the fields it now retains from normalisation and
         /// extraction.
@@ -3924,8 +3942,10 @@ mod tests {
         /// external — the pair the matcher drops on its way past the call.
         #[test]
         fn declared_external_env_var_becomes_a_row() {
+            let mut env_call = call("${process.env.BILLING_API}/invoices", None, Some(7));
+            env_call.base = Some(env_base("${process.env.BILLING_API}", "BILLING_API"));
             assert_eq!(
-                rows(&[call("${process.env.BILLING_API}/invoices", None, Some(7))]),
+                rows(&[env_call]),
                 vec![ExternalCallCandidate {
                     file: "src/client.ts".to_string(),
                     line: 7,
@@ -3938,14 +3958,25 @@ mod tests {
             );
         }
 
-        /// The canonical `ENV_VAR:NAME:/path` shape resolves to the same row as
-        /// the raw interpolation.
+        /// The variable the base reads names the row, not text cut from the
+        /// key: `${config.billing}` holds `process.env.BILLING_API`.
         #[test]
-        fn canonical_env_var_route_becomes_a_row() {
-            let rows = rows(&[call("ENV_VAR:BILLING_API:/invoices", None, Some(4))]);
+        fn the_row_names_the_variable_the_base_reads() {
+            let mut env_call = call("${config.billing}/invoices", None, Some(4));
+            env_call.base = Some(env_base("${config.billing}", "BILLING_API"));
+            let rows = rows(&[env_call]);
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].package, "BILLING_API");
             assert_eq!(rows[0].mechanism, CallMechanism::EnvVarUrl);
+        }
+
+        /// A base the canonical key no longer carries (declared internal, so the
+        /// key is the bare path) is not an env-var row.
+        #[test]
+        fn a_base_the_key_stripped_is_no_row() {
+            let mut env_call = call("/invoices", None, Some(4));
+            env_call.base = Some(env_base("${process.env.BILLING_API}", "BILLING_API"));
+            assert!(rows(&[env_call]).is_empty());
         }
 
         /// An undeclared destination is the one thing the scanner does not
