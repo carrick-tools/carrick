@@ -25,6 +25,7 @@ import { resolveChannel } from "../channel.ts";
 import { drain } from "./reuse.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
+import { markInvoker } from "./invoker.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -49,6 +50,7 @@ export function emission(context: string): string {
 }
 
 async function main(): Promise<void> {
+  markInvoker("stop");
   // `off` silences every surface this package has, and this is one of them.
   // The `lsp` channel is NOT excluded: it decides who delivers a verdict about
   // an edited file, and this says nothing about a verdict.

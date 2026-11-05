@@ -20,6 +20,7 @@ import { createLogger } from "../log.ts";
 import { renderPostRead } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { markRead, markTold, toldKey, wasRead } from "./reuse.ts";
+import { markInvoker } from "./invoker.ts";
 
 const log = createLogger("carrick-hook");
 /** The files the index has rows for. */
@@ -40,6 +41,7 @@ async function readStdin(): Promise<string> {
 }
 
 async function main(): Promise<void> {
+  markInvoker("post-read");
   // Only `hook` prints from here; `lsp` and `off` start nothing and write
   // nothing, so a file is not marked as asked about by a channel that said
   // nothing.

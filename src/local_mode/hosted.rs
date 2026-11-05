@@ -378,6 +378,7 @@ impl Reader {
             .client
             .post(&self.endpoint)
             .bearer_auth(&credential.token)
+            .header(crate::invoker::HEADER, crate::invoker::current())
             .json(&body)
             .send()
             .await
