@@ -966,6 +966,58 @@ fn a_comment_only_edit_is_answered_without_a_re_scan() {
     );
 }
 
+/// carrick#3204: a comment-only edit re-runs nothing, so its `--json` answer
+/// carries the index's own `type_check`, ran or skipped with its reason.
+#[test]
+#[serial]
+fn a_comment_only_edit_answers_with_the_indexs_type_check() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    index(root);
+    let args = ["check", route, "--workspace", ".", "--recheck", "--json"];
+
+    for skipped in [None, Some("type checker not found")] {
+        if let Some(reason) = skipped {
+            let path = root.join(".carrick/index.json");
+            let mut stored: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read the index"))
+                    .expect("the index is JSON");
+            stored["type_check"]["skipped"] = serde_json::json!(reason);
+            std::fs::write(&path, stored.to_string()).expect("write the index");
+        }
+        let indexed: serde_json::Value =
+            serde_json::from_str(&run(root, &["check", route, "--workspace", ".", "--json"]))
+                .expect("JSON");
+        edit(
+            &root.join(route),
+            "export async function",
+            "// a note\nexport async function",
+        );
+        let answered: serde_json::Value = serde_json::from_str(&run(root, &args)).expect("JSON");
+        assert_eq!(answered["recheck"]["ran"], "none", "{answered:#}");
+        assert_eq!(
+            answered["type_check"], indexed["type_check"],
+            "{answered:#}"
+        );
+        assert_eq!(
+            answered["type_check"]["ran"],
+            skipped.is_none(),
+            "{answered:#}"
+        );
+        assert_eq!(
+            answered["type_check"]["reason"],
+            skipped.map_or(serde_json::Value::Null, serde_json::Value::from),
+            "{answered:#}"
+        );
+        edit(
+            &root.join(route),
+            "// a note\nexport async function",
+            "export async function",
+        );
+    }
+}
+
 /// A token the scan reads, or a comment that carries a type, is not an edit
 /// that reads the same: both still take the re-scan.
 #[test]
@@ -2711,6 +2763,39 @@ fn a_verdict_the_upload_missed_is_named_by_the_build_and_by_status() {
         json["type_check"]["not_stored"][0]["consumer"], "basket-svc",
         "{json:#}"
     );
+}
+
+/// carrick#3204: an index built without type checking says so in the check
+/// answer, with the reason, and an index that checked says it did. Before, the
+/// reason was only in `carrick status`, so a reader of one file's answer could
+/// not tell "no pair here was compared" from "nothing was ever type-checked".
+#[test]
+#[serial]
+fn a_check_answer_states_whether_the_index_was_type_checked() {
+    let (workspace, said) = laptop_index("inventory-svc");
+    let root = workspace.path();
+    let file = "inventory-svc/src/inventory.ts";
+
+    let ran = check_json(root, file);
+    assert_eq!(ran["type_check"]["ran"], true, "{ran:#}\n{said}");
+    assert!(ran["type_check"]["reason"].is_null(), "{ran:#}");
+
+    // The same index, as a build on a machine with no type checker leaves it.
+    let path = root.join(".carrick/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the index"))
+            .expect("the index is JSON");
+    index["type_check"]["skipped"] = serde_json::json!("type checker not found");
+    std::fs::write(&path, index.to_string()).expect("write the index");
+
+    let skipped = check_json(root, file);
+    assert_eq!(skipped["type_check"]["ran"], false, "{skipped:#}");
+    assert_eq!(
+        skipped["type_check"]["reason"], "type checker not found",
+        "{skipped:#}"
+    );
+    assert!(skipped["type_check"]["pairs"].is_number(), "{skipped:#}");
+    assert!(skipped["type_check"]["judged"].is_number(), "{skipped:#}");
 }
 
 /// `carrick check --changed`, with its exit code and its stdout. The budget is

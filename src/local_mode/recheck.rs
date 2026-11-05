@@ -100,6 +100,8 @@ pub struct Fresh {
     /// do not (carrick#1330), in line order.
     pub new_functions: Vec<super::contract::NewFunction>,
     pub ran: Ran,
+    /// What the type check of this re-join did (carrick#3204).
+    pub type_check: super::read_model::TypeCheckSummary,
     pub elapsed: Duration,
     /// Which services were re-read and which were not.
     pub scope: RecheckScope,
@@ -896,6 +898,11 @@ fn inside(
         // Filled in by `run`, from the parse that did not wait on this.
         new_functions: Vec::new(),
         ran,
+        type_check: super::index::type_check_summary(
+            &rejoined.join,
+            &[],
+            &std::collections::BTreeMap::new(),
+        ),
         elapsed: Duration::default(),
         scope: plan.scope.clone(),
         moved: moved_rows(workspace, before, &rejoined, repo, relative, plan),

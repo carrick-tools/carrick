@@ -385,6 +385,10 @@ function judgedAnyPair(result: CheckResult): boolean {
 
 /** Why no pair was judged, in the words the index recorded, else a plain statement. */
 function notJudgedReason(result: CheckResult): string {
+  // The build's own statement first: a type check that did not run is the
+  // cause of every unjudged pair, whatever the boundary says (carrick#3204).
+  const stated = result.type_check;
+  if (stated && !stated.ran && stated.reason) return stated.reason.replace(/\.+$/, "");
   const boundary = result.boundary;
   const degraded = boundary?.types_degraded;
   if (degraded?.detail) return degraded.detail.replace(/\.+$/, "");
@@ -650,6 +654,15 @@ export function renderSessionStart(status: StatusResult): string {
     `Carrick indexed ${status.services.length} service(s)${where}${when}${version}${detailed ? "" : totals(status)}.`,
     ...scans,
   ];
+  // Said once for the whole index, ahead of the services: every verdict below
+  // is missing, and an agent that reads "no contract problem" later would
+  // otherwise take that as an answer (carrick#3204).
+  if (status.type_check && !status.type_check.ran) {
+    const reason = status.type_check.reason?.replace(/\.+$/, "") ?? "no reason recorded";
+    lines.push(
+      `Types were not checked for this index (${reason}), so no pair has a type verdict.`,
+    );
+  }
   if (detailed) {
     for (const service of status.services) lines.push(serviceLine(service));
   } else {
