@@ -127,7 +127,7 @@ test("stop says the re-check is still running when it outlives the wait, once, a
   assert.ok(first.ms < 2500, `returned inside its wait (${first.ms} ms)`);
   assert.match(
     context(first.stdout),
-    /^Carrick: the re-check of user-service\/src\/routes\/users\.ts is still running after \d+ s\. Run `carrick check --changed` before you finish\.$/,
+    /^Carrick: the re-check of user-service\/src\/routes\/users\.ts is still running after \d+ s\. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish\.$/,
   );
 
   const second = await stopWith(home, 20, { stop_hook_active: true });
@@ -211,7 +211,7 @@ test("the wait is read from the command and defaults to 3 s", () => {
 // already said what the clause "Run `carrick check --changed` before you
 // finish" asks for (carrick#3357): the agent ran it twice, 137 s then 133 s.
 
-const CLAUSE = /Run `carrick check --changed` before you finish/;
+const CLAUSE = /If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish/;
 
 /** What `carrick check --changed` leaves in the workspace when it ends. */
 function marker(root: string, startedMs: number, exit: number): void {

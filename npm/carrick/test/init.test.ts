@@ -1230,7 +1230,7 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
       ].sort(),
     );
     assert.equal(
-      fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8").includes("run `carrick check --changed`"),
+      fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8").includes("run `carrick check --changed` before you say it is done"),
       true,
     );
 

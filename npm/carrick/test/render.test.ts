@@ -46,7 +46,7 @@ function connectedRows(count: number): CheckItem[] {
 }
 
 function expectedNotRechecked(reason?: string): string {
-  return `Carrick: src/routes/users.ts was not re-checked: ${reason ?? "no re-check of it ran"}. Run \`carrick check --changed\` before you finish.`;
+  return `Carrick: src/routes/users.ts was not re-checked: ${reason ?? "no re-check of it ran"}. If this change touches a route, a call to another service, an event or a type another service reads, run \`carrick check --changed\` before you finish.`;
 }
 
 test("an edit the hook could not re-check lists none of the index's verdicts", () => {
@@ -84,7 +84,7 @@ test("an edit the scan reads the same gets no not-re-checked line", () => {
 test("a file left un-checked says why, and the pending and late lines read as pinned", () => {
   assert.equal(
     notRecheckedLine("src/a.ts", "an earlier re-check of this repo ran past its budget"),
-    "Carrick: src/a.ts was not re-checked: an earlier re-check of this repo ran past its budget. Run `carrick check --changed` before you finish.",
+    "Carrick: src/a.ts was not re-checked: an earlier re-check of this repo ran past its budget. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.",
   );
   // A reason that already names the command is not told to run it twice.
   assert.equal(
@@ -148,7 +148,7 @@ test("a re-check that judged a service reading the edit at its indexed version n
   };
   assert.equal(
     renderPostToolUse(result),
-    "Carrick re-checked src/routes/users.ts: no contract problem in what it re-read; 4 services that read this edit were judged at their indexed version (inventory, billing, ledger, and 1 more). Run `carrick check --changed` before you finish.",
+    "Carrick re-checked src/routes/users.ts: no contract problem in what it re-read; 4 services that read this edit were judged at their indexed version (inventory, billing, ledger, and 1 more). If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.",
   );
   // With nothing stale, the headline is the plain one.
   result.recheck.scope = { reread: ["catalog"], not_reread: [], stale: [] };
@@ -883,7 +883,7 @@ test("a payload without uses lines renders exactly as before", () => {
 test("the session-start check line is short and names both exit codes", () => {
   assert.equal(
     CHECK_BEFORE_DONE,
-    "Before you call a change done, run `carrick check --changed`. Exit 1 is a contract problem; exit 2 means nothing could be checked.",
+    "When your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done. Exit 1 is a contract problem; exit 2 means nothing could be checked.",
   );
 });
 
@@ -968,6 +968,6 @@ test("a check --changed that ran after the last edit drops the clause that sends
     elapsed_ms: 900,
     scope: { reread: ["catalog"], not_reread: [], stale: ["inventory"] },
   };
-  assert.match(renderPostToolUse(result) ?? "", /Run `carrick check --changed` before you finish\.$/);
+  assert.match(renderPostToolUse(result) ?? "", /If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish\.$/);
   assert.doesNotMatch(renderPostToolUse(result, undefined, { settled: true }) ?? "", /check --changed/);
 });

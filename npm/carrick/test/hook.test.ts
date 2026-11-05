@@ -246,7 +246,7 @@ test("under Codex the session line goes out as additionalContext; Claude Code ke
   const output = wire["hookSpecificOutput"] as { hookEventName: string; additionalContext: string };
   assert.equal(output.hookEventName, "SessionStart");
   // Both carry the finish-line check.
-  assert.match(plain.stdout, /\nBefore you call a change done, run `carrick check --changed`\. Exit 1 is a contract problem; exit 2 means nothing could be checked\.\n$/);
+  assert.match(plain.stdout, /\nWhen your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done\. Exit 1 is a contract problem; exit 2 means nothing could be checked\.\n$/);
   // The same text Claude Code is given, byte for byte.
   assert.equal(`${output.additionalContext}\n`, plain.stdout);
 });
@@ -606,7 +606,7 @@ test("a three-file patch is one binary call, and every file gets its answer", as
     files
       .map(
         (file) =>
-          `Carrick: ${file} was not re-checked: no re-check of it ran. Run \`carrick check --changed\` before you finish.`,
+          `Carrick: ${file} was not re-checked: no re-check of it ran. If this change touches a route, a call to another service, an event or a type another service reads, run \`carrick check --changed\` before you finish.`,
       )
       .join("\n\n"),
   );
@@ -641,7 +641,7 @@ test("a repo whose re-check is known not to fit gets a line with its reason on e
   // The index's verdicts describe the file before the edit, so none is
   // printed: one line that sends the reader to the command that answers.
   const line =
-    "Carrick: user-service/src/routes/users.ts was not re-checked: an earlier re-check of this repo ran past its budget against this index. Run `carrick check --changed` before you finish.";
+    "Carrick: user-service/src/routes/users.ts was not re-checked: an earlier re-check of this repo ran past its budget against this index. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.";
   assert.equal(first, line);
   // Every edit is answered, the second one included (B3).
   assert.equal(second, line);
@@ -1252,7 +1252,7 @@ test("on the lsp channel nothing is queued and new functions are still recorded;
   const none = await runHook("post-edit.ts", { payload: editPayload(workspace), env: deferredEnv(home) });
   assert.equal(
     contextOf(none.stdout),
-    "Carrick: user-service/src/routes/users.ts was not re-checked: this edit needs a re-scan, which this call was asked not to start. Run `carrick check --changed` before you finish.",
+    "Carrick: user-service/src/routes/users.ts was not re-checked: this edit needs a re-scan, which this call was asked not to start. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.",
   );
   assert.equal(fs.existsSync(path.join(workspace.root, ".carrick", "rechecks")), false);
 });
