@@ -124,7 +124,7 @@ test("the nudge is short, starts with Carrick, and names at most two functions",
   const one = nudge([fn("slugify")]);
   assert.equal(
     one,
-    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, passing `functions: [{ name, file }]`, one entry per new function. Where it names an existing function that does the same job, replace your new copy with it (keep yours only if it is a deliberate variant). Then tell the user in one line what Carrick found and what you changed.",
+    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, passing `functions: [{ name, file }]`, one entry per new function. Where it names an existing function that does the same job, replace your new copy with a call to it and remove your copy (keep yours only if it is a deliberate variant). Then tell the user in one line what Carrick found and what you changed.",
   );
   // The argument is named exactly: the server ignores any other name, and an
   // agent that guessed `entries` got an answer to the wrong question.

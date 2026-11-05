@@ -372,5 +372,5 @@ export function nudge(entries: NewFunction[]): string {
       : shown.length === 2
         ? `${shown[0]} and ${shown[1]}`
         : shown[0]!;
-  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing \`functions: [{ name, file }]\`, one entry per new function. Where it names an existing function that does the same job, replace your new copy with it (keep yours only if it is a deliberate variant). Then tell the user in one line what Carrick found and what you changed.`;
+  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing \`functions: [{ name, file }]\`, one entry per new function. Where it names an existing function that does the same job, replace your new copy with a call to it and remove your copy (keep yours only if it is a deliberate variant). Then tell the user in one line what Carrick found and what you changed.`;
 }
