@@ -619,6 +619,24 @@ pub(crate) fn derive_capture_anchors(
             );
             continue;
         }
+        // A symbol whose declaring file is not on disk cannot be bundled: a
+        // framework-sourced hint (`Response`) reaches here with a path that
+        // names no file, and the capture would fail the whole alias on it.
+        // Leave the alias to its own infer anchor below.
+        let declaring = Path::new(&request.source_file);
+        let declaring = if declaring.is_relative() {
+            Path::new(repo_root).join(declaring)
+        } else {
+            declaring.to_path_buf()
+        };
+        if !declaring.exists() {
+            debug!(
+                "v2 capture: alias {} has an explicit '{}' anchor in {} which does not \
+                 exist; skipping the symbol anchor",
+                alias, request.symbol_name, request.source_file
+            );
+            continue;
+        }
         if !seen.insert(alias.to_string()) {
             continue;
         }
@@ -5197,6 +5215,43 @@ mod tests {
         assert_eq!(with(Some("{ scope: any; }")).len(), 1);
     }
 
+    /// A symbol anchor whose declaring file is not on disk (a framework
+    /// hint such as `Response`) is not emitted; the alias keeps its infer
+    /// anchor.
+    #[test]
+    fn a_symbol_anchor_in_a_missing_file_is_not_emitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("types.ts"), "export interface Order {}\n").unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let explicit = |file: &str| SymbolRequest {
+            symbol_name: "Order".to_string(),
+            source_file: file.to_string(),
+            alias: Some("Endpoint_a_Response".to_string()),
+            array_depth: Some(1),
+            payload_borrow_witness: false,
+            consumer_response: false,
+        };
+        let run = |file: &str| {
+            derive_capture_anchors(
+                &[explicit(file)],
+                &[],
+                &[],
+                &[],
+                &["Endpoint_a_Response".to_string()],
+                &root,
+            )
+        };
+        let is_symbol = |anchors: &[CaptureAnchor]| {
+            anchors
+                .iter()
+                .any(|a| matches!(a, CaptureAnchor::Symbol { .. }))
+        };
+        assert!(is_symbol(&run(&format!("{root}/types.ts"))));
+        assert!(!is_symbol(&run(&format!(
+            "{root}/node_modules/express/index.d.ts"
+        ))));
+    }
+
     /// carrick#1842: a body the call site reads as raw text marks the literal
     /// anchor that publishes the inference's text, and no other anchor.
     #[test]
@@ -5751,13 +5806,25 @@ mod tests {
 
     // ---- derive_capture_anchors -------------------------------------------
 
+    /// A declaring file that exists on disk, so a symbol anchor in a test is
+    /// not dropped as unbundleable (`derive_capture_anchors`).
+    fn types_file() -> String {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("types.ts"), "export interface Order {}\n").unwrap();
+            dir
+        });
+        dir.path().join("types.ts").to_string_lossy().into_owned()
+    }
+
     /// Precedence per alias mirrors the v1 bundle: symbol wins over infer,
     /// infer wins over literal; aliases pass through byte-identical.
     #[test]
     fn derive_anchors_precedence_and_alias_passthrough() {
         let explicit = vec![SymbolRequest {
             symbol_name: "Order".to_string(),
-            source_file: "src/types.ts".to_string(),
+            source_file: types_file(),
             alias: Some("Endpoint_a_Response".to_string()),
             array_depth: Some(1),
             payload_borrow_witness: false,
@@ -5813,7 +5880,7 @@ mod tests {
             } => {
                 assert_eq!(alias, "Endpoint_a_Response");
                 assert_eq!(*array_depth, Some(1));
-                assert_eq!(source_file, "src/types.ts");
+                assert_eq!(*source_file, types_file());
             }
             other => panic!("expected symbol anchor, got {:?}", other),
         }
@@ -5878,7 +5945,7 @@ mod tests {
     fn order_explicit(alias: &str) -> SymbolRequest {
         SymbolRequest {
             symbol_name: "Order".to_string(),
-            source_file: "src/types.ts".to_string(),
+            source_file: types_file(),
             alias: Some(alias.to_string()),
             // The join found no depth to copy — the LLM anchor is bare by
             // schema contract, so this is the state every unjoined alias is in.
@@ -8181,7 +8248,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let entry = |alias: &str| ManifestEntry {
             alias: alias.to_string(),
             original_name: "Order".to_string(),
-            source_file: "src/types.ts".to_string(),
+            source_file: types_file(),
             type_string: "{ id: string; total: number; }".to_string(),
             is_explicit: true,
         };
@@ -8226,7 +8293,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let manifest_entry = |alias: &str, text: &str| ManifestEntry {
             alias: alias.to_string(),
             original_name: "T".to_string(),
-            source_file: "src/types.ts".to_string(),
+            source_file: types_file(),
             type_string: text.to_string(),
             is_explicit: true,
         };

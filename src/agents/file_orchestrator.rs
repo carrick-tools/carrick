@@ -51,8 +51,8 @@ use crate::{
     receiver_origin::{ReceiverOrigins, collect_receiver_origins},
     request_summary::{RequestSummaryIndex, SummaryRow},
     services::type_sidecar::{
-        ExtractionConfig, InferKind, InferRequestItem, SymbolFailureKind, SymbolRequest,
-        TypeResolutionResult, TypeSidecar,
+        ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
+        TypeSidecar,
     },
     swc_scanner::{
         CandidateTarget, ControllerRouteBinding, DecoratorRoute, DescriptorDataArray,
@@ -11219,12 +11219,12 @@ impl FileOrchestrator {
             return result;
         }
 
-        // A symbol the bundler read as a value is no type to alias, and
-        // `type Alias = orderService` would name it as one (blueprint row N10c).
+        // A symbol the bundler could not resolve (read as a value, or not
+        // found at all) is no type to alias, and `type Alias = orderService`
+        // would name it as one (blueprint row N10c).
         let values: HashSet<String> = result
             .symbol_failures
             .iter()
-            .filter(|failure| failure.kind == Some(SymbolFailureKind::NotAType))
             .map(|failure| failure.symbol_name.clone())
             .collect();
         let mut combined = result.dts_content.take().unwrap_or_default();
@@ -12654,7 +12654,7 @@ mod tests {
                 source_file: "src/services.ts".to_string(),
                 reason: "Symbol 'orderService' in src/services.ts is a value, not a type"
                     .to_string(),
-                kind: Some(SymbolFailureKind::NotAType),
+                kind: Some(crate::services::type_sidecar::SymbolFailureKind::NotAType),
             }],
             errors: vec![],
             anchor_changes: vec![],
@@ -12670,6 +12670,32 @@ mod tests {
         let dts = result.dts_content.unwrap_or_default();
         assert!(!dts.contains("Value_Response"), "got:\n{dts}");
         assert!(dts.contains("Type_Response"), "got:\n{dts}");
+    }
+
+    /// A symbol that failed with no kind (a bare specifier the bundler could
+    /// not find) is no type to alias either.
+    #[test]
+    fn an_inline_alias_to_any_failed_symbol_is_not_written() {
+        let result = TypeResolutionResult {
+            dts_content: None,
+            explicit_manifest: vec![],
+            inferred_types: vec![],
+            symbol_failures: vec![crate::services::type_sidecar::SymbolFailure {
+                symbol_name: "Missing".to_string(),
+                source_file: "src/services.ts".to_string(),
+                reason: "Symbol 'Missing' not found".to_string(),
+                kind: None,
+            }],
+            errors: vec![],
+            anchor_changes: vec![],
+            request_files: Default::default(),
+        };
+        let result = FileOrchestrator::append_inline_aliases(
+            result,
+            vec![("Gone_Response".to_string(), "Missing".to_string())],
+        );
+        let dts = result.dts_content.unwrap_or_default();
+        assert!(!dts.contains("Gone_Response"), "got:\n{dts}");
     }
 
     /// The warning for a file that cannot be asked says it in these words.

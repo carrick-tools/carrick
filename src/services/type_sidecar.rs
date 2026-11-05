@@ -2154,6 +2154,10 @@ pub enum SymbolFailureKind {
     /// as a type: it is not a payload type, and the inference asked for the
     /// same alias defines it (blueprint row N10c).
     NotAType,
+    /// A kind this scanner does not know: a newer sidecar must not break the
+    /// response.
+    #[serde(other)]
+    Other,
 }
 
 /// Response from the sidecar
@@ -5416,6 +5420,16 @@ fn answered_in_order(
 
 #[cfg(test)]
 mod tests {
+    /// A failure kind a newer sidecar states must not break the response.
+    #[test]
+    fn an_unknown_symbol_failure_kind_still_parses() {
+        let failure: SymbolFailure = serde_json::from_str(
+            r#"{"symbol_name":"A","source_file":"a.ts","reason":"r","kind":"brand_new"}"#,
+        )
+        .expect("parses");
+        assert_eq!(failure.kind, Some(SymbolFailureKind::Other));
+    }
+
     use super::*;
 
     /// carrick#2100: the key the sidecar sets when the unwidened reading ran
