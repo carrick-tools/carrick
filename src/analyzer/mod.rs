@@ -6,7 +6,6 @@ use swc_ecma_ast::TsTypeAnn;
 use crate::{
     app_context::AppContext,
     config::Config,
-    extractor::CoreExtractor,
     findings::{Finding, PackageVersionRef, tier},
     mount_graph::MountGraph,
     operation::{OperationKey, TypeVerdict},
@@ -14,7 +13,7 @@ use crate::{
     type_manifest::parse_file_location,
     url_normalizer::UrlNormalizer,
     utils::join_prefix_and_path,
-    visitor::{FunctionDefinition, FunctionNodeType, Json, Mount, OwnerType, TypeReference},
+    visitor::{FunctionDefinition, Json, Mount, OwnerType, TypeReference},
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::LazyLock;
@@ -33,7 +32,6 @@ static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"Array<([^>]+)>").unwrap());
 
 // Type aliases to reduce complexity
-type RouteFieldMap = HashMap<OperationKey, Json>;
 /// A verified (matched) producer endpoint for the report: display label +
 /// A verified producer endpoint: a display label + name (`(method, path)` for
 /// HTTP, `(KIND, field)` / `(direction, event)` / `("PUBSUB", topic)` for
@@ -1909,8 +1907,6 @@ pub(crate) fn repo_relative_location(location: &str) -> String {
     strip_ci_workspace_prefix(location).to_string()
 }
 
-impl CoreExtractor for Analyzer {}
-
 impl Analyzer {
     pub fn new(config: Config) -> Self {
         Analyzer {
@@ -2496,91 +2492,6 @@ impl Analyzer {
                 endpoint.response_type = Some(resp_type.clone());
             }
         }
-        self
-    }
-
-    // This function analyzes the function definitions and returns a HashMap of route fields.
-    pub fn resolve_imported_handler_route_fields(
-        &self,
-        imported_handlers: &[(String, String, String, String)],
-        function_definitions: &HashMap<String, FunctionDefinition>,
-    ) -> (RouteFieldMap, RouteFieldMap) {
-        let mut response_fields = HashMap::new();
-        let mut request_fields = HashMap::new();
-
-        for (route, method, handler_name, _) in imported_handlers {
-            if let Some(func_def) = function_definitions.get(handler_name) {
-                // Extract response fields from the handler function
-                let resp_json = match &func_def.node_type {
-                    FunctionNodeType::ArrowFunction(arrow) => self.extract_fields_from_arrow(arrow),
-                    FunctionNodeType::FunctionDeclaration(decl) => {
-                        self.extract_fields_from_function_decl(decl)
-                    }
-                    FunctionNodeType::FunctionExpression(expr) => {
-                        self.extract_fields_from_function_expr(expr)
-                    }
-                    FunctionNodeType::FromPayload(_) | FunctionNodeType::Placeholder => {
-                        // No AST in hand, so no fields to read off it
-                        Json::Null
-                    }
-                };
-
-                // Extract request body fields from the handler function
-                let req_json = match &func_def.node_type {
-                    FunctionNodeType::ArrowFunction(arrow) => {
-                        if let swc_ecma_ast::ArrowFunctionBody::FunctionBody(block) = &*arrow.body {
-                            self.extract_req_body_fields(block)
-                        } else {
-                            None
-                        }
-                    }
-                    FunctionNodeType::FunctionDeclaration(decl) => {
-                        if let Some(body) = &decl.function.body {
-                            self.extract_req_body_fields(body)
-                        } else {
-                            None
-                        }
-                    }
-                    FunctionNodeType::FunctionExpression(expr) => {
-                        if let Some(body) = &expr.function.body {
-                            self.extract_req_body_fields(body)
-                        } else {
-                            None
-                        }
-                    }
-                    FunctionNodeType::FromPayload(_) | FunctionNodeType::Placeholder => {
-                        // No AST in hand, so no request body to read off it
-                        None
-                    }
-                };
-
-                // Store with composite key
-                let key = OperationKey::http(method, route.clone());
-                response_fields.insert(key.clone(), resp_json);
-                if let Some(req) = req_json {
-                    request_fields.insert(key, req);
-                }
-            }
-        }
-
-        (response_fields, request_fields)
-    }
-
-    // We know endpoints will exist for each imported handler
-    pub fn update_endpoints_with_resolved_fields(
-        &mut self,
-        response_fields: RouteFieldMap,
-        request_fields: RouteFieldMap,
-    ) -> &mut Self {
-        for endpoint in &mut self.endpoints {
-            if let Some(response) = response_fields.get(&endpoint.key) {
-                endpoint.response_body = Some(response.clone());
-            }
-            if let Some(request) = request_fields.get(&endpoint.key) {
-                endpoint.request_body = Some(request.clone());
-            }
-        }
-
         self
     }
 

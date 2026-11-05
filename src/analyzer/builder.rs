@@ -86,15 +86,6 @@ impl AnalyzerBuilder {
         // Build the router
         analyzer.build_endpoint_router();
 
-        // Resolve imported handler route fields
-        let (response_fields, request_fields) = analyzer.resolve_imported_handler_route_fields(
-            &analyzer.imported_handlers.clone(),
-            &analyzer.function_definitions.clone(),
-        );
-
-        // Update endpoints and resolve types (skip type resolution in cross-repo mode)
-        analyzer.update_endpoints_with_resolved_fields(response_fields, request_fields);
-
         if !self.skip_type_resolution {
             analyzer.resolve_types_for_endpoints(self.cm.clone());
         }
