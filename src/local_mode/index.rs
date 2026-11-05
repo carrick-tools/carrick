@@ -2843,6 +2843,27 @@ mod tests {
         assert_eq!(join.get(off), Some(&Some("1".into())));
     }
 
+    /// A tree with no `carrick.json` takes its services from the hosted
+    /// configs its previous generation carries. The join starts the scanner on
+    /// the first repo too, so it must read the same previous generation that
+    /// repo's scan read: without it the join derives the services from the
+    /// manifests, which can fail (a workspace pattern matching nothing) and
+    /// end the whole check (carrick#3366).
+    #[test]
+    fn the_join_reads_the_services_its_anchor_repo_was_scanned_with() {
+        let previous = Path::new("/build/previous.json");
+        let scan = scan_env(&Pass::Facts);
+        let join = env_of(&join_command(
+            Path::new("/bin/carrick"),
+            Path::new("/repos/api"),
+            Path::new("/build/repos"),
+            Path::new("/build/join.json"),
+        ));
+        let key = super::super::hosted::PREVIOUS_ENV;
+        assert_eq!(scan.get(key), Some(&Some(previous.display().to_string())));
+        assert_eq!(join.get(key), scan.get(key));
+    }
+
     /// One email per `carrick index` run (cloud#1363): the inferred pass tells
     /// every repo's scan how many repos the run covers, and every other pass
     /// removes the count, so an inherited one cannot hold a mail for repos
