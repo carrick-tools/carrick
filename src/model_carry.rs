@@ -93,8 +93,6 @@ pub fn carry_edited_files(
     files: impl Iterator<Item = (String, String)>,
     previous: &HashMap<String, FileAnalysisResult>,
     unchanged: &HashSet<String>,
-    data_fetchers: &[String],
-    messaging_clients: &[String],
 ) -> Carried {
     let mut out = Carried::default();
     for (key, relative) in files {
@@ -113,15 +111,7 @@ pub fn carry_edited_files(
         let hunks = changed_hunks(repo_path, prev_commit, &relative, None);
         let new_text = std::fs::read_to_string(&key).ok();
         let carry = match (old_text, hunks, new_text) {
-            (Some(old), Ok(hunks), Some(new)) => carry_file(
-                &relative,
-                &old,
-                &new,
-                &hunks,
-                answer,
-                data_fetchers,
-                messaging_clients,
-            ),
+            (Some(old), Ok(hunks), Some(new)) => carry_file(&relative, &old, &new, &hunks, answer),
             _ => unavailable(&relative, answer),
         };
         out.examined += carry.examined;
@@ -209,13 +199,14 @@ pub fn carry_file(
     new_text: &str,
     hunks: &[Hunk],
     answer: &FileAnalysisResult,
-    data_fetchers: &[String],
-    messaging_clients: &[String],
 ) -> FileCarry {
+    // Every call in each text, not the calls the detection lists let the
+    // scanner raise: a row stands on the call it names, whichever signal the
+    // model's answer came from (N24).
     let scanner = SwcScanner::new();
     let path = Path::new(relative);
-    let old_scan = scanner.scan_content(path, old_text, data_fetchers, messaging_clients);
-    let new_scan = scanner.scan_content(path, new_text, data_fetchers, messaging_clients);
+    let old_scan = scanner.scan_every_call(path, old_text);
+    let new_scan = scanner.scan_every_call(path, new_text);
     let new_lines: Vec<&str> = new_text.lines().collect();
     let ctx = Context {
         hunks,
@@ -562,7 +553,7 @@ function listItems() {
     }
 
     fn run(new: &str, hunks: &[Hunk]) -> FileCarry {
-        carry_file("routes.ts", OLD, new, hunks, &answer(), &[], &[])
+        carry_file("routes.ts", OLD, new, hunks, &answer())
     }
 
     fn insert_two_lines_above() -> (String, Vec<Hunk>) {
@@ -764,7 +755,7 @@ function listItems() {
             "primary_type_symbol": null, "type_import_source": null,
         }]))
         .expect("graphql row parses");
-        let carry = carry_file("routes.ts", OLD, OLD, &[], &answer, &[], &[]);
+        let carry = carry_file("routes.ts", OLD, OLD, &[], &answer);
         assert_eq!(carry.examined, 5);
         assert_eq!(carry.carried, 4);
         assert_eq!(
@@ -784,5 +775,61 @@ function listItems() {
                 .iter()
                 .all(|r| r.ends_with(OLD_SOURCE_UNAVAILABLE))
         );
+    }
+
+    const SUBSCRIBE: &str = "\
+import { Kafka } from 'kafkajs';
+const kafka = new Kafka({ brokers: [] });
+const consumer = kafka.consumer({ groupId: 'g' });
+export async function run() {
+  await consumer.subscribe({ topic: 'order.placed' });
+}
+";
+
+    /// A model row on an import-gated messaging subscribe is carried with no
+    /// detection list: the carry places the row by the calls in the file, not
+    /// by re-running the scanner behind the lists (N24).
+    #[test]
+    fn a_messaging_subscribe_row_is_carried_without_detection_lists() {
+        let id = SwcScanner::new()
+            .scan_content(
+                Path::new("consumer.ts"),
+                SUBSCRIBE,
+                &[],
+                &["kafkajs".to_string()],
+            )
+            .candidates
+            .iter()
+            .find(|c| c.callee_property.as_deref() == Some("subscribe"))
+            .expect("the gated scan raises the subscribe")
+            .candidate_id
+            .clone();
+        let answer: FileAnalysisResult = serde_json::from_value(json!({
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": [{
+                "candidate_id": id,
+                "line_number": 5,
+                "target": "order.placed",
+                "method": null,
+                "pattern_matched": ".subscribe(",
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null,
+            }],
+        }))
+        .expect("answer parses");
+        let new = format!("// one\n{SUBSCRIBE}");
+        let hunks = vec![Hunk {
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+        }];
+        let carry = carry_file("consumer.ts", SUBSCRIBE, &new, &hunks, &answer);
+        assert_eq!(carry.not_carried, Vec::<String>::new());
+        assert_eq!(carry.carried, 1);
+        assert_eq!(carry.answer.data_calls[0].line_number, 6);
     }
 }
