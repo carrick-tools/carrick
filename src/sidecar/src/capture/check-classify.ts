@@ -584,7 +584,15 @@ function factness(input: ClassifyInput, strict = false): {
     // Open members only (carrick#2591): the closed members were judged and an
     // open one is never a mismatch, so the verdict is a fact about the type.
     // A declared `unknown` is open on the receiving side alone.
-    if (!strict && onlyDeclaredOpenMembers(findings[side], side === 'expected')) continue;
+    if (
+      !strict &&
+      onlyDeclaredOpenMembers(
+        findings[side],
+        side === 'expected',
+        findings[side === 'sent' ? 'expected' : 'sent']
+      )
+    )
+      continue;
     const first = findings[side][0];
     if (!first) continue;
     const label = side === 'sent' ? input.plan.direction.sent : input.plan.direction.expected;

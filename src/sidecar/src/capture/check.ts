@@ -847,9 +847,13 @@ function deepDecayOf(
     const findings = record?.any_provenance ?? [];
     // An `any` the source declares under a named member is an open member
     // (carrick#2591), and so is an `unknown` on the side that receives the
-    // payload: the pair is probed, and the compiler judges the closed members.
+    // payload, or one the receiving side also declares at the same path: the pair is probed, and the compiler judges the closed members.
     // Anything else on the record keeps the pair out of the probe.
-    if (onlyDeclaredOpenMembers(findings, side === plan.direction.expected)) continue;
+    const other = side === 'producer' ? 'consumer' : 'producer';
+    const otherEndpoint = plan.spec[other];
+    const counterpart =
+      aliasRecords.get(otherEndpoint.service_name)?.get(otherEndpoint.alias)?.any_provenance ?? [];
+    if (onlyDeclaredOpenMembers(findings, side === plan.direction.expected, counterpart)) continue;
     const finding = findings[0];
     if (finding) {
       return { side, kind: finding.kind, path: finding.path };

@@ -197,3 +197,122 @@ describe('what stays gated on the receiving side', () => {
     assert.strictEqual(sent.resolved, false);
   });
 });
+
+describe('a sending-side unknown is open where the receiver declares a top type at the same path', () => {
+  const declared = (path: string, kind: 'any' | 'unknown' = 'unknown'): TypeProvenance => ({
+    path,
+    kind,
+    reason: 'declared',
+  });
+
+  it('matches by identical path, including index elements and nested members', () => {
+    for (const p of ['audit', 'audit[index]', 'order.meta[index]', 'rows<0>.extra']) {
+      assert.strictEqual(onlyDeclaredOpenMembers([declared(p)], false, [declared(p)]), true, p);
+      assert.strictEqual(onlyDeclaredOpenMembers([declared(p)], false, [declared(p, 'any')]), true, p);
+    }
+  });
+
+  it('stays gated against a concrete receiver, another path, or an unvouching list', () => {
+    const sent = [declared('audit[index]')];
+    assert.strictEqual(onlyDeclaredOpenMembers(sent, false, []), false);
+    assert.strictEqual(onlyDeclaredOpenMembers(sent, false), false);
+    assert.strictEqual(onlyDeclaredOpenMembers(sent, false, [declared('audit')]), false);
+    assert.strictEqual(onlyDeclaredOpenMembers(sent, false, [declared('other[index]')]), false);
+    // The receiver's own root top type or non-declared reason is no match.
+    assert.strictEqual(
+      onlyDeclaredOpenMembers(sent, false, [
+        { path: 'audit[index]', kind: 'unknown', reason: 'unresolved_import' },
+      ]),
+      false
+    );
+    // A receiver list at the walk's cap may have stopped listing.
+    const capped = Array.from({ length: MAX_DEEP_FINDINGS }, (_, i) => declared(`m${i}`));
+    capped[0] = declared('audit[index]');
+    assert.strictEqual(onlyDeclaredOpenMembers(sent, false, capped), false);
+    // One matched member does not vouch for an unmatched one beside it.
+    assert.strictEqual(
+      onlyDeclaredOpenMembers([declared('audit'), declared('x')], false, [declared('audit')]),
+      false
+    );
+  });
+
+  it('the classifier calls the pair a fact only when both sides declare it', () => {
+    const spec: CheckPairSpec = {
+      pair_key: 'k',
+      protocol: 'http',
+      type_kind: 'response',
+      producer: { service_name: 'a', alias: 'A' },
+      consumer: { service_name: 'b', alias: 'B' },
+    };
+    const plan = buildProbe(spec, (s: string) => `@carrick/${s}`);
+    const input = {
+      plan,
+      probeDiags: [],
+      poisonReason: () => undefined,
+      scrubCtx: { workspaceRoot: '/tmp/ws', packageLabelOf: () => undefined },
+    };
+    const both = classifyPair({
+      ...input,
+      deepFindings: { sent: [declared('audit[index]')], expected: [declared('audit[index]')] },
+    });
+    assert.strictEqual(both.resolved, true);
+    const concrete = classifyPair({
+      ...input,
+      deepFindings: { sent: [declared('audit[index]')], expected: [] },
+    });
+    assert.strictEqual(concrete.resolved, false);
+  });
+});
+
+describe('check phase: sender and receiver both declare unknown at the same path', () => {
+  let root: string;
+  let producerStub: string;
+  let consumerStub: string;
+
+  before(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-open-sent-unknown-'));
+    producerStub = captureLiterals(root, 'shop-api', {
+      P_Both: '{ order: { id: string; legacyCode: string }; audit: { [k: string]: unknown } }',
+      P_BothRenamed: '{ order: { id: string; code: string }; audit: { [k: string]: unknown } }',
+      P_Concrete: '{ order: { id: string; legacyCode: string }; audit: { [k: string]: unknown } }',
+    }).stub_dir;
+    consumerStub = captureLiterals(root, 'shop-client', {
+      C_Both: '{ order: { id: string; legacyCode: string }; audit?: { [k: string]: unknown } }',
+      C_Concrete: '{ order: { id: string; legacyCode: string }; audit: { by: string } }',
+    }).stub_dir;
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('judges the pair, and still fails a renamed closed member', async () => {
+    const mk = (key: string, p: string, c: string): CheckPairSpec => ({
+      pair_key: key,
+      protocol: 'http',
+      type_kind: 'response',
+      producer: { service_name: 'shop-api', alias: p },
+      consumer: { service_name: 'shop-client', alias: c },
+    });
+    const result = await runCheck({
+      stubs: [
+        { service_name: 'shop-api', stub_dir: producerStub },
+        { service_name: 'shop-client', stub_dir: consumerStub },
+      ],
+      pairs: [
+        mk('both', 'P_Both', 'C_Both'),
+        mk('renamed', 'P_BothRenamed', 'C_Both'),
+        mk('concrete', 'P_Concrete', 'C_Concrete'),
+      ],
+    });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    const byKey = new Map(result.verdicts.map((v) => [v.pair_key, v]));
+    const both = byKey.get('both')!;
+    assert.strictEqual(both.bucket, 'compatible', JSON.stringify(both));
+    assert.strictEqual(both.resolved, true, JSON.stringify(both));
+    assert.strictEqual(byKey.get('renamed')!.bucket, 'incompatible');
+    const concrete = byKey.get('concrete')!;
+    assert.strictEqual(concrete.bucket, 'unverifiable', JSON.stringify(concrete));
+    assert.strictEqual(concrete.gate, 'capture:producer:unknown');
+  });
+});
