@@ -260,7 +260,8 @@ fn same_operation(a: &DataCallResult, b: &DataCallResult, normalizer: &UrlNormal
         )
     };
     method(a) == method(b)
-        && normalizer.consumer_call_path(&a.target) == normalizer.consumer_call_path(&b.target)
+        && normalizer.consumer_call_path(&a.target, a.base.as_ref())
+            == normalizer.consumer_call_path(&b.target, b.base.as_ref())
 }
 
 /// Whether the row is the model's own statement. A deterministic pass read its

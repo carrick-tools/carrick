@@ -1354,7 +1354,7 @@ mod tests {
         // No env vars declared: the injected base cannot be classified through
         // `internalEnvVars`, which is exactly the point.
         let normalizer = UrlNormalizer::new(&Config::default());
-        let canonical = normalizer.consumer_call_path("${this.someBase}/api/v1/widgets/${id}");
+        let canonical = normalizer.consumer_call_path_read("${this.someBase}/api/v1/widgets/${id}");
         assert_eq!(canonical, "/api/v1/widgets/:id");
         assert!(UrlNormalizer::canonical_path_has_literal_segment(
             &canonical

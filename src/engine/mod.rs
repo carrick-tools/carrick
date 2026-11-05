@@ -9380,7 +9380,7 @@ fn add_graphql_request_entry(
 
 /// Key every HTTP request a site row states as every consumer row is keyed:
 /// on its canonical call path ([`UrlNormalizer::consumer_call_path`]), never
-/// the target as written.
+/// the target as written, with the base the row states.
 fn key_site_requests_canonically(
     rows: &mut crate::site_rows::SiteRows,
     normalizer: &UrlNormalizer,
@@ -9389,7 +9389,7 @@ fn key_site_requests_canonically(
         if row.side == crate::site_rows::RowSide::Call
             && let OperationKey::Http { path, .. } = &mut row.key
         {
-            *path = normalizer.consumer_call_path(path);
+            *path = normalizer.consumer_call_path(path, row.base.as_ref());
         }
     }
 }
@@ -17362,7 +17362,7 @@ unfollowed_member_calls_total: 0,
             let target = target.to_string();
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
-                canonical_path: normalizer.consumer_call_path(&target),
+                canonical_path: normalizer.consumer_call_path_read(&target),
                 target_url: target,
                 client: "fetch".to_string(),
                 file_location: file.to_string(),
@@ -26588,6 +26588,64 @@ unfollowed_member_calls_total: 0,
                 "http|GET|https://api.internal.test/v1/orders".to_string(),
             ]
         );
+    }
+
+    /// carrick#3387: a site row and a consumer row that state the same base
+    /// are keyed the same way, by the base each states and not by how the
+    /// target spells it. An injected base spelled like an environment variable
+    /// (`${BASE_URL}`, a parameter) is stripped on both; an environment read
+    /// spelled like a property (`${env.API_URL}`) is kept on both.
+    #[test]
+    fn a_site_row_and_a_consumer_row_key_one_base_alike() {
+        use crate::call_base::{CallBaseKind, stated_base};
+        use crate::request_summary::Root;
+        use crate::site_rows::RowSide;
+        let normalizer = UrlNormalizer::new(&Config::default());
+        let injected = Root::Param(0, "BASE_URL".to_string());
+        let env = Root::Env {
+            written: "env.API_URL".to_string(),
+            name: "API_URL".to_string(),
+            fallback: None,
+        };
+        let no_fallbacks = Default::default();
+        let no_schema = Default::default();
+        for (target, end, kind, key) in [
+            (
+                "${BASE_URL}/v1/orders",
+                &injected,
+                CallBaseKind::Injected,
+                "/v1/orders",
+            ),
+            (
+                "${env.API_URL}/v1/orders",
+                &env,
+                CallBaseKind::Env,
+                "${env.API_URL}/v1/orders",
+            ),
+        ] {
+            let base = stated_base(target, Some(end), &no_fallbacks, &no_schema);
+            assert_eq!(base.as_ref().map(|base| base.kind), Some(kind));
+            let mut site = site_row(
+                "src/client.ts",
+                OperationKey::http("GET", target),
+                RowSide::Call,
+                true,
+            );
+            site.base = base.clone();
+            let mut rows = crate::site_rows::SiteRows {
+                enabled: true,
+                rows: vec![site],
+                ..crate::site_rows::SiteRows::default()
+            };
+            key_site_requests_canonically(&mut rows, &normalizer);
+            let consumer = normalizer.consumer_call_path(target, base.as_ref());
+            assert_eq!(consumer, key);
+            assert_eq!(
+                rows.rows[0].key,
+                OperationKey::http("GET", &consumer),
+                "{target}: the site row is keyed as the consumer row is"
+            );
+        }
     }
 
     /// carrick#2439 / carrick#2472 C3: a reader row the fold replaced leaves

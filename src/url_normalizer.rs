@@ -42,6 +42,7 @@
 //! [`UrlNormalizer::consumer_call_path`] is where that rule lives, with the
 //! shapes that keep their strip for want of a host to read.
 
+use crate::call_base::{CallBaseKind, CallBaseResolution};
 use crate::config::Config;
 use crate::env_alias::is_loopback_origin;
 use std::collections::BTreeSet;
@@ -606,22 +607,26 @@ impl UrlNormalizer {
     /// config-suggestion still see the raw var. A DECLARED-external base
     /// (`externalEnvVars`) is kept verbatim whatever its shape.
     ///
-    /// A leading interpolation that is NOT env-var-shaped is a different animal
-    /// (#467): a base held on a class property or a local binding
-    /// (`${this.apiUrl}/api/v1/widgets`, `${opts.baseUrl}/catalog`) is
-    /// dependency-injected, not read from the environment, so there is no env
-    /// var for the user to declare and no `internalEnvVars` entry that could
-    /// ever rescue the key — the "declare it to classify it" escape hatch the
-    /// verbatim rule assumes simply does not exist. That is the ordinary shape
-    /// of an internal client in a TS monorepo, so the base is stripped and the
-    /// bare route becomes the key. The residual collision risk is bounded by
-    /// shape: third-party bases are overwhelmingly `SCREAMING_SNAKE` or
-    /// `process.env.*`, both of which still stay verbatim, and the #307
-    /// literal-segment gate still drops keys with nothing to match on.
+    /// A base the call states is INJECTED (`base.kind` is
+    /// [`CallBaseKind::Injected`], #467) is a different animal: a base held on
+    /// a class property or a local binding (`${this.apiUrl}/api/v1/widgets`,
+    /// `${opts.baseUrl}/catalog`) is dependency-injected, not read from the
+    /// environment, so there is no env var for the user to declare and no
+    /// `internalEnvVars` entry that could ever rescue the key. That is the
+    /// ordinary shape of an internal client in a TS monorepo, so the base is
+    /// stripped and the bare route becomes the key. The residual collision
+    /// risk is bounded by the base being read from where its value ends, not
+    /// from how it is spelled (carrick#3387), and the #307 literal-segment
+    /// gate still drops keys with nothing to match on. A row that states no
+    /// base keeps its target verbatim: nothing says the base is injected.
+    ///
+    /// `base` is the base the ROW states ([`crate::call_base`]): a consumer
+    /// row's `DataCall.base`, a site row's `SiteRow.base`. Both key an
+    /// injected base the same way.
     ///
     /// The raw target is always retained separately on the call (`target_url`)
     /// for per-call classification/display; only the MATCH key is canonicalized.
-    pub fn consumer_call_path(&self, url: &str) -> String {
+    pub fn consumer_call_path(&self, url: &str, base: Option<&CallBaseResolution>) -> String {
         let trimmed = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
         let is_relative_path = trimmed.starts_with('/') && !trimmed.starts_with("//");
         let has_scheme = trimmed.starts_with("http://") || trimmed.starts_with("https://");
@@ -673,47 +678,38 @@ impl UrlNormalizer {
         // A base the user DECLARED external stays verbatim whatever its shape —
         // `externalEnvVars` is tested against the raw interpolation text, so it
         // can name a property base just as well as an env var.
-        if !normalized.is_external && Self::has_injected_base(trimmed) {
+        if !normalized.is_external
+            && base.is_some_and(|base| base.kind == CallBaseKind::Injected)
+            && Self::has_route_after_base(trimmed)
+        {
             return normalized.path;
         }
         url.to_string()
     }
 
-    /// Whether `url` is `${<base>}/<route…>` where `<base>` is NOT env-var-shaped
-    /// — i.e. a dependency-injected base (class property, local binding) rather
-    /// than an environment variable the user could classify in carrick.json.
-    ///
-    /// Env-var shape is defined POSITIVELY, so no property name is special-cased:
-    /// a `process.env.` / `import.meta.env.` read, or a bare `SCREAMING_SNAKE`
-    /// identifier. Everything else — `this.apiUrl`, `opts.baseUrl`, `clientBase`
-    /// — is an injected base. A route remainder (a leading `/` after the closing
-    /// brace) is required, which is the same structural test #378 applies: a
-    /// whole-URL opaque variable (`${url}`, `${base}${path}`) has no path to key
-    /// on and stays raw.
-    fn has_injected_base(url: &str) -> bool {
-        let Some(inner_start) = url.strip_prefix("${") else {
-            return false;
-        };
-        let Some(end) = inner_start.find('}') else {
-            return false;
-        };
-        // `${ PAYMENTS_URL }` is valid JS: trim before the shape test so a
-        // spaced env-var base is not misread as injected.
-        let base = inner_start[..end].trim();
-        if !inner_start[end + 1..].starts_with('/') {
-            return false;
-        }
-        // A `process.env.X` anywhere else in the target routes `normalize`
-        // through `normalize_process_env_pattern` rather than the template
-        // branch, so its `path` is not this base's remainder. Leave those raw.
-        if url.contains("process.env.") || url.contains("import.meta.env.") {
-            return false;
-        }
-        let is_screaming_snake = !base.is_empty()
-            && base
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
-        !is_screaming_snake
+    /// [`Self::consumer_call_path`] for a test that states only a target: the
+    /// base is read off the target's text, as a call site that wrote it would
+    /// state it, with no environment bindings in scope.
+    #[cfg(test)]
+    pub(crate) fn consumer_call_path_read(&self, url: &str) -> String {
+        let base = crate::call_base::resolve_call_base(
+            url,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        self.consumer_call_path(url, base.as_ref())
+    }
+
+    /// Whether `url` opens with an interpolated base and then a route
+    /// (`${<base>}/<route…>`). A route remainder (a leading `/` after the
+    /// closing brace) is required, which is the same structural test #378
+    /// applies: a whole-URL opaque variable (`${url}`, `${base}${path}`) has
+    /// no path to key on and stays raw.
+    fn has_route_after_base(url: &str) -> bool {
+        url.strip_prefix("${")
+            .and_then(|rest| rest.find('}').map(|end| &rest[end + 1..]))
+            .is_some_and(|remainder| remainder.starts_with('/'))
     }
 
     /// Whether a canonical consumer path carries at least one LITERAL segment —
@@ -806,7 +802,7 @@ mod tests {
             normalizer.keep_declared_alias_names(&mut aliases);
             let target = crate::env_alias::resolve_target_env_alias(target, &aliases)
                 .unwrap_or_else(|| target.to_string());
-            normalizer.consumer_call_path(&target)
+            normalizer.consumer_call_path_read(&target)
         };
         let target = "${env.API_URL}/v1/register/search";
         // The written name is declared, the linked variable is not.
@@ -1175,20 +1171,23 @@ mod tests {
 
         // Declared-internal env-var base: host stripped to the bare path.
         assert_eq!(
-            normalizer.consumer_call_path("${process.env.API_URL}/users"),
+            normalizer.consumer_call_path_read("${process.env.API_URL}/users"),
             "/users"
         );
-        assert_eq!(normalizer.consumer_call_path("${API_URL}/users"), "/users");
+        assert_eq!(
+            normalizer.consumer_call_path_read("${API_URL}/users"),
+            "/users"
+        );
 
         // Plain relative path: kept as its clean path.
-        assert_eq!(normalizer.consumer_call_path("/track"), "/track");
+        assert_eq!(normalizer.consumer_call_path_read("/track"), "/track");
 
         // Unknown/external env-var base (STRIPE_URL is not in internalEnvVars):
         // VERBATIM, so a third-party call can't collide with an internal
         // producer's path and the "unclassified env var" config-suggestion still
         // sees the raw var. There is no concrete origin to strip here.
         assert_eq!(
-            normalizer.consumer_call_path("${process.env.STRIPE_URL}/charges"),
+            normalizer.consumer_call_path_read("${process.env.STRIPE_URL}/charges"),
             "${process.env.STRIPE_URL}/charges"
         );
 
@@ -1198,25 +1197,26 @@ mod tests {
         // surface canonicalize to its bare path and match its own endpoint. The
         // raw target is retained separately on the call (`target_url`).
         assert_eq!(
-            normalizer.consumer_call_path("http://localhost:4002/api/orders?user=${userId}"),
+            normalizer.consumer_call_path_read("http://localhost:4002/api/orders?user=${userId}"),
             "/api/orders"
         );
         // A loopback origin with `${...}` PATH segments → bare param path.
         assert_eq!(
-            normalizer.consumer_call_path("http://localhost:4002/warehouses/${wid}/stock/${sku}"),
+            normalizer
+                .consumer_call_path_read("http://localhost:4002/warehouses/${wid}/stock/${sku}"),
             "/warehouses/:wid/stock/:sku"
         );
         // Any other literal host is kept whole, declared or not
         // (carrick-cloud#656): see
         // `consumer_call_path_keeps_an_undeclared_absolute_host_verbatim`.
         assert_eq!(
-            normalizer.consumer_call_path("https://orders.internal/api/orders?user=${userId}"),
+            normalizer.consumer_call_path_read("https://orders.internal/api/orders?user=${userId}"),
             "https://orders.internal/api/orders?user=${userId}"
         );
 
         // A declared-internal base with a param interpolation collapses to a clean
         // `:`-param segment and never leaks the raw `process.env` var.
-        let param = normalizer.consumer_call_path("${process.env.API_URL}/users/${id}");
+        let param = normalizer.consumer_call_path_read("${process.env.API_URL}/users/${id}");
         assert!(
             param.starts_with("/users/:"),
             "expected clean param path, got {param}"
@@ -1251,16 +1251,16 @@ mod tests {
         let normalizer = UrlNormalizer::new(&config);
 
         assert_eq!(
-            normalizer.consumer_call_path("https://api.github.com/user"),
+            normalizer.consumer_call_path_read("https://api.github.com/user"),
             "https://api.github.com/user"
         );
         assert_eq!(
-            normalizer.consumer_call_path("https://github.com/login/oauth/access_token"),
+            normalizer.consumer_call_path_read("https://github.com/login/oauth/access_token"),
             "https://github.com/login/oauth/access_token"
         );
         // A declared-external host with `${...}` PATH segments stays whole too.
         assert_eq!(
-            normalizer.consumer_call_path(
+            normalizer.consumer_call_path_read(
                 "https://api.github.com/user/installations/${installationId}/repositories"
             ),
             "https://api.github.com/user/installations/${installationId}/repositories"
@@ -1270,7 +1270,7 @@ mod tests {
         // reaches here already resolved to its literal URL, so it is the same
         // case — no separate const resolution runs in this crate.
         assert_eq!(
-            normalizer.consumer_call_path("https://api.resend.com/emails"),
+            normalizer.consumer_call_path_read("https://api.resend.com/emails"),
             "https://api.resend.com/emails"
         );
 
@@ -1278,11 +1278,11 @@ mod tests {
         // and `is_valid_route_shape` both gate on a bare `http(s)://` prefix, so
         // a retained wrapper quote would silently drop the call as noise.
         assert_eq!(
-            normalizer.consumer_call_path("\"https://api.github.com/user\""),
+            normalizer.consumer_call_path_read("\"https://api.github.com/user\""),
             "https://api.github.com/user"
         );
         assert_eq!(
-            normalizer.consumer_call_path("`https://api.github.com/user`"),
+            normalizer.consumer_call_path_read("`https://api.github.com/user`"),
             "https://api.github.com/user"
         );
 
@@ -1292,7 +1292,7 @@ mod tests {
         // is part of the verbatim target, so it is retained rather than
         // trimmed to a bare path.
         assert_eq!(
-            normalizer.consumer_call_path("https://api.github.com/user/emails?per_page=100"),
+            normalizer.consumer_call_path_read("https://api.github.com/user/emails?per_page=100"),
             "https://api.github.com/user/emails?per_page=100"
         );
 
@@ -1300,14 +1300,14 @@ mod tests {
         // key would fail the `http(s)://` test every reader applies, so it
         // keeps its existing strip rather than gaining an unrecognised shape.
         assert_eq!(
-            normalizer.consumer_call_path("//api.github.com/user"),
+            normalizer.consumer_call_path_read("//api.github.com/user"),
             "/user"
         );
 
         // A loopback origin is still stripped, which is what lets a self-call
         // match.
         assert_eq!(
-            normalizer.consumer_call_path("http://localhost:4002/warehouses/${wid}"),
+            normalizer.consumer_call_path_read("http://localhost:4002/warehouses/${wid}"),
             "/warehouses/:wid"
         );
     }
@@ -1331,7 +1331,7 @@ mod tests {
         let normalizer = UrlNormalizer::default_permissive();
 
         assert_eq!(
-            normalizer.consumer_call_path("https://api.resend.com/emails"),
+            normalizer.consumer_call_path_read("https://api.resend.com/emails"),
             "https://api.resend.com/emails"
         );
         // A host that IS internal but undeclared is kept too. It reads as
@@ -1339,7 +1339,7 @@ mod tests {
         // bare path that could collide with any producer. `internalDomains` is
         // the declaration that says otherwise, and it still wins.
         assert_eq!(
-            normalizer.consumer_call_path("https://orders.internal/api/orders"),
+            normalizer.consumer_call_path_read("https://orders.internal/api/orders"),
             "https://orders.internal/api/orders"
         );
         let declared_internal = UrlNormalizer::new(&Config {
@@ -1347,7 +1347,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            declared_internal.consumer_call_path("https://orders.internal/api/orders"),
+            declared_internal.consumer_call_path_read("https://orders.internal/api/orders"),
             "/api/orders"
         );
 
@@ -1360,7 +1360,7 @@ mod tests {
             "http://[::1]:3000/api/orders",
         ] {
             assert_eq!(
-                normalizer.consumer_call_path(loopback),
+                normalizer.consumer_call_path_read(loopback),
                 "/api/orders",
                 "loopback origin {loopback}"
             );
@@ -1369,7 +1369,7 @@ mod tests {
         // An origin whose HOST is interpolated names no host, so there is
         // nothing to classify by and the existing strip stands.
         assert_eq!(
-            normalizer.consumer_call_path("https://${apiHost}/api/orders"),
+            normalizer.consumer_call_path_read("https://${apiHost}/api/orders"),
             "/api/orders"
         );
     }
@@ -1384,7 +1384,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            UrlNormalizer::new(&config).consumer_call_path("https://api.company.com/users"),
+            UrlNormalizer::new(&config).consumer_call_path_read("https://api.company.com/users"),
             "/users"
         );
     }
@@ -1399,21 +1399,21 @@ mod tests {
         let normalizer = UrlNormalizer::new(&config);
 
         assert_eq!(
-            normalizer.consumer_call_path("${this.someBase}/api/v1/widgets/${id}"),
+            normalizer.consumer_call_path_read("${this.someBase}/api/v1/widgets/${id}"),
             "/api/v1/widgets/:id"
         );
         assert_eq!(
-            normalizer.consumer_call_path("${this.apiUrl}/engine/v1/worker-actions/heartbeat"),
+            normalizer.consumer_call_path_read("${this.apiUrl}/engine/v1/worker-actions/heartbeat"),
             "/engine/v1/worker-actions/heartbeat"
         );
         // A plain camelCase local/injected base behaves the same — the rule is
         // about SHAPE, not about the `this.` receiver.
         assert_eq!(
-            normalizer.consumer_call_path("${opts.baseUrl}/catalog/items"),
+            normalizer.consumer_call_path_read("${opts.baseUrl}/catalog/items"),
             "/catalog/items"
         );
         assert_eq!(
-            normalizer.consumer_call_path("${clientBase}/catalog/items"),
+            normalizer.consumer_call_path_read("${clientBase}/catalog/items"),
             "/catalog/items"
         );
 
@@ -1422,17 +1422,17 @@ mod tests {
         // producer's path and the "unclassified env var" config suggestion
         // still sees the raw var name.
         assert_eq!(
-            normalizer.consumer_call_path("${process.env.STRIPE_URL}/charges"),
+            normalizer.consumer_call_path_read("${process.env.STRIPE_URL}/charges"),
             "${process.env.STRIPE_URL}/charges"
         );
         assert_eq!(
-            normalizer.consumer_call_path("${PAYMENTS_URL}/charges"),
+            normalizer.consumer_call_path_read("${PAYMENTS_URL}/charges"),
             "${PAYMENTS_URL}/charges"
         );
         // `${ PAYMENTS_URL }` is valid JS — internal whitespace must not
         // reclassify an env-var-shaped base as injected (Copilot review find).
         assert_eq!(
-            normalizer.consumer_call_path("${ PAYMENTS_URL }/charges"),
+            normalizer.consumer_call_path_read("${ PAYMENTS_URL }/charges"),
             "${ PAYMENTS_URL }/charges"
         );
         // A DECLARED-external base stays verbatim regardless of its shape.
@@ -1442,18 +1442,18 @@ mod tests {
         };
         let external_normalizer = UrlNormalizer::new(&external);
         assert_eq!(
-            external_normalizer.consumer_call_path("${billing.baseUrl}/charges"),
+            external_normalizer.consumer_call_path_read("${billing.baseUrl}/charges"),
             "${billing.baseUrl}/charges"
         );
 
         // A whole-URL opaque variable has no route remainder to key on and is
         // still returned verbatim (the #307 literal-segment gate drops it).
         assert_eq!(
-            normalizer.consumer_call_path("${this.someBase}"),
+            normalizer.consumer_call_path_read("${this.someBase}"),
             "${this.someBase}"
         );
         assert_eq!(
-            normalizer.consumer_call_path("${this.someBase}${path}"),
+            normalizer.consumer_call_path_read("${this.someBase}${path}"),
             "${this.someBase}${path}"
         );
     }

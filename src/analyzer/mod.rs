@@ -4562,10 +4562,13 @@ mod tests {
         let normalized = normalize_env_fallback_target(verbatim).expect("collapses");
         assert!(is_valid_route_shape(&normalized));
         assert_eq!(
-            normalizer.consumer_call_path(&normalized),
-            normalizer.consumer_call_path(clean)
+            normalizer.consumer_call_path_read(&normalized),
+            normalizer.consumer_call_path_read(clean)
         );
-        assert_eq!(normalizer.consumer_call_path(&normalized), "/audit/events");
+        assert_eq!(
+            normalizer.consumer_call_path_read(&normalized),
+            "/audit/events"
+        );
     }
 
     /// carrick#1150: a query string appended only when there is one is the

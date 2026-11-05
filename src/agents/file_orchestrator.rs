@@ -11067,7 +11067,7 @@ impl FileOrchestrator {
             .loopback_default_url
             .as_deref()
             .unwrap_or(&data_call.target);
-        normalizer.consumer_call_path(url)
+        normalizer.consumer_call_path(url, data_call.base.as_ref())
     }
 
     /// Record how each call's base resolves (carrick#649).
