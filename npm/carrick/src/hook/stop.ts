@@ -15,6 +15,9 @@
 // several turns — so "already nudged" is the state this has to get right or
 // the line repeats on every turn until the session ends.
 //
+// Before the nudge it delivers the answers of background re-checks and waits
+// for the ones still running (`stop-wait.ts`).
+//
 // It exits 0 on every path, like the other two.
 //
 // Reference: `docs/reference/task-skills.md`, "The reuse nudge" — the three
@@ -26,6 +29,7 @@ import { drain } from "./reuse.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 import { markInvoker } from "./invoker.ts";
+import { stopAnswers, waitSeconds } from "./stop-wait.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -72,12 +76,18 @@ async function main(): Promise<void> {
     return;
   }
 
+  // First: what the background re-checks of this session's edits answered, and
+  // a wait for the ones still running (`--wait-s`, from the settings entry).
+  // Before the nudge, so functions the runner recorded meanwhile are named.
+  const parts: string[] = [];
+  const late = await stopAnswers(session, { waitS: waitSeconds(process.argv.slice(2)) });
+  parts.push(...late.lines);
+
   // `drain` reads the store, builds the line and marks the set as spoken, in
   // that order. Codex's `UserPromptSubmit` hook calls the same function
   // (carrick#1335); the difference between the two hosts is the event name on
   // the wire and nothing else.
   const spoken = drain(session);
-  const parts: string[] = [];
   if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
   else parts.push(spoken.line);
 

@@ -495,7 +495,7 @@ test("the hook entries land beside everything else the settings file holds", () 
   assert.equal(written.hooks.PostToolUse[1].hooks[0].timeout, 5);
   // The end-of-task reuse nudge (carrick#1330). Installed beside the other two
   // rather than by anything the user has to add.
-  assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop");
+  assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop --wait-s 200");
   assert.equal(written.hooks.Stop[0].matcher, undefined, "a Stop hook has no matcher");
 });
 

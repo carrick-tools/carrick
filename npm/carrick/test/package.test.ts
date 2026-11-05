@@ -11,6 +11,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { carrickHooks } from "../src/init/settings.ts";
 import { PLATFORMS, platformPackage } from "../src/native.ts";
 import { manifest } from "../../platform/build.mjs";
 
@@ -156,8 +157,11 @@ test("the host manifests name this CLI's commands, and travel with the package",
     "carrick hook post-edit",
     "carrick hook post-read",
     "carrick hook session-start",
-    "carrick hook stop",
+    "carrick hook stop --wait-s 200",
   ]);
+  // Stop waits for the background re-check of the last edit, so the plugin's
+  // entry is the one `carrick init` writes: same wait, timeout and message.
+  assert.deepEqual(hooks["hooks"]["Stop"], carrickHooks()["Stop"]);
   const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
   assert.equal(lsp["carrick"]["command"], "carrick");
   assert.deepEqual(lsp["carrick"]["args"], ["lsp", "--stdio", "--hooks-installed"]);
