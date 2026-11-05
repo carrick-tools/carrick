@@ -133,7 +133,11 @@ export class DenoProject {
   private readonly externalNames = new Map<string, string>();
 
   constructor(readonly config: DenoConfig, readonly repoRoot: string) {
-    const cache = path.join(config.workspaceRoot, '.carrick', 'deno', createHash('sha256').update(path.resolve(repoRoot)).digest('hex').slice(0, 16));
+    // Named from where the service sits in its workspace, never from the
+    // checkout's absolute path: the name reaches the relocated declarations,
+    // so the same tree at two paths must name its folder alike (cloud#2928).
+    const place = path.relative(config.workspaceRoot, path.resolve(repoRoot)).split(path.sep).join('/') || '.';
+    const cache = path.join(config.workspaceRoot, '.carrick', 'deno', createHash('sha256').update(place).digest('hex').slice(0, 16));
     this.cacheDir = cache;
     // The graph root lives within the service so compilerOptions.types uses
     // that member's import-map scope, just like the real source files do.
