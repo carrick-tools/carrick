@@ -300,9 +300,11 @@ jobs:
           ' "$RUNNER_TEMP/check-producer.out"
 
           # A re-check with something to do. Edited first: on a file the index
-          # already matches, `recheck` answers `ran: none`, and a job asserting
-          # only that the object exists would never run the half it is about.
-          printf '\n// a byte the index has not seen\n' >> inventory-svc/src/client.ts
+          # already matches, or an edit the scan reads the same (a comment),
+          # `recheck` answers `ran: none`, and a job asserting only that the
+          # object exists would never run the half it is about. So the edit is
+          # a statement, which the scan does read.
+          printf '\nexport const carrickSmokeEdit: number = 1;\n' >> inventory-svc/src/client.ts
           budget 240 check-recheck zero \
             carrick check inventory-svc/src/client.ts --recheck --json
           node -e '
