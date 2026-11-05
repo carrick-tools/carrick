@@ -5527,6 +5527,24 @@ fn a_comment_in_a_shared_package_moves_nothing_outside_it() {
     let root = dir.path();
     shared_package_repo(root, true);
     index(root);
+
+    // The premise, as in the edit test: the pair types before the comment, so
+    // "nothing moved" is not also true of a pair that never types.
+    let (code, body) = check_files(root, &[SHARED_PACKAGE_ROUTE, SHARED_PACKAGE_CALL, "--json"]);
+    let pair: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(
+        code,
+        Some(0),
+        "the fixture's pair must type before the comment means anything (carrick#3261):\n{pair:#}"
+    );
+    assert_eq!(pair["type_checked"], 2, "{pair:#}");
+    assert!(
+        pair["not_type_checked"]
+            .as_array()
+            .is_none_or(|rows| rows.is_empty()),
+        "{pair:#}"
+    );
+
     edit(
         &root.join(SHARED_PACKAGE_TYPE),
         "export type",
