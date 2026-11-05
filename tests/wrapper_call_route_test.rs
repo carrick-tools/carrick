@@ -8,15 +8,16 @@
 //! requests. Before the fix that row stayed, and once its value was typed it
 //! was judged against the wrong route's producer.
 //!
-//! With the fix the row takes the helper's route, which the helper's own
-//! request line already states, so the graph keeps the one row for the one
-//! request (the wrapper-echo rule). The other hook, whose helper states no row
+//! The helper's own request line already states the shared route, and the
+//! helper writes that route and not the stats one, so the hook's row is
+//! withdrawn and the graph keeps the one row for the one request
+//! (`call_through::helper_row`). The other hook, whose helper states no row
 //! of its own, keeps its row on the stats route.
 //!
 //! carrick#1801 (`wrapper-call-value`): the call's value is what the helper
 //! returns. A helper that writes the path and parses the body into a copy of
 //! its own makes its call worth that copy, so the hook's row keeps its route
-//! and states no consumer response type.
+//! and states no consumer response type (`call_through::drop_copied_response`).
 //!
 //! Deterministic end to end: the model is replayed from `__llm__/`.
 
