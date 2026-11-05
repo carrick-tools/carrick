@@ -2797,6 +2797,9 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
 
     let content_section = &prompt[file_content_start..];
     let content_to_analyze = if let Some(fence_start) = content_section.find("```") {
+        // Source line 1 starts after the fence line's own newline; without
+        // this the empty remainder of the fence line counts as line 1 and
+        // every mock row lands one line low (#3314).
         let after_fence = &content_section[fence_start + 3..];
         if let Some(fence_end) = after_fence.find("```") {
             &after_fence[..fence_end]
@@ -3657,6 +3660,40 @@ pub(crate) mod tests {
     /// replay keys each answer by a trailing part of its path. The longest
     /// part with an answer wins, and a file with none falls back to the stem
     /// key, as before.
+    /// The mock reader's line numbers are the source's. A route on source
+    /// line 2 comes back at line 2, and takes the candidate stated at line 2,
+    /// not the one on line 3 (#3314).
+    #[test]
+    fn the_mock_reader_numbers_source_lines_as_the_source_does() {
+        let candidate = |id: &str, line: u32, snippet: &str| {
+            format!(
+                "{{\"candidate_id\":\"{id}\",\"line_number\":{line},\"code_snippet\":\"{snippet}\"}}"
+            )
+        };
+        let prompt = format!(
+            "{}\n{}\n### FILE CONTENT (Path: main.ts)\nLines are prefixed with line numbers.\n```\nconst x = 1;\napp.get('/health', h);\napp.get('/other', h);\n```\n\nAnalyze this file\n",
+            candidate("c-health", 2, "app.get('/health', h)"),
+            candidate("c-other", 3, "app.get('/other', h)"),
+        );
+        let answer: serde_json::Value =
+            serde_json::from_str(&generate_mock_file_analysis_response(&prompt)).unwrap();
+        let rows: Vec<(i64, String)> = answer["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["line_number"].as_i64().unwrap(),
+                    e["candidate_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(2, "c-health".to_string()), (3, "c-other".to_string())]
+        );
+    }
+
     #[test]
     fn a_mock_answer_keyed_by_path_tells_two_files_of_one_stem_apart() {
         let dir = tempfile::tempdir().expect("tempdir");
