@@ -502,7 +502,7 @@ fn each_operation_through_a_client_wrapper_keeps_one_fact_row() {
         // aside request keeps the wrapper's row.
         "services/app/src/api.ts:14 GET /api/version request_summary",
         "services/app/src/commands.ts:11 GET /api/status request_summary",
-        "services/app/src/commands.ts:16 GET /api/items/:id request_summary",
+        "services/app/src/commands.ts:16 GET /api/items/1 request_summary",
         "services/app/src/commands.ts:21 GET /api/health request_summary",
         "services/app/src/commands.ts:6 GET /api/items/:id request_summary",
     ];

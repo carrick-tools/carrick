@@ -1796,7 +1796,7 @@ fn state_leaves<'g>(
 /// for did. Only when exactly one of the first `held` rows inside the
 /// wrapper states the operation, the callee's path matches it, and it holds
 /// more literal segments than the callee's: a wrapper that passes its own
-/// parameter on (`${id}`) states no more than the callee does, and the
+/// parameter on writes `${id}`, a template it has no value for, and the
 /// callee's template stands.
 fn filled_request(
     data: &CloudRepoData,
@@ -1828,8 +1828,9 @@ fn filled_request(
         return None;
     }
     let (_, path) = call.key.as_http()?;
-    let filled = carrick_match::path_literal_specificity(path)
-        > carrick_match::path_literal_specificity(&request.canonical_path)
+    let filled = !path.contains("${")
+        && carrick_match::path_literal_specificity(path)
+            > carrick_match::path_literal_specificity(&request.canonical_path)
         && carrick_match::paths_match(&request.canonical_path, path);
     filled.then(|| Reached {
         target_url: path.to_string(),
