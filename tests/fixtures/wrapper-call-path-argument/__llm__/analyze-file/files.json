@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "/v1/shelves/files/${name}",
+      "method": "GET",
+      "pattern_matched": "request({",
+      "call_expression_text": "request({\n    path: `/v1/shelves/files/${name}`,\n    method: \"GET\",\n  })",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

@@ -96,6 +96,36 @@ fn a_helper_s_caller_reaches_the_route_the_helper_requests() {
     );
 }
 
+/// `wrapper-call-path-argument`: the helper's request writes its path's last
+/// segment as a hole (`/v1/shelves/files/${name}`) that the caller fills with
+/// an imported constant. The caller's row names the filled path, a segment the
+/// helper never writes, and it is true: the helper's row is the template, not
+/// a sibling route, so the caller's row is not withdrawn.
+#[test]
+fn a_helper_s_caller_keeps_the_path_it_fills_into_the_helper_s_request() {
+    let calls = calls("wrapper-call-path-argument");
+
+    assert_eq!(
+        rows(&calls),
+        vec![
+            (
+                "src/hooks/useShelfCover.ts".to_string(),
+                5,
+                "GET".to_string(),
+                "/v1/shelves/files/cover.png".to_string()
+            ),
+            (
+                "src/lib/files.ts".to_string(),
+                4,
+                "GET".to_string(),
+                "/v1/shelves/files/:name".to_string()
+            ),
+        ],
+        "the caller's argument fills the hole the helper's request ends in; its row \
+         states that request and stays"
+    );
+}
+
 /// Every service's blob from one offline scan of the fixture, with the type
 /// sidecar optional: the manifest entries are under test, not the types.
 fn blobs(fixture_dir: &str) -> Vec<serde_json::Value> {

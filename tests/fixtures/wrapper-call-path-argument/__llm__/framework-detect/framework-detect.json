@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "A client. Its requests go through a transport module the service declares."
+}
