@@ -61,12 +61,12 @@ fn call_at_line(calls: &[serde_json::Value], line: i64) -> &serde_json::Value {
 #[test]
 fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let calls = calls("imported-request-member");
-    // One row per call site: the ten the member join states, the client's own
+    // One row per call site: the nine the member join states, the client's own
     // four requests — each `send(...)` line fills the URL and the verb its
     // transport helper leaves open — and the site calling through the
     // exported instance, which the call graph follows through the instance's
     // declared construction (carrick#1555).
-    assert_eq!(calls.len(), 15, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 14, "one row per call site: {calls:#?}");
 
     // `client.createArtifactUrl(name)` reaches a PUT to /api/v2. The cassette
     // says POST, and says v2 only because the error message four lines below
@@ -90,11 +90,20 @@ fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     );
 
     // `apiClient.createArtifactUrl(name)` shares a name with the client's
-    // method and is imported from somewhere else, so the join must not fire
-    // and the row must keep what extraction gave it.
-    let local = call_at_line(&calls, 21);
-    assert_eq!(local["method"], "GET");
-    assert_eq!(local["target_url"], "/legacy/handles");
+    // method and is imported from somewhere else, so the join must not fire:
+    // the call must not take the client's URL. `legacy.ts`'s member makes no
+    // request, so the cassette's `GET /legacy/handles` row for this site is
+    // removed (carrick#3356), and no row remains at line 21.
+    assert!(
+        calls.iter().all(|call| call["line"].as_i64() != Some(21)),
+        "the member makes no request, so the site has no row: {calls:#?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| call["target_url"] != "/legacy/handles"),
+        "the wrong cassette row is gone: {calls:#?}"
+    );
 }
 
 /// carrick#588 finding 3: the member builds its URL with `new URL(path, base)`

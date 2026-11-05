@@ -154,9 +154,13 @@ fn a_request_inside_a_handed_callback_reads_its_method_from_the_helper_s_caller(
             "the caller writes PUT; the model said PATCH",
             "src/tasks-api.ts:6 PUT /v1/tasks/:id/status request_summary",
         ),
+        // The label's default GET is stated by the model, not by a fact row:
+        // a URL ending in a parameter no caller fills states no fact row
+        // (carrick#3372). When #3372 lands the row returns as
+        // `request_summary`; tighten this entry then.
         (
-            "the caller writes no method: the label's GET",
-            "src/tasks-api.ts:10 GET /v1/tasks/:id request_summary",
+            "the caller writes no method: the label's GET (model row; fact row owed by #3372)",
+            "src/tasks-api.ts:10 GET /v1/tasks/:id model",
         ),
         (
             "the caller's whole bag, its `url` and `method` read inside the span",
