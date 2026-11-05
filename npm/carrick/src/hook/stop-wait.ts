@@ -70,7 +70,7 @@ function render(answer: Answer): string {
       ? `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}. ${RUN}`
       : `Carrick: ${where} was not re-checked here. ${RUN}`;
   }
-  return renderPostToolUse(result, where, { uses: false }) ?? "";
+  return renderPostToolUse(result, where, { uses: false, late: true }) ?? "";
 }
 
 export type StopOptions = {

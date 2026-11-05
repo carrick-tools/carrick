@@ -99,6 +99,12 @@ test("stop waits for a re-check that finishes inside the wait and prints its pro
   assert.ok(run.ms >= 1800 && run.ms < 8000, `waited for the answer, not the whole wait (${run.ms} ms)`);
   const text = context(run.stdout);
   assert.match(text, /contract problem/);
+  assert.match(
+    text,
+    /Carrick re-checked \S*users\.ts after your earlier edit to it: /,
+    "a late answer says it is about an earlier edit",
+  );
+  assert.doesNotMatch(text, /after this edit/);
   assert.doesNotMatch(text, /still running/);
 });
 

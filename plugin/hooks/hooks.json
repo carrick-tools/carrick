@@ -38,8 +38,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook stop",
-            "timeout": 5
+            "command": "carrick hook stop --wait-s 200",
+            "timeout": 210,
+            "statusMessage": "Carrick: waiting for the re-check of your last edit"
           }
         ]
       }
