@@ -1076,11 +1076,13 @@ pub fn fold_rows(
             })
             .map(|(index, _)| index)
             .collect();
-        // A fact the scan states keeps the site. An old-path row does not
-        // keep it from a fact site row: the fact replaces it as it replaces
-        // the reader's row (carrick#3283).
+        // A fact the scan states keeps the site. An old-path row that states
+        // another operation than a fact site row does not: the fact
+        // replaces it as it replaces the reader's row (carrick#3283). One
+        // that states the same operation keeps the site, which then changes
+        // nothing.
         let gives_way = |existing: &ApiEndpointDetails| {
-            is_reader(existing) || (row.fact() && is_old_path(existing))
+            is_reader(existing) || (row.fact() && is_old_path(existing) && existing.key != row.key)
         };
         if here.iter().any(|&index| !gives_way(&rows[index])) {
             continue;
