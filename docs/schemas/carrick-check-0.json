@@ -196,6 +196,10 @@
           "type": "string",
           "description": "Why the re-check did not run. Present only when ran is none."
         },
+        "deferred": {
+          "const": true,
+          "description": "Present, and true, only when ran is none because the call was `--recheck --no-rescan` and the edit needs a re-scan, which it did not start. The items are the indexed ones."
+        },
         "new_functions": {
           "type": "array",
           "description": "Functions the re-extracted file declares that the index does not hold under that name (carrick#1330). Absent when ran is none, which extracted nothing to compare, and absent when the edit added no function. At most 20. A NAME comparison against index_commit: the index holds no body hash, so a renamed function reads as new.",

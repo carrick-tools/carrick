@@ -41,7 +41,12 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
     Indexed,
-    Recheck,
+    /// `rescan: false` is the probe (`check --recheck --no-rescan`): it answers
+    /// at once what needs no re-scan and marks the rest `deferred`, starting
+    /// nothing (`recheck.rs`, "deferred").
+    Recheck {
+        rescan: bool,
+    },
 }
 
 /// Answer about one file.
@@ -119,7 +124,7 @@ pub fn answer(
     let mut reads_same = false;
     let mut moved_items: Option<Vec<IndexedItem>> = None;
     let recheck = match (freshness, mode) {
-        (Freshness::Recheck, Mode::Check) if stale && !deleted => {
+        (Freshness::Recheck { rescan }, Mode::Check) if stale && !deleted => {
             // An edit the scan reads the same (comments, layout) has nothing
             // to re-scan: the indexed rows stand, each at the line its node
             // moved to. Every other edit takes the re-scan below.
@@ -156,15 +161,15 @@ pub fn answer(
                         &repo_root,
                         &relative,
                         &indexed_at,
-                        &index.indexed_at,
                         &reach,
                         &index,
+                        rescan,
                     ),
                     None => (None, not_run("no service reads this file", &indexed_at)),
                 },
             })
         }
-        (Freshness::Recheck, Mode::Check) => Some((
+        (Freshness::Recheck { .. }, Mode::Check) => Some((
             None,
             not_run(
                 if deleted {
@@ -409,6 +414,7 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
         reason: Some(reason.to_string()),
         new_functions: Vec::new(),
         known_miss: false,
+        deferred: false,
         scope: None,
         moved: Vec::new(),
     }
@@ -430,9 +436,9 @@ fn rechecked(
     repo_root: &Path,
     relative: &str,
     indexed_at: &str,
-    index_generation: &str,
     reach: &super::recheck::Reach,
     before: &LocalIndex,
+    rescan: bool,
 ) -> (Option<(Vec<IndexedItem>, TypeCheckSummary)>, Recheck) {
     let started = std::time::Instant::now();
     let workspace = match super::workspace::Workspace::load(workspace_root) {
@@ -447,6 +453,7 @@ fn rechecked(
                     reason: Some(reason),
                     new_functions: Vec::new(),
                     known_miss: false,
+                    deferred: false,
                     scope: None,
                     moved: Vec::new(),
                 },
@@ -457,9 +464,10 @@ fn rechecked(
         &workspace,
         repo_root,
         relative,
-        index_generation,
+        &before.indexed_at,
         reach,
         before,
+        rescan,
     ) {
         Ok(fresh) => (
             Some((fresh.items, fresh.type_check)),
@@ -470,6 +478,7 @@ fn rechecked(
                 reason: None,
                 new_functions: fresh.new_functions,
                 known_miss: false,
+                deferred: false,
                 scope: Some(fresh.scope),
                 moved: fresh.moved,
             },
@@ -486,6 +495,7 @@ fn rechecked(
                 // (carrick#2849).
                 new_functions: degraded.new_functions,
                 known_miss: degraded.known_miss,
+                deferred: degraded.deferred,
                 scope: degraded.scope,
                 moved: Vec::new(),
             },

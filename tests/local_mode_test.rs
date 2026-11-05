@@ -801,9 +801,9 @@ fn a_re_check_that_missed_its_budget_is_not_started_again_until_the_index_moves(
         "{missed:#}"
     );
 
-    // Same index, ample budget: the re-scan would fit now, and is still not
-    // started, because this repo already missed against this index.
-    let skipped = ask(&ample);
+    // The same budget again: the miss holds and no re-scan starts. A LONGER
+    // budget is not told the service does not fit, so it re-scans.
+    let skipped = ask(&[("CARRICK_RECHECK_BUDGET_MS", "1")]);
     assert_eq!(
         skipped["recheck"]["ran"],
         serde_json::json!("none"),
@@ -829,6 +829,18 @@ fn a_re_check_that_missed_its_budget_is_not_started_again_until_the_index_moves(
         skipped["items"][0]["verdict"]["state"],
         serde_json::json!("resolved"),
         "with the indexed verdicts:\n{skipped:#}"
+    );
+
+    let longer = ask(&ample);
+    assert_ne!(
+        longer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "a miss at 1 ms does not silence a call with ten minutes:\n{longer:#}"
+    );
+    assert_eq!(
+        longer["recheck"]["known_miss"],
+        serde_json::Value::Null,
+        "{longer:#}"
     );
 
     // A new index is a new generation: the re-check is tried again, and fits.
@@ -4679,6 +4691,23 @@ fn statement_in(file: &Path, text: &str) {
     std::fs::write(file, format!("{existing}\nvoid {text:?};\n")).expect("write the statement");
 }
 
+/// Make the recorded miss read as one that ran under an ample budget. A miss
+/// is remembered only against calls whose budget is no longer than the one it
+/// ran under (B3-R), and a test cannot make a re-scan miss ten minutes.
+fn miss_ran_under_an_ample_budget(root: &Path) {
+    let path = root.join(".carrick/recheck-misses.json");
+    let text = std::fs::read_to_string(&path).expect("the miss was recorded");
+    let mut misses: serde_json::Value = serde_json::from_str(&text).expect("misses JSON");
+    for miss in misses["services"]
+        .as_object_mut()
+        .expect("services")
+        .values_mut()
+    {
+        miss["budget_ms"] = serde_json::json!(600_000);
+    }
+    std::fs::write(&path, misses.to_string()).expect("write the misses");
+}
+
 /// A re-check reads the edited file's service and judges every other service
 /// at the newest copy it has: here the client, as the last re-check left it.
 /// Reading the whole repo again would give the same verdict by a different
@@ -4733,6 +4762,109 @@ fn a_re_check_reads_only_the_edited_files_service_and_judges_against_the_last_re
             .as_array()
             .is_none_or(|stale| stale.is_empty()),
         "{answer:#}"
+    );
+}
+
+/// `check --recheck --no-rescan` is the probe the post-edit hook asks first:
+/// what needs no re-scan is answered as before, and an edit that does comes
+/// back `deferred` at once with the indexed rows, no re-scan started and no
+/// miss remembered (B3-R).
+#[test]
+#[serial]
+fn a_no_rescan_recheck_answers_at_once_and_starts_nothing() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    let probe = |file: &str| -> serde_json::Value {
+        let text = run_with_env(
+            root,
+            &[
+                "check",
+                file,
+                "--workspace",
+                ".",
+                "--recheck",
+                "--no-rescan",
+                "--json",
+            ],
+            &AMPLE,
+        );
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
+    };
+
+    // A comment-only edit reads the same: answered from the index, as B5 does.
+    edit(&root.join(SHOP_HEALTH), "export", "// a note\nexport");
+    let same = probe(SHOP_HEALTH);
+    assert_eq!(
+        same["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{same:#}"
+    );
+    assert!(
+        same["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("changed nothing the scan reads")),
+        "{same:#}"
+    );
+    assert!(same["recheck"].get("deferred").is_none(), "{same:#}");
+    // Put the file back, so the full re-check below judges a clean sibling.
+    edit(&root.join(SHOP_HEALTH), "// a note\nexport", "export");
+
+    // An edit that moves a type needs a re-scan: the probe starts none.
+    // The verdict of each indexed row, as `check` reads it before the edit.
+    let results = |answer: &serde_json::Value| -> Vec<serde_json::Value> {
+        answer["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["verdict"]["result"].clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let indexed_results = results(&check_json(root, SHOP_CLIENT));
+    edit(
+        &root.join(SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let before = recheck_temp_dirs();
+    let deferred = probe(SHOP_CLIENT);
+    assert_eq!(
+        deferred["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{deferred:#}"
+    );
+    assert_eq!(
+        deferred["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{deferred:#}"
+    );
+    assert!(
+        deferred["recheck"]["scope"].is_null(),
+        "no service was read: {deferred:#}"
+    );
+    assert_eq!(
+        results(&deferred),
+        indexed_results,
+        "the verdicts are the indexed ones, not a re-check's:\n{deferred:#}"
+    );
+    assert_eq!(recheck_temp_dirs(), before, "no staged generation was left");
+    for kept in ["recheck-misses.json", "working"] {
+        assert!(
+            !root.join(".carrick").join(kept).exists(),
+            "the probe left .carrick/{kept}"
+        );
+    }
+
+    // The same edit through a full re-check still re-scans and answers.
+    let full = recheck_json(root, SHOP_CLIENT, &AMPLE);
+    assert!(full["recheck"].get("deferred").is_none(), "{full:#}");
+    assert_ne!(
+        full["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{full:#}"
     );
 }
 
@@ -4872,6 +5004,7 @@ fn a_miss_in_one_service_leaves_the_others_re_checked() {
     statement_in(&root.join(SHOP_LEDGER), "ledger edit");
 
     let missed = recheck_json(root, SHOP_ROUTE, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
+    miss_ran_under_an_ample_budget(root);
     assert_eq!(
         missed["recheck"]["ran"],
         serde_json::json!("none"),
@@ -4934,6 +5067,7 @@ fn check_each_answers_a_missed_services_other_files_at_once() {
     statement_in(&root.join(SHOP_LEDGER), "ledger");
 
     let missed = recheck_json(root, SHOP_ROUTE, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
+    miss_ran_under_an_ample_budget(root);
     assert_eq!(missed["recheck"]["ran"], serde_json::json!("none"));
 
     let text = run_with_env(

@@ -207,6 +207,12 @@ export type Recheck = {
    * are the indexed ones until the next `carrick refresh`. Absent otherwise.
    */
   known_miss?: boolean;
+  /**
+   * True on a `none` from `check --recheck --no-rescan` for an edit that
+   * needs a re-scan: the call was asked not to start one, so the rows are the
+   * indexed ones. Absent otherwise.
+   */
+  deferred?: boolean;
   /** Which services this re-check read and which it judged at another version. */
   scope?: RecheckScope;
   /**
