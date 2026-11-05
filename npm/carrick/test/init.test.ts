@@ -3950,7 +3950,7 @@ test("where Carrick builds the index, init asks nothing, installs everything and
       const closing = text.slice(text.indexOf(CLOUD_NEXT_TITLE));
       assert.match(closing, /Written here:/);
       assert.match(closing, /Claude Code hooks in \.claude\/settings(\.local)?\.json/);
-      assert.match(closing, /Codex hooks in /);
+      assert.match(closing, /Codex hooks in \S+ \(open `codex` here once and trust the project's hooks, or Codex skips them\)/);
       assert.match(closing, /Carrick task skills/);
       assert.match(closing, /The Carrick MCP server for Claude Code/);
       assert.match(closing, /Open a new agent session in this folder, so it loads the MCP server and the hooks\./);

@@ -1578,7 +1578,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // know, and a hook file for a host nobody runs costs nothing.
   try {
     const codex = writeCodexHooks(workspace, command.command);
-    wrote.push(`Codex hooks in ${CODEX_HOOKS_FILE}`);
+    wrote.push(`Codex hooks in ${CODEX_HOOKS_FILE} (open \`codex\` here once and trust the project's hooks, or Codex skips them)`);
     if (codex === "written") {
       todo.push("Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.");
     }
