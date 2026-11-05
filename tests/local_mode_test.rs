@@ -4556,6 +4556,73 @@ fn a_re_check_reads_only_the_edited_files_service_and_judges_against_the_last_re
     );
 }
 
+/// A re-check says how long each phase before, around and after its re-scan
+/// took, when asked to, and says nothing more when not. The lines are what
+/// names the cut that makes the pre-scan cost small, so each phase the cost
+/// can sit in has one and the scan's start is named.
+#[test]
+#[serial]
+fn a_re_check_states_how_long_each_phase_took_when_asked() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    edit(
+        &root.join(SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let args = [
+        "check",
+        SHOP_CLIENT,
+        "--workspace",
+        ".",
+        "--recheck",
+        "--json",
+    ];
+    let run_it = |timing: bool| {
+        let mut command = Command::new(carrick());
+        command
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_RECHECK_BUDGET_MS", "600000");
+        as_signed_in(&mut command, &args);
+        if timing {
+            command.env("CARRICK_RECHECK_TIMING", "1");
+        }
+        let output = command.output().expect("run the re-check");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    let quiet = run_it(false);
+    assert!(
+        !quiet.contains("recheck-timing"),
+        "no timing lines unless asked:\n{quiet}"
+    );
+    let said = run_it(true);
+    for phase in [
+        "held-read",
+        "plan-make/readers-of-the-edit",
+        "plan-make/digests-and-working-reads",
+        "stage/retained-and-hosted-blobs",
+        "stage/hosted-and-previous-lists",
+        "scan-starts",
+        "scan ",
+        "after-scan/read-fresh-and-keep",
+        "after-scan/read-staged-lists",
+        "after-scan/carried-and-kept-walks",
+        "after-scan/write-local-blobs",
+        "join ",
+        "fold ",
+    ] {
+        assert!(
+            said.contains(&format!("recheck-timing {phase}")),
+            "a timing line for {phase}:\n{said}"
+        );
+    }
+}
+
 /// A service that imports the edited file is never judged unannounced. The
 /// type-use record names only the operations that read a type the file
 /// declares, so a constant the client imports is invisible to it; the import

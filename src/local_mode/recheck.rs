@@ -199,6 +199,37 @@ impl Reach {
     }
 }
 
+/// The environment variable that prints each phase's timing line to stderr.
+/// `check` is a read command and installs no log, so the lines go to the debug
+/// log when a caller installed one and to stderr when this is set; unset, a
+/// re-check prints nothing more than before.
+pub const TIMING_ENV: &str = "CARRICK_RECHECK_TIMING";
+
+/// When the per-edit re-check in this process began, for the offsets in the
+/// timing lines.
+static RUN_STARTED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Say that `phase` took from `began` until now, and where in the command that
+/// ended: one line per phase, `recheck-timing <phase> took <ms> ms, ended at
+/// <ms> ms`. Only the per-edit re-check calls it; the several-file check is
+/// not timed here.
+fn took(phase: &str, began: Instant) {
+    let now = Instant::now();
+    let at = RUN_STARTED
+        .lock()
+        .ok()
+        .and_then(|started| *started)
+        .map_or(0, |started| now.duration_since(started).as_millis());
+    let line = format!(
+        "recheck-timing {phase} took {} ms, ended at {at} ms",
+        now.duration_since(began).as_millis()
+    );
+    tracing::debug!("{line}");
+    if std::env::var_os(TIMING_ENV).is_some() {
+        eprintln!("carrick: {line}");
+    }
+}
+
 /// Re-extract `relative` in `repo`, re-join it against every blob the index
 /// already holds, and answer with the rows the working tree states.
 ///
@@ -214,13 +245,19 @@ pub fn run(
     reach: &Reach,
 ) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
+    if let Ok(mut at) = RUN_STARTED.lock() {
+        *at = Some(started);
+    }
     let deadline = started + budget();
     // The index is read once, here, and named twice: for what the edit added
     // and for the re-join. What the edit added does not wait on the re-scan
     // (carrick#2849): on a large repo the re-scan alone outlasts the budget,
     // and the reuse nudge would then never hear of a function the edit wrote.
     let held = match Held::read(workspace) {
-        Ok(held) => held,
+        Ok(held) => {
+            took("held-read", started);
+            held
+        }
         Err(reason) => {
             return Err(Box::new(Degraded {
                 reason,
@@ -231,9 +268,14 @@ pub fn run(
             }));
         }
     };
+    let began = Instant::now();
     let new_functions = added_functions(&held, repo, relative);
+    took("added-functions", began);
+    let began = Instant::now();
     let misses = ServiceMisses::path(workspace);
-    if let Some(miss) = ServiceMisses::read(&misses).holds(index_generation, &reach.owner) {
+    let known = ServiceMisses::read(&misses);
+    took("known-miss-read", began);
+    if let Some(miss) = known.holds(index_generation, &reach.owner) {
         return Err(Box::new(Degraded {
             reason: miss_reason(&reach.owner, miss),
             new_functions,
@@ -242,7 +284,9 @@ pub fn run(
             scope: None,
         }));
     }
+    let began = Instant::now();
     let plan = Plan::make(workspace, repo, reach, index_generation, &held);
+    took("plan-make", began);
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
     let outcome = inside(
         workspace,
@@ -256,7 +300,9 @@ pub fn run(
     // The temporary generation goes on every path, including the one where a
     // phase was killed at the deadline: a hook that leaves a directory behind
     // per edit is a hook that fills a disk in an afternoon.
+    let began = Instant::now();
     let _ = std::fs::remove_dir_all(&generation);
+    took("remove-staged-dir", began);
     match outcome {
         Ok(fresh) => Ok(Fresh {
             new_functions,
@@ -464,7 +510,10 @@ impl Plan {
         generation: &str,
         held: &Held,
     ) -> Self {
+        let began = Instant::now();
         let mut readers = readers_of_the_edit(repo, reach, held);
+        took("plan-make/readers-of-the-edit", began);
+        let began = Instant::now();
         let mut listings: std::collections::BTreeMap<String, Option<HashSet<String>>> =
             Default::default();
         let mut digests = std::collections::BTreeMap::new();
@@ -528,6 +577,7 @@ impl Plan {
                 reason: reason.to_string(),
             });
         }
+        took("plan-make/digests-and-working-reads", began);
         Self {
             generation: generation.to_string(),
             services: reach.reread.clone(),
@@ -956,6 +1006,9 @@ fn rejoin_held(
 ) -> Result<Rejoined, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
+    // Timed only for the per-edit re-check, which has a plan.
+    let timed = plan.is_some();
+    let began = Instant::now();
     let blobs = generation.join("repos");
     // The re-scans and the re-join judge the same stubs and pairs; the folder
     // is where the first answer waits for the others. A per-edit re-check
@@ -990,6 +1043,10 @@ fn rejoin_held(
         remote_services.insert(service_id(&blob), remote);
         write_blob(&blobs.join(format!("hosted-{position}.json")), &blob)?;
     }
+    if timed {
+        took("stage/retained-and-hosted-blobs", began);
+    }
+    let began = Instant::now();
 
     // Phase 1, one scan per repo, analysing only the services whose inputs
     // changed (`--changed-only`, carrick#2826). `previous` is what the last
@@ -1031,6 +1088,9 @@ fn rejoin_held(
     }
     drop(hosted);
     drop(indexed);
+    if timed {
+        took("stage/hosted-and-previous-lists", began);
+    }
 
     for (position, repo) in repos.iter().enumerate() {
         let name = repo_label(repo);
@@ -1057,15 +1117,31 @@ fn rejoin_held(
             scan.env(crate::progress::PROGRESS_ENV, "1");
             narrator.repo(Instant::now(), &name, position + 1, repos.len());
         }
+        if timed {
+            took("scan-starts", Instant::now());
+        }
+        let began = Instant::now();
         bounded(scan, "re-scan", deadline, narrator)?;
+        if timed {
+            took("scan", began);
+        }
+        let began = Instant::now();
         let fresh = read_blobs(&scan_dir)?;
         if let Some(plan) = plan {
             for blob in &fresh {
                 plan.keep(workspace, blob);
             }
         }
+        if timed {
+            took("after-scan/read-fresh-and-keep", began);
+        }
+        let began = Instant::now();
         let hosted_data = read_staged(&staged(generation, "hosted", position))?;
         let previous_data = read_staged(&previous)?;
+        if timed {
+            took("after-scan/read-staged-lists", began);
+        }
+        let began = Instant::now();
         let carried = super::index::carried_services(repo, &hosted_data, &previous_data, &fresh)?;
         // A check writes kept state under `.carrick` (carrick#3245): the rows
         // of the carried services it walked, bound on use by build stamp,
@@ -1073,9 +1149,16 @@ fn rejoin_held(
         // so the next check reads them instead of walking again. Never an
         // analysed service's rows.
         super::index::keep_carried_walks(&scan_dir, &kept, &carried);
+        if timed {
+            took("after-scan/carried-and-kept-walks", began);
+        }
+        let began = Instant::now();
         for (offset, blob) in fresh.iter().chain(&carried).enumerate() {
             services.insert(service_id(blob));
             write_blob(&blobs.join(format!("local-{position}-{offset}.json")), blob)?;
+        }
+        if timed {
+            took("after-scan/write-local-blobs", began);
         }
     }
 
@@ -1096,7 +1179,12 @@ fn rejoin_held(
             ),
         );
     }
+    let began = Instant::now();
     bounded(join, "re-join", deadline, narrator)?;
+    if timed {
+        took("join", began);
+    }
+    let began = Instant::now();
     let text = std::fs::read_to_string(&out)
         .map_err(|e| format!("the re-join wrote no result to {}: {e}", out.display()))?;
     let joined: super::LocalJoin =
@@ -1105,6 +1193,9 @@ fn rejoin_held(
     // The same fold the indexer performs, over the same shapes, so a re-checked
     // row and an indexed row can never be built two different ways.
     let index = build(workspace, &blobs, &joined, &remote_services)?;
+    if timed {
+        took("fold", began);
+    }
     Ok(Rejoined {
         index,
         join: joined,
