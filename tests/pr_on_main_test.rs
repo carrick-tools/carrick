@@ -2047,46 +2047,6 @@ async fn a_pr_with_no_base_commit_shows_no_endpoint_delta() {
 // full assertion under `#[ignore]`, naming the issue that fixes it; that issue
 // removes the ignore as its failing-first test.
 
-/// Set the five switches the cloud runner sets for every workspace
-/// (carrick-cloud `runner/image/src/proc.ts`) until the guard drops.
-struct FactLayer(Vec<(&'static str, Option<String>)>);
-
-impl FactLayer {
-    const SWITCHES: [&'static str; 5] = [
-        "CARRICK_SITE_QUESTIONS",
-        "CARRICK_POSITION_ROWS",
-        "CARRICK_RECEIVER_TRACE",
-        "CARRICK_FACT_FILES",
-        "CARRICK_SITE_PAYLOADS",
-    ];
-
-    fn on() -> Self {
-        let before = Self::SWITCHES
-            .iter()
-            .map(|name| (*name, std::env::var(name).ok()))
-            .collect();
-        for name in Self::SWITCHES {
-            // SAFETY: the tests in this binary run one at a time (SERIAL).
-            unsafe { std::env::set_var(name, "1") };
-        }
-        FactLayer(before)
-    }
-}
-
-impl Drop for FactLayer {
-    fn drop(&mut self) {
-        for (name, value) in &self.0 {
-            // SAFETY: the tests in this binary run one at a time (SERIAL).
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-}
-
 /// The process environment a seed scan starts from: the model replayed from
 /// cassettes, and no runner event.
 fn seed_env() {
@@ -2384,7 +2344,6 @@ async fn scan_seed_repo(store: &Store, repo: &Path) {
 /// Seed main's trees under `trees` and scan them into the three stores.
 async fn build_snapshot(trees: &Path) -> MainSnapshot {
     seed_env();
-    let _fact_layer = FactLayer::on();
     std::fs::create_dir_all(trees).unwrap();
     let orders = seed_repo(trees, "orders-api");
     let storefront = seed_repo(trees, "storefront");
@@ -2670,7 +2629,6 @@ async fn seed_payload_from(
     change: &dyn Fn(&Path),
 ) -> serde_json::Value {
     seed_env();
-    let _fact_layer = FactLayer::on();
     let tmp = tempfile::tempdir().unwrap();
     let repo = unlinked(tmp.path()).join(repo_name);
     copy_dir(&main.trees.join(repo_name), &repo);

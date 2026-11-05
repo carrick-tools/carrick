@@ -356,8 +356,8 @@ pub struct ApiEndpointDetails {
     /// What the site questions said about this row (carrick#2439): on a row
     /// an answer stated (`resolution_source: model`), the answer; on a reader
     /// row an answer below the fold band disagreed with, that answer as
-    /// `alternative`. `None` on every other row and on every blob written
-    /// with the switch off ([`crate::site_rows`]).
+    /// `alternative`. `None` on every other row and on every service the site
+    /// pass never read ([`crate::site_rows`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<crate::site_rows::Inference>,
 }

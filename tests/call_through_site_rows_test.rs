@@ -85,12 +85,7 @@ fn scan_command(repo: &Path, storage: &Path, home: &Path, cache: &Path) -> Comma
         .env(
             "CARRICK_SIDECAR_DIR",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
-        )
-        .env("CARRICK_SITE_QUESTIONS", "1")
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_FACT_FILES", "1")
-        .env("CARRICK_RECEIVER_TRACE", "1")
-        .env("CARRICK_SITE_PAYLOADS", "1");
+        );
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",

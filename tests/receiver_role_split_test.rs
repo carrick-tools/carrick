@@ -95,10 +95,7 @@ fn scan(installed: bool) -> Rows {
             format!("{}/", cassettes.display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_ALLOW_UNPREPARED", "1")
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1")
-        .env("CARRICK_RECEIVER_TRACE", "1");
+        .env("CARRICK_ALLOW_UNPREPARED", "1");
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",

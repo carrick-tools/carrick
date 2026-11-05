@@ -1389,18 +1389,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // The pass is timed from here: the walks are part of it, as they were
     // when each ran inside the loop.
     let pass_started = Instant::now();
-    // Every analysed service's compiler walk, when the run walks, admitted
-    // beside the analyses on the same budget (carrick#3085): each analysis
-    // starts once the walks it reads have ended.
-    let walking = walk_lane::requested();
-    if !walking {
-        info!("Walk lane off: no per-position rows are walked");
-    }
-    let (walk_ends, walked) = if walking {
-        walk_lane::signals(analysed.len())
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    // Every analysed service's compiler walk, admitted beside the analyses
+    // on the same budget (carrick#3085): each analysis starts once the walks
+    // it reads have ended.
+    let (walk_ends, walked) = walk_lane::signals(analysed.len());
     // Every service's detection and guidance, asked for from here on beside
     // the loop below instead of one service at a time inside it
     // (carrick#1895), each once its own walk has ended. Dropped with this
@@ -1417,14 +1409,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         },
         walked,
     );
-    let walk_slots = walking.then(|| std::sync::Arc::new(walk_lane::Slots::new(services.len())));
+    let walk_slots = std::sync::Arc::new(walk_lane::Slots::new(services.len()));
     let scan = std::sync::Arc::new(ServiceScan {
         repo_path: repo_path.to_string(),
         siblings: siblings::SiblingRegistry::new(
             repo_path,
             &services,
             scan_index.clone(),
-            walk_slots.clone(),
+            Some(std::sync::Arc::clone(&walk_slots)),
         ),
         services: analysed.into(),
         sidecar: recipe.clone(),
@@ -1432,10 +1424,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         graphql_schemas,
         setups: std::sync::Arc::new(setups),
         workspace: workspace_scan,
-        walking,
         reach,
         ahead: answers_ahead::requested()
-            .then(|| std::sync::Arc::new(answers_ahead::Board::new(analysed_count, walking))),
+            .then(|| std::sync::Arc::new(answers_ahead::Board::new(analysed_count, true))),
     });
     let upload_blocked = multi_service && !storage.supports_multi_service();
     let jobs: Vec<ServiceJob> = services
@@ -1470,82 +1461,75 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             }),
         )
     });
-    let mut outcomes = match &walk_slots {
-        Some(slots) => {
-            let clean_commit = (!git_state.dirty && !git_state.commit.is_empty())
-                .then(|| git_state.commit.clone());
-            // Per declared service: an analysed one's walk ends for its
-            // setup, and its rows are recorded at a clean tree's commit,
-            // whose inputs they are a walk of; a carried one's are walked
-            // from, and kept rows must be a walk of, the commit it is carried
-            // at (carrick#3027).
-            let mut walk_ends = walk_ends.into_iter();
-            let mut ended = Vec::with_capacity(services.len());
-            let mut at = Vec::with_capacity(services.len());
-            for (index, analysed_at) in scan_index.iter().enumerate() {
-                match analysed_at {
-                    Some(_) => {
-                        ended.push(walk_ends.next());
-                        at.push(clean_commit.clone());
-                    }
-                    None => {
-                        ended.push(None);
-                        at.push(match scopes.get(index) {
-                            Some(crate::change_scope::Scope::Carried { commit }) => {
-                                Some(commit.clone())
-                            }
-                            _ => None,
-                        });
-                    }
+    let mut outcomes = {
+        let clean_commit =
+            (!git_state.dirty && !git_state.commit.is_empty()).then(|| git_state.commit.clone());
+        // Per declared service: an analysed one's walk ends for its setup,
+        // and its rows are recorded at a clean tree's commit, whose inputs
+        // they are a walk of; a carried one's are walked from, and kept rows
+        // must be a walk of, the commit it is carried at (carrick#3027).
+        let mut walk_ends = walk_ends.into_iter();
+        let mut ended = Vec::with_capacity(services.len());
+        let mut at = Vec::with_capacity(services.len());
+        for (index, analysed_at) in scan_index.iter().enumerate() {
+            match analysed_at {
+                Some(_) => {
+                    ended.push(walk_ends.next());
+                    at.push(clean_commit.clone());
+                }
+                None => {
+                    ended.push(None);
+                    at.push(match scopes.get(index) {
+                        Some(crate::change_scope::Scope::Carried { commit }) => {
+                            Some(commit.clone())
+                        }
+                        _ => None,
+                    });
                 }
             }
-            // Each walk sized by the walk peak its previous generation stored
-            // (carrick#3085); a generation stored before walks were measured
-            // has its analysis peak only. How far a walk stays under that is
-            // unmeasured, so the walk starts at it rather than at the blind
-            // walk cap, and a death below the run's cap is walked again
-            // alone (carrick#3283).
-            let walk_memories = services
-                .iter()
-                .map(|service| {
-                    let stored_peak = (!no_cache)
-                        .then(|| previous_generation(previous_generations, &repo_name, service))
-                        .flatten()
-                        .and_then(|generation| {
-                            let peaks = generation.memory_peaks.as_ref()?;
-                            peaks.walk_mb.or(peaks.analysis_mb)
-                        });
-                    service_workers::ServiceMemory::for_walk(stored_peak, run_cap_mb)
-                })
-                .collect();
-            // The walks a read of a walked service may enter, which its
-            // analysis waits for. Nothing reads a sibling unless the site
-            // questions run, so then an analysis waits for its own walk alone.
-            let reaches_of: walk_lane::ReachesOf = if crate::site_questions::enabled() {
-                let scan = std::sync::Arc::clone(&scan);
-                std::sync::Arc::new(move |service: usize, walked: &walk_lane::Walked| {
-                    scan.siblings.walks_read_by(service, &walked.index())
-                })
-            } else {
-                std::sync::Arc::new(|_: usize, _: &walk_lane::Walked| Default::default())
-            };
-            let lane = walk_lane::Lane::new(
-                recipe,
-                repo_path,
-                &services,
-                at,
-                walk_memories,
-                run_cap_mb,
-                ended,
-                std::sync::Arc::clone(slots),
-                reaches_of,
-                std::sync::Arc::new(move |repo: &str, service: Option<&str>| {
-                    crate::position_rows::destination(should_upload, repo, service)
-                }),
-            );
-            scan.walk_and_analyze(jobs, &plan, lane).await
         }
-        None => scan.analyze_all(jobs, &plan).await,
+        // Each walk sized by the walk peak its previous generation stored
+        // (carrick#3085); a generation stored before walks were measured has
+        // its analysis peak only. How far a walk stays under that is
+        // unmeasured, so the walk starts at it rather than at the blind walk
+        // cap, and a death below the run's cap is walked again alone
+        // (carrick#3283).
+        let walk_memories = services
+            .iter()
+            .map(|service| {
+                let stored_peak = (!no_cache)
+                    .then(|| previous_generation(previous_generations, &repo_name, service))
+                    .flatten()
+                    .and_then(|generation| {
+                        let peaks = generation.memory_peaks.as_ref()?;
+                        peaks.walk_mb.or(peaks.analysis_mb)
+                    });
+                service_workers::ServiceMemory::for_walk(stored_peak, run_cap_mb)
+            })
+            .collect();
+        // The walks a read of a walked service may enter, which its analysis
+        // waits for.
+        let reaches_of: walk_lane::ReachesOf = {
+            let scan = std::sync::Arc::clone(&scan);
+            std::sync::Arc::new(move |service: usize, walked: &walk_lane::Walked| {
+                scan.siblings.walks_read_by(service, &walked.index())
+            })
+        };
+        let lane = walk_lane::Lane::new(
+            recipe,
+            repo_path,
+            &services,
+            at,
+            walk_memories,
+            run_cap_mb,
+            ended,
+            walk_slots,
+            reaches_of,
+            std::sync::Arc::new(move |repo: &str, service: Option<&str>| {
+                crate::position_rows::destination(should_upload, repo, service)
+            }),
+        );
+        scan.walk_and_analyze(jobs, &plan, lane).await
     };
     drop(answers_lane);
     // A service whose type checker died of memory beside another service,
@@ -2845,13 +2829,11 @@ struct ServiceScan {
     /// The repo-wide external-call pass, built by the first service to ask
     /// and read by the rest.
     workspace: std::sync::Arc<crate::external_call_candidates::WorkspaceScan>,
-    /// Whether the run walks each service's compiler rows (carrick#2413).
-    /// Each walk is kept in its slot in [`Self::siblings`] until the run
-    /// ends: read by its service's analysis, by the services that reach it,
-    /// and by the owed-work retry.
-    walking: bool,
     /// The other services of the run, read for the walks that enter them
-    /// (carrick#2618).
+    /// (carrick#2618). Each service's walk of its compiler rows
+    /// (carrick#2413) is kept in its slot here until the run ends: read by
+    /// its service's analysis, by the services that reach it, and by the
+    /// owed-work retry.
     siblings: siblings::SiblingRegistry,
     /// What a pull request run reads to decide each service's type reach
     /// (carrick#3102); `None` on any other run.
@@ -3300,17 +3282,16 @@ impl ServiceScan {
         let packages_took = service_started.elapsed();
 
         // The compiler's rows for every position of the service's files
-        // (carrick#2405), when asked for, read before discovery
-        // (carrick#2413). Walked in a process of its own that exited before
-        // this analysis started (carrick#3085). Outside the local and model
-        // split: the walk is neither the analysis nor its wait.
+        // (carrick#2405), read before discovery (carrick#2413). Walked in a
+        // process of its own that exited before this analysis started
+        // (carrick#3085). Outside the local and model split: the walk is
+        // neither the analysis nor its wait.
         let walked = self
             .siblings
             .declared(index)
-            .filter(|_| self.walking)
             .and_then(|own| self.siblings.walked(own));
         debug_assert!(
-            !self.walking || walked.is_some(),
+            walked.is_some(),
             "{label} was analysed before its walk ended"
         );
         let positions = walked.map(walk_lane::Walked::index);
@@ -3519,12 +3500,9 @@ impl ServiceScan {
             return;
         };
         let own = self.siblings.declared(at);
-        let walked = own
-            .filter(|_| self.walking)
-            .and_then(|own| self.siblings.walked(own));
-        if self.walking && walked.is_none() {
+        let Some(walked) = own.and_then(|own| self.siblings.walked(own)) else {
             return;
-        }
+        };
         let Ok(unchanged) = reusable_paths(repo_path, &previous.commit_hash) else {
             return;
         };
@@ -3557,7 +3535,7 @@ impl ServiceScan {
             repo_path,
             service,
             Default::default(),
-            walked.map(walk_lane::Walked::index),
+            Some(walked.index()),
             &self.workspace,
             Read::Sibling,
         )
@@ -4894,7 +4872,7 @@ fn discover_service(
         cm,
         positions,
         crate::request_summary::ROWS_JOIN_BUDGET,
-        crate::request_summary::discovery::receiver_trace_enabled(),
+        true,
         &workspace.test_only,
         read,
     )
@@ -5348,7 +5326,7 @@ async fn analyze_current_repo_incremental(
                     }
                     None => crate::agents::asked_ahead::AheadRole::None,
                 });
-            let (analysis, (settled, placements, fallbacks), library_answer, first_discovery) = tokio::join!(
+            let (analysis, (settled, placements, fallbacks), library_answer, ()) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -5459,21 +5437,13 @@ async fn analyze_current_repo_incremental(
             );
             protocol_extractions.library = library;
             let server_claims = server_claims_of(&claims, &semantics_root);
-            let declarations = member_declarations(
-                crate::site_questions::enabled()
-                    && crate::request_summary::discovery::receiver_trace_enabled(),
-                &request_inputs,
-                &claims,
-                sidecar,
-                &semantics_root,
-            );
+            let declarations =
+                member_declarations(&request_inputs, &claims, sidecar, &semantics_root);
             let results = result_index_of(
-                crate::site_questions::enabled(),
                 &request_inputs,
                 Path::new(repo_path),
                 &claims,
                 SiteContext {
-                    prior: first_discovery.as_ref(),
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
@@ -5484,7 +5454,6 @@ async fn analyze_current_repo_incremental(
             );
             let file_orchestrator = file_orchestrator.with_result_index(results.clone());
             protocol_extractions.site = site_rows_of(
-                crate::site_questions::enabled(),
                 &request_inputs,
                 repo_path,
                 service,
@@ -5492,7 +5461,6 @@ async fn analyze_current_repo_incremental(
                 SiteContext {
                     placements: Some(&placements),
                     library: library_ask.as_ref().map(|ask| &ask.sites),
-                    prior: first_discovery.as_ref(),
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
@@ -5501,14 +5469,12 @@ async fn analyze_current_repo_incremental(
             .await;
             yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
             let site_payloads = site_payloads_of(
-                crate::site_payloads::enabled(),
                 &request_inputs,
                 repo_path,
                 &claims,
                 SiteContext {
                     placements: Some(&placements),
                     library: library_ask.as_ref().map(|ask| &ask.sites),
-                    prior: first_discovery.as_ref(),
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
@@ -5682,7 +5648,7 @@ async fn analyze_current_repo_incremental(
             // withdrawn as in-process has no operation to type (carrick#1513).
             let pubsub_results = in_process_pubsub.pubsub_rows_kept(&merged_results);
             // Where the fact layer places a payload, the type capture reads it
-            // there (`CARRICK_SITE_PAYLOADS=1`; empty otherwise), so a
+            // there (empty with no compiler rows), so a
             // pub/sub symbol and locator the reader stated for that alias are
             // not the ones asked (carrick#2472 C3).
             let payload_infer = site_payloads.requests(
@@ -6256,7 +6222,7 @@ struct ProtocolExtractions {
     /// and the sidecar are at hand, after the scan above.
     library: crate::library_claims::LibraryRows,
     /// The rows and possible calls the decided sites come to (carrick#2439,
-    /// [`site_rows_of`]). Empty, and off, unless `CARRICK_SITE_QUESTIONS=1`.
+    /// [`site_rows_of`]). Empty, and off, until the site pass reads them.
     site: crate::site_rows::SiteRows,
     /// Where every socket row above stands (carrick#1670 T4), set by
     /// [`yield_bus_to_sockets`] once the site rows are read: the bus ops
@@ -6391,31 +6357,21 @@ impl LibraryAsk {
         if !typed {
             return None;
         }
-        let site_questions = crate::site_questions::enabled();
-        Self::of_with(
-            inputs,
-            siblings,
-            service_root,
-            repo_root,
-            turns,
-            site_questions,
-        )
-        .map(|ask| Self {
+        Self::of_with(inputs, siblings, service_root, repo_root, turns).map(|ask| Self {
             read_only: crate::local_mode::no_model(),
             ..ask
         })
     }
 
-    /// What the service asks: the roles [`crate::library_store::roles_for`]
-    /// `site_questions` (carrick#2436), for the public registry packages its
-    /// library calls go through.
+    /// What the service asks: every network role
+    /// ([`crate::library_store::NETWORK_ROLES`], carrick#2436), for the
+    /// public registry packages its library calls go through.
     #[cfg(test)]
     fn of(
         inputs: &crate::request_summary::RequestSummaryInputs,
         service_root: &Path,
         repo_root: &Path,
         turns: setup_ahead::AskTurns,
-        site_questions: bool,
     ) -> Option<Self> {
         Self::of_with(
             inputs,
@@ -6423,7 +6379,6 @@ impl LibraryAsk {
             service_root,
             repo_root,
             turns,
-            site_questions,
         )
     }
 
@@ -6438,15 +6393,14 @@ impl LibraryAsk {
         service_root: &Path,
         repo_root: &Path,
         turns: setup_ahead::AskTurns,
-        site_questions: bool,
     ) -> Option<Self> {
         let sites = crate::request_summary::library_sites(inputs);
-        let own = Self::asked_by(inputs, &sites, service_root, repo_root, site_questions);
+        let own = Self::asked_by(inputs, &sites, service_root, repo_root);
         let (asked, dropped) = crate::library_store::Asked::merged(
             own,
             siblings
                 .iter()
-                .filter_map(|sibling| sibling.asked(repo_root, site_questions)),
+                .filter_map(|sibling| sibling.asked(repo_root)),
         );
         if dropped > 0 {
             debug!(
@@ -6461,14 +6415,13 @@ impl LibraryAsk {
         })
     }
 
-    /// What the service whose read is `inputs` asks the library store, with
-    /// the roles `site_questions` asks for: `None` when it asks nothing.
+    /// What the service whose read is `inputs` asks the library store, for
+    /// every network role: `None` when it asks nothing.
     fn asked_by(
         inputs: &crate::request_summary::RequestSummaryInputs,
         sites: &crate::request_summary::LibrarySites,
         service_root: &Path,
         repo_root: &Path,
-        site_questions: bool,
     ) -> Option<crate::library_store::Asked> {
         let specifiers: BTreeSet<String> = sites.packages().into_values().flatten().collect();
         let home = dirs::home_dir();
@@ -6485,56 +6438,47 @@ impl LibraryAsk {
         };
         let asked = crate::library_store::request(&specifiers, &install);
         // The language's own library (carrick#2504): the default-library
-        // files the compiler read the code's globals from, asked only with
-        // site questions on.
+        // files the compiler read the code's globals from.
         let mut library = match inputs
             .positions
             .as_ref()
             .map(|p| p.default_library_globals())
         {
-            Some(Some((typescript, globals))) if site_questions => {
+            Some(Some((typescript, globals))) => {
                 crate::library_store::default_library_packages(typescript, globals)
             }
             _ => Vec::new(),
         };
         // And the runtime's own (carrick#2445): the globals its types
         // declare, for a program that loads no DOM library.
-        if site_questions {
-            library.extend(crate::library_store::runtime_global_packages(
-                &crate::request_summary::discovery::runtime_globals(inputs),
-                &install,
-            ));
-        }
+        library.extend(crate::library_store::runtime_global_packages(
+            &crate::request_summary::discovery::runtime_globals(inputs),
+            &install,
+        ));
         let asked = crate::library_store::Asked::with_default_library(asked, library);
         // And the packages it reaches only through their types (carrick#2588):
         // a package whose instance the service is handed as a parameter typed
         // by a type-only import makes no library site, so only the compiler's
         // call rows name it. Asked after everything above, so a cap drops
         // these first, and never a package the service already asks by value.
-        let asked = if site_questions {
-            let by_value: BTreeSet<&str> = specifiers
-                .iter()
-                .map(|specifier| crate::request_summary::package_name(specifier))
-                .collect();
-            let typed: BTreeSet<String> =
-                crate::request_summary::discovery::called_packages(inputs)
-                    .into_iter()
-                    .filter(|package| !by_value.contains(package.as_str()))
-                    .collect();
-            let (asked, dropped) = crate::library_store::Asked::merged(
-                asked,
-                crate::library_store::request_declared(&typed, &install),
+        let by_value: BTreeSet<&str> = specifiers
+            .iter()
+            .map(|specifier| crate::request_summary::package_name(specifier))
+            .collect();
+        let typed: BTreeSet<String> = crate::request_summary::discovery::called_packages(inputs)
+            .into_iter()
+            .filter(|package| !by_value.contains(package.as_str()))
+            .collect();
+        let (asked, dropped) = crate::library_store::Asked::merged(
+            asked,
+            crate::library_store::request_declared(&typed, &install),
+        );
+        if dropped > 0 {
+            debug!(
+                "Library store ask: {dropped} package(s) the service reaches only through their types were left out at the cap"
             );
-            if dropped > 0 {
-                debug!(
-                    "Library store ask: {dropped} package(s) the service reaches only through their types were left out at the cap"
-                );
-            }
-            asked
-        } else {
-            asked
-        };
-        asked.map(|asked| asked.with_roles(crate::library_store::roles_for(site_questions)))
+        }
+        asked.map(|asked| asked.with_roles(&crate::library_store::NETWORK_ROLES))
     }
 }
 
@@ -6619,9 +6563,8 @@ async fn settled_library_answer(
 /// Run discovery on the store's first answer and tell the file reader's
 /// orchestrator which files the fact layer would send it (carrick#2613,
 /// record-only). Always sends: `None` when the scan records nothing here
-/// (site questions off, nothing asked, no compiler rows), so the orchestrator
-/// never waits on a sender that is gone. The walk is returned, so the site
-/// questions reuse it when the settled answer equals the first.
+/// (nothing asked, no compiler rows), so the orchestrator never waits on a
+/// sender that is gone.
 async fn fact_files_of(
     ask: Option<&LibraryAsk>,
     first: tokio::sync::oneshot::Receiver<crate::library_store::FirstAnswer>,
@@ -6630,25 +6573,22 @@ async fn fact_files_of(
     root: &Path,
     implementations: &crate::request_summary::implementations::Implementations,
     sender: tokio::sync::oneshot::Sender<Option<crate::request_summary::fact_files::FactFiles>>,
-) -> Option<FirstDiscovery> {
+) {
     let recorded = match ask {
-        Some(ask) if crate::site_questions::enabled() && inputs.positions.is_some() => {
-            first.await.ok().map(|answer| (ask, answer))
-        }
+        Some(ask) if inputs.positions.is_some() => first.await.ok().map(|answer| (ask, answer)),
         _ => None,
     };
     let Some((ask, answer)) = recorded else {
         let _ = sender.send(None);
-        return None;
+        return;
     };
-    let (facts, first) =
-        first_discovery(&ask.sites, answer, inputs, siblings, root, implementations);
+    let facts = first_discovery(&ask.sites, answer, inputs, siblings, root, implementations);
     let _ = sender.send(Some(facts));
-    Some(first)
 }
 
-/// Discovery run on the store's first `answer`, and the files the fact layer
-/// would send the reader from it ([`crate::request_summary::fact_files`]).
+/// The files the fact layer would send the reader
+/// ([`crate::request_summary::fact_files`]), from discovery run on the
+/// store's first `answer`.
 fn first_discovery(
     library: &crate::request_summary::LibrarySites,
     answer: crate::library_store::FirstAnswer,
@@ -6656,10 +6596,7 @@ fn first_discovery(
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     root: &Path,
     implementations: &crate::request_summary::implementations::Implementations,
-) -> (
-    crate::request_summary::fact_files::FactFiles,
-    FirstDiscovery,
-) {
+) -> crate::request_summary::fact_files::FactFiles {
     // With the packages answered, so a call into one the store has not
     // answered is told apart (`unanswered_package`) from a call it answered
     // with nothing to label.
@@ -6684,18 +6621,11 @@ fn first_discovery(
     );
     // A walk into a sibling ends in a file this service does not read: it
     // selects none of its own and lists no span there (carrick#2618).
-    let facts = if siblings.is_empty() {
+    if siblings.is_empty() {
         facts
     } else {
         facts.within(|file| inputs.files.contains_key(&root.join(file)))
-    };
-    (
-        facts,
-        FirstDiscovery {
-            exports: answer.exports,
-            discovery,
-        },
-    )
+    }
 }
 
 /// The service's library rows: its library sites read through the claims
@@ -6752,21 +6682,16 @@ fn server_claims_of(
 /// The service's site rows (carrick#2439): every call discovery finds that
 /// reaches an export the settled `claims` label, reported where its name is
 /// decided, its record built, the records that ask a slot asked, and the
-/// answers read into rows and possible calls ([`crate::site_rows`]). Off
-/// unless `enabled` (`CARRICK_SITE_QUESTIONS=1`); with no compiler rows
-/// (`CARRICK_POSITION_ROWS=1`) discovery finds nothing. A row in a mock or
-/// test tree of the service states nothing.
+/// answers read into rows and possible calls ([`crate::site_rows`]). With no
+/// compiler rows discovery finds nothing. A row in a mock or test tree of the
+/// service states nothing.
 async fn site_rows_of(
-    enabled: bool,
     inputs: &crate::request_summary::RequestSummaryInputs,
     repo_path: &str,
     service: &Config,
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> crate::site_rows::SiteRows {
-    if !enabled {
-        return crate::site_rows::SiteRows::default();
-    }
     let root = Path::new(repo_path);
     let SiteRecordsOf {
         discovered,
@@ -6852,20 +6777,14 @@ async fn site_rows_of(
 }
 
 /// Where the service's decided sites place their payloads (phase 3 step 1,
-/// [`crate::site_payloads`]). Built only when `enabled`
-/// (`CARRICK_SITE_PAYLOADS=1`), from the same records the site questions
-/// read; with no compiler rows (`CARRICK_POSITION_ROWS=1`) discovery finds
-/// no site and nothing moves.
+/// [`crate::site_payloads`]), from the same records the site questions read;
+/// with no compiler rows discovery finds no site and nothing moves.
 fn site_payloads_of(
-    enabled: bool,
     inputs: &crate::request_summary::RequestSummaryInputs,
     repo_path: &str,
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> crate::site_payloads::SitePayloads {
-    if !enabled {
-        return crate::site_payloads::SitePayloads::default();
-    }
     let records = site_records_of(inputs, Path::new(repo_path), claims, context).records;
     let payloads = crate::site_payloads::SitePayloads::of(&records);
     debug!(
@@ -6883,12 +6802,10 @@ fn site_payloads_of(
 struct SiteContext<'a> {
     placements: Option<&'a crate::request_summary::decided_sites::SummaryPlacements>,
     library: Option<&'a crate::request_summary::LibrarySites>,
-    /// The walk made on the store's first answer, read again when the settled
-    /// answer is the same (carrick#2613).
-    prior: Option<&'a FirstDiscovery>,
-    /// With the receiver trace on (carrick#2474 R1): the member
-    /// declarations verified op claims resolve to ([`member_declarations`]).
-    /// `None` leaves discovery as it was.
+    /// For the receiver trace (carrick#2474 R1): the member declarations
+    /// verified op claims resolve to ([`member_declarations`]). `None` only
+    /// for a service with no compiler rows, and in tests of the untraced
+    /// walk.
     declarations: Option<&'a crate::request_summary::discovery::MemberDeclarations>,
     /// The other services of the run the service's walk may enter
     /// (carrick#2618); none when it calls into no other.
@@ -6898,19 +6815,10 @@ struct SiteContext<'a> {
     implementations: Option<&'a crate::request_summary::implementations::Implementations>,
 }
 
-/// Discovery run on the library store's first answer, before the file reader
-/// dispatched (carrick#2613), with the answer it read. The site questions read
-/// it instead of walking again when the settled answer equals it.
-#[derive(Debug)]
-struct FirstDiscovery {
-    exports: Vec<crate::library_claims::ExportClaims>,
-    discovery: crate::request_summary::discovery::Discovery,
-}
-
 /// What the analysis sidecar finds for each call of the service through an
 /// interface member (carrick#2432 slice B), asked once, before the walks that
-/// read it. Empty unless site questions are on and the service has rows and a
-/// type checker; a failed ask leaves each call the `interface_member` stop it
+/// read it. Empty unless the service has rows and a type checker; a failed
+/// ask leaves each call the `interface_member` stop it
 /// was. The ask waits on the service's analysis and runs under the sidecar's
 /// own silence deadline.
 fn implementations_for(
@@ -6922,7 +6830,7 @@ fn implementations_for(
     let Some(sidecar) = sidecar else {
         return Implementations::default();
     };
-    if !crate::site_questions::enabled() || inputs.positions.is_none() {
+    if inputs.positions.is_none() {
         return Implementations::default();
     }
     let found = implementations_of(inputs, |queries| {
@@ -6941,18 +6849,16 @@ fn implementations_for(
 /// member a `call` row of that package names, on every receiver the claim
 /// applies to ([`crate::request_summary::discovery::declaration_ask`]). It
 /// runs under the library checks' time limit; the checks it does not reach
-/// are counted. `None` unless `enabled` (`CARRICK_RECEIVER_TRACE=1` with site
-/// questions on) and the service has rows. No sidecar, or a failed request,
-/// indexes nothing; the trace still records each site's receiver.
+/// are counted. `None` when the service has no rows. No sidecar, or a failed
+/// request, indexes nothing; the trace still records each site's receiver.
 fn member_declarations(
-    enabled: bool,
     inputs: &crate::request_summary::RequestSummaryInputs,
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
 ) -> Option<crate::request_summary::discovery::MemberDeclarations> {
     use crate::request_summary::discovery::{MemberDeclarations, declaration_ask};
-    if !enabled || inputs.positions.is_none() {
+    if inputs.positions.is_none() {
         return None;
     }
     let ask = declaration_ask(inputs, claims);
@@ -7012,51 +6918,33 @@ fn discovered_sites(
         .collect()
 }
 
-/// The calls of `inputs` that reach a labelled export: the walk made on the
-/// store's first answer when `context` holds it and the settled answer is the
-/// same, else a walk made now and left in `walked`.
-fn discovery_of<'a>(
+/// The calls of `inputs` that reach a labelled export.
+fn discovery_of(
     inputs: &crate::request_summary::RequestSummaryInputs,
     root: &Path,
     claims: &[crate::library_claims::ExportClaims],
-    context: SiteContext<'a>,
-    walked: &'a mut Option<crate::request_summary::discovery::Discovery>,
-) -> &'a crate::request_summary::discovery::Discovery {
-    // A walk made without the trace is not the walk the trace asks for.
-    let prior = context
-        .prior
-        .filter(|prior| prior.exports == claims && context.declarations.is_none());
-    match prior {
-        Some(prior) => &prior.discovery,
-        None => {
-            let labels = match context.declarations {
-                Some(declarations) => {
-                    crate::request_summary::discovery::Labels::traced(claims, declarations)
-                }
-                None => crate::request_summary::discovery::Labels::of(claims),
-            };
-            let labels = match context.implementations {
-                Some(implementations) => labels.following(implementations),
-                None => labels,
-            };
-            walked.insert(crate::request_summary::discovery::discover_with(
-                inputs,
-                context.siblings,
-                &labels,
-                root,
-            ))
+    context: SiteContext<'_>,
+) -> crate::request_summary::discovery::Discovery {
+    let labels = match context.declarations {
+        Some(declarations) => {
+            crate::request_summary::discovery::Labels::traced(claims, declarations)
         }
-    }
+        None => crate::request_summary::discovery::Labels::of(claims),
+    };
+    let labels = match context.implementations {
+        Some(implementations) => labels.following(implementations),
+        None => labels,
+    };
+    crate::request_summary::discovery::discover_with(inputs, context.siblings, &labels, root)
 }
 
 /// The results the store labels and the sidecar verifies (carrick#2819): one
 /// `result` check for each labelled claim whose end discovery finds, beside
 /// the member declarations' request and under the library checks' time limit.
-/// Empty unless `enabled`, the service has rows and some claim carries a
-/// result, so a scan whose store labels none walks and asks nothing more. No
-/// sidecar, or a failed request, indexes nothing.
+/// Empty unless the service has rows and some claim carries a result, so a
+/// scan whose store labels none walks and asks nothing more. No sidecar, or a
+/// failed request, indexes nothing.
 fn result_index_of(
-    enabled: bool,
     inputs: &crate::request_summary::RequestSummaryInputs,
     root: &Path,
     claims: &[crate::library_claims::ExportClaims],
@@ -7071,12 +6959,11 @@ fn result_index_of(
             .iter()
             .any(|claim| claim.result_check().is_some())
     });
-    if !enabled || !labelled || inputs.positions.is_none() {
+    if !labelled || inputs.positions.is_none() {
         return ResultIndex::default();
     }
-    let mut walked = None;
-    let discovery = discovery_of(inputs, root, claims, context, &mut walked);
-    let ask = result_checks(claims, discovery);
+    let discovery = discovery_of(inputs, root, claims, context);
+    let ask = result_checks(claims, &discovery);
     let verdicts = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
             match sidecar.verify_library_claims(from_dir, &ask.checks) {
@@ -7089,7 +6976,7 @@ fn result_index_of(
         }
         _ => Vec::new(),
     };
-    let index = ResultIndex::of(&ask, &verdicts, discovery);
+    let index = ResultIndex::of(&ask, &verdicts, &discovery);
     debug!(
         checks = index.checks,
         not_reached = index.not_reached,
@@ -7109,14 +6996,13 @@ fn site_records_of(
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> SiteRecordsOf {
-    let mut walked = None;
-    let discovery = discovery_of(inputs, root, claims, context, &mut walked);
+    let discovery = discovery_of(inputs, root, claims, context);
     let reached_label = discovery
         .sites
         .iter()
         .filter(|site| site.end.is_some())
         .count();
-    let discovered = discovered_sites(discovery);
+    let discovered = discovered_sites(&discovery);
     let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
     // With the receiver trace on, each request handler's path and method
     // comparisons, as the records the handler questions ask (carrick#2474
@@ -8193,8 +8079,9 @@ fn append_deterministic_protocol_operations(
             crate::site_rows::RowSide::Endpoint => to_producer(key, file, line),
         },
     );
-    crate::possible_calls::attach_when(extractions.site.enabled, cloud_data, site.leads.clone());
+    // A service the site pass never read writes neither key.
     if extractions.site.enabled {
+        crate::possible_calls::attach(cloud_data, site.leads.clone());
         debug!(
             routes = extractions.site.routes.len(),
             route_kept_reader = site.route_kept_reader,
@@ -11018,8 +10905,9 @@ enum Read {
 /// rows, when the run walked them, to the text discovery parses it from
 /// (carrick#2413): the one read of the file, so the rows' hash is checked
 /// against the bytes every span is counted in. Binding the rows may take
-/// `rows_budget` (carrick#2564). With `receiver_trace`, it also reads the
-/// files only tests import (carrick#2775).
+/// `rows_budget` (carrick#2564). With `test_only_files`, it also reads the
+/// files only tests import, for the receiver trace (carrick#2775): a
+/// service's read is, a sibling's read for another's walk is not.
 #[allow(clippy::too_many_arguments)]
 fn discover_with_positions(
     repo_path: &str,
@@ -11027,7 +10915,7 @@ fn discover_with_positions(
     cm: Lrc<SourceMap>,
     mut positions: Option<crate::position_rows::PositionIndex>,
     rows_budget: std::time::Duration,
-    receiver_trace: bool,
+    test_only_files: bool,
     test_only_cache: &crate::test_only_files::Cache,
     read: Read,
 ) -> FileDiscoveryResult {
@@ -11266,7 +11154,7 @@ fn discover_with_positions(
     }
     // The files only tests import: the receiver trace ignores the router
     // mounts made in them (carrick#2775). Read for the trace alone.
-    let test_only = if receiver_trace {
+    let test_only = if test_only_files {
         let started = Instant::now();
         let test_only = crate::test_only_files::of(
             test_only_cache,
@@ -13231,7 +13119,7 @@ async fn analyze_current_repo(
     );
     let (early_answer, first_answer) = tokio::sync::oneshot::channel();
     let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
-    let (analysis_result, (settled, placements, fallbacks), library_answer, first_discovery) = tokio::join!(
+    let (analysis_result, (settled, placements, fallbacks), library_answer, ()) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -13317,21 +13205,12 @@ async fn analyze_current_repo(
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
     protocol_extractions.library = library;
     let server_claims = server_claims_of(&claims, &service_root);
-    let declarations = member_declarations(
-        crate::site_questions::enabled()
-            && crate::request_summary::discovery::receiver_trace_enabled(),
-        &request_inputs,
-        &claims,
-        sidecar,
-        &service_root,
-    );
+    let declarations = member_declarations(&request_inputs, &claims, sidecar, &service_root);
     let results = result_index_of(
-        crate::site_questions::enabled(),
         &request_inputs,
         Path::new(repo_path),
         &claims,
         SiteContext {
-            prior: first_discovery.as_ref(),
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
@@ -13341,7 +13220,6 @@ async fn analyze_current_repo(
         &service_root,
     );
     protocol_extractions.site = site_rows_of(
-        crate::site_questions::enabled(),
         &request_inputs,
         repo_path,
         service,
@@ -13349,7 +13227,6 @@ async fn analyze_current_repo(
         SiteContext {
             placements: Some(&placements),
             library: library_ask.as_ref().map(|ask| &ask.sites),
-            prior: first_discovery.as_ref(),
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
@@ -13358,14 +13235,12 @@ async fn analyze_current_repo(
     .await;
     yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
     let site_payloads = site_payloads_of(
-        crate::site_payloads::enabled(),
         &request_inputs,
         repo_path,
         &claims,
         SiteContext {
             placements: Some(&placements),
             library: library_ask.as_ref().map(|ask| &ask.sites),
-            prior: first_discovery.as_ref(),
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
@@ -25516,50 +25391,11 @@ unfollowed_member_calls_total: 0,
         }
     }
 
-    /// carrick#2515: with the switch off, an export the store labels with no
-    /// op writes no lead either; the blob is as it was.
-    #[tokio::test]
-    async fn an_export_with_no_op_writes_nothing_with_the_switch_off() {
-        let inputs = crate::engine::discover_request_inputs(
-            &crate::request_summary::decided_sites::tests::decided_fixture(),
-        );
-        let claims: Vec<crate::library_claims::ExportClaims> =
-            serde_json::from_value(serde_json::json!([
-                { "package": "gql-thing", "version": "1.0.0", "specifier": "gql-thing",
-                  "export": "Client", "role": "graphql_client", "claims": [] }
-            ]))
-            .unwrap();
-        let off = site_rows_of(
-            false,
-            &inputs,
-            ".",
-            &Config::default(),
-            &claims,
-            SiteContext::default(),
-        )
-        .await;
-        assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
-    }
-
-    /// carrick#2439: with the switch off the site pass reads nothing and the
-    /// blob is byte for byte the one the scan wrote before it, with no
-    /// `possible_calls` and no `inference` on any row.
-    #[tokio::test]
-    async fn site_rows_off_leave_the_blob_byte_identical() {
-        let inputs = crate::engine::discover_request_inputs(
-            &crate::request_summary::decided_sites::tests::decided_fixture(),
-        );
-        let off = site_rows_of(
-            false,
-            &inputs,
-            ".",
-            &Config::default(),
-            &[],
-            SiteContext::default(),
-        )
-        .await;
-        assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
-
+    /// carrick#2439: a service the site pass never read keeps its blob byte
+    /// for byte as the other passes wrote it, with no `possible_calls` and no
+    /// `inference` on any row.
+    #[test]
+    fn site_rows_never_read_leave_the_blob_byte_identical() {
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         file_results.insert(
             "svc/src/orders.ts".to_string(),
@@ -25591,7 +25427,7 @@ unfollowed_member_calls_total: 0,
             serde_json::to_string(&cloud_data).unwrap()
         };
         let before = blob(crate::site_rows::SiteRows::default());
-        // A pass that was off holds rows only by mistake; none of them
+        // A pass that never ran holds rows only by mistake; none of them
         // reaches the blob.
         let stray = crate::site_rows::SiteRows {
             enabled: false,
@@ -25603,7 +25439,6 @@ unfollowed_member_calls_total: 0,
             )],
             ..crate::site_rows::SiteRows::default()
         };
-        assert_eq!(blob(off), before);
         assert_eq!(blob(stray), before);
         assert!(!before.contains("possible_calls") && !before.contains("inference"));
     }
@@ -25702,11 +25537,10 @@ unfollowed_member_calls_total: 0,
         );
     }
 
-    /// carrick#2436: a service's library ask names every network role with
-    /// site questions on, and today's message roles, byte for byte, with them
-    /// off, for the same packages.
+    /// carrick#2436: a service's library ask names every network role for
+    /// its packages.
     #[test]
-    fn a_service_s_library_ask_names_the_roles_its_switch_picks() {
+    fn a_service_s_library_ask_names_every_network_role() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let write = |file: &str, text: &str| {
@@ -25731,19 +25565,12 @@ unfollowed_member_calls_total: 0,
             "import { bus } from \"fixture-bus\";\nexport async function send() {\n  await bus.publish(\"orders.created\", { id: 1 });\n}\n",
         );
         let inputs = crate::engine::discover_request_inputs(root);
-        let body = |site_questions: bool| {
-            let ask =
-                super::LibraryAsk::of(&inputs, root, root, Default::default(), site_questions)
-                    .expect("the service asks about its public package");
-            serde_json::to_string(&ask.asked.request).unwrap()
-        };
+        let ask = super::LibraryAsk::of(&inputs, root, root, Default::default())
+            .expect("the service asks about its public package");
+        let body = serde_json::to_string(&ask.asked.request).unwrap();
         let packages = r#""packages":[{"package":"fixture-bus","version":"1.0.0","specifiers":["fixture-bus"]}]"#;
         assert_eq!(
-            body(false),
-            format!(r#"{{"roles":["broker","socket","in_process_bus"],{packages}}}"#)
-        );
-        assert_eq!(
-            body(true),
+            body,
             format!(
                 r#"{{"roles":["broker","socket","in_process_bus","http_client","graphql_client","server_framework"],{packages}}}"#
             )
@@ -25766,12 +25593,11 @@ unfollowed_member_calls_total: 0,
             .to_string()
     }
 
-    /// carrick#2436: with site questions on, the scan asks the store for
-    /// every network role, so a call through an HTTP client's export is a
-    /// discovery site with its record. Off, the ask names the message roles
-    /// alone, the store answers no HTTP label, and the call is no site.
+    /// carrick#2436: the scan asks the store for every network role, so a
+    /// call through an HTTP client's export is a discovery site with its
+    /// record.
     #[tokio::test]
-    async fn an_http_client_s_call_is_a_site_only_when_site_questions_ask_its_role() {
+    async fn an_http_client_s_call_is_a_site_when_the_ask_names_its_role() {
         let edit = [
             (
                 "node_modules/fixture-http/package.json",
@@ -25796,52 +25622,45 @@ unfollowed_member_calls_total: 0,
             return;
         };
         let file = "services/web/src/orders-api.ts";
-        for site_questions in [false, true] {
-            let asked = crate::library_store::Asked::naming_for(
-                &["fixture-http"],
-                crate::library_store::roles_for(site_questions),
-            );
-            let settled = crate::library_store::ask_until_settled(
-                &asked,
-                |_| async {},
-                |request| async move { Ok(http_store(&request)) },
-                None,
-            )
-            .await;
-            let of = super::site_records_of(
-                &on.inputs,
-                &on.repo,
-                &settled.exports,
-                super::SiteContext::default(),
-            );
-            let sites: Vec<(String, u32, String)> = of
-                .decided
-                .sites
-                .iter()
-                .filter(|site| site.file == file)
-                .map(|site| (site.file.clone(), site.line, site.end.role.clone()))
-                .collect();
-            let records = of
-                .records
-                .iter()
-                .filter(|record| {
-                    serde_json::to_string(&record.state.point)
-                        .unwrap()
-                        .contains("orders-api.ts")
-                })
-                .count();
-            if site_questions {
-                assert_eq!(
-                    sites,
-                    vec![(file.to_string(), 4, "http_client".to_string())],
-                    "on: the HTTP call is a site"
-                );
-                assert_eq!(records, 1, "on: the site has its record");
-            } else {
-                assert!(sites.is_empty(), "off: no HTTP label, no site");
-                assert_eq!(records, 0);
-            }
-        }
+        let asked = crate::library_store::Asked::naming_for(
+            &["fixture-http"],
+            &crate::library_store::NETWORK_ROLES,
+        );
+        let settled = crate::library_store::ask_until_settled(
+            &asked,
+            |_| async {},
+            |request| async move { Ok(http_store(&request)) },
+            None,
+        )
+        .await;
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &settled.exports,
+            super::SiteContext::default(),
+        );
+        let sites: Vec<(String, u32, String)> = of
+            .decided
+            .sites
+            .iter()
+            .filter(|site| site.file == file)
+            .map(|site| (site.file.clone(), site.line, site.end.role.clone()))
+            .collect();
+        let records = of
+            .records
+            .iter()
+            .filter(|record| {
+                serde_json::to_string(&record.state.point)
+                    .unwrap()
+                    .contains("orders-api.ts")
+            })
+            .count();
+        assert_eq!(
+            sites,
+            vec![(file.to_string(), 4, "http_client".to_string())],
+            "the HTTP call is a site"
+        );
+        assert_eq!(records, 1, "the site has its record");
     }
 
     /// carrick#2504: the file a service calls `fetch(url, init)` in.
@@ -25855,12 +25674,11 @@ unfollowed_member_calls_total: 0,
     }
 
     /// carrick#2504: a service asks the store for the language's own
-    /// library only with site questions on: one `lib:<file>` package per
-    /// default-library file its code's globals are declared in, at the
-    /// compiler's version, narrowed with `exports` to those globals. Off, the
-    /// request is the one a run with no rows makes, byte for byte.
+    /// library: one `lib:<file>` package per default-library file its code's
+    /// globals are declared in, at the compiler's version, narrowed with
+    /// `exports` to those globals.
     #[test]
-    fn a_service_asks_for_the_language_s_library_only_with_site_questions_on() {
+    fn a_service_asks_for_the_language_s_library() {
         let Some(on) = crate::request_summary::fixture_walk::walked(
             "discovery",
             "services/web",
@@ -25871,17 +25689,12 @@ unfollowed_member_calls_total: 0,
             return;
         };
         let root = on.repo.join("services/web");
-        let body = |inputs: &crate::request_summary::RequestSummaryInputs, site_questions| {
-            super::LibraryAsk::of(inputs, &root, &on.repo, Default::default(), site_questions)
+        let body = |inputs: &crate::request_summary::RequestSummaryInputs| {
+            super::LibraryAsk::of(inputs, &root, &on.repo, Default::default())
                 .map(|ask| serde_json::to_string(&ask.asked.request).unwrap())
         };
-        let off = body(&on.inputs, false).expect("off: the service asks about its packages");
-        assert!(
-            !off.contains("lib:") && !off.contains("exports"),
-            "off: the request names no library: {off}"
-        );
         let request =
-            serde_json::from_str::<serde_json::Value>(&body(&on.inputs, true).unwrap()).unwrap();
+            serde_json::from_str::<serde_json::Value>(&body(&on.inputs).unwrap()).unwrap();
         let (typescript, _) = on
             .inputs
             .positions
@@ -25935,11 +25748,11 @@ unfollowed_member_calls_total: 0,
 
     /// carrick#2445: a service asks for a global the runtime's types
     /// declare under the key the store gives the file (`node:web-globals/fetch`),
-    /// at the runtime types' installed version, narrowed to the name, only
-    /// with site questions on; and asks no `lib:` key for it. A program
-    /// that loads the DOM library asks only `lib:lib.dom.d.ts`.
+    /// at the runtime types' installed version, narrowed to the name; and
+    /// asks no `lib:` key for it. A program that loads the DOM library asks
+    /// only `lib:lib.dom.d.ts`.
     #[test]
-    fn a_service_asks_for_the_runtime_s_globals_only_with_site_questions_on() {
+    fn a_service_asks_for_the_runtime_s_globals() {
         let Some(on) = crate::request_summary::fixture_walk::walked(
             "discovery",
             "services/web",
@@ -25950,17 +25763,12 @@ unfollowed_member_calls_total: 0,
             return;
         };
         let root = on.repo.join("services/web");
-        let body = |inputs: &crate::request_summary::RequestSummaryInputs, site_questions| {
-            super::LibraryAsk::of(inputs, &root, &on.repo, Default::default(), site_questions)
+        let body = |inputs: &crate::request_summary::RequestSummaryInputs| {
+            super::LibraryAsk::of(inputs, &root, &on.repo, Default::default())
                 .map(|ask| serde_json::to_string(&ask.asked.request).unwrap())
         };
-        let off = body(&on.inputs, false).expect("off: the service asks about its packages");
-        assert!(
-            !off.contains("web-globals") && !off.contains("exports"),
-            "off: the request names no runtime global: {off}"
-        );
         let request =
-            serde_json::from_str::<serde_json::Value>(&body(&on.inputs, true).unwrap()).unwrap();
+            serde_json::from_str::<serde_json::Value>(&body(&on.inputs).unwrap()).unwrap();
         let packages = request["packages"].as_array().unwrap();
         let runtime = packages
             .iter()
@@ -25988,8 +25796,7 @@ unfollowed_member_calls_total: 0,
         ) else {
             return;
         };
-        let asked =
-            serde_json::from_str::<serde_json::Value>(&body(&dom.inputs, true).unwrap()).unwrap();
+        let asked = serde_json::from_str::<serde_json::Value>(&body(&dom.inputs).unwrap()).unwrap();
         assert!(
             asked["packages"]
                 .as_array()
@@ -26018,7 +25825,7 @@ unfollowed_member_calls_total: 0,
             return;
         };
         let root = on.repo.join("services/web");
-        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default())
             .expect("the service asks the store");
         let store = |request: &crate::library_store::LibraryClaimsRequest| {
             let answers: Vec<serde_json::Value> = request
@@ -26123,7 +25930,7 @@ unfollowed_member_calls_total: 0,
             return;
         };
         let root = on.repo.join("services/web");
-        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default())
             .expect("the service asks the store");
         let settled = crate::library_store::ask_until_settled(
             &ask.asked,
@@ -26162,11 +25969,9 @@ unfollowed_member_calls_total: 0,
     }
 
     /// carrick#2613: the store's first answer gives the fact layer's files
-    /// before the settle ends (the file holding a site is one), and the site
-    /// questions read that walk again, not a second one, only while the
-    /// settled answer equals the first.
+    /// before the settle ends (the file holding a site is one).
     #[tokio::test]
-    async fn the_first_answers_walk_is_read_again_only_for_an_equal_settled_answer() {
+    async fn the_first_answer_gives_the_fact_files_before_the_settle_ends() {
         let Some(on) = crate::request_summary::fixture_walk::walked(
             "discovery",
             "services/web",
@@ -26177,7 +25982,7 @@ unfollowed_member_calls_total: 0,
             return;
         };
         let root = on.repo.join("services/web");
-        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default())
             .expect("the service asks the store");
         let (early, first) = tokio::sync::oneshot::channel();
         let settled = crate::library_store::ask_until_settled(
@@ -26189,7 +25994,7 @@ unfollowed_member_calls_total: 0,
         .await;
         let first = first.await.expect("the first answer is sent");
         assert_eq!(first.exports, settled.exports, "the settle added nothing");
-        let (facts, prior) = super::first_discovery(
+        let facts = super::first_discovery(
             &ask.sites,
             first,
             &on.inputs,
@@ -26208,37 +26013,6 @@ unfollowed_member_calls_total: 0,
             }),
             "the call is recorded as a site"
         );
-        // An equal settled answer reads the prior walk: an emptied one finds
-        // no site, so the walk was not made again.
-        let emptied = super::FirstDiscovery {
-            exports: prior.exports.clone(),
-            discovery: Default::default(),
-        };
-        let reused = super::site_records_of(
-            &on.inputs,
-            &on.repo,
-            &settled.exports,
-            super::SiteContext {
-                prior: Some(&emptied),
-                ..Default::default()
-            },
-        );
-        assert_eq!(reused.discovered, 0, "the prior walk was read");
-        // A different settled answer walks again.
-        let stale = super::FirstDiscovery {
-            exports: Vec::new(),
-            discovery: Default::default(),
-        };
-        let walked = super::site_records_of(
-            &on.inputs,
-            &on.repo,
-            &settled.exports,
-            super::SiteContext {
-                prior: Some(&stale),
-                ..Default::default()
-            },
-        );
-        assert!(walked.discovered > 0, "a settle that changed it walks");
     }
 
     /// carrick#2506: a factory typed in a DefinitelyTyped-style package

@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn calls(fixture_dir: &str) -> Vec<serde_json::Value> {
-    scan_calls(fixture_dir, false)
+    scan_calls(fixture_dir)
 }
 
 /// Whether the live sidecar can run. CI builds it before the Rust tests, so
@@ -49,10 +49,10 @@ fn calls_with_rows(fixture_dir: &str) -> Option<Vec<serde_json::Value>> {
         eprintln!("Skipping: node or the built sidecar is missing");
         return None;
     }
-    Some(scan_calls(fixture_dir, true))
+    Some(scan_calls(fixture_dir))
 }
 
-fn scan_calls(fixture_dir: &str, rows: bool) -> Vec<serde_json::Value> {
+fn scan_calls(fixture_dir: &str) -> Vec<serde_json::Value> {
     let repo = env!("CARGO_MANIFEST_DIR");
     let fixture = format!("{repo}/tests/fixtures/{fixture_dir}");
     let mock_dir = format!("{fixture}/__llm__/");
@@ -66,11 +66,6 @@ fn scan_calls(fixture_dir: &str, rows: bool) -> Vec<serde_json::Value> {
         .env_remove("GITHUB_REPOSITORY")
         .env_remove("GITHUB_ACTIONS")
         .env_remove("CI");
-    if rows {
-        cmd.env("CARRICK_POSITION_ROWS", "1");
-    } else {
-        cmd.env_remove("CARRICK_POSITION_ROWS");
-    }
     let output = cmd.output().expect("failed to spawn carrick binary");
 
     assert!(

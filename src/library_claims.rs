@@ -2239,8 +2239,7 @@ mod tests {
         );
     }
 
-    /// carrick#2436: with site questions on the store answers every network
-    /// role, and a claim of a role other than the message roles (an HTTP
+    /// carrick#2436: the store answers every network role, and a claim of a role other than the message roles (an HTTP
     /// client's, a server framework's) feeds discovery and the site rows
     /// only. Here it asks no check and states no library row: the rows are
     /// those of the message-role claims alone, byte for byte.

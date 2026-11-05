@@ -6,9 +6,9 @@
 //! client. The record is built by #2435 and the answers become rows in #2439;
 //! neither is here.
 //!
-//! - **Switch.** Nothing is sent unless `CARRICK_SITE_QUESTIONS=1`
-//!   ([`enabled`]). With it unset the scanner sends nothing new, and every
-//!   site is unanswered.
+//! - **When.** Every scan that may ask the model sends them ([`asks`],
+//!   carrick#3283). A no-model pass sends nothing, and every site is
+//!   unanswered.
 //! - **Route.** `POST /site-questions`, through the agent service's one path
 //!   ([`crate::agent_service::AgentService::post_to_lambda`]): the scanner's
 //!   credential, the `X-Carrick-Scanner-Version` gate, the pacer, and the
@@ -59,9 +59,6 @@ use crate::agent_service::{AgentCallError, AgentService};
 /// The route.
 pub const ROUTE: &str = "/site-questions";
 
-/// The switch (#2439): on only when set to `1`.
-pub const SWITCH: &str = "CARRICK_SITE_QUESTIONS";
-
 /// The offline answer's key: `<CARRICK_MOCK_FIXTURE_DIR>/site-questions/default.json`.
 pub const MOCK_SEED: &str = "default";
 
@@ -90,27 +87,12 @@ pub fn agent() -> AgentService {
     AgentService::new().with_retry_policy(crate::agent_service::RetryPolicy::RUN_BUDGETED)
 }
 
-/// Whether the switch is on in this process.
-pub fn enabled() -> bool {
-    enabled_from(std::env::var(SWITCH).ok().as_deref())
-}
-
-/// Whether this process sends its site and handler questions: the switch is
-/// on and the run may ask the model. A no-model pass (`check`, `refresh`,
-/// `init`'s read-in, the after-edit hook) builds its records and asks
-/// nothing, so a slot only an answer fills stays unfilled (carrick#2907).
+/// Whether this process sends its site and handler questions: the run may
+/// ask the model. A no-model pass (`check`, `refresh`, `init`'s read-in, the
+/// after-edit hook) builds its records and asks nothing, so a slot only an
+/// answer fills stays unfilled (carrick#2907).
 pub fn asks() -> bool {
-    asks_with(enabled(), crate::local_mode::no_model())
-}
-
-/// [`asks`], given the switch and whether the run asks no model.
-fn asks_with(enabled: bool, no_model: bool) -> bool {
-    enabled && !no_model
-}
-
-/// Whether a value of [`SWITCH`] turns site questions on: `1` only.
-pub fn enabled_from(value: Option<&str>) -> bool {
-    value == Some("1")
+    !crate::local_mode::no_model()
 }
 
 /// A slot the record can ask or state.
@@ -774,8 +756,8 @@ where
     out
 }
 
-/// [`ask`] through the agent service, when the switch is on. Off, nothing is
-/// sent and nothing is answered. `agent` should retry under
+/// [`ask`] through the agent service, when the run may ask the model
+/// ([`asks`]). Otherwise nothing is sent and nothing is answered. `agent` should retry under
 /// [`crate::agent_service::RetryPolicy::RUN_BUDGETED`] ([`agent`]), so the
 /// requests' own retries draw on the run's budget too.
 pub async fn ask_service(
@@ -813,19 +795,4 @@ async fn ask_service_seeded<Q: Question>(
         agent.post_to_lambda(ROUTE, &request, seed).await
     })
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A no-model pass sends no site or handler question whatever the switch
-    /// says: the questions are model calls (carrick#2907).
-    #[test]
-    fn a_no_model_pass_asks_no_site_question() {
-        assert!(asks_with(true, false));
-        assert!(!asks_with(true, true));
-        assert!(!asks_with(false, false));
-        assert!(!asks_with(false, true));
-    }
 }

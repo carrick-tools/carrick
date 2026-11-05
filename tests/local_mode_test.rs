@@ -5318,8 +5318,6 @@ fn walking_env(repo: &Path) -> Vec<(String, String)> {
             "CARRICK_MOCK_FIXTURE_DIR".into(),
             format!("{}/", repo.join("__llm__").display()),
         ),
-        ("CARRICK_POSITION_ROWS".into(), "1".into()),
-        ("CARRICK_SITE_QUESTIONS".into(), "1".into()),
         ("CARRICK_SKIP_INTENTS".into(), "1".into()),
         ("CARRICK_ALLOW_UNPREPARED".into(), "1".into()),
         ("CARRICK_NO_UPDATE_CHECK".into(), "1".into()),
@@ -5629,8 +5627,6 @@ fn documented_command(root: &Path, args: &[&str]) -> Command {
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
         .env("CARRICK_MOCK_ALL", "1")
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1")
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
         .env(
             "CARRICK_MOCK_FIXTURE_DIR",

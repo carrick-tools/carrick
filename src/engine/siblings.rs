@@ -53,21 +53,11 @@ pub(super) struct Sibling {
 
 impl Sibling {
     /// What this service asks the library store, once per run.
-    pub(super) fn asked(
-        &self,
-        repo_root: &Path,
-        site_questions: bool,
-    ) -> Option<crate::library_store::Asked> {
+    pub(super) fn asked(&self, repo_root: &Path) -> Option<crate::library_store::Asked> {
         self.asked
             .get_or_init(|| {
                 let sites = crate::request_summary::library_sites(&self.inputs);
-                super::LibraryAsk::asked_by(
-                    &self.inputs,
-                    &sites,
-                    &self.root,
-                    repo_root,
-                    site_questions,
-                )
+                super::LibraryAsk::asked_by(&self.inputs, &sites, &self.root, repo_root)
             })
             .clone()
     }
@@ -101,10 +91,6 @@ pub(super) struct Neighbours<'a> {
 impl Neighbours<'_> {
     /// The siblings the service whose read is `inputs` may walk into.
     pub(super) fn reached(&self, inputs: &RequestSummaryInputs) -> Siblings {
-        // Nothing reads a walk into a sibling unless the site questions run.
-        if !crate::site_questions::enabled() {
-            return Siblings::default();
-        }
         self.registry.reached(self.own, inputs)
     }
 }
@@ -122,7 +108,8 @@ pub(super) struct SiblingRegistry {
     owners: OnceLock<HashMap<PathBuf, usize>>,
     slots: Vec<OnceLock<Option<Arc<Sibling>>>>,
     /// Every declared service's compiler walk, analysed or carried, once it
-    /// has ended (carrick#3085), when the run walks. A carried service has
+    /// has ended (carrick#3085); `None` only in tests that walk nothing. A
+    /// carried service has
     /// one only when some walked service's rows reach it.
     walks: Option<Arc<walk_lane::Slots>>,
 }

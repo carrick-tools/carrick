@@ -844,11 +844,6 @@ async fn main_then_change(tmp: &Path, ahead: bool) -> Rescanned {
         std::env::set_var("CARRICK_SKIP_INTENTS", "1");
         std::env::set_var(WIDTH_ENV, "1");
         std::env::set_var("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "600");
-        // What a cloud runner's scan sets: the walks, the site questions and
-        // the fact layer's files, so the library store is asked.
-        std::env::set_var("CARRICK_POSITION_ROWS", "1");
-        std::env::set_var("CARRICK_SITE_QUESTIONS", "1");
-        std::env::set_var("CARRICK_FACT_FILES", "1");
         std::env::remove_var("GITHUB_EVENT_NAME");
         std::env::remove_var("GITHUB_REF");
         if ahead {
@@ -895,14 +890,7 @@ async fn main_then_change(tmp: &Path, ahead: bool) -> Rescanned {
     take_schedules();
     // SAFETY: as above.
     unsafe {
-        for name in [
-            "CARRICK_POSITION_ROWS",
-            "CARRICK_SITE_QUESTIONS",
-            "CARRICK_FACT_FILES",
-            AHEAD_ENV,
-        ] {
-            std::env::remove_var(name);
-        }
+        std::env::remove_var(AHEAD_ENV);
     }
     result.expect("the second scan succeeds");
     let requests = agent_service::request_counts()

@@ -36,7 +36,10 @@ const MARKER: &str = "@carrick-fallbacks ";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rows {
-    /// The run walks no rows (`CARRICK_POSITION_ROWS` unset).
+    /// The service's analysis had no walk to read: every scan walks since
+    /// carrick#3283, so a scan reaches this only where no walk slot exists.
+    /// The word stays, because the cloud runner and the old-path dashboard
+    /// read it.
     Off,
     /// The rows are bound to what discovery read.
     Read,

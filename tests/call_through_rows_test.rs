@@ -310,8 +310,8 @@ fn sidecar_available() -> bool {
     node && built
 }
 
-/// The fixture scanned as a fact-layer scan runs, with the compiler's
-/// per-position rows (`CARRICK_POSITION_ROWS=1`), once for the whole binary.
+/// The fixture scanned as every scan runs, with the compiler's per-position
+/// rows, once for the whole binary.
 fn blobs_with_rows() -> &'static Blobs {
     static SCAN: OnceLock<Blobs> = OnceLock::new();
     SCAN.get_or_init(|| {
@@ -324,7 +324,6 @@ fn blobs_with_rows() -> &'static Blobs {
         let mut cmd = scan_command(&repo, &storage);
         cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
-            .env("CARRICK_POSITION_ROWS", "1")
             .env("HOME", &home);
         run(cmd);
         read_blobs(&storage)
@@ -1051,7 +1050,6 @@ fn unanswered() -> &'static Blobs {
         let mut cmd = scan_command(&repo, &storage);
         cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
-            .env("CARRICK_POSITION_ROWS", "1")
             .env("HOME", &home);
         run(cmd);
         read_blobs(&storage)

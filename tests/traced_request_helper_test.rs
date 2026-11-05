@@ -83,9 +83,7 @@ fn scan() -> serde_json::Value {
         .env(
             "CARRICK_SIDECAR_DIR",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
-        )
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1");
+        );
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -97,7 +95,6 @@ fn scan() -> serde_json::Value {
         "CI",
         "CARRICK_NO_MODEL",
         "CARRICK_ALLOW_MISSING_TYPES",
-        "CARRICK_FACT_FILES",
     ] {
         cmd.env_remove(var);
     }

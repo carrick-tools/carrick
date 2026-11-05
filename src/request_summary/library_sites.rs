@@ -3179,14 +3179,10 @@ pub(super) fn site_arg(expr: &Expr, scope: &Scope<'_>) -> SiteArg {
     }
 }
 
-/// The position of the first spread argument, when the receiver trace is on
-/// (carrick#2662): the arguments before it read as written, and it and
-/// every argument after it hold a value the source does not state. With the
-/// trace off a spread moves every position, and no call with one is read.
+/// The position of the first spread argument (carrick#2662): the arguments
+/// before it read as written, and it and every argument after it hold a
+/// value the source does not state.
 pub(super) fn spread_from(args: &[ExprOrSpread]) -> Option<usize> {
-    if !super::discovery::receiver_trace_enabled() {
-        return None;
-    }
     args.iter().position(|arg| arg.spread.is_some())
 }
 
@@ -4189,8 +4185,7 @@ mod tests {
         site(&sites, "src/queue.ts", 3, Some("add"));
     }
 
-    /// A key a later spread may overwrite holds nothing the source states,
-    /// and a spread argument moves every position, so it is no site.
+    /// A key a later spread may overwrite holds nothing the source states.
     #[test]
     fn a_key_a_later_spread_may_overwrite_is_not_read() {
         let sites = sites_of(&[(
@@ -4209,10 +4204,6 @@ mod tests {
         assert_eq!(
             site(&sites, "src/tasks.ts", 5, None).literal(0, Some("id")),
             Some("after")
-        );
-        assert!(
-            sites.iter().all(|site| site.line != 6),
-            "a spread argument is no site: {sites:#?}"
         );
     }
 

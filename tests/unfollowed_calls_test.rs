@@ -33,7 +33,7 @@ fn sidecar_available() -> bool {
 }
 
 /// The blob the fixture scan stores.
-fn scan_blob(rows: bool) -> serde_json::Value {
+fn scan_blob() -> serde_json::Value {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
@@ -42,11 +42,7 @@ fn scan_blob(rows: bool) -> serde_json::Value {
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
         .env("CARRICK_MOCK_ALL", "1")
-        .env("CARRICK_SKIP_INTENTS", "1")
-        .env_remove("CARRICK_POSITION_ROWS");
-    if rows {
-        cmd.env("CARRICK_POSITION_ROWS", "1");
-    }
+        .env("CARRICK_SKIP_INTENTS", "1");
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -94,7 +90,7 @@ fn an_interface_member_and_an_untyped_receiver_are_written_with_their_reason() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
     }
-    let blob = scan_blob(true);
+    let blob = scan_blob();
     let rows = rows_of(&blob);
 
     // `store.read()` with `store: Store`, an interface declared at line 2 of
@@ -154,7 +150,7 @@ fn a_call_that_has_an_edge_or_reaches_a_library_writes_no_row() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
     }
-    let blob = scan_blob(true);
+    let blob = scan_blob();
     let rows = rows_of(&blob);
 
     // Every call the blob states an edge for, by caller and call line.
@@ -180,19 +176,5 @@ fn a_call_that_has_an_edge_or_reaches_a_library_writes_no_row() {
     assert!(
         row_by_caller(&rows, "viaLibrary").is_empty(),
         "a library call writes no row: {rows:#?}"
-    );
-}
-
-#[test]
-fn without_position_rows_the_blob_has_neither_key() {
-    if !sidecar_available() {
-        eprintln!("Skipping: node or the built sidecar is missing");
-        return;
-    }
-    let blob = scan_blob(false);
-    assert!(blob.get("unfollowed_member_calls").is_none(), "{blob:#}");
-    assert!(
-        blob.get("unfollowed_member_calls_total").is_none(),
-        "{blob:#}"
     );
 }

@@ -116,7 +116,7 @@ model stated nothing at these:
 | `commands.ts:121` | `POST /api/v1/audit` |
 
 The second scan empties the answers for `commands.ts` and `hooks.ts` and
-walks the compiler's rows (`CARRICK_POSITION_ROWS=1`); `packages/cli` has a
+walks the compiler's rows, as every scan does; `packages/cli` has a
 `tsconfig.json`, as a TypeScript package does, so the compiler resolves its
 own modules' imports. Every call into the
 client class then states its row from the source alone (`commands.ts` lines
@@ -175,8 +175,8 @@ lines 145, 151, 157 and 171; `commands.ts` lines 76, 82 and 94 stay empty, for
 the reasons in the table above.
 
 A method called on a call's value (carrick#2822, #2823) is followed only
-through the compiler's `call` rows, so these rows are asserted on a scan with
-`CARRICK_POSITION_ROWS=1`:
+through the compiler's `call` rows, so these rows are asserted on a scan that
+walks them:
 
 - `packages/cli/src/inline-commands.ts:9` (`getClient().getRun(id)`) and `:13`
   (`createClient().getStatus()`): the model's path is made from names; each

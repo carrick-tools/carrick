@@ -7,9 +7,6 @@
 //! - **Never an input.** Nothing here feeds findings, the type check, the
 //!   matcher or the PR result. The cloud reader shows them in a section of
 //!   their own.
-//! - **Switch.** Written only when `CARRICK_SITE_QUESTIONS=1`
-//!   ([`crate::site_questions::enabled`]). With the switch off the blob has
-//!   neither key, byte for byte as before.
 //! - **Cap.** At most [`MAX_PER_SERVICE`] rows per service, in a fixed
 //!   order; the count past that is `possible_calls_omitted`, so the blob
 //!   stays inside the ingest ceilings. One cap, here: every producer of a
@@ -300,17 +297,8 @@ pub fn cap(mut rows: Vec<PossibleCall>) -> (Vec<PossibleCall>, usize) {
     (rows, omitted)
 }
 
-/// Write a service's possible calls on its blob when the site-question
-/// switch is on; with it off the blob is left as it was.
+/// Write a service's possible calls on its blob.
 pub fn attach(data: &mut CloudRepoData, rows: Vec<PossibleCall>) {
-    attach_when(crate::site_questions::enabled(), data, rows);
-}
-
-/// [`attach`] with the switch given.
-pub fn attach_when(on: bool, data: &mut CloudRepoData, rows: Vec<PossibleCall>) {
-    if !on {
-        return;
-    }
     let (rows, omitted) = cap(rows);
     data.possible_calls = Some(rows);
     data.possible_calls_omitted = (omitted > 0).then_some(omitted as u32);
@@ -394,22 +382,12 @@ mod tests {
         assert_eq!((kept.len(), omitted), (MAX_PER_SERVICE, 0));
     }
 
-    /// With the switch off the blob is as it was: neither key is written.
+    /// The rows and the omitted count are written; no count when none were
+    /// left out.
     #[test]
-    fn with_the_switch_off_the_blob_is_unchanged() {
-        let before = serde_json::to_string(&blob()).unwrap();
+    fn the_rows_and_the_count_are_written() {
         let mut data = blob();
-        attach_when(false, &mut data, vec![call("a.ts", 1)]);
-        assert_eq!(serde_json::to_string(&data).unwrap(), before);
-        assert!(!before.contains("possible_calls"));
-    }
-
-    /// With it on the rows and the omitted count are written; no count when
-    /// none were left out.
-    #[test]
-    fn with_the_switch_on_the_rows_and_the_count_are_written() {
-        let mut data = blob();
-        attach_when(true, &mut data, vec![call("a.ts", 1)]);
+        attach(&mut data, vec![call("a.ts", 1)]);
         let wire = serde_json::to_value(&data).unwrap();
         assert_eq!(wire["possible_calls"].as_array().map(Vec::len), Some(1));
         assert!(wire.get("possible_calls_omitted").is_none());
@@ -418,7 +396,7 @@ mod tests {
         let rows = (1..=MAX_PER_SERVICE as u32 + 3)
             .map(|n| call("a.ts", n))
             .collect();
-        attach_when(true, &mut over, rows);
+        attach(&mut over, rows);
         let wire = serde_json::to_value(&over).unwrap();
         assert_eq!(
             wire["possible_calls"].as_array().map(Vec::len),

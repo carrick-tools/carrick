@@ -1,12 +1,11 @@
 //! carrick#2613: the fact layer's files are worked out before the file
-//! reader dispatches, from the library store's first answer. Without
-//! `CARRICK_FACT_FILES` they are only recorded in the run log (ticket T1);
-//! with it, they are the files the reader is sent, each with the fact
-//! layer's calls listed (ticket T3).
+//! reader dispatches, from the library store's first answer. They are
+//! recorded in the run log (ticket T1), and they are the files the reader is
+//! sent, each with the fact layer's calls listed (ticket T3).
 //!
-//! The fixture is the library-store one, scanned as the Action scans it
-//! (`CARRICK_POSITION_ROWS=1`, `CARRICK_SITE_QUESTIONS=1`, the real sidecar,
-//! the store's answer from the cassette), with files added here:
+//! The fixture is the library-store one, scanned as every scan runs (the
+//! real sidecar, the store's answer from the cassette), with files added
+//! here:
 //! - `src/notify.ts`, whose only network call is `relay(url)` on a labelled
 //!   default export. It is not awaited, takes no literal argument and names
 //!   nothing a signal looks for, so no hand-written signal raises it and
@@ -384,9 +383,8 @@ impl Scan {
     }
 }
 
-/// A scan with the site questions on or off, and the fact layer choosing the
-/// reader's files or not.
-fn run_scan(site_questions: bool, fact_files: bool) -> Scan {
+/// A scan of the fixture, in the one form every scan runs.
+fn run_scan() -> Scan {
     let tmp = tempfile::tempdir().unwrap();
     let repo = repo(tmp.path());
     let storage = tmp.path().join("storage");
@@ -413,19 +411,15 @@ fn run_scan(site_questions: bool, fact_files: bool) -> Scan {
             "CARRICK_SIDECAR_DIR",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
         )
-        .env("CARRICK_OUTPUT_JSON", "1")
-        .env("CARRICK_POSITION_ROWS", "1");
-    if site_questions {
-        cmd.env("CARRICK_SITE_QUESTIONS", "1");
-    } else {
-        cmd.env_remove("CARRICK_SITE_QUESTIONS");
-    }
-    if fact_files {
-        cmd.env("CARRICK_FACT_FILES", "1");
-    } else {
-        cmd.env_remove("CARRICK_FACT_FILES");
-    }
+        .env("CARRICK_OUTPUT_JSON", "1");
     for var in [
+        // The retired fact-layer switches (carrick#3283): removed, so the
+        // environment cannot mask a scanner that still reads one.
+        "CARRICK_SITE_QUESTIONS",
+        "CARRICK_POSITION_ROWS",
+        "CARRICK_RECEIVER_TRACE",
+        "CARRICK_FACT_FILES",
+        "CARRICK_SITE_PAYLOADS",
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
         "GITHUB_EVENT_NAME",
@@ -470,16 +464,10 @@ fn run_scan(site_questions: bool, fact_files: bool) -> Scan {
     }
 }
 
-/// The scan with the fact layer recording its files only.
-fn recording() -> &'static Scan {
-    static SCAN: OnceLock<Scan> = OnceLock::new();
-    SCAN.get_or_init(|| run_scan(true, false))
-}
-
-/// The scan with the fact layer choosing the reader's files.
+/// The scan, with the fact layer choosing the reader's files.
 fn choosing() -> &'static Scan {
     static SCAN: OnceLock<Scan> = OnceLock::new();
-    SCAN.get_or_init(|| run_scan(true, true))
+    SCAN.get_or_init(run_scan)
 }
 
 fn fact_lines(log: &str) -> Vec<&str> {
@@ -497,7 +485,7 @@ fn span_id(source: &str, call: &str) -> String {
 
 #[test]
 fn files_only_the_fact_layer_finds_are_logged_as_fact_only() {
-    let scan = recording();
+    let scan = choosing();
     let lines = fact_lines(&scan.log);
     assert!(
         lines
@@ -533,46 +521,6 @@ fn files_only_the_fact_layer_finds_are_logged_as_fact_only() {
             "{signal} is counted: {lines:#?}"
         );
     }
-    // Record-only: the reader was sent neither file.
-    for file in ["src/notify.ts", "src/slow.ts"] {
-        assert!(
-            !scan.log.lines().any(|line| {
-                line.contains(file)
-                    && (line.contains("Analyzing:") || line.contains("Force-analyzing"))
-            }),
-            "the reader's file set did not move for {file}"
-        );
-    }
-    assert!(
-        scan.log_has(&["Skipped (no API patterns)", "src/notify.ts"]),
-        "today's gate still skips the file"
-    );
-}
-
-#[test]
-fn with_the_site_questions_off_nothing_is_recorded_and_the_scan_runs() {
-    let scan = run_scan(false, false);
-    assert!(
-        fact_lines(&scan.log).is_empty(),
-        "no fact-layer record without the site questions: {:#?}",
-        fact_lines(&scan.log)
-    );
-}
-
-/// With the switch on and no fact files to choose by (the site questions
-/// off), selection fails closed: every candidate stays, and every file a
-/// candidate selects is read and says so.
-#[test]
-fn with_the_switch_on_and_no_fact_files_every_candidate_stays() {
-    let scan = run_scan(false, true);
-    for file in ["src/hook.ts", "src/twice.ts", "src/nested.ts"] {
-        assert!(scan.prompt(file).is_some(), "{file} is read");
-        assert!(
-            scan.log_has(&["Analyzing: ", file]),
-            "{file} is logged as read"
-        );
-    }
-    assert!(!scan.log_has(&["Fact-layer file"]));
 }
 
 /// T3 test 2, with the span check: the fact layer sends the reader the file
@@ -598,10 +546,6 @@ fn a_fact_file_is_read_with_its_call_listed_and_the_readers_row_joins() {
     assert!(
         !scan.log_has(&["had no matching SWC candidate", "notify.ts"]),
         "the reader's row joined its listed call"
-    );
-    assert!(
-        recording().prompt("src/notify.ts").is_none(),
-        "without the switch the file is not read"
     );
 }
 
@@ -632,7 +576,6 @@ fn a_readers_route_at_a_fact_site_survives_the_unlisted_id_drop() {
         "{}",
         scan.log
     );
-    assert!(recording().prompt("src/serve.ts").is_none());
 }
 
 /// T3 test 5 (D4): a register-signal candidate at a call discovery cannot
@@ -641,14 +584,9 @@ fn a_readers_route_at_a_fact_site_survives_the_unlisted_id_drop() {
 /// dropped, and its file is no longer read.
 #[test]
 fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
-    let (off, on) = (recording(), choosing());
+    let on = choosing();
     let hook = span_id(HOOK, "post(\"/hooks\")");
-    assert_eq!(off.listed("src/hook.ts"), vec![hook.clone()]);
     assert_eq!(on.listed("src/hook.ts"), vec![hook], "kept under its id");
-    assert_eq!(
-        off.listed("src/twice.ts"),
-        vec![span_id(TWICE, "double(\"/twice\")")]
-    );
     assert!(
         on.prompt("src/twice.ts").is_none(),
         "dropped at a finished walk"
@@ -657,12 +595,10 @@ fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
     // A walk that found no site but passed a call it could not follow on the
     // way has not read everything: the candidate stays.
     let nested = span_id(NESTED, "send(\"/nested\")");
-    assert_eq!(off.listed("src/nested.ts"), vec![nested.clone()]);
     assert_eq!(on.listed("src/nested.ts"), vec![nested]);
     // So has one that hands a package's function a callback that reaches a
     // labelled export: the walk never entered it from this call.
     let traced = span_id(TRACED, "traced(\"/traced\")");
-    assert!(off.listed("src/traced.ts").contains(&traced));
     assert!(
         on.listed("src/traced.ts").contains(&traced),
         "{:?}",
@@ -684,34 +620,27 @@ fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
             "the cloud would skip `{key}`: {fallbacks}"
         );
     }
-    assert!(
-        off.fallbacks().get("fallback_selection_c2").is_none(),
-        "without the switch the line is as it was"
-    );
 }
 
 /// F0 (carrick#2440): a candidate kept at a call discovery cannot follow
-/// feeds the imported-member join as it does with the switch off. The call
-/// `client.push("a")` goes through an interface, so discovery cannot follow
-/// it and the register candidate is kept; the member another module declares
-/// states the verb and the path.
+/// feeds the imported-member join. The call `client.push("a")` goes through
+/// an interface, so discovery cannot follow it and the register candidate is
+/// kept; the member another module declares states the verb and the path.
 #[test]
 fn a_kept_candidate_reaches_the_imported_member_join() {
-    let (off, on) = (recording(), choosing());
-    for (scan, name) in [(off, "off"), (on, "on")] {
-        let row = scan
-            .calls
-            .iter()
-            .find(|call| {
-                call["file"]
-                    .as_str()
-                    .is_some_and(|f| f.ends_with("member_caller.ts"))
-                    && call["line"].as_i64() == Some(10)
-            })
-            .unwrap_or_else(|| panic!("{name}: no row at the call: {:#?}", scan.calls));
-        assert_eq!(row["method"], "PUT", "{name}: {row}");
-        assert_eq!(row["path"], "/api/v2/items/:item", "{name}: {row}");
-    }
+    let scan = choosing();
+    let row = scan
+        .calls
+        .iter()
+        .find(|call| {
+            call["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("member_caller.ts"))
+                && call["line"].as_i64() == Some(10)
+        })
+        .unwrap_or_else(|| panic!("no row at the call: {:#?}", scan.calls));
+    assert_eq!(row["method"], "PUT", "{row}");
+    assert_eq!(row["path"], "/api/v2/items/:item", "{row}");
 }
 
 /// carrick#2745: a route registration has a request's shape
@@ -750,16 +679,11 @@ fn a_callee_that_registers_a_route_states_no_call_at_its_caller() {
         "the drop is logged: {}",
         on.log
     );
-    assert!(
-        !recording().log_has(&["is a server-framework call"]),
-        "the off arm does not run the filter"
-    );
 }
 
 /// A registration whose handler is a named function has a request's shape
-/// too (the summaries read `srv.get("/x", handler)` as `GET /x`). With the
-/// fact layer choosing, the store's role for the export withdraws the row at
-/// every caller; the off arm keeps it.
+/// too (the summaries read `srv.get("/x", handler)` as `GET /x`). The
+/// store's role for the export withdraws the row at every caller.
 #[test]
 fn a_callee_that_registers_a_named_handler_states_no_call_at_its_caller() {
     let at = |scan: &Scan| -> Vec<serde_json::Value> {
@@ -784,14 +708,11 @@ fn a_callee_that_registers_a_named_handler_states_no_call_at_its_caller() {
         "the drop is logged: {}",
         choosing().log
     );
-    let off = at(recording());
-    assert_eq!(off.len(), 1, "the off arm is unchanged: {off:#?}");
-    assert_eq!(off[0]["path"], "/health/named", "{}", off[0]);
 }
 
 /// The fact layer lists a call into an in-module request helper that reaches
 /// a labelled export, awaited or not, and never one into a helper that sends
-/// nothing. With the switch off the file is not read: no signal raises it.
+/// nothing; no signal raises the file.
 #[test]
 fn an_unawaited_call_into_a_request_helper_is_a_fact_site() {
     let on = choosing();
@@ -803,10 +724,6 @@ fn an_unawaited_call_into_a_request_helper_is_a_fact_site() {
         ],
         "the helper's own send and the call into it, never the call into `shout`: {}",
         on.log
-    );
-    assert!(
-        recording().prompt("src/helper.ts").is_none(),
-        "without the switch the file is not read"
     );
 }
 

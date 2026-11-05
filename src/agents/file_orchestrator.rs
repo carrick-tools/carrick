@@ -638,7 +638,7 @@ pub struct ProcessingStats {
     pub files_skipped_unrouted_protocol: usize,
     /// Files sent to the reader because the fact layer found a site, a lead
     /// or an unanswered-package call in them and no signal raised a
-    /// candidate there (carrick#2613, `CARRICK_FACT_FILES=1`).
+    /// candidate there (carrick#2613).
     pub fact_layer_files: usize,
     /// Register-signal candidates kept for the reader at a call discovery
     /// could not follow, by signal (`C2`-`C4`): the old path's selection
@@ -2921,10 +2921,9 @@ impl FileOrchestrator {
         }
 
         // Whether the fact layer chooses the reader's files (carrick#2613,
-        // ticket T3): the switch is on and the engine sends the fact layer's
-        // files. Without them the gate below is today's.
-        let choosing_files = crate::request_summary::fact_files::enabled()
-            && !matches!(self.fact_files, FactFileSource::None);
+        // ticket T3): the engine sends the fact layer's files. Without them
+        // the gate below is the hand-written signals'.
+        let choosing_files = !matches!(self.fact_files, FactFileSource::None);
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
@@ -3436,7 +3435,7 @@ impl FileOrchestrator {
         // The files the fact layer sends the reader, from the store's first
         // answer (carrick#2613). Awaited here, after the serial scan above
         // has run beside the ask, and before the passes below read the
-        // candidates. Without the switch it is only logged, after the rescue.
+        // candidates. When the engine sent none, nothing is chosen here.
         let fact_files = self.fact_files.take().await;
         if let Some(facts) = fact_files.as_ref().filter(|_| choosing_files) {
             use crate::request_summary::fact_files::Followed;
@@ -3599,8 +3598,8 @@ impl FileOrchestrator {
             }
             deferred_zero_candidates = still_deferred;
         } else {
-            // The engine sent no fact files (site questions off, nothing
-            // asked, no rows): every candidate stays, and the files whose
+            // The engine sent no fact files (no fact source, nothing asked,
+            // no rows): every candidate stays, and the files whose
             // line phase 1 held back are read as today.
             for pf in pending.iter().filter(|pf| !pf.held.is_empty()) {
                 debug!(
@@ -10848,8 +10847,8 @@ impl FileOrchestrator {
     /// Drop the members of `module` whose request is a call through a
     /// server-framework export (carrick#2745): `srv.get("/health", handler)`
     /// has a request's shape and is a route registration. The store's role for
-    /// the export decides, so this reads no syntax. With no facts (the switch
-    /// is off) it keeps every member.
+    /// the export decides, so this reads no syntax. With no facts (nothing
+    /// was asked) it keeps every member.
     fn drop_server_framework_members(
         index: &mut RequestMemberIndex,
         module: &Path,
@@ -11200,7 +11199,7 @@ impl FileOrchestrator {
         // The alias each carries matches its manifest entry so the join lands.
         infer.extend_from_slice(extra_infer);
         // A payload the fact layer places is read there, not at the model
-        // reader's locator (`CARRICK_SITE_PAYLOADS=1`; empty otherwise).
+        // reader's locator (empty with no rows).
         crate::site_payloads::take_over(&mut infer, payload_infer);
         // A request the fact layer placed names its row's path as the
         // reader's does (carrick#1029).

@@ -10,7 +10,7 @@
 //! carrick#3085), and a service's walk process exits before its own analysis
 //! starts.
 //!
-//! The walk runs only with [`POSITION_ROWS_ENV`] set to `1`. With a local
+//! Every scan walks (carrick#3283). With a local
 //! store directory ([`CACHE_DIR_ENV`]) it writes
 //! `<store>/positions/<repo>__<service>.jsonl.gz` beside the blobs. Both blob
 //! listings read top-level `*.json` only, so the subdirectory is never read
@@ -68,9 +68,6 @@ use tracing::debug;
 use crate::cloud_storage::{CACHE_DIR_ENV, blob_stem};
 use crate::request_summary::HoleReason;
 use crate::services::type_sidecar::{PositionRowsCounts, SidecarRecipe};
-
-/// Set to `1` to walk each service and read its rows.
-pub const POSITION_ROWS_ENV: &str = "CARRICK_POSITION_ROWS";
 
 /// The store subdirectory the rows files go in.
 pub const POSITIONS_DIR: &str = "positions";
@@ -308,19 +305,14 @@ impl Drop for Destination {
     }
 }
 
-/// Where a service's rows go this run, or `None` when the flag is unset.
+/// Where a service's rows go this run.
 ///
 /// `uploads` is whether the run writes an index (`--upload`, a main push, the
 /// laptop indexer into its store). A run that writes nothing (`--no-upload`,
 /// a PR scan) leaves the local store untouched too, so its rows go under the
 /// per-run temp directory like the Action's (carrick#3283).
-pub fn destination(
-    uploads: bool,
-    repo_name: &str,
-    service_name: Option<&str>,
-) -> Option<Destination> {
+pub fn destination(uploads: bool, repo_name: &str, service_name: Option<&str>) -> Destination {
     destination_from(
-        std::env::var(POSITION_ROWS_ENV).ok().as_deref(),
         std::env::var_os(CACHE_DIR_ENV)
             .map(PathBuf::from)
             .filter(|_| uploads)
@@ -331,20 +323,16 @@ pub fn destination(
     )
 }
 
-/// [`destination`] over the settings it reads: the flag, the local store and
-/// the OS temp dir.
+/// [`destination`] over the settings it reads: the local store and the OS
+/// temp dir.
 pub fn destination_from(
-    flag: Option<&str>,
     store: Option<&Path>,
     temp: &Path,
     repo_name: &str,
     service_name: Option<&str>,
-) -> Option<Destination> {
-    if flag != Some("1") {
-        return None;
-    }
+) -> Destination {
     let name = format!("{}.jsonl.gz", blob_stem(repo_name, service_name));
-    Some(match store.filter(|dir| !dir.as_os_str().is_empty()) {
+    match store.filter(|dir| !dir.as_os_str().is_empty()) {
         Some(store) => Destination {
             path: store.join(POSITIONS_DIR).join(name),
             temporary: None,
@@ -356,7 +344,7 @@ pub fn destination_from(
                 temporary: Some(dir),
             }
         }
-    })
+    }
 }
 
 /// The directory a laptop pass keeps its rows in between passes
@@ -946,33 +934,8 @@ pub fn record_service_rows(
 mod tests {
     use super::*;
 
-    fn path_of(destination: Option<Destination>) -> Option<(PathBuf, bool)> {
-        destination.map(|d| (d.path().to_path_buf(), d.is_temporary()))
-    }
-
-    #[test]
-    fn the_walk_is_off_without_the_flag() {
-        let (store, temp) = (Path::new("/store"), Path::new("/tmp"));
-        assert_eq!(
-            path_of(destination_from(
-                None,
-                Some(store),
-                temp,
-                "repo",
-                Some("api")
-            )),
-            None
-        );
-        assert_eq!(
-            path_of(destination_from(
-                Some("0"),
-                Some(store),
-                temp,
-                "repo",
-                Some("api")
-            )),
-            None
-        );
+    fn path_of(destination: Destination) -> (PathBuf, bool) {
+        (destination.path().to_path_buf(), destination.is_temporary())
     }
 
     #[test]
@@ -980,39 +943,35 @@ mod tests {
         let temp = Path::new("/tmp");
         assert_eq!(
             path_of(destination_from(
-                Some("1"),
                 Some(Path::new("/store")),
                 temp,
                 "repo",
                 Some("apps/api")
             )),
-            Some((
+            (
                 PathBuf::from("/store/positions/repo__apps_api.jsonl.gz"),
                 false
-            ))
+            )
         );
         assert_eq!(
             path_of(destination_from(
-                Some("1"),
                 Some(Path::new("/store")),
                 temp,
                 "repo",
                 None
             )),
-            Some((PathBuf::from("/store/positions/repo.jsonl.gz"), false))
+            (PathBuf::from("/store/positions/repo.jsonl.gz"), false)
         );
     }
 
-    /// carrick#2413: with no store the flag still walks, into a directory
+    /// carrick#2413: with no store the scan still walks, into a directory
     /// of this run's own under the temp dir, which goes when the service
     /// ends.
     #[test]
     fn without_a_store_the_rows_go_to_a_run_directory_that_is_removed() {
         let temp = tempfile::tempdir().unwrap();
         for store in [None, Some(Path::new(""))] {
-            let destination =
-                destination_from(Some("1"), store, temp.path(), "repo", Some("apps/api"))
-                    .expect("the flag walks without a store");
+            let destination = destination_from(store, temp.path(), "repo", Some("apps/api"));
             assert!(destination.is_temporary());
             let dir = destination.path().parent().unwrap().to_path_buf();
             assert_eq!(dir.parent(), Some(temp.path()));
@@ -1259,8 +1218,7 @@ mod tests {
             assert!(error.contains("version"), "{error}");
         }
         let dir = tempfile::tempdir().unwrap();
-        let destination = destination_from(Some("1"), Some(dir.path()), dir.path(), "repo", None)
-            .expect("the flag walks");
+        let destination = destination_from(Some(dir.path()), dir.path(), "repo", None);
         std::fs::create_dir_all(destination.path().parent().unwrap()).unwrap();
         let text = "{\"v\":3,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"ident\",0,1,\"a\",\"a.ts\",1,null,\"1\",0],\

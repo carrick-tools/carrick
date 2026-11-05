@@ -921,10 +921,9 @@ struct CallIr {
     /// a name from a parameter (carrick#1562). `None` when an argument is
     /// spread: it moves every position after it.
     site_args: Option<Vec<SiteArg>>,
-    /// The position of the first spread argument, when the receiver trace is
-    /// on (carrick#2662): a decided site reads the arguments before it as
-    /// written, and every position from it on as unread. `None` without a
-    /// spread, and with the trace off.
+    /// The position of the first spread argument (carrick#2662): a decided
+    /// site reads the arguments before it as written, and every position
+    /// from it on as unread. `None` without a spread.
     spread_from: Option<usize>,
     /// The line of the member the call names, or of the callee: where a
     /// library call a caller fills is placed ([`LibrarySite::line`]).
@@ -8204,8 +8203,8 @@ pub struct RequestSummaryInputs {
     pub sites: CallSiteTargets,
     pub bindings: ImportedBindings,
     /// The compiler's rows for the service's positions, bound to the bytes
-    /// discovery parsed, when the run walks them (`CARRICK_POSITION_ROWS=1`,
-    /// carrick#2413); `None` otherwise.
+    /// discovery parsed (carrick#2413); `None` when the service's walk left
+    /// no rows or binding them ran past the budget.
     pub positions: Option<crate::position_rows::PositionIndex>,
     /// What each import binding reaches, read from [`Self::positions`] by
     /// [`Self::linked`] (carrick#2413 slice B): where the module-scope

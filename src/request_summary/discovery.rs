@@ -533,16 +533,6 @@ pub(crate) fn receiver_object(callee: &Expr) -> Option<(u32, u32, ObjectForm)> {
     Some((span.lo.0, span.hi.0, form))
 }
 
-/// The switch for the receiver trace (carrick#2474 R1): `1` only. The cloud
-/// runner and every laptop scan set it ([`crate::fact_layer`]); `0` turns it
-/// off for a comparison.
-pub const RECEIVER_TRACE_SWITCH: &str = "CARRICK_RECEIVER_TRACE";
-
-/// Whether the receiver trace is on in this process.
-pub fn receiver_trace_enabled() -> bool {
-    std::env::var(RECEIVER_TRACE_SWITCH).ok().as_deref() == Some("1")
-}
-
 /// What holds the receiver a labelled call is made on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5733,18 +5723,17 @@ export function listen(): void {
     /// answer>[;…]' [CARRICK_DISCOVERY_CENSUS_OUT=<file>] cargo test --lib
     /// discovery_census -- --ignored --nocapture`
     ///
-    /// With `CARRICK_RECEIVER_TRACE=1` the sites are discovered with the
-    /// receiver trace (carrick#2474 R1): the built sidecar verifies each
-    /// service's declaration ask from the service's root, as a scan does,
-    /// and every site names its receiver and how it was reached.
+    /// The sites are discovered with the receiver trace (carrick#2474 R1):
+    /// the built sidecar verifies each service's declaration ask from the
+    /// service's root, as a scan does, and every site names its receiver and
+    /// how it was reached.
     #[test]
     #[ignore]
     fn discovery_census() {
         let Ok(spec) = std::env::var("CARRICK_DISCOVERY_CENSUS") else {
             return;
         };
-        let script = receiver_trace_enabled()
-            .then(|| super::super::fixture_walk::sidecar().expect("the built sidecar"));
+        let script = Some(super::super::fixture_walk::sidecar().expect("the built sidecar"));
         let mut all: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         for entry in spec.split(';').filter(|entry| !entry.is_empty()) {
             let parts: Vec<&str> = entry.splitn(4, '=').collect();
@@ -5929,7 +5918,7 @@ export function listen(): void {
                 let request = crate::library_store::Asked::with_default_library(asked, library)
                     .map(|asked| {
                         asked
-                            .with_roles(crate::library_store::roles_for(true))
+                            .with_roles(&crate::library_store::NETWORK_ROLES)
                             .request
                     });
                 all.entry(label.to_string())

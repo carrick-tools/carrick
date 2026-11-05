@@ -3,8 +3,7 @@
 //!
 //! Drives the real scanner binary offline over `tests/fixtures/site-payloads/`
 //! with the type sidecar LIVE (no `CARRICK_ALLOW_MISSING_TYPES`, so a sidecar
-//! that cannot start fails the test) and the compiler's position rows on
-//! (`CARRICK_POSITION_ROWS=1`), as the Action runs a scan with them.
+//! that cannot start fails the test), as the Action runs a scan.
 //!
 //! `src/orders.ts:14` calls `http.post<Receipt>('/orders', order)` through a
 //! package the library store labels an HTTP client whose `post` sends its
@@ -12,12 +11,9 @@
 //! with no locator at all: no call text, no span, no payload text, no type
 //! symbol (carrick-cloud#2522's shape).
 //!
-//! Answer key:
-//!
-//! | switch | request alias | response alias |
-//! |---|---|---|
-//! | off | `unknown` (a manifest placeholder) | names `Receipt` (read at the call's line) |
-//! | `CARRICK_SITE_PAYLOADS=1` | `Order`'s shape, `{ sku: string; quantity: number }` (the body argument) | names `Receipt` (the call's result) |
+//! Answer key: the request alias is `Order`'s shape,
+//! `{ sku: string; quantity: number }` (the body argument), and the response
+//! alias names `Receipt` (the call's result).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,6 +21,17 @@ use std::process::Command;
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-payloads")
 }
+
+/// The five environment variables that once switched the fact layer on
+/// (carrick#3283). Every scan here removes them, so neither the caller's
+/// environment nor CI's can mask what a scan with none of them does.
+const RETIRED_SWITCHES: [&str; 5] = [
+    "CARRICK_SITE_QUESTIONS",
+    "CARRICK_POSITION_ROWS",
+    "CARRICK_RECEIVER_TRACE",
+    "CARRICK_FACT_FILES",
+    "CARRICK_SITE_PAYLOADS",
+];
 
 /// The blob one offline scan of `repo` writes, with `env` set.
 fn scan(repo: &Path, env: &[(&str, &str)]) -> serde_json::Value {
@@ -41,10 +48,10 @@ fn scan(repo: &Path, env: &[(&str, &str)]) -> serde_json::Value {
             format!("{}/", repo.join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env_remove("CARRICK_ALLOW_MISSING_TYPES")
-        .env_remove("CARRICK_SITE_PAYLOADS")
-        .env_remove("CARRICK_SITE_QUESTIONS");
+        .env_remove("CARRICK_ALLOW_MISSING_TYPES");
+    for name in RETIRED_SWITCHES {
+        cmd.env_remove(name);
+    }
     for (name, value) in env {
         cmd.env(name, value);
     }
@@ -143,28 +150,13 @@ fn captured_block(blob: &serde_json::Value, alias: &str) -> String {
     rest[..rest.find("\nexport ").unwrap_or(rest.len())].to_string()
 }
 
-#[test]
-fn a_call_the_reader_left_unlocated_is_typed_at_its_payload_slots() {
-    let off = scan(&fixture_dir(), &[]);
-    let on = scan(&fixture_dir(), &[("CARRICK_SITE_PAYLOADS", "1")]);
-
-    // The known negative: the reader states no locator, so off, the request
-    // is a placeholder. The response is read at the call's line already
-    // (a line-only request finds the call there), and must stay so.
-    let (request, response) = (alias(&off, "request"), alias(&off, "response"));
-    assert_eq!(captured(&off, &request).trim_end_matches(';'), "unknown");
-    assert!(
-        captured(&off, &response).contains("Receipt"),
-        "response off: {}",
-        captured(&off, &response)
-    );
-
-    // On, the request is read at the body argument and the response at the
-    // call's result.
-    assert_eq!(alias(&on, "request"), request, "the aliases do not move");
+/// The request at `src/orders.ts:14` is read at the body argument and the
+/// response at the call's result, with none of the retired switches set.
+fn assert_typed_at_the_slots(blob: &serde_json::Value) {
+    let (request, response) = (alias(blob, "request"), alias(blob, "response"));
     // The capture prints a body inferred at an expression structurally.
-    let request_type = captured_block(&on, &request);
-    let response_type = captured(&on, &response);
+    let request_type = captured_block(blob, &request);
+    let response_type = captured(blob, &response);
     assert!(
         request_type.contains("sku: string") && request_type.contains("quantity: number"),
         "request: {request_type}"
@@ -175,35 +167,37 @@ fn a_call_the_reader_left_unlocated_is_typed_at_its_payload_slots() {
     );
 }
 
+/// The reader states no locator (carrick-cloud#2522's shape), so only the
+/// fact layer's slots can type the request; a scan with no switch set does.
 #[test]
-fn with_the_switch_at_anything_but_one_the_blob_is_unchanged() {
-    let off = scan(&fixture_dir(), &[]);
-    let not_one = scan(&fixture_dir(), &[("CARRICK_SITE_PAYLOADS", "true")]);
-    let (request, response) = (alias(&not_one, "request"), alias(&not_one, "response"));
-    assert_eq!(captured(&not_one, &request), captured(&off, &request));
-    assert_eq!(captured(&not_one, &response), captured(&off, &response));
-    assert_eq!(off["type_manifest"], not_one["type_manifest"]);
-    assert_eq!(off["capture_stub"], not_one["capture_stub"]);
+fn a_call_the_reader_left_unlocated_is_typed_at_its_payload_slots() {
+    assert_typed_at_the_slots(&scan(&fixture_dir(), &[]));
+}
+
+/// carrick#3283: no value turns the fact layer off. A scan with each
+/// retired switch set to `0` is typed at the slots and writes the manifest
+/// and the capture a scan with none set writes.
+#[test]
+fn a_switch_set_to_zero_changes_nothing() {
+    let none = scan(&fixture_dir(), &[]);
+    let zero: Vec<(&str, &str)> = RETIRED_SWITCHES.iter().map(|name| (*name, "0")).collect();
+    let zeroed = scan(&fixture_dir(), &zero);
+    assert_typed_at_the_slots(&zeroed);
+    assert_eq!(none["type_manifest"], zeroed["type_manifest"]);
+    assert_eq!(none["capture_stub"], zeroed["capture_stub"]);
+    assert_eq!(none["mount_graph"], zeroed["mount_graph"]);
+    assert_eq!(none["possible_calls"], zeroed["possible_calls"]);
 }
 
 /// carrick#2674 P3-1a: a wrapper hands its caller's options on through the
-/// rest of a destructured parameter (`src/notes.ts`). Switch on, the caller
-/// whose literal writes no `body` is decided "no body": its request entry
-/// names the root reason `no_request_body` and the capture prints `unknown`,
-/// not the options literal's own type. The caller that writes a body is typed
-/// at the body's value. Switch off, neither is read.
+/// rest of a destructured parameter (`src/notes.ts`). The caller whose
+/// literal writes no `body` is decided "no body": its request entry names
+/// the root reason `no_request_body` and the capture prints `unknown`, not
+/// the options literal's own type. The caller that writes a body is typed at
+/// the body's value.
 #[test]
 fn a_caller_that_writes_no_body_through_a_wrapper_is_decided_no_body() {
-    // The global `fetch` is a decided site only with the site questions on,
-    // as the Action runs them.
-    let off = scan(&fixture_dir(), &[("CARRICK_SITE_QUESTIONS", "1")]);
-    let on = scan(
-        &fixture_dir(),
-        &[
-            ("CARRICK_SITE_QUESTIONS", "1"),
-            ("CARRICK_SITE_PAYLOADS", "1"),
-        ],
-    );
+    let on = scan(&fixture_dir(), &[]);
     let (note, ping) = (14_u64, 18_u64);
 
     let ping_entry = entry_at(&on, "request", "src/notes.ts", ping);
@@ -223,15 +217,6 @@ fn a_caller_that_writes_no_body_through_a_wrapper_is_decided_no_body() {
     let note_alias = alias_at(&on, "request", "src/notes.ts", note);
     let note_type = captured_block(&on, &note_alias);
     assert!(note_type.contains("text: string"), "request: {note_type}");
-
-    // Off, the options literal's own type is not read as a decision.
-    let off_entry = entry_at(&off, "request", "src/notes.ts", ping);
-    assert!(
-        off_entry["any_provenance"]
-            .as_array()
-            .is_none_or(|rows| rows.iter().all(|row| row["reason"] != "no_request_body")),
-        "{off_entry:#?}"
-    );
 }
 
 /// carrick#2472 C3: a pub/sub payload a slot types is read there, not at the
@@ -247,57 +232,35 @@ fn a_caller_that_writes_no_body_through_a_wrapper_is_decided_no_body() {
 /// `src/relay.ts` is the same shape through a function the store does not
 /// label: no site, no slot.
 ///
-/// | alias | switch off | `CARRICK_SITE_PAYLOADS=1` |
-/// |---|---|---|
-/// | `orders.created` (slotted, borrowed symbol) | `OrderCreated` | the envelope's own shape |
-/// | `orders.paid` (slotted, no symbol) | the envelope's own shape | the same |
-/// | `orders.shipped` (no slot, borrowed symbol) | `OrderShipped` | `OrderShipped` |
+/// | alias | the scan |
+/// |---|---|
+/// | `orders.created` (slotted, borrowed symbol) | the envelope's own shape, not `OrderCreated` |
+/// | `orders.paid` (slotted, no symbol) | the envelope's own shape |
+/// | `orders.shipped` (no slot, borrowed symbol) | `OrderShipped` |
 #[test]
 fn a_borrowed_pubsub_symbol_gives_way_to_the_slot_that_types_the_alias() {
     let repo =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-payloads-pubsub");
-    let off = scan(&repo, &[("CARRICK_SITE_QUESTIONS", "1")]);
-    let on = scan(
-        &repo,
-        &[
-            ("CARRICK_SITE_QUESTIONS", "1"),
-            ("CARRICK_SITE_PAYLOADS", "1"),
-        ],
-    );
+    let on = scan(&repo, &[]);
     let type_at = |blob: &serde_json::Value, file: &str, line: u64| {
         let alias = alias_at(blob, "response", file, line);
         captured_block(blob, &alias)
     };
 
-    let created_off = type_at(&off, "src/orders.ts", 4);
-    assert!(created_off.contains("OrderCreated"), "off: {created_off}");
     let created_on = type_at(&on, "src/orders.ts", 4);
     assert!(
         created_on.contains("quantity: number") && !created_on.contains("OrderCreated"),
         "on: {created_on}"
     );
 
-    // A slotted alias with no symbol is typed at the slot either way.
-    for blob in [&off, &on] {
-        let paid = type_at(blob, "src/orders.ts", 5);
-        assert!(paid.contains("sku: string"), "paid: {paid}");
-    }
+    // A slotted alias with no symbol is typed at the slot.
+    let paid = type_at(&on, "src/orders.ts", 5);
+    assert!(paid.contains("sku: string"), "paid: {paid}");
 
     // No slot: the guard decides, as before.
-    for blob in [&off, &on] {
-        let shipped = type_at(blob, "src/relay.ts", 9);
-        assert!(shipped.contains("OrderShipped"), "shipped: {shipped}");
-    }
+    let shipped = type_at(&on, "src/relay.ts", 9);
+    assert!(shipped.contains("OrderShipped"), "shipped: {shipped}");
 }
-
-/// The fact-layer switches the cloud runner sets for every workspace, beside
-/// `CARRICK_POSITION_ROWS`, which [`scan`] always sets.
-const FACT_LAYER: [(&str, &str); 4] = [
-    ("CARRICK_SITE_QUESTIONS", "1"),
-    ("CARRICK_RECEIVER_TRACE", "1"),
-    ("CARRICK_FACT_FILES", "1"),
-    ("CARRICK_SITE_PAYLOADS", "1"),
-];
 
 /// Every pub/sub entry of `role` at `file:line`.
 fn pubsub_entries<'a>(
@@ -322,17 +285,16 @@ fn pubsub_entries<'a>(
 /// row, not a site row. The reader's cassette states only the `jobs.named`
 /// publish, naming `Job`.
 ///
-/// | call | entry | `CARRICK_SITE_PAYLOADS` unset | fact layer on |
-/// |---|---|---|---|
-/// | `jobs.created` publish, `:6` | one consumer, site-id'd | - | the payload's shape |
-/// | `jobs.done` subscribe, `:10` | one producer | - | the handler parameter's shape |
-/// | `jobs.named` publish, `:17` | one consumer, site-id'd | `Job` | `Job` |
+/// | call | entry | the type |
+/// |---|---|---|
+/// | `jobs.created` publish, `:6` | one consumer, site-id'd | the payload's shape |
+/// | `jobs.done` subscribe, `:10` | one producer | the handler parameter's shape |
+/// | `jobs.named` publish, `:17` | one consumer, site-id'd | `Job` |
 #[test]
 fn a_verified_library_pubsub_call_is_anchored_and_typed_at_its_slot() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/site-payloads-pubsub-verified");
-    let on = scan(&repo, &FACT_LAYER);
-    let off = scan(&repo, &[]);
+    let on = scan(&repo, &[]);
     let manifest = &on["type_manifest"];
 
     let one = |blob: &serde_json::Value, role: &str, line: u64| -> String {
@@ -378,13 +340,4 @@ fn a_verified_library_pubsub_call_is_anchored_and_typed_at_its_slot() {
         .collect();
     let unique: std::collections::BTreeSet<&&str> = aliases.iter().collect();
     assert_eq!(unique.len(), aliases.len(), "no alias twice: {aliases:#?}");
-
-    // T2: with the switch off, the model's symbol still types the folded row.
-    let named_off = one(&off, "consumer", 17);
-    assert_eq!(named_off, named, "one alias whichever switch");
-    let named_off_type = captured_block(&off, &named_off);
-    assert!(
-        named_off_type.contains("Job"),
-        "named, switch off: {named_off_type}"
-    );
 }
