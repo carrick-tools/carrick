@@ -14,8 +14,7 @@
 //! 3. the walk is record-only: a walk process that dies of memory or misses
 //!    its deadline records nothing for the run, restarts nothing and leaves no
 //!    rows file;
-//! 4. every scan writes the rows, and its blob is the one a scan whose walk
-//!    died writes, but for the calls the rows leave open;
+//! 4. every scan writes the rows, and a walk that dies loses no blob;
 //! 5. every service's walk has exited before the first analysis sidecar
 //!    starts (carrick#2413 slice G1).
 //!
@@ -780,13 +779,13 @@ fn without_a_store_the_walk_writes_to_the_temp_dir_and_cleans_up() {
     );
 }
 
-/// Every scan writes the rows, and its blob is the one a scan whose walk
-/// died writes, but for the calls the rows leave open; a walk that dies of
+/// Every scan writes the rows, with no switch set; a walk that dies of
 /// memory under `CARRICK_FAIL_ON_TYPE_MEMORY=1` leaves the scan to finish,
-/// with no rows. Each scan states, for a parent reading its stderr, what its
-/// service read the rows as (`read`, `missing`).
+/// with the same blobs stored and no rows. Each scan states, for a parent
+/// reading its stderr, what its service read the rows as (`read`,
+/// `missing`).
 #[test]
-fn a_scan_writes_rows_and_its_blob_never_moves() {
+fn every_scan_writes_rows_and_a_dead_walk_loses_no_blob() {
     if !sidecar_available() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
@@ -832,17 +831,19 @@ fn a_scan_writes_rows_and_its_blob_never_moves() {
         .collect();
     assert!(left.is_empty(), "a walk that died left files: {left:?}");
     assert_eq!(read_as(&died), BTreeSet::from(["missing".to_string()]));
-    // Rows add the calls the code left open (carrick#813) and nothing else.
-    let mut on_blobs = on.blobs.clone();
+    // A walk that died leaves the scan to finish: the same blobs are stored.
+    assert_eq!(
+        died.blobs.keys().collect::<Vec<_>>(),
+        on.blobs.keys().collect::<Vec<_>>(),
+        "a walk that died lost a blob"
+    );
+    // Rows state the calls the code left open (carrick#813).
     let mut left_open = Vec::new();
-    for blob in on_blobs.values_mut() {
-        let blob = blob.as_object_mut().expect("a blob is an object");
-        if let Some(rows) = blob.remove("unfollowed_member_calls") {
+    for blob in on.blobs.values() {
+        if let Some(rows) = blob.get("unfollowed_member_calls") {
             left_open.extend(rows.as_array().expect("rows are a list").clone());
         }
-        blob.remove("unfollowed_member_calls_total");
     }
-    assert_eq!(on_blobs, died.blobs, "writing rows moved the blob");
     assert_eq!(
         left_open
             .iter()

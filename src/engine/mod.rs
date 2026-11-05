@@ -6858,9 +6858,7 @@ fn member_declarations(
     from_dir: &Path,
 ) -> Option<crate::request_summary::discovery::MemberDeclarations> {
     use crate::request_summary::discovery::{MemberDeclarations, declaration_ask};
-    if inputs.positions.is_none() {
-        return None;
-    }
+    inputs.positions.as_ref()?;
     let ask = declaration_ask(inputs, claims);
     let verdicts = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {

@@ -483,22 +483,15 @@ fn span_id(source: &str, call: &str) -> String {
     format!("span:{}-{}", start, start + call.len() as u32)
 }
 
+/// The run log states the fact files' summary and each register signal's
+/// counts (ticket T1).
 #[test]
-fn files_only_the_fact_layer_finds_are_logged_as_fact_only() {
+fn the_fact_files_are_logged_with_the_signal_counts() {
     let scan = choosing();
     let lines = fact_lines(&scan.log);
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("fact-only src/notify.ts (site true")),
-        "the file whose only call is a labelled relay is fact-only: {lines:#?}"
-    );
-    assert!(
-        lines.iter().any(|line| {
-            line.contains("fact-only src/slow.ts (site false, lead false, unanswered-package true)")
-        }),
-        "a call into a package the store has not answered selects its file: {lines:#?}"
-    );
+    // The files only the fact layer finds (`src/notify.ts`, `src/slow.ts`)
+    // are read now, so they count under "read today"
+    // (`a_fact_file_is_read_with_its_call_listed_and_the_readers_row_joins`).
     assert!(
         lines.iter().any(|line| {
             line.contains("fact files: ")
