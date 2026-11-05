@@ -5921,14 +5921,14 @@ fn a_moved_row_of_this_builds_index_carries_no_other_build() {
     assert!(route.get("other_build").is_none(), "{answer:#}");
 }
 
-/// An edit that moves no type and no route moves nothing.
+/// An edit the scan reads differently that moves no type and no route moves nothing.
 #[test]
 #[serial]
-fn a_comment_only_edit_moves_no_row() {
+fn a_type_neutral_edit_moves_no_row() {
     let workspace = shop();
     let root = workspace.path();
     index(root);
-    comment_in(&root.join(SHOP_ROUTE), "no contract change");
+    statement_in(&root.join(SHOP_ROUTE), "no contract change");
     let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
     assert_ne!(
         answer["recheck"]["ran"],
