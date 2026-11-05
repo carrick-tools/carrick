@@ -11,6 +11,7 @@ import { fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
 import { currentVersion } from "../src/update.ts";
 import { CODEX_HOOKS_FILE, codexHooks } from "../src/init/codex.ts";
 import { carrickHooks, mergeCarrickHooks } from "../src/init/settings.ts";
+import { updateHooks } from "../src/init/self-update.ts";
 import { skillFile, SKILL_ROOTS, stamped, writeTaskSkills } from "../src/init/task-skills.ts";
 
 const LOCAL = path.join(".claude", "settings.local.json");
@@ -78,6 +79,22 @@ test("a session start rewrites our stale entries, keeps the user's hook and keys
   }
   assert.deepEqual(after.permissions, { allow: ["Read"] });
   assert.ok(JSON.stringify(after.hooks.PostToolUse).includes("echo mine"), "the user's hook stays");
+});
+
+test("a stale-looking file the merge leaves as it is is neither stamped nor reported", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const body = olderSettings();
+  const file = put(workspace.root, LOCAL, body);
+
+  const reported = updateHooks(workspace.root, workspace.root, running, (existing) => ({
+    body: existing ?? "",
+    changed: false,
+  }));
+
+  assert.deepEqual(reported, []);
+  assert.equal(fs.readFileSync(file, "utf8"), body);
+  assert.equal(fs.existsSync(path.join(workspace.root, ".carrick", "hook-entries-updated.json")), false);
 });
 
 test("a second session start writes nothing and prints nothing about it", async (t) => {

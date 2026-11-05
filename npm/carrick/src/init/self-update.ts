@@ -64,8 +64,17 @@ function writeAtomic(target: string, body: string): void {
   }
 }
 
-/** Our hook entries that an older version wrote, rewritten in place. Returns the files changed. */
-function updateHooks(workspace: string, projectDir: string, running: string): string[] {
+/**
+ * Our hook entries that an older version wrote, rewritten in place. Returns the
+ * files written: a file the merge leaves as it is is neither stamped nor reported.
+ * `merge` is a parameter so a test can hold a file the merge does not move.
+ */
+export function updateHooks(
+  workspace: string,
+  projectDir: string,
+  running: string,
+  merge: typeof mergeCarrickHooks = mergeCarrickHooks,
+): string[] {
   const stamp = readStamp(workspace);
   const changed: string[] = [];
   for (const relative of SETTINGS_FILES) {
@@ -75,8 +84,9 @@ function updateHooks(workspace: string, projectDir: string, running: string): st
       const body = fs.readFileSync(target, "utf8");
       if (!entriesAreStale(body, expectedCarrickHooks)) continue;
       const prefix = installedCarrickHooks(body)[0]!.command.split(/\s+hook\s+/)[0]!;
-      const merged = mergeCarrickHooks(body, prefix);
-      if (merged.changed) writeAtomic(target, merged.body);
+      const merged = merge(body, prefix);
+      if (!merged.changed) continue;
+      writeAtomic(target, merged.body);
       stamp[relative] = running;
       changed.push(relative);
     } catch {
