@@ -224,10 +224,9 @@ nothing about them. A function added after a nudge is pending on its own.
 **The line is short and says where it came from.** It reads "Carrick: this task
 added N new functions (a, b and N-2 more). Check them for existing copies with
 one find_similar call, passing `functions: [{ name, file }]`, one entry per new
-function. Where it names an existing function that does the same job, use that
-function: import or call it, delete your new copy, and rerun the tests. Keep
-your copy only if it is a deliberate variant, and say why. Then tell the user in
-one line what Carrick found and what you changed." Names
+function. Where it names an existing function that does the same job, replace
+your new copy with it (keep yours only if it is a deliberate variant). Then tell
+the user in one line what Carrick found and what you changed." Names
 only, at most two, no paths; one and two functions read "(a)" and "(a and b)".
 Test, spec and story files are never recorded (`isCheckedSource`), and a
 function is keyed by its path relative to the nearest checkout top, so an edit
