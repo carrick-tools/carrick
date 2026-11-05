@@ -26628,6 +26628,7 @@ unfollowed_member_calls_total: 0,
             route_kept_reader: 0,
             lead_on_row_line: 0,
             through_folded: Vec::new(),
+            replaced_by_fact: Vec::new(),
         };
         // The anchor's file is the one discovery names, absolute here, and the
         // index is keyed by the repo-relative file.
