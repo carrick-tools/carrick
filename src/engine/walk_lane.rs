@@ -124,7 +124,8 @@ impl Slots {
 
 /// Whether this run walks the rows at all.
 pub(super) fn requested() -> bool {
-    std::env::var(crate::position_rows::POSITION_ROWS_ENV).as_deref() == Ok("1")
+    // carrick#3283 S0 census: always on.
+    true
 }
 
 /// One heard [`WalkEnded`] per service, and the senders the lane drops as

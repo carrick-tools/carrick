@@ -34,7 +34,8 @@ pub const SWITCH: &str = "CARRICK_FACT_FILES";
 /// Whether the fact layer chooses the file reader's files
 /// (`CARRICK_FACT_FILES=1`, decision D6). Off: it only logs them.
 pub fn enabled() -> bool {
-    std::env::var(SWITCH).is_ok_and(|value| value == "1")
+    // carrick#3283 S0 census: always on.
+    true
 }
 
 /// The reason a call is not followed to the end when the walk found no site
