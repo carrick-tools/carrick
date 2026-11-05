@@ -1,15 +1,19 @@
-//! A call through a helper whose own request writes the verb takes that verb.
+//! A call through a helper whose own request writes the verb.
 //!
 //! The helper in `catalog.ts` requests `POST /catalog/sync`. The screen calls
 //! it and the replayed model answer states no method at the call, which would
-//! index as a GET. Every row for the route must carry the helper's POST.
+//! index as a GET.
+//!
+//! - Every row for the route carries the helper's POST.
+//! - The call and the request its helper issues are one operation, so the
+//!   route has one row.
 //!
 //! See `tests/fixtures/wrapper-fixed-verb/README.md` for the answer key.
 
 use std::process::Command;
 
-#[test]
-fn a_call_through_a_helper_that_fixes_the_verb_is_not_indexed_as_a_get() {
+/// `(file, line, method, path)` of every call row after one offline scan.
+fn rows() -> Vec<(String, i64, String, String)> {
     let repo = env!("CARGO_MANIFEST_DIR");
     let fixture = format!("{repo}/tests/fixtures/wrapper-fixed-verb");
     let mock_dir = format!("{fixture}/__llm__/");
@@ -49,13 +53,18 @@ fn a_call_through_a_helper_that_fixes_the_verb_is_not_indexed_as_a_get() {
         })
         .collect();
     rows.sort();
+    rows
+}
 
+#[test]
+fn a_call_through_a_helper_that_fixes_the_verb_is_not_indexed_as_a_get() {
+    let rows = rows();
     assert!(
         rows.iter()
             .any(|(file, _, method, path)| file == "src/lib/catalog.ts"
                 && method == "POST"
                 && path == "/catalog/sync"),
-        "the helper's own request is a POST row: {projection:#}"
+        "the helper's own request is a POST row: {rows:?}"
     );
     let off_verb: Vec<_> = rows
         .iter()
@@ -63,6 +72,20 @@ fn a_call_through_a_helper_that_fixes_the_verb_is_not_indexed_as_a_get() {
         .collect();
     assert!(
         off_verb.is_empty(),
-        "every row for the route carries the helper's POST, found {off_verb:?}: {projection:#}"
+        "every row for the route carries the helper's POST, found {off_verb:?}"
+    );
+}
+
+#[test]
+fn a_call_through_a_helper_and_the_helper_s_request_are_one_operation() {
+    let rows = rows();
+    let on_route: Vec<_> = rows
+        .iter()
+        .filter(|(_, _, _, path)| path == "/catalog/sync")
+        .collect();
+    assert_eq!(
+        on_route.len(),
+        1,
+        "the screen's call and the helper's request are one row: {rows:?}"
     );
 }
