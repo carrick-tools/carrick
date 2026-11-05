@@ -1166,7 +1166,7 @@ mod tests {
         };
         let note = enrichment_note(&enrichment, None, "api");
         assert!(note.contains("has no hosted index yet"), "{note}");
-        assert!(note.contains("`carrick refresh` reads it in"), "{note}");
+        assert!(note.contains("`carrick refresh` downloads it"), "{note}");
         assert!(!note.contains("carrick index"), "{note}");
     }
 
