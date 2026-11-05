@@ -138,6 +138,19 @@ fn read(path: &Path, label: &str, text: &str) -> Option<Reading> {
     })
 }
 
+/// How the file `file` on disk in `repo` reads against its copy at `commit`:
+/// the line map when the scan reads them the same, `None` when it does not,
+/// when either copy does not parse, when the file is not a scanned source, or
+/// when the clone lacks the commit (carrick#3245).
+pub(super) fn reads_same_since(repo: &Path, commit: &str, file: &str) -> Option<LineMap> {
+    if !crate::file_finder::is_scanned_source(&repo.join(file), repo) {
+        return None;
+    }
+    let before = crate::git_state::file_at_commit(&repo.to_string_lossy(), commit, file)?;
+    let now = std::fs::read_to_string(repo.join(file)).ok()?;
+    same_reading(Path::new(file), &before, &now)
+}
+
 /// How the edited copy `now` reads against the base copy `before` of the file
 /// at `path`: the map of base lines to edited lines when the scan reads them
 /// the same, `None` when it reads them differently or either does not parse.

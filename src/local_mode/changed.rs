@@ -35,7 +35,7 @@ use serde::Serialize;
 
 use super::join::{JoinedOperation, Role};
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex, Source};
-use super::reads_same::{LineMap, same_reading};
+use super::reads_same::{LineMap, reads_same_since};
 
 pub const SCHEMA: &str = "carrick.check-changed/0";
 
@@ -698,18 +698,12 @@ fn reads_the_same(repo: &Path, indexed: &IndexedRepo) -> Option<BTreeMap<String,
     {
         return None;
     }
-    let text = repo.to_string_lossy();
     let mut lines = BTreeMap::new();
     for file in super::query::changed_since(repo, commit)? {
         if !crate::change_scope::read_by_input_rule(&file) {
             continue;
         }
-        if !crate::file_finder::is_scanned_source(&repo.join(&file), repo) {
-            return None;
-        }
-        let before = crate::git_state::file_at_commit(&text, commit, &file)?;
-        let now = std::fs::read_to_string(repo.join(&file)).ok()?;
-        lines.insert(file.clone(), same_reading(Path::new(&file), &before, &now)?);
+        lines.insert(file.clone(), reads_same_since(repo, commit, &file)?);
     }
     Some(lines)
 }

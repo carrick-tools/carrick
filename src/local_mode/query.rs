@@ -116,18 +116,45 @@ pub fn answer(
     // not changed — and "no re-check was asked for" and "one was asked for and
     // there was nothing to do" are different facts that an absent block cannot
     // tell apart.
+    let mut reads_same = false;
     let recheck = match (freshness, mode) {
         (Freshness::Recheck, Mode::Check) if stale && !deleted => {
-            Some(match super::recheck::Reach::of(repo, &relative, &service) {
-                Some(reach) => rechecked(
-                    workspace_root,
-                    &repo_root,
-                    &relative,
-                    &indexed_at,
-                    &index.indexed_at,
-                    &reach,
+            // An edit the scan reads the same (comments, layout) has nothing
+            // to re-scan: the indexed rows stand, each at the line its node
+            // moved to. Every other edit takes the re-scan below.
+            let unchanged = service_row
+                .filter(|service| !service.dirty && !service.commit.is_empty())
+                .and_then(|service| {
+                    super::reads_same::reads_same_since(&repo_root, &service.commit, &relative)
+                });
+            reads_same = unchanged.is_some();
+            Some(match unchanged {
+                Some(lines) => (
+                    Some(
+                        items
+                            .iter()
+                            .map(|item| IndexedItem {
+                                line: item.line.map(|line| lines.map(line)),
+                                ..item.clone()
+                            })
+                            .collect(),
+                    ),
+                    Recheck {
+                        reason: Some(UNREAD_EDIT_REASON.to_string()),
+                        ..not_run("", &indexed_at)
+                    },
                 ),
-                None => (None, not_run("no service reads this file", &indexed_at)),
+                None => match super::recheck::Reach::of(repo, &relative, &service) {
+                    Some(reach) => rechecked(
+                        workspace_root,
+                        &repo_root,
+                        &relative,
+                        &indexed_at,
+                        &index.indexed_at,
+                        &reach,
+                    ),
+                    None => (None, not_run("no service reads this file", &indexed_at)),
+                },
             })
         }
         (Freshness::Recheck, Mode::Check) => Some((
@@ -150,6 +177,12 @@ pub fn answer(
     // Rows this run computed are not "unresolved since your edit": they ARE
     // the edit. The file is still reported as changed at the top level, which
     // is a fact about the tree either way.
+    //
+    // An edit the scan reads the same moved nothing the rows describe, so the
+    // file is not stale: `stale` says whether the indexed rows may differ from
+    // the tree, and for such an edit they cannot. `changed_since_index` still
+    // counts the file, and `recheck.reason` says why it is not stale.
+    let stale = stale && !reads_same;
     let rows_are_indexed = stale && !matches!(&recheck, Some((Some(_), _)));
     let recheck = recheck.map(|(_, block)| block);
 
@@ -364,6 +397,10 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
         scope: None,
     }
 }
+
+/// Said when an edit changed nothing the scan reads. Agent-facing.
+const UNREAD_EDIT_REASON: &str =
+    "the edit changed nothing the scan reads (comments or layout); verdicts are the index's";
 
 /// One indexed row, in the contract's shape.
 /// Re-judge one file from the working tree, and say what happened either way.
