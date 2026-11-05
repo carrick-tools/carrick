@@ -5764,6 +5764,8 @@ fn a_shared_package_with_no_install_is_named_not_type_checked() {
         text.contains("api.v1.widgets.$widgetId.ts") && text.contains("client.ts"),
         "{json:#}"
     );
+}
+
 // --- carrick#1049: a re-check names the rows outside the edited file that the
 // edit moved ---
 
