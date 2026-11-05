@@ -486,11 +486,20 @@ fn run_generation(
     // part of the local read the next build's opening line quotes.
     let join_started = Instant::now();
     let built_judged = generation.join("judged");
+    // What `join_target`'s own scan read as its previous generation; the
+    // per-repo file above holds whichever repo was scanned last.
+    let join_previous = generation.join("join-previous.json");
+    std::fs::write(
+        &join_previous,
+        serde_json::to_vec(&hosted.local_blobs(join_target)).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     let join = join(
         &exe,
         join_target,
         blobs,
         &generation.join("join.json"),
+        &join_previous,
         &built_judged,
     )?;
     timing.local_secs += join_started.elapsed().as_secs_f64();
@@ -978,11 +987,12 @@ fn join(
     repo: &Path,
     blobs: &Path,
     out: &Path,
+    previous: &Path,
     judged: &Path,
 ) -> Result<LocalJoin, String> {
     // The type checker's finished answers are kept where the build leaves
     // them for the per-edit re-check to find ([`super::recheck::adopt_index_state`]).
-    let mut command = join_command(exe, repo, blobs, out);
+    let mut command = join_command(exe, repo, blobs, out, Some(previous));
     command.env(crate::engine::type_compat_v2::JUDGE_ANSWERS_ENV, judged);
     run_scan(
         command,
@@ -1002,7 +1012,20 @@ fn join(
 /// The subprocess the join phase runs as, built apart from the spawn for the
 /// same reason [`scan_command`] is: what this phase asks for is entirely in
 /// its environment, and a test reads it back from here.
-pub(super) fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Command {
+///
+/// `previous` is the previous generation `repo`'s own scan read. The join
+/// starts the scanner on `repo`, and a tree with no `carrick.json` takes its
+/// services from the hosted configs that file carries; without it the join
+/// derives a list the scan never used, and fails preflight where that
+/// derivation fails (carrick#3366). Nothing else in a join reads it: the
+/// join returns before the engine replays any hosted answer.
+pub(super) fn join_command(
+    exe: &Path,
+    repo: &Path,
+    blobs: &Path,
+    out: &Path,
+    previous: Option<&Path>,
+) -> Command {
     let mut command = Command::new(exe);
     command
         .arg(repo)
@@ -1017,11 +1040,14 @@ pub(super) fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) ->
         .env(super::JOIN_OUT_ENV, out)
         .env_remove(crate::cloud_storage::ISOLATE_ENV)
         .env_remove(crate::cloud_storage::PEERS_ENV)
-        .env_remove(super::hosted::PREVIOUS_ENV)
         // Never a laptop scan: this phase analyses nothing and uploads
         // nothing, it reads blobs back and joins them.
         .env_remove(crate::cloud_storage::LAPTOP_SCAN_ENV)
         .env_remove("CARRICK_OUTPUT_JSON");
+    match previous {
+        Some(previous) => command.env(super::hosted::PREVIOUS_ENV, previous),
+        None => command.env_remove(super::hosted::PREVIOUS_ENV),
+    };
     strip_ci_env(&mut command);
     no_colour(&mut command);
     held_awake_by_parent(&mut command);
@@ -2815,6 +2841,7 @@ mod tests {
             Path::new("/repos/api"),
             Path::new("/build/repos"),
             Path::new("/build/join.json"),
+            None,
         ));
         assert_eq!(env.get(crate::logging::RUN_ID_ENV), expected);
         assert_eq!(
@@ -2839,8 +2866,31 @@ mod tests {
             Path::new("/repos/api"),
             Path::new("/build/repos"),
             Path::new("/build/join.json"),
+            None,
         ));
         assert_eq!(join.get(off), Some(&Some("1".into())));
+    }
+
+    /// A tree with no `carrick.json` takes its services from the hosted
+    /// configs its previous generation carries. The join starts the scanner on
+    /// the first repo too, so it must read the same previous generation that
+    /// repo's scan read: without it the join derives the services from the
+    /// manifests, which can fail (a workspace pattern matching nothing) and
+    /// end the whole check (carrick#3366).
+    #[test]
+    fn the_join_reads_the_services_its_anchor_repo_was_scanned_with() {
+        let previous = Path::new("/build/previous.json");
+        let scan = scan_env(&Pass::Facts);
+        let join = env_of(&join_command(
+            Path::new("/bin/carrick"),
+            Path::new("/repos/api"),
+            Path::new("/build/repos"),
+            Path::new("/build/join.json"),
+            Some(previous),
+        ));
+        let key = super::super::hosted::PREVIOUS_ENV;
+        assert_eq!(scan.get(key), Some(&Some(previous.display().to_string())));
+        assert_eq!(join.get(key), scan.get(key));
     }
 
     /// One email per `carrick index` run (cloud#1363): the inferred pass tells
