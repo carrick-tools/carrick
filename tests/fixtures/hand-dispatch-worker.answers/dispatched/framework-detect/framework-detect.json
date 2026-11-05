@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "No router: one default export whose fetch handler compares the request path by hand; requests are made with the platform fetch."
+}

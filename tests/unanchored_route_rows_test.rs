@@ -66,7 +66,7 @@ struct Scan {
 
 /// Scan a committed copy of the fixture on `.`, offline, replaying the
 /// answer set `set`.
-fn scan(set: &str) -> Scan {
+fn scan(set: &str, trace: bool) -> Scan {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir(), &repo);
@@ -91,6 +91,11 @@ fn scan(set: &str) -> Scan {
             format!("{}/", answers_dir(set).display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1");
+    if trace {
+        cmd.env("CARRICK_POSITION_ROWS", "1")
+            .env("CARRICK_SITE_QUESTIONS", "1")
+            .env("CARRICK_RECEIVER_TRACE", "1");
+    }
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -132,7 +137,7 @@ fn scan(set: &str) -> Scan {
 
 fn listed() -> &'static Scan {
     static SCAN: OnceLock<Scan> = OnceLock::new();
-    SCAN.get_or_init(|| scan("listed"))
+    SCAN.get_or_init(|| scan("listed", false))
 }
 
 /// `(file, line, method, path)` of a row.
@@ -214,4 +219,31 @@ fn routes_that_echo_a_listed_call_keep_their_rows() {
     let scan = listed();
     assert_eq!(model_routes(scan), expected_routes());
     assert_model_only_rows(scan);
+}
+
+/// carrick#2474 R4 (row R4, the deleted route-literal witness, #2717): the
+/// four routes the file compares the request path against are stated with
+/// the model's ids made up, now by the guard chain's dispatch rows and the
+/// handler answers (the narrower model question), at their own lines. The
+/// two the file states in no comparison (`GET /metrics`, `POST /audit`, a
+/// request only) are no routes.
+#[test]
+fn routes_with_made_up_ids_are_stated_by_the_dispatch_rows() {
+    let scan = scan("dispatched", true);
+    let flat: BTreeSet<Row> = scan.blob["endpoints"]
+        .as_array()
+        .expect("the blob holds endpoint rows")
+        .iter()
+        .map(|row| {
+            let location = row["file_path"].as_str().unwrap();
+            let (file, line) = location.rsplit_once(':').expect("file:line");
+            (
+                file.to_string(),
+                line.parse().expect("a line number"),
+                row["key"]["method"].as_str().unwrap().to_string(),
+                row["key"]["path"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(flat, expected_routes());
 }
