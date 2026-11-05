@@ -2800,7 +2800,13 @@ fn generate_mock_file_analysis_response(prompt: &str) -> String {
         // Source line 1 starts after the fence line's own newline; without
         // this the empty remainder of the fence line counts as line 1 and
         // every mock row lands one line low (#3314).
+        // Source line 1 starts after the fence line's own newline; without
+        // this the empty remainder of the fence line counts as line 1 and
+        // every mock row lands one line low (#3314).
         let after_fence = &content_section[fence_start + 3..];
+        let after_fence = after_fence
+            .split_once('\n')
+            .map_or(after_fence, |(_, body)| body);
         if let Some(fence_end) = after_fence.find("```") {
             &after_fence[..fence_end]
         } else {
