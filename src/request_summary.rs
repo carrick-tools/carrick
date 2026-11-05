@@ -1946,6 +1946,9 @@ pub fn extract_file_ir(
     // Each function a module-scope binding names, and whether the statement
     // that declares it publishes it (carrick#1798).
     let mut bound: HashMap<String, bool> = HashMap::new();
+    // The span starts of the object members read as functions above, which
+    // module scope does not read again (carrick#3356).
+    let mut lifted_members: HashSet<u32> = HashSet::new();
     for item in &module.body {
         let declared_exported = matches!(item, ModuleItem::ModuleDecl(_));
         match module_decl(item) {
@@ -1968,6 +1971,34 @@ pub fn extract_file_ir(
                         Expr::Arrow(arrow) => reader.arrow(arrow, None, module_scope, &none),
                         Expr::Fn(fn_expr) => {
                             reader.function(&fn_expr.function, None, module_scope, &none)
+                        }
+                        // The functions a constant object holds (carrick#3356).
+                        Expr::Object(object) => {
+                            let name = ident.id.sym.as_ref();
+                            if var.kind != VarDeclKind::Const
+                                || !module_scope.object_consts.contains(name)
+                                || module_scope.written_through(name)
+                            {
+                                continue;
+                            }
+                            let mut members = Vec::new();
+                            object_members(name, object, 0, &mut members);
+                            for (key, member) in members {
+                                if !definition_keys.contains(&key) {
+                                    continue;
+                                }
+                                let ir = match member {
+                                    ObjectMember::Function(function) => {
+                                        reader.function(function, None, module_scope, &none)
+                                    }
+                                    ObjectMember::Arrow(arrow) => {
+                                        reader.arrow(arrow, None, module_scope, &none)
+                                    }
+                                };
+                                lifted_members.insert(member.span().lo.0);
+                                file.functions.insert(key, ir);
+                            }
+                            continue;
                         }
                         _ => continue,
                     };
@@ -2053,13 +2084,21 @@ pub fn extract_file_ir(
                 _ => match module_decl(item) {
                     Some(Decl::Var(var)) => {
                         for declarator in &var.decls {
-                            if let Some(init) = &declarator.init
-                                && !matches!(
-                                    crate::graphql_document_sites::unwrap_expression(init),
-                                    Expr::Arrow(_) | Expr::Fn(_)
-                                )
-                            {
-                                reader.walk(&**init, &scope, &mut module_level);
+                            let Some(init) = &declarator.init else {
+                                continue;
+                            };
+                            match crate::graphql_document_sites::unwrap_expression(init) {
+                                Expr::Arrow(_) | Expr::Fn(_) => {}
+                                Expr::Object(object) if !lifted_members.is_empty() => {
+                                    walk_object_except(
+                                        &reader,
+                                        object,
+                                        &lifted_members,
+                                        &scope,
+                                        &mut module_level,
+                                    );
+                                }
+                                _ => reader.walk(&**init, &scope, &mut module_level),
                             }
                         }
                     }
@@ -2085,6 +2124,115 @@ pub fn extract_file_ir(
             .collect();
     }
     file
+}
+
+/// A function an object literal holds as one of its entries.
+#[derive(Clone, Copy)]
+enum ObjectMember<'o> {
+    Function(&'o Function),
+    Arrow(&'o ArrowExpr),
+}
+
+impl ObjectMember<'_> {
+    fn span(&self) -> Span {
+        match self {
+            ObjectMember::Function(function) => function.span,
+            ObjectMember::Arrow(arrow) => arrow.span,
+        }
+    }
+}
+
+/// Each function `object` holds, keyed `owner.member` (`owner.v1.member` one
+/// object down) the way the function extractor keys an exported object's
+/// members (`FunctionDefinitionExtractor::collect_exported_object_members`
+/// in `visitor.rs`, carrick#830), to the same depth: a method, or an entry
+/// whose value is an arrow or a function expression (carrick#3356). An entry
+/// naming a function declared elsewhere is that function already.
+fn object_members<'o>(
+    owner: &str,
+    object: &'o ObjectLit,
+    depth: usize,
+    out: &mut Vec<(String, ObjectMember<'o>)>,
+) {
+    const MAX_DEPTH: usize = 3;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    for prop in &object.props {
+        let PropOrSpread::Prop(prop) = prop else {
+            continue;
+        };
+        match &**prop {
+            Prop::Method(method) => {
+                if let Some(key) = prop_name(&method.key) {
+                    out.push((
+                        format!("{owner}.{key}"),
+                        ObjectMember::Function(&method.function),
+                    ));
+                }
+            }
+            Prop::KeyValue(kv) => {
+                let Some(key) = prop_name(&kv.key) else {
+                    continue;
+                };
+                let name = format!("{owner}.{key}");
+                match &*kv.value {
+                    Expr::Arrow(arrow) => out.push((name, ObjectMember::Arrow(arrow))),
+                    Expr::Fn(fn_expr) => {
+                        out.push((name, ObjectMember::Function(&fn_expr.function)))
+                    }
+                    Expr::Object(nested) => object_members(&name, nested, depth + 1, out),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read the calls `object` makes where the module is loaded, as a walk of
+/// the whole literal would, less the bodies of the members read as functions
+/// of the module (`lifted`, by span start): each is read once, as its own
+/// function (carrick#3356).
+fn walk_object_except(
+    reader: &Reader<'_>,
+    object: &ObjectLit,
+    lifted: &HashSet<u32>,
+    scope: &Scope<'_>,
+    ir: &mut FnIr,
+) {
+    for prop in &object.props {
+        let prop = match prop {
+            PropOrSpread::Spread(spread) => {
+                reader.walk(&*spread.expr, scope, ir);
+                continue;
+            }
+            PropOrSpread::Prop(prop) => &**prop,
+        };
+        match prop {
+            Prop::Method(method) if lifted.contains(&method.function.span.lo.0) => {}
+            Prop::KeyValue(kv) => {
+                let value = &*kv.value;
+                let kept = match value {
+                    Expr::Arrow(arrow) => !lifted.contains(&arrow.span.lo.0),
+                    Expr::Fn(fn_expr) => !lifted.contains(&fn_expr.function.span.lo.0),
+                    Expr::Object(_) => false,
+                    _ => true,
+                };
+                if kept {
+                    reader.walk(prop, scope, ir);
+                    continue;
+                }
+                if let PropName::Computed(key) = &kv.key {
+                    reader.walk(&*key.expr, scope, ir);
+                }
+                if let Expr::Object(nested) = value {
+                    walk_object_except(reader, nested, lifted, scope, ir);
+                }
+            }
+            _ => reader.walk(prop, scope, ir),
+        }
+    }
 }
 
 fn module_decl(item: &ModuleItem) -> Option<&Decl> {
