@@ -5840,7 +5840,9 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 &served_paths::PathScrub::for_scan(repo_path),
             );
-            let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
+            let placed = crate::handler_span::attach_handler_spans(&mut cloud_data, |file| {
+                crate::parser::read_source(&Path::new(repo_path).join(file))
+            });
             debug!("Handler spans placed on endpoint rows: {placed}");
             crate::unfollowed_calls::attach(&mut cloud_data, &request_inputs.unfollowed, repo_path);
 
@@ -13626,7 +13628,9 @@ async fn analyze_current_repo(
     );
     // Each route's handler function, placed once paths are relative so a row's
     // file and a definition's file compare (cloud#948).
-    let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
+    let placed = crate::handler_span::attach_handler_spans(&mut cloud_data, |file| {
+        crate::parser::read_source(&Path::new(repo_path).join(file))
+    });
     debug!("Handler spans placed on endpoint rows: {placed}");
     crate::unfollowed_calls::attach(&mut cloud_data, &request_inputs.unfollowed, repo_path);
 
