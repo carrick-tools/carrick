@@ -1736,7 +1736,7 @@ mod hosted_wire_tests {
         let text = output.render();
         assert!(text.contains("changed since index: 1"), "{text}");
         assert!(
-            text.contains("3 candidate(s) waiting for `carrick index`"),
+            text.contains("3 candidate(s) waiting for Carrick's cloud scan"),
             "{text}"
         );
         assert!(

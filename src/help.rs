@@ -15,13 +15,16 @@ so AI coding agents search existing code by intent and see every route, type,
 and consumer before writing new code.
 
 USAGE:
-    carrick [OPTIONS] [REPO_PATH]   scan one repository and upload its index
-    carrick <COMMAND> [OPTIONS]     build or read the index on this machine
+    carrick <COMMAND> [OPTIONS]     set up this folder, and read and check the
+                                    index Carrick builds for your repos
+    carrick [OPTIONS] [REPO_PATH]   the scan Carrick's own runners make
 
 SCAN:
     [REPO_PATH]    Repository to analyse (default: the working directory). This
-                   is what the GitHub Action runs: it scans the source, resolves
-                   the types, and uploads that repository's index.
+                   is what Carrick's cloud runners and the GitHub Action run: it
+                   scans the source, resolves the types, and uploads that
+                   repository's index. Carrick builds your index itself, so you
+                   do not need to run it.
 
 WORKSPACE:
     init       Set up this folder: sign in, read in the index Carrick builds
