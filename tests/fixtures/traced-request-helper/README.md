@@ -34,7 +34,7 @@ the helper's caller writes.
 | File | Line | Method | Path | Source | Why |
 |---|---|---|---|---|---|
 | src/tasks-api.ts | 6 | PUT | /v1/tasks/:id/status | fact | the caller's `init` writes `method: "PUT"` |
-| src/tasks-api.ts | 10 | GET | /v1/tasks/:id | fact | the caller passes no `init`: the label's default |
+| src/tasks-api.ts | 10 | GET | /v1/tasks/:id | model (fact row owed by #3372) | the caller passes no `init`: the label's default; a URL ending in a parameter no caller fills states no fact row yet |
 | src/tasks-api.ts | 14 | PUT | /v1/tasks/:id/archive | fact | no span; control |
 | src/workspace-api.ts | 9 | GET | /v1/workspaces/:id | fact | the bag's rest carries `method` |
 | src/workspace-api.ts | 12 | PATCH | /v1/workspaces/:id | fact | the same |
