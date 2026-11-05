@@ -25,9 +25,9 @@
 //!   name the model gave its handler, read as the identifier is. An inline
 //!   handler the model calls `anonymous` matches no definition and places
 //!   nothing.
-//! A named
-//! definition that opens above the registration line and contains it is the
-//! function the route is registered FROM (a plugin), never the handler
+//!
+//! A named definition that opens above the registration line and contains it
+//! is the function the route is registered FROM (a plugin), never the handler
 //! (carrick#2824), and places nothing.
 
 use crate::agents::file_analyzer_agent::FileAnalysisResult;
