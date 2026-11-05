@@ -5288,8 +5288,6 @@ async fn analyze_current_repo_incremental(
                     }),
                     prev_file_results,
                     &unchanged,
-                    &setup.detection.data_fetchers,
-                    &setup.detection.messaging_clients,
                 )
             } else {
                 crate::model_carry::Carried::default()

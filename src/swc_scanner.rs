@@ -671,7 +671,24 @@ impl SwcScanner {
         data_fetchers: &[String],
         messaging_clients: &[String],
     ) -> ScanResult {
-        self.scan_content_with(file_path, content, data_fetchers, messaging_clients, None)
+        self.scan_content_with(
+            file_path,
+            content,
+            data_fetchers,
+            messaging_clients,
+            None,
+            false,
+        )
+    }
+
+    /// Every candidate [`SwcScanner::scan_content`] raises, plus one at each
+    /// other call expression, with no detection list. The edited-file carry
+    /// (`model_carry`) places a model row by the call it stands on, and a row
+    /// can stand on a call no signal raises without the detection lists
+    /// (an import-gated messaging subscribe), so it enumerates calls instead
+    /// of re-running the gated scanner.
+    pub fn scan_every_call(&self, file_path: &Path, content: &str) -> ScanResult {
+        self.scan_content_with(file_path, content, &[], &[], None, true)
     }
 
     /// The HTTP candidates at the calls the fact layer found in a file
@@ -686,7 +703,8 @@ impl SwcScanner {
         content: &str,
         spans: &BTreeSet<(u32, u32)>,
     ) -> ScanResult {
-        let mut result = self.scan_content_with(file_path, content, &[], &[], Some(spans.clone()));
+        let mut result =
+            self.scan_content_with(file_path, content, &[], &[], Some(spans.clone()), false);
         result
             .candidates
             .retain(|candidate| spans.contains(&(candidate.span_start, candidate.span_end)));
@@ -703,6 +721,7 @@ impl SwcScanner {
         data_fetchers: &[String],
         messaging_clients: &[String],
         wanted: Option<BTreeSet<(u32, u32)>>,
+        every_call: bool,
     ) -> ScanResult {
         use swc_common::{FileName, GLOBALS, Globals, Mark};
         use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
@@ -776,6 +795,7 @@ impl SwcScanner {
             Declarations::of(&module),
         );
         visitor.wanted = wanted;
+        visitor.every_call = every_call;
         module.visit_with(&mut visitor);
 
         ScanResult {
@@ -2322,6 +2342,9 @@ struct CandidateVisitor {
     /// Set by [`SwcScanner::scan_sites`]: no signal runs, and a candidate is
     /// raised at each of these call spans and nowhere else.
     wanted: Option<BTreeSet<(u32, u32)>>,
+    /// Set by [`SwcScanner::scan_every_call`]: the signals run, then a
+    /// candidate is raised at every call they left alone.
+    every_call: bool,
 }
 
 impl CandidateVisitor {
@@ -2355,6 +2378,7 @@ impl CandidateVisitor {
             register_hits: BTreeMap::new(),
             kept_hits: BTreeSet::new(),
             wanted: None,
+            every_call: false,
         }
     }
 
@@ -3880,6 +3904,18 @@ impl Visit for CandidateVisitor {
 
                 self.push_candidate(call, obj_name, method);
             }
+        }
+
+        if self.every_call {
+            self.register_signal = None;
+            let (obj, prop) = match &call.callee {
+                Callee::Expr(e) => (
+                    Self::extract_callee_object(e).unwrap_or_else(|| "<call>".to_string()),
+                    Self::callee_member_prop(e),
+                ),
+                _ => ("<call>".to_string(), None),
+            };
+            self.push_candidate(call, obj, prop);
         }
 
         // Continue visiting child nodes
