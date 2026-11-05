@@ -1691,7 +1691,8 @@ fn state_leaves<'g>(
         if !written.insert((format!("{}:{}", leaf.file, leaf.line), operation)) {
             continue;
         }
-        if state_leaf(service.data, leaf, request) {
+        let filled = filled_request(service.data, held, callee, request);
+        if state_leaf(service.data, leaf, filled.as_ref().unwrap_or(request)) {
             outcome.own += 1;
             through.push((
                 callee.clone(),
@@ -1786,6 +1787,55 @@ fn state_leaves<'g>(
     }
     outcome.withdrawn = withdraw_wrapped(service.data, held, &through);
     outcome
+}
+
+/// The request a wrapper's own fact row states where it fills the callee's
+/// parameter with a value the source writes (carrick#3315): `getItem("1")`
+/// states `/api/items/1` where the callee's route is `/api/items/:id`. The
+/// leaf row at the wrapper's caller takes that path, as the row it stands in
+/// for did. Only when exactly one of the first `held` rows inside the
+/// wrapper states the operation, the callee's path matches it, and it holds
+/// more literal segments than the callee's: a wrapper that passes its own
+/// parameter on (`${id}`) states no more than the callee does, and the
+/// callee's template stands.
+fn filled_request(
+    data: &CloudRepoData,
+    held: usize,
+    callee: &DefinitionSite,
+    request: &Reached,
+) -> Option<Reached> {
+    let definition = data.function_definitions.values().find(|definition| {
+        definition.line_number == callee.line
+            && definition.file_path.to_string_lossy() == callee.file
+    })?;
+    let last = definition.end_line.max(callee.line);
+    let key = OperationKey::http(&request.method, request.canonical_path.clone());
+    let mut inside = data.calls.iter().take(held).filter(|call| {
+        call.resolution_source == Some(ResolutionSource::RequestSummary)
+            && call
+                .file_path
+                .to_str()
+                .and_then(|text| text.rsplit_once(':'))
+                .and_then(|(file, line)| Some((file, line.parse::<u32>().ok()?)))
+                .is_some_and(|(file, line)| {
+                    file == callee.file
+                        && (callee.line..=last).contains(&line)
+                        && crate::site_rows::agrees(&call.key, &key)
+                })
+    });
+    let call = inside.next()?;
+    if inside.next().is_some() {
+        return None;
+    }
+    let (_, path) = call.key.as_http()?;
+    let filled = carrick_match::path_literal_specificity(path)
+        > carrick_match::path_literal_specificity(&request.canonical_path)
+        && carrick_match::paths_match(&request.canonical_path, path);
+    filled.then(|| Reached {
+        target_url: path.to_string(),
+        canonical_path: path.to_string(),
+        ..request.clone()
+    })
 }
 
 /// Withdraw each fact row a service's site questions stated inside a callee
