@@ -726,7 +726,7 @@ pub fn internal_origin_path(call_path: &str, internal_domains: Vec<String>) -> O
             _ => return None,
         },
     };
-    let (authority, tail) = match rest.find(|c| c == '/' || c == '?' || c == '#') {
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
         Some(i) => rest.split_at(i),
         None => (rest, ""),
     };
@@ -737,7 +737,7 @@ pub fn internal_origin_path(call_path: &str, internal_domains: Vec<String>) -> O
     if !host_matches_domains(host, &internal_domains) {
         return None;
     }
-    let route = tail.split(|c| c == '?' || c == '#').next().unwrap_or("");
+    let route = tail.split(['?', '#']).next().unwrap_or("");
     Some(if route.is_empty() {
         "/".to_string()
     } else {
