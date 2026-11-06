@@ -533,6 +533,8 @@ type InitPlan = {
   editors: string[];
   /** The covered repos Carrick holds no index for yet. */
   waiting: string[];
+  /** The covered repos and the services the workspace read holds for them. */
+  counts: { repos: number; services: number };
 };
 
 /**
@@ -623,6 +625,10 @@ async function planRun(input: {
     groups,
     editors,
     waiting: repoNames(selected.filter((repo) => held(repo)!.services.length === 0)),
+    counts: {
+      repos: selected.length,
+      services: selected.reduce((sum, repo) => sum + held(repo)!.services.length, 0),
+    },
   };
 }
 
@@ -841,7 +847,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // The check block in AGENTS.md (carrick#2828): only our marked section is
   // written, and every other line of the file is left as it is.
   try {
-    writeAgentsSection(workspace);
+    writeAgentsSection(workspace, { slug: project }, plan.counts);
   } catch (error) {
     out.refuse(`Could not write the Carrick check section in ${AGENTS_FILE}: ${(error as Error).message}`);
   }
