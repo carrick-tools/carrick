@@ -98,6 +98,14 @@ test("stop waits for a re-check that finishes inside the wait and prints its pro
   const run = await stopWith(home, 20);
   assert.equal(run.code, 0);
   assert.ok(run.ms >= 1800 && run.ms < 8000, `waited for the answer, not the whole wait (${run.ms} ms)`);
+  // The one Stop channel Claude Code delivers to the model while letting the
+  // turn continue: `systemMessage` never reaches the model, and `decision:
+  // "block"` reaches it by refusing to stop.
+  const parsed = JSON.parse(run.stdout) as Record<string, unknown> & { hookSpecificOutput: { hookEventName: string } };
+  assert.equal(parsed.hookSpecificOutput.hookEventName, "Stop");
+  assert.equal(parsed["decision"], undefined);
+  assert.equal(parsed["continue"], undefined);
+  assert.equal(parsed["systemMessage"], undefined);
   const text = context(run.stdout);
   assert.match(text, /contract problem/);
   assert.match(

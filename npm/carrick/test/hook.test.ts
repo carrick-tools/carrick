@@ -1021,8 +1021,19 @@ test("the Codex prompt hook delivers a finished answer", async (t) => {
     payload: { hook_event_name: "UserPromptSubmit", session_id: "codex-b4", cwd: workspace.root },
     env,
   });
-  const parsed = JSON.parse(prompt.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+  const parsed = JSON.parse(prompt.stdout) as {
+    hookSpecificOutput: { hookEventName: string; additionalContext: string };
+    decision?: unknown;
+    continue?: unknown;
+    systemMessage?: unknown;
+  };
+  // Codex parses this with `deny_unknown_fields` and accepts
+  // `additionalContext` on this event and not on `Stop`, so the event name is
+  // the load-bearing byte. A `decision` here would be a block.
   assert.equal(parsed.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+  assert.equal(parsed.decision, undefined);
+  assert.equal(parsed.continue, undefined);
+  assert.equal(parsed.systemMessage, undefined);
   assert.ok(parsed.hookSpecificOutput.additionalContext.startsWith(LATE_USERS));
 });
 

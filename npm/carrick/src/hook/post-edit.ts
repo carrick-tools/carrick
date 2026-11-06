@@ -86,9 +86,8 @@ function emit(context: string): void {
 async function main(): Promise<void> {
   markInvoker("post-edit");
   // `off` stops the work as well as the printing. `lsp` stops only the
-  // printing: it decides which surface delivers a verdict, and the reuse
-  // record below is not a verdict — it is what the Stop hook speaks from, and
-  // the language server has no equivalent of that moment (carrick#1330).
+  // printing: it decides which surface delivers a verdict, and the session
+  // record below (the edit stamp) is not a verdict.
   const channel = resolveChannel({ hooksInstalled: true });
   if (channel.channel === "off") {
     log("CARRICK_CHANNEL=off; doing nothing");
