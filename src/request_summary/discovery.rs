@@ -4855,6 +4855,92 @@ export function listen(): void {
         );
     }
 
+    /// carrick#3213: a route path written as a template over a constant
+    /// another package exports, where that constant is itself a template
+    /// over exported constants (`${LOGIN_PATH}/:id` with `LOGIN_PATH =
+    /// `${AUTH_BASE}/login``), folds across the packages, so the route is
+    /// served at its whole path and is no guessed site. A constant whose
+    /// template holds a value read at runtime does not fold: that site stays
+    /// guessed.
+    #[test]
+    fn a_route_path_over_a_nested_template_constant_from_another_package_is_served() {
+        let Some((on, exports, declarations)) = traced_fixture_in(
+            "receiver-route-nested-template",
+            "packages/server",
+            "server",
+        ) else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        let routes = crate::site_rows::traced(&decided, &records);
+        let mut served: Vec<String> = routes
+            .routes
+            .iter()
+            .map(|route| {
+                format!(
+                    "{}:{} {} {}",
+                    route.file,
+                    route.line,
+                    route.method,
+                    route.full_paths.join(" ")
+                )
+            })
+            .collect();
+        served.sort();
+        assert_eq!(
+            served,
+            texts(&[
+                "packages/server/src/main.ts:7 GET /auth/login",
+                "packages/server/src/main.ts:8 GET /auth/login/:id",
+                "packages/server/src/main.ts:9 POST /account/profile/:section",
+            ]),
+            "{served:#?}"
+        );
+        let guessed: Vec<String> = routes
+            .guessed
+            .iter()
+            .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
+            .collect();
+        assert_eq!(
+            guessed,
+            texts(&["packages/server/src/main.ts:10 GET"]),
+            "{:#?}",
+            routes.guessed
+        );
+        // Each record states the name the trace serves, whole: forced, not
+        // a lead. The one that does not fold is a lead.
+        let mut names: Vec<String> = records
+            .iter()
+            .map(|record| {
+                format!(
+                    "{} {:?} {}",
+                    record.anchors.call.line,
+                    record.bucket,
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .map_or("-", String::as_str)
+                )
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            texts(&[
+                "10 Lead -",
+                "7 Forced /auth/login",
+                "8 Forced /auth/login/:id",
+                "9 Forced /account/profile/:section",
+            ])
+        );
+    }
+
     /// carrick#1678: a verb called on the object a scope member returns
     /// (`items.at("/items").get(list)`) is a route whose path is the scope
     /// call's argument and whose instance is the scope call's receiver: the
