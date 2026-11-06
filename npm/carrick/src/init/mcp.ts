@@ -29,6 +29,7 @@
 // detection, the same container the file uses, and one gate of its own — an
 // entry is only removed when it points at this server's host.
 
+import { isRecord } from "../fs-util.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -215,10 +216,6 @@ export type McpOutcome = {
   /** The line to print: the path written, or what to do by hand. */
   detail: string;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /** The document back, with `servers` in the container it came from. */
 function withServers(

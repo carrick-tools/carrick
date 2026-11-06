@@ -17,6 +17,7 @@
 //
 // Reference: `docs/reference/task-skills.md`, "The reuse nudge".
 
+import { snapshotRepos } from "../hosted-snapshot.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -384,14 +385,8 @@ export function nudge(entries: NewFunction[], slug = ""): string {
  * carries each connected repo's `project_slug`.
  */
 export function snapshotProjectSlug(root: string): string {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(fs.readFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), "utf8"));
-  } catch {
-    return "";
-  }
-  const repos = (parsed as { resolution?: { repos?: unknown } } | null)?.resolution?.repos;
-  if (!Array.isArray(repos)) return "";
+  const repos = snapshotRepos(root);
+  if (repos === null) return "";
   const slugs = new Set<string>();
   for (const repo of repos) {
     const slug = (repo as { project_slug?: unknown } | null)?.project_slug;

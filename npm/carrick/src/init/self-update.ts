@@ -31,6 +31,7 @@
 //
 // Reference: `docs/reference/task-skills.md`.
 
+import { snapshotRepos } from "../hosted-snapshot.ts";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -132,21 +133,14 @@ function updateSkills(workspace: string): string[] {
 
 /** Repos and services the snapshot's resolution holds; null where it cannot be read. */
 function snapshotCounts(workspace: string): WorkspaceCounts | null {
-  try {
-    const parsed: unknown = JSON.parse(
-      fs.readFileSync(path.join(workspace, ".carrick", "hosted", "snapshot.json"), "utf8"),
-    );
-    const repos = (parsed as { resolution?: { repos?: unknown } } | null)?.resolution?.repos;
-    if (!Array.isArray(repos) || repos.length === 0) return null;
-    let services = 0;
-    for (const repo of repos) {
-      const held = (repo as { services?: unknown } | null)?.services;
-      if (Array.isArray(held)) services += held.length;
-    }
-    return { repos: repos.length, services };
-  } catch {
-    return null;
+  const repos = snapshotRepos(workspace);
+  if (repos === null || repos.length === 0) return null;
+  let services = 0;
+  for (const repo of repos) {
+    const held = (repo as { services?: unknown } | null)?.services;
+    if (Array.isArray(held)) services += held.length;
   }
+  return { repos: repos.length, services };
 }
 
 /**

@@ -13,6 +13,7 @@
 // about once per session whatever the answer was. Whatever happens it exits 0
 // and prints at most the one JSON object.
 
+import { readStdin } from "./stdin.ts";
 import path from "node:path";
 import { check } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
@@ -34,12 +35,6 @@ type Payload = {
   session_id?: string;
   tool_input?: { file_path?: string };
 };
-
-async function readStdin(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString("utf8");
-}
 
 /** The one JSON object this hook prints, or nothing when there are no lines. */
 function emit(contexts: string[]): void {

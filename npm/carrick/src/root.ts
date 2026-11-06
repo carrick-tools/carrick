@@ -11,7 +11,7 @@
 // first one holding `.carrick/` wins; when the winner is not the directory the
 // client sent, that is logged.
 
-import fs from "node:fs";
+import { defaultExists } from "./fs-util.ts";
 import path from "node:path";
 
 export const MARKER = ".carrick";
@@ -30,14 +30,6 @@ export type RootChoice = {
 
 export function hasMarker(dir: string, exists = defaultExists): boolean {
   return exists(path.join(dir, MARKER));
-}
-
-function defaultExists(target: string): boolean {
-  try {
-    return fs.existsSync(target);
-  } catch {
-    return false;
-  }
 }
 
 /** Every directory from `from` up to the filesystem root, nearest first. */
