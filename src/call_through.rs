@@ -141,6 +141,20 @@ pub struct CallThroughSites {
     /// that analyses the service, so never stored: a carried service's blob
     /// already holds the rows they stated.
     pub leaves: Vec<LeafCall>,
+    /// Every path segment the strings and templates inside each of the
+    /// service's definitions write, lowercased ([`WrittenSegments`]): what
+    /// [`settle`] reads to say a helper writes a route (carrick#1794,
+    /// carrick#1801). Read only in the run that analyses the service, so never
+    /// stored: it decides only for a row whose helper is in the row's own
+    /// service, and a carried service's blob already holds what it decided.
+    pub written: HashMap<DefinitionSite, HashSet<String>>,
+    /// The rows (repository-relative file and line) whose call is a direct
+    /// call of a binding (`loadStats(id)`), not a member called on a value
+    /// (`api.load(id)`, where the value can be any object of its type).
+    /// [`settle`] reads a helper's route only for these. Read only in the
+    /// run that analyses the service, so never stored, like
+    /// [`Self::written`].
+    pub direct: HashSet<(String, u32)>,
 }
 
 impl CallThroughSites {
@@ -269,6 +283,8 @@ impl StoredCallThrough {
     pub fn sites(&self) -> CallThroughSites {
         CallThroughSites {
             leaves: Vec::new(),
+            written: HashMap::new(),
+            direct: HashSet::new(),
             rows: self.rows.clone(),
             return_shapes: self
                 .return_shapes
@@ -335,7 +351,8 @@ pub fn read_sites(
     definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
 ) -> CallThroughSites {
     let root = repo_path.trim_end_matches('/');
-    let (side_calls, return_shapes) = read_function_facts(file_results, inputs, root, definitions);
+    let (side_calls, return_shapes, written) =
+        read_function_facts(file_results, inputs, root, definitions);
     let lines = definition_lines(definitions, root);
     let leaves = read_leaves(inputs, root, &lines);
     let mut keys: Vec<&String> = file_results
@@ -350,6 +367,8 @@ pub fn read_sites(
             return_shapes,
             side_calls,
             leaves,
+            written,
+            direct: HashSet::new(),
         };
     }
 
@@ -357,6 +376,7 @@ pub fn read_sites(
     // not always the spelling a row's key joins to.
     let mut walked: Option<HashMap<PathBuf, &PathBuf>> = None;
     let mut rows = Vec::new();
+    let mut direct = HashSet::new();
     for key in keys {
         let absolute = if Path::new(key).is_absolute() {
             PathBuf::from(key)
@@ -432,7 +452,7 @@ pub fn read_sites(
             }
         }
         let relative = crate::engine::repo_relative(key, root);
-        rows.extend(read_file_sites(
+        let (read, lines) = read_file_sites(
             &absolute,
             &relative,
             &file_results[key],
@@ -440,13 +460,17 @@ pub fn read_sites(
                 resolved: &resolved,
                 outside: &outside,
             },
-        ));
+        );
+        rows.extend(read);
+        direct.extend(lines.into_iter().map(|line| (relative.clone(), line)));
     }
     CallThroughSites {
         rows,
         return_shapes,
         side_calls,
         leaves,
+        written,
+        direct,
     }
 }
 
@@ -561,9 +585,12 @@ fn read_leaves(
 }
 
 /// Every resolved call of the service whose value is not handed back by the
-/// function it is written in ([`SideCall`]), and what each of the service's
-/// definitions returns ([`BodyShape`]). Each file is parsed once; a file with
-/// no resolved call (a generated client) is read for its definitions alone.
+/// function it is written in ([`SideCall`]), what each of the service's
+/// definitions returns ([`BodyShape`]), and the path segments each one's
+/// strings and templates write ([`CallThroughSites::written`]). Each file is
+/// parsed once; a file with no resolved call (a generated client) is read for
+/// its definitions alone.
+#[allow(clippy::type_complexity)]
 fn read_function_facts(
     file_results: &HashMap<String, FileAnalysisResult>,
     inputs: &RequestSummaryInputs,
@@ -572,7 +599,26 @@ fn read_function_facts(
 ) -> (
     HashMap<SideKey, SideCall>,
     HashMap<DefinitionSite, BodyShape>,
+    HashMap<DefinitionSite, HashSet<String>>,
 ) {
+    // Each definition's first and last line, by its file.
+    let mut extents: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+    for definition in definitions
+        .values()
+        .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
+    {
+        extents
+            .entry(crate::engine::repo_relative(
+                &definition.file_path.to_string_lossy(),
+                root,
+            ))
+            .or_default()
+            .push((
+                definition.line_number,
+                definition.end_line.max(definition.line_number),
+            ));
+    }
+    let mut written: HashMap<DefinitionSite, HashSet<String>> = HashMap::new();
     let defined: HashSet<DefinitionSite> = definitions
         .values()
         .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
@@ -624,6 +670,30 @@ fn read_function_facts(
             continue;
         };
         let positions = Positions { cm: &cm };
+        if let Some(extents) = extents.get(&relative) {
+            let mut segments = WrittenSegments {
+                positions: &positions,
+                at: Vec::new(),
+            };
+            module.visit_with(&mut segments);
+            for &(first, last) in extents {
+                let inside: HashSet<String> = segments
+                    .at
+                    .iter()
+                    .filter(|(line, _)| first <= *line && *line <= last)
+                    .map(|(_, segment)| segment.clone())
+                    .collect();
+                if !inside.is_empty() {
+                    written
+                        .entry(DefinitionSite {
+                            file: relative.clone(),
+                            line: first,
+                        })
+                        .or_default()
+                        .extend(inside);
+                }
+            }
+        }
         // The function node that opens a definition's line is the definition
         // (every kind takes its line from its node); where two open on one
         // line, the outer one.
@@ -693,7 +763,70 @@ fn read_function_facts(
             side_calls.insert((relative.clone(), extent.line, target.clone()), side);
         }
     }
-    (side_calls, return_shapes)
+    (side_calls, return_shapes, written)
+}
+
+/// Every path segment the strings and templates of a module write, lowercased,
+/// with the line each is written on: `/v1/shelves/stats?shelf=` writes `v1`,
+/// `shelves`, `stats` and `shelf`. A template's interpolations write nothing.
+struct WrittenSegments<'a> {
+    positions: &'a Positions<'a>,
+    at: Vec<(u32, String)>,
+}
+
+impl WrittenSegments<'_> {
+    fn add(&mut self, span: Span, text: &str) {
+        let line = self.positions.extent(span).line;
+        self.at.extend(
+            text.split(|c: char| matches!(c, '/' | '?' | '#' | '&' | '=') || c.is_whitespace())
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| (line, segment.to_ascii_lowercase())),
+        );
+    }
+}
+
+impl Visit for WrittenSegments<'_> {
+    fn visit_str(&mut self, node: &Str) {
+        self.add(node.span, &node.value.to_string_lossy());
+    }
+
+    fn visit_tpl(&mut self, node: &Tpl) {
+        for quasi in &node.quasis {
+            match &quasi.cooked {
+                Some(cooked) => self.add(quasi.span, &cooked.to_string_lossy()),
+                None => self.add(quasi.span, &quasi.raw),
+            }
+        }
+        node.visit_children_with(self);
+    }
+}
+
+/// The last segment of a consumer path that carries literal text, lowercased,
+/// with any query dropped: the segment a helper that requests the path writes.
+/// `None` for a path with no literal segment.
+fn last_literal_segment(path: &str) -> Option<String> {
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    path.split('/')
+        .rev()
+        .map(str::trim)
+        .find(|segment| {
+            !segment.is_empty()
+                && !carrick_match::is_param_segment(segment)
+                && !matches!(*segment, "*" | "**" | "(.*)")
+                && !segment.contains("${")
+        })
+        .map(str::to_ascii_lowercase)
+}
+
+/// Whether a path's last segment, past any query, is not literal text: a
+/// parameter, a wildcard or a template hole (`/v1/files/${name}`). A caller
+/// of a helper whose request ends so can fill that segment with its argument.
+fn ends_in_hole(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    path.split('/')
+        .map(str::trim)
+        .rfind(|segment| !segment.is_empty())
+        .is_some_and(|segment| last_literal_segment(segment).is_none())
 }
 
 /// A row this pass may settle: the model's own reading, with nothing linking
@@ -749,11 +882,11 @@ fn read_file_sites(
     relative: &str,
     result: &FileAnalysisResult,
     resolution: &Resolution<'_>,
-) -> Vec<SiteRow> {
+) -> (Vec<SiteRow>, Vec<u32>) {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let Some(module) = parse_file(absolute, &cm, &handler) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let positions = Positions { cm: &cm };
 
@@ -772,8 +905,13 @@ fn read_file_sites(
         .filter_map(|call| Some((call, place(&every.calls, call)?)))
         .collect();
     if placed.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
+    let mut direct_calls = DirectCalls {
+        positions: &positions,
+        spans: HashSet::new(),
+    };
+    module.visit_with(&mut direct_calls);
 
     let mut reader = SiteReader {
         positions: &positions,
@@ -783,6 +921,7 @@ fn read_file_sites(
     module.visit_with(&mut reader);
 
     let mut rows = Vec::new();
+    let mut direct = Vec::new();
     for (call, extent) in placed {
         let Some(site) = reader.read.get(&extent.span()) else {
             continue;
@@ -827,8 +966,28 @@ fn read_file_sites(
             receiver: resolution.receiver(extent.span(), &site.receivers),
             callbacks,
         });
+        if direct_calls.spans.contains(&extent.span()) {
+            direct.push(line);
+        }
     }
-    rows
+    (rows, direct)
+}
+
+/// The spans of every call whose callee is a bare name (`loadStats(id)`).
+struct DirectCalls<'a> {
+    positions: &'a Positions<'a>,
+    spans: HashSet<(u32, u32)>,
+}
+
+impl Visit for DirectCalls<'_> {
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        if let Callee::Expr(callee) = &node.callee
+            && matches!(unwrap_expression(callee), Expr::Ident(_))
+        {
+            self.spans.insert(self.positions.extent(node.span).span());
+        }
+        node.visit_children_with(self);
+    }
 }
 
 /// Whether a deterministic row of the file sits inside the call expression:
@@ -1318,6 +1477,14 @@ pub struct Settled {
     /// Rows skipped because a fact site row replaced the model's row at the
     /// call, and the graph no longer holds it (carrick#2795).
     pub replaced_by_site_row: usize,
+    /// Rows withdrawn at a call of a helper of the row's own service whose
+    /// body writes and states one other route ([`helper_row`],
+    /// carrick#1794): the helper's row is the request.
+    pub withdrawn_at_helper: usize,
+    /// Rows left alone whose response entry went, because the helper the call
+    /// reaches writes the row's route and hands back a value of its own, not
+    /// the request's parsed body ([`drop_copied_response`], carrick#1801).
+    pub responses_dropped: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -1327,7 +1494,8 @@ pub struct Settled {
 /// |---|---|
 /// | One operation, the row's own | stays the model's and keeps its type anchors; gains `role: wrapper_call` and `reaches_request` |
 /// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its response type entry is keyed to the reached operation where the call hands back the request's parsed body, and goes otherwise; its request type entry goes |
-/// | None, several, or one beside a request no fact states | left as it is, and counted |
+/// | One row only the model states, at a call of a helper of the row's own service that writes that row's route and not the row's ([`helper_row`]) | withdrawn: the helper's row is the request |
+/// | None, several, or one beside a request no fact states | left as it is, and counted; where its own helper writes the row's route and does not hand back a parsed body, its response entry goes ([`drop_copied_response`]) |
 ///
 /// A corrected row keeps the RESPONSE type anchored at it only where the
 /// row's call is itself the call that reaches the request (its own callee
@@ -1354,6 +1522,11 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         .flat_map(|sites| sites.return_shapes.iter())
         .map(|(definition, shape)| (definition.clone(), *shape))
         .collect();
+    graph.written = sites
+        .iter()
+        .flat_map(|sites| sites.written.iter())
+        .map(|(definition, segments)| (definition.clone(), segments.clone()))
+        .collect();
     let owners = file_owners(services.iter().map(|service| &*service.data));
     let siblings = SiblingLines::of(services.iter().map(|service| &*service.data));
     let mut decider = Decider::new(&graph, &sites);
@@ -1364,6 +1537,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         .filter(|(_, service)| service.writable)
     {
         let mut corrected = 0;
+        let mut withdrawn_at_helper = 0;
         for row in &service.sites.rows {
             let left = |why: &str| {
                 debug!(
@@ -1383,14 +1557,37 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                 Reach::None => {
                     left("reaches no request row");
                     settled.reaches_none += 1;
+                    settled.responses_dropped += usize::from(drop_copied_response(
+                        service.data,
+                        row,
+                        &graph,
+                        &service.sites.direct,
+                        &owners,
+                        index,
+                    ));
                 }
                 Reach::Several => {
                     left("reaches several operations");
                     settled.reaches_several += 1;
                 }
                 Reach::Unstated => {
+                    if let Some(request) =
+                        helper_row(&decider, row, &service.sites.direct, &owners, index)
+                        && withdraw_at_helper_call(service.data, row, request)
+                    {
+                        withdrawn_at_helper += 1;
+                        continue;
+                    }
                     left("reaches a request only the model states");
                     settled.reaches_unstated += 1;
+                    settled.responses_dropped += usize::from(drop_copied_response(
+                        service.data,
+                        row,
+                        &graph,
+                        &service.sites.direct,
+                        &owners,
+                        index,
+                    ));
                 }
                 Reach::One { request, step } => match apply(
                     service.data,
@@ -1425,6 +1622,8 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
             }
         }
         settled.corrected += corrected;
+        settled.withdrawn_at_helper += withdrawn_at_helper;
+        let corrected = corrected + withdrawn_at_helper;
         let stated = state_leaves(service, index, &owners, &siblings, &graph, &mut decider);
         settled.leaf_rows += stated.own + stated.boundary;
         settled.boundary_rows += stated.boundary;
@@ -1463,7 +1662,199 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         "Call-through wrapper rows withdrawn: {} at a client wrapper's call into another service, whose caller's leaf row now states the request (carrick#2618)",
         settled.wrapper_rows_withdrawn
     );
+    debug!(
+        "Call-through rows at a call of a helper of their own service: {} withdrawn, the helper writes and states one other route (carrick#1794); {} lost their response entry, the helper writes their route and hands back a value of its own (carrick#1801)",
+        settled.withdrawn_at_helper, settled.responses_dropped
+    );
     settled
+}
+
+/// The one helper of `row`'s own service its own callee reaches, when the
+/// row's call is a direct call of a binding ([`CallThroughSites::direct`]) and
+/// its callee is one definition of the service at `index`.
+fn own_helper<'r>(
+    row: &'r SiteRow,
+    direct: &HashSet<(String, u32)>,
+    owners: &HashMap<String, usize>,
+    index: usize,
+) -> Option<&'r DefinitionSite> {
+    if !direct.contains(&(row.file.clone(), row.line)) {
+        return None;
+    }
+    match row.steps.first().map(Vec::as_slice) {
+        Some([helper]) if owners.get(&helper.file) == Some(&index) => Some(helper),
+        _ => None,
+    }
+}
+
+/// The row the helper `row` calls states for its request, where that row
+/// names the route the helper writes and `row` names one it does not
+/// (carrick#1794).
+///
+/// A call of an imported function writes no URL: the path is written in the
+/// function's body. The model answers the call with a route anyway, read off
+/// the function's name, and where a module declares one function per sibling
+/// route it can name the sibling. The row stays wrong unless the source says
+/// otherwise, so every guard here reads the source and says nothing when it
+/// cannot:
+///
+/// - the row's call is a direct call of a binding (`loadStats(id)`), not a
+///   member called on a value that can be any object of its type, and its own
+///   callee is ONE function of the row's own service;
+/// - the walk from it reaches no fact and exactly one row only the model
+///   states, not through a side call, written inside that function;
+/// - that row's last literal path segment is written in the function's
+///   strings, and the calling row's is not: a function that writes both may
+///   request both;
+/// - that row's path does not end in a parameter or a template hole
+///   ([`ends_in_hole`]): the calling row may name the path its argument
+///   fills in, a segment the function's strings never write.
+///
+/// The request then has its row at the line that writes it, and the calling
+/// row names a route its call never reaches.
+fn helper_row<'g>(
+    decider: &Decider<'g>,
+    row: &SiteRow,
+    direct: &HashSet<(String, u32)>,
+    owners: &HashMap<String, usize>,
+    index: usize,
+) -> Option<&'g Unstated> {
+    let helper = own_helper(row, direct, owners, index)?;
+    let (reached, unstated) = decider.reached_by(row, std::slice::from_ref(helper));
+    if !reached.is_empty() || unstated.len() != 1 {
+        return None;
+    }
+    let (rows, side) = unstated.into_values().next()?;
+    let (first, rest) = rows.split_first()?;
+    if side
+        || rest
+            .iter()
+            .any(|other| (&other.method, &other.target_url) != (&first.method, &first.target_url))
+    {
+        return None;
+    }
+    let inside = decider
+        .graph
+        .unstated
+        .get(helper)
+        .is_some_and(|rows| rows.iter().any(|inside| inside.site == first.site));
+    if ends_in_hole(&first.target_url) {
+        return None;
+    }
+    let written = decider.graph.written.get(helper)?;
+    let requested = last_literal_segment(&first.target_url)?;
+    let named = last_literal_segment(&row.target)?;
+    (inside && written.contains(&requested) && !written.contains(&named)).then_some(*first)
+}
+
+/// Withdraw the model's row `row` names, with its projection and the consumer
+/// type entries anchored at it: its call reaches `request`, whose own row
+/// states it. `false` when the blob holds no such row.
+fn withdraw_at_helper_call(data: &mut CloudRepoData, row: &SiteRow, request: &Unstated) -> bool {
+    let location = format!("{}:{}", row.file, row.line);
+    let Some(graph) = data.mount_graph.as_mut() else {
+        return false;
+    };
+    let Some(index) = graph.data_calls.iter().position(|call| {
+        call.file_location == location
+            && call.method == row.method
+            && call.target_url == row.target
+            && call.resolution_source == Some(ResolutionSource::Model)
+            && call.reaches_request.is_none()
+    }) else {
+        return false;
+    };
+    let call = graph.data_calls.remove(index);
+    debug!(
+        "  - {location}: the model's {} {} withdrawn, the helper it calls writes {} {}, the request stated at {}",
+        call.method, call.target_url, request.method, request.target_url, request.site
+    );
+    let before = OperationKey::http(&call.method, call.canonical_path.clone());
+    if let Some(projected) = data.calls.iter().position(|operation| {
+        operation.key == before
+            && operation.dispatch == call.dispatch
+            && operation.resolution_source == Some(ResolutionSource::Model)
+            && operation.file_path == Path::new(&location)
+    }) {
+        data.calls.remove(projected);
+    }
+    if let Some(manifest) = data.type_manifest.as_mut() {
+        manifest.retain(|entry| !anchored_at(entry, row, &call.method, &call.canonical_path));
+    }
+    true
+}
+
+/// Drop the consumer response entry at the model's row `row` names, where the
+/// row's call is a direct call of one helper of its service that writes the row's route
+/// and does not hand back the request's parsed body (carrick#1801): the call
+/// is worth what the helper returns (a mapped copy, a wrapper, a flag), not
+/// the response, so no response type is the caller's. The request entry
+/// stays. `true` when an entry went.
+fn drop_copied_response(
+    data: &mut CloudRepoData,
+    row: &SiteRow,
+    graph: &ReachGraph,
+    direct: &HashSet<(String, u32)>,
+    owners: &HashMap<String, usize>,
+    index: usize,
+) -> bool {
+    let Some(helper) = own_helper(row, direct, owners, index) else {
+        return false;
+    };
+    let writes_route = last_literal_segment(&row.target).is_some_and(|named| {
+        graph
+            .written
+            .get(helper)
+            .is_some_and(|written| written.contains(&named))
+    });
+    if !writes_route || graph.hands_back_parse(helper) {
+        return false;
+    }
+    let location = format!("{}:{}", row.file, row.line);
+    let Some(call) = data.mount_graph.as_ref().and_then(|graph| {
+        graph.data_calls.iter().find(|call| {
+            call.file_location == location
+                && call.method == row.method
+                && call.target_url == row.target
+                && call.resolution_source == Some(ResolutionSource::Model)
+        })
+    }) else {
+        return false;
+    };
+    let (method, path) = (call.method.clone(), call.canonical_path.clone());
+    let Some(manifest) = data.type_manifest.as_mut() else {
+        return false;
+    };
+    let before = manifest.len();
+    manifest.retain(|entry| {
+        !(entry.type_kind == ManifestTypeKind::Response && anchored_at(entry, row, &method, &path))
+    });
+    let dropped = manifest.len() < before;
+    if dropped {
+        debug!(
+            "  - {location}: response entry dropped, the helper it calls writes {method} {path} and hands back a value of its own"
+        );
+    }
+    dropped
+}
+
+/// Whether `entry` is a consumer entry anchored at `row`'s site under the
+/// operation `method` `path`.
+fn anchored_at(
+    entry: &crate::cloud_storage::TypeManifestEntry,
+    row: &SiteRow,
+    method: &str,
+    path: &str,
+) -> bool {
+    entry.role == ManifestRole::Consumer
+        && entry.file_path == row.file
+        && entry.line_number == row.line
+        && entry
+            .key
+            .as_http()
+            .is_some_and(|(entry_method, entry_path)| {
+                entry_method == normalize_manifest_method(method) && entry_path == path
+            })
 }
 
 /// Whether the model's row `row` names is gone from the graph because a fact
@@ -2161,6 +2552,9 @@ struct ReachGraph {
     makes_request: std::cell::RefCell<HashMap<DefinitionSite, bool>>,
     /// Every service's return shapes ([`CallThroughSites::return_shapes`]).
     shapes: HashMap<DefinitionSite, BodyShape>,
+    /// The path segments each analysed service's definitions write
+    /// ([`CallThroughSites::written`]).
+    written: HashMap<DefinitionSite, HashSet<String>>,
 }
 
 impl ReachGraph {
@@ -2428,6 +2822,56 @@ impl ReachGraph {
     fn hands_back_body(&self, start: &DefinitionSite, operation: &Operation) -> bool {
         self.returned_steps(start, operation)
             .is_some_and(|steps| steps == [ShapeKind::Parsed])
+    }
+
+    /// Whether a call of `start` is worth one parsed body, where no request
+    /// row says which request it is (carrick#1801): from `start`, each
+    /// definition's return shape is followed into the calls written inside
+    /// the lines of the call it returns whose value is returned, not one
+    /// handed to another call or dropped ([`SideCall`]), until a returned call
+    /// reaches no definition of the scan; and exactly one step on the way is
+    /// the Fetch standard's `Response.json()`. A definition with no return
+    /// shape, a call edge with no line, or a callee no service indexes leaves
+    /// it unproven.
+    fn hands_back_parse(&self, start: &DefinitionSite) -> bool {
+        let Some((start, _)) = self.calls.get_key_value(start) else {
+            return false;
+        };
+        let mut seen: HashSet<&DefinitionSite> = HashSet::from([start]);
+        let mut queue: VecDeque<(&DefinitionSite, usize)> = VecDeque::from([(start, 0)]);
+        let mut steps: Vec<ShapeKind> = Vec::new();
+        while let Some((definition, depth)) = queue.pop_front() {
+            let Some(shape) = self.shapes.get(definition) else {
+                return false;
+            };
+            if shape.kind != ShapeKind::Value {
+                steps.push(shape.kind);
+            }
+            if depth == MAX_EDGE_DEPTH {
+                return false;
+            }
+            for edge in self.calls.get(definition).into_iter().flatten() {
+                if edge.line == 0 {
+                    return false;
+                }
+                if !(shape.first_line <= edge.line && edge.line <= shape.last_line)
+                    || self.side_calls.contains_key(&(
+                        definition.file.clone(),
+                        edge.line,
+                        edge.to.clone(),
+                    ))
+                {
+                    continue;
+                }
+                let Some((callee, _)) = self.calls.get_key_value(&edge.to) else {
+                    return false;
+                };
+                if seen.insert(callee) {
+                    queue.push_back((callee, depth + 1));
+                }
+            }
+        }
+        steps == [ShapeKind::Parsed]
     }
 
     /// Whether `start` returns the value of a request of `operation`, whole,
@@ -3000,6 +3444,32 @@ fn is_bare_top_type(entry: &crate::cloud_storage::TypeManifestEntry) -> bool {
 mod tests {
     use super::*;
 
+    /// carrick#1794: the segment a helper that requests a path writes is its
+    /// last literal one, read past a query, a parameter and a template hole.
+    #[test]
+    fn a_path_s_last_literal_segment_skips_parameters_holes_and_the_query() {
+        let segments: Vec<Option<String>> = [
+            "/v1/shelves/stats",
+            "/v1/shelves/shared-stats?shelfId=1",
+            "/v1/shelves/:shelfId",
+            "${API_URL}/v1/Shelves/${id}",
+            "/:id",
+        ]
+        .into_iter()
+        .map(last_literal_segment)
+        .collect();
+        assert_eq!(
+            segments,
+            vec![
+                Some("stats".to_string()),
+                Some("shared-stats".to_string()),
+                Some("shelves".to_string()),
+                Some("shelves".to_string()),
+                None,
+            ]
+        );
+    }
+
     const SOURCE: &str = r#"export async function load(id: string, target: string) {
   const run = await client.getRun(id);
   const page = useQuery({ ...runOptions({ id }) });
@@ -3091,6 +3561,8 @@ mod tests {
                 return_shapes: order.iter().map(|&i| shapes[i].clone()).collect(),
                 side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
                 leaves: Vec::new(),
+                written: HashMap::new(),
+                direct: HashSet::new(),
             }
         };
         let sites = facts(&[0, 1]);
@@ -3222,6 +3694,7 @@ mod tests {
                 outside: &outside(),
             },
         )
+        .0
     }
 
     /// [`read_rows`] as (line, steps).

@@ -32,7 +32,7 @@ The answers are the shape the model gives for this code:
 | `useShelfStats.ts:4` | GET /v1/shelves/stats |
 | `shelves.ts:22` | GET /v1/shelves/shared-stats |
 
-The shared-stats hook's row takes its helper's route. The helper's own request
-line already states that route with a candidate behind it, so the graph keeps
-that one row for the one request (the wrapper-echo rule), and no row names the
-stats route at the shared-stats hook.
+The helper the shared-stats hook calls writes the shared route and not the
+stats one, and its own request line already states the shared route, so the
+graph keeps that one row for the one request and no row names the stats route
+at the shared-stats hook.
