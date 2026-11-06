@@ -864,14 +864,14 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
 /// carrick#3213: a route path written as a template over a constant another
 /// package exports, where that constant is itself a template over exported
 /// constants (`${LOGIN_PATH}/:id`, `LOGIN_PATH = `${AUTH_BASE}/login``),
-/// keeps its row in the form a cloud scan runs: the trace reads the whole
-/// path as the compiler types it and serves the route there. The bare use
-/// of the same constant keeps its row too. A constant whose template holds
-/// a value read at runtime (`STATUS_PATH`) folds to nothing: that site stays
-/// guessed and the reader's row there is withdrawn.
+/// keeps its row: the trace reads the whole path as the compiler types it
+/// and serves the route there. The bare use of the same constant keeps its
+/// row too. A constant whose template holds a value read at runtime
+/// (`STATUS_PATH`) folds to nothing: that site stays guessed and the
+/// reader's row there is withdrawn.
 #[test]
 fn a_route_path_over_a_nested_template_constant_keeps_its_row() {
-    let (on, fallbacks) = scan_fixture_on_form("receiver-route-nested-template");
+    let (on, fallbacks) = scan_fixture_reading("receiver-route-nested-template");
     let (graph, _) = endpoint_rows(&on);
     let main: Vec<&String> = graph.iter().filter(|row| row.contains("main.ts")).collect();
     for want in [
