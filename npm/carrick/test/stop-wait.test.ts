@@ -16,7 +16,7 @@ import type { CheckResult } from "../src/contract.ts";
 import { BACKGROUND_CAP_MS, enqueue, lockPath, STOP_TIMEOUT_S, STOP_WAIT_S } from "../src/hook/rechecks.ts";
 import type { Answer, QueueEntry } from "../src/hook/rechecks.ts";
 import { checkMarkerPath } from "../src/hook/checked.ts";
-import { record, recordEdit, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
+import { recordEdit, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
 import { stopAnswers, waitSeconds } from "../src/hook/stop-wait.ts";
 import { carrickHooks } from "../src/init/settings.ts";
 
@@ -98,6 +98,14 @@ test("stop waits for a re-check that finishes inside the wait and prints its pro
   const run = await stopWith(home, 20);
   assert.equal(run.code, 0);
   assert.ok(run.ms >= 1800 && run.ms < 8000, `waited for the answer, not the whole wait (${run.ms} ms)`);
+  // The one Stop channel Claude Code delivers to the model while letting the
+  // turn continue: `systemMessage` never reaches the model, and `decision:
+  // "block"` reaches it by refusing to stop.
+  const parsed = JSON.parse(run.stdout) as Record<string, unknown> & { hookSpecificOutput: { hookEventName: string } };
+  assert.equal(parsed.hookSpecificOutput.hookEventName, "Stop");
+  assert.equal(parsed["decision"], undefined);
+  assert.equal(parsed["continue"], undefined);
+  assert.equal(parsed["systemMessage"], undefined);
   const text = context(run.stdout);
   assert.match(text, /contract problem/);
   assert.match(
@@ -109,12 +117,16 @@ test("stop waits for a re-check that finishes inside the wait and prints its pro
   assert.doesNotMatch(text, /still running/);
 });
 
-test("stop with nothing pending returns at once and leaves the nudge as it was", async (t) => {
+test("stop with nothing pending returns at once and names no function (carrick#3436)", async (t) => {
   const { workspace, home } = setup(t);
-  record(SESSION, [{ name: "slugify", file: "src/a.ts", indexCommit: "abc" }], home);
+  // A session file an older install wrote, still listing a function it found.
+  writeAtomic(
+    path.join(sessionsDir(home), `${SESSION}.json`),
+    `${JSON.stringify({ found: [{ name: "slugify", file: "src/a.ts", indexCommit: "abc" }], nudged: [], told: [], read: [], edited: {}, updated: new Date().toISOString() })}\n`,
+  );
   const run = await stopWith(home, 20);
   assert.ok(run.ms < 1500, `no wait (${run.ms} ms)`);
-  assert.match(context(run.stdout), /^Carrick: this task added 1 new function \(slugify\)/);
+  assert.equal(run.stdout, "");
   void workspace;
 });
 
@@ -160,18 +172,6 @@ test("a clean late answer alone prints nothing and is marked delivered; beside a
   assert.match(both, /no contract problem|re-checked/, "the clean answer rides along");
   assert.ok(both.split("\n").some((line) => line.includes("users.ts")));
   assert.ok(both.split("\n").some((line) => line.includes("orders.ts")));
-});
-
-test("functions the runner records during the wait are named in the nudge", async (t) => {
-  const { workspace, home } = setup(t);
-  liveRunner(workspace.root);
-  const entry = queue(workspace.root, home, workspace.file);
-  setTimeout(() => {
-    record(SESSION, [{ name: "lateName", file: "src/a.ts", indexCommit: "abc" }], home);
-    answer(home, entry, clean());
-  }, 1000);
-  const run = await stopWith(home, 20);
-  assert.match(context(run.stdout), /lateName/);
 });
 
 test("a dead runner lock with queued entries: stop starts a runner before it waits", async (t) => {

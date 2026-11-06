@@ -15,18 +15,19 @@
 // the same reason: entries whose command is this CLI are the only ones touched,
 // and a hooks file a user already has keeps everything else in it.
 //
-// Three entries, which is the whole nudge on this host:
+// Three entries:
 //
 // * `SessionStart`, which puts the index map in front of the agent before its
 //   first move (carrick#2848). `hook session-start` prints it as
 //   `hookSpecificOutput.additionalContext` when Codex runs it.
-// * `PostToolUse` on `apply_patch`, which records what an edit added. The
+// * `PostToolUse` on `apply_patch`, which re-checks the patched files. The
 //   matcher is a regex (`codex-rs/hooks/src/engine/dispatcher.rs`) and
 //   `apply_patch` is the canonical tool name Codex puts on the payload.
-// * `UserPromptSubmit`, which speaks the accumulated set once. Codex's `Stop`
-//   event cannot emit `additionalContext` at all, so this is the only
-//   non-blocking way to reach the model there — and the cost is that the line
-//   arrives with the next prompt.
+// * `UserPromptSubmit`, which delivers the background re-checks that finished
+//   since. Codex's `Stop` event cannot emit `additionalContext` at all, so
+//   this is the only non-blocking way to reach the model there — and the cost
+//   is that an answer arrives with the next prompt. It names no function a
+//   task added, as Claude Code's Stop hook does not (carrick#3436).
 //
 // One thing this file cannot do for the user: a project hook is untrusted until
 // Codex records its hash, and an untrusted hook is discovered and not run
@@ -34,7 +35,7 @@
 // start in the TUI only; `codex exec` and the editor extensions skip it without
 // a message. `carrick init` says so; nothing here can answer it.
 //
-// Reference: `docs/reference/task-skills.md`, "The reuse nudge".
+// Reference: `docs/reference/task-skills.md`, "What the hooks deliver".
 
 import fs from "node:fs";
 import path from "node:path";

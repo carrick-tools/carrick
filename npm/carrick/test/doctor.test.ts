@@ -369,7 +369,7 @@ test("a settings file holding last version's entries is a finding, not a pass", 
   const lines = checkHooks(noSessionStart, onPath);
   assert.equal(findingCount(lines), 1, texts(lines).join("\n"));
   // Both of the entries that settings file lacks are named, so a check that
-  // learns a new entry (the Stop nudge, carrick#1330) reports it without a
+  // learns a new entry (the Stop hook, carrick#1330) reports it without a
   // line of its own here.
   // The Read hook (carrick#2069) is missing from this file too, and named first.
   assert.match(lines[0]!.text, /not the ones this version installs: PostToolUse `carrick hook post-read`/);

@@ -444,8 +444,8 @@ test("the hook entries land beside everything else the settings file holds", () 
   assert.equal(written.hooks.PostToolUse[1].matcher, "Read");
   assert.equal(written.hooks.PostToolUse[1].hooks[0].command, "carrick hook post-read");
   assert.equal(written.hooks.PostToolUse[1].hooks[0].timeout, 5);
-  // The end-of-task reuse nudge (carrick#1330). Installed beside the other two
-  // rather than by anything the user has to add.
+  // The end-of-task re-check wait (carrick#3198). Installed beside the other
+  // two rather than by anything the user has to add.
   assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop --wait-s 200");
   assert.equal(written.hooks.Stop[0].matcher, undefined, "a Stop hook has no matcher");
 });
@@ -1222,7 +1222,7 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
         // `carrick` than this one says so (carrick#1372).
         path.join(".carrick", "cli-version"),
         path.join(".claude", onPath ? "settings.json" : "settings.local.json"),
-        // The same two-part nudge, for the other host (carrick#1335).
+        // The same hooks, for the other host (carrick#1335).
         CODEX_HOOKS_FILE,
         // The check section for agents (carrick#2828).
         "AGENTS.md",

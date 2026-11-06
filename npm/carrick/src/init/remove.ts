@@ -604,9 +604,9 @@ function removeMachine(plan: MachinePlan, out: InitOutput): void {
     for (const line of warn) out.warn(line);
   }
 
-  // Before the install id, so the directory both live in can go with it: what
-  // the Stop hook speaks from is a scratch record of conversations that have
-  // ended, and it is no more use than the hook entry that fed it
+  // Before the install id, so the directory both live in can go with it: the
+  // hooks' session records are scratch records of conversations that have
+  // ended, and they are no more use than the hook entries that fed them
   // (carrick#1330).
   if (plan.sessions > 0) {
     const sessions = removeSessions();

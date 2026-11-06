@@ -246,13 +246,13 @@ process.exit(0);
   fs.mkdirSync(path.dirname(installIdPath(home)), { recursive: true, mode: 0o700 });
   fs.writeFileSync(installIdPath(home), `${INSTALL_ID}\n`, { mode: 0o600 });
 
-  // A session record the Stop hook would have spoken from (carrick#1330). It
+  // A session record the hooks keep (carrick#1330). It
   // shares `~/.carrick` with the install id, so leaving it behind also leaves
   // that directory behind.
   fs.mkdirSync(sessionsDir(home), { recursive: true, mode: 0o700 });
   fs.writeFileSync(
     sessionFile("a-session", home)!,
-    `${JSON.stringify({ found: [{ name: "slugify", file: "src/util.ts", indexCommit: "abc" }], nudged: [], updated: "" })}\n`,
+    `${JSON.stringify({ told: [], read: ["/w/src/util.ts"], edited: {}, updated: "" })}\n`,
     { mode: 0o600 },
   );
 

@@ -1,13 +1,6 @@
-// What one session has added that the index does not hold, and the one line
-// the agent is told about it at the end of the task (carrick#1330).
-//
-// The measured problem: a reuse check that waits to be remembered does not
-// run. Prose alone reached the index in none of five runs; a hook reached it
-// in all five. So the check has to be delivered, not documented — but delivery
-// costs a model turn, and most edits add no function, so it cannot ride the
-// edit. The split is: the post-edit hook RECORDS silently (it already re-checks
-// the edited file, and the list of new functions comes back in that answer),
-// and the Stop hook SPEAKS once, with everything the task accumulated.
+// What one session's hooks remember between calls: which files' uses lines it
+// has been shown, which files the Read hook has asked about, and when it last
+// edited each workspace.
 //
 // The store is a file per session under `~/.carrick/sessions`, outside every
 // repository: a scratch file about one conversation is not a thing to put in a
@@ -15,7 +8,9 @@
 // Nothing here ever throws at its caller — an edit and a stop must not fail
 // because a state file could not be written.
 //
-// Reference: `docs/reference/task-skills.md`, "The reuse nudge".
+// It no longer lists the functions a session added: the end-of-task reuse
+// nudge that read that list is gone (carrick#3436). A file an older install
+// wrote still loads; `readSession` keeps only the fields below.
 
 import { snapshotRepos } from "../hosted-snapshot.ts";
 import fs from "node:fs";
@@ -23,22 +18,8 @@ import os from "node:os";
 import path from "node:path";
 import type { CheckResult } from "../contract.ts";
 
-/** One function the working tree declares and the index does not. */
-export type NewFunction = {
-  /** As the source spells it. */
-  name: string;
-  /** Repo-relative path of the file that declares it. */
-  file: string;
-  /** The commit the index this was compared against was taken at. */
-  indexCommit: string;
-};
-
 /** A session's accumulated record. */
 export type SessionRecord = {
-  /** Every new function this session has seen, in the order it saw them. */
-  found: NewFunction[];
-  /** `file::name` for the ones a nudge has already listed. */
-  nudged: string[];
   /**
    * `repo::file` for every file whose uses lines this session has been shown
    * (carrick#2067), so the post-edit hook prints them once per file.
@@ -77,16 +58,9 @@ export function sessionsDir(home: string = os.homedir()): string {
   return path.join(home, ".carrick", "sessions");
 }
 
-/** The key a `nudged` list holds an entry under. */
-function key(entry: NewFunction): string {
-  return `${entry.file}::${entry.name}`;
-}
-
 /** A session's record, or an empty one. Never throws. */
 export function readSession(sessionId: string, home?: string): SessionRecord {
   const empty: SessionRecord = {
-    found: [],
-    nudged: [],
     told: [],
     read: [],
     edited: {},
@@ -105,15 +79,6 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     if (typeof parsed !== "object" || parsed === null) return empty;
     const record = parsed as Partial<SessionRecord>;
     return {
-      found: Array.isArray(record.found)
-        ? record.found.filter(
-            (entry): entry is NewFunction =>
-              typeof entry?.name === "string" && typeof entry?.file === "string",
-          )
-        : [],
-      nudged: Array.isArray(record.nudged)
-        ? record.nudged.filter((entry): entry is string => typeof entry === "string")
-        : [],
       told: Array.isArray(record.told)
         ? record.told.filter((entry): entry is string => typeof entry === "string")
         : [],
@@ -152,8 +117,8 @@ export function writeAtomic(file: string, body: string): boolean {
     fs.renameSync(temp, file);
     return true;
   } catch {
-    // Nothing to do and nothing to say: the nudge is a nicety and the edit it
-    // rides behind is not.
+    // Nothing to do and nothing to say: this record is a nicety and the edit
+    // it rides behind is not.
     try {
       fs.unlinkSync(temp);
     } catch {
@@ -245,41 +210,6 @@ export function removeSessions(home?: string): number {
 }
 
 /**
- * Add what one edit found, keeping the first sighting of each function.
- *
- * Deduplicated on file and name: an agent edits one file several times in a
- * task, and every one of those edits re-reports the same new function.
- */
-export function record(sessionId: string, found: NewFunction[], home?: string): SessionRecord {
-  const current = readSession(sessionId, home);
-  const seen = new Set(current.found.map(key));
-  for (const entry of found) {
-    if (seen.has(key(entry))) continue;
-    seen.add(key(entry));
-    current.found.push(entry);
-  }
-  current.updated = new Date().toISOString();
-  write(sessionId, current, home);
-  return current;
-}
-
-/** What a nudge has not yet named, oldest first. */
-export function pending(record: SessionRecord): NewFunction[] {
-  const nudged = new Set(record.nudged);
-  return record.found.filter((entry) => !nudged.has(key(entry)));
-}
-
-/** Mark entries as named, so the next stop of the same task says nothing. */
-export function markNudged(sessionId: string, entries: NewFunction[], home?: string): void {
-  const current = readSession(sessionId, home);
-  const nudged = new Set(current.nudged);
-  for (const entry of entries) nudged.add(key(entry));
-  current.nudged = [...nudged];
-  current.updated = new Date().toISOString();
-  write(sessionId, current, home);
-}
-
-/**
  * The key a file's uses lines are remembered under: its repo and its
  * repo-relative path, so one path in two repos is two files.
  */
@@ -325,62 +255,9 @@ export function markRead(sessionId: string, file: string, home?: string): void {
   write(sessionId, current, home);
 }
 
-/** What one delivery of the nudge said, for the hook that delivered it. */
-export type Drained = {
-  /** The line to hand the model. */
-  line: string;
-  /** How many functions it names. */
-  named: number;
-  /** How many the session has recorded in all, named or not. */
-  found: number;
-};
-
-/**
- * The nudge for one session, marked as spoken, or nothing to say (carrick#1335).
- *
- * The one place the sequence lives, because two hooks deliver it: Claude Code's
- * `Stop`, and Codex's `UserPromptSubmit`, which is the only non-blocking
- * model-visible event Codex gives us. Both read the same store, speak the same
- * line and mark the same set; only the event name on the wire differs.
- *
- * The marking happens here, before the caller writes anything, and that order
- * is the point: a nudge that is written and not recorded fires again on the
- * next stop, and a task is several stops.
- */
-export function drain(sessionId: string, root: string | null, home?: string): Drained | null {
-  const current = readSession(sessionId, home);
-  const waiting = pending(current);
-  if (waiting.length === 0) return null;
-  const line = nudge(waiting, root === null ? "" : snapshotProjectSlug(root));
-  markNudged(sessionId, waiting, home);
-  return { line, named: waiting.length, found: current.found.length };
-}
-
-/**
- * The one line the Stop hook hands the model: how many functions, at most two
- * names, and the ask with the exact call (`functions`, one `{ description }` each: the
- * functions are new, so the index has no name to find). Short on purpose, and it starts with "Carrick:" so the
- * user can tell where it came from. The two limits on the answer (what the
- * index was taken at, and that the match is on what a function is described as
- * doing) live in the `carrick-reuse` skill, where the answer is read.
- */
-export function nudge(entries: NewFunction[], slug = ""): string {
-  const total = entries.length;
-  const shown = entries.slice(0, 2).map((entry) => entry.name);
-  const rest = total - shown.length;
-  const list =
-    rest > 0
-      ? `${shown.join(", ")} and ${rest} more`
-      : shown.length === 2
-        ? `${shown[0]} and ${shown[1]}`
-        : shown[0]!;
-  const projectArg = slug === "" ? "" : `\`project: "${slug}"\` and `;
-  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing ${projectArg}\`functions\`, one \`{ description }\` per new function: one plain sentence saying what it does (new functions are not in the index yet, so a name is not found). Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.`;
-}
-
 /**
  * The one project slug the workspace's cached hosted snapshot names, or ""
- * when there is none or more than one (`find_similar` needs one project).
+ * when there is none or more than one (a tool call needs one project).
  * `snapshot.json` is written by the hosted refresh: `resolution.repos[]`
  * carries each connected repo's `project_slug`.
  */
