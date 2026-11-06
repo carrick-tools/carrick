@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.3.146](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.145...carrick-v0.3.146) (2026-11-06)
+
+
+### Features
+
+* a command-object send is a publisher row ([#3439](https://github.com/carrick-tools/carrick/issues/3439) T1) ([#3472](https://github.com/carrick-tools/carrick/issues/3472)) ([7586d69](https://github.com/carrick-tools/carrick/commit/7586d69f454d20676640c4222ea940dad0829bdc))
+* **hook:** self-update refreshes the Carrick rules section in AGENTS.md ([#3430](https://github.com/carrick-tools/carrick/issues/3430)) ([391256a](https://github.com/carrick-tools/carrick/commit/391256a5a8801fb6c426f960ba7a17f0a5f2ab7a))
+* **init:** rule 5 asks for check --changed only where another service reads the change ([#3457](https://github.com/carrick-tools/carrick/issues/3457)) ([eb4b133](https://github.com/carrick-tools/carrick/commit/eb4b133729c6220ec52519b4f4bf1e1fb347e557))
+* **scan:** every scan runs the fact layer; delete its five switches ([#3283](https://github.com/carrick-tools/carrick/issues/3283) F1) ([#3395](https://github.com/carrick-tools/carrick/issues/3395)) ([20f96f4](https://github.com/carrick-tools/carrick/commit/20f96f4e3f53ec7c95cc5f8db60a7de5414a376d))
+* **session-start:** name the hosted index the MCP answers from, and a copy HEAD holds back ([#3461](https://github.com/carrick-tools/carrick/issues/3461)) ([1a8dc87](https://github.com/carrick-tools/carrick/commit/1a8dc873dcb2cd959237996f99b102b5dd8d3f15))
+
+
+### Bug Fixes
+
+* **hooks:** Stop hook stops printing the reuse nudge, keeps the re-check wait ([#3436](https://github.com/carrick-tools/carrick/issues/3436)) ([#3460](https://github.com/carrick-tools/carrick/issues/3460)) ([921953f](https://github.com/carrick-tools/carrick/commit/921953fc4db16ecf2bbdf2e654e36b9761820001))
+* **npm:** Codex session start refreshes the AGENTS.md rules section and skills ([#3458](https://github.com/carrick-tools/carrick/issues/3458)) ([f8ef343](https://github.com/carrick-tools/carrick/commit/f8ef343d7226f379fc290c27d6292db08324ecd3)), closes [#3435](https://github.com/carrick-tools/carrick/issues/3435)
+* **scan:** a default-exported object's members are functions of the module ([#3370](https://github.com/carrick-tools/carrick/issues/3370)) ([#3409](https://github.com/carrick-tools/carrick/issues/3409)) ([14f5107](https://github.com/carrick-tools/carrick/commit/14f5107307a4e98286b13abf573a2f98d9a12521))
+* **scan:** a helper's caller states the helper's request, and no response type for a mapped copy (C12) ([#3350](https://github.com/carrick-tools/carrick/issues/3350)) ([906f59b](https://github.com/carrick-tools/carrick/commit/906f59b0cec43f71aa436fdbc009c61ea1151a14))
+* **scanner:** an optional call is a library site and a placed call ([#3399](https://github.com/carrick-tools/carrick/issues/3399)) ([cc280e0](https://github.com/carrick-tools/carrick/commit/cc280e0be685242e36c88ccc34677a06cb272209))
+* **scan:** object-form and template-literal controller prefixes read as decorator routes ([#3426](https://github.com/carrick-tools/carrick/issues/3426)) ([3250706](https://github.com/carrick-tools/carrick/commit/3250706ce68d033459cdf55376ffe1efc190b9b4))
+* **sidecar:** a model-located body behind an unresolved callee is a lead, not a type (N34) ([#3405](https://github.com/carrick-tools/carrick/issues/3405)) ([b0610ef](https://github.com/carrick-tools/carrick/commit/b0610ef7b74a27bde5d637b2a8bc9f8f374912d2))
+* **sidecar:** platform body reads are decided by the receiver's declaration (N33) ([#3407](https://github.com/carrick-tools/carrick/issues/3407)) ([6e97664](https://github.com/carrick-tools/carrick/commit/6e97664e7401d4a43c8e2da5d76ea8682be42d4d))
+* **trace:** fold a route path over nested template constants from other packages through the compiler ([#3455](https://github.com/carrick-tools/carrick/issues/3455)) ([19d7473](https://github.com/carrick-tools/carrick/commit/19d7473aa69522f72feb29ac80ec72439324723c))
+
+
+### Refactoring
+
+* **match:** internal-domain rule into carrick-match, wasm-exported ([#3441](https://github.com/carrick-tools/carrick/issues/3441)) ([#3467](https://github.com/carrick-tools/carrick/issues/3467)) ([05ac2a4](https://github.com/carrick-tools/carrick/commit/05ac2a42eab022ef65d076a8b1ef64057c3fb8b4))
+* **npm:** one copy each of defaultExists, readStdin, isRecord, realPath and the snapshot repos reader ([#3445](https://github.com/carrick-tools/carrick/issues/3445)) ([6160527](https://github.com/carrick-tools/carrick/commit/6160527263c630c428948cc79c66140895607cf8))
+* **router:** select file-routing conventions by declared dependency only (N7a) ([#3383](https://github.com/carrick-tools/carrick/issues/3383)) ([3c1c182](https://github.com/carrick-tools/carrick/commit/3c1c1825146a98a1fba4bcbb37a9d3cb23f2932f))
+* **sidecar:** the compiler relates a consumer call's model symbol and stated root (N27 i, N30) ([#3406](https://github.com/carrick-tools/carrick/issues/3406)) ([72b676e](https://github.com/carrick-tools/carrick/commit/72b676ee36ce522f64599568bc3cb1705fe270d7))
+* **url:** key an injected base on the base a row states (N14b) ([#3396](https://github.com/carrick-tools/carrick/issues/3396)) ([87890c0](https://github.com/carrick-tools/carrick/commit/87890c052c670bea8ea2d1eb5a548e8a87ac4ea2))
+
 ## [0.3.145](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.144...carrick-v0.3.145) (2026-11-06)
 
 
