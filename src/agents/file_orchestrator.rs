@@ -2461,7 +2461,7 @@ impl FileOrchestrator {
         // etc.). Empty when neither the detected frameworks nor the declared
         // dependencies name a convention-bearing framework, in which case the
         // file-based pass below is a no-op.
-        let conventions = builtin_conventions(&framework_detection.frameworks, dependency_names);
+        let conventions = builtin_conventions(dependency_names);
         debug!(
             "File-based routing conventions active: {:?}",
             conventions.iter().map(|c| &c.name).collect::<Vec<_>>()
@@ -18379,7 +18379,7 @@ export default [
     }
 
     fn next_conventions() -> Vec<RoutingConvention> {
-        builtin_conventions(&["Next.js".to_string()], &[])
+        builtin_conventions(&["next".to_string()])
     }
 
     #[test]
@@ -18449,7 +18449,7 @@ export const prerender = false;
             Path::new("src/pages/api/users.ts"),
             Path::new("src/pages/api/users.ts"),
             content,
-            &builtin_conventions(&["Astro".to_string()], &[]),
+            &builtin_conventions(&["astro".to_string()]),
         )
         .endpoints;
         endpoints.sort_by(|a, b| a.method.cmp(&b.method));
@@ -18474,7 +18474,7 @@ export const prerender = false;
             Path::new("src/pages/posts/[id].ts"),
             Path::new("src/pages/posts/[id].ts"),
             content,
-            &builtin_conventions(&["Astro".to_string()], &[]),
+            &builtin_conventions(&["astro".to_string()]),
         )
         .endpoints;
         assert_eq!(endpoints.len(), 1);
@@ -18518,7 +18518,7 @@ export const prerender = false;
     }
 
     fn flat_conventions() -> Vec<RoutingConvention> {
-        builtin_conventions(&["remix".to_string()], &[])
+        builtin_conventions(&["remix".to_string()])
     }
 
     #[test]
@@ -18852,7 +18852,7 @@ export function serializeWidget(w) { return w; }
             Path::new("app/users/route.ts"),
             Path::new("app/users/route.ts"),
             content,
-            &builtin_conventions(&["express".to_string()], &[]),
+            &builtin_conventions(&[]),
         )
         .endpoints;
         assert!(endpoints.is_empty());
