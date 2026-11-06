@@ -684,6 +684,19 @@ impl DecidedSite {
     }
 }
 
+impl DecidedSite {
+    /// Where the name's leading value ends, read as [`Self::name_text`]
+    /// writes it: the end of a leading value the source names (an environment
+    /// read, a parameter, a field), `None` when the name opens with text the
+    /// source writes. What a request's base is read from (carrick#3387).
+    pub fn base_end(&self) -> Option<super::Root> {
+        match named_base(&self.name)?.first() {
+            Some(Piece::Opaque { end, .. }) => Some(end.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// The URL with its leading value written the way a key can carry it
 /// (carrick#2524). A value this pass stopped reading at an expression (a
 /// constant whose initializer is a call) carries that expression's source

@@ -171,6 +171,8 @@ fn row(
         needs_reader: false,
         through: false,
         within: place.within.clone(),
+        // A handler is no request: it states no base.
+        base: None,
     }
 }
 
