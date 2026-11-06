@@ -44,13 +44,34 @@ export async function ${name}({ request }: { request: Request }) {
 `;
 
 const ROUTE_TS = `import { serialise } from "./transport";
+import { makeForeign } from "./factory";
 import { serialise as undeclared } from "transport-runtime-absent";
 
 interface Detail {
   id: string;
   label: string;
 }
-${HANDLER('serialise', 'declaredCallee')}${HANDLER('undeclared', 'undeclaredCallee')}`;
+${HANDLER('serialise', 'declaredCallee')}${HANDLER('undeclared', 'undeclaredCallee')}
+export async function foreignTypeCallee({ request }: { request: Request }) {
+  if (!request.url) {
+    return undeclared({ error: "missing" }, { status: 400 });
+  }
+  const foreign = makeForeign();
+  return undeclared(foreign);
+}
+`;
+
+// The route imports the factory but not the module that declares the type, so
+// the compiler can only name that type by where its module sits on disk.
+const FACTORY_TS = `import type { ForeignRecord } from "./foreign-model";
+export declare function makeForeign(): Map<string, ForeignRecord>;
+`;
+const FOREIGN_MODEL_TS = `export class ForeignRecord {
+  private secret = 1;
+  ref = "";
+  count = 0;
+}
+`;
 
 function lineOf(marker: string): number {
   const idx = ROUTE_TS.split('\n').findIndex((l) => l.includes(marker));
@@ -92,6 +113,8 @@ describe('carrick#2472 T7: declared serialiser callee', () => {
       })
     );
     fs.writeFileSync(path.join(repoDir, 'src', 'transport.ts'), TRANSPORT_TS);
+    fs.writeFileSync(path.join(repoDir, 'src', 'factory.ts'), FACTORY_TS);
+    fs.writeFileSync(path.join(repoDir, 'src', 'foreign-model.ts'), FOREIGN_MODEL_TS);
     routePath = path.join(repoDir, 'src', 'route.ts');
     fs.writeFileSync(routePath, ROUTE_TS);
     client = new SidecarClient();
@@ -117,7 +140,12 @@ describe('carrick#2472 T7: declared serialiser callee', () => {
 
   // The model's response locator: `claims`, the argument of the handler's
   // success return, asked at the line that declares the handler (carrick#807).
-  async function inferLocated(alias: string, marker: string, returnMarker: string) {
+  async function inferLocated(
+    alias: string,
+    marker: string,
+    returnMarker: string,
+    expression = 'claims'
+  ) {
     const res = await client.send<InferShape>({
       action: 'infer',
       request_id: alias,
@@ -127,7 +155,7 @@ describe('carrick#2472 T7: declared serialiser callee', () => {
           line_number: lineOf(marker),
           infer_kind: 'response_body',
           alias,
-          expression_text: 'claims',
+          expression_text: expression,
           expression_line: lineOf(returnMarker),
         },
       ],
@@ -166,6 +194,24 @@ describe('carrick#2472 T7: declared serialiser callee', () => {
     assert.ok(lead, JSON.stringify(inferred.any_provenance));
     assert.match(lead.detail ?? '', /model located/);
     assert.match(lead.detail ?? '', /Detail|id: string/);
+  });
+
+  it('an unresolved callee: a lead whose type comes from an unimported module names no path', async () => {
+    const inferred = await inferLocated(
+      'Foreign_Located',
+      'function foreignTypeCallee',
+      'return undeclared(foreign)',
+      'foreign'
+    );
+    assert.ok(inferred, 'the row keeps its honest any');
+    const lead = (inferred.any_provenance ?? []).find((p) => p.reason === 'no_payload_evidence');
+    assert.ok(lead, JSON.stringify(inferred.any_provenance));
+    const detail = lead.detail ?? '';
+    assert.match(detail, /model located/);
+    assert.match(detail, /ForeignRecord/);
+    assert.doesNotMatch(detail, /import\("/);
+    assert.doesNotMatch(detail, /\/(?:tmp|var|private|Users|home)\//);
+    assert.ok(!detail.includes(repoDir), detail);
   });
 
   it('a declared callee: the located body is still the type', async () => {

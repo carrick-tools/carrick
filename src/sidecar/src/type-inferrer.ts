@@ -2480,10 +2480,13 @@ export class TypeInferrer {
     // located argument's reading rides in the provenance for a reader.
     const sender = this.returnedSendHolding(returned, located);
     if (sender) {
+      // The printed type names a module the use site does not import by its
+      // declaring file, `import("/abs/path").Name`, and this text reaches a
+      // reader: keep the bare name, before truncation can split the path.
       const lead = this.payloadCandidateOf(
         this.peelTransparentExpression(located),
         this.wireFormatFor(request)
-      ).typeString;
+      ).typeString.replace(/import\("[^"]*"\)\./g, '');
       const shown = lead.length > LEAD_TEXT_MAX ? `${lead.slice(0, LEAD_TEXT_MAX)}…` : lead;
       walked.any_provenance = (walked.any_provenance ?? []).map((entry) =>
         entry.reason === 'no_payload_evidence'
