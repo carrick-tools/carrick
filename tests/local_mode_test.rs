@@ -4541,6 +4541,40 @@ fn an_index_commit_missing_from_the_clone_is_not_a_pass() {
     assert!(said.contains("git fetch origin"), "{said}");
 }
 
+/// The per-edit re-check meets the same index: it re-scans the edited repo
+/// with the stored answers, cannot replay them, and so answers as it does for
+/// a library store it cannot ask: `ran: none`, the reason, exit 2
+/// (carrick#3413).
+#[test]
+#[serial]
+fn the_recheck_of_an_index_commit_missing_from_the_clone_is_not_a_pass() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    stored_blobs_say_commit(root, &"f".repeat(40));
+    rename_connected(root);
+
+    let (code, text) = carrick_code(
+        root,
+        &[
+            "check",
+            CARRY_ROUTES,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).expect("--json is JSON");
+    assert_eq!(json["recheck"]["ran"], "none", "{json:#}");
+    let said = json["recheck"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("fffffff") && said.contains("routes and calls are missing"),
+        "{json:#}"
+    );
+    assert!(said.contains("git fetch origin"), "{said}");
+    assert_eq!(code, Some(2), "{text}");
+}
+
 /// The same index commit, held by `origin` and gone from the clone (a PR
 /// squash-merged on the host before the user pulled): the scan fetches that one
 /// commit by its hash, keeps it under a ref Carrick owns, replays the model's
