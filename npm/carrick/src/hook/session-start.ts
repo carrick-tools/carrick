@@ -110,7 +110,7 @@ async function main(): Promise<void> {
     const projectDir = process.env["CLAUDE_PROJECT_DIR"];
     if (!codex && projectDir) {
       try {
-        lines.push(...bringUpToDate(choice.root, projectDir, currentVersion()));
+        lines.push(...bringUpToDate(choice.root, projectDir, currentVersion(), (message) => log(message)));
       } catch (error) {
         log("self-update failed", String(error));
       }
