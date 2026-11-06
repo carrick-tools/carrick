@@ -129,11 +129,10 @@ async function main(): Promise<void> {
   const note = rootNote(choice);
   if (note) log(note);
   // Stamped before any line is built: a `carrick check --changed` that began
-  // earlier did not read this edit (`checked.ts`). Each file is recorded with
-  // the same time its entry or in-hand answer carries, so the Stop hook can
-  // tell an answer to this edit from an older one (carrick#3466).
+  // earlier did not read this edit (`checked.ts`). The files themselves are
+  // recorded once the probe has answered (below).
   const editedAt = Date.now();
-  if (session) recordEdit(session, choice.root, editedAt, undefined, edited);
+  if (session) recordEdit(session, choice.root, editedAt);
 
   const contexts: string[] = [];
   // Files whose uses lines this message carries, remembered only once it is
@@ -185,13 +184,21 @@ async function main(): Promise<void> {
       }
     }
   }
-  // Every answer this hook had in hand is the session's answer for that edit,
-  // for the Stop hook's statement of the change (`sessionCoverage`).
-  if (session) {
+  // What the Stop hook states the session's check from (carrick#3466): each
+  // file, at the time its entry or in-hand answer carries, and every answer
+  // this hook had in hand as the session's answer for that edit. Only on the
+  // hook channel, which is the one that queues and speaks at Stop. A file the
+  // binary refused (`error`: no index, an unreadable one) is not recorded:
+  // there is no check to state, and a fallback would fail the same way.
+  if (session && channel.channel === "hook") {
+    const recorded: string[] = [];
     for (const [index, file] of edited.entries()) {
       const result = answers.results[index] ?? null;
+      if (result?.error) continue;
       if (result !== null && !queued.has(file)) answerInHand(choice.root, session, file, result, editedAt);
+      if (result !== null || queued.has(file)) recorded.push(file);
     }
+    if (recorded.length > 0) recordEdit(session, choice.root, editedAt, undefined, recorded);
   }
   // Delivered after this edit is queued, so an older answer for a file this
   // edit queues again is skipped (the newer entry carries it).

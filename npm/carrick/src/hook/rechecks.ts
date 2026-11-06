@@ -292,7 +292,7 @@ export function answerInHand(
   // Delivered, then answered, then pending: no carrier ever reads it as owed
   // to it, and no Stop ever waits for it.
   if (!claimDelivery(session, seq, options.home, now)) return;
-  writeAnswer(entry, "answered", now, now, { result }, options.home);
+  if (!writeAnswer(entry, "answered", now, now, { result }, options.home)) return;
   writeAtomic(pending, `${JSON.stringify(entry, null, 2)}\n`);
 }
 
@@ -442,7 +442,7 @@ function writeAnswer(
   finishedAt: number,
   body: { result?: CheckResult; changed?: ChangedResult; failure?: string },
   home?: string,
-): void {
+): boolean {
   const answer: Answer = {
     seq: entry.seq,
     session: entry.session,
@@ -457,7 +457,7 @@ function writeAnswer(
     ...body,
   };
   const file = sessionPart(entry.session, entry.seq, "answer.json", home);
-  if (file !== null) writeAtomic(file, `${JSON.stringify(answer, null, 2)}\n`);
+  return file !== null && writeAtomic(file, `${JSON.stringify(answer, null, 2)}\n`);
 }
 
 function remove(file: string): void {

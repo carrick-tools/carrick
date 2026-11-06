@@ -206,16 +206,18 @@ export async function stopAnswers(session: string, options: StopOptions): Promis
   const delivered: Answer[] = collect(session, home, clock());
 
   // A runner that died holding the queue would hold the reply for the whole
-  // wait: start one before waiting.
+  // wait: start one before waiting. A queued `check --changed` needs one too,
+  // though Stop does not wait for it.
+  for (const root of new Set(pendingFor(session, home).map((entry) => entry.root))) {
+    try {
+      ensure(root);
+    } catch (error) {
+      log("could not restart the re-check runner", String(error));
+    }
+  }
+  delivered.push(...collect(session, home, clock()));
   const waiting = toWaitFor();
   if (waiting.length > 0) {
-    for (const root of new Set(waiting.map((entry) => entry.root))) {
-      try {
-        ensure(root);
-      } catch (error) {
-        log("could not restart the re-check runner", String(error));
-      }
-    }
     const deadline = clock() + options.waitS * 1000;
     while (toWaitFor().length > 0 && clock() < deadline) {
       await sleep(Math.min(POLL_MS, Math.max(0, deadline - clock())));

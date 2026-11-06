@@ -368,6 +368,22 @@ test("the stop hook says nothing about the functions a task added (carrick#3436)
   assert.equal(again.stdout, "", "stated once per change");
 });
 
+test("an edit the binary refused (no index) gives Stop nothing to state and queues no check (carrick#3466)", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-refused" },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-not-indexed.json") }),
+  });
+  const stop = await runHook("stop.ts", {
+    payload: { hook_event_name: "Stop", session_id: "sess-refused" },
+    env: fakeEnv({ HOME: home }),
+  });
+  assert.equal(stop.stdout, "");
+  assert.equal(fs.existsSync(path.join(workspace.root, ".carrick", "rechecks", "queue")), false, "no check --changed queued");
+});
+
 test("the stop hook is silent with nothing recorded, no session, or the channel off", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
