@@ -23,6 +23,7 @@ import {
   wasRead,
   wasTold,
   type NewFunction,
+  snapshotProjectSlug,
 } from "../src/hook/reuse.ts";
 
 function home(): { dir: string; cleanup: () => void } {
@@ -124,12 +125,13 @@ test("the nudge is short, starts with Carrick, and names at most two functions",
   const one = nudge([fn("slugify")]);
   assert.equal(
     one,
-    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, passing `functions: [{ name, file }]`, one entry per new function. Where it names an existing function that does the same job, replace your new copy with a call to it and remove your copy (keep yours only if it is a deliberate variant). Then tell the user in one line what Carrick found and what you changed.",
+    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, passing `functions: [{ name, file }]`, one entry per new function. Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.",
   );
   // The argument is named exactly: the server ignores any other name, and an
   // agent that guessed `entries` got an answer to the wrong question.
   assert.match(one, /`functions: \[\{ name, file \}\]`/);
   assert.doesNotMatch(one, /entries/);
+  assert.doesNotMatch(one, /deliberate variant/);
   assert.match(
     nudge([fn("slugify"), fn("titleCase")]),
     /added 2 new functions \(slugify and titleCase\)\./,
@@ -139,6 +141,43 @@ test("the nudge is short, starts with Carrick, and names at most two functions",
   assert.equal(many.includes("helper2"), false);
   // No paths, no commit, no limits: those live in the carrick-reuse skill.
   assert.doesNotMatch(many, /src\/|6a1b2c3|default branch|not on its source/);
+});
+
+function workspace(repos: unknown): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-slug-"));
+  if (repos !== undefined) {
+    fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, ".carrick", "hosted", "snapshot.json"),
+      JSON.stringify({ resolution: { repos } }),
+    );
+  }
+  return root;
+}
+
+test("the nudge names the project when the snapshot holds exactly one slug", (t) => {
+  const root = workspace([{ project_slug: "trig-bench" }, { project_slug: "trig-bench" }]);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.equal(snapshotProjectSlug(root), "trig-bench");
+  assert.match(
+    nudge([fn("slugify")], snapshotProjectSlug(root)),
+    /passing `project: "trig-bench"` and `functions: \[\{ name, file \}\]`/,
+  );
+});
+
+test("the nudge has no project clause with no snapshot, bad JSON or several slugs", (t) => {
+  const none = workspace(undefined);
+  const bad = workspace(undefined);
+  fs.mkdirSync(path.join(bad, ".carrick", "hosted"), { recursive: true });
+  fs.writeFileSync(path.join(bad, ".carrick", "hosted", "snapshot.json"), "{nope");
+  const two = workspace([{ project_slug: "a" }, { project_slug: "b" }]);
+  t.after(() => {
+    for (const dir of [none, bad, two]) fs.rmSync(dir, { recursive: true, force: true });
+  });
+  for (const root of [none, bad, two]) {
+    assert.equal(snapshotProjectSlug(root), "");
+    assert.doesNotMatch(nudge([fn("slugify")], snapshotProjectSlug(root)), /project:/);
+  }
 });
 
 // The files whose uses lines a session has been shown (carrick#2067), kept in

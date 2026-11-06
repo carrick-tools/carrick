@@ -87,7 +87,8 @@ async function main(): Promise<void> {
   // that order. Codex's `UserPromptSubmit` hook calls the same function
   // (carrick#1335); the difference between the two hosts is the event name on
   // the wire and nothing else.
-  const spoken = drain(session);
+  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
+  const spoken = drain(session, root);
   if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
   else parts.push(spoken.line);
 
@@ -95,7 +96,6 @@ async function main(): Promise<void> {
   // hooks resolve is not the one that set this workspace up (carrick#1372).
   // Once a day, through the same channel, because a mismatch stands until
   // somebody fixes it and a line per turn would be noise.
-  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
   const mismatch = root === null ? null : throttledVersionMismatch(root, currentVersion());
   if (mismatch) parts.push(mismatch);
 

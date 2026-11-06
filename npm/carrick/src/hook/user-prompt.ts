@@ -81,13 +81,13 @@ async function main(): Promise<void> {
   // Finished background re-checks first (Codex has no Stop to carry them),
   // then the reuse nudge, which is about what the whole task added.
   const parts: string[] = [...deliverLate(session)];
-  const spoken = drain(session);
+  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
+  const spoken = drain(session, root);
   if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
   else parts.push(spoken.line);
 
   // The same backstop the other hooks carry: this `carrick` is not the one
   // that set this workspace up (carrick#1372), once a day per workspace.
-  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
   const mismatch = root === null ? null : throttledVersionMismatch(root, currentVersion());
   if (mismatch) parts.push(mismatch);
 
