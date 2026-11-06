@@ -6212,12 +6212,12 @@ fn carry_workspace_with_a_moved_mount() -> tempfile::TempDir {
     workspace
 }
 
-/// The web's calls the index matched, now reaching no route, as `file` rows.
-fn stranded_client_rows<'a>(
+/// The rows in the web's client, whose calls the moved routes served.
+fn web_client_rows<'a>(
     rows: impl IntoIterator<Item = &'a serde_json::Value>,
 ) -> Vec<&'a serde_json::Value> {
     rows.into_iter()
-        .filter(|row| row["file"] == "items-web/src/client.ts" && row["after"] == "no_route")
+        .filter(|row| row["file"] == "items-web/src/client.ts")
         .collect()
 }
 
@@ -6232,7 +6232,7 @@ fn check_changed_names_the_calls_a_mount_prefix_edit_strands() {
 
     let (_, json) = carry_check_changed(root);
     let problems = json["problems"].as_array().into_iter().flatten();
-    let stranded = stranded_client_rows(problems);
+    let stranded = web_client_rows(problems);
     assert!(
         !stranded.is_empty(),
         "the client calls are named:\n{json:#}"
@@ -6257,13 +6257,14 @@ fn a_recheck_of_a_mount_prefix_edit_names_the_calls_it_strands() {
         "{answer:#}"
     );
     let moved = moved_of(&answer);
-    let stranded = stranded_client_rows(&moved);
+    let stranded = web_client_rows(&moved);
     assert!(
         !stranded.is_empty(),
         "the client calls are named:\n{answer:#}"
     );
     for row in stranded {
         assert_eq!(row["before"], "matched", "{answer:#}");
+        assert_eq!(row["after"], "no_route", "{answer:#}");
     }
 }
 

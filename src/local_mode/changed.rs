@@ -1133,7 +1133,10 @@ pub(super) fn judge(
                             .collect();
                     let producer_touched = producers.iter().any(|counterpart| {
                         repo_of.get(counterpart.service.as_str()).is_none_or(
-                            |&(producer_repo, _)| is_touched(producer_repo, &counterpart.file),
+                            |&(producer_repo, _)| {
+                                is_touched(producer_repo, &counterpart.file)
+                                    || rekeyed(before, rebuilt, strict, producer_repo, counterpart)
+                            },
                         )
                     });
                     if !producer_touched {
@@ -1361,6 +1364,41 @@ fn was_matched(before: &LocalIndex, strict: bool, repo: &str, operation: &Joined
                     && item.line == operation.line
                     && !item.counterparts.is_empty()
             })
+        })
+}
+
+/// Whether the rebuilt index reads a route at an old producer's file and line
+/// under another operation than the index held there (carrick#3412). The file
+/// is unchanged since the index, so its lines did not move: a route still read
+/// at that line under another path was re-keyed by something on its mount
+/// chain, which the work changed. Any route the index held there that is still
+/// read under its own key and dispatch case means nothing re-keyed it. No
+/// route read there at all is no evidence (a re-scan that did not re-extract
+/// the handler reads the same, carrick#3411), so it is false.
+fn rekeyed(
+    before: &LocalIndex,
+    rebuilt: &LocalIndex,
+    strict: bool,
+    repo: &str,
+    producer: &super::read_model::Counterpart,
+) -> bool {
+    let Some(line) = producer.line else {
+        return false;
+    };
+    let at_line = |item: &&IndexedItem| {
+        item.kind == super::read_model::ItemKind::Route && item.line == Some(line)
+    };
+    let old: Vec<&IndexedItem> = indexed_rows(before, repo, &producer.file)
+        .filter(at_line)
+        .collect();
+    let new: Vec<&IndexedItem> = indexed_rows(rebuilt, repo, &producer.file)
+        .filter(at_line)
+        .collect();
+    !old.is_empty()
+        && !new.is_empty()
+        && !old.iter().any(|old| {
+            new.iter()
+                .any(|new| old.key == new.key && (!strict || old.dispatch == new.dispatch))
         })
 }
 
