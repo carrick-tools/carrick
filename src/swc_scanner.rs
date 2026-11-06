@@ -1704,11 +1704,66 @@ fn decorator_call(decorator: &Decorator) -> Option<(String, &[ExprOrSpread])> {
 fn decorator_string_argument(args: &[ExprOrSpread]) -> Option<String> {
     match args {
         [] => Some(String::new()),
-        [arg] if arg.spread.is_none() => match &*arg.expr {
-            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
-            _ => None,
-        },
+        [arg] if arg.spread.is_none() => literal_string(&arg.expr),
         _ => None,
+    }
+}
+
+/// The text of a string literal or of a template literal with no
+/// substitution, `None` for any other expression.
+fn literal_string(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
+        Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => tpl.quasis[0]
+            .cooked
+            .as_ref()
+            .map(|cooked| cooked.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+/// What a class decorator's one argument states about the controller prefix
+/// (carrick#3422): a literal, or an object whose `path` is a literal, states
+/// it; an object with no `path` key states the empty prefix, as a call with no
+/// argument does; anything else (a `path` that is an array, an identifier, a
+/// substitution template, a spread or a computed key) states nothing.
+enum ClassPrefixStatement {
+    Stated(String),
+    Empty,
+}
+
+fn class_prefix_statement(arg: &ExprOrSpread) -> Option<ClassPrefixStatement> {
+    if arg.spread.is_some() {
+        return None;
+    }
+    if let Some(text) = literal_string(&arg.expr) {
+        return Some(ClassPrefixStatement::Stated(text));
+    }
+    let Expr::Object(object) = unwrap_expr(&arg.expr) else {
+        return None;
+    };
+    let mut path: Option<&Expr> = None;
+    for prop in &object.props {
+        let PropOrSpread::Prop(prop) = prop else {
+            return None;
+        };
+        let Prop::KeyValue(kv) = &**prop else {
+            // A shorthand `path`, a method or an accessor named `path` is not a literal.
+            if matches!(&**prop, Prop::Shorthand(id) if &*id.sym == "path") {
+                return None;
+            }
+            continue;
+        };
+        match &kv.key {
+            PropName::Ident(id) if &*id.sym == "path" => path = Some(&kv.value),
+            PropName::Str(s) if s.value.to_string_lossy() == "path" => path = Some(&kv.value),
+            PropName::Computed(_) => return None,
+            _ => {}
+        }
+    }
+    match path {
+        None => Some(ClassPrefixStatement::Empty),
+        Some(value) => literal_string(value).map(ClassPrefixStatement::Stated),
     }
 }
 
@@ -1873,14 +1928,9 @@ impl DecoratorRouteVisitor {
                 let [arg] = args else {
                     return None;
                 };
-                if arg.spread.is_some() {
-                    return None;
-                }
-                match &*arg.expr {
-                    Expr::Lit(Lit::Str(literal)) => {
-                        Some(literal.value.to_string_lossy().into_owned())
-                    }
-                    _ => None,
+                match class_prefix_statement(arg)? {
+                    ClassPrefixStatement::Stated(text) => Some(text),
+                    ClassPrefixStatement::Empty => None,
                 }
             })
             .collect();
@@ -1889,7 +1939,14 @@ impl DecoratorRouteVisitor {
                 .decorators
                 .iter()
                 .filter_map(same_origin_arguments)
-                .filter(|args| args.is_empty())
+                .filter(|args| match args {
+                    [] => true,
+                    [arg] => matches!(
+                        class_prefix_statement(arg),
+                        Some(ClassPrefixStatement::Empty)
+                    ),
+                    _ => false,
+                })
                 .map(|_| String::new())
                 .collect()
         } else {
@@ -5899,6 +5956,99 @@ export class UsersController {
                 ),
             ]
         );
+    }
+
+    /// carrick#3422: a class decorator whose one argument is an object states
+    /// its prefix in `path`; the other keys are not read here.
+    #[test]
+    fn object_form_controller_states_its_path_as_the_prefix() {
+        let content = r#"
+import { Controller, Get } from './framework';
+
+@Controller({ path: 'orders', version: '2' })
+export class OrdersController {
+  @Get(':id')
+  find() { return null; }
+}
+
+@Controller({ version: '1' })
+export class RootController {
+  @Get('ping')
+  ping() { return 1; }
+}
+"#;
+        let paths: Vec<String> = decorator_routes(content)
+            .into_iter()
+            .map(|(_, path, _, _)| path)
+            .collect();
+        assert_eq!(paths, vec!["/orders/:id".to_string(), "/ping".to_string()]);
+    }
+
+    /// carrick#3422: a template literal with no substitution is a string.
+    #[test]
+    fn no_substitution_template_prefix_and_path_read_as_literals() {
+        let content = r#"
+import { Controller, Get } from './framework';
+
+@Controller(`reports`)
+export class ReportsController {
+  @Get(`daily`)
+  daily() { return 1; }
+}
+
+@Controller({ path: `layouts` })
+export class LayoutsController {
+  @Get(`:id`)
+  find() { return 1; }
+}
+"#;
+        let paths: Vec<String> = decorator_routes(content)
+            .into_iter()
+            .map(|(_, path, _, _)| path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/layouts/:id".to_string(), "/reports/daily".to_string()]
+        );
+    }
+
+    #[test]
+    fn object_form_from_another_module_states_nothing() {
+        let content = r#"
+import { Get } from './framework';
+import { Docs } from './docs';
+
+@Docs({ path: 'x', version: '9' })
+export class Documented {
+  @Get('one')
+  one() { return 1; }
+}
+"#;
+        assert!(decorator_routes(content).is_empty());
+    }
+
+    #[test]
+    fn object_form_path_that_is_not_a_literal_states_nothing() {
+        let content = r#"
+import { Controller, Get } from './framework';
+const base = 'x';
+
+@Controller({ path: base })
+export class A { @Get('a') a() { return 1; } }
+
+@Controller({ path: ['a', 'b'] })
+export class B { @Get('b') b() { return 1; } }
+
+@Controller({ path: `${base}/c` })
+export class C { @Get('c') c() { return 1; } }
+
+@Controller({ ...base })
+export class D { @Get('d') d() { return 1; } }
+
+@Controller({ [base]: 'e' })
+export class E { @Get('e') e() { return 1; } }
+"#;
+        assert!(decorator_routes(content).is_empty());
     }
 
     /// carrick#745: the route also carries where its HANDLER declares itself

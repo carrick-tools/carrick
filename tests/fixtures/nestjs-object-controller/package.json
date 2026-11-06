@@ -1,0 +1,7 @@
+{
+  "name": "object-form-controller-shape",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: controllers whose class decorator states its prefix as an object (carrick#3422)",
+  "main": "src/orders.controller.ts"
+}

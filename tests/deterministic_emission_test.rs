@@ -1008,3 +1008,30 @@ fn two_producers_at_one_path_each_resolve_their_own_type() {
         "two producers at one path must not share a manifest alias"
     );
 }
+
+/// carrick#3422: a class decorator that states its prefix as an object
+/// (`{ path: 'x', version: '2' }`) or as a template literal with no
+/// substitution is the same statement as the string form, so the routes
+/// survive a silent model. A `path` that is not a literal, an array, or an
+/// object from another module states nothing.
+#[test]
+fn object_form_controllers_are_decorator_routes_with_a_silent_model() {
+    let endpoints = rows(&empty_scan("nestjs-object-controller"), "endpoints");
+
+    for (line, method, path, handler) in [
+        (7, "GET", "/orders", "list"),
+        (12, "POST", "/orders", "create"),
+        (21, "GET", "/reports/daily", "daily"),
+        (30, "GET", "/ping", "ping"),
+    ] {
+        let row = row_at(&endpoints, "src/orders.controller.ts", line);
+        assert_eq!(row["method"], method, "method at line {line}");
+        assert_eq!(row["path"], path, "path at line {line}");
+        assert_eq!(row["handler"], handler, "handler at line {line}");
+        assert_eq!(
+            row["resolution_source"], "decorator_route",
+            "source at line {line}"
+        );
+    }
+    assert_eq!(endpoints.len(), 4, "no decoy is a route: {endpoints:#?}");
+}
