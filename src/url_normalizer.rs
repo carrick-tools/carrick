@@ -491,41 +491,9 @@ impl UrlNormalizer {
     }
 
     /// True if `host` exactly equals, or is a subdomain of, one of `domains`.
-    ///
-    /// Comparison is case-insensitive because DNS hostnames are. We deliberately do
-    /// NOT do substring matching (the old `domain.contains(host)` clause): it was
-    /// backwards and could flip internal/external classification — e.g. host `company`
-    /// would spuriously match a configured `api.company.com`, and `api.com` would fail
-    /// to match `api.company.com`.
+    /// The rule lives in `carrick_match::host_matches_domains` (carrick#3441).
     fn host_matches_domains(host: &str, domains: &BTreeSet<String>) -> bool {
-        // Strip port if present, then lowercase.
-        let host_without_port = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
-
-        domains.iter().any(|domain| {
-            let domain = Self::domain_host(domain);
-            host_without_port == domain || host_without_port.ends_with(&format!(".{}", domain))
-        })
-    }
-
-    /// Reduce a configured domain entry to a bare, comparable hostname.
-    ///
-    /// carrick.json lets users write `externalDomains`/`internalDomains` either
-    /// as bare hosts (`api.resend.com`) or full URLs (`https://api.resend.com`).
-    /// Incoming call hosts are always bare, so we normalize config entries the
-    /// same way — strip the scheme, any path/query, and the port — before
-    /// comparing. Without this, a `https://`-prefixed entry never matches and
-    /// the call is misclassified as internal (reported as a missing endpoint).
-    fn domain_host(domain: &str) -> String {
-        // Lowercase first so a mixed-case scheme (`HTTPS://`) still strips —
-        // URL schemes are case-insensitive.
-        let lower = domain.to_ascii_lowercase();
-        let without_scheme = lower
-            .strip_prefix("https://")
-            .or_else(|| lower.strip_prefix("http://"))
-            .unwrap_or(&lower);
-        // Drop anything from the first '/' (path) onward, then the port.
-        let host = without_scheme.split('/').next().unwrap_or(without_scheme);
-        host.split(':').next().unwrap_or(host).to_string()
+        carrick_match::host_matches_domains(host, domains)
     }
 
     /// Clean up a path by removing query strings, fragments, and normalizing slashes
