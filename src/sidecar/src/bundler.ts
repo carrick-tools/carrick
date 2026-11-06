@@ -17,6 +17,7 @@ import type {
   BundleResult,
   ManifestEntry,
   SymbolFailure,
+  SymbolFailureKind,
 } from './types.js';
 import {
   expandTypeStructural,
@@ -51,6 +52,19 @@ function declaresName(sourceFile: SourceFile, name: string): boolean {
       sourceFile.getEnum(name) ??
       sourceFile.getVariableDeclaration(name) ??
       sourceFile.getFunction(name)
+  );
+}
+
+/**
+ * Whether `sourceFile` declares `name` as a type: an interface, a type alias,
+ * a class or an enum. A variable or a function is a value only.
+ */
+function declaresType(sourceFile: SourceFile, name: string): boolean {
+  return Boolean(
+    sourceFile.getInterface(name) ??
+      sourceFile.getTypeAlias(name) ??
+      sourceFile.getClass(name) ??
+      sourceFile.getEnum(name)
   );
 }
 
@@ -288,6 +302,7 @@ export class TypeBundler {
           symbol_name: symbol.symbol_name,
           source_file: symbol.source_file,
           reason: result.reason || 'Unknown error',
+          ...(result.kind ? { kind: result.kind } : {}),
         });
       }
     }
@@ -297,7 +312,7 @@ export class TypeBundler {
 
   private validateSymbol(
     symbol: SymbolRequest
-  ): { valid: boolean; reason?: string } {
+  ): { valid: boolean; reason?: string; kind?: SymbolFailureKind } {
     if (this.isPlaceholderSource(symbol.source_file)) {
       return {
         valid: false,
@@ -336,7 +351,18 @@ export class TypeBundler {
     }
 
     const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file, this.expandOrigin());
-    return 'reason' in site ? { valid: false, reason: site.reason } : { valid: true };
+    if ('reason' in site) return { valid: false, reason: site.reason };
+    // A model may name the value a handler reads its payload from (a service
+    // object, a function) as the payload's type. A value is not a type: the
+    // inference asked for the same alias defines it (blueprint row N10c).
+    if (!declaresType(site.sourceFile, site.name)) {
+      return {
+        valid: false,
+        reason: `Symbol '${symbol.symbol_name}' in ${symbol.source_file} is a value, not a type`,
+        kind: 'not_a_type',
+      };
+    }
+    return { valid: true };
   }
 
   /** Where a requested symbol is declared, or undefined when it cannot be found. */
@@ -455,15 +481,14 @@ export class TypeBundler {
 
   /// Whether the element type must be parenthesised before an `[]` suffix.
   /// Interfaces/classes/enums are always object/nominal (never a top-level
-  /// union), so only type aliases and typed variables can carry a bare
-  /// union/intersection/function that would misparse; those are re-resolved
-  /// from the source Type here (this runs only on the rare array_depth path).
+  /// union), so only type aliases can carry a bare union/intersection/function
+  /// that would misparse; those are re-resolved from the source Type here
+  /// (this runs only on the rare array_depth path).
   private elementNeedsArrayParens(symbol: SymbolRequest): boolean {
     const site = this.siteOf(symbol);
     if (!site) return false;
     const { sourceFile, name } = site;
-    const decl =
-      sourceFile.getTypeAlias(name) ?? sourceFile.getVariableDeclaration(name);
+    const decl = sourceFile.getTypeAlias(name);
     if (!decl) return false;
     const t = decl.getType();
     return (
@@ -577,31 +602,8 @@ export class TypeBundler {
       return { definition, typeString, typeStringIsExpression: false };
     }
 
-    // Try variable (const type definitions)
-    const varDecl = sourceFile.getVariableDeclaration(symbolName);
-    if (varDecl) {
-      const type = varDecl.getType();
-      const typeString = type.getText();
-      const definition = `export type ${alias} = ${typeString};`;
-      return { definition, typeString, typeStringIsExpression: true };
-    }
-
-    // Try function
-    const funcDecl = sourceFile.getFunction(symbolName);
-    if (funcDecl) {
-      const text = funcDecl.getText();
-      const typeString = text;
-      const alreadyExported = text.trimStart().startsWith('export');
-      const definition = alias !== symbolName
-        ? (alreadyExported
-            ? text.replace(`function ${symbolName}`, `declare function ${alias}`)
-            : text.replace(`function ${symbolName}`, `export declare function ${alias}`))
-        : alreadyExported
-          ? text
-          : `export declare ${text}`;
-      return { definition, typeString, typeStringIsExpression: false };
-    }
-
+    // A variable or a function is a value, never bundled: `validateSymbol`
+    // fails it as `not_a_type` (blueprint row N10c).
     return null;
   }
 

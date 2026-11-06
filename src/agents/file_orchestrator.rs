@@ -2708,7 +2708,6 @@ impl FileOrchestrator {
         fn run_post_join_passes(
             adjusted: &mut FileAnalysisResult,
             pf: &mut PendingFile,
-            framework_detection: &DetectionResult,
             env_schema: &EnvSchemaIndex,
             stats: &mut ProcessingStats,
             member_deficits: &mut HashMap<String, u32>,
@@ -2740,8 +2739,12 @@ impl FileOrchestrator {
                 &pf.whole_url_fallbacks,
                 &pf.literal_bases,
             );
+            // A hint naming a module, a namespace or a value (a framework's
+            // default export, a service object) is not dropped here: the
+            // bundler fails it (`not_a_type`, or an installed package it
+            // never bundles), and the inference asked for the same alias
+            // defines it (blueprint row N10c).
             FileOrchestrator::validate_type_hints(adjusted, &pf.symbol_table);
-            FileOrchestrator::normalize_unusable_types(adjusted, &framework_detection.frameworks);
 
             // Deterministic extraction-flake guards (#361): drop a
             // data-call response symbol that borrows the request type,
@@ -4634,7 +4637,6 @@ impl FileOrchestrator {
                     run_post_join_passes(
                         &mut adjusted,
                         &mut pf,
-                        framework_detection,
                         &env_schema,
                         &mut stats,
                         &mut member_deficits,
@@ -4715,7 +4717,6 @@ impl FileOrchestrator {
                     run_post_join_passes(
                         &mut deterministic,
                         &mut pf,
-                        framework_detection,
                         &env_schema,
                         &mut stats,
                         &mut member_deficits,
@@ -7764,43 +7765,6 @@ impl FileOrchestrator {
                 op.primary_type_symbol = None;
                 op.type_import_source = None;
             }
-        }
-    }
-
-    /// Normalize unusable type hints from the LLM so we can force inference instead of padding unknowns.
-    ///
-    /// Checks BOTH `type_import_source` AND `primary_type_symbol` against all detected frameworks.
-    /// This prevents the LLM from using framework namespace types (e.g., `express`, `fastify`)
-    /// as payload types, which would resolve to the framework's root namespace instead of actual data.
-    fn normalize_unusable_types(result: &mut FileAnalysisResult, frameworks: &[String]) {
-        let scrub = |primary: &mut Option<String>, source: &mut Option<String>| {
-            // Check type_import_source against ALL detected frameworks
-            if let Some(src) = source.as_deref()
-                && frameworks.iter().any(|f| f == src)
-            {
-                *primary = None;
-                *source = None;
-                return;
-            }
-            // Check primary_type_symbol: if it matches a framework package name
-            // (the default import), it's a framework namespace, not a payload type
-            if let Some(sym) = primary.as_deref() {
-                let sym_lower = sym.to_lowercase();
-                if frameworks.iter().any(|f| f.to_lowercase() == sym_lower) {
-                    *primary = None;
-                    *source = None;
-                }
-            }
-        };
-
-        for endpoint in &mut result.endpoints {
-            scrub(
-                &mut endpoint.primary_type_symbol,
-                &mut endpoint.type_import_source,
-            );
-        }
-        for call in &mut result.data_calls {
-            scrub(&mut call.primary_type_symbol, &mut call.type_import_source);
         }
     }
 
@@ -11228,7 +11192,7 @@ impl FileOrchestrator {
             round_trip.elapsed().as_secs_f64()
         );
 
-        let result = self.append_inline_aliases(result, inline_aliases);
+        let result = Self::append_inline_aliases(result, inline_aliases);
 
         // Log results
         debug!(
@@ -11301,7 +11265,6 @@ impl FileOrchestrator {
     }
 
     fn append_inline_aliases(
-        &self,
         mut result: TypeResolutionResult,
         inline_aliases: Vec<(String, String)>,
     ) -> TypeResolutionResult {
@@ -11309,11 +11272,19 @@ impl FileOrchestrator {
             return result;
         }
 
+        // A symbol the bundler could not resolve (read as a value, or not
+        // found at all) is no type to alias, and `type Alias = orderService`
+        // would name it as one (blueprint row N10c).
+        let values: HashSet<String> = result
+            .symbol_failures
+            .iter()
+            .map(|failure| failure.symbol_name.clone())
+            .collect();
         let mut combined = result.dts_content.take().unwrap_or_default();
         let mut seen = HashSet::new();
 
         for (alias, type_string) in inline_aliases {
-            if !seen.insert(alias.clone()) {
+            if values.contains(&type_string) || !seen.insert(alias.clone()) {
                 continue;
             }
             if crate::type_manifest::dts_defines_alias(&combined, &alias) {
@@ -12722,6 +12693,63 @@ impl FileOrchestrator {
 mod tests {
     use super::*;
     use crate::wrapper_request_shape::WrapperRequestShape;
+
+    /// A model symbol the bundler read as a value (`not_a_type`) is never
+    /// written as an alias's type; a type symbol still is (blueprint row N10c).
+    #[test]
+    fn an_inline_alias_to_a_value_is_not_written() {
+        let result = TypeResolutionResult {
+            dts_content: None,
+            explicit_manifest: vec![],
+            inferred_types: vec![],
+            symbol_failures: vec![crate::services::type_sidecar::SymbolFailure {
+                symbol_name: "orderService".to_string(),
+                source_file: "src/services.ts".to_string(),
+                reason: "Symbol 'orderService' in src/services.ts is a value, not a type"
+                    .to_string(),
+                kind: Some(crate::services::type_sidecar::SymbolFailureKind::NotAType),
+            }],
+            errors: vec![],
+            anchor_changes: vec![],
+            request_files: Default::default(),
+        };
+        let result = FileOrchestrator::append_inline_aliases(
+            result,
+            vec![
+                ("Value_Response".to_string(), "orderService".to_string()),
+                ("Type_Response".to_string(), "Order".to_string()),
+            ],
+        );
+        let dts = result.dts_content.unwrap_or_default();
+        assert!(!dts.contains("Value_Response"), "got:\n{dts}");
+        assert!(dts.contains("Type_Response"), "got:\n{dts}");
+    }
+
+    /// A symbol that failed with no kind (a bare specifier the bundler could
+    /// not find) is no type to alias either.
+    #[test]
+    fn an_inline_alias_to_any_failed_symbol_is_not_written() {
+        let result = TypeResolutionResult {
+            dts_content: None,
+            explicit_manifest: vec![],
+            inferred_types: vec![],
+            symbol_failures: vec![crate::services::type_sidecar::SymbolFailure {
+                symbol_name: "Missing".to_string(),
+                source_file: "src/services.ts".to_string(),
+                reason: "Symbol 'Missing' not found".to_string(),
+                kind: None,
+            }],
+            errors: vec![],
+            anchor_changes: vec![],
+            request_files: Default::default(),
+        };
+        let result = FileOrchestrator::append_inline_aliases(
+            result,
+            vec![("Gone_Response".to_string(), "Missing".to_string())],
+        );
+        let dts = result.dts_content.unwrap_or_default();
+        assert!(!dts.contains("Gone_Response"), "got:\n{dts}");
+    }
 
     /// The warning for a file that cannot be asked says it in these words.
     #[test]

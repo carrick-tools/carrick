@@ -2140,6 +2140,24 @@ pub struct SymbolFailure {
     pub source_file: String,
     /// Reason for the failure
     pub reason: String,
+    /// What kind of failure, where the bundler states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SymbolFailureKind>,
+}
+
+/// A failure kind the bundler states (`SymbolFailure.kind` in the sidecar's
+/// `types.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolFailureKind {
+    /// The symbol is declared, but as a value (a variable or a function), not
+    /// as a type: it is not a payload type, and the inference asked for the
+    /// same alias defines it (blueprint row N10c).
+    NotAType,
+    /// A kind this scanner does not know: a newer sidecar must not break the
+    /// response.
+    #[serde(other)]
+    Other,
 }
 
 /// Response from the sidecar
@@ -5402,6 +5420,16 @@ fn answered_in_order(
 
 #[cfg(test)]
 mod tests {
+    /// A failure kind a newer sidecar states must not break the response.
+    #[test]
+    fn an_unknown_symbol_failure_kind_still_parses() {
+        let failure: SymbolFailure = serde_json::from_str(
+            r#"{"symbol_name":"A","source_file":"a.ts","reason":"r","kind":"brand_new"}"#,
+        )
+        .expect("parses");
+        assert_eq!(failure.kind, Some(SymbolFailureKind::Other));
+    }
+
     use super::*;
 
     /// carrick#2100: the key the sidecar sets when the unwidened reading ran
