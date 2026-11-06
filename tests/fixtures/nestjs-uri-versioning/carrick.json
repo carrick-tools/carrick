@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "catalog-api", "directory": "catalog-api" },
+    { "name": "storefront", "directory": "storefront" }
+  ]
+}

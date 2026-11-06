@@ -510,6 +510,12 @@ pub struct DecoratorRoute {
     pub span_start: u32,
     /// End byte offset of the method.
     pub span_end: u32,
+    /// The module the verb decorator came from. The service's versioning
+    /// statements count only when they come from one of these.
+    pub origin: String,
+    /// The version the handler or the controller states for this route
+    /// (carrick#3422). See [`crate::uri_versioning`].
+    pub version: crate::uri_versioning::RouteVersion,
 }
 
 /// A route bound to an imported handler in a route table
@@ -1987,6 +1993,8 @@ impl Visit for DecoratorRouteVisitor {
                 returns_no_payload: method.returns_no_payload,
                 span_start: method.span_start,
                 span_end: method.span_end,
+                origin: method.decorator_origin,
+                version: crate::uri_versioning::RouteVersion::Inherit,
             });
         }
     }
