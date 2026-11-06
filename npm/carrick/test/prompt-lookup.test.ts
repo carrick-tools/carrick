@@ -86,7 +86,7 @@ test("one call carries the first 1,000 characters, the project id and the invoke
   assert.equal(sent[0]!.headers["x-carrick-invoker"], "hook:user-prompt");
   assert.equal(
     line,
-    "Carrick: functions that may already do part of this: `parseAmount` (`core/src/money.ts:12`), `b` (`b.ts:2`), `c` (`c.ts:3`). If one does the job, import it and call it rather than writing your own.",
+    "Carrick: functions that may already do part of this: `parseAmount` (`core/src/money.ts:12`), `b` (`b.ts:2`), `c` (`c.ts:3`). If one does the job, or most of it, call it rather than writing your own; if the task names a new function, make its body call the existing one and add only what it lacks.",
   );
 });
 

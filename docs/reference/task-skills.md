@@ -316,8 +316,9 @@ user-prompt` (`npm/carrick/src/hook/user-prompt.ts`) on Claude Code and Codex.
 
 On a prompt of 12 words or more, the hook asks the project's index which
 functions already do part of the task and hands the model up to three of them,
-as `name (file:line)`, with the line "If one does the job, import it and call it
-rather than writing your own." It makes at most 10 lookups per session, waits at
+as `name (file:line)`, with the line "If one does the job, or most of it, call it
+rather than writing your own; if the task names a new function, make its body
+call the existing one and add only what it lacks." It makes at most 10 lookups per session, waits at
 most 3 seconds, and prints nothing on any failure, so it never holds a prompt
 past that.
 

@@ -84,7 +84,7 @@ export function namedRows(payload: unknown): { name: string; where: string }[] {
 /** The line the model is handed. */
 export function lookupLine(rows: { name: string; where: string }[]): string {
   const list = rows.map((row) => `\`${row.name}\` (\`${row.where}\`)`).join(", ");
-  return `Carrick: functions that may already do part of this: ${list}. If one does the job, import it and call it rather than writing your own.`;
+  return `Carrick: functions that may already do part of this: ${list}. If one does the job, or most of it, call it rather than writing your own; if the task names a new function, make its body call the existing one and add only what it lacks.`;
 }
 
 export type LookupOptions = {

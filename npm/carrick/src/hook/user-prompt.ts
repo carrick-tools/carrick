@@ -90,20 +90,20 @@ async function main(): Promise<void> {
 
   // Claude Code sets `CLAUDE_PROJECT_DIR` for every hook and Codex does not.
   const codex = !process.env["CLAUDE_PROJECT_DIR"];
+  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? payload.cwd ?? process.cwd());
   const parts: string[] = [];
   let spoken: ReturnType<typeof drain> = null;
   if (codex) {
     // Finished background re-checks first (Codex has no Stop to carry them),
     // then the reuse nudge, which is about what the whole task added.
     parts.push(...deliverLate(session));
-    spoken = drain(session);
+    spoken = drain(session, root);
     if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
     else parts.push(spoken.line);
   }
 
   // The same backstop the other hooks carry: this `carrick` is not the one
   // that set this workspace up (carrick#1372), once a day per workspace.
-  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? payload.cwd ?? process.cwd());
   const mismatch = root === null ? null : throttledVersionMismatch(root, currentVersion());
   if (mismatch) parts.push(mismatch);
 
