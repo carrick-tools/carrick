@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.145](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.144...carrick-v0.3.145) (2026-11-06)
+
+
+### Features
+
+* **hook:** reuse message tells the agent to swap in the existing function ([#3346](https://github.com/carrick-tools/carrick/issues/3346)) ([aedd3a8](https://github.com/carrick-tools/carrick/commit/aedd3a82637f661dcb0131af34fc978868110969))
+* **init:** write the measured Carrick rules block (carrick-cloud[#2991](https://github.com/carrick-tools/carrick/issues/2991)) ([#3415](https://github.com/carrick-tools/carrick/issues/3415)) ([b786ca5](https://github.com/carrick-tools/carrick/commit/b786ca55718f1364e7edf6c1a7dceba5a20b11ea))
+
+
+### Bug Fixes
+
+* **check:** a mount edit that re-keys an unchanged route file's routes names the calls it strands ([#3420](https://github.com/carrick-tools/carrick/issues/3420)) ([e69296d](https://github.com/carrick-tools/carrick/commit/e69296d5e750c0aed16e0c57dd3dc032fed22b72))
+* **check:** an untouched call is no route only when its old producer's file changed ([#3416](https://github.com/carrick-tools/carrick/issues/3416)) ([eb00272](https://github.com/carrick-tools/carrick/commit/eb002723e1a9220323905673c9b69fd00d825001))
+* **init:** rule 5 asks for check --changed when a change touches a contract ([#3428](https://github.com/carrick-tools/carrick/issues/3428)) ([587469b](https://github.com/carrick-tools/carrick/commit/587469b0011a9a20a34f2335497fb07df6a327af))
+* **recheck:** the per-edit re-check applies the answers_lost guard ([#3418](https://github.com/carrick-tools/carrick/issues/3418)) ([641b60b](https://github.com/carrick-tools/carrick/commit/641b60bc1b0d7dd62733f038c09a964d9282fe3b))
+
 ## [0.3.144](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.143...carrick-v0.3.144) (2026-11-05)
 
 
