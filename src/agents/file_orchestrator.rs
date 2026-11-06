@@ -8730,7 +8730,10 @@ impl FileOrchestrator {
                     primary_type_symbol: None,
                     type_import_source: None,
                     loopback_default_url: None,
-                    base: None,
+                    // The row states its base, read off the wrapper's URL
+                    // expression: the match key strips an injected base only
+                    // when the row says it is one (carrick#3387).
+                    base: resolve_call_base(&call.target, aliases, env_fallbacks, env_schema),
                     consumers_not_resolved: None,
                     dispatch: None,
                     resolution_source: Some(ResolutionSource::SameFileWrapper),
@@ -11083,9 +11086,11 @@ impl FileOrchestrator {
     /// end ([`Self::summary_resolved`], carrick#2406), and it is read again
     /// here only where a pass after the summaries rewrote the target's base
     /// slot ([`Self::resolve_target_bases`]): the end describes the piece
-    /// the summary wrote, not the rewrite. Any other row already carrying a
-    /// base is left alone, because the pass that read the call site is the
-    /// better witness than this re-reading of its target.
+    /// the summary wrote, not the rewrite. A same-file wrapper row states the
+    /// base read off its target at emission, so it is read again on the same
+    /// condition. Any other row already carrying a base is left alone,
+    /// because the pass that read the call site is the better witness than
+    /// this re-reading of its target.
     fn stamp_call_bases(
         result: &mut FileAnalysisResult,
         aliases: &EnvAliasMap,
@@ -11093,13 +11098,16 @@ impl FileOrchestrator {
         env_schema: &EnvSchemaIndex,
     ) {
         for data_call in &mut result.data_calls {
-            if data_call.resolution_source == Some(ResolutionSource::RequestSummary) {
+            if matches!(
+                data_call.resolution_source,
+                Some(ResolutionSource::RequestSummary | ResolutionSource::SameFileWrapper)
+            ) {
                 let stated = data_call.base.as_ref().map(|base| base.written.clone());
                 if stated == written_base(&data_call.target) {
                     continue;
                 }
                 debug!(
-                    "A summary row's base slot was rewritten after the summaries: reading {} from its target",
+                    "A row's base slot was rewritten after it was emitted: reading {} from its target",
                     data_call.target
                 );
             } else if data_call.base.is_some() {
@@ -20816,6 +20824,47 @@ export { routes };
             ],
             "the query string is not part of the route and must not drop the call"
         );
+    }
+
+    /// A same-file wrapper row states the base read off its target when it is
+    /// emitted (carrick#3387). A pass after the join that rewrites the base
+    /// slot (`${base}` to the env read behind it) leaves that base stale, so
+    /// the stamping pass reads it again from the rewritten target.
+    #[test]
+    fn a_wrapper_row_states_its_base_and_is_read_again_after_a_rewrite() {
+        use crate::call_base::CallBaseKind;
+        let calls = vec![wrapper_call(31, 100, "${base}/api/v1/widgets", None)];
+        let (mut result, _) = emit_and_join_with(
+            FileAnalysisResult::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &calls,
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/tools.ts",
+            false,
+        );
+        let stated = result.data_calls[0]
+            .base
+            .as_ref()
+            .expect("a base is stated");
+        assert_eq!(stated.kind, CallBaseKind::Injected);
+        assert_eq!(stated.written, "${base}");
+
+        result.data_calls[0].target = "${process.env.API_URL}/api/v1/widgets".to_string();
+        FileOrchestrator::stamp_call_bases(
+            &mut result,
+            &EnvAliasMap::new(),
+            &Default::default(),
+            &Default::default(),
+        );
+        let reread = result.data_calls[0]
+            .base
+            .as_ref()
+            .expect("a base is stated");
+        assert_eq!(reread.kind, CallBaseKind::Env);
+        assert_eq!(reread.written, "${process.env.API_URL}");
     }
 
     /// Two sites on one source line (a `Promise.all` of them) are two calls:
