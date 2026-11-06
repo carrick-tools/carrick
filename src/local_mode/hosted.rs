@@ -612,23 +612,26 @@ impl Reader {
     ///
     /// Asks `resolve-repos` first and downloads only when something moved and
     /// every move passed, so a refusal costs one metadata request. Returns the
-    /// snapshot to persist with [`Forward::Moved`], and none otherwise.
+    /// snapshot to persist with [`Forward::Moved`], and none otherwise, and,
+    /// whenever the cloud answered for this workspace, where each repo's
+    /// hosted index and this machine's copy stand ([`synced_repos`]).
     async fn forward(
         &self,
         credential: &Credential,
         remotes: &BTreeMap<PathBuf, String>,
         old: Snapshot,
-    ) -> (Forward, Option<Snapshot>) {
+    ) -> (Forward, Option<Snapshot>, Option<Vec<SyncedRepo>>) {
         let repos: Vec<String> = remotes.values().cloned().collect();
         let resolution = match self.resolve(credential, &repos).await {
             Ok(resolution) => resolution,
-            Err(reason) => return (Forward::Kept(reason), None),
+            Err(reason) => return (Forward::Kept(reason), None, None),
         };
         if resolution.workspace.slug != old.resolution.workspace.slug {
             return (
                 Forward::Kept(
                     "the hosted workspace is not the one this index was read from".into(),
                 ),
+                None,
                 None,
             );
         }
@@ -637,6 +640,23 @@ impl Reader {
             remotes: remotes.clone(),
             ..Default::default()
         };
+        let synced = Some(synced_repos(&resolution, &before));
+        let (outcome, snapshot) = self
+            .forward_from(credential, remotes, &repos, resolution, &before, old)
+            .await;
+        (outcome, snapshot, synced)
+    }
+
+    /// [`Reader::forward`] once the cloud has answered for this workspace.
+    async fn forward_from(
+        &self,
+        credential: &Credential,
+        remotes: &BTreeMap<PathBuf, String>,
+        repos: &[String],
+        resolution: Resolution,
+        before: &HostedInput,
+        old: Snapshot,
+    ) -> (Forward, Option<Snapshot>) {
         let mut approved: BTreeMap<PathBuf, std::collections::BTreeSet<String>> = BTreeMap::new();
         let mut moved: Vec<(PathBuf, String)> = Vec::new();
         for (path, name) in remotes {
@@ -701,7 +721,7 @@ impl Reader {
             return (Forward::Current, None);
         }
         let (snapshot, failure, _) = self
-            .assemble(credential, &repos, resolution, Some(old))
+            .assemble(credential, repos, resolution, Some(old))
             .await;
         if let Some(failure) = failure {
             return (Forward::Kept(failure), None);
@@ -795,20 +815,164 @@ pub(super) fn forward(workspace: &Workspace) -> Forward {
     })
     .join()
     .unwrap_or_else(|_| Err("Hosted reader failed".into()));
-    match result {
-        Ok((Forward::Moved(moved), Some(snapshot))) => {
+    let (outcome, synced) = match result {
+        Ok((Forward::Moved(moved), Some(snapshot), synced)) => {
             match persist(
                 &workspace.index_dir().join("hosted/snapshot.json"),
                 &snapshot,
             ) {
-                Ok(()) => Forward::Moved(moved),
-                Err(reason) => Forward::Kept(reason),
+                Ok(()) => (Forward::Moved(moved), synced),
+                Err(reason) => (Forward::Kept(reason), synced),
             }
         }
-        Ok((Forward::Moved(_), None)) => Forward::Kept("no snapshot to write".into()),
-        Ok((outcome, _)) => outcome,
-        Err(reason) => Forward::Kept(reason),
+        Ok((Forward::Moved(_), None, synced)) => {
+            (Forward::Kept("no snapshot to write".into()), synced)
+        }
+        Ok((outcome, _, synced)) => (outcome, synced),
+        Err(reason) => (Forward::Kept(reason), None),
+    };
+    // Only a run the cloud answered says where the hosted index stands; any
+    // other keeps the last record, whose own time says how old it is.
+    if let Some(synced) = synced {
+        let record = SyncRecord::of(&outcome, synced, chrono::Utc::now().to_rfc3339());
+        let _ = record.write(&workspace.index_dir().join(SYNC_RECORD));
     }
+    outcome
+}
+
+/// Where [`forward`] records what it found, under the index directory. Small,
+/// so the session-start hook reads it instead of the snapshot beside it.
+/// Its shape is listed in `docs/local-mode-output.md` ("On-disk layout").
+pub(super) const SYNC_RECORD: &str = "hosted/last-sync.json";
+
+/// One repo in [`SyncRecord`]: the hosted index the cloud holds for it, the
+/// copy this machine compares against, and whether HEAD can take the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct SyncedRepo {
+    repo: String,
+    hosted_commit: String,
+    /// When the cloud stored the newest hosted row at that commit.
+    hosted_scanned_at: Option<String>,
+    copy_commit: String,
+    copy_scanned_at: Option<String>,
+    /// Whether HEAD's history holds `hosted_commit`. Where it does not, the
+    /// copy cannot move until the checkout does.
+    head_holds_hosted: bool,
+    /// Whether this clone holds `hosted_commit` at all.
+    fetched: bool,
+    /// Commits `hosted_commit` has that HEAD lacks, when this clone holds it
+    /// and HEAD does not.
+    behind: Option<u64>,
+    head_detached: bool,
+}
+
+/// `.carrick/hosted/last-sync.json`, rewritten by every [`forward`] the cloud
+/// answered (carrick#3432, carrick#3433).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct SyncRecord {
+    schema: &'static str,
+    at: String,
+    outcome: &'static str,
+    reason: Option<String>,
+    repos: Vec<SyncedRepo>,
+}
+
+impl SyncRecord {
+    /// The record of `outcome`. A repo the copy moved for now holds the hosted
+    /// commit, so its copy is stated as that one.
+    fn of(outcome: &Forward, mut repos: Vec<SyncedRepo>, at: String) -> Self {
+        let (outcome, reason) = match outcome {
+            Forward::Moved(moved) => {
+                for repo in &mut repos {
+                    if moved
+                        .iter()
+                        .any(|(_, commit)| *commit == repo.hosted_commit)
+                    {
+                        repo.copy_commit = repo.hosted_commit.clone();
+                        repo.copy_scanned_at = repo.hosted_scanned_at.clone();
+                    }
+                }
+                ("moved", None)
+            }
+            Forward::Current => ("current", None),
+            Forward::Kept(reason) => ("kept", Some(reason.clone())),
+        };
+        Self {
+            schema: "carrick.hosted-sync/0",
+            at,
+            outcome,
+            reason,
+            repos,
+        }
+    }
+
+    fn write(&self, path: &Path) -> Result<(), String> {
+        let dir = path.parent().ok_or("Invalid hosted cache directory")?;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let pending = dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        let result = std::fs::write(&pending, json)
+            .and_then(|()| std::fs::rename(&pending, path))
+            .map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(pending);
+        result
+    }
+}
+
+/// Where each local repo's hosted index and this machine's copy of it stand,
+/// for the repos whose hosted and held commits are each one line of history.
+fn synced_repos(resolution: &Resolution, before: &HostedInput) -> Vec<SyncedRepo> {
+    let scanned_at = |resolution: &Resolution, name: &str, commit: &str| -> Option<String> {
+        resolution
+            .repos
+            .iter()
+            .filter(|repo| repo.connected && repo.full_name.eq_ignore_ascii_case(name))
+            .flat_map(|repo| repo.services.iter().flatten())
+            .filter(|service| service.hash.as_deref() == Some(commit))
+            .filter_map(|service| service.updated_at.clone())
+            .max()
+    };
+    let Some(old) = before.snapshot.as_ref() else {
+        return Vec::new();
+    };
+    let mut synced = Vec::new();
+    for (path, name) in &before.remotes {
+        let repo = path.to_string_lossy();
+        let now: std::collections::BTreeSet<String> = resolution
+            .repos
+            .iter()
+            .filter(|r| r.connected && r.full_name.eq_ignore_ascii_case(name))
+            .flat_map(|r| r.services.iter().flatten())
+            .filter_map(|service| service.hash.clone())
+            .collect();
+        let held: std::collections::BTreeSet<String> = before
+            .local_blobs(path)
+            .into_iter()
+            .map(|blob| blob.commit_hash)
+            .collect();
+        let (Some(hosted), Some(copy)) = (newest_commit(&repo, &now), newest_commit(&repo, &held))
+        else {
+            continue;
+        };
+        let head = crate::git_state::head_commit(&repo).unwrap_or_default();
+        let fetched = crate::git_state::has_commit(&repo, &hosted);
+        let head_holds_hosted = crate::git_state::is_ancestor(&repo, &hosted, &head);
+        let behind = (fetched && !head_holds_hosted)
+            .then(|| crate::git_state::commits_ahead(&repo, &head, &hosted).ok())
+            .flatten();
+        synced.push(SyncedRepo {
+            repo: name.clone(),
+            hosted_scanned_at: scanned_at(resolution, name, &hosted),
+            copy_scanned_at: scanned_at(&old.resolution, name, &copy),
+            hosted_commit: hosted,
+            copy_commit: copy,
+            head_holds_hosted,
+            fetched,
+            behind,
+            head_detached: crate::git_state::head_is_detached(&repo),
+        });
+    }
+    synced
 }
 
 /// Every service row `resolve-repos` answered for one project, with the repo
@@ -3075,7 +3239,7 @@ mod tests {
             ),
         ]);
         let remotes = remotes_of(dir.path());
-        let (outcome, snapshot) = reader(url)
+        let (outcome, snapshot, _) = reader(url)
             .forward(&credential("test"), &remotes, held_at(&a))
             .await;
         assert_eq!(
@@ -3126,7 +3290,7 @@ mod tests {
             "200 OK",
             serde_json::to_vec(&resolved_at(&b)).unwrap(),
         )]);
-        let (outcome, snapshot) = reader(url)
+        let (outcome, snapshot, _) = reader(url)
             .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
             .await;
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
@@ -3139,12 +3303,99 @@ mod tests {
             "200 OK",
             serde_json::to_vec(&resolved_at(&side)).unwrap(),
         )]);
-        let (outcome, snapshot) = reader(url)
+        let (outcome, snapshot, _) = reader(url)
             .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
             .await;
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
         assert!(snapshot.is_none());
         assert_eq!(requests.join().unwrap().len(), 1, "it downloaded anyway");
+    }
+
+    /// A checkout behind the hosted commit keeps the copy, and the answer says
+    /// where both stand: the hosted commit, the copy's, and how far HEAD is
+    /// behind, so the session start can name `git pull` (carrick#3433). The
+    /// record written from it says `kept`, with both commits.
+    #[tokio::test]
+    async fn a_kept_copy_states_both_commits_and_how_far_head_is_behind() {
+        use crate::git_state::tests::git_in;
+        let (dir, a, b, _) = moved_on_repo();
+        git_in(dir.path(), &["checkout", "-q", &a]);
+        let (url, _) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&resolved_at(&b)).unwrap(),
+        )]);
+        let (outcome, _, synced) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
+        let synced = synced.expect("the cloud answered, so the run says where things stand");
+        assert_eq!(
+            synced,
+            vec![SyncedRepo {
+                repo: "example/api".into(),
+                hosted_commit: b.clone(),
+                hosted_scanned_at: Some(STORED_AT.into()),
+                copy_commit: a.clone(),
+                copy_scanned_at: Some(STORED_AT.into()),
+                head_holds_hosted: false,
+                fetched: true,
+                behind: Some(1),
+                head_detached: true,
+            }]
+        );
+
+        let record = SyncRecord::of(&outcome, synced, "2026-11-06T10:00:00Z".into());
+        let path = dir.path().join(".carrick").join(SYNC_RECORD);
+        record.write(&path).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["schema"], "carrick.hosted-sync/0");
+        assert_eq!(written["outcome"], "kept");
+        assert_eq!(written["repos"][0]["hosted_commit"], json!(b));
+        assert_eq!(written["repos"][0]["copy_commit"], json!(a));
+        assert_eq!(written["repos"][0]["behind"], 1);
+    }
+
+    /// A hosted commit this clone has never fetched has no count, and says
+    /// so, rather than a guessed one; a moved copy is recorded at the
+    /// hosted commit it moved to; an unreachable cloud records nothing.
+    #[tokio::test]
+    async fn an_unfetched_hosted_commit_is_named_as_one_and_a_move_records_the_new_copy() {
+        let (dir, a, b, _) = moved_on_repo();
+        let unknown = "f".repeat(40);
+        let (url, _) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&resolved_at(&unknown)).unwrap(),
+        )]);
+        let (_, _, synced) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        let row = &synced.unwrap()[0];
+        assert!(!row.fetched && !row.head_holds_hosted, "{row:?}");
+        assert_eq!(row.behind, None);
+        assert!(!row.head_detached, "{row:?}");
+
+        let (url, _) = serve_sequence(vec![
+            ("200 OK", serde_json::to_vec(&resolved_at(&b)).unwrap()),
+            (
+                "200 OK",
+                answered(&[(named_blob("api", "api", &b), "2026-10-02T10:00:00.000Z")]),
+            ),
+        ]);
+        let (outcome, _, synced) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        let record = SyncRecord::of(&outcome, synced.unwrap(), "now".into());
+        assert_eq!(record.outcome, "moved");
+        assert_eq!(record.repos[0].copy_commit, b);
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (_, _, synced) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        assert!(synced.is_none());
     }
 
     /// A push scan rescans only the services the push reached, so a hosted
@@ -3183,7 +3434,7 @@ mod tests {
             ),
         ]);
         let remotes = remotes_of(dir.path());
-        let (outcome, snapshot) = reader(url)
+        let (outcome, snapshot, _) = reader(url)
             .forward(&credential("test"), &remotes, held.clone())
             .await;
         assert_eq!(
@@ -3220,7 +3471,7 @@ mod tests {
             "200 OK",
             serde_json::to_vec(&two_at(&b, &side)).unwrap(),
         )]);
-        let (outcome, snapshot) = reader(url)
+        let (outcome, snapshot, _) = reader(url)
             .forward(&credential("test"), &remotes, held)
             .await;
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
@@ -3236,7 +3487,7 @@ mod tests {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", closed.local_addr().unwrap());
         drop(closed);
-        let (outcome, snapshot) = reader(url)
+        let (outcome, snapshot, _) = reader(url)
             .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
             .await;
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
@@ -3253,7 +3504,7 @@ mod tests {
             "200 OK",
             serde_json::to_vec(&resolved_at(&a)).unwrap(),
         )]);
-        let (outcome, _) = reader(url)
+        let (outcome, _, _) = reader(url)
             .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
             .await;
         assert_eq!(outcome, Forward::Current);
@@ -3266,7 +3517,7 @@ mod tests {
                 answered(&[(named_blob("api", "api", &c), "2026-10-02T10:00:00.000Z")]),
             ),
         ]);
-        let (outcome, snapshot) = reader(url)
+        let (outcome, snapshot, _) = reader(url)
             .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
             .await;
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
