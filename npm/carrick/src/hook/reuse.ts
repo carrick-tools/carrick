@@ -346,23 +346,24 @@ export type Drained = {
  * is the point: a nudge that is written and not recorded fires again on the
  * next stop, and a task is several stops.
  */
-export function drain(sessionId: string, home?: string): Drained | null {
+export function drain(sessionId: string, root: string | null, home?: string): Drained | null {
   const current = readSession(sessionId, home);
   const waiting = pending(current);
   if (waiting.length === 0) return null;
-  const line = nudge(waiting);
+  const line = nudge(waiting, root === null ? "" : snapshotProjectSlug(root));
   markNudged(sessionId, waiting, home);
   return { line, named: waiting.length, found: current.found.length };
 }
 
 /**
  * The one line the Stop hook hands the model: how many functions, at most two
- * names, and the ask with the exact call (`functions: [{ name, file }]`). Short on purpose, and it starts with "Carrick:" so the
+ * names, and the ask with the exact call (`functions`, one `{ description }` each: the
+ * functions are new, so the index has no name to find). Short on purpose, and it starts with "Carrick:" so the
  * user can tell where it came from. The two limits on the answer (what the
  * index was taken at, and that the match is on what a function is described as
  * doing) live in the `carrick-reuse` skill, where the answer is read.
  */
-export function nudge(entries: NewFunction[]): string {
+export function nudge(entries: NewFunction[], slug = ""): string {
   const total = entries.length;
   const shown = entries.slice(0, 2).map((entry) => entry.name);
   const rest = total - shown.length;
@@ -372,5 +373,29 @@ export function nudge(entries: NewFunction[]): string {
       : shown.length === 2
         ? `${shown[0]} and ${shown[1]}`
         : shown[0]!;
-  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing \`functions: [{ name, file }]\`, one entry per new function. Then tell the user in one line what Carrick found.`;
+  const projectArg = slug === "" ? "" : `\`project: "${slug}"\` and `;
+  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing ${projectArg}\`functions\`, one \`{ description }\` per new function: one plain sentence saying what it does (new functions are not in the index yet, so a name is not found). Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.`;
+}
+
+/**
+ * The one project slug the workspace's cached hosted snapshot names, or ""
+ * when there is none or more than one (`find_similar` needs one project).
+ * `snapshot.json` is written by the hosted refresh: `resolution.repos[]`
+ * carries each connected repo's `project_slug`.
+ */
+export function snapshotProjectSlug(root: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), "utf8"));
+  } catch {
+    return "";
+  }
+  const repos = (parsed as { resolution?: { repos?: unknown } } | null)?.resolution?.repos;
+  if (!Array.isArray(repos)) return "";
+  const slugs = new Set<string>();
+  for (const repo of repos) {
+    const slug = (repo as { project_slug?: unknown } | null)?.project_slug;
+    if (typeof slug === "string" && slug !== "") slugs.add(slug);
+  }
+  return slugs.size === 1 ? [...slugs][0]! : "";
 }
