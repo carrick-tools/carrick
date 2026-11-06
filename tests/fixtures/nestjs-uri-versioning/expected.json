@@ -1,0 +1,55 @@
+{
+  "_doc": "Answer key for tests/nestjs_uri_versioning_test.rs. The service enables URI versioning with default version 1: widgets inherit it, the orders controller states 2, a handler states 3, and a neutral version adds no segment. The last two calls name paths nothing serves (the decoys).",
+  "endpoints": [
+    {
+      "service": "catalog-api",
+      "method": "GET",
+      "path": "/v1/widgets"
+    },
+    {
+      "service": "catalog-api",
+      "method": "GET",
+      "path": "/v1/widgets/:id"
+    },
+    {
+      "service": "catalog-api",
+      "method": "GET",
+      "path": "/widgets/ping"
+    },
+    {
+      "service": "catalog-api",
+      "method": "GET",
+      "path": "/v2/orders"
+    },
+    {
+      "service": "catalog-api",
+      "method": "POST",
+      "path": "/v2/orders"
+    },
+    {
+      "service": "catalog-api",
+      "method": "GET",
+      "path": "/v3/reports/daily"
+    },
+    {
+      "service": "catalog-api",
+      "method": "GET",
+      "path": "/v1/reports/weekly"
+    },
+    {
+      "service": "catalog-api",
+      "method": "GET",
+      "path": "/status/health"
+    }
+  ],
+  "decoy_calls": [
+    {
+      "method": "GET",
+      "path": "/v1/orders"
+    },
+    {
+      "method": "GET",
+      "path": "/widgets"
+    }
+  ]
+}
