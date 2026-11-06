@@ -4992,10 +4992,13 @@ pub(crate) fn model_symbols_for_reads(
     explicit: &[SymbolRequest],
     infer: &[InferRequestItem],
 ) -> Vec<ModelSymbol> {
-    let read: HashMap<&str, &InferKind> = infer
-        .iter()
-        .filter_map(|item| Some((item.alias.as_deref()?, &item.infer_kind)))
-        .collect();
+    // First item per alias wins, as the inference join does.
+    let mut read: HashMap<&str, &InferKind> = HashMap::new();
+    for item in infer {
+        if let Some(alias) = item.alias.as_deref() {
+            read.entry(alias).or_insert(&item.infer_kind);
+        }
+    }
     let mut alias_counts: HashMap<&str, usize> = HashMap::new();
     for req in explicit {
         if let Some(alias) = req.alias.as_deref() {
