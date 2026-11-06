@@ -5085,6 +5085,116 @@ fn a_re_check_names_a_service_that_reads_the_edited_file() {
     );
 }
 
+/// The reason a re-check gives for a service it did not re-read.
+fn not_reread_reason(answer: &serde_json::Value, service: &str) -> String {
+    answer["recheck"]["scope"]["not_reread"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["service"] == service))
+        .and_then(|entry| entry["reason"].as_str())
+        .unwrap_or_else(|| panic!("{service} is named as not re-read:\n{answer:#}"))
+        .to_string()
+}
+
+/// What `carrick init` writes at a repo root (agent skills, hook config, an
+/// agents file) is read by no service, so it leaves every other service at its
+/// indexed version with nothing to re-check. A root manifest is a repo input,
+/// and still makes every other service stale, even when the walk of what each
+/// service reads carries it (a bump of its `version` alone) (carrick#3465).
+#[test]
+#[serial]
+fn a_re_check_leaves_other_services_alone_for_root_files_no_service_reads() {
+    let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
+        std::fs::write(
+            repo.join("package.json"),
+            "{ \"name\": \"shop\", \"version\": \"1.0.0\", \"private\": true }\n",
+        )
+        .expect("write the root manifest");
+    });
+    let root = workspace.path();
+    index(root);
+
+    for (file, text) in [
+        (
+            "shop/.claude/skills/carrick-impact/SKILL.md",
+            "# carrick-impact\n",
+        ),
+        ("shop/.codex/hooks.json", "{ \"hooks\": {} }\n"),
+        ("shop/AGENTS.md", "# Agents\n"),
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("make the dir");
+        std::fs::write(path, text).expect("write the root file");
+    }
+    statement_in(&root.join(SHOP_LEDGER), "ledger edit");
+    let answer = recheck_json(root, SHOP_LEDGER, &AMPLE);
+    assert_eq!(reread(&answer), ["ledger"], "{answer:#}");
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!([]),
+        "{answer:#}"
+    );
+    for service in ["catalog", "inventory"] {
+        assert_eq!(
+            not_reread_reason(&answer, service),
+            "no edits since the index; judged at its indexed version",
+            "{answer:#}"
+        );
+    }
+
+    edit(
+        &root.join("shop/package.json"),
+        "\"version\": \"1.0.0\"",
+        "\"version\": \"1.0.1\"",
+    );
+    let answer = recheck_json(root, SHOP_LEDGER, &AMPLE);
+    assert_eq!(reread(&answer), ["ledger"], "{answer:#}");
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!(["catalog", "inventory"]),
+        "{answer:#}"
+    );
+}
+
+/// A root config one service reads by name (its tsconfig extends it) still
+/// counts for that service, and only for it (carrick#3465).
+#[test]
+#[serial]
+fn a_re_check_names_the_service_whose_tsconfig_extends_an_edited_root_config() {
+    let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
+        std::fs::write(
+            repo.join("tsconfig.base.json"),
+            "{ \"compilerOptions\": { \"strict\": true } }\n",
+        )
+        .expect("write the root tsconfig");
+        std::fs::write(
+            repo.join("catalog/tsconfig.json"),
+            "{ \"extends\": \"../tsconfig.base.json\" }\n",
+        )
+        .expect("write the catalog tsconfig");
+    });
+    let root = workspace.path();
+    index(root);
+
+    edit(
+        &root.join("shop/tsconfig.base.json"),
+        "\"strict\": true",
+        "\"strict\": false",
+    );
+    statement_in(&root.join(SHOP_LEDGER), "ledger edit");
+    let answer = recheck_json(root, SHOP_LEDGER, &AMPLE);
+    assert_eq!(reread(&answer), ["ledger"], "{answer:#}");
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!(["catalog"]),
+        "{answer:#}"
+    );
+    assert_eq!(
+        not_reread_reason(&answer, "inventory"),
+        "no edits since the index; judged at its indexed version",
+        "{answer:#}"
+    );
+}
+
 /// A miss in one service leaves the other services of the repo re-checked, and
 /// a new index tries the missed one again.
 #[test]
