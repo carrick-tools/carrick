@@ -1,0 +1,32 @@
+{
+  "schema": "carrick.check-changed/0",
+  "workspace": "/workspace",
+  "files": 1,
+  "routes": 0,
+  "calls": 1,
+  "services": 3,
+  "repos": [{ "repo": "/workspace", "main_branch": "main", "base": "abc123", "files": ["order-service/src/client.ts"], "rescan": "ran" }],
+  "problems": [
+    {
+      "kind": "incompatible",
+      "file": "order-service/src/client.ts",
+      "line": 14,
+      "role": "call",
+      "method": "GET",
+      "path": "/users/:id",
+      "other": ["user-service user-service/src/routes/users.ts:9"],
+      "reason": "the response type does not match: email is missing",
+      "source": "fact",
+      "already_indexed": false,
+      "unconfirmed": false,
+      "outside_the_change": false,
+      "other_build": false,
+      "fails": true
+    }
+  ],
+  "failing": 1,
+  "type_checked": 1,
+  "not_type_checked": [],
+  "outside_moved": 0,
+  "elapsed_ms": 1200
+}

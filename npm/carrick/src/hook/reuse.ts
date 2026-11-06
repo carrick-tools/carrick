@@ -35,6 +35,23 @@ export type SessionRecord = {
    * `checked.ts` compares it with the last `carrick check --changed`.
    */
   edited: Record<string, number>;
+  /**
+   * Absolute path -> the workspace root it was edited in and epoch ms of its
+   * newest edit: the files the Stop hook states the session's check for
+   * (`sessionCoverage` in `stop-wait.ts`, carrick#3466).
+   */
+  files: Record<string, { root: string; at: number }>;
+  /**
+   * Workspace root -> the newest edit there the Stop hook has already spoken
+   * about (checked, or queued `check --changed` for): it speaks once per change.
+   */
+  stated: Record<string, number>;
+  /**
+   * Workspace root -> the newest edit there whose every file the per-file
+   * re-checks answered, as Stop stated it. `checked.ts` reads it like a clean
+   * `check --changed` marker.
+   */
+  covered: Record<string, number>;
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -58,12 +75,25 @@ export function sessionsDir(home: string = os.homedir()): string {
   return path.join(home, ".carrick", "sessions");
 }
 
+/** The `root -> epoch ms` entries of a record field that are numbers. */
+function stamps(raw: unknown): Record<string, number> {
+  if (typeof raw !== "object" || raw === null) return {};
+  return Object.fromEntries(
+    Object.entries(raw).filter(
+      (entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]),
+    ),
+  );
+}
+
 /** A session's record, or an empty one. Never throws. */
 export function readSession(sessionId: string, home?: string): SessionRecord {
   const empty: SessionRecord = {
     told: [],
     read: [],
     edited: {},
+    files: {},
+    stated: {},
+    covered: {},
     updated: "",
   };
   const file = sessionFile(sessionId, home);
@@ -85,11 +115,19 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       read: Array.isArray(record.read)
         ? record.read.filter((entry): entry is string => typeof entry === "string")
         : [],
-      edited: Object.fromEntries(
-        Object.entries(record.edited ?? {}).filter(
-          (entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]),
+      edited: stamps(record.edited),
+      files: Object.fromEntries(
+        Object.entries(record.files ?? {}).filter(
+          (entry): entry is [string, { root: string; at: number }] =>
+            typeof entry[1] === "object" &&
+            entry[1] !== null &&
+            typeof entry[1].root === "string" &&
+            typeof entry[1].at === "number" &&
+            Number.isFinite(entry[1].at),
         ),
       ),
+      stated: stamps(record.stated),
+      covered: stamps(record.covered),
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -233,10 +271,28 @@ export function markTold(sessionId: string, keys: string[], home?: string): void
   write(sessionId, current, home);
 }
 
-/** Remember that this session edited a file in the workspace at `root` at `at` (epoch ms). */
-export function recordEdit(sessionId: string, root: string, at: number, home?: string): void {
+/**
+ * Remember that this session edited `files` (absolute paths) in the workspace
+ * at `root` at `at` (epoch ms).
+ */
+export function recordEdit(sessionId: string, root: string, at: number, home?: string, files: string[] = []): void {
   const current = readSession(sessionId, home);
   current.edited[root] = Math.max(at, current.edited[root] ?? 0);
+  for (const file of files) {
+    current.files[file] = { root, at: Math.max(at, current.files[file]?.at ?? 0) };
+  }
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/**
+ * Remember that Stop spoke about the change in `root` up to the edit at
+ * `upTo`, and whether every file of it was answered (`covered`).
+ */
+export function markStated(sessionId: string, root: string, upTo: number, covered: boolean, home?: string): void {
+  const current = readSession(sessionId, home);
+  current.stated[root] = Math.max(upTo, current.stated[root] ?? 0);
+  if (covered) current.covered[root] = Math.max(upTo, current.covered[root] ?? 0);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

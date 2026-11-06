@@ -8,8 +8,8 @@
 // hooks print it once.
 
 import { createLogger } from "../log.ts";
-import { answersTheEdit, notRecheckedLine, renderPostToolUse } from "../render.ts";
-import { claimDelivery, finishedFor } from "./rechecks.ts";
+import { answersTheEdit, changedFailedLine, changedLines, notRecheckedLine, renderPostToolUse } from "../render.ts";
+import { claimDelivery, finishedFor, isChanged } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
 import { markTold, toldKey, wasTold } from "./reuse.ts";
@@ -18,6 +18,14 @@ const log = createLogger("carrick-late");
 
 /** The words for one finished answer, or null when there is nothing to say. */
 export function lateContext(answer: Answer, uses: boolean, settled = false): string | null {
+  // The whole-change check a Stop queued (carrick#3466): its verdict, or that
+  // it gave none. Never a clause: it is the check the clause asks for.
+  if (isChanged(answer)) {
+    if (answer.changed) return changedLines(answer.changed);
+    return changedFailedLine(
+      answer.state === "stopped" ? (answer.failure ?? "it stopped") : "the binary failed or printed no answer",
+    );
+  }
   if (!answer.result) {
     // An internal failure is logged, never shown: the reader needs the next step.
     const reason =

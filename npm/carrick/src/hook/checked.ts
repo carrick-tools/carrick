@@ -34,12 +34,18 @@ function readMarker(root: string): Marker | null {
  * stands, so the clause would only send the agent to repeat it. Exit 1 (a
  * problem to fix) and 2 (nothing checked) never count, and neither does a
  * session with no recorded edit (nothing to compare). Started rather than
- * finished: an edit made while the check ran may not have been read.
+ * finished: an edit made while the check ran may not have been read. A Stop
+ * that stated every edited file checked (`covered` in the session record)
+ * settles it the same way.
  */
 export function checkedSinceLastEdit(session: string | undefined, root: string, home?: string): boolean {
   if (!session) return false;
-  const edited = readSession(session, home).edited[root];
+  const record = readSession(session, home);
+  const edited = record.edited[root];
   if (edited === undefined) return false;
+  // The Stop hook stated that the per-file re-checks answered every file this
+  // session edited, up to its newest edit (carrick#3466): the same settlement.
+  if ((record.covered[root] ?? -1) >= edited) return true;
   const marker = readMarker(root);
   return marker !== null && marker.exit === 0 && marker.started_at_ms > edited;
 }

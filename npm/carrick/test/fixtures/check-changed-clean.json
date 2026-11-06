@@ -1,0 +1,15 @@
+{
+  "schema": "carrick.check-changed/0",
+  "workspace": "/workspace",
+  "files": 2,
+  "routes": 1,
+  "calls": 1,
+  "services": 3,
+  "repos": [{ "repo": "/workspace", "main_branch": "main", "base": "abc123", "files": ["user-service/src/routes/users.ts", "order-service/src/client.ts"], "rescan": "ran" }],
+  "problems": [],
+  "failing": 0,
+  "type_checked": 2,
+  "not_type_checked": [],
+  "outside_moved": 0,
+  "elapsed_ms": 1200
+}

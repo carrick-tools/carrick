@@ -9,6 +9,7 @@ import {
   connectedItems,
   problemItems,
   type Boundary,
+  type ChangedResult,
   type CheckItem,
   type CheckResult,
   type Counted,
@@ -363,6 +364,96 @@ export function pendingLine(file: string, service?: string | null): string {
   return `Carrick is re-checking ${file} in the background${reading}. Its answer comes with the next Carrick line, and before you finish.`;
 }
 
+/** "N services that read <subject> were judged at their indexed version (a, b, and K more)". */
+export function staleClause(stale: readonly string[], subject: string): string {
+  const names = stale.slice(0, MAX_STALE_SERVICES).join(", ");
+  const more = stale.length > MAX_STALE_SERVICES ? `, and ${stale.length - MAX_STALE_SERVICES} more` : "";
+  return stale.length === 1
+    ? `1 service that reads ${subject} was judged at its indexed version (${names})`
+    : `${stale.length} services that read ${subject} were judged at their indexed version (${names}${more})`;
+}
+
+/**
+ * The Stop hook's one line for a change whose every edited file a per-file
+ * re-check answered after its last edit (carrick#3466), worded with the
+ * clauses `headline` uses, then the problem and moved lines of `fresh`: the
+ * answers this Stop delivers (the others were printed when they landed).
+ */
+export function sessionCheckedLines(
+  results: readonly CheckResult[],
+  fresh: ReadonlyArray<{ result: CheckResult; where: string }>,
+): string {
+  const files = results.length;
+  const services = [...new Set(results.map((result) => result.service).filter((s): s is string => Boolean(s)))];
+  const problems = results.reduce((total, result) => total + problemItems(result).length, 0);
+  const unjudged = results.find((result) => (result.items ?? []).length > 0 && !judgedAnyPair(result));
+  const tail =
+    problems > 0
+      ? `${problems} contract ${problems === 1 ? "problem" : "problems"}`
+      : unjudged
+        ? `types were not checked (${notJudgedReason(unjudged)}), so no contract verdict`
+        : results.some(judgedAnyPair)
+          ? "no contract problem"
+          : `no route or call in ${files === 1 ? "it" : "them"}`;
+  const where = services.length > 0 ? ` (${services.join(", ")})` : "";
+  const lines = [`Carrick checked the ${files} ${files === 1 ? "file" : "files"} this session edited${where}: ${tail}.`];
+  for (const { result, where: file } of fresh) {
+    if (result.deleted) lines.push(deletedLine(result, file));
+    const found = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
+    for (const item of found.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, file)));
+    const hidden = found.length - Math.min(found.length, MAX_EDIT_PROBLEMS);
+    if (hidden > 0) lines.push(`- and ${hidden} more: \`carrick check ${file}\` lists them.`);
+    lines.push(...movedLines(result));
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The Stop hook's line for a change it could not state from the per-file
+ * re-checks: each file and why, and that the whole-change check is queued.
+ */
+export function notCoveredLine(gaps: ReadonlyArray<{ file: string; reason: string }>): string {
+  const named = gaps.map((gap) => `${gap.file}: ${gap.reason.trim().replace(/\.+$/, "")}`).join("; ");
+  return `Carrick did not check the whole change: ${named}. A background \`carrick check --changed\` is queued; its answer comes with the next Carrick line.`;
+}
+
+/** What a background `check --changed` answered, for the next carrier. */
+export function changedLines(changed: ChangedResult): string {
+  const head = "Carrick ran `carrick check --changed` for this session's change";
+  const files = `${changed.files} changed ${changed.files === 1 ? "file" : "files"}`;
+  if (changed.exit === 1) {
+    const failing = changed.problems.filter((problem) => problem.fails);
+    const lines = [
+      `${head}: ${changed.failing} contract ${changed.failing === 1 ? "problem" : "problems"} in ${files}.`,
+    ];
+    for (const problem of failing.slice(0, MAX_EDIT_PROBLEMS)) {
+      const at = `${problem.file}${problem.line ? `:${problem.line}` : ""}`;
+      const other = problem.other.length > 0 ? ` (against ${problem.other.join(", ")})` : "";
+      lines.push(cutLine(`- ${at} ${problem.role} ${problem.method} ${problem.path}: ${problem.reason.replace(/\.+$/, "")}${other}.`));
+    }
+    if (failing.length > MAX_EDIT_PROBLEMS) {
+      lines.push(`- and ${failing.length - MAX_EDIT_PROBLEMS} more: \`carrick check --changed\` lists them.`);
+    }
+    return lines.join("\n");
+  }
+  if (changed.exit === 0) {
+    const tail =
+      changed.routes + changed.calls === 0
+        ? `no route or call in ${files}`
+        : changed.type_checked > 0
+          ? `no contract problem in ${files}`
+          : `no contract problem found in ${files}`;
+    return `${head}: ${tail}.`;
+  }
+  const why = changed.not_checked ?? "the matched routes and calls in it had no usable type on both sides, or the index was written by another carrick version";
+  return `${head}: it could not check the change (${why.replace(/\.+$/, "")}).`;
+}
+
+/** The line for a background `check --changed` that gave no answer. */
+export function changedFailedLine(reason: string): string {
+  return `Carrick could not check the whole change: the background \`carrick check --changed\` gave no answer (${reason.replace(/\.+$/, "")}).`;
+}
+
 function deletedLine(result: CheckResult, where: string): string {
   const consumers = (result.items ?? []).reduce(
     (total, item) => total + (item.counterparts ?? []).length,
@@ -416,7 +507,7 @@ function notJudgedReason(result: CheckResult): string {
  * only when a re-check ran, and "no contract problem" only when a type pair
  * was judged and none of the verdicts is a problem.
  */
-function headline(result: CheckResult, where: string, problems: number, late = false, settled = false): string {
+function headline(result: CheckResult, where: string, problems: number, late = false): string {
   const noProblem = judgedAnyPair(result) ? "no contract problem" : null;
   const unjudged =
     (result.items ?? []).length === 0
@@ -434,9 +525,9 @@ function headline(result: CheckResult, where: string, problems: number, late = f
     // it, so a bare "no contract problem" would be a claim the check did not
     // make. Problems found still list below.
     const tail = count(" in what it re-read") ?? (noProblem ? `${noProblem} in what it re-read` : unjudged);
-    const names = stale.slice(0, MAX_STALE_SERVICES).join(", ");
-    const more = stale.length > MAX_STALE_SERVICES ? `, and ${stale.length - MAX_STALE_SERVICES} more` : "";
-    return `Carrick re-checked ${where}: ${tail}; ${stale.length} ${stale.length === 1 ? "service" : "services"} that read this edit ${stale.length === 1 ? "was" : "were"} judged at their indexed version (${names}${more}).${runClause(settled)}`;
+    // No run-the-check clause: the re-check answered, and the Stop hook
+    // queues `check --changed` for a change with a stale service (carrick#3466).
+    return `Carrick re-checked ${where}: ${tail}; ${staleClause(stale, "this edit")}.`;
   }
   return `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}: ${count("") ?? noProblem ?? unjudged}.`;
 }
@@ -477,7 +568,7 @@ export function renderPostToolUse(
     if (result.deleted) {
       lines.push(deletedLine(result, where));
     } else {
-      lines.push(headline(result, where, problems.length, options.late === true, options.settled === true));
+      lines.push(headline(result, where, problems.length, options.late === true));
     }
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);

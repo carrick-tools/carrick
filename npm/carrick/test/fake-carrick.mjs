@@ -67,6 +67,24 @@ if (exitCode !== 0) {
   process.exit(exitCode);
 }
 
+// `check --changed --json`: prints CARRICK_FAKE_CHANGED_FIXTURE (default
+// check-changed-clean.json), exits CARRICK_FAKE_CHANGED_EXIT (default 0), and
+// leaves the marker the binary writes (`record_check_marker`, changed.rs).
+if (argv.includes("--changed")) {
+  const fixture = process.env.CARRICK_FAKE_CHANGED_FIXTURE
+    ? path.resolve(process.env.CARRICK_FAKE_CHANGED_FIXTURE)
+    : path.join(here, "fixtures", "check-changed-clean.json");
+  const code = process.env.CARRICK_FAKE_CHANGED_EXIT ? Number(process.env.CARRICK_FAKE_CHANGED_EXIT) : 0;
+  const started = Date.now();
+  fs.mkdirSync(path.join(process.cwd(), ".carrick"), { recursive: true });
+  fs.writeFileSync(
+    path.join(process.cwd(), ".carrick", "last-check-changed.json"),
+    JSON.stringify({ started_at_ms: started, finished_at_ms: Date.now(), exit: code }),
+  );
+  process.stdout.write(fs.readFileSync(fixture, "utf8"));
+  process.exit(code);
+}
+
 const probe = argv.includes("--no-rescan");
 const fallbackFixture =
   probe && process.env.CARRICK_FAKE_PROBE_FIXTURE

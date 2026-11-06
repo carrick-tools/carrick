@@ -138,6 +138,8 @@ test("a re-checked edit with no problem says so in one line", () => {
   );
 });
 
+// No run-the-check clause: the per-file re-check answered, and the Stop hook
+// queues `check --changed` itself for a change it could not state (carrick#3466).
 test("a re-check that judged a service reading the edit at its indexed version never says no contract problem", () => {
   const result = rechecked();
   result.items = result.items!.filter((item) => item.verdict?.result == null || item.verdict.result === "compatible");
@@ -148,7 +150,7 @@ test("a re-check that judged a service reading the edit at its indexed version n
   };
   assert.equal(
     renderPostToolUse(result),
-    "Carrick re-checked src/routes/users.ts: no contract problem in what it re-read; 4 services that read this edit were judged at their indexed version (inventory, billing, ledger, and 1 more). If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.",
+    "Carrick re-checked src/routes/users.ts: no contract problem in what it re-read; 4 services that read this edit were judged at their indexed version (inventory, billing, ledger, and 1 more).",
   );
   // With nothing stale, the headline is the plain one.
   result.recheck.scope = { reread: ["catalog"], not_reread: [], stale: [] };
@@ -961,6 +963,9 @@ test("a check --changed that ran after the last edit drops the clause that sends
     notRecheckedLine("src/a.ts", "an earlier re-check of this repo ran past its budget", true),
     "Carrick: src/a.ts was not re-checked: an earlier re-check of this repo ran past its budget.",
   );
+  assert.match(notRecheckedLine("src/a.ts", "an earlier re-check of this repo ran past its budget"), /run `carrick check --changed` before you finish\.$/);
+  // A re-check that answered, with a service judged at its indexed version,
+  // never carries it: the Stop hook queues the check (carrick#3466).
   const result = rechecked();
   result.items = result.items!.filter((item) => item.verdict?.result == null || item.verdict.result === "compatible");
   result.recheck = {
@@ -968,6 +973,5 @@ test("a check --changed that ran after the last edit drops the clause that sends
     elapsed_ms: 900,
     scope: { reread: ["catalog"], not_reread: [], stale: ["inventory"] },
   };
-  assert.match(renderPostToolUse(result) ?? "", /If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish\.$/);
-  assert.doesNotMatch(renderPostToolUse(result, undefined, { settled: true }) ?? "", /check --changed/);
+  assert.doesNotMatch(renderPostToolUse(result) ?? "", /check --changed/);
 });
