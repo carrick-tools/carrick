@@ -7,40 +7,64 @@
 //! labels the handler a helper in a route file. The row therefore carries the
 //! handler's own span, `handler_span`, 1-based and inclusive, in the row's file.
 //!
-//! The span is read from the function index this scan already built, not from
-//! a second parse, because the question the cloud asks is about THOSE rows: the
-//! function a search returns is a `function_definitions` row, and the span that
-//! decides its role must be the same row's span. Two placements, and nothing is
-//! guessed beyond them:
+//! The span is read from the registration call itself, never from a name the
+//! scan builds. Every endpoint row joined to its call site carries that call's
+//! span in `file_results` (`call_expression_span_start`/`_end`); the call's
+//! LAST argument is the handler, because a route call passes its handler after
+//! any middleware:
 //!
-//! - **A named handler declared in the same file** (`router.get("/x", listX)`
-//!   with `function listX` in that file): the one definition in the file with
-//!   that name. Two same-named definitions in the file place nothing.
-//! - **An inline handler** (the model names it `anonymous`, or names none): the
-//!   discovery pass indexes a function literal passed to a call under a name
-//!   derived from the call (`get_users__id_handler`, see
-//!   `visitor::derive_handler_name`). The row's method and registered path give
-//!   the same name. The candidates are the definitions with that name that open
-//!   at or after the registration line and before the next registration in the
-//!   file; of those not nested inside another, the LAST is the handler, because
-//!   a route call passes its handler after any inline middleware. A handler a
-//!   later registration could own is not placed.
+//! - **A function literal** (`router.get("/x", auth, async (req, res) => …)`):
+//!   the literal's own lines. They are the lines the function index gives the
+//!   same literal, so a reader comparing a `function_definitions` row's span
+//!   with the row's `handler_span` sees the same numbers.
+//! - **An identifier** (`router.get("/x", listX)`): the one definition in the
+//!   file with that name. Two same-named definitions, or none (an imported
+//!   handler), place nothing.
+//! - Anything else (a wrapper call around the handler, an object), and a row
+//!   with no call span (a model row joined to no call site), fall back to the
+//!   name the model gave its handler, read as the identifier is. An inline
+//!   handler the model calls `anonymous` matches no definition and places
+//!   nothing.
+//!
+//! A named definition that opens above the registration line and contains it
+//! is the function the route is registered FROM (a plugin), never the handler
+//! (carrick#2824), and places nothing.
 
+use crate::agents::file_analyzer_agent::FileAnalysisResult;
 use crate::cloud_storage::CloudRepoData;
 use crate::mount_graph::HandlerSpan;
 use crate::operation::OperationKey;
 use crate::visitor::FunctionDefinition;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use swc_common::{FileName, SourceMap, Span, Spanned, errors::Handler, sync::Lrc};
+use swc_ecma_ast::{CallExpr, Expr};
+use swc_ecma_visit::{Visit, VisitWith};
 
-/// Names the file analyzer gives a handler that has no name of its own.
-const INLINE_HANDLER_NAMES: [&str; 3] = ["", "anonymous", "<anonymous>"];
+/// What a registration call hands in last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandedIn {
+    /// A function literal, at these lines.
+    Literal(HandlerSpan),
+    /// A bare identifier.
+    Named(String),
+    /// Something the span cannot be read from.
+    Other,
+}
+
+/// A call's span in SWC's numbering, as the candidate scanner records it.
+type CallSpan = (u32, u32);
 
 /// Stamp `handler_span` onto every HTTP endpoint row the payload holds: the
 /// mount graph's rows, and the top-level `endpoints[]` rows projected from
 /// them. Run after `relativize_cloud_paths`, so a row's file and a
-/// definition's file are in the same, repo-relative form. Returns how many
-/// mount-graph rows were placed.
-pub fn attach_handler_spans(data: &mut CloudRepoData) -> usize {
+/// definition's file are in the same, repo-relative form. `read` returns a
+/// file's text by its repo-relative path. Returns how many mount-graph rows
+/// were placed.
+pub fn attach_handler_spans(
+    data: &mut CloudRepoData,
+    read: impl Fn(&str) -> Option<String>,
+) -> usize {
     let mut by_file: HashMap<String, Vec<&FunctionDefinition>> = HashMap::new();
     for def in data.function_definitions.values() {
         by_file
@@ -49,18 +73,24 @@ pub fn attach_handler_spans(data: &mut CloudRepoData) -> usize {
             .push(def);
     }
 
+    let calls = registration_calls(data.file_results.as_ref());
+    let mut wanted: HashMap<&str, HashSet<CallSpan>> = HashMap::new();
+    for ((file, _, _), span) in &calls {
+        if let Some(span) = span {
+            wanted.entry(file.as_str()).or_default().insert(*span);
+        }
+    }
+    let handed_in: HashMap<String, HashMap<CallSpan, HandedIn>> = wanted
+        .into_iter()
+        .filter_map(|(file, spans)| {
+            let text = read(file)?;
+            Some((file.to_string(), last_arguments(file, text, &spans)))
+        })
+        .collect();
+
     let Some(graph) = data.mount_graph.as_mut() else {
         return 0;
     };
-
-    // Every registration line per file, so an inline handler is never handed
-    // to a registration that opens before a later one.
-    let mut registrations: HashMap<String, Vec<u32>> = HashMap::new();
-    for endpoint in &graph.endpoints {
-        if let Some((file, line)) = split_location(&endpoint.file_location) {
-            registrations.entry(file).or_default().push(line);
-        }
-    }
 
     let mut placed_rows: HashMap<(String, OperationKey, Option<String>), HandlerSpan> =
         HashMap::new();
@@ -70,18 +100,18 @@ pub fn attach_handler_spans(data: &mut CloudRepoData) -> usize {
             continue;
         };
         let defs = by_file.get(&file).map(Vec::as_slice).unwrap_or_default();
-        let lines = registrations
-            .get(&file)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let span = place(
-            defs,
-            lines,
-            line,
-            endpoint.handler.as_deref(),
-            &endpoint.method,
-            &endpoint.path,
-        );
+        let call = calls
+            .get(&(file.clone(), line, endpoint.method.to_ascii_lowercase()))
+            .copied()
+            .flatten();
+        let last = call.map(|span| {
+            handed_in
+                .get(&file)
+                .and_then(|calls| calls.get(&span))
+                .cloned()
+                .unwrap_or(HandedIn::Other)
+        });
+        let span = place(defs, line, last, endpoint.handler.as_deref());
         endpoint.handler_span = span;
         if let Some(span) = span {
             placed += 1;
@@ -113,60 +143,144 @@ pub fn attach_handler_spans(data: &mut CloudRepoData) -> usize {
     placed
 }
 
-/// The span of the handler registered at `line`, or `None` when it cannot be
-/// placed in this file.
-fn place(
-    defs: &[&FunctionDefinition],
-    registrations: &[u32],
-    line: u32,
-    handler: Option<&str>,
-    method: &str,
-    path: &str,
-) -> Option<HandlerSpan> {
-    let handler = handler.map(str::trim).unwrap_or_default();
-    if !INLINE_HANDLER_NAMES.contains(&handler) {
-        let mut named = defs.iter().filter(|def| def.name == handler);
-        let def = named.next()?;
-        if named.next().is_some() {
-            return None;
-        }
-        // A route is never registered from inside its own handler, so a named
-        // definition that opens above the registration line and contains it is
-        // the function the route is registered FROM (a plugin), not the
-        // handler: read the row as inline (carrick#2824).
-        if !(def.line_number < line && line <= def.end_line) {
-            return span_of(def);
+/// The call span each endpoint row was joined to, keyed by the row's file,
+/// line and lower-cased method (the mount graph's row is
+/// `file:line_number` of the same result). Two results at one key with
+/// different spans read as `None`: which call the graph row is cannot be told.
+fn registration_calls(
+    file_results: Option<&HashMap<String, FileAnalysisResult>>,
+) -> HashMap<(String, u32, String), Option<CallSpan>> {
+    let mut calls: HashMap<(String, u32, String), Option<CallSpan>> = HashMap::new();
+    for (file, result) in file_results.into_iter().flatten() {
+        for endpoint in &result.endpoints {
+            let (Some(start), Some(end), Ok(line)) = (
+                endpoint.call_expression_span_start,
+                endpoint.call_expression_span_end,
+                u32::try_from(endpoint.line_number),
+            ) else {
+                continue;
+            };
+            // The graph row's method is this one trimmed and upper-cased
+            // (`FileOrchestrator`'s mount-graph build), its location
+            // `<this key>:<line_number>`.
+            let key = (
+                normalize(file),
+                line,
+                endpoint.method.trim().to_ascii_lowercase(),
+            );
+            calls
+                .entry(key)
+                .and_modify(|held| {
+                    if *held != Some((start, end)) {
+                        *held = None;
+                    }
+                })
+                .or_insert(Some((start, end)));
         }
     }
+    calls
+}
 
-    let derived = crate::visitor::derive_handler_name(&method.to_lowercase(), Some(path));
-    let next_registration = registrations
-        .iter()
-        .copied()
-        .filter(|other| *other > line)
-        .min()
-        .unwrap_or(u32::MAX);
-    let candidates: Vec<&FunctionDefinition> = defs
-        .iter()
-        .copied()
-        .filter(|def| {
-            def.name == derived && def.line_number >= line && def.line_number < next_registration
-        })
-        .collect();
-    let outermost = candidates.iter().filter(|def| {
-        !candidates.iter().any(|outer| {
-            !std::ptr::eq(**def, *outer)
-                && outer.line_number <= def.line_number
-                && def.end_line <= outer.end_line
-                && (outer.line_number, outer.end_line) != (def.line_number, def.end_line)
-        })
-    });
-    let def = outermost.max_by_key(|def| def.line_number)?;
+/// What each call at `spans` hands in last, read from the file's text parsed
+/// on a fresh source map: the numbering the candidate scanner recorded the
+/// spans in (`swc_scanner::SWC_SPAN_BASE`).
+fn last_arguments(
+    file: &str,
+    text: String,
+    spans: &HashSet<CallSpan>,
+) -> HashMap<CallSpan, HandedIn> {
+    let source_map: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_emitter_writer(Box::new(std::io::sink()), None);
+    let path = Path::new(file);
+    let Some(module) = crate::parser::parse_source(
+        path,
+        FileName::Real(path.to_path_buf()),
+        text,
+        &source_map,
+        &handler,
+        None,
+    ) else {
+        return HashMap::new();
+    };
+    let mut reader = LastArguments {
+        source_map: &source_map,
+        spans,
+        found: HashMap::new(),
+    };
+    module.visit_with(&mut reader);
+    reader.found
+}
+
+struct LastArguments<'a> {
+    source_map: &'a SourceMap,
+    spans: &'a HashSet<CallSpan>,
+    found: HashMap<CallSpan, HandedIn>,
+}
+
+impl LastArguments<'_> {
+    fn lines(&self, span: Span) -> HandlerSpan {
+        HandlerSpan {
+            start_line: self.source_map.lookup_char_pos(span.lo).line as u32,
+            end_line: self.source_map.lookup_char_pos(span.hi).line as u32,
+        }
+    }
+}
+
+impl Visit for LastArguments<'_> {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        let key = (call.span.lo.0, call.span.hi.0);
+        if self.spans.contains(&key) {
+            let last = call.args.last().filter(|arg| arg.spread.is_none());
+            let handed_in = match last
+                .map(|arg| crate::graphql_document_sites::unwrap_expression(&arg.expr))
+            {
+                Some(Expr::Arrow(arrow)) => HandedIn::Literal(self.lines(arrow.span)),
+                Some(Expr::Fn(function)) => HandedIn::Literal(self.lines(function.function.span())),
+                Some(Expr::Ident(ident)) => HandedIn::Named(ident.sym.to_string()),
+                _ => HandedIn::Other,
+            };
+            self.found.insert(key, handed_in);
+        }
+        call.visit_children_with(self);
+    }
+}
+
+/// The span of the handler registered at `line`, or `None` when it cannot be
+/// placed in this file. `last` is what the registration call hands in last,
+/// `None` when the row was joined to no call; `handler` is the model's name,
+/// read only when the call states no literal and no identifier.
+fn place(
+    defs: &[&FunctionDefinition],
+    line: u32,
+    last: Option<HandedIn>,
+    handler: Option<&str>,
+) -> Option<HandlerSpan> {
+    let name = match last {
+        Some(HandedIn::Literal(span)) => return valid(span),
+        Some(HandedIn::Named(name)) => name,
+        Some(HandedIn::Other) | None => handler.map(str::trim).unwrap_or_default().to_string(),
+    };
+    let mut named = defs.iter().filter(|def| def.name == name);
+    let def = named.next()?;
+    if named.next().is_some() {
+        return None;
+    }
+    // A route is never registered from inside its own handler, so a named
+    // definition that opens above the registration line and contains it is
+    // the function the route is registered FROM (a plugin), not the handler
+    // (carrick#2824).
+    if def.line_number < line && line <= def.end_line {
+        return None;
+    }
     span_of(def)
 }
 
+fn valid(span: HandlerSpan) -> Option<HandlerSpan> {
+    (span.start_line > 0 && span.end_line >= span.start_line).then_some(span)
+}
+
 fn span_of(def: &FunctionDefinition) -> Option<HandlerSpan> {
-    (def.line_number > 0 && def.end_line >= def.line_number).then_some(HandlerSpan {
+    valid(HandlerSpan {
         start_line: def.line_number,
         end_line: def.end_line,
     })
@@ -298,6 +412,51 @@ mod tests {
             .collect()
     }
 
+    /// The source a test reads: one file, `file`, holding `text`.
+    fn reader(file: &'static str, text: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |asked: &str| (asked == file).then(|| text.to_string())
+    }
+
+    /// Join each row to the call the candidate scanner records at its line,
+    /// as the model-row join does: `file_results` carries the call's span.
+    fn join_calls(data: &mut CloudRepoData, file: &str, text: &str) {
+        let candidates = crate::swc_scanner::SwcScanner::new()
+            .scan_content(Path::new(file), text, &[], &[])
+            .candidates;
+        let rows = data.mount_graph.as_ref().unwrap().endpoints.clone();
+        let endpoints = rows
+            .iter()
+            .filter_map(|row| {
+                let (_, line) = split_location(&row.file_location)?;
+                let call = candidates
+                    .iter()
+                    .find(|c| c.line_number as u32 == line)
+                    .unwrap_or_else(|| panic!("no candidate at line {line}"));
+                Some(
+                    serde_json::from_value(serde_json::json!({
+                        "candidate_id": call.candidate_id,
+                        "line_number": line,
+                        "owner_node": row.owner,
+                        "method": row.method,
+                        "path": row.path,
+                        "handler_name": row.handler,
+                        "pattern_matched": "",
+                        "call_expression_span_start": call.span_start,
+                        "call_expression_span_end": call.span_end,
+                    }))
+                    .unwrap(),
+                )
+            })
+            .collect();
+        data.file_results = Some(HashMap::from([(
+            file.to_string(),
+            FileAnalysisResult {
+                endpoints,
+                ..Default::default()
+            },
+        )]));
+    }
+
     const fn span(start_line: u32, end_line: u32) -> Option<HandlerSpan> {
         Some(HandlerSpan {
             start_line,
@@ -305,29 +464,63 @@ mod tests {
         })
     }
 
-    /// The audit's shape: `router.get(` opens at 10, validators run to 13, and
-    /// the arrow the discovery pass indexed as `get_invoices__id_matches_handler`
-    /// spans 14-30. The row carries the arrow's span, on both row lists.
+    /// The audit's shape: `router.get(` opens at 1, validators run to 4, and
+    /// the arrow handed in last spans 5-7. The row carries the arrow's span,
+    /// on both row lists.
     #[test]
     fn an_inline_handler_behind_a_validator_chain_carries_the_literal_span() {
+        const FILE: &str = "src/routes/invoices.ts";
+        const TEXT: &str = "router.get(\n  \"/invoices/:id/matches\",\n  param(\"id\").isUUID(),\n  validate,\n  async (req, res) => {\n    res.json(await matches(req.params.id));\n  },\n);\n";
         let mut data = payload(
-            vec![def(
-                "get_invoices__id_matches_handler",
-                "src/routes/invoices.ts",
-                14,
-                30,
-            )],
+            vec![def("get_invoices__id_matches_handler", FILE, 5, 7)],
             vec![row(
                 "GET",
                 "/invoices/:id/matches",
                 "anonymous",
-                "src/routes/invoices.ts:10",
+                &format!("{FILE}:1"),
             )],
         );
+        join_calls(&mut data, FILE, TEXT);
 
-        assert_eq!(attach_handler_spans(&mut data), 1);
-        assert_eq!(spans(&data), vec![span(14, 30)]);
-        assert_eq!(data.endpoints[0].handler_span, span(14, 30));
+        assert_eq!(attach_handler_spans(&mut data, reader(FILE, TEXT)), 1);
+        assert_eq!(spans(&data), vec![span(5, 7)]);
+        assert_eq!(data.endpoints[0].handler_span, span(5, 7));
+    }
+
+    /// N32-a: the model names an inline handler `"handler"`, a name nothing in
+    /// the file declares, and two inline middlewares open before it. The
+    /// function index holds only the first literal under the name it builds
+    /// from the route (`visitor::derive_handler_name` indexes one literal per
+    /// built name), so neither the model's name nor the built one reaches the
+    /// handler. The registration call's last argument does.
+    #[test]
+    fn an_inline_handler_behind_inline_middlewares_is_placed_from_the_call() {
+        const FILE: &str = "src/orders.ts";
+        const TEXT: &str = "router.post(\n  \"/orders\",\n  (req, res, next) => next(),\n  (req, res, next) => {\n    next();\n  },\n  async (req, res) => {\n    res.status(201).json(await create(req.body));\n  },\n);\n";
+        let mut data = payload(
+            vec![def("post_orders_handler", FILE, 3, 3)],
+            vec![row("POST", "/orders", "handler", &format!("{FILE}:1"))],
+        );
+        join_calls(&mut data, FILE, TEXT);
+
+        assert_eq!(attach_handler_spans(&mut data, reader(FILE, TEXT)), 1);
+        assert_eq!(spans(&data), vec![span(7, 9)]);
+    }
+
+    /// A call that hands in an identifier is placed at the one definition of
+    /// that name in the file, whatever the model called the handler.
+    #[test]
+    fn an_identifier_handed_in_last_is_placed_by_its_own_name() {
+        const FILE: &str = "src/orders.ts";
+        const TEXT: &str = "router.get(\"/orders\", requireAuth, listOrders);\n\nfunction listOrders(req, res) {\n  res.json([]);\n}\n";
+        let mut data = payload(
+            vec![def("listOrders", FILE, 3, 5)],
+            vec![row("GET", "/orders", "anonymous", &format!("{FILE}:1"))],
+        );
+        join_calls(&mut data, FILE, TEXT);
+
+        attach_handler_spans(&mut data, reader(FILE, TEXT));
+        assert_eq!(spans(&data), vec![span(3, 5)]);
     }
 
     /// A named handler declared in the same file is placed by name, wherever
@@ -348,35 +541,31 @@ mod tests {
             ],
         );
 
-        attach_handler_spans(&mut data);
+        attach_handler_spans(&mut data, |_: &str| None);
         assert_eq!(spans(&data), vec![span(40, 52), None, None]);
     }
 
     /// The plugin function the routes are registered from names every row, but
-    /// its definition encloses each registration: the row is placed as inline.
+    /// its definition encloses each registration: each row is placed at the
+    /// literal its own call hands in.
     #[test]
     fn a_named_handler_that_encloses_its_registration_is_read_as_inline() {
-        let get_a = crate::visitor::derive_handler_name("get", Some("/trend/a"));
-        let get_c = crate::visitor::derive_handler_name("get", Some("/trend/c/:id"));
+        const FILE: &str = "src/routes/report.ts";
+        const TEXT: &str = "export async function reportRoutes(app) {\n  app.get(\"/trend/a\", async () => {\n    return a();\n  });\n  app.get(\"/trend/c/:id\", async (req) => {\n    return c(req.params.id);\n  });\n}\n";
         let mut data = payload(
             vec![
-                def("reportRoutes", "src/routes/report.ts", 11, 43),
-                def(&get_a, "src/routes/report.ts", 12, 15),
-                def(&get_c, "src/routes/report.ts", 22, 25),
+                def("reportRoutes", FILE, 1, 8),
+                def("get_trend_a_handler", FILE, 2, 4),
             ],
             vec![
-                row("GET", "/trend/a", "reportRoutes", "src/routes/report.ts:12"),
-                row(
-                    "GET",
-                    "/trend/c/:id",
-                    "reportRoutes",
-                    "src/routes/report.ts:22",
-                ),
+                row("GET", "/trend/a", "reportRoutes", &format!("{FILE}:2")),
+                row("GET", "/trend/c/:id", "reportRoutes", &format!("{FILE}:5")),
             ],
         );
+        join_calls(&mut data, FILE, TEXT);
 
-        attach_handler_spans(&mut data);
-        assert_eq!(spans(&data), vec![span(12, 15), span(22, 25)]);
+        attach_handler_spans(&mut data, reader(FILE, TEXT));
+        assert_eq!(spans(&data), vec![span(2, 4), span(5, 7)]);
     }
 
     /// An enclosing named handler with no inline definition indexed places
@@ -393,42 +582,37 @@ mod tests {
             )],
         );
 
-        attach_handler_spans(&mut data);
+        attach_handler_spans(&mut data, |_: &str| None);
         assert_eq!(spans(&data), vec![None]);
     }
 
     /// A route call that passes an inline middleware before its inline handler
-    /// has both indexed under the derived name; the handler is the last.
+    /// on one line: the handler is the last literal.
     #[test]
     fn the_last_inline_literal_of_a_registration_is_the_handler() {
+        const FILE: &str = "src/orders.ts";
+        const TEXT: &str = "app.post(\"/orders\", (req, res, next) => next(), (req, res) => {\n  res.sendStatus(201);\n});\n";
         let mut data = payload(
-            vec![
-                def("post_orders_handler", "src/orders.ts", 4, 6),
-                def("post_orders_handler", "src/orders.ts", 7, 12),
-            ],
-            vec![row("POST", "/orders", "anonymous", "src/orders.ts:3")],
+            vec![def("post_orders_handler", FILE, 1, 1)],
+            vec![row("POST", "/orders", "anonymous", &format!("{FILE}:1"))],
         );
+        join_calls(&mut data, FILE, TEXT);
 
-        attach_handler_spans(&mut data);
-        assert_eq!(spans(&data), vec![span(7, 12)]);
+        attach_handler_spans(&mut data, reader(FILE, TEXT));
+        assert_eq!(spans(&data), vec![span(1, 3)]);
     }
 
-    /// An inline handler is never handed to a registration that opens before a
-    /// later registration, and a derived-name definition that opens BEFORE the
-    /// row belongs to an earlier call.
+    /// A row joined to no call places no inline handler: the name the scan
+    /// builds from the method and path (`get_health_handler`) is never read.
     #[test]
-    fn an_inline_handler_a_later_registration_could_own_is_not_placed() {
+    fn a_row_joined_to_no_call_is_not_placed_by_a_built_name() {
         let mut data = payload(
-            vec![def("get_health_handler", "src/app.ts", 8, 9)],
-            vec![
-                row("GET", "/health", "anonymous", "src/app.ts:2"),
-                row("POST", "/other", "anonymous", "src/app.ts:5"),
-                row("GET", "/health", "", "src/app.ts:12"),
-            ],
+            vec![def("get_health_handler", "src/app.ts", 3, 5)],
+            vec![row("GET", "/health", "anonymous", "src/app.ts:2")],
         );
 
-        attach_handler_spans(&mut data);
-        assert_eq!(spans(&data), vec![None, None, None]);
+        attach_handler_spans(&mut data, |_: &str| None);
+        assert_eq!(spans(&data), vec![None]);
     }
 
     /// Wire spelling on both structs, and the field is absent, not null, on a
