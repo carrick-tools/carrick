@@ -15,8 +15,7 @@ default version `1`. Its controllers:
 | `health.controller.ts` | controller `version: VERSION_NEUTRAL` | `/status/health` |
 | `decoy.controller.ts` | class decorator from another module | no row |
 
-`storefront` calls each route through an undeclared environment base (an
-expected find, so nothing is declared) and makes two calls nothing serves:
+`storefront` calls each route by its path and makes two calls nothing serves:
 `GET /v1/orders` and `GET /widgets`.
 
 The model is silent for every file (`__llm__/`), so every producer row is the

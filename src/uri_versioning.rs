@@ -11,8 +11,20 @@
 //! Every name below is gated by the decorator pass's own same-origin rule: it
 //! must be imported from the module the service's verb decorators come from.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+use swc_ecma_ast::*;
+use swc_ecma_visit::{Visit, VisitWith};
+
+use crate::swc_scanner::{
+    collect_import_locals, decorator_call, literal_string, parse_standalone_module, unwrap_expr,
+};
+
+/// The framework's name for "this route has no version segment".
+const NEUTRAL_VERSION: &str = "VERSION_NEUTRAL";
+/// The framework's default prefix for a URI version segment.
+const DEFAULT_PREFIX: &str = "v";
 
 /// What a version expression states, before the module it came from is known
 /// to be the verbs' own.
@@ -87,24 +99,270 @@ pub struct Resolution {
     pub prefix_unread_lead: usize,
 }
 
-/// The URI versioning statements in one file.
-pub fn app_versioning(_file_path: &Path, _content: &str) -> Vec<AppVersioning> {
-    Vec::new()
+impl RawVersion {
+    /// The statement as a route's own, once the module the neutral identifier
+    /// came from is checked against the module the route's verb came from.
+    pub fn for_origin(&self, verb_origin: &str) -> RouteVersion {
+        match self {
+            Self::Absent => RouteVersion::Inherit,
+            Self::Literal(text) => RouteVersion::Literal(text.clone()),
+            Self::Neutral { origin } if origin == verb_origin => RouteVersion::Neutral,
+            Self::Neutral { .. } | Self::Unread => RouteVersion::Unread,
+        }
+    }
 }
 
-/// The statements of a service, reduced to the one it states.
-pub fn resolve(_statements: &[AppVersioning], _verb_origins: &HashSet<String>) -> Resolution {
-    Resolution::default()
+/// What a version expression states: a string, the imported neutral
+/// identifier, or something the scan cannot read.
+fn read_version(expr: &Expr, imports: &HashMap<String, String>) -> RawVersion {
+    let expr = unwrap_expr(expr);
+    if let Some(text) = literal_string(expr) {
+        return RawVersion::Literal(text);
+    }
+    if let Expr::Ident(ident) = expr
+        && &*ident.sym == NEUTRAL_VERSION
+        && let Some(origin) = imports.get(&ident.sym.to_string())
+    {
+        return RawVersion::Neutral {
+            origin: origin.clone(),
+        };
+    }
+    RawVersion::Unread
+}
+
+/// The value of the property `name` in an object literal, `Err(())` when a
+/// spread, a computed key or a shorthand of that name hides it.
+fn object_property<'a>(object: &'a ObjectLit, name: &str) -> Result<Option<&'a Expr>, ()> {
+    let mut found = None;
+    for prop in &object.props {
+        let PropOrSpread::Prop(prop) = prop else {
+            return Err(());
+        };
+        match &**prop {
+            Prop::KeyValue(kv) => match &kv.key {
+                PropName::Ident(id) if &*id.sym == name => found = Some(&*kv.value),
+                PropName::Str(s) if s.value.to_string_lossy() == name => found = Some(&*kv.value),
+                PropName::Computed(_) => return Err(()),
+                _ => {}
+            },
+            Prop::Shorthand(id) if &*id.sym == name => return Err(()),
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+/// The `version` a controller decorator's object argument states. The string
+/// form states none.
+pub(crate) fn controller_version(
+    arg: &ExprOrSpread,
+    imports: &HashMap<String, String>,
+) -> RawVersion {
+    let Expr::Object(object) = unwrap_expr(&arg.expr) else {
+        return RawVersion::Absent;
+    };
+    match object_property(object, "version") {
+        Ok(None) => RawVersion::Absent,
+        Ok(Some(value)) => read_version(value, imports),
+        Err(()) => RawVersion::Unread,
+    }
+}
+
+/// The version a handler states with `@Version(...)`, when that decorator
+/// comes from the module its verb decorator came from.
+pub(crate) fn handler_version(
+    decorators: &[Decorator],
+    imports: &HashMap<String, String>,
+    verb_origin: &str,
+    origin_of: impl Fn(&str) -> String,
+) -> RawVersion {
+    for decorator in decorators {
+        let Some((name, args)) = decorator_call(decorator) else {
+            continue;
+        };
+        if name != "Version" || origin_of(&name) != verb_origin {
+            continue;
+        }
+        return match args {
+            [arg] if arg.spread.is_none() => read_version(&arg.expr, imports),
+            _ => RawVersion::Unread,
+        };
+    }
+    RawVersion::Absent
+}
+
+/// What `prefix` states: `false`, a string, a template whose unread pieces all
+/// come before its literal tail (carrick#3422, D2), or nothing readable.
+fn read_prefix(expr: &Expr) -> VersionPrefix {
+    let expr = unwrap_expr(expr);
+    if matches!(expr, Expr::Lit(Lit::Bool(flag)) if !flag.value) {
+        return VersionPrefix::NoPrefix;
+    }
+    if let Some(text) = literal_string(expr) {
+        return VersionPrefix::Literal(text);
+    }
+    if let Expr::Tpl(tpl) = expr {
+        let tail = tpl
+            .quasis
+            .last()
+            .and_then(|quasi| quasi.cooked.as_ref())
+            .map(|cooked| cooked.to_string_lossy().into_owned())
+            .filter(|tail| !tail.is_empty());
+        if let Some(tail) = tail {
+            return VersionPrefix::UnreadLead(tail);
+        }
+    }
+    VersionPrefix::Unread
+}
+
+struct VersioningVisitor {
+    imports: HashMap<String, String>,
+    found: Vec<AppVersioning>,
+}
+
+impl VersioningVisitor {
+    fn statement(&self, call: &CallExpr) -> Option<AppVersioning> {
+        let Callee::Expr(callee) = &call.callee else {
+            return None;
+        };
+        let Expr::Member(member) = unwrap_expr(callee) else {
+            return None;
+        };
+        if !matches!(&member.prop, MemberProp::Ident(id) if &*id.sym == "enableVersioning") {
+            return None;
+        }
+        let [arg] = call.args.as_slice() else {
+            return None;
+        };
+        let Expr::Object(options) = unwrap_expr(&arg.expr) else {
+            return None;
+        };
+        // `type: <V>.URI`, with `V` an import; any other type states nothing.
+        let Ok(Some(kind)) = object_property(options, "type") else {
+            return None;
+        };
+        let Expr::Member(kind) = unwrap_expr(kind) else {
+            return None;
+        };
+        if !matches!(&kind.prop, MemberProp::Ident(id) if &*id.sym == "URI") {
+            return None;
+        }
+        let Expr::Ident(owner) = unwrap_expr(&kind.obj) else {
+            return None;
+        };
+        let type_origin = self.imports.get(&owner.sym.to_string())?.clone();
+        let default_version = match object_property(options, "defaultVersion") {
+            Ok(None) => RawVersion::Absent,
+            Ok(Some(value)) => read_version(value, &self.imports),
+            Err(()) => RawVersion::Unread,
+        };
+        let prefix = match object_property(options, "prefix") {
+            Ok(None) => VersionPrefix::Default,
+            Ok(Some(value)) => read_prefix(value),
+            Err(()) => VersionPrefix::Unread,
+        };
+        Some(AppVersioning {
+            type_origin,
+            default_version,
+            prefix,
+        })
+    }
+}
+
+impl Visit for VersioningVisitor {
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        node.visit_children_with(self);
+        if let Some(statement) = self.statement(node) {
+            self.found.push(statement);
+        }
+    }
+}
+
+/// The URI versioning statements in one file.
+pub fn app_versioning(file_path: &Path, content: &str) -> Vec<AppVersioning> {
+    if !content.contains("enableVersioning") {
+        return Vec::new();
+    }
+    let Some((_, module)) = parse_standalone_module(file_path, content) else {
+        return Vec::new();
+    };
+    let mut visitor = VersioningVisitor {
+        imports: collect_import_locals(&module),
+        found: Vec::new(),
+    };
+    module.visit_with(&mut visitor);
+    visitor.found
+}
+
+/// The statements of a service, reduced to the one it states. A statement
+/// counts only when its `type` comes from a module the service's verb
+/// decorators come from; two that differ state nothing.
+pub fn resolve(statements: &[AppVersioning], verb_origins: &HashSet<String>) -> Resolution {
+    let mut distinct: Vec<&AppVersioning> = Vec::new();
+    for statement in statements
+        .iter()
+        .filter(|statement| verb_origins.contains(&statement.type_origin))
+    {
+        if !distinct.contains(&statement) {
+            distinct.push(statement);
+        }
+    }
+    let mut resolution = Resolution::default();
+    let statement = match distinct.as_slice() {
+        [] => return resolution,
+        [one] => *one,
+        _ => {
+            resolution.conflicts = 1;
+            return resolution;
+        }
+    };
+    let prefix = match &statement.prefix {
+        VersionPrefix::Default => DEFAULT_PREFIX.to_string(),
+        VersionPrefix::NoPrefix => String::new(),
+        VersionPrefix::Literal(text) => text.clone(),
+        VersionPrefix::UnreadLead(tail) => {
+            resolution.prefix_unread_lead = 1;
+            tail.clone()
+        }
+        VersionPrefix::Unread => {
+            resolution.prefix_unread = 1;
+            return resolution;
+        }
+    };
+    let default_version = match &statement.default_version {
+        RawVersion::Absent => DefaultVersion::None,
+        RawVersion::Literal(text) => DefaultVersion::Literal(text.clone()),
+        RawVersion::Neutral { origin } if verb_origins.contains(origin) => DefaultVersion::None,
+        RawVersion::Neutral { .. } | RawVersion::Unread => DefaultVersion::Unread,
+    };
+    resolution.versioning = Some(ServiceVersioning {
+        default_version,
+        prefix,
+    });
+    resolution
 }
 
 /// The path a route is served under, and whether its version was stated but
-/// unread.
+/// unread (the path is then left as it was).
 pub fn versioned_path(
-    _service: &ServiceVersioning,
-    _version: &RouteVersion,
+    service: &ServiceVersioning,
+    version: &RouteVersion,
     path: &str,
 ) -> (String, bool) {
-    (path.to_string(), false)
+    let stated = match (version, &service.default_version) {
+        (RouteVersion::Literal(text), _) => Some(text),
+        (RouteVersion::Neutral, _) => None,
+        (RouteVersion::Unread, _) | (RouteVersion::Inherit, DefaultVersion::Unread) => {
+            return (path.to_string(), true);
+        }
+        (RouteVersion::Inherit, DefaultVersion::Literal(text)) => Some(text),
+        (RouteVersion::Inherit, DefaultVersion::None) => None,
+    };
+    match stated {
+        None => (path.to_string(), false),
+        Some(version) if path == "/" => (format!("/{}{version}", service.prefix), false),
+        Some(version) => (format!("/{}{version}{path}", service.prefix), false),
+    }
 }
 
 #[cfg(test)]
