@@ -1,4 +1,4 @@
-// The "Carrick check" section `carrick init` keeps in a folder's AGENTS.md
+// The Carrick rules section `carrick init` keeps in a folder's AGENTS.md
 // (carrick#2828), so an agent in Codex or Claude Code runs the local check
 // before it says a change is done.
 //
@@ -13,21 +13,70 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { writeIfChanged } from "./files.ts";
+import { scopeArgument, type SkillScope } from "./task-skills.ts";
 
 export const AGENTS_FILE = "AGENTS.md";
 
 const START = "<!-- carrick:check start -->";
 const END = "<!-- carrick:check end -->";
 
-/** The section as written, markers included. Ends in one newline. */
-export const CHECK_SECTION = [
-  START,
-  "## Carrick check",
-  "",
-  "When your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you say it is done. The per-edit check covers only the file each edit touched; `check --changed` checks every changed file on this branch against the other services. Then tell the user in one line what Carrick checked and found (for example \"Carrick checked 3 changed files against 35 services: no contract problems\"). If it exits non-zero, fix what it reports, or say why it is wrong. When you added functions, use the carrick-reuse skill on them.",
-  END,
-  "",
-].join("\n");
+/** What init knows of the workspace when it writes the section. */
+export type WorkspaceCounts = { repos: number; services: number };
+
+/** "three repositories, 43 services" as the section says it; null where init has no count to give. */
+function countsPhrase(counts: WorkspaceCounts | null): string | null {
+  if (counts === null || counts.repos < 1 || counts.services < 1) return null;
+  const repos = counts.repos === 1 ? "one repository" : `${counts.repos} repositories`;
+  const services = counts.services === 1 ? "1 service" : `${counts.services} services`;
+  return `${repos}, ${services}`;
+}
+
+/**
+ * The section as written, markers included. Ends in one newline.
+ *
+ * The words are the rules block measured in carrick-cloud#2991 (21 graded runs
+ * per arm on one build: reused 17/21 against 5/21). Only the counts and the
+ * scope clause vary; edit nothing else without a new measurement.
+ */
+export function renderCheckSection(scope: SkillScope, counts: WorkspaceCounts | null): string {
+  const phrase = countsPhrase(counts);
+  const indexed = phrase === null ? "This workspace is indexed by Carrick." : `This workspace (${phrase}) is indexed by Carrick.`;
+  return [
+    START,
+    "## Carrick: use it while you work, not only at the end",
+    "",
+    `${indexed} The`,
+    "`mcp__carrick__*` tools answer questions about code outside the file you are",
+    "editing more completely than grep: across every service and every protocol",
+    "(HTTP routes, socket events, pub/sub topics), including callers reached through",
+    "SDKs, wrappers, client instances and untyped helpers that share no searchable",
+    `name with what you changed. Pass \`${scopeArgument(scope)}\` on every Carrick`,
+    "call.",
+    "",
+    "1. Before you write a new function, helper or utility, call `search_by_intent`",
+    "   (or `find_similar`) with a plain-English description of what it does. If",
+    "   something in any package already does the job, or most of it, import it and",
+    "   call it instead of writing your own. When the task names a new function or",
+    "   file, still create it, but make its body call the existing function and add",
+    "   only what the existing one lacks. Never leave a second copy of logic that",
+    "   already exists.",
+    "2. Before you change a route, a request or response shape, an event payload or",
+    "   an exported function, call `get_operation` (method and path, or the event or",
+    "   topic name) or `get_callers`, and update or explicitly clear every consumer",
+    "   it lists, in every repository.",
+    "3. Before you write code that calls another service's endpoint or handles its",
+    "   event, call `get_endpoint_types` (or `get_contract_pair`) and use the real",
+    "   request and response types it returns. Never take a shape from the ticket, a",
+    "   similar endpoint or another API version, or a local copy of a type.",
+    "4. Use grep and Read to confirm and to read code once Carrick has told you",
+    "   where to look.",
+    "5. After you edit a file, run `carrick check <file>` on that one file (one",
+    "   file per call). In your final summary,",
+    "   say what Carrick found and what you changed because of it.",
+    END,
+    "",
+  ].join("\n");
+}
 
 /** The span of our section in a body, end included; null where there is none. */
 function span(body: string): { from: number; to: number } | null {
@@ -40,12 +89,12 @@ function span(body: string): { from: number; to: number } | null {
 }
 
 /** The body with our section written in: replaced where it is, appended where it is not. */
-export function withCheckSection(existing: string | null): string {
-  if (existing === null || existing.trim() === "") return CHECK_SECTION;
+export function withCheckSection(existing: string | null, section: string): string {
+  if (existing === null || existing.trim() === "") return section;
   const found = span(existing);
-  if (found !== null) return existing.slice(0, found.from) + CHECK_SECTION + existing.slice(found.to);
+  if (found !== null) return existing.slice(0, found.from) + section + existing.slice(found.to);
   const lf = existing.endsWith("\n") ? existing : `${existing}\n`;
-  return `${lf}\n${CHECK_SECTION}`;
+  return `${lf}\n${section}`;
 }
 
 /** The body with our section taken out; `empty` where nothing else was in it. */
@@ -61,10 +110,14 @@ export function withoutCheckSection(existing: string): { body: string; changed: 
 }
 
 /** Write our section into the folder's AGENTS.md. */
-export function writeAgentsSection(workspace: string): "written" | "unchanged" {
+export function writeAgentsSection(
+  workspace: string,
+  scope: SkillScope,
+  counts: WorkspaceCounts | null,
+): "written" | "unchanged" {
   const target = path.join(workspace, AGENTS_FILE);
   const existing = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null;
-  return writeIfChanged(target, withCheckSection(existing));
+  return writeIfChanged(target, withCheckSection(existing, renderCheckSection(scope, counts)));
 }
 
 /** True where the folder's AGENTS.md holds our section. */

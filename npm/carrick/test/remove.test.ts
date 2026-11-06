@@ -707,7 +707,7 @@ test("the folder plan lists our AGENTS.md check section, and a file without it l
   try {
     fs.writeFileSync(path.join(dir, "AGENTS.md"), "# Repo\n\n## Carrick check\n\nMine, no markers.\n");
     assert.equal(folderPlan(dir).agents, false);
-    writeAgentsSection(dir);
+    writeAgentsSection(dir, { slug: "shop-system" }, { repos: 1, services: 1 });
     const plan = folderPlan(dir);
     assert.equal(plan.agents, true);
     assert.ok(folderLines(plan).includes('The "Carrick check" section in AGENTS.md'));

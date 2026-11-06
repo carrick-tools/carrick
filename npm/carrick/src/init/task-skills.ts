@@ -145,7 +145,7 @@ export function skillState(existing: string | null): SkillState {
 /** How a call names the project on every Carrick tool call in a body. */
 export type SkillScope = { slug: string | null };
 
-function scopeArgument(scope: SkillScope): string {
+export function scopeArgument(scope: SkillScope): string {
   return scope.slug === null ? 'repo: "<owner/repo>"' : `project: "${scope.slug}"`;
 }
 
