@@ -6087,6 +6087,114 @@ fn a_route_rename_names_the_callers_it_strands() {
     assert_eq!(stranded["before"], serde_json::json!("matched"));
 }
 
+/// The shop gains a call to a route nobody serves, committed with the fixture
+/// so it is not a change since the index. The index is then rewritten to hold
+/// a pairing the fresh read does not produce: the call matched to the widgets
+/// route, a file nothing has touched (carrick#3411).
+fn shop_whose_index_pairs_a_gadgets_call_with_an_untouched_route() -> tempfile::TempDir {
+    let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
+        let client = repo.join("inventory/src/client.ts");
+        edit(
+            &client,
+            "  readWidget(widgetId: string)",
+            "  readGadget(gadgetId: string): Promise<Widget> {\n    return send<Widget>(`${this.baseUrl}/api/v1/gadgets/${gadgetId}`, {\n      method: \"GET\",\n    });\n  }\n\n  readWidget(widgetId: string)",
+        );
+        let caller = repo.join("inventory/src/inventory.ts");
+        let mut text = std::fs::read_to_string(&caller).expect("read the caller");
+        text.push_str(
+            "\nexport async function gadgetName(\n  gadgetId: string,\n  client: CatalogClient\n): Promise<string> {\n  const gadget = await client.readGadget(gadgetId);\n  return gadget.name;\n}\n",
+        );
+        std::fs::write(&caller, text).expect("write the caller");
+    });
+    let root = workspace.path();
+    index(root);
+    let path = root.join(".carrick/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the index"))
+            .expect("the index is JSON");
+    let route_file = "catalog/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_line = index["repos"][0]["files"][route_file]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["kind"] == "route"))
+        .and_then(|row| row["line"].as_u64())
+        .unwrap_or_else(|| panic!("the widgets route is indexed:\n{index:#}"));
+    let gadgets = index["repos"][0]["files"]
+        .as_object_mut()
+        .expect("the files")
+        .values_mut()
+        .flat_map(|rows| rows.as_array_mut().expect("rows").iter_mut())
+        .find(|row| {
+            row["path"]
+                .as_str()
+                .is_some_and(|p| p.contains("/gadgets/"))
+        })
+        .expect("the gadgets call is a row");
+    gadgets["counterparts"] = serde_json::json!([{
+        "role": "producer", "service": "catalog", "file": route_file, "line": route_line
+    }]);
+    std::fs::write(&path, index.to_string()).expect("write the index");
+    workspace
+}
+
+/// carrick#3411: a call the index paired with a route in a file nothing has
+/// touched, that the re-scan no longer pairs, is re-scan drift. A new file
+/// elsewhere did not take that route away, so the re-check does not name the
+/// call.
+#[test]
+#[serial]
+fn a_new_file_names_no_call_an_untouched_producers_rescan_left_with_no_route() {
+    let workspace = shop_whose_index_pairs_a_gadgets_call_with_an_untouched_route();
+    let root = workspace.path();
+
+    let util = "shop/catalog/app/util.ts";
+    std::fs::write(root.join(util), "export const unrelated = 1;\n").expect("write the util");
+    let answer = recheck_json(root, util, &AMPLE);
+    assert_ne!(
+        answer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answer:#}"
+    );
+    let stranded: Vec<_> = moved_of(&answer)
+        .into_iter()
+        .filter(|row| row["after"] == "no_route")
+        .collect();
+    assert!(stranded.is_empty(), "{stranded:?}\n{answer:#}");
+}
+
+/// The same drift through `check --changed`: no problem row for the call, and
+/// the run does not fail.
+#[test]
+#[serial]
+fn check_changed_does_not_name_a_call_an_untouched_producers_rescan_left_with_no_route() {
+    let workspace = shop_whose_index_pairs_a_gadgets_call_with_an_untouched_route();
+    let root = workspace.path();
+
+    std::fs::write(
+        root.join("shop/catalog/app/util.ts"),
+        "export const unrelated = 1;\n",
+    )
+    .expect("write the util");
+    let (code, json, _) = check_changed_json_with(
+        root,
+        &[
+            ("CARRICK_MOCK_ALL", "1"),
+            ("CARRICK_CHECK_RESCAN", "always"),
+        ],
+    );
+    let named: Vec<_> = json["problems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("client.ts"))
+        })
+        .collect();
+    assert!(named.is_empty(), "{named:?}\n{json:#}");
+    assert_ne!(code, Some(1), "{json:#}");
+}
+
 /// The shop with `Widget` moved out of the route file into `types.ts`.
 fn shop_with_widget_in_a_types_file() -> tempfile::TempDir {
     workspace_prepared(SHOP, &["shop"], |repo| {
