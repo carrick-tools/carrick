@@ -21,10 +21,17 @@ import { readStdin } from "./stdin.ts";
 import { status } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { CHECK_BEFORE_DONE, renderSessionStart } from "../render.ts";
+import { CHECK_BEFORE_DONE, heldLine, hostedLine, renderSessionStart } from "../render.ts";
+import { lastSync } from "../hosted-snapshot.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
-import { forwardInBackground, refreshInBackground } from "./refresh.ts";
+import {
+  claimRefresh,
+  cooldownMs,
+  forwardInBackground,
+  markerPath,
+  refreshInBackground,
+} from "./refresh.ts";
 import { versionMismatch } from "../init/outdated.ts";
 import { bringUpToDate } from "../init/self-update.ts";
 import { markInvoker } from "./invoker.ts";
@@ -123,9 +130,15 @@ async function main(): Promise<void> {
     flush(lines, codex);
     return;
   }
+  // What the MCP answers from, and the copy the hooks compare against, ahead
+  // of this machine's own scan: that scan's date alone was read as the age of
+  // every answer (carrick#3432). From the last background move's record; the
+  // move itself runs after this read, so the line is at most one run behind.
+  const hosted = outcome.result.error ? null : hostedSync(choice.root, Date.now());
+  if (hosted) lines.push(...hosted);
   // Ends with a newline: this is a line a developer also runs by hand and
   // compares against `carrick status`, and that one ends its output properly.
-  lines.push(renderSessionStart(outcome.result));
+  lines.push(renderSessionStart(outcome.result, { afterHostedLine: hosted !== null }));
   if (!outcome.result.error) lines.push(CHECK_BEFORE_DONE);
 
   // The hosted index the first CI scan writes is picked up here rather than by
@@ -149,6 +162,26 @@ async function main(): Promise<void> {
     }
   }
   flush(lines, codex);
+}
+
+/** Default gap between two statements that HEAD keeps the copy back. */
+export const HELD_NOTICE_COOLDOWN_MS = 24 * 60 * 60_000;
+
+/**
+ * The hosted line, and, at most once per cooldown, the line saying HEAD keeps
+ * this machine's copy back (carrick#3433). Null where no record exists yet,
+ * which keeps the session start as it was. The claim is taken only when there
+ * is a held line to print, so a day of current copies does not use it up.
+ */
+export function hostedSync(root: string, now: number, env: NodeJS.ProcessEnv = process.env): string[] | null {
+  const sync = lastSync(root);
+  const hosted = sync ? hostedLine(sync, now) : null;
+  if (!sync || !hosted) return null;
+  const lines = [hosted];
+  const held = heldLine(sync);
+  const cooldown = cooldownMs(env, "CARRICK_HELD_NOTICE_COOLDOWN_MS", HELD_NOTICE_COOLDOWN_MS);
+  if (held && claimRefresh(markerPath(root, "last-held-notice"), now, cooldown)) lines.push(held);
+  return lines;
 }
 
 /** One write at the end, so the Codex form is a single JSON document. */

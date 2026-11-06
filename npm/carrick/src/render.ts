@@ -18,6 +18,7 @@ import {
   type StatusResult,
   type StatusService,
 } from "./contract.ts";
+import type { SyncRecord, SyncedRepo } from "./hosted-snapshot.ts";
 
 /** How many item lines one hook message carries before it says how many are left. */
 export const MAX_ITEM_LINES = 12;
@@ -617,6 +618,90 @@ export function repoLine(repo: StatusRepo): string | null {
   return `- ${repo.name}: ${repo.outside_every_service} file(s) changed outside every service${listed}`;
 }
 
+/** `2 h ago`, `8 days ago`: how long before `now` the time `iso` was. */
+export function ago(iso: string, now: number): string | null {
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return null;
+  const minutes = Math.max(0, Math.round((now - then) / 60_000));
+  if (minutes < 60) return `${Math.max(1, minutes)} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} h ago`;
+  return `${Math.round(hours / 24)} days ago`;
+}
+
+/** The repo's own name, as `example/api` is `api`. */
+function repoName(repo: SyncedRepo): string {
+  return repo.repo.split("/").pop() ?? repo.repo;
+}
+
+/** `api at abc1234 (scanned 2 h ago)`. */
+function indexAt(repo: SyncedRepo, commit: string, scannedAt: string | null, now: number): string {
+  const age = scannedAt ? ago(scannedAt, now) : null;
+  return `${repoName(repo)} at ${commit.slice(0, 7)}${age ? ` (scanned ${age})` : ""}`;
+}
+
+/** Up to this many repos a hosted line names before it counts the rest. */
+const NAMED_REPOS = 3;
+
+function named(parts: string[]): string {
+  const shown = parts.slice(0, NAMED_REPOS);
+  const rest = parts.length - shown.length;
+  return rest > 0 ? `${shown.join(", ")}, +${rest} more` : shown.join(", ");
+}
+
+/** A record older than this says when it was taken: the cloud may have moved since. */
+const STALE_RECORD_MS = 60 * 60_000;
+
+/**
+ * The first session-start line where the hosted copy has a record
+ * (carrick#3432): which hosted index the MCP tools answer from and how old it
+ * is, and, where this machine's copy is older, that copy apart. The status
+ * line's own date is this machine's scan, which an agent read as the age of
+ * every answer.
+ */
+export function hostedLine(sync: SyncRecord, now: number): string | null {
+  if (!sync.repos.length) return null;
+  const hosted = sync.repos.map((repo) => indexAt(repo, repo.hosted_commit, repo.hosted_scanned_at, now));
+  let line = `Carrick's MCP tools answer from the hosted index: ${named(hosted)}.`;
+  const older = sync.repos.filter((repo) => repo.copy_commit !== repo.hosted_commit);
+  if (older.length) {
+    const copies = older.map((repo) => indexAt(repo, repo.copy_commit, repo.copy_scanned_at, now));
+    line += ` The hooks and \`carrick check\` compare against this machine's older copy: ${named(copies)}.`;
+  }
+  const checked = Date.parse(sync.at);
+  if (Number.isFinite(checked) && now - checked > STALE_RECORD_MS) {
+    line += ` Last checked ${ago(sync.at, now)}.`;
+  }
+  return line;
+}
+
+/**
+ * The line for a copy HEAD keeps back (carrick#3433): the hosted commit is
+ * not in HEAD's history, so `refresh --hosted-only` cannot move the copy to
+ * it. Staying on the branch's base is correct; the line makes it visible and
+ * names the move. Null when no repo is held.
+ */
+export function heldLine(sync: SyncRecord): string | null {
+  const held = sync.repos.find(
+    (repo) => repo.copy_commit !== repo.hosted_commit && !repo.head_holds_hosted,
+  );
+  if (!held) return null;
+  const target = `the hosted index of ${repoName(held)} (${held.hosted_commit.slice(0, 7)})`;
+  const stuck = "so this machine's copy cannot move forward.";
+  const pull = "`git pull` (or a rebase onto the default branch)";
+  if (!held.fetched) {
+    return `This clone has not fetched ${target}, ${stuck} \`git fetch\`, then ${pull}, moves it.`;
+  }
+  const behind =
+    held.behind !== null
+      ? `This checkout is ${held.behind} commit${held.behind === 1 ? "" : "s"} behind ${target}`
+      : `This checkout's HEAD does not hold ${target}`;
+  if (held.head_detached) {
+    return `${behind}, ${stuck} HEAD is detached. Check out the default branch and \`git pull\` to move it.`;
+  }
+  return `${behind}, ${stuck} ${pull} moves it.`;
+}
+
 /**
  * The SessionStart line, from `carrick status --json`.
  *
@@ -625,7 +710,10 @@ export function repoLine(repo: StatusRepo): string | null {
  * indexed and what each service could not classify, and nothing about whether a
  * contract holds.
  */
-export function renderSessionStart(status: StatusResult): string {
+export function renderSessionStart(
+  status: StatusResult,
+  options: { afterHostedLine?: boolean } = {},
+): string {
   const scans = [...(status.running_scans ?? []).map(runningScanLine), ...(status.analysing ?? [])];
   if (status.error === "not_indexed") {
     // A first index being built right now is the answer, not "there is none":
@@ -654,7 +742,10 @@ export function renderSessionStart(status: StatusResult): string {
 
   const version = status.scanner_version ? `, scanner ${status.scanner_version}` : "";
   const where = status.workspace ? ` in ${status.workspace}` : "";
-  const when = status.indexed_at ? ` at ${status.indexed_at}` : "";
+  // Below a hosted line this date is the one beside the MCP's, so it says
+  // whose it is (carrick#3432).
+  const machine = options.afterHostedLine ? " on this machine" : "";
+  const when = status.indexed_at ? `${machine} at ${status.indexed_at}` : "";
 
   // Every service, with its boundary, is what this printed: on a workspace of
   // fifteen that was about ninety lines in every session's context, most of

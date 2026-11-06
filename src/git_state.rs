@@ -473,6 +473,24 @@ pub fn head_commit(repo_path: &str) -> Result<String, String> {
         .to_string())
 }
 
+/// How many commits `to` holds that `from` does not (`git rev-list --count
+/// from..to`). `Err` when either is not a commit this clone holds.
+pub fn commits_ahead(repo_path: &str, from: &str, to: &str) -> Result<u64, String> {
+    run_git(
+        repo_path,
+        &["rev-list", "--count", &format!("{from}..{to}")],
+    )?
+    .trim()
+    .parse()
+    .map_err(|_| "git rev-list gave no count".to_string())
+}
+
+/// Whether HEAD is detached: on no branch, where `git pull` has nothing to
+/// pull into.
+pub fn head_is_detached(repo_path: &str) -> bool {
+    run_git(repo_path, &["symbolic-ref", "-q", "HEAD"]).is_err()
+}
+
 /// Whether the trees of commits `a` and `b` differ under `repo_path`.
 ///
 /// `Err` when either is not a commit id this clone holds, or git could not
