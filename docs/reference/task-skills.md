@@ -11,8 +11,8 @@ call or a `carrick check` run, and the agent's work is to confirm what came back
 in source, classify it, decide and act. A body that asks the agent to go and
 explore instead is not one of these.
 
-The reminder skill at `.claude/skills/carrick/SKILL.md` is the cloud scaffold's
-and is untouched by everything below.
+An older setup may hold a reminder skill at `.claude/skills/carrick/SKILL.md`,
+written by the retired scaffold tool; nothing below reads or writes it.
 
 ## The four
 
