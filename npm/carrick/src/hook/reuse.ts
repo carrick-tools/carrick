@@ -357,7 +357,8 @@ export function drain(sessionId: string, root: string | null, home?: string): Dr
 
 /**
  * The one line the Stop hook hands the model: how many functions, at most two
- * names, and the ask with the exact call (`functions: [{ name, file }]`). Short on purpose, and it starts with "Carrick:" so the
+ * names, and the ask with the exact call (`functions`, one `{ description }` each: the
+ * functions are new, so the index has no name to find). Short on purpose, and it starts with "Carrick:" so the
  * user can tell where it came from. The two limits on the answer (what the
  * index was taken at, and that the match is on what a function is described as
  * doing) live in the `carrick-reuse` skill, where the answer is read.
@@ -373,7 +374,7 @@ export function nudge(entries: NewFunction[], slug = ""): string {
         ? `${shown[0]} and ${shown[1]}`
         : shown[0]!;
   const projectArg = slug === "" ? "" : `\`project: "${slug}"\` and `;
-  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing ${projectArg}\`functions: [{ name, file }]\`, one entry per new function. Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.`;
+  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing ${projectArg}\`functions\`, one \`{ description }\` per new function: one plain sentence saying what it does (new functions are not in the index yet, so a name is not found). Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.`;
 }
 
 /**

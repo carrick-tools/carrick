@@ -125,11 +125,12 @@ test("the nudge is short, starts with Carrick, and names at most two functions",
   const one = nudge([fn("slugify")]);
   assert.equal(
     one,
-    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, passing `functions: [{ name, file }]`, one entry per new function. Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.",
+    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, passing `functions`, one `{ description }` per new function: one plain sentence saying what it does (new functions are not in the index yet, so a name is not found). Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.",
   );
   // The argument is named exactly: the server ignores any other name, and an
   // agent that guessed `entries` got an answer to the wrong question.
-  assert.match(one, /`functions: \[\{ name, file \}\]`/);
+  assert.match(one, /`functions`, one `\{ description \}` per new function/);
+  assert.doesNotMatch(one, /name, file/);
   assert.doesNotMatch(one, /entries/);
   assert.doesNotMatch(one, /deliberate variant/);
   assert.match(
@@ -156,12 +157,12 @@ function workspace(repos: unknown): string {
 }
 
 test("the nudge names the project when the snapshot holds exactly one slug", (t) => {
-  const root = workspace([{ project_slug: "trig-bench" }, { project_slug: "trig-bench" }]);
+  const root = workspace([{ project_slug: "shop-system" }, { project_slug: "shop-system" }]);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  assert.equal(snapshotProjectSlug(root), "trig-bench");
+  assert.equal(snapshotProjectSlug(root), "shop-system");
   assert.match(
     nudge([fn("slugify")], snapshotProjectSlug(root)),
-    /passing `project: "trig-bench"` and `functions: \[\{ name, file \}\]`/,
+    /passing `project: "shop-system"` and `functions`, one `\{ description \}` per new function/,
   );
 });
 
