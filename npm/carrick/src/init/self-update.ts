@@ -25,6 +25,11 @@
 //   missing or does not name one project (a section that named a project is not
 //   downgraded).
 //
+// Both harnesses run it (carrick#3435). A Codex session has no Claude Code
+// project dir, so it passes `projectDir: null` and the settings files above wait
+// for a Claude Code session; the skills and the AGENTS.md section, which Codex
+// reads with no trust gate, move the same way under either.
+//
 // `.codex/hooks.json` is never written: a changed project hook is untrusted until
 // Codex records its hash (`codex.ts`), so only `carrick init` plus the user's
 // approval can move it.
@@ -178,7 +183,7 @@ function updateAgentsSection(workspace: string, log: (message: string) => void):
  */
 export function bringUpToDate(
   workspace: string,
-  projectDir: string,
+  projectDir: string | null,
   running: string | null,
   log: (message: string) => void = () => {},
 ): string[] {
@@ -186,7 +191,7 @@ export function bringUpToDate(
   const recorded = recordedCliVersion(workspace);
   if (recorded !== null && isNewer(recorded, running)) return [];
   const lines: string[] = [];
-  const hooks = updateHooks(workspace, projectDir, running);
+  const hooks = projectDir === null ? [] : updateHooks(workspace, projectDir, running);
   if (hooks.length > 0) {
     lines.push(`Carrick brought its hook entries in ${hooks.join(", ")} up to date for ${running}.`);
   }

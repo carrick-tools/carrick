@@ -178,7 +178,7 @@ test("a running version older than the recorded one rewrites nothing", async (t)
   assert.equal(fs.readFileSync(skill, "utf8"), stamped("an older body"));
 });
 
-test("a Codex payload (no CLAUDE_PROJECT_DIR) rewrites nothing", async (t) => {
+test("a Codex payload (no CLAUDE_PROJECT_DIR) leaves the Claude Code settings files alone", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const file = put(workspace.root, LOCAL, olderSettings());
@@ -324,4 +324,42 @@ test("self-update leaves the AGENTS.md section alone, and says why, without a re
   bringUpToDate(workspace.root, workspace.root, running, (message) => said.push(message));
   assert.equal(fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"), body);
   assert.ok(said.some((message) => /AGENTS\.md section left/.test(message)));
+});
+
+// A workspace used only from Codex gets the same rules refresh (carrick#3435):
+// Codex reads AGENTS.md directly, and only `.codex/hooks.json` has a trust gate.
+test("a Codex session start rewrites the AGENTS.md section and skills, never .codex/hooks.json", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  put(workspace.root, "AGENTS.md", SURROUND_BEFORE + OLD_SECTION + SURROUND_AFTER);
+  snapshot(workspace.root, TWO_REPOS);
+  writeTaskSkills(workspace.root, { slug: "shop-system" });
+  const agentsSkill = path.join(workspace.root, skillFile(SKILL_ROOTS[1]!, "carrick-impact"));
+  const currentSkill = fs.readFileSync(agentsSkill, "utf8");
+  fs.writeFileSync(agentsSkill, stamped('an older body that says project: "shop-system"'));
+  const old = JSON.parse(JSON.stringify({ hooks: codexHooks("carrick") }));
+  for (const groups of Object.values(old.hooks) as { hooks: { timeout?: number }[] }[][]) groups[0]!.hooks[0]!.timeout = 99;
+  const codexBody = `${JSON.stringify(old, null, 2)}\n`;
+  const codexFile = put(workspace.root, CODEX_HOOKS_FILE, codexBody);
+  recordVersion(workspace.root, "0.0.1");
+
+  const run = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    payload: { hook_event_name: "SessionStart", session_id: "s", cwd: workspace.root },
+    env: fakeEnv({ CLAUDE_PROJECT_DIR: "", CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json") }),
+  });
+  assert.equal(run.code, 0);
+  const context = (JSON.parse(run.stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput
+    .additionalContext;
+  assert.match(context, /rules section in AGENTS\.md up to date/);
+  assert.match(context, /task skills in \.agents\/skills up to date/);
+  assert.equal(
+    fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"),
+    SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 }) + SURROUND_AFTER,
+  );
+  assert.equal(fs.readFileSync(agentsSkill, "utf8"), currentSkill);
+  assert.equal(fs.readFileSync(codexFile, "utf8"), codexBody);
+  // The old Codex hooks are still ours to replace, so the mismatch line stays.
+  assert.match(context, /Run `carrick init`/);
+  assert.equal(fs.readFileSync(path.join(workspace.root, ".carrick", "cli-version"), "utf8").trim(), "0.0.1");
 });
