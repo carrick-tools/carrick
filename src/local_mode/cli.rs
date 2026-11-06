@@ -1937,7 +1937,10 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
                             super::recheck::LIBRARY_NOT_SIGNED_IN
                                 | super::recheck::LIBRARY_UNREACHABLE
                         )
-                    )
+                    ) || recheck
+                        .reason
+                        .as_deref()
+                        .is_some_and(super::query::is_answers_unavailable)
                 });
             if signed_out {
                 super::changed::EXIT_NOTHING_COVERED
