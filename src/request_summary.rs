@@ -7293,7 +7293,7 @@ impl CallWalker<'_, '_, '_> {
     ) -> Vec<Value> {
         let mut values: Vec<Value> = Vec::with_capacity(args.len());
         for (index, arg) in args.iter().enumerate() {
-            let written_in = WrittenIn::argument(call_site, &callee_text, index);
+            let written_in = WrittenIn::argument(call_site, callee_text, index);
             let value = match &*arg.expr {
                 Expr::Arrow(arrow) => {
                     let mut nested = self.reader.arrow(
