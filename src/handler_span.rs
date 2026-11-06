@@ -342,6 +342,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             handler_span: None,
+            address: None,
         }
     }
 

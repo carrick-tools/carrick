@@ -228,6 +228,11 @@ pub struct TracedRoute {
     pub path: String,
     /// Every full path it is served at, sorted, one per stated value.
     pub full_paths: Vec<String>,
+    /// The address each full path is composed of
+    /// (`docs/reference/address-chain.md`), where it is recorded: the first
+    /// chain that composes the path. Empty for a procedure's route and for
+    /// one the cross-service join writes.
+    pub addresses: std::collections::BTreeMap<String, crate::address::Address>,
     /// The handler's name where the call hands it by name.
     pub handler: Option<String>,
     /// The symbol of the binding the route is registered on.
@@ -382,6 +387,7 @@ fn procedure_route(
         method: method.to_uppercase(),
         path: crate::utils::join_prefix_and_path("/", &key_path),
         full_paths: procedure.full_paths.clone(),
+        addresses: std::collections::BTreeMap::new(),
         handler: site
             .handler
             .as_ref()
@@ -424,6 +430,24 @@ fn states_first_segment(name: &[crate::request_summary::Piece]) -> bool {
     };
     rest.split_once('/')
         .is_some_and(|(segment, _)| !segment.is_empty())
+}
+
+/// The last part of a traced route's address: the path `own` its own call
+/// writes, at that call.
+fn own_part(site: &DecidedSite, own: &str) -> crate::address::Part {
+    use crate::address;
+    address::Part {
+        kind: address::PartKind::Own,
+        dimension: address::Dimension::Path,
+        at: format!("{}:{}", site.file, site.line),
+        member: site.end.member.clone(),
+        value: address::Value::Text {
+            values: vec![vec![address::Piece::Lit {
+                text: own.to_string(),
+            }]],
+        },
+        via: address::Via::Label,
+    }
 }
 
 /// `site`'s traced routes, or why it has none: one, or where the call writes
@@ -472,8 +496,11 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
     }
     // Each own path with the full paths it joins: the call's whole text, or
     // each way it writes through a conditional or a default.
-    let mut by_own: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
+    type Served = (
+        Vec<String>,
+        std::collections::BTreeMap<String, crate::address::Address>,
+    );
+    let mut by_own: std::collections::BTreeMap<String, Served> = std::collections::BTreeMap::new();
     for composed in &site.composed {
         let (Some(own), Some(path)) = (
             composed.own.clone().or_else(|| site.name_text()),
@@ -481,11 +508,17 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
         ) else {
             return Err("unread_prefix".to_string().into());
         };
-        by_own.entry(own).or_default().push(path);
+        let mut parts = composed.parts.clone();
+        parts.push(own_part(site, &own));
+        let (paths, addresses) = by_own.entry(own).or_default();
+        addresses
+            .entry(path.clone())
+            .or_insert_with(|| crate::address::Address::of(parts));
+        paths.push(path);
     }
     Ok(by_own
         .into_iter()
-        .map(|(path, mut full_paths)| {
+        .map(|(path, (mut full_paths, addresses))| {
             full_paths.sort();
             full_paths.dedup();
             TracedRoute {
@@ -494,6 +527,7 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
                 method: method.to_uppercase(),
                 path,
                 full_paths,
+                addresses,
                 handler: site
                     .handler
                     .as_ref()

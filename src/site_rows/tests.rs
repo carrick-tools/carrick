@@ -1827,7 +1827,7 @@ fn traced_site(file: &str, start: u32, ends: &[(&str, Option<&str>)]) -> Decided
         .map(
             |(end, path)| crate::request_summary::decided_sites::Composed {
                 path: path.map(str::to_string),
-                edges: Vec::new(),
+                parts: Vec::new(),
                 end: end.to_string(),
                 own: None,
             },
@@ -1888,6 +1888,24 @@ fn every_route_the_trace_does_not_serve_is_counted_by_why() {
             method: "GET".to_string(),
             path: "/items/:id".to_string(),
             full_paths: vec!["/v1/items/:id".to_string()],
+            // The site's composed path carries no parts here: its address
+            // is its own part alone.
+            addresses: [(
+                "/v1/items/:id".to_string(),
+                crate::address::Address::of(vec![crate::address::Part {
+                    kind: crate::address::PartKind::Own,
+                    dimension: crate::address::Dimension::Path,
+                    at: format!("src/served.ts:{LINE}"),
+                    member: served.end.member.clone(),
+                    value: crate::address::Value::Text {
+                        values: vec![vec![crate::address::Piece::Lit {
+                            text: "/items/:id".to_string(),
+                        }]],
+                    },
+                    via: crate::address::Via::Label,
+                }]),
+            )]
+            .into(),
             handler: None,
             owner: Some("items".to_string()),
             corrects: true,

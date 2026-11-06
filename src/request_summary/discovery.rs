@@ -4504,7 +4504,7 @@ export function listen(): void {
                 };
                 let mut line = format!("{}:{} <- {what}", site.file, site.line);
                 if edges {
-                    line = format!("{line} via {}", composed.edges.join(" > "));
+                    line = format!("{line} via {}", composed.edges().join(" > "));
                 }
                 out.push(line);
             }

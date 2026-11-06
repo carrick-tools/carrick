@@ -23,6 +23,7 @@ use super::instances::{
     InstanceAt, InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,
 };
 use super::{Calls, Placed, relative};
+use crate::address;
 
 /// One path a route site is served at.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -32,9 +33,10 @@ pub struct Composed {
     /// is not text. Full only where `end` is `top`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Each scope or mount edge, from the top down: `file:line member
-    /// prefix`.
-    pub edges: Vec<String>,
+    /// Each scope or mount part of the address, from the top down
+    /// (`docs/reference/address-chain.md`): the route's own part is added
+    /// where the row is written ([`crate::site_rows`]).
+    pub parts: Vec<address::Part>,
     /// Where the walk up ends: `top` (an instance served at no mount), a
     /// hole's reason (the path is relative to what serves the instance
     /// there), or `cycle`.
@@ -47,6 +49,63 @@ pub struct Composed {
     pub own: Option<String>,
 }
 
+impl Composed {
+    /// Each part as `file:line member value`, from the top down: the value
+    /// is `-` where unstated, the stated texts joined by `|`, or `?` and the
+    /// pieces as written where one is not read.
+    pub fn edges(&self) -> Vec<String> {
+        self.parts
+            .iter()
+            .map(|part| {
+                let value = match &part.value {
+                    address::Value::Unstated => "-".to_string(),
+                    address::Value::Text { values } => {
+                        let texts: Option<Vec<String>> =
+                            values.iter().map(|pieces| read_text(pieces)).collect();
+                        match texts {
+                            Some(texts) => texts.join("|"),
+                            None => {
+                                let written: String = values
+                                    .iter()
+                                    .flatten()
+                                    .map(|piece| match piece {
+                                        address::Piece::Lit { text }
+                                        | address::Piece::Folded { text, .. } => text.as_str(),
+                                        address::Piece::Unknown { written, .. } => written,
+                                    })
+                                    .collect();
+                                format!("?{written}")
+                            }
+                        }
+                    }
+                };
+                format!(
+                    "{} {} {value}",
+                    part.at,
+                    part.member.as_deref().unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+}
+
+/// The text `pieces` state, where every one is read.
+fn read_text(pieces: &[address::Piece]) -> Option<String> {
+    pieces.iter().map(address::Piece::text).collect()
+}
+
+/// The part a scope or mount call states, read through its store label.
+fn part(kind: address::PartKind, at: &str, member: &str, value: &address::Value) -> address::Part {
+    address::Part {
+        kind,
+        dimension: address::Dimension::Path,
+        at: at.to_string(),
+        member: Some(member.to_string()),
+        value: value.clone(),
+        via: address::Via::Label,
+    }
+}
+
 /// An instance served under a prefix: a call of a member labelled with
 /// `mounts`, handed a labelled maker's result.
 #[derive(Debug, Clone)]
@@ -57,6 +116,8 @@ pub(super) struct MountEdge {
     at: String,
     member: String,
     prefix: Prefix,
+    /// What the prefix slot states as an address part's value.
+    value: address::Value,
     /// The ends of the mount call's own receiver the label applies to.
     parents: Vec<InstanceEnd>,
     /// Made in a file only tests import (carrick#2775); kept only while no
@@ -255,11 +316,13 @@ fn verified_edges<'a>(
                     continue;
                 };
                 let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
+                let prefix = walk().prefix_of(&placed, &label.name, None);
                 edges.push(MountEdge {
                     child: (file.clone(), *line),
                     at,
                     member: label.member.clone(),
-                    prefix: walk().prefix_of(&placed, &label.name, None),
+                    value: walk().value_of(&placed, &label.name, &prefix),
+                    prefix,
                     parents: parents.clone(),
                     in_test_only: inputs.test_only.contains(placed.file),
                 });
@@ -290,7 +353,10 @@ fn verified_edges<'a>(
 #[derive(Clone)]
 struct Chain {
     prefixes: Vec<Prefix>,
+    /// Each edge as a boundary record holds it ([`aboves`]).
     edges: Vec<String>,
+    /// Each edge as an address part.
+    parts: Vec<address::Part>,
     end: String,
     /// Where the chain leaves the service, for a hole that names it
     /// (carrick#2474 R5a).
@@ -346,6 +412,7 @@ fn chains(
             vec![Chain {
                 prefixes: Vec::new(),
                 edges: Vec::new(),
+                parts: Vec::new(),
                 end,
                 boundary,
             }]
@@ -402,6 +469,12 @@ fn chains(
                         chain
                             .edges
                             .push(edge_text(&edge.at, &edge.member, &edge.prefix));
+                        chain.parts.push(part(
+                            address::PartKind::Mount,
+                            &edge.at,
+                            &edge.member,
+                            &edge.value,
+                        ));
                         out.push(chain);
                     }
                 }
@@ -414,6 +487,7 @@ fn chains(
             line,
             member,
             prefix,
+            value,
             parents,
             ..
         } => {
@@ -423,6 +497,9 @@ fn chains(
                 for mut chain in chains(parent, mounts, seen, budget) {
                     chain.prefixes.push(prefix.clone());
                     chain.edges.push(edge_text(&at, member, prefix));
+                    chain
+                        .parts
+                        .push(part(address::PartKind::Scope, &at, member, value));
                     out.push(chain);
                 }
             }
@@ -529,7 +606,7 @@ pub(super) fn compose(
             };
             let composed = Composed {
                 path,
-                edges: chain.edges.clone(),
+                parts: chain.parts.clone(),
                 end: chain.end.clone(),
                 own: None,
             };
@@ -598,13 +675,28 @@ mod tests {
     }
 
     fn scope(values: Vec<String>, parents: Vec<InstanceEnd>) -> InstanceEnd {
+        let value = address::Value::Text {
+            values: values
+                .iter()
+                .map(|text| vec![address::Piece::Lit { text: text.clone() }])
+                .collect(),
+        };
+        scope_stating(Prefix::Stated { values }, value, parents)
+    }
+
+    fn scope_stating(
+        prefix: Prefix,
+        value: address::Value,
+        parents: Vec<InstanceEnd>,
+    ) -> InstanceEnd {
         InstanceEnd {
             at: "src/routes.ts:3".to_string(),
             end: InstanceAt::Scope {
                 file: "src/plugin.ts".to_string(),
                 line: 5,
                 member: "register".to_string(),
-                prefix: Prefix::Stated { values },
+                prefix,
+                value,
                 package: "fixture-server".to_string(),
                 export: "default".to_string(),
                 receiver: "instance:()".to_string(),
@@ -644,5 +736,66 @@ mod tests {
             vec!["/a/x", "/b/x"]
         );
         assert!(!trimmed);
+    }
+
+    /// Address chain S1: each composed path carries its scope and mount
+    /// parts from the top down, each at the call that states it and with
+    /// its value as read: a folded constant keeps the file that declares
+    /// it, and a prefix set at run time is kept as an unknown piece with
+    /// its reason, though it composes no path.
+    #[test]
+    fn a_composed_path_carries_each_part_with_where_it_is_stated() {
+        let none = Mounts::default();
+        let folded = address::Value::Text {
+            values: vec![vec![address::Piece::Folded {
+                text: "/api".to_string(),
+                from: "src/config.ts".to_string(),
+            }]],
+        };
+        let outer = scope_stating(
+            Prefix::Stated {
+                values: vec!["/api".to_string()],
+            },
+            folded.clone(),
+            vec![root(1)],
+        );
+        let (paths, _) = compose(&[outer], Some("/x"), &none);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].path.as_deref(), Some("/api/x"));
+        assert_eq!(
+            paths[0].parts,
+            vec![address::Part {
+                kind: address::PartKind::Scope,
+                dimension: address::Dimension::Path,
+                at: "src/plugin.ts:5".to_string(),
+                member: Some("register".to_string()),
+                value: folded,
+                via: address::Via::Label,
+            }]
+        );
+        assert_eq!(paths[0].edges(), vec!["src/plugin.ts:5 register /api"]);
+
+        let env = address::Value::Text {
+            values: vec![vec![address::Piece::Unknown {
+                written: "process.env.ADMIN_BASE".to_string(),
+                reason: address::UnknownReason::RuntimeEnv,
+                reads: vec!["ADMIN_BASE".to_string()],
+            }]],
+        };
+        let unread = scope_stating(
+            Prefix::Unread {
+                text: Some("process.env.ADMIN_BASE".to_string()),
+            },
+            env.clone(),
+            vec![root(1)],
+        );
+        let (paths, _) = compose(&[unread], Some("/stats"), &none);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].path, None);
+        assert_eq!(paths[0].parts[0].value, env);
+        assert_eq!(
+            paths[0].edges(),
+            vec!["src/plugin.ts:5 register ?process.env.ADMIN_BASE"]
+        );
     }
 }

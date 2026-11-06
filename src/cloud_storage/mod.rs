@@ -2505,6 +2505,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);
@@ -2541,6 +2542,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         // A route whose module also renders a view (carrick#704).
         graph.endpoints.push(ResolvedEndpoint {
@@ -2559,6 +2561,7 @@ mod tests {
             view_module: true,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -2632,6 +2635,7 @@ mod tests {
             view_module: false,
             dispatch,
             handler_span: None,
+            address: None,
         };
         graph.endpoints.push(route(Some(case("search-by-intent"))));
         graph.endpoints.push(route(None));
@@ -2757,6 +2761,7 @@ mod tests {
             view_module,
             dispatch: None,
             handler_span: None,
+            address: None,
         };
         graph
             .endpoints

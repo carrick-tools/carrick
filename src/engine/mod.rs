@@ -7541,6 +7541,7 @@ fn write_traced_routes(
                 };
                 let own = route.path.clone();
                 let row = &mut mount_graph.endpoints[index];
+                row.address = route.addresses.get(&full_path).cloned();
                 row.full_path = full_path;
                 row.resolution_source = Some(ResolutionSource::LibraryClaim);
                 if corrects {
@@ -7605,6 +7606,21 @@ fn write_traced_routes(
             let row = &mut mount_graph.endpoints[index];
             if !declared(row) {
                 row.resolution_source = Some(ResolutionSource::LibraryClaim);
+                // The row states a path the trace serves: it takes that
+                // path's address.
+                row.address = routes
+                    .iter()
+                    .filter(|route| route.method.eq_ignore_ascii_case(&row.method))
+                    .find_map(|route| {
+                        route
+                            .full_paths
+                            .iter()
+                            .find(|traced| {
+                                MountGraph::paths_equal_modulo_param_names(traced, &row.full_path)
+                            })
+                            .and_then(|traced| route.addresses.get(traced))
+                    })
+                    .cloned();
                 applied.relabelled += 1;
                 write.relabelled.push(index);
             }
@@ -7645,6 +7661,7 @@ fn write_traced_routes(
                         full_path: full_path.clone(),
                         resolution_source: Some(ResolutionSource::LibraryClaim),
                         handler_span: None,
+                        address: route.addresses.get(full_path).cloned(),
                         ..template.clone()
                     },
                     // With no binding symbol there is no owner to write: the
@@ -7677,6 +7694,7 @@ fn write_traced_routes(
                         view_module: false,
                         dispatch: None,
                         handler_span: None,
+                        address: route.addresses.get(full_path).cloned(),
                     },
                 };
                 written.push(row);
@@ -16545,6 +16563,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -17586,6 +17605,7 @@ unfollowed_member_calls_total: 0,
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![
@@ -17664,6 +17684,7 @@ unfollowed_member_calls_total: 0,
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         }];
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
             method: "POST".to_string(),
@@ -26955,6 +26976,7 @@ unfollowed_member_calls_total: 0,
             resolution_source: Some(source),
             dispatch: None,
             handler_span: None,
+            address: None,
         };
         let mut mount_graph = crate::mount_graph::MountGraph::new();
         mount_graph.endpoints = vec![
@@ -27052,6 +27074,7 @@ unfollowed_member_calls_total: 0,
             resolution_source: Some(source),
             dispatch: None,
             handler_span: None,
+            address: None,
         }
     }
 
@@ -27069,6 +27092,7 @@ unfollowed_member_calls_total: 0,
             method: method.to_string(),
             path: path.to_string(),
             full_paths: full_paths.iter().map(|path| path.to_string()).collect(),
+            addresses: std::collections::BTreeMap::new(),
             handler: Some("list".to_string()),
             owner: Some("users".to_string()),
             corrects: true,
@@ -27585,6 +27609,104 @@ unfollowed_member_calls_total: 0,
         assert!(written.dispatch.is_none());
         assert_eq!(written.owner, "users");
         assert_eq!(written.handler.as_deref(), Some("list"));
+    }
+
+    /// Address chain S1: every row the trace stands behind carries the
+    /// address of the full path it states: a row that agrees (relabelled),
+    /// a reader row at the route's own path (corrected), and a row the trace
+    /// writes. A row it leaves as read carries none.
+    #[test]
+    fn each_row_the_trace_writes_or_confirms_carries_its_address() {
+        use crate::address::{Address, Dimension, Part, PartKind, Piece, Value, Via};
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let address = |at: &str, text: &str| {
+            Address::of(vec![Part {
+                kind: PartKind::Own,
+                dimension: Dimension::Path,
+                at: at.to_string(),
+                member: Some("get".to_string()),
+                value: Value::Text {
+                    values: vec![vec![Piece::Lit {
+                        text: text.to_string(),
+                    }]],
+                },
+                via: Via::Label,
+            }])
+        };
+        let with = |route: crate::site_rows::TracedRoute, at: &str| {
+            let addresses = route
+                .full_paths
+                .iter()
+                .map(|full_path| (full_path.clone(), address(at, full_path)))
+                .collect();
+            crate::site_rows::TracedRoute { addresses, ..route }
+        };
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![
+            traced_row(
+                "src/a.ts:5",
+                "GET",
+                "/items",
+                "/api/items",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/b.ts:7",
+                "GET",
+                "/users",
+                "/users",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/d.ts:3",
+                "GET",
+                "/other",
+                "/other",
+                ResolutionSource::Model,
+            ),
+        ];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[
+                with(
+                    traced_route("src/a.ts", 5, "GET", "/items", &["/api/items"]),
+                    "src/a.ts:5",
+                ),
+                with(
+                    traced_route("src/b.ts", 7, "GET", "/users", &["/v1/users"]),
+                    "src/b.ts:7",
+                ),
+                with(
+                    traced_route("src/c.ts", 9, "GET", "/c", &["/v1/c"]),
+                    "src/c.ts:9",
+                ),
+            ],
+            ".",
+        );
+        assert_eq!(
+            (applied.relabelled, applied.corrected, applied.added),
+            (1, 1, 1)
+        );
+        let address_at = |location: &str| {
+            graph
+                .endpoints
+                .iter()
+                .find(|row| row.file_location == location)
+                .and_then(|row| row.address.clone())
+        };
+        assert_eq!(
+            address_at("src/a.ts:5"),
+            Some(address("src/a.ts:5", "/api/items"))
+        );
+        assert_eq!(
+            address_at("src/b.ts:7"),
+            Some(address("src/b.ts:7", "/v1/users"))
+        );
+        assert_eq!(
+            address_at("src/c.ts:9"),
+            Some(address("src/c.ts:9", "/v1/c"))
+        );
+        assert_eq!(address_at("src/d.ts:3"), None);
     }
 
     /// PR #2687 review: a traced route whose method no row at the line

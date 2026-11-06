@@ -1646,7 +1646,7 @@ fn client_receivers_in_every_held_form_are_sites() {
     assert_eq!(stated, want);
 }
 
-/// Each mount-graph row's stored address (`docs/address-chain.md`), by
+/// Each mount-graph row's stored address (`docs/reference/address-chain.md`), by
 /// `file:line METHOD full_path`; `null` where the row carries none.
 fn endpoint_addresses(blobs: &Blobs) -> BTreeMap<String, serde_json::Value> {
     let mut out = BTreeMap::new();

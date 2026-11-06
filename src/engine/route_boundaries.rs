@@ -103,6 +103,8 @@ pub(super) fn settle(
             method: resolved.method,
             path: resolved.path,
             full_paths: resolved.paths,
+            // Not recorded across services yet (address chain S9).
+            addresses: std::collections::BTreeMap::new(),
             handler: resolved.handler,
             owner: resolved.owner,
             corrects: true,
