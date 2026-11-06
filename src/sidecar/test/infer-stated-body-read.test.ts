@@ -31,11 +31,8 @@ import { SidecarClient } from './helpers.js';
 
 const SERVICE_TS = `export type Member = { id: string; name: string; email: string };
 
-interface Reply {
-  ok: boolean;
-  status: number;
-  json(): Promise<any>;
-}
+// The platform's response: its json() is the body read by declaration (blueprint row N33).
+type Reply = Response;
 
 declare function fetchReply(path: string): Promise<Reply>;
 
@@ -229,7 +226,7 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
           module: 'esnext',
           moduleResolution: 'bundler',
           target: 'es2022',
-          lib: ['es2022'],
+          lib: ['es2022', 'dom'],
           skipLibCheck: true,
         },
         include: ['src'],

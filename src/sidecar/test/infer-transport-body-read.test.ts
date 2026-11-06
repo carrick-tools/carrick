@@ -180,7 +180,8 @@ export async function echoed(widget: Widget): Promise<Widget> {
   return echo(widget);
 }
 
-declare function apiFetch(url: string): Promise<{ ok: boolean; json(): Promise<unknown> }>;
+// The platform's response: its json() is the body read by declaration (blueprint row N33).
+declare function apiFetch(url: string): Promise<Response>;
 
 export async function narrowedEnvelope(): Promise<{ data: Widget[] }> {
   const res = await apiFetch("/v1/widgets");
@@ -248,7 +249,7 @@ describe('carrick#2714: a consumer reads the body, never the transport response 
           module: 'esnext',
           moduleResolution: 'bundler',
           target: 'es2022',
-          lib: ['es2022'],
+          lib: ['es2022', 'dom'],
           skipLibCheck: true,
         },
         include: ['src'],
@@ -377,10 +378,10 @@ describe('carrick#2714: a consumer reads the body, never the transport response 
 
   it('a closed statement at the body read is kept over a later recast', async () => {
     // Only a placeholder is narrowed: a closed statement keeps the answer it
-    // had, its anchor included (the call's, here none).
+    // had, its anchor included (the call's: the platform `Response`).
     const inferred = await infer('Restated', 'apiFetch("/v1/widgets/restated")');
     assert.strictEqual(collapse(inferred.type_string), `{ data: ${WIDGET}[]; }`, JSON.stringify(inferred));
-    assert.strictEqual(inferred.primary_type_symbol, undefined, JSON.stringify(inferred));
+    assert.strictEqual(inferred.primary_type_symbol, 'Response', JSON.stringify(inferred));
   });
 
   it('a call that states its payload type keeps that payload', async () => {
@@ -400,3 +401,160 @@ describe('carrick#2714: a consumer reads the body, never the transport response 
     assert.ok(inferred.stated_body, `the narrowed statement is the stated body: ${JSON.stringify(inferred)}`);
   });
 });
+
+/**
+ * Blueprint row N33: a zero-argument `json()` or `text()` is the platform's
+ * body read only where the runtime declares the value it is called on: a
+ * global the compiler's library or an installed runtime typings package
+ * declares (`fetch`'s `Response`). The member's name picks the read; the
+ * declaration decides whether it is one. A repository's own class that
+ * happens to have a `json()` or `text()` member reads its own value.
+ */
+const OWN_READS_TS = `export interface Widget {
+  id: string;
+  label: string;
+}
+
+export class Envelope {
+  constructor(private readonly raw: string) {}
+  json(): { size: number } {
+    return { size: this.raw.length };
+  }
+  text(): string {
+    return this.raw;
+  }
+}
+
+export declare function load(url: string): Promise<Envelope>;
+
+export async function ownJson() {
+  const env = await load("/v1/own-json");
+  return env.json();
+}
+
+export async function ownText() {
+  const env = await load("/v1/own-text");
+  return env.text();
+}
+
+export async function platformJson() {
+  const res = await fetch("/v1/platform-json");
+  return (await res.json()) as Widget;
+}
+
+export async function platformText() {
+  const res = await fetch("/v1/platform-text");
+  return res.text();
+}
+`;
+
+/** A runtime typings package: the platform's `Response` declared as a global from a module. */
+const RUNTIME_TYPES_DTS = `export {};
+declare global {
+  interface Response {
+    readonly ok: boolean;
+    readonly status: number;
+    json(): Promise<unknown>;
+    text(): Promise<string>;
+  }
+  function fetch(input: string): Promise<Response>;
+}
+`;
+
+interface ReadInferred extends Inferred {
+  raw_text_read?: true;
+}
+
+// 'nothing declared': `fetch` resolves to nothing (no DOM library, no runtime
+// typings installed), so its value is `any` and the name alone decides, as before.
+for (const runtime of ['default library', 'runtime typings', 'nothing declared'] as const) {
+  describe(`blueprint row N33: body reads are the platform's by declaration (${runtime})`, () => {
+    let client: SidecarClient;
+    let repoDir: string;
+    let servicePath: string;
+
+    before(async () => {
+      repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-n33-'));
+      fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+      if (runtime === 'runtime typings') {
+        const typesDir = path.join(repoDir, 'node_modules', '@types', 'node');
+        fs.mkdirSync(typesDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(typesDir, 'package.json'),
+          JSON.stringify({ name: '@types/node', version: '22.0.0', types: 'index.d.ts' })
+        );
+        fs.writeFileSync(path.join(typesDir, 'index.d.ts'), RUNTIME_TYPES_DTS);
+      }
+      fs.writeFileSync(
+        path.join(repoDir, 'tsconfig.json'),
+        JSON.stringify({
+          compilerOptions: {
+            strict: true,
+            module: 'esnext',
+            moduleResolution: 'bundler',
+            target: 'es2022',
+            lib: runtime === 'default library' ? ['es2022', 'dom'] : ['es2022'],
+            types: runtime === 'nothing declared' ? [] : undefined,
+            skipLibCheck: true,
+          },
+          include: ['src'],
+        })
+      );
+      servicePath = path.join(repoDir, 'src', 'service.ts');
+      fs.writeFileSync(servicePath, OWN_READS_TS);
+      client = new SidecarClient();
+      await client.start();
+      await client.send({ action: 'init', request_id: 'init', repo_root: repoDir });
+    });
+
+    after(async () => {
+      await client.stop();
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    });
+
+    async function infer(alias: string, expressionText: string): Promise<ReadInferred> {
+      const lines = OWN_READS_TS.split('\n');
+      const index = lines.findIndex((line) => line.includes(expressionText));
+      assert.ok(index >= 0, `fixture must contain ${expressionText}`);
+      const res = await client.send<{ inferred_types?: ReadInferred[] }>({
+        action: 'infer',
+        request_id: alias,
+        requests: [
+          {
+            file_path: servicePath,
+            line_number: index + 1,
+            infer_kind: 'call_result',
+            alias,
+            expression_text: expressionText,
+            expression_line: index + 1,
+          },
+        ],
+      });
+      const inferred = (res.inferred_types ?? []).find((t) => t.alias === alias);
+      assert.ok(inferred, `expected an answer for ${alias}`);
+      return inferred;
+    }
+
+    it("fetch's json() is the body read, and the cast on it is the body", async () => {
+      const inferred = await infer('PlatformJson', 'fetch("/v1/platform-json")');
+      assert.strictEqual(collapse(inferred.type_string), WIDGET, JSON.stringify(inferred));
+    });
+
+    it("fetch's text() is a raw-text body read", async () => {
+      const inferred = await infer('PlatformText', 'fetch("/v1/platform-text")');
+      // Nothing declared: the read is taken, but it yields `any`, not a string.
+      const expected = runtime === 'nothing declared' ? undefined : true;
+      assert.strictEqual(inferred.raw_text_read, expected, JSON.stringify(inferred));
+    });
+
+    it("a repository class's own text() is not a raw-text body read", async () => {
+      const inferred = await infer('OwnText', 'load("/v1/own-text")');
+      assert.strictEqual(inferred.raw_text_read, undefined, JSON.stringify(inferred));
+    });
+
+    it("a repository class's own json() is not the parsed body: the call answers its own value", async () => {
+      const inferred = await infer('OwnJson', 'load("/v1/own-json")');
+      assert.strictEqual(collapse(inferred.type_string), 'Envelope', JSON.stringify(inferred));
+    });
+  });
+}

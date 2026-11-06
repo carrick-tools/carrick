@@ -719,10 +719,10 @@ describe('carrick#1493: retype a body read off a fetch Response', () => {
     });
   }
 
-  it('abstains when the body read already states a type', async () => {
+  it("abstains on a repository's own client, whose json() is not the platform's read (blueprint row N33)", async () => {
     const out = await retype('typedBody', '{ y: number; }');
     assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
-    assert.match(out.reason ?? '', /already states a type/);
+    assert.match(out.reason ?? '', /cannot be retyped/);
   });
 
   it('leaves the file as it found it', async () => {

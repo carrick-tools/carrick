@@ -35,9 +35,8 @@ const SERVICE_TS = `export interface PreferenceEnvelope {
   version: string;
 }
 
-interface TransportBody {
-  json(): Promise<any>;
-}
+// The platform's response: its json() is the body read by declaration (blueprint row N33).
+type TransportBody = Response;
 
 declare function request(path: string): Promise<TransportBody>;
 declare function readRaw(path: string): Promise<unknown>;
@@ -135,7 +134,7 @@ describe('carrick#1375: a projection of the response is not the response', () =>
           module: 'esnext',
           moduleResolution: 'bundler',
           target: 'es2022',
-          lib: ['es2022'],
+          lib: ['es2022', 'dom'],
           skipLibCheck: true,
         },
         include: ['src'],

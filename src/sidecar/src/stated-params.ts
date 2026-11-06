@@ -615,6 +615,20 @@ export class StatedParams {
   }
 
   /**
+   * The called member's declaration is one the labels name a request body
+   * (blueprint row N33): a framework's own `json()` on its request, read as
+   * the body where the store says so. Matched by declaration, never by name.
+   */
+  readsLabelledBody(call: Node): boolean {
+    if (this.labels.bodies.size === 0 || !Node.isCallExpression(call)) return false;
+    const callee = call.getExpression();
+    if (!Node.isPropertyAccessExpression(callee)) return false;
+    return (callee.getNameNode().getSymbol()?.getDeclarations() ?? []).some((d) =>
+      this.labels.bodies.has(declarationKey(d.compilerNode))
+    );
+  }
+
+  /**
    * What the labels say about one call (carrick#2472 C2): the payload slot
    * when the called member's declaration is a labelled send; `'setter'` when
    * the receiver's type has a labelled send member but this member is not
