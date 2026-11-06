@@ -2446,14 +2446,27 @@ fn decide(
     let mounts = match (makers, &index) {
         (Some(makers), Some(index)) => {
             let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
+            let mut fold = super::site_record::NameFold::new(inputs, root);
             for site in &mut out.sites {
                 (site.composed, site.composed_trimmed) = match site.name_text() {
                     Some(own) => composed::compose(&site.instances, Some(&own), &mounts),
-                    None => composed::compose_ways(
-                        &site.instances,
-                        &route_ways(site, labels, &calls, root),
-                        &mounts,
-                    ),
+                    None => {
+                        // A route's own path written as a template over
+                        // values the compiler types as one string each, from
+                        // any package (carrick#3213): the one way it reads.
+                        // Else each way a conditional or a default writes.
+                        let ways = match site
+                            .end
+                            .op
+                            .as_deref()
+                            .filter(|op| *op == "receive")
+                            .and_then(|_| fold.own_path(site))
+                        {
+                            Some(own) => vec![own],
+                            None => route_ways(site, labels, &calls, root),
+                        };
+                        composed::compose_ways(&site.instances, &ways, &mounts)
+                    }
                 };
             }
             procedures::Pass {
