@@ -1984,23 +1984,15 @@ pub fn extract_file_ir(
                             {
                                 continue;
                             }
-                            let mut members = Vec::new();
-                            object_members(name, object, 0, &mut members);
-                            for (key, member) in members {
-                                if !definition_keys.contains(&key) {
-                                    continue;
-                                }
-                                let ir = match member {
-                                    ObjectMember::Function(function) => {
-                                        reader.function(function, None, module_scope, &none)
-                                    }
-                                    ObjectMember::Arrow(arrow) => {
-                                        reader.arrow(arrow, None, module_scope, &none)
-                                    }
-                                };
-                                lifted_members.insert(member.span().lo.0);
-                                file.functions.insert(key, ir);
-                            }
+                            lift_object_members(
+                                &reader,
+                                name,
+                                object,
+                                module_scope,
+                                definition_keys,
+                                &mut lifted_members,
+                                &mut file,
+                            );
                             continue;
                         }
                         _ => continue,
@@ -2043,6 +2035,23 @@ pub fn extract_file_ir(
                 _ => {}
             }
         }
+        // `export default { async fetch() {} }`: the extractor keys its
+        // members `default.<member>` (carrick#830). No binding names the
+        // object, so nothing writes through it (carrick#3370).
+        if let ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) = item
+            && let Expr::Object(object) =
+                crate::graphql_document_sites::unwrap_expression(&export.expr)
+        {
+            lift_object_members(
+                &reader,
+                "default",
+                object,
+                module_scope,
+                definition_keys,
+                &mut lifted_members,
+                &mut file,
+            );
+        }
     }
     // A getter of a lazily built client (carrick#1790), with how this module
     // uses its binding, so that every call of it can be accounted for
@@ -2069,7 +2078,18 @@ pub fn extract_file_ir(
         for item in &module.body {
             match item {
                 ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
-                    reader.walk(&*export.expr, &scope, &mut module_level);
+                    match crate::graphql_document_sites::unwrap_expression(&export.expr) {
+                        Expr::Object(object) if !lifted_members.is_empty() => {
+                            walk_object_except(
+                                &reader,
+                                object,
+                                &lifted_members,
+                                &scope,
+                                &mut module_level,
+                            );
+                        }
+                        _ => reader.walk(&*export.expr, &scope, &mut module_level),
+                    }
                 }
                 // `export default function () {}`: no name keys it, so it is
                 // read here, as a detached function.
@@ -2190,6 +2210,37 @@ fn object_members<'o>(
             }
             _ => {}
         }
+    }
+}
+
+/// Read each function `object` holds that the extractor keys (under
+/// `owner`) as a function of the module under that key, and note its span
+/// so module scope does not read its body again (carrick#3356, #3370).
+#[allow(clippy::too_many_arguments)]
+fn lift_object_members(
+    reader: &Reader<'_>,
+    owner: &str,
+    object: &ObjectLit,
+    module_scope: &ModuleScope,
+    definition_keys: &HashSet<String>,
+    lifted: &mut HashSet<u32>,
+    file: &mut FileIr,
+) {
+    let none = Captured::default();
+    let mut members = Vec::new();
+    object_members(owner, object, 0, &mut members);
+    for (key, member) in members {
+        if !definition_keys.contains(&key) {
+            continue;
+        }
+        let ir = match member {
+            ObjectMember::Function(function) => {
+                reader.function(function, None, module_scope, &none)
+            }
+            ObjectMember::Arrow(arrow) => reader.arrow(arrow, None, module_scope, &none),
+        };
+        lifted.insert(member.span().lo.0);
+        file.functions.insert(key, ir);
     }
 }
 
@@ -10823,6 +10874,76 @@ written.send = () => Promise.resolve(new Response());
             2,
             "only the written-through object's two functions stay detached: {:#?}",
             file.module_level.detached
+        );
+    }
+
+    /// carrick#3370: each function member of a default-exported object (a
+    /// worker's `fetch`, its `queue` handler) is a function of the module
+    /// under the extractor's `default.<member>` key, read once, as a module
+    /// `const` object's are (carrick#3356): module scope does not read its
+    /// body again, and still reads every other entry of the object.
+    #[test]
+    fn a_default_exported_objects_members_are_functions_of_the_module() {
+        let source = r#"
+type Handler = Record<string, unknown>;
+function api(path: string) { return fetch(`https://api.example.com${path}`); }
+function announce(topic: string) { return queue.send(topic); }
+function warm() { return true; }
+export default {
+  async fetch(request: Request) {
+    return api("/health");
+  },
+  queue: async () => announce("jobs.nightly"),
+  admin: { purge: function () { return api("/purge"); } },
+  ready: warm(),
+} satisfies Handler;
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(&path, source).expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let keys: HashSet<String> = [
+            "default.fetch",
+            "default.queue",
+            "default.admin.purge",
+            "api",
+            "announce",
+            "warm",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let file = extract_file_ir(&module, &cm, &keys);
+        for (key, callee) in [
+            ("default.fetch", "api"),
+            ("default.queue", "announce"),
+            ("default.admin.purge", "api"),
+        ] {
+            let member = file
+                .functions
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} is a function: {:?}", file.functions.keys()));
+            let callees: Vec<&str> = member.calls.iter().map(|c| c.callee.as_str()).collect();
+            assert_eq!(callees, vec![callee], "{key}: {:#?}", member.calls);
+        }
+        let module_calls: Vec<&str> = file
+            .module_level
+            .calls
+            .iter()
+            .map(|call| call.callee.as_str())
+            .collect();
+        assert_eq!(module_calls, vec!["warm"], "{:#?}", file.module_level);
+        assert!(
+            file.module_level.nested.is_empty() && file.module_level.detached.is_empty(),
+            "module scope read a member's body again: {:#?}",
+            file.module_level
         );
     }
 
