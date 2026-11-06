@@ -5,66 +5,11 @@ this file through `CLAUDE.md`, Codex reads it directly. Edit this file, not
 `CLAUDE.md`. This is the **public** Rust scanner for Carrick; the private
 companion `carrick-cloud` holds Lambdas, Terraform and the dashboard.
 
-## Carrick
+## Carrick (this repo)
 
-**If the answer is defined by another service — its endpoints, its real
-request/response types, who consumes it, or any local type, constant, or
-SDK helper that mirrors it — ask Carrick before you rely on anything
-local.** Local copies of another service's contract drift and lie; the
-producing service defines the contract, and if two definitions disagree,
-the producer's definition wins. Load the Carrick tools now so they are ready at that
-moment.
-
-**Read the file you are editing. For anything that lives elsewhere in the
-workspace (a helper, an endpoint, a consumer, a type), ask Carrick first,
-then grep to confirm a location.** Run `search_by_intent` before writing
-any helper, parser, validator, or domain function, even when you are sure
-it is new. Grep can prove a name is absent; it can never prove the
-behaviour is.
-
-Then, before you write new code, state one line naming what you asked and
-what came back:
-
-`Carrick checked: <query> -> <result count>`
-
-The loop for cross-service work: `get_service_graph` (who calls whom) →
-`search_by_intent` (prior art) → `get_endpoint_types` (real contracts) →
-build → `check_compatibility` (each consumer, before changing a response
-shape, removing an endpoint, or renaming a path). Before adding or bumping
-an npm package, `get_service_dependencies` surfaces cross-service version
-conflicts at design time. For audit-shaped work, such as inventorying what
-a service calls outside itself, `list_external_calls` enumerates the
-recorded outbound-call candidates (SDK calls, external domains, env-var URL
-bases) with their file and line.
-
-Carrick indexes every service in the project **scanner-evals**
-(workspace **daveymoores**): every function with an intent
-description, its dependencies, and API endpoints with their real
-request/response types, on each repo's main branch, exported or not. Pass
-`project: "scanner-evals"` (or `repo: "<owner/repo>"` from the git
-remote) on every call. Carrick is read-only; data reflects the most recent
-scan of each repo. The index at main is what production integrates
-against, so build against a sibling's contract from the index and merge —
-your unmerged local state does not need to be visible to Carrick.
-
-The index cannot see the Rust scanner as a service (no HTTP surface), so a
-nil result for scanner-internal behaviour is expected; say so rather than
-skipping the call.
-
-Write correct, idiomatic, explicitly typed code; never contort code so the
-scanner can read it. If Carrick fails to extract something written
-normally, that is a Carrick bug to report, not a constraint to code
-around.
-
-### Connect the agent
-
-```
-claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
-codex mcp add carrick --url https://api.carrick.tools/mcp && codex mcp login carrick
-```
-
-One install per harness serves every project in the workspace.
-
+- Project slug if opened alone: `project: "scanner-evals"` (workspace `daveymoores`). The index reads each repo's main, so build against a sibling's contract from the index; unmerged local state need not be visible.
+- The index cannot see the Rust scanner as a service (no HTTP surface), so a nil result for scanner-internal behaviour is expected; say so rather than skipping the call.
+- Write correct, idiomatic, explicitly typed code; never contort code so the scanner can read it. If Carrick fails to extract something written normally, that is a Carrick bug to report, not a constraint to code around.
 
 ## Core Goals (Read First)
 - Build a live, type-aware, intent-aware index of TypeScript services across a GitHub org. The index is the product surface; AI coding agents query it over MCP.
