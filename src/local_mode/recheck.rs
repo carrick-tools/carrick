@@ -1023,6 +1023,7 @@ fn judge_edit(
         &rejoined.index,
         &rejoined.join,
         &wanted,
+        &super::changed::Touched::new(),
     );
     let (outside, inside): (Vec<_>, Vec<_>) = judged
         .problems

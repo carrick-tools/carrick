@@ -536,6 +536,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &rejoined.index,
         &rejoined.join,
         &wanted,
+        &Touched::new(),
     );
     let judged = remap_lines(judged, &root, &rejoined.index, &unmoved);
     output.routes = judged.routes;
@@ -547,6 +548,11 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     output.problems = judged.problems;
     output
 }
+
+/// The files each repo changed since the index was written, by repo label.
+/// A repo with no entry, or `None`, is one git could not list: every file in
+/// it counts as touched (carrick#3411).
+pub(super) type Touched = BTreeMap<String, Option<BTreeSet<String>>>;
 
 /// Every repo's changed source files, keyed by repo name, with the repos
 /// listed as the answer states them.
@@ -892,6 +898,7 @@ pub(super) fn judge(
     rebuilt: &LocalIndex,
     join: &super::LocalJoin,
     changed: &BTreeMap<String, &BTreeSet<String>>,
+    _touched: &Touched,
 ) -> Judged {
     // Which repo each service belongs to, and where that repo is, so a row's
     // repo-relative file can be tested against the changed set and printed
@@ -2013,9 +2020,86 @@ mod tests {
         let mut join = join;
         join.operations[0].resolution_source =
             Some(crate::agents::file_analyzer_agent::ResolutionSource::RequestSpec);
-        let judged = judge(Path::new("/w"), &before, true, &rebuilt, &join, &changed);
+        let judged = judge(
+            Path::new("/w"),
+            &before,
+            true,
+            &rebuilt,
+            &join,
+            &changed,
+            &Touched::new(),
+        );
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
         judged.problems.into_iter().next().unwrap()
+    }
+
+    /// One untouched call at `client.ts:10` the index paired with `h.ts` in
+    /// service `web`, now unmatched; `touched` says which files moved since
+    /// the index.
+    fn judged_untouched_call(touched: Touched) -> Vec<Problem> {
+        let before = index_of(vec![serde_json::json!({
+            "kind": "call", "service": "web", "key": "http|GET|/gone", "dispatch": null,
+            "method": "GET", "path": "/gone", "line": 10, "col": null, "source": "fact",
+            "resolution_source": null, "evidence": null,
+            "counterparts": [{"role": "producer", "service": "web", "file": "h.ts", "line": 1}],
+            "verdict": null
+        })]);
+        let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
+            "scanner_version": "0",
+            "operations": [{
+                "role": "consumer", "service": "web", "key": "http|GET|/gone",
+                "method": "GET", "path": "/gone", "file": "client.ts", "line": 10,
+                "resolution_source": null, "handler": null, "dispatch": null
+            }],
+            "matches": [], "findings": [],
+            "unmatched": [{
+                "method": "GET", "path": "/gone",
+                "call_sites": ["client.ts:10"], "injected": []
+            }],
+            "type_check": {"state": "ran"}
+        }))
+        .expect("a join");
+        let rebuilt = index_of(Vec::new());
+        let edited: BTreeSet<String> = ["edited.ts".to_string()].into();
+        let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();
+        judge(
+            Path::new("/w"),
+            &before,
+            true,
+            &rebuilt,
+            &join,
+            &changed,
+            &touched,
+        )
+        .problems
+    }
+
+    /// A call outside the change whose old producers all sit in files unchanged
+    /// since the index lost its route to the re-scan, not to the work
+    /// (carrick#3411).
+    #[test]
+    fn an_untouched_call_whose_producer_file_is_unchanged_is_drift_not_a_problem() {
+        let touched: Touched = [("web".to_string(), Some(["edited.ts".to_string()].into()))].into();
+        let problems = judged_untouched_call(touched);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// The same call, with its producer's file among those changed since the
+    /// index: the work took the route away.
+    #[test]
+    fn an_untouched_call_whose_producer_file_changed_is_still_reported() {
+        let touched: Touched = [(
+            "web".to_string(),
+            Some(["edited.ts".to_string(), "h.ts".to_string()].into()),
+        )]
+        .into();
+        let problems = judged_untouched_call(touched);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].kind, ProblemKind::NoRoute);
+        assert!(
+            problems[0].outside_the_change && problems[0].fails,
+            "{problems:?}"
+        );
     }
 
     /// A row outside the changed files counts as moved only when the index
@@ -2061,7 +2145,15 @@ mod tests {
         let edited: BTreeSet<String> = ["edited.ts".to_string()].into();
         let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();
 
-        let judged = judge(Path::new("/w"), &before, true, &rebuilt, &join, &changed);
+        let judged = judge(
+            Path::new("/w"),
+            &before,
+            true,
+            &rebuilt,
+            &join,
+            &changed,
+            &Touched::new(),
+        );
 
         assert_eq!(judged.problems.len(), 2, "{:?}", judged.problems);
         assert_eq!(judged.outside_moved, 1, "{:?}", judged.problems);
