@@ -668,9 +668,149 @@ fn agreement_with_wildcards(endpoint_path: &str, call_path: &str) -> Option<u32>
     Some(agreement)
 }
 
+/// True if `host` exactly equals, or is a subdomain of, one of `domains`
+/// (carrick#3441: the one implementation of the internal/external host rule).
+///
+/// Comparison is case-insensitive because DNS hostnames are. Entries may be
+/// bare hosts (`api.example.com`) or full URLs (`https://api.example.com`);
+/// both reduce to a bare host. The host's own port is ignored. There is
+/// deliberately no substring matching: host `company` must not match a
+/// configured `api.company.com`, and `api.com` must not match it either.
+pub fn host_matches_domains<S: AsRef<str>>(
+    host: &str,
+    domains: impl IntoIterator<Item = S>,
+) -> bool {
+    let host_without_port = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    domains.into_iter().any(|domain| {
+        let domain = domain_host(domain.as_ref());
+        host_without_port == domain || host_without_port.ends_with(&format!(".{domain}"))
+    })
+}
+
+/// Reduce a configured domain entry (`carrick.json` `internalDomains` /
+/// `externalDomains`) to a bare, comparable lowercase hostname: no scheme,
+/// path, query or port.
+pub fn domain_host(domain: &str) -> String {
+    let lower = domain.to_ascii_lowercase();
+    let without_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(&lower);
+    let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+    host.split(':').next().unwrap_or(host).to_string()
+}
+
+/// The route of a call whose literal `http(s)://` host a project declares
+/// internal, else `None` (carrick#3441).
+///
+/// `call_path` is a call target as stored (`https://api.example.com/jobs/run`).
+/// When its host equals, or is a subdomain of, an entry of `internal_domains`
+/// (the union of every service's `carrick.json` `internalDomains`), the call
+/// is this system's own and is compared by its path: the result is the route
+/// (`/jobs/run`) with query and fragment dropped, `/` when there is none.
+/// Anything else is `None`: relative paths, an undeclared host, a lookalike
+/// (`api.example.com.evil`, `evil-api.example.com`), a host that is an
+/// interpolation (`${host}`), and `user@host` forms whose real host is the
+/// part after the `@`. An undeclared host is a third party, never guessed
+/// internal (carrick-cloud#656).
+///
+/// HTTP only: other protocols pair by name, not by host.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn internal_origin_path(call_path: &str, internal_domains: Vec<String>) -> Option<String> {
+    let trimmed = call_path.trim_matches(|c| c == '`' || c == '"' || c == '\'');
+    let lower_prefix = trimmed.get(..8).map(str::to_ascii_lowercase);
+    let rest = match lower_prefix.as_deref() {
+        Some("https://") => &trimmed[8..],
+        _ => match trimmed.get(..7).map(str::to_ascii_lowercase).as_deref() {
+            Some("http://") => &trimmed[7..],
+            _ => return None,
+        },
+    };
+    let (authority, tail) = match rest.find(|c| c == '/' || c == '?' || c == '#') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if host.is_empty() || host.contains('$') || host.contains('{') {
+        return None;
+    }
+    if !host_matches_domains(host, &internal_domains) {
+        return None;
+    }
+    let route = tail.split(|c| c == '?' || c == '#').next().unwrap_or("");
+    Some(if route.is_empty() {
+        "/".to_string()
+    } else {
+        route.to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- internal origin (carrick#3441) -------------------------------------
+
+    fn internal(call: &str, domains: &[&str]) -> Option<String> {
+        internal_origin_path(call, domains.iter().map(|d| d.to_string()).collect())
+    }
+
+    #[test]
+    fn a_declared_host_reduces_to_its_route() {
+        let d = ["api.ledger.example"];
+        assert_eq!(
+            internal("https://api.ledger.example/jobs/run", &d).as_deref(),
+            Some("/jobs/run")
+        );
+        assert_eq!(
+            internal("http://api.ledger.example:8080/jobs/status?x=1#f", &d).as_deref(),
+            Some("/jobs/status")
+        );
+        assert_eq!(
+            internal("https://API.Ledger.Example/jobs", &d).as_deref(),
+            Some("/jobs")
+        );
+        assert_eq!(
+            internal("https://api.ledger.example", &d).as_deref(),
+            Some("/")
+        );
+    }
+
+    #[test]
+    fn subdomains_and_url_shaped_entries_match() {
+        assert_eq!(
+            internal("https://eu.api.ledger.example/x", &["api.ledger.example"]).as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            internal(
+                "https://api.ledger.example/x",
+                &["https://api.ledger.example"]
+            )
+            .as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            internal(
+                "https://api.ledger.example/x",
+                &["HTTPS://API.ledger.example/v1"]
+            )
+            .as_deref(),
+            Some("/x")
+        );
+    }
+
+    #[test]
+    fn lookalikes_undeclared_and_unreadable_hosts_do_not_match() {
+        let d = ["api.ledger.example"];
+        assert_eq!(internal("https://api.ledger.example.evil/x", &d), None);
+        assert_eq!(internal("https://evil-api.ledger.example/x", &d), None);
+        assert_eq!(internal("https://api.ledger.example@evil.com/x", &d), None);
+        assert_eq!(internal("https://api.mailer.example/v1/send", &d), None);
+        assert_eq!(internal("https://${host}/x", &d), None);
+        assert_eq!(internal("/jobs/run", &d), None);
+        assert_eq!(internal("https://api.ledger.example/x", &[]), None);
+    }
 
     // --- methods (carrick#1148) --------------------------------------------
 
