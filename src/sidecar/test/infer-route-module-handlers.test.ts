@@ -544,17 +544,21 @@ describe('carrick#807: a handler its module exports by method name', () => {
       );
     });
 
-    it('takes the located payload as proof of the sender and reads every body it sends', async () => {
+    it('keeps the located payload as a lead, never as the type (blueprint row N34)', async () => {
+      // The model's locator is the only word that the unresolved call sends a
+      // response: the row keeps the walk's honest `any`, and the located
+      // argument's reading rides in its provenance.
       const inferred = await located(
         'export async function oneOrMany',
         '{ many: await listParts() }'
       );
-      assert.ok(inferred, 'the located payload is an argument of a returned call');
-      // Both sends, in source order; the printer puts `null` first in a union.
-      assert.strictEqual(
-        collapse(inferred.type_string),
-        `{ one: null | ${PART}; } | { many: ${PART}[]; }`
-      );
+      assertAbstains(inferred, 'a model locator alone never types the response');
+      if (inferred) {
+        const provenance = (inferred as { any_provenance?: Array<{ reason: string; detail?: string }> })
+          .any_provenance ?? [];
+        const lead = provenance.find((p) => p.reason === 'no_payload_evidence');
+        assert.match(lead?.detail ?? '', /model located/, JSON.stringify(provenance));
+      }
     });
 
     it('publishes the success body when the located expression is the error body', async () => {

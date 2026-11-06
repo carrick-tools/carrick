@@ -62,7 +62,7 @@ interface InferShape {
   inferred_types?: Array<{
     alias: string;
     type_string: string;
-    any_provenance?: Array<{ reason: string }>;
+    any_provenance?: Array<{ reason: string; detail?: string }>;
   }>;
 }
 
@@ -115,6 +115,26 @@ describe('carrick#2472 T7: declared serialiser callee', () => {
     return (res.inferred_types ?? []).find((t) => t.alias === alias);
   }
 
+  // The model's response locator: `claims`, the argument of the handler's
+  // success return, asked at the line that declares the handler (carrick#807).
+  async function inferLocated(alias: string, marker: string, returnMarker: string) {
+    const res = await client.send<InferShape>({
+      action: 'infer',
+      request_id: alias,
+      requests: [
+        {
+          file_path: routePath,
+          line_number: lineOf(marker),
+          infer_kind: 'response_body',
+          alias,
+          expression_text: 'claims',
+          expression_line: lineOf(returnMarker),
+        },
+      ],
+    });
+    return (res.inferred_types ?? []).find((t) => t.alias === alias);
+  }
+
   it('reads the payload from the returned argument when the callee declares a Response', async () => {
     const inferred = await inferReturn('Declared_Response', 'function declaredCallee');
     assert.ok(inferred, 'must resolve a contract, not abstain');
@@ -128,5 +148,33 @@ describe('carrick#2472 T7: declared serialiser callee', () => {
     assert.ok(inferred);
     assert.strictEqual(collapse(inferred.type_string), 'any');
     assert.strictEqual((inferred.any_provenance ?? [])[0]?.reason, 'no_payload_evidence');
+  });
+
+  // Blueprint row N34: where the returned callee resolves to nothing, the
+  // model's locator alone says the call is a response sender. That is a lead,
+  // never a type the check enforces: the row stays at the honest `any`, and
+  // the lead rides in its provenance.
+  it('an unresolved callee: the model-located body is a lead in the provenance, not the type', async () => {
+    const inferred = await inferLocated(
+      'Undeclared_Located',
+      'function undeclaredCallee',
+      'return undeclared(claims)'
+    );
+    assert.ok(inferred, 'the row keeps its honest any');
+    assert.strictEqual(collapse(inferred.type_string), 'any');
+    const lead = (inferred.any_provenance ?? []).find((p) => p.reason === 'no_payload_evidence');
+    assert.ok(lead, JSON.stringify(inferred.any_provenance));
+    assert.match(lead.detail ?? '', /model located/);
+    assert.match(lead.detail ?? '', /Detail|id: string/);
+  });
+
+  it('a declared callee: the located body is still the type', async () => {
+    const inferred = await inferLocated(
+      'Declared_Located',
+      'function declaredCallee',
+      'return serialise(claims)'
+    );
+    assert.ok(inferred);
+    assert.strictEqual(collapse(inferred.type_string), '{ id: string; label: string; }');
   });
 });
