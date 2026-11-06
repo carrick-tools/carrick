@@ -137,10 +137,12 @@ workspace keeps the hook entries and skill bodies of whichever version first ran
   `init`, `doctor`, `remove` or `uninstall` (`npm/carrick/src/init/outdated.ts`). The day it
   was last said is `~/.carrick/last-notice`, and it is only spent when there was
   something to say.
-- **Session start** brings our own files up to date itself, in Claude Code
+- **Session start** brings our own files up to date itself
   (`npm/carrick/src/init/self-update.ts`): the hook entries in
-  `.claude/settings.json` and `.claude/settings.local.json`, and the task skills
-  still ours under `.claude/skills` and `.agents/skills`. It prints one line for
+  `.claude/settings.json` and `.claude/settings.local.json` (Claude Code
+  sessions only), and, in Claude Code and Codex alike, the task skills still
+  ours under `.claude/skills` and `.agents/skills` and the Carrick rules section
+  between its markers in `AGENTS.md`. It prints one line for
   each ("Carrick brought its hook entries in <file> up to date for <version>.")
   and records the version, so the "run `carrick init`" line is not what an
   upgrade costs. It skips a file that holds no entry of ours, a settings file
