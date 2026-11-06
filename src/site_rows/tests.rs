@@ -1830,6 +1830,7 @@ fn traced_site(file: &str, start: u32, ends: &[(&str, Option<&str>)]) -> Decided
                 parts: Vec::new(),
                 end: end.to_string(),
                 own: None,
+                own_pieces: Vec::new(),
             },
         )
         .collect();

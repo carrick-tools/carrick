@@ -433,18 +433,28 @@ fn states_first_segment(name: &[crate::request_summary::Piece]) -> bool {
 }
 
 /// The last part of a traced route's address: the path `own` its own call
-/// writes, at that call.
-fn own_part(site: &DecidedSite, own: &str) -> crate::address::Part {
+/// writes, at that call, as `pieces` where the compiler folded it from
+/// constants (their text is `own`), else as its text.
+fn own_part(
+    site: &DecidedSite,
+    own: &str,
+    pieces: &[crate::address::Piece],
+) -> crate::address::Part {
     use crate::address;
+    let text: Option<String> = pieces.iter().map(address::Piece::text).collect();
+    let pieces = match text {
+        Some(text) if !pieces.is_empty() && text == own => pieces.to_vec(),
+        _ => vec![address::Piece::Lit {
+            text: own.to_string(),
+        }],
+    };
     address::Part {
         kind: address::PartKind::Own,
         dimension: address::Dimension::Path,
         at: format!("{}:{}", site.file, site.line),
         member: site.end.member.clone(),
         value: address::Value::Text {
-            values: vec![vec![address::Piece::Lit {
-                text: own.to_string(),
-            }]],
+            values: vec![pieces],
         },
         via: address::Via::Label,
     }
@@ -509,7 +519,7 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
             return Err("unread_prefix".to_string().into());
         };
         let mut parts = composed.parts.clone();
-        parts.push(own_part(site, &own));
+        parts.push(own_part(site, &own, &composed.own_pieces));
         let (paths, addresses) = by_own.entry(own).or_default();
         addresses
             .entry(path.clone())

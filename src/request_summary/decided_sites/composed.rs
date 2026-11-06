@@ -47,6 +47,11 @@ pub struct Composed {
     /// the call writes it whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub own: Option<String>,
+    /// The pieces of `own` where the compiler folded it from constants
+    /// (carrick#3213): its own part's value, each folded piece with the
+    /// file that declares it. Empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub own_pieces: Vec<address::Piece>,
 }
 
 impl Composed {
@@ -609,6 +614,7 @@ pub(super) fn compose(
                 parts: chain.parts.clone(),
                 end: chain.end.clone(),
                 own: None,
+                own_pieces: Vec::new(),
             };
             if out.contains(&composed) {
                 continue;

@@ -1734,3 +1734,32 @@ fn a_traced_route_stores_the_parts_of_its_address() {
         }
     }
 }
+
+/// Address chain S1 over carrick#3213's fold: a route path written as a
+/// template over a constant another package exports
+/// (`${LOGIN_PATH}/:id`) stores its own part as the compiler folded it: the
+/// constant's text, `folded` from the file in the other package that
+/// declares it, then the text the call writes.
+#[test]
+fn a_route_path_over_another_packages_constant_stores_where_it_is_declared() {
+    let on = scan_fixture("receiver-route-nested-template");
+    let addresses = endpoint_addresses(&on);
+    let (row, address) = addresses
+        .iter()
+        .find(|(row, _)| row.ends_with("main.ts:9 GET /auth/login/:id"))
+        .unwrap_or_else(|| panic!("{addresses:#?}"));
+    let own = address["parts"]
+        .as_array()
+        .and_then(|parts| parts.last())
+        .unwrap_or_else(|| panic!("{row}: {address}"));
+    assert_eq!(own["kind"], "own", "{row}: {address}");
+    assert_eq!(
+        own["value"]["values"],
+        serde_json::json!([[
+            { "piece": "folded", "text": "/auth/login", "from": "packages/paths/src/index.ts" },
+            { "piece": "lit", "text": "/:id" },
+        ]]),
+        "{row}: {address}"
+    );
+    assert_eq!(address["reading"], "whole", "{row}: {address}");
+}

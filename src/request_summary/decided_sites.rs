@@ -2506,17 +2506,29 @@ fn decide(
                         // values the compiler types as one string each, from
                         // any package (carrick#3213): the one way it reads.
                         // Else each way a conditional or a default writes.
-                        let ways = match site
+                        match site
                             .end
                             .op
                             .as_deref()
                             .filter(|op| *op == "receive")
                             .and_then(|_| fold.own_path(site))
                         {
-                            Some(own) => vec![own],
-                            None => route_ways(site, labels, &calls, root),
-                        };
-                        composed::compose_ways(&site.instances, &ways, &mounts)
+                            // The folded path's pieces are its own part's
+                            // value (address chain S1).
+                            Some((own, pieces)) => {
+                                let (mut composed, trimmed) =
+                                    composed::compose_ways(&site.instances, &[own], &mounts);
+                                for composed in &mut composed {
+                                    composed.own_pieces = pieces.clone();
+                                }
+                                (composed, trimmed)
+                            }
+                            None => composed::compose_ways(
+                                &site.instances,
+                                &route_ways(site, labels, &calls, root),
+                                &mounts,
+                            ),
+                        }
                     }
                 };
             }
