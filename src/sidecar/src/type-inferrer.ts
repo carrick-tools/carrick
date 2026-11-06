@@ -50,6 +50,7 @@ import type {
   InferredType,
   InferKind,
   ModelSymbol,
+  ModelSymbolRelation,
   SourceLocation,
   StatedBody,
   ExtractionConfig,
@@ -1069,6 +1070,46 @@ export class TypeInferrer {
       if (answer) inferred.model_symbol_relation = answer;
     } catch (err) {
       // The relation only ever adds an answer; it never costs one.
+      this.logError(
+        `Model symbol relation failed for ${inferred.alias}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
+   * Blueprint row N27 (i) (carrick#3334): a consumer call whose result is
+   * untyped (`client.post(url, event)` on an untyped client) states nothing
+   * the model's symbol could be compared with, and the model sometimes names
+   * the type of what the call SENDS. Where the symbol is the type of one of
+   * the call's arguments, or that argument's element, the answer is
+   * `different`: the symbol names the request, not the result, and the
+   * driver drops it so the inference defines the alias.
+   *
+   * Nothing is recorded where the result (`read`, the type the published
+   * text prints) is typed: a consumer's read can be a later expression of
+   * the caller's, so a typed result is not related here.
+   */
+  private relateModelSymbolToArguments(
+    request: InferRequestItem,
+    inferred: InferredType,
+    callExpr: CallExpression,
+    read: Type | undefined
+  ): void {
+    if (request.infer_kind !== 'call_result' || !read) return;
+    const named = this.modelSymbols.get(inferred.alias);
+    if (!named) return;
+    const result = this.unwrapPromiseType(read);
+    if (!result.isAny() && !result.isUnknown()) return;
+    try {
+      const symbolType = this.modelSymbolType(named);
+      if (!symbolType) return;
+      const checker = this.project.getTypeChecker().compilerObject;
+      const sent = callExpr.getArguments().some((argument) => {
+        const answer = relateSymbolToRead(checker, symbolType.compilerType, [argument.getType().compilerType]);
+        return answer?.relation === 'same' || answer?.relation === 'list';
+      });
+      if (sent) inferred.model_symbol_relation = { relation: 'different' };
+    } catch (err) {
       this.logError(
         `Model symbol relation failed for ${inferred.alias}: ${err instanceof Error ? err.message : String(err)}`
       );
@@ -3625,6 +3666,8 @@ export class TypeInferrer {
         : undefined;
     if (statedBody) {
       inferred.stated_body = statedBody;
+    } else {
+      this.relateModelSymbolToArguments(request, inferred, callExpr, printedType);
     }
     // carrick#1842: `string` cannot tell a body read as raw text from a JSON
     // body that is a string, and raw text states no structural contract. The
@@ -3882,13 +3925,36 @@ export class TypeInferrer {
     }
     const source = symbol?.getDeclarations()[0]?.getSourceFile().getFilePath();
     const typeArguments = node.getTypeArguments().length;
+    const rootRelation = symbol ? this.statedRootRelation(symbol, typeNode) : undefined;
     return {
       root: nameNode.getText(),
       ...(source ? { root_source: source } : {}),
       ...depthField,
       ...(typeArguments > 0 ? { root_type_arguments: typeArguments } : {}),
+      ...(rootRelation ? { root_relation: rootRelation } : {}),
       ...(this.isFrameworkMachinery(node.getType()) ? { machinery: true as const } : {}),
     };
+  }
+
+  /**
+   * Blueprint row N30 (carrick#3336): how the root's declared type (what
+   * bundling the root alone publishes) relates to the type the source states
+   * (`as readonly User[]` against `User`: a list, 1 deep). The compiler
+   * decides; the printed text is never compared. A generic root's declared
+   * type keeps its parameters, so `Page<User>` relates to `Page` as
+   * `different`. Absent where nothing could be compared.
+   */
+  private statedRootRelation(symbol: TsSymbol, typeNode: Node): ModelSymbolRelation | undefined {
+    try {
+      return relateSymbolToRead(
+        this.project.getTypeChecker().compilerObject,
+        symbol.getDeclaredType().compilerType,
+        [this.unwrapPromiseType(typeNode.getType()).compilerType]
+      );
+    } catch (err) {
+      this.logError(`Stated root relation failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
   }
 
   private inferVariable(

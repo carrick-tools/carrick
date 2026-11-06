@@ -2129,6 +2129,12 @@ pub struct StatedBody {
     /// is declared, as `InferredType::machinery`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub machinery: bool,
+    /// Blueprint row N30: how `root`'s declared type, what bundling `root`
+    /// alone publishes, relates to the stated type (`readonly User[]` against
+    /// `User`: `List`, depth 1). The sidecar's compiler decides it; `None`
+    /// where nothing could be compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_relation: Option<ModelSymbolRelation>,
 }
 
 /// Information about a symbol that failed to resolve
@@ -4348,7 +4354,7 @@ impl TypeSidecar {
             let infer_response = self.infer_types_beside_model_symbols(
                 infer,
                 extraction_config,
-                &producer_response_model_symbols(explicit, infer),
+                &model_symbols_for_reads(explicit, infer),
                 server_claims,
             )?;
             if let Some(inferred) = infer_response.inferred_types {
@@ -4730,7 +4736,8 @@ fn frame_errors(value: &serde_json::Value) -> String {
 /// source says the body is not: an element inside it (`as Promise<{ members:
 /// Member[] }>`, model `Member`) or a value the caller computed from it (the
 /// enclosing function's mapped return). The explicit request is then re-aimed
-/// at the stated root when the inference is its bare named form and its
+/// at the stated root when the compiler relates the root's declared type to
+/// the statement as the same type or a list of it (blueprint row N30) and its
 /// declaration file is known, and dropped otherwise, so the alias is defined
 /// by the inference itself. The fan-in keep above applies to both witnesses.
 ///
@@ -4741,7 +4748,10 @@ fn frame_errors(value: &serde_json::Value) -> String {
 /// The symbol is kept where it is the read or one member of it beside
 /// another body, kept at the read's depth where the read is a list of it,
 /// and dropped otherwise, so the inference defines the alias
-/// (`arbitrate_model_symbol`). No relation, no change. A symbol dropped only
+/// (`arbitrate_model_symbol`). No relation, no change. A consumer call's
+/// result (`call_result`, blueprint row N27 (i)) carries a relation only
+/// where the call's result is untyped and the symbol is the type of what the
+/// call sends: `Different`, so the borrowed request type is dropped. A symbol dropped only
 /// because the read adds `null` or `undefined` to it is not reported in
 /// `changed`: it still names the body.
 ///
@@ -4782,10 +4792,9 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
             if inf.infer_kind == InferKind::CallResult
                 && let Some(stated) = inf.stated_body.as_ref()
             {
-                return arbitrate_stated_body(req, alias, inf, stated);
+                return arbitrate_stated_body(req, alias, stated);
             }
-            if reads_producer_response(&inf.infer_kind)
-                && names_producer_response(req)
+            if model_symbol_is_related(req, &inf.infer_kind)
                 && let Some(relation) = inf.model_symbol_relation.as_ref()
             {
                 return arbitrate_model_symbol(req, alias, relation);
@@ -4961,17 +4970,31 @@ fn names_producer_response(req: &SymbolRequest) -> bool {
     !req.consumer_response && !req.payload_borrow_witness && req.array_depth.is_none()
 }
 
-/// The model's symbol for each producer response `infer` reads: an explicit
+/// Whether the sidecar relates `req`'s symbol to an inference of `kind`: a
+/// producer's response read (carrick#2111), or a consumer call's result
+/// (blueprint row N27 (i)), where the sidecar answers only `Different`, for a
+/// symbol that is the type of what an untyped call sends. A consumer's
+/// symbol may be a status table: the sidecar never finds one as an argument's
+/// type, so it is sent like any other.
+fn model_symbol_is_related(req: &SymbolRequest, kind: &InferKind) -> bool {
+    match kind {
+        InferKind::ResponseBody | InferKind::FunctionReturn => names_producer_response(req),
+        InferKind::CallResult => !req.payload_borrow_witness && req.array_depth.is_none(),
+        _ => false,
+    }
+}
+
+/// The model's symbol for each read the sidecar relates it to (a producer
+/// response, carrick#2111; a consumer call result, N27 (i)): an explicit
 /// request and an infer item that share an alias no other explicit request
-/// carries (carrick#2111).
-pub(crate) fn producer_response_model_symbols(
+/// carries.
+pub(crate) fn model_symbols_for_reads(
     explicit: &[SymbolRequest],
     infer: &[InferRequestItem],
 ) -> Vec<ModelSymbol> {
-    let read: HashSet<&str> = infer
+    let read: HashMap<&str, &InferKind> = infer
         .iter()
-        .filter(|item| reads_producer_response(&item.infer_kind))
-        .filter_map(|item| item.alias.as_deref())
+        .filter_map(|item| Some((item.alias.as_deref()?, &item.infer_kind)))
         .collect();
     let mut alias_counts: HashMap<&str, usize> = HashMap::new();
     for req in explicit {
@@ -4981,13 +5004,15 @@ pub(crate) fn producer_response_model_symbols(
     }
     explicit
         .iter()
-        .filter(|req| names_producer_response(req))
         .filter_map(|req| {
             let alias = req.alias.as_deref()?;
-            (read.contains(alias) && alias_counts.get(alias) == Some(&1)).then(|| ModelSymbol {
-                alias: alias.to_string(),
-                symbol_name: req.symbol_name.clone(),
-                source_file: req.source_file.clone(),
+            let kind = read.get(alias)?;
+            (model_symbol_is_related(req, kind) && alias_counts.get(alias) == Some(&1)).then(|| {
+                ModelSymbol {
+                    alias: alias.to_string(),
+                    symbol_name: req.symbol_name.clone(),
+                    source_file: req.source_file.clone(),
+                }
             })
         })
         .collect()
@@ -5034,19 +5059,30 @@ fn arbitrate_model_symbol(
 fn arbitrate_stated_body(
     req: &SymbolRequest,
     alias: &str,
-    inf: &InferredType,
     stated: &StatedBody,
 ) -> Option<SymbolRequest> {
     if stated.root.as_deref() == Some(req.symbol_name.as_str()) {
         return Some(req.clone());
     }
-    let mut named_form = inf.type_string.trim();
-    while let Some(stripped) = named_form.strip_suffix("[]") {
-        named_form = stripped.trim_end();
-    }
-    if let (Some(root), Some(root_source)) = (stated.root.as_deref(), stated.root_source.as_deref())
-        && named_form == root
-        && !stated.machinery
+    // Blueprint row N30: the compiler says whether bundling the root alone
+    // publishes the stated type (`Same`) or a list of it (`List`), whatever
+    // the statement prints (`readonly User[]`, `Users`).
+    let reaim_depth = match stated.root_relation.as_ref() {
+        Some(ModelSymbolRelation {
+            relation: SymbolRelationKind::Same,
+            ..
+        }) => Some(None),
+        Some(ModelSymbolRelation {
+            relation: SymbolRelationKind::List,
+            depth,
+        }) => Some(depth.filter(|depth| *depth > 0)),
+        _ => None,
+    };
+    if let (Some(root), Some(root_source), Some(array_depth)) = (
+        stated.root.as_deref(),
+        stated.root_source.as_deref(),
+        reaim_depth,
+    ) && !stated.machinery
     {
         info!(
             alias = %alias,
@@ -5059,7 +5095,7 @@ fn arbitrate_stated_body(
             symbol_name: root.to_string(),
             source_file: root_source.to_string(),
             alias: req.alias.clone(),
-            array_depth: stated.array_depth,
+            array_depth,
             payload_borrow_witness: false,
             consumer_response: false,
         });
@@ -7766,6 +7802,7 @@ mod tests {
                 array_depth: None,
                 root_type_arguments: None,
                 machinery: false,
+                root_relation: None,
             },
         )];
 
@@ -7789,6 +7826,7 @@ mod tests {
                 array_depth: None,
                 root_type_arguments: None,
                 machinery: false,
+                root_relation: None,
             },
         )];
 
@@ -7814,6 +7852,10 @@ mod tests {
                 array_depth: Some(1),
                 root_type_arguments: None,
                 machinery: false,
+                root_relation: Some(ModelSymbolRelation {
+                    relation: SymbolRelationKind::List,
+                    depth: Some(1),
+                }),
             },
         )];
 
@@ -7824,6 +7866,100 @@ mod tests {
         assert_eq!(kept[0].source_file, "/repo/src/pages.ts");
         assert_eq!(kept[0].array_depth, Some(1));
         assert_eq!(kept[0].alias.as_deref(), Some("Page_Response_Call1"));
+    }
+
+    /// Blueprint row N30: a statement the root's name does not print
+    /// (`readonly MemberPage[]`) is re-aimed by the compiler's relation of
+    /// the root to it, never by the text with `[]` stripped.
+    #[test]
+    fn arbitration_reaims_at_a_root_the_compiler_relates_as_a_readonly_list() {
+        let explicit = vec![symbol_request("Member", "Page_Response_Call1", None)];
+        let inferred = vec![stated_call_result(
+            "Page_Response_Call1",
+            "readonly MemberPage[]",
+            StatedBody {
+                root: Some("MemberPage".to_string()),
+                root_source: Some("/repo/src/pages.ts".to_string()),
+                array_depth: Some(1),
+                root_relation: Some(ModelSymbolRelation {
+                    relation: SymbolRelationKind::List,
+                    depth: Some(1),
+                }),
+                ..StatedBody::default()
+            },
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
+
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].symbol_name, "MemberPage");
+        assert_eq!(kept[0].source_file, "/repo/src/pages.ts");
+        assert_eq!(kept[0].array_depth, Some(1));
+    }
+
+    /// N30: a root the statement prints by its bare name, whose relation the
+    /// compiler did not answer `Same` or `List`, is not re-aimed at: a
+    /// generic root (`Page<Member>`) loses its argument when bundled alone,
+    /// and a root with `null` beside it publishes without the `null`.
+    #[test]
+    fn arbitration_never_reaims_at_a_root_the_compiler_does_not_relate() {
+        for (text, relation) in [
+            ("Page", Some(SymbolRelationKind::Different)),
+            ("Page", Some(SymbolRelationKind::Nullable)),
+            ("Page", None),
+        ] {
+            let explicit = vec![symbol_request("Member", "Page_Response_Call1", None)];
+            let inferred = vec![stated_call_result(
+                "Page_Response_Call1",
+                text,
+                StatedBody {
+                    root: Some("Page".to_string()),
+                    root_source: Some("/repo/src/pages.ts".to_string()),
+                    root_type_arguments: Some(1),
+                    root_relation: relation.map(|relation| ModelSymbolRelation {
+                        relation,
+                        depth: None,
+                    }),
+                    ..StatedBody::default()
+                },
+            )];
+
+            let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
+
+            assert!(kept.is_empty(), "{relation:?}: {kept:?}");
+        }
+    }
+
+    /// Blueprint row N27 (i): the model named the type an untyped call
+    /// sends (`client.post(url, event)`, `event: AuditEvent`) as the type it
+    /// receives. The sidecar answers `Different` on the call's result, and
+    /// the request is dropped, so the inference defines the alias and the
+    /// manifest row lets the symbol go.
+    #[test]
+    fn arbitration_drops_a_model_symbol_the_untyped_call_sends() {
+        let explicit = vec![SymbolRequest {
+            consumer_response: true,
+            ..symbol_request("AuditEvent", "Audit_Response_Call1", None)
+        }];
+        let mut inf = related(
+            "Audit_Response_Call1",
+            InferKind::CallResult,
+            SymbolRelationKind::Different,
+            None,
+        );
+        inf.type_string = "any".to_string();
+
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &[inf]);
+
+        assert!(arbitrated.requests.is_empty(), "{:?}", arbitrated.requests);
+        assert_eq!(
+            arbitrated.changed,
+            vec![AnchorChange {
+                alias: "Audit_Response_Call1".to_string(),
+                rejected: "AuditEvent".to_string(),
+                reaimed: None,
+            }]
+        );
     }
 
     /// A stated root that is transport machinery is never installed as a
@@ -7841,6 +7977,7 @@ mod tests {
                 array_depth: None,
                 root_type_arguments: None,
                 machinery: true,
+                root_relation: None,
             },
         )];
 
@@ -7939,6 +8076,10 @@ mod tests {
                 array_depth: Some(1),
                 root_type_arguments: None,
                 machinery: false,
+                root_relation: Some(ModelSymbolRelation {
+                    relation: SymbolRelationKind::List,
+                    depth: Some(1),
+                }),
             },
         );
         let borrowed = inferred_with_anchor(
@@ -7999,6 +8140,7 @@ mod tests {
                     array_depth: None,
                     root_type_arguments: None,
                     machinery: false,
+                    root_relation: None,
                 },
             ),
             stated_call_result(
@@ -8175,7 +8317,7 @@ mod tests {
     }
 
     #[test]
-    fn model_symbols_are_sent_for_producer_response_reads_only() {
+    fn model_symbols_are_sent_for_the_reads_the_sidecar_relates() {
         let item = |alias: &str, infer_kind: InferKind| InferRequestItem {
             member: None,
             result: None,
@@ -8203,6 +8345,10 @@ mod tests {
                 ..symbol_request("Table", "Tabled", None)
             },
             SymbolRequest {
+                consumer_response: true,
+                ..symbol_request("AuditEvent", "Consumed", None)
+            },
+            SymbolRequest {
                 payload_borrow_witness: true,
                 ..symbol_request("Event", "Borrowed", None)
             },
@@ -8215,13 +8361,16 @@ mod tests {
             item("Listed", InferKind::ResponseBody),
             item("Tabled", InferKind::ResponseBody),
             item("Borrowed", InferKind::ResponseBody),
+            item("Consumed", InferKind::CallResult),
         ];
 
-        let sent = producer_response_model_symbols(&explicit, &infer);
+        let sent = model_symbols_for_reads(&explicit, &infer);
 
+        // A consumer call's result (N27 (i)) is related too, whatever the
+        // request's consumer flag; a producer read's status table is not.
         assert_eq!(
             sent.iter().map(|s| s.alias.as_str()).collect::<Vec<_>>(),
-            vec!["Returned", "Sent"]
+            vec!["Returned", "Sent", "Called", "Consumed"]
         );
         assert_eq!(sent[0].symbol_name, "ItemDto");
         assert_eq!(sent[0].source_file, explicit[0].source_file);

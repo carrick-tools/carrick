@@ -23757,6 +23757,7 @@ unfollowed_member_calls_total: 0,
             array_depth: None,
             root_type_arguments: None,
             machinery: false,
+            root_relation: None,
         }
     }
 

@@ -1706,9 +1706,11 @@ export interface InferredType {
    */
   stated_body?: StatedBody;
   /**
-   * carrick#2111, a producer's response read only: how the type the model
-   * named for this row relates to the type read here. Absent where the model
-   * named none, or nothing could be compared.
+   * carrick#2111, a producer's response read: how the type the model named
+   * for this row relates to the type read here. Absent where the model named
+   * none, or nothing could be compared. Blueprint row N27 (i), a consumer's
+   * `call_result`: only ever `different`, where the call's result is untyped
+   * and the symbol is the type of an argument the call sends.
    */
   model_symbol_relation?: ModelSymbolRelation;
   /**
@@ -1776,6 +1778,13 @@ export interface StatedBody {
    * declared, as `InferredType.machinery`. Absent otherwise.
    */
   machinery?: true;
+  /**
+   * Blueprint row N30: how `root`'s declared type, the type bundling `root`
+   * alone publishes, relates to the stated type (`readonly User[]` against
+   * `User`: `list`, depth 1). The compiler decides; the scanner re-aims at
+   * `root` only on `same` or `list`. Absent where nothing could be compared.
+   */
+  root_relation?: ModelSymbolRelation;
 }
 
 /**
