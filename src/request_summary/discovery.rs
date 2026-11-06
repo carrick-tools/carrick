@@ -4895,9 +4895,11 @@ export function listen(): void {
         assert_eq!(
             served,
             texts(&[
-                "packages/server/src/main.ts:7 GET /auth/login",
-                "packages/server/src/main.ts:8 GET /auth/login/:id",
-                "packages/server/src/main.ts:9 POST /account/profile/:section",
+                "packages/server/src/main.ts:10 POST /account/profile/:section",
+                "packages/server/src/main.ts:12 GET /auth/reset",
+                "packages/server/src/main.ts:13 GET /auth/reset/:token",
+                "packages/server/src/main.ts:8 GET /auth/login",
+                "packages/server/src/main.ts:9 GET /auth/login/:id",
             ]),
             "{served:#?}"
         );
@@ -4908,7 +4910,7 @@ export function listen(): void {
             .collect();
         assert_eq!(
             guessed,
-            texts(&["packages/server/src/main.ts:10 GET"]),
+            texts(&["packages/server/src/main.ts:11 GET"]),
             "{:#?}",
             routes.guessed
         );
@@ -4933,10 +4935,12 @@ export function listen(): void {
         assert_eq!(
             names,
             texts(&[
-                "10 Lead -",
-                "7 Forced /auth/login",
-                "8 Forced /auth/login/:id",
-                "9 Forced /account/profile/:section",
+                "10 Forced /account/profile/:section",
+                "11 Lead -",
+                "12 Forced /auth/reset",
+                "13 Forced /auth/reset/:token",
+                "8 Forced /auth/login",
+                "9 Forced /auth/login/:id",
             ])
         );
     }

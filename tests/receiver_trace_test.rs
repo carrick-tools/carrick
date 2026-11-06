@@ -866,18 +866,21 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
 /// constants (`${LOGIN_PATH}/:id`, `LOGIN_PATH = `${AUTH_BASE}/login``),
 /// keeps its row: the trace reads the whole path as the compiler types it
 /// and serves the route there. The bare use of the same constant keeps its
-/// row too. A constant whose template holds a value read at runtime
-/// (`STATUS_PATH`) folds to nothing: that site stays guessed and the
-/// reader's row there is withdrawn.
+/// row too, as do both uses of a constant this service builds on another
+/// package's (`RESET_PATH`). A constant whose template holds a value read
+/// at runtime (`STATUS_PATH`) folds to nothing: that site stays guessed and
+/// the reader's row there is withdrawn.
 #[test]
 fn a_route_path_over_a_nested_template_constant_keeps_its_row() {
     let (on, fallbacks) = scan_fixture_reading("receiver-route-nested-template");
     let (graph, _) = endpoint_rows(&on);
     let main: Vec<&String> = graph.iter().filter(|row| row.contains("main.ts")).collect();
     for want in [
-        "main.ts:7 GET /auth/login ",
-        "main.ts:8 GET /auth/login/:id ",
-        "main.ts:9 POST /account/profile/:section ",
+        "main.ts:8 GET /auth/login ",
+        "main.ts:9 GET /auth/login/:id ",
+        "main.ts:10 POST /account/profile/:section ",
+        "main.ts:12 GET /auth/reset ",
+        "main.ts:13 GET /auth/reset/:token ",
     ] {
         assert!(
             main.iter().any(|row| row.contains(want)),
@@ -885,7 +888,7 @@ fn a_route_path_over_a_nested_template_constant_keeps_its_row() {
         );
     }
     assert!(
-        main.iter().all(|row| !row.contains("main.ts:10 ")),
+        main.iter().all(|row| !row.contains("main.ts:11 ")),
         "{main:#?}"
     );
     let counts = route_counts(&fallbacks);
