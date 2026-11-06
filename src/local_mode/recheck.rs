@@ -771,9 +771,13 @@ fn readers_of_the_edit(
 }
 
 /// What the working tree holds, since the index, of the files `service` reads:
-/// a hash of each changed file's path and bytes. The changes no service covers
-/// (a root manifest, a tsconfig) are in every service's digest. `None` when
-/// none of its files changed.
+/// a hash of each changed file's path and bytes. A change no service covers is
+/// in every service's digest only when it is a repo input
+/// ([`crate::change_scope::is_repo_input`]: a manifest, a lockfile,
+/// `carrick.json`, a GraphQL schema). A root file a service reads by name (its
+/// tsconfig chain) is named by [`readers_of_the_edit`], which walks that
+/// service's inputs, and markdown, skill files and hook config at the root are
+/// read by no service (carrick#3465). `None` when none of its files changed.
 fn service_digest(
     repo: &Path,
     changed: &HashSet<String>,
@@ -783,7 +787,11 @@ fn service_digest(
     use sha2::{Digest, Sha256};
     let mut files: Vec<&String> = changed
         .iter()
-        .filter(|file| service.covers(file) || !all.iter().any(|other| other.covers(file)))
+        .filter(|file| {
+            service.covers(file)
+                || (crate::change_scope::is_repo_input(file)
+                    && !all.iter().any(|other| other.covers(file)))
+        })
         .collect();
     if files.is_empty() {
         return None;
