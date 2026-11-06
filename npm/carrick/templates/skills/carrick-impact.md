@@ -45,9 +45,14 @@ For a function:
 get_callers({{SCOPE}}, function_name: "<name>", file: "<file>", depth: 1)
 ```
 
-Each row names the enclosing caller and its line span, not the call-site line.
-Raise `depth` to 2 or 3 for transitive callers. Zero recorded callers is not
-deletion evidence, because a function passed as a value is unmeasured.
+Each row names the enclosing caller and its line span, and carries
+`call_site_line`, the line the call is written on, where the scan recorded one.
+Raise `depth` to 2 or 3 for transitive callers. When `get_callers` returns 0
+rows, grep the function's name across the workspace before you conclude anything:
+a function passed as a value, such as a callback or a handler table entry, is
+not counted. Zero recorded callers with no grep match is the only reading that
+supports "nothing calls this", and a function outside the index is still not
+covered.
 
 ## 3. Verdicts, one consumer at a time
 
