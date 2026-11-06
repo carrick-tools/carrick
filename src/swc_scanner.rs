@@ -5901,6 +5901,99 @@ export class UsersController {
         );
     }
 
+    /// carrick#3422: a class decorator whose one argument is an object states
+    /// its prefix in `path`; the other keys are not read here.
+    #[test]
+    fn object_form_controller_states_its_path_as_the_prefix() {
+        let content = r#"
+import { Controller, Get } from './framework';
+
+@Controller({ path: 'orders', version: '2' })
+export class OrdersController {
+  @Get(':id')
+  find() { return null; }
+}
+
+@Controller({ version: '1' })
+export class RootController {
+  @Get('ping')
+  ping() { return 1; }
+}
+"#;
+        let paths: Vec<String> = decorator_routes(content)
+            .into_iter()
+            .map(|(_, path, _, _)| path)
+            .collect();
+        assert_eq!(paths, vec!["/orders/:id".to_string(), "/ping".to_string()]);
+    }
+
+    /// carrick#3422: a template literal with no substitution is a string.
+    #[test]
+    fn no_substitution_template_prefix_and_path_read_as_literals() {
+        let content = r#"
+import { Controller, Get } from './framework';
+
+@Controller(`reports`)
+export class ReportsController {
+  @Get(`daily`)
+  daily() { return 1; }
+}
+
+@Controller({ path: `layouts` })
+export class LayoutsController {
+  @Get(`:id`)
+  find() { return 1; }
+}
+"#;
+        let paths: Vec<String> = decorator_routes(content)
+            .into_iter()
+            .map(|(_, path, _, _)| path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/layouts/:id".to_string(), "/reports/daily".to_string()]
+        );
+    }
+
+    #[test]
+    fn object_form_from_another_module_states_nothing() {
+        let content = r#"
+import { Get } from './framework';
+import { Docs } from './docs';
+
+@Docs({ path: 'x', version: '9' })
+export class Documented {
+  @Get('one')
+  one() { return 1; }
+}
+"#;
+        assert!(decorator_routes(content).is_empty());
+    }
+
+    #[test]
+    fn object_form_path_that_is_not_a_literal_states_nothing() {
+        let content = r#"
+import { Controller, Get } from './framework';
+const base = 'x';
+
+@Controller({ path: base })
+export class A { @Get('a') a() { return 1; } }
+
+@Controller({ path: ['a', 'b'] })
+export class B { @Get('b') b() { return 1; } }
+
+@Controller({ path: `${base}/c` })
+export class C { @Get('c') c() { return 1; } }
+
+@Controller({ ...base })
+export class D { @Get('d') d() { return 1; } }
+
+@Controller({ [base]: 'e' })
+export class E { @Get('e') e() { return 1; } }
+"#;
+        assert!(decorator_routes(content).is_empty());
+    }
+
     /// carrick#745: the route also carries where its HANDLER declares itself
     /// and what that declaration says about a payload, because the row's own
     /// line is the method's NAME and its span is the whole member — neither of
