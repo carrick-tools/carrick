@@ -1,5 +1,6 @@
-// The per-session record of functions the index does not hold, and the one
-// line the Stop hook speaks from (carrick#1330).
+// The per-session record the hooks keep between calls: the files whose uses
+// lines a session has been shown, the files the Read hook asked about, and the
+// last edit per workspace (`src/hook/reuse.ts`).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -8,12 +9,9 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  markNudged,
-  nudge,
-  pending,
   prune,
   readSession,
-  record,
+  recordEdit,
   removeSessions,
   sessionFile,
   sessionsDir,
@@ -22,7 +20,6 @@ import {
   toldKey,
   wasRead,
   wasTold,
-  type NewFunction,
   snapshotProjectSlug,
 } from "../src/hook/reuse.ts";
 
@@ -31,53 +28,17 @@ function home(): { dir: string; cleanup: () => void } {
   return { dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
-function fn(name: string, file = "src/util/format.ts"): NewFunction {
-  return { name, file, indexCommit: "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233" };
-}
-
 test("the record lives outside every repository, one file per session", (t) => {
   const { dir, cleanup } = home();
   t.after(cleanup);
 
-  record("abc-123", [fn("slugify")], dir);
+  markRead("abc-123", "/w/api/src/a.ts", dir);
   assert.equal(sessionFile("abc-123", dir), path.join(dir, ".carrick", "sessions", "abc-123.json"));
   assert.ok(fs.existsSync(sessionFile("abc-123", dir)!));
   // A session id that could walk out of the directory is not a file name.
   assert.equal(sessionFile("../../etc/passwd", dir), null);
-  record("../../etc/passwd", [fn("slugify")], dir);
-  assert.deepEqual(readSession("../../etc/passwd", dir).found, []);
-});
-
-test("one function is recorded once however many edits touch its file", (t) => {
-  const { dir, cleanup } = home();
-  t.after(cleanup);
-
-  record("s1", [fn("slugify"), fn("titleCase")], dir);
-  record("s1", [fn("slugify")], dir);
-  record("s1", [fn("slugify", "src/other.ts")], dir);
-  assert.deepEqual(
-    readSession("s1", dir).found.map((entry) => `${entry.file}::${entry.name}`),
-    ["src/util/format.ts::slugify", "src/util/format.ts::titleCase", "src/other.ts::slugify"],
-  );
-});
-
-test("a set that has been named is not pending again", (t) => {
-  const { dir, cleanup } = home();
-  t.after(cleanup);
-
-  record("s2", [fn("slugify"), fn("titleCase")], dir);
-  const first = pending(readSession("s2", dir));
-  assert.equal(first.length, 2);
-  markNudged("s2", first, dir);
-  assert.deepEqual(pending(readSession("s2", dir)), []);
-
-  // A function added after the nudge is pending on its own: the rule is "not
-  // this set again", never "this session is done".
-  record("s2", [fn("truncate")], dir);
-  assert.deepEqual(
-    pending(readSession("s2", dir)).map((entry) => entry.name),
-    ["truncate"],
-  );
+  markRead("../../etc/passwd", "/w/api/src/a.ts", dir);
+  assert.deepEqual(readSession("../../etc/passwd", dir).read, []);
 });
 
 test("a record this build cannot read is replaced, not thrown at the caller", (t) => {
@@ -87,20 +48,43 @@ test("a record this build cannot read is replaced, not thrown at the caller", (t
   const file = sessionFile("s3", dir)!;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, "{ not json");
-  assert.deepEqual(readSession("s3", dir).found, []);
-  record("s3", [fn("slugify")], dir);
-  assert.deepEqual(
-    readSession("s3", dir).found.map((entry) => entry.name),
-    ["slugify"],
+  assert.deepEqual(readSession("s3", dir).read, []);
+  markRead("s3", "/w/api/src/a.ts", dir);
+  assert.deepEqual(readSession("s3", dir).read, ["/w/api/src/a.ts"]);
+});
+
+test("a record an older install wrote loads, and its function list is dropped on the next write (carrick#3436)", (t) => {
+  const { dir, cleanup } = home();
+  t.after(cleanup);
+
+  const file = sessionFile("s-old", dir)!;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      found: [{ name: "slugify", file: "src/a.ts", indexCommit: "abc" }],
+      nudged: [],
+      told: ["/w/api::src/a.ts"],
+      read: [],
+      edited: {},
+      updated: "",
+    }),
   );
+  assert.equal(wasTold("s-old", "/w/api::src/a.ts", dir), true);
+  recordEdit("s-old", "/w", 5, dir);
+  const written = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  assert.equal("found" in written, false);
+  assert.equal("nudged" in written, false);
+  assert.deepEqual(written["told"], ["/w/api::src/a.ts"]);
+  assert.deepEqual(written["edited"], { "/w": 5 });
 });
 
 test("records nothing will read again are pruned", (t) => {
   const { dir, cleanup } = home();
   t.after(cleanup);
 
-  record("old", [fn("slugify")], dir);
-  record("new", [fn("titleCase")], dir);
+  markRead("old", "/w/a.ts", dir);
+  markRead("new", "/w/b.ts", dir);
   const old = sessionFile("old", dir)!;
   const ancient = Date.now() - 30 * 24 * 60 * 60 * 1000;
   fs.utimesSync(old, ancient / 1000, ancient / 1000);
@@ -113,35 +97,12 @@ test("remove deletes every record and the directory holding them", (t) => {
   const { dir, cleanup } = home();
   t.after(cleanup);
 
-  record("s4", [fn("slugify")], dir);
-  record("s5", [fn("titleCase")], dir);
+  markRead("s4", "/w/a.ts", dir);
+  markRead("s5", "/w/b.ts", dir);
   assert.equal(removeSessions(dir), 2);
   assert.equal(fs.existsSync(sessionsDir(dir)), false);
   // A machine that never recorded one has nothing to say about it.
   assert.equal(removeSessions(dir), 0);
-});
-
-test("the nudge is short, starts with Carrick, and names at most two functions", () => {
-  const one = nudge([fn("slugify")]);
-  assert.equal(
-    one,
-    "Carrick: this task added 1 new function (slugify). Check them for existing copies with one find_similar call, passing `functions`, one `{ description }` per new function: one plain sentence saying what it does (new functions are not in the index yet, so a name is not found). Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.",
-  );
-  // The argument is named exactly: the server ignores any other name, and an
-  // agent that guessed `entries` got an answer to the wrong question.
-  assert.match(one, /`functions`, one `\{ description \}` per new function/);
-  assert.doesNotMatch(one, /name, file/);
-  assert.doesNotMatch(one, /entries/);
-  assert.doesNotMatch(one, /deliberate variant/);
-  assert.match(
-    nudge([fn("slugify"), fn("titleCase")]),
-    /added 2 new functions \(slugify and titleCase\)\./,
-  );
-  const many = nudge(Array.from({ length: 5 }, (_, index) => fn(`helper${index}`)));
-  assert.match(many, /^Carrick: this task added 5 new functions \(helper0, helper1 and 3 more\)\./);
-  assert.equal(many.includes("helper2"), false);
-  // No paths, no commit, no limits: those live in the carrick-reuse skill.
-  assert.doesNotMatch(many, /src\/|6a1b2c3|default branch|not on its source/);
 });
 
 function workspace(repos: unknown): string {
@@ -156,17 +117,13 @@ function workspace(repos: unknown): string {
   return root;
 }
 
-test("the nudge names the project when the snapshot holds exactly one slug", (t) => {
+test("the snapshot's project slug is read when it holds exactly one", (t) => {
   const root = workspace([{ project_slug: "shop-system" }, { project_slug: "shop-system" }]);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   assert.equal(snapshotProjectSlug(root), "shop-system");
-  assert.match(
-    nudge([fn("slugify")], snapshotProjectSlug(root)),
-    /passing `project: "shop-system"` and `functions`, one `\{ description \}` per new function/,
-  );
 });
 
-test("the nudge has no project clause with no snapshot, bad JSON or several slugs", (t) => {
+test("no slug with no snapshot, bad JSON or several slugs", (t) => {
   const none = workspace(undefined);
   const bad = workspace(undefined);
   fs.mkdirSync(path.join(bad, ".carrick", "hosted"), { recursive: true });
@@ -175,32 +132,21 @@ test("the nudge has no project clause with no snapshot, bad JSON or several slug
   t.after(() => {
     for (const dir of [none, bad, two]) fs.rmSync(dir, { recursive: true, force: true });
   });
-  for (const root of [none, bad, two]) {
-    assert.equal(snapshotProjectSlug(root), "");
-    assert.doesNotMatch(nudge([fn("slugify")], snapshotProjectSlug(root)), /project:/);
-  }
+  for (const root of [none, bad, two]) assert.equal(snapshotProjectSlug(root), "");
 });
 
-// The files whose uses lines a session has been shown (carrick#2067), kept in
-// the same record as the reuse nudge and never at its expense.
-test("a told file is remembered beside the reuse record, and neither drops the other", (t) => {
+// The files whose uses lines a session has been shown (carrick#2067).
+test("a told file is remembered, and an edit stamp keeps it", (t) => {
   const { dir, cleanup } = home();
   t.after(cleanup);
 
-  record("sess-told", [fn("slugify")], dir);
   const key = toldKey({ schema: "carrick.check/0", repo: "/w/api", file: "src/a.ts" }, "ignored.ts");
   assert.equal(key, "/w/api::src/a.ts");
   assert.equal(wasTold("sess-told", key, dir), false);
   markTold("sess-told", [key], dir);
   assert.equal(wasTold("sess-told", key, dir), true);
-  assert.deepEqual(
-    readSession("sess-told", dir).found.map((entry) => entry.name),
-    ["slugify"],
-  );
 
-  // And the reuse writes keep what the told list holds.
-  record("sess-told", [fn("titleCase")], dir);
-  markNudged("sess-told", [fn("slugify")], dir);
+  recordEdit("sess-told", "/w", Date.now(), dir);
   assert.deepEqual(readSession("sess-told", dir).told, [key]);
   // Without a repo or file in the answer, the hook's own path stands in.
   assert.equal(toldKey({ schema: "carrick.check/0" }, "src/b.ts"), "::src/b.ts");
@@ -212,7 +158,6 @@ test("a read file survives a write and a read back, and a write leaves no temp f
   const { dir, cleanup } = home();
   t.after(cleanup);
 
-  record("sess-read", [fn("slugify")], dir);
   assert.equal(wasRead("sess-read", "/w/api/src/a.ts", dir), false);
   markRead("sess-read", "/w/api/src/a.ts", dir);
   markRead("sess-read", "/w/api/src/a.ts", dir);
@@ -220,14 +165,9 @@ test("a read file survives a write and a read back, and a write leaves no temp f
   assert.deepEqual(readSession("sess-read", dir).read, ["/w/api/src/a.ts"]);
   // Neither list drops the other.
   markTold("sess-read", ["/w/api::src/a.ts"], dir);
-  markNudged("sess-read", [fn("slugify")], dir);
   const after = readSession("sess-read", dir);
   assert.deepEqual(after.read, ["/w/api/src/a.ts"]);
   assert.deepEqual(after.told, ["/w/api::src/a.ts"]);
-  assert.deepEqual(
-    after.found.map((entry) => entry.name),
-    ["slugify"],
-  );
   assert.deepEqual(fs.readdirSync(sessionsDir(dir)), ["sess-read.json"]);
 
   // A write replaces the file rather than emptying it in place, so a reader

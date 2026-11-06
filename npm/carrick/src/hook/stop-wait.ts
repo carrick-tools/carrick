@@ -82,7 +82,7 @@ export type StopOptions = {
 };
 
 export type StopResult = {
-  /** Lines to print before the reuse nudge; empty when there is nothing to say. */
+  /** Lines to print; empty when there is nothing to say. */
   lines: string[];
 };
 

@@ -99,13 +99,11 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
         hooks: [{ type: "command", command: `${command} hook session-start`, timeout: 30 }],
       },
     ],
-    // The end of a task, which is the only moment a reuse check is worth a
-    // model turn: the post-edit hook records what each edit added and this
-    // names the lot once (carrick#1330). It reads one small file and prints
-    // nothing when the task added no function. It also waits for a background
-    // re-check of the last edit (B3, carrick#3198), so its timeout sits above
-    // that wait (`STOP_WAIT_S`): a hook that reaches its timeout is cancelled
-    // and its output dropped.
+    // The end of a task: delivers what the background re-checks of this
+    // session's edits answered and waits for the ones still running (B3,
+    // carrick#3198). It names no function the task added (carrick#3436). Its
+    // timeout sits above that wait (`STOP_WAIT_S`): a hook that reaches its
+    // timeout is cancelled and its output dropped.
     Stop: [
       {
         hooks: [

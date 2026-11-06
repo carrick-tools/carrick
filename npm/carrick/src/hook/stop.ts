@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-// Stop hook: one reuse nudge per task, or nothing at all (carrick#1330).
+// Stop hook: what the background re-checks of this session's edits answered,
+// and a wait for the ones still running (`stop-wait.ts`, carrick#3198). It
+// reports what the agent's edits came to; it never asks the agent to start
+// something new at the end of a task (carrick#3436).
 //
 // What it prints, and why that shape: Claude Code delivers a Stop hook's
 // `hookSpecificOutput.additionalContext` to the MODEL and lets the turn
@@ -7,26 +10,18 @@
 // both wrong for this: `systemMessage` is shown to the user and never reaches
 // the model (measured, carrick session 2026-09-03 — a Stop hook fired in 21
 // sessions and changed nothing), and `decision: "block"` reaches the model by
-// refusing to let the turn end, which is a block. This nudge is advice.
+// refusing to let the turn end, which is a block.
 //
-// It is silent whenever it has nothing new to say: no session id, no recorded
-// functions, or every recorded function already named by an earlier stop of
-// the same session. A stop after a stop is the common case — a task is
-// several turns — so "already nudged" is the state this has to get right or
-// the line repeats on every turn until the session ends.
+// It is silent whenever it has nothing to say: no session id, no re-check
+// answer with something to act on, nothing still running.
 //
-// Before the nudge it delivers the answers of background re-checks and waits
-// for the ones still running (`stop-wait.ts`).
+// It exits 0 on every path, like the other hooks.
 //
-// It exits 0 on every path, like the other two.
-//
-// Reference: `docs/reference/task-skills.md`, "The reuse nudge" — the three
-// parts, the channel measurement behind this shape, and what Codex lacks.
+// Reference: `docs/reference/task-skills.md`, "What the hooks deliver".
 
 import { readStdin } from "./stdin.ts";
 import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
-import { drain } from "./reuse.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 import { markInvoker } from "./invoker.ts";
@@ -52,7 +47,7 @@ async function main(): Promise<void> {
   markInvoker("stop");
   // `off` silences every surface this package has, and this is one of them.
   // The `lsp` channel is NOT excluded: it decides who delivers a verdict about
-  // an edited file, and this says nothing about a verdict.
+  // an edited file as it is edited, and the language server has no Stop.
   if (resolveChannel({ hooksInstalled: true }).channel === "off") {
     log("CARRICK_CHANNEL=off; printing nothing");
     return;
@@ -71,32 +66,22 @@ async function main(): Promise<void> {
     return;
   }
 
-  // First: what the background re-checks of this session's edits answered, and
-  // a wait for the ones still running (`--wait-s`, from the settings entry).
-  // Before the nudge, so functions the runner recorded meanwhile are named.
+  // What the background re-checks of this session's edits answered, and a
+  // wait for the ones still running (`--wait-s`, from the settings entry).
   const parts: string[] = [];
   const late = await stopAnswers(session, { waitS: waitSeconds(process.argv.slice(2)) });
   parts.push(...late.lines);
-
-  // `drain` reads the store, builds the line and marks the set as spoken, in
-  // that order. Codex's `UserPromptSubmit` hook calls the same function
-  // (carrick#1335); the difference between the two hosts is the event name on
-  // the wire and nothing else.
-  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
-  const spoken = drain(session, root);
-  if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
-  else parts.push(spoken.line);
 
   // The other thing a task's end is a good moment for: the `carrick` these
   // hooks resolve is not the one that set this workspace up (carrick#1372).
   // Once a day, through the same channel, because a mismatch stands until
   // somebody fixes it and a line per turn would be noise.
+  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
   const mismatch = root === null ? null : throttledVersionMismatch(root, currentVersion());
   if (mismatch) parts.push(mismatch);
 
   if (parts.length === 0) return;
   process.stdout.write(emission(parts.join("\n\n")));
-  if (spoken) log(`named ${spoken.named} new function(s) to the model, of ${spoken.found} recorded`);
 }
 
 await main();

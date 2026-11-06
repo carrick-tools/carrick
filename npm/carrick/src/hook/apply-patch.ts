@@ -4,9 +4,8 @@
 // `apply_patch`, whose PostToolUse payload is
 // `tool_input: { "command": "<the patch text>" }`
 // (`codex-rs/core/src/tools/handlers/apply_patch.rs`), and one patch can add,
-// update, delete and rename several files at once. So the recording half of
-// the reuse nudge needs this: the patch text in, the paths worth re-checking
-// out.
+// update, delete and rename several files at once. So the post-edit hook
+// needs this: the patch text in, the paths worth re-checking out.
 //
 // The grammar is four header lines, each at the start of its own line, inside
 // a `*** Begin Patch` / `*** End Patch` envelope (`codex-rs/apply-patch`):
@@ -29,7 +28,7 @@
 //   compared against is the destination, so the destination replaces the source
 //   rather than joining it.
 //
-// Reference: `docs/reference/task-skills.md`, "The reuse nudge".
+// Reference: `docs/reference/task-skills.md`, "What the hooks deliver".
 
 /** The header that opens a patch, used to tell a patch from any other string. */
 const ENVELOPE = "*** Begin Patch";

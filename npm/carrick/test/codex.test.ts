@@ -55,8 +55,8 @@ test("the entries Codex needs are the entries it gets", () => {
   // One call can carry several files, each a separate check, so this is not the
   // single-file timeout the Claude entry uses.
   assert.equal(written["PostToolUse"]![0]!.hooks[0]!.timeout, 60);
-  // The speaking half. Codex refuses `additionalContext` on `Stop`, so the
-  // nudge rides the next prompt instead, and this event takes no matcher.
+  // The delivering half. Codex refuses `additionalContext` on `Stop`, so
+  // finished re-checks ride the next prompt instead, and this event takes no matcher.
   assert.equal(written["UserPromptSubmit"]![0]!.hooks[0]!.command, "carrick hook user-prompt");
   assert.equal(written["UserPromptSubmit"]![0]!.matcher, undefined);
   assert.equal(written["Stop"], undefined, "a Codex Stop hook could only block");

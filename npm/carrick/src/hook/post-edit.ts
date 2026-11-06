@@ -28,9 +28,7 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { markTold, record, recordEdit, toldKey, wasTold } from "./reuse.ts";
-import type { NewFunction } from "./reuse.ts";
-import { checkoutRelative, newFunctions } from "./edited.ts";
+import { markTold, recordEdit, toldKey, wasTold } from "./reuse.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
@@ -135,7 +133,6 @@ async function main(): Promise<void> {
   // earlier did not read this edit (`checked.ts`).
   if (session) recordEdit(session, choice.root, Date.now());
 
-  const found: NewFunction[] = [];
   const contexts: string[] = [];
   // Files whose uses lines this message carries, remembered only once it is
   // delivered: who uses a file is shown once per file per session (carrick#2067).
@@ -159,7 +156,6 @@ async function main(): Promise<void> {
       if (queueable) toQueue.push(index);
       continue;
     }
-    found.push(...newFunctions(result, checkoutRelative(choice.root, edited[index]!)));
     if (queueable && needsBackground(result)) {
       toQueue.push(index);
       continue;
@@ -193,13 +189,6 @@ async function main(): Promise<void> {
   for (const index of relatives.keys()) {
     const context = rendered.get(index);
     if (context) contexts.push(context);
-  }
-
-  // Silent and local: the names go to a file under the user's home directory
-  // and nothing about them is printed here.
-  if (found.length > 0 && session) {
-    record(session, found);
-    log(`recorded ${found.length} new function(s) for ${session}`);
   }
 
   if (channel.channel !== "hook") {

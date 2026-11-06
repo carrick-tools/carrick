@@ -27,9 +27,8 @@ import { fileURLToPath } from "node:url";
 import { binary, check } from "../cli.ts";
 import type { CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
-import { checkoutRelative, newFunctions } from "./edited.ts";
 import { startDetached } from "./refresh.ts";
-import { record, safeId, sessionsDir, writeAtomic } from "./reuse.ts";
+import { safeId, sessionsDir, writeAtomic } from "./reuse.ts";
 
 const log = createLogger("carrick-recheck");
 
@@ -519,8 +518,6 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
       const finishedAt = clock();
       if (outcome.result) {
         writeAnswer(entry, "answered", startedAt, finishedAt, { result: outcome.result }, options.home);
-        const found = newFunctions(outcome.result, checkoutRelative(root, entry.file));
-        if (found.length > 0) record(entry.session, found, options.home);
       } else {
         const failure = outcome.failure ?? "the re-check gave no answer";
         writeAnswer(entry, "answered", startedAt, finishedAt, { failure }, options.home);

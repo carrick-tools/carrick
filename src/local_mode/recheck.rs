@@ -33,8 +33,9 @@
 //!    index, and neither is the index itself.
 //!
 //! It also answers with the functions the edited file declares that the index
-//! does not hold, which is what the end-of-task reuse nudge speaks from
-//! (carrick#1330; `docs/reference/task-skills.md`, "The reuse nudge"). Those
+//! does not hold (carrick#1330). No hook reads them since the end-of-task
+//! reuse nudge was removed (carrick#3436; `docs/reference/task-skills.md`,
+//! "What the hooks deliver"). Those
 //! come from one parse of the file before either phase starts, and are kept on
 //! a miss too (carrick#2849): on a large monorepo the re-scan alone outlasts
 //! the budget, and the nudge must not depend on it.

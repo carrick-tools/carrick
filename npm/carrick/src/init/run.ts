@@ -809,7 +809,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       `Could not configure Carrick hooks: ${(error as Error).message}. Fix ${settingsName} and ${again()}.`,
     );
   }
-  // The same two-part nudge for Codex, in the file Codex reads project hooks
+  // The same hooks for Codex, in the file Codex reads project hooks
   // from. Written for both hosts for the same reason the task skills are
   // (carrick#1335): which agent opens this workspace is not a thing init can
   // know, and a hook file for a host nobody runs costs nothing.
