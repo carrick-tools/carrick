@@ -1,0 +1,9 @@
+{
+  "name": "command-object-send-orders-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@aws-sdk/client-sns": "^3.600.0",
+    "@aws-sdk/client-sqs": "^3.600.0"
+  }
+}

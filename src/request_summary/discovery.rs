@@ -1262,30 +1262,42 @@ impl<'a> Walker<'a> {
         member: Option<&str>,
         claims: &ExportClaims,
     ) -> SiteEnd {
-        let op = (!invoke.construction)
-            .then(|| {
-                claims
-                    .claims
-                    .iter()
-                    .filter(|claim| claim.is_call_form())
-                    .find_map(|claim| match claim {
-                        // An op claimed on what a scope member returns is read
-                        // only where a verified declaration says so
-                        // (carrick#1678), never by the member's name.
-                        LibraryClaim::Op {
-                            op,
-                            member: claimed,
-                            of,
-                            ..
-                        } if claimed.as_deref() == member
-                            && of.as_deref().is_none_or(|of| scope_step(of).is_none()) =>
-                        {
-                            Some(*op)
-                        }
-                        _ => None,
-                    })
+        // A construction states an op only where the claim is written as a
+        // `new` of this member (carrick#3439 T1); a maker's `new` is no op.
+        let op = if invoke.construction {
+            claims.claims.iter().find_map(|claim| match claim {
+                LibraryClaim::Op {
+                    op,
+                    member: claimed,
+                    path,
+                    ..
+                } if claim.is_new_form_op() && claimed.as_deref() == member && path.is_empty() => {
+                    Some(*op)
+                }
+                _ => None,
             })
-            .flatten();
+        } else {
+            claims
+                .claims
+                .iter()
+                .filter(|claim| claim.is_call_form())
+                .find_map(|claim| match claim {
+                    // An op claimed on what a scope member returns is read
+                    // only where a verified declaration says so
+                    // (carrick#1678), never by the member's name.
+                    LibraryClaim::Op {
+                        op,
+                        member: claimed,
+                        of,
+                        ..
+                    } if claimed.as_deref() == member
+                        && of.as_deref().is_none_or(|of| scope_step(of).is_none()) =>
+                    {
+                        Some(*op)
+                    }
+                    _ => None,
+                })
+        };
         SiteEnd {
             package: package.to_string(),
             export: export.to_string(),

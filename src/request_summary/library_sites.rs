@@ -457,6 +457,9 @@ pub struct Selector<'a> {
     pub of: Option<&'a str>,
     pub path: &'a [String],
     pub member: Option<&'a str>,
+    /// The op is written as a construction of its receiver (`form: new`,
+    /// carrick#3439): it selects a `new` call and never a plain one.
+    pub new: bool,
 }
 
 /// What a package's surface says one member use is, as the caller
@@ -606,7 +609,9 @@ impl LibrarySite {
     /// through one of its receivers: the export (`through` is `None`), or the
     /// instance of `through`, one of the site's makers (carrick#1689). `of`
     /// names exactly one receiver by its id, and `on` applies otherwise
-    /// (contract amendment 2, B3). An op is a call, never a construction.
+    /// (contract amendment 2, B3). An op is a call, unless its claim is
+    /// written as a construction (`selector.new`): then it is that and
+    /// nothing else.
     pub fn selected_by(&self, through: Option<&SiteMaker>, selector: &Selector<'_>) -> bool {
         let id = match (&self.receiver, through) {
             (SiteReceiver::Export, None) => "export".to_string(),
@@ -624,7 +629,12 @@ impl LibrarySite {
             _ => false,
         };
         receiver
-            && self.form == MakerForm::Call
+            && self.form
+                == if selector.new {
+                    MakerForm::New
+                } else {
+                    MakerForm::Call
+                }
             && self.path == selector.path
             && self.member.as_deref() == selector.member
     }
@@ -3718,6 +3728,7 @@ mod tests {
         assert!(trigger.selected_by(
             None,
             &Selector {
+                new: false,
                 on: Some(On::Export),
                 of: None,
                 path: &path,
@@ -3727,6 +3738,7 @@ mod tests {
         assert!(!trigger.selected_by(
             None,
             &Selector {
+                new: false,
                 on: Some(On::Export),
                 of: None,
                 path: &[],
@@ -3752,12 +3764,14 @@ mod tests {
              }\n",
         )]);
         let on = |on: On, member: &'static str| Selector {
+            new: false,
             on: Some(on),
             of: None,
             path: &[],
             member: Some(member),
         };
         let of = |of: &'static str, member: &'static str| Selector {
+            new: false,
             on: None,
             of: Some(of),
             path: &[],
@@ -3780,6 +3794,7 @@ mod tests {
             !on_task.selected_by(
                 task,
                 &Selector {
+                    new: false,
                     on: Some(On::Instance),
                     of: Some("instance:task"),
                     path: &[],
@@ -3792,6 +3807,7 @@ mod tests {
             !on_task.selected_by(
                 task,
                 &Selector {
+                    new: false,
                     on: None,
                     of: None,
                     path: &[],
@@ -6016,6 +6032,7 @@ mod tests {
     fn a_set_of_makers_states_a_fact_only_when_every_maker_reads_the_same() {
         // `of` names one receiver; without it the op is on every instance.
         let on = |of: Option<&'static str>, member: &'static str| Selector {
+            new: false,
             on: of.is_none().then_some(On::Instance),
             of,
             path: &[],
@@ -6078,6 +6095,7 @@ mod tests {
             makers: &[],
             ops: vec![(
                 Selector {
+                    new: false,
                     on: Some(On::Export),
                     of: None,
                     path: &[],

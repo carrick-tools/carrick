@@ -189,6 +189,11 @@ pub struct SiteLabel {
     /// "Message roles").
     #[serde(default)]
     pub by_origin: bool,
+    /// The op is written as a construction of the export (`new
+    /// SendMessageCommand({ QueueUrl, ... })`, claim `form: new`), so it is
+    /// met at a `new` call and never at a plain call (carrick#3439 T1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool,
     #[serde(default)]
     pub name: Option<ArgSlot>,
     #[serde(default)]
@@ -293,6 +298,7 @@ impl SiteLabel {
                 let by_origin = export.side_rule.as_deref() == Some("by_origin");
                 for op in export.ops {
                     labels.push(SiteLabel {
+                        new: false,
                         package: package.package.clone(),
                         export: export.export.clone(),
                         member: op.member,
@@ -348,6 +354,7 @@ impl SiteLabel {
                 } = claim
                 {
                     labels.push(SiteLabel {
+                        new: false,
                         package: export.package.clone(),
                         export: export.export.clone(),
                         member: member.clone(),
@@ -370,7 +377,13 @@ impl SiteLabel {
                     });
                     continue;
                 }
-                if !claim.is_call_form() {
+                // An op written as a `new` of the export is a label of its
+                // own (carrick#3439 T1), unless its name sits inside an
+                // array (`each`), which the readers do not walk: that op
+                // labels nothing, and its call stays a lead. Every other
+                // form is not met at a call site.
+                let new = claim.is_new_form_op();
+                if !claim.is_call_form() && !new {
                     continue;
                 }
                 let LibraryClaim::Op {
@@ -392,6 +405,15 @@ impl SiteLabel {
                 else {
                     continue;
                 };
+                let walks_an_array = |slot: &crate::services::type_sidecar::ClaimSlot| {
+                    slot.each || slot.at.is_some()
+                };
+                if new
+                    && (matches!(name.as_deref(), Some(OpName::Slot(name)) if walks_an_array(name))
+                        || [payload, handler].into_iter().flatten().any(walks_an_array))
+                {
+                    continue;
+                }
                 let method = (method.is_some() || method_key.is_some() || method_default.is_some())
                     .then(|| MethodLabel {
                         from: method_key.as_ref().map(slot),
@@ -399,6 +421,7 @@ impl SiteLabel {
                         literal: method.clone(),
                     });
                 labels.push(SiteLabel {
+                    new,
                     package: export.package.clone(),
                     export: export.export.clone(),
                     member: member.clone(),
@@ -449,13 +472,15 @@ impl SiteLabel {
     }
 
     /// Whether the label is claimed on the receiver `end` is made on: the
-    /// same package, export and member, and the same scope step (none for a
-    /// member claimed on the export itself). The one match every lookup of a
-    /// label by its end shares (carrick#1678).
+    /// same package, export and member, the same form (a call, or a
+    /// construction of the export, carrick#3439 T1), and the same scope step
+    /// (none for a member claimed on the export itself). The one match every
+    /// lookup of a label by its end shares (carrick#1678).
     pub fn is_on(&self, end: &LabelledEnd) -> bool {
         self.package == end.package
             && self.export == end.export
             && self.member == end.member
+            && self.new == end.new
             && self.scope.as_ref().map(|scope| &scope.step) == end.scope.as_ref()
     }
 
@@ -2978,6 +3003,7 @@ pub(crate) mod tests {
             labels,
             vec![
                 SiteLabel {
+                    new: false,
                     by_origin: false,
                     yields: None,
                     package: "@fixture/http".into(),
@@ -3000,6 +3026,7 @@ pub(crate) mod tests {
                     }),
                 },
                 SiteLabel {
+                    new: false,
                     by_origin: false,
                     yields: None,
                     package: "@fixture/http".into(),
@@ -3832,6 +3859,7 @@ pub(crate) mod tests {
         handler: Option<usize>,
     ) -> SiteLabel {
         SiteLabel {
+            new: false,
             by_origin: false,
             yields: None,
             package: "@fixture/wire".into(),
@@ -3854,6 +3882,7 @@ pub(crate) mod tests {
     /// The language's own `fetch`, with label v2's method fields.
     pub(crate) fn fetch_label() -> SiteLabel {
         SiteLabel {
+            new: false,
             by_origin: false,
             yields: None,
             package: "lib:lib.dom.d.ts".into(),
@@ -3884,6 +3913,7 @@ pub(crate) mod tests {
     /// name.
     pub(crate) fn child_send_label() -> SiteLabel {
         SiteLabel {
+            new: false,
             by_origin: false,
             yields: None,
             package: "node:child_process".into(),
@@ -4498,6 +4528,7 @@ pub(crate) mod tests {
     fn a_member_claimed_on_a_scope_result_is_a_label_of_its_own() {
         let router = http_get_label();
         let scoped = SiteLabel {
+            new: false,
             by_origin: false,
             yields: None,
             name: None,
@@ -4523,6 +4554,58 @@ pub(crate) mod tests {
         assert_eq!(SiteLabel::find(&reversed, &on_scope), Some(&reversed[0]));
         // A call on a scope's result no label states is no router call.
         assert_eq!(SiteLabel::find(&[router], &on_scope), None);
+    }
+
+    /// carrick#3439 T1: an op claimed in the `new` form is a label met at a
+    /// construction and never at a call (and the reverse for a call-form
+    /// op); one whose slots walk inside an array (`each`) labels nothing.
+    #[test]
+    fn a_new_form_op_is_a_label_of_the_construction() {
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([{
+                "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+                "export": "SendCommand", "role": "broker",
+                "claims": [
+                    { "kind": "op", "op": "send", "member": null, "on": "export", "form": "new",
+                      "name": { "arg": 0, "key": "QueueUrl" },
+                      "payload": { "arg": 0, "key": "Body" } },
+                    { "kind": "op", "op": "send", "member": null, "on": "export", "form": "new",
+                      "name": { "arg": 0, "key": "Entries", "each": true, "at": ["Topic"] },
+                      "payload": { "arg": 0, "key": "Body" } },
+                    { "kind": "op", "op": "send", "member": "other", "on": "export",
+                      "form": "set", "name": { "arg": 0 } }
+                ]
+            }]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        assert_eq!(labels.len(), 1, "{labels:#?}");
+        assert!(labels[0].new);
+        assert_eq!(
+            labels[0].name,
+            Some(ArgSlot {
+                arg: 0,
+                key: Some("QueueUrl".into())
+            })
+        );
+        let built = LabelledEnd {
+            package: "@fixture/queue".into(),
+            export: "SendCommand".into(),
+            member: None,
+            role: "broker".into(),
+            op: Some("send".into()),
+            file: "x.ts".into(),
+            line: 1,
+            span_start: 0,
+            span_end: 1,
+            new: true,
+            scope: None,
+        };
+        assert_eq!(SiteLabel::find(&labels, &built), Some(&labels[0]));
+        let called = LabelledEnd {
+            new: false,
+            ..built
+        };
+        assert_eq!(SiteLabel::find(&labels, &called), None);
     }
 
     fn names_at(decided: &Decided, file: &str) -> Vec<(u32, Option<String>)> {
@@ -4647,6 +4730,7 @@ pub(crate) mod tests {
     /// The label of the fixture's `@fixture/http` instance member `get`.
     fn http_get_label() -> SiteLabel {
         SiteLabel {
+            new: false,
             by_origin: false,
             yields: None,
             package: "@fixture/http".into(),

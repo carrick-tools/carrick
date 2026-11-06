@@ -1,0 +1,46 @@
+{
+  "library_claims": [
+    {
+      "package": "@aws-sdk/client-sqs",
+      "version": "3.600.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@aws-sdk/client-sqs",
+          "export": "SendMessageCommand",
+          "role": "broker",
+          "side": null,
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": null, "on": "export", "form": "new", "name": { "arg": 0, "key": "QueueUrl" }, "payload": { "arg": 0, "key": "MessageBody" }, "name_scope": { "scope": "global" }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@aws-sdk/client-sns",
+      "version": "3.600.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@aws-sdk/client-sns",
+          "export": "PublishCommand",
+          "role": "broker",
+          "side": null,
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": null, "on": "export", "form": "new", "name": { "arg": 0, "key": "TopicArn" }, "payload": { "arg": 0, "key": "Message" }, "name_scope": { "scope": "global" }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
