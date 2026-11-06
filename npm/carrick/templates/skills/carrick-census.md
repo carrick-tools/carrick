@@ -77,16 +77,37 @@ that do the thing, and drop the rest with one line each saying what they turned
 out to be. `role` on a row says what the scan joined it to, such as a route
 handler or a client, and a route handler for a different operation is not a hit.
 
-## 5. Report
+## 5. Follow helpers to callers
+
+The rows from step 4 are often the mechanism: a helper that others call to do
+the thing. The places that do X are then its callers. For each kept row that is
+a helper, run:
+
+```
+get_callers({{SCOPE}}, function_name: "<helper>", file: "<file>", depth: 1)
+```
+
+or grep for the helper's name where the index returns nothing. A function passed
+as a value is not counted, so grep before you treat zero callers as none. Report
+the callers as the places that do X, each with `call_site_line` where the row
+carries it, and list the helper itself apart as the mechanism.
+
+Where the question names an identifier, such as an environment variable, a
+table or a header, grep the source for that identifier as well and merge the two
+lists on file and line. A match inside a config file, a template or generated
+output reaches you only this way. Mark each row with how it was found: index,
+callers, grep.
+
+## 6. Report
 
 | file:line | function | what it does | found by |
 |---|---|---|---|
 | src/billing/charge.ts:88 | chargeCard | reads the billing key | purpose, mechanism |
 
-Close with the receipt from step 3, so the list is read against what was
+Close with the receipt from step 3, and the helpers followed in step 5, so the list is read against what was
 searched.
 
-## 6. Act
+## 7. Act
 
 Change nothing unless you were asked to. Offer one issue per finding that needs
 work, and file the ones accepted:

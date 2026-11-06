@@ -189,6 +189,24 @@ test("the bodies read what an answer carries rather than a response shape writte
   assert.match(census, /ranked on their name, signature and body tokens alone/);
 });
 
+test("census follows helpers to callers, impact greps on zero, drift reads per-call-site verdicts (#3443)", () => {
+  const census = renderTaskSkill("carrick-census", { slug: "acme-index" }).replace(/\s+/g, " ");
+  assert.match(census, /## 5\. Follow helpers to callers/);
+  assert.match(census, /get_callers\(project: "acme-index", function_name: "<helper>"/);
+  assert.match(census, /Report the callers as the places that do X/);
+  assert.match(census, /grep the source for that identifier as well and merge the two/);
+
+  const impact = renderTaskSkill("carrick-impact", { slug: "acme-index" }).replace(/\s+/g, " ");
+  assert.match(impact, /When `get_callers` returns 0 rows, grep the function's name/);
+  assert.match(impact, /carries `call_site_line`/);
+  assert.doesNotMatch(impact, /not the call-site line/);
+
+  const drift = renderTaskSkill("carrick-drift", { slug: "acme-index" }).replace(/\s+/g, " ");
+  assert.match(drift, /the top-level `verdicts` can be `\[\]` while the call sites hold them/);
+  assert.match(drift, /from the `verdict\.state` on each call site/);
+  assert.match(drift, /`verdicts` is empty and no call site carries a `verdict`/);
+});
+
 test("a second run writes nothing and reports nothing to fix", () => {
   const dir = workspace();
   writeTaskSkills(dir, { slug: "acme-index" });

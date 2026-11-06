@@ -37,14 +37,22 @@ Operations are ranked by call-site count then by untyped sides. Page with
 A verdict's `state` is `compatible`, `incompatible` or `unresolved`, and it
 carries `scanner_version` with `mismatch_reason` or `unresolved_reason` where
 the scan wrote one. One verdict covers the whole consumer and producer pair, so
-every call site on that operation shares it. An operation with `verdicts: []`
-was never judged, and `verdict_note` says so.
+every call site on that operation shares it. Each entry of `consumer.call_sites`
+may also carry its own `verdict` with `scope: "call_site"` and a `state`, and
+the top-level `verdicts` can be `[]` while the call sites hold them. An
+operation is never judged only where `verdicts` is empty and no call site
+carries a `verdict`; `verdict_note` says so.
 
 Honour the wire note. Where `wire_notes` is present, one side declares a field
 as `Date` and the other as `string`. JSON serialises a Date to a string, so
 those two texts can describe the same bytes, and that is not drift.
 
 ## 3. Class each operation
+
+Read the stored verdict from the top-level `verdicts`, and where that is empty
+from the `verdict.state` on each call site. Class the operation on the worst
+state across its call sites (incompatible, then unresolved, then compatible),
+and give each call site its own state in the report.
 
 - **MATCH**: the stored verdict is `compatible`.
 - **DRIFT**: the stored verdict is `incompatible`. Name the field and the
@@ -55,7 +63,7 @@ those two texts can describe the same bytes, and that is not drift.
   they differ name the field and say whether it is missing on one side, optional
   on one side and required on the other, or of a different type. Report that as
   "type texts differ", never as a verdict.
-- **NOT JUDGED**: `verdicts` is empty. Relay `verdict_note`, then read the same
+- **NOT JUDGED**: `verdicts` is empty and no call site carries a `verdict`. Relay `verdict_note`, then read the same
   two type texts the same way and report any difference as "type texts differ".
 - **CONSUMER UNTYPED**: a call site's `expected_request` or `expected_response`
   is null on a side that carries one.
