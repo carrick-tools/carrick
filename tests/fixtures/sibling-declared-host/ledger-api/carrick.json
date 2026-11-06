@@ -1,0 +1,4 @@
+{
+  "serviceName": "ledger-api",
+  "internalDomains": ["https://api.ledger.example"]
+}
