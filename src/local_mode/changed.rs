@@ -173,7 +173,8 @@ pub struct Problem {
     /// fails the run.
     pub unconfirmed: bool,
     /// In a file the work did not touch: a call the index matched whose
-    /// route the work took away, or a pair whose verdict the work moved to a
+    /// route the work took away (its producer's file changed since the
+    /// index), or a pair whose verdict the work moved to a
     /// mismatch. Listed when it fails, and with `--all`; counted on the
     /// summary line only through `outside_moved`.
     pub outside_the_change: bool,
@@ -536,7 +537,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &rejoined.index,
         &rejoined.join,
         &wanted,
-        &Touched::new(),
+        &touched_since_index(&index),
     );
     let judged = remap_lines(judged, &root, &rejoined.index, &unmoved);
     output.routes = judged.routes;
@@ -553,6 +554,27 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
 /// A repo with no entry, or `None`, is one git could not list: every file in
 /// it counts as touched (carrick#3411).
 pub(super) type Touched = BTreeMap<String, Option<BTreeSet<String>>>;
+
+/// What each repo of the index changed since the commit it was indexed at
+/// (untracked files, deletions and renames-away included). A repo whose
+/// services carry no commit, or that git cannot list, is `None`.
+pub(super) fn touched_since_index(index: &LocalIndex) -> Touched {
+    index
+        .repos
+        .iter()
+        .map(|repo| {
+            let commit = repo
+                .services
+                .iter()
+                .map(|service| service.commit.as_str())
+                .find(|commit| !commit.is_empty());
+            let files = commit
+                .and_then(|commit| super::query::changed_since(Path::new(&repo.path), commit))
+                .map(|files| files.into_iter().collect());
+            (repo.name.clone(), files)
+        })
+        .collect()
+}
 
 /// Every repo's changed source files, keyed by repo name, with the repos
 /// listed as the answer states them.
@@ -898,7 +920,7 @@ pub(super) fn judge(
     rebuilt: &LocalIndex,
     join: &super::LocalJoin,
     changed: &BTreeMap<String, &BTreeSet<String>>,
-    _touched: &Touched,
+    touched: &Touched,
 ) -> Judged {
     // Which repo each service belongs to, and where that repo is, so a row's
     // repo-relative file can be tested against the changed set and printed
@@ -913,6 +935,12 @@ pub(super) fn judge(
         }
     }
     let is_changed = |repo: &str, file: &str| changed.get(repo).is_some_and(|f| f.contains(file));
+    // Whether a file changed since the index was written. A repo git could
+    // not list counts every file as changed (carrick#3411).
+    let is_touched = |repo: &str, file: &str| match touched.get(repo) {
+        Some(Some(files)) => files.contains(file),
+        _ => true,
+    };
     let item_of = |repo: &str, operation: &JoinedOperation| -> Option<&IndexedItem> {
         rebuilt
             .repos
@@ -1086,9 +1114,32 @@ pub(super) fn judge(
                     continue;
                 };
                 // A call in a file the work did not touch is reported only
-                // when the index matched it: the work took its route away.
-                if !is_changed(repo, &file) && !was_matched(before, strict, repo, operation) {
-                    continue;
+                // when the index matched it and one of its producers sits in
+                // a file changed since the index: the work took its route
+                // away. Otherwise the re-scan alone stopped pairing it, and
+                // that is drift, not a break (carrick#3411).
+                if !is_changed(repo, &file) {
+                    if !was_matched(before, strict, repo, operation) {
+                        continue;
+                    }
+                    let producers: Vec<&super::read_model::Counterpart> =
+                        indexed_rows(before, repo, &file)
+                            .filter(|old| {
+                                same_operation(old, operation, strict)
+                                    && old.line == operation.line
+                                    && !old.counterparts.is_empty()
+                            })
+                            .flat_map(|old| old.counterparts.iter())
+                            .collect();
+                    let producer_touched = producers.iter().any(|counterpart| {
+                        repo_of.get(counterpart.service.as_str()).is_none_or(
+                            |&(producer_repo, _)| is_touched(producer_repo, &counterpart.file),
+                        )
+                    });
+                    if !producer_touched {
+                        note_drift(&file, line, operation, &producers);
+                        continue;
+                    }
                 }
                 let source = Source::of(operation.resolution_source);
                 // Already unmatched in the index: the same call in the same
@@ -1311,6 +1362,38 @@ fn was_matched(before: &LocalIndex, strict: bool, repo: &str, operation: &Joined
                     && !item.counterparts.is_empty()
             })
         })
+}
+
+/// The environment variable that prints each `rescan-drift` line on stderr.
+pub(super) const DRIFT_ENV: &str = "CARRICK_RECHECK_DRIFT";
+
+/// Say that a call outside the change was not reported: the index paired it,
+/// no producer file of it changed since, and the re-scan stopped pairing it
+/// (carrick#3411). One line to the debug log; also to stderr under
+/// [`DRIFT_ENV`].
+fn note_drift(
+    file: &str,
+    line: Option<u32>,
+    operation: &JoinedOperation,
+    producers: &[&super::read_model::Counterpart],
+) {
+    let producers = producers
+        .iter()
+        .map(|p| match p.line {
+            Some(at) => format!("{} {}:{at}", p.service, p.file),
+            None => format!("{} {}", p.service, p.file),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let at = line.map_or(String::new(), |l| format!(":{l}"));
+    let message = format!(
+        "rescan-drift {file}{at} {} {} left with no route; old producers unchanged since the index: {producers}",
+        operation.method, operation.path
+    );
+    tracing::debug!("{message}");
+    if std::env::var_os(DRIFT_ENV).is_some() {
+        crate::errln!("carrick: {message}");
+    }
 }
 
 /// A repo-relative file as a path from the workspace root.
@@ -2059,6 +2142,9 @@ mod tests {
             "type_check": {"state": "ran"}
         }))
         .expect("a join");
+        let mut join = join;
+        join.operations[0].resolution_source =
+            Some(crate::agents::file_analyzer_agent::ResolutionSource::RequestSpec);
         let rebuilt = index_of(Vec::new());
         let edited: BTreeSet<String> = ["edited.ts".to_string()].into();
         let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();

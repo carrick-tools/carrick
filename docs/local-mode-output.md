@@ -253,7 +253,11 @@ The rule is `carrick check --changed`'s (carrick#2998), applied to the rows of
 the edited file's repo and of every repo holding a re-read service: a row
 counts when the index held the same row at the same line with a resolved,
 compatible pair and the re-join now mismatches it, or when the index matched a
-call to a route and the re-join finds none. A route renamed in its own file
+call to a route and the re-join finds none, and a file of one of that call's
+old producers changed since the index (edited, added, deleted or renamed
+away). A call whose producers are all in unchanged files is re-scan drift: not
+listed, with one `rescan-drift` line in the debug log (on stderr when
+`CARRICK_RECHECK_DRIFT` is set). A route renamed in its own file
 lists the callers it strands, wherever they are. The rows of the edited file
 itself are `items`, not here.
 
@@ -690,7 +694,8 @@ re-scanned, is reported in two cases. Both are marked `outside_the_change` and
 never add to `routes`, `calls` or `type_checked`, which are about the changed
 files.
 
-- A call the index matched that now reaches no route. It is listed when it
+- A call the index matched, whose old producer sits in a file changed since
+  the index, that now reaches no route. It is listed when it
   fails, and with `--all` otherwise.
 - A pair whose rebuilt verdict is a mismatch (`type_mismatch` or
   `method_mismatch`) and that the index did not already hold as a mismatch at
