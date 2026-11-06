@@ -1368,6 +1368,71 @@ mod tests {
         );
     }
 
+    /// carrick#3370: a function member of a default-exported object (a
+    /// worker's `fetch` and `queue`) is a function of the module keyed
+    /// `default.<member>`, as a module `const` object's are (carrick#3356).
+    /// A call inside it reaches its helper, an HTTP one and an event one,
+    /// and a call through the imported default reaches the member, with the
+    /// HTTP request inside it stated at that call, with and without rows.
+    #[test]
+    fn a_call_through_a_default_exported_objects_member_reaches_the_member() {
+        let edit = [
+            (
+                "src/worker-api.ts",
+                "export function api(path: string): Promise<Response> {\n  return fetch(path);\n}\n",
+            ),
+            (
+                "src/worker-events.ts",
+                "declare const socket: { send(name: string): void };\n\nexport function emitEvent(name: string): void {\n  socket.send(name);\n}\n",
+            ),
+            (
+                "src/worker.ts",
+                "import { api } from \"./worker-api\";\nimport { emitEvent } from \"./worker-events\";\n\nexport default {\n  async fetch(): Promise<Response> {\n    return api(\"/health\");\n  },\n  async queue(): Promise<void> {\n    emitEvent(\"jobs.nightly\");\n  },\n};\n",
+            ),
+            (
+                "src/worker-user.ts",
+                "import worker from \"./worker\";\n\nexport function check(): Promise<Response> {\n  return worker.fetch();\n}\n\nexport function drain(): Promise<void> {\n  return worker.queue();\n}\n",
+            ),
+        ];
+        let Some(on) = calls(&edit, true) else {
+            return;
+        };
+        let off = calls(&edit, false).unwrap();
+        let at = |n: u32, text: &str| (n, vec![text.to_string()]);
+        let worker = "services/calls/src/worker.ts";
+        let inside = BTreeMap::from([
+            at(6, "worker-api.ts:api"),
+            at(9, "worker-events.ts:emitEvent"),
+        ]);
+        assert_eq!(
+            (reached_in(&off, worker), reached_in(&on, worker)),
+            (inside.clone(), inside),
+            "(without rows, with rows)"
+        );
+        let own = BTreeMap::from([line(6, "/health")]);
+        assert_eq!(
+            (stated_in(&off, worker), stated_in(&on, worker)),
+            (own.clone(), own),
+            "(without rows, with rows)"
+        );
+        let user = "services/calls/src/worker-user.ts";
+        let reached = BTreeMap::from([
+            at(4, "worker.ts:default.fetch"),
+            at(8, "worker.ts:default.queue"),
+        ]);
+        assert_eq!(
+            (reached_in(&off, user), reached_in(&on, user)),
+            (reached.clone(), reached),
+            "(without rows, with rows)"
+        );
+        let stated = BTreeMap::from([line(4, "/health")]);
+        assert_eq!(
+            (stated_in(&off, user), stated_in(&on, user)),
+            (stated.clone(), stated),
+            "(without rows, with rows)"
+        );
+    }
+
     /// A walk that produced no rows is a scan-level fact, not a call left
     /// open: no call is written as unfollowed (fix G).
     #[test]
