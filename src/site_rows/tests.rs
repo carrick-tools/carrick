@@ -155,6 +155,7 @@ const ASKED: &[Slot] = &[Slot::Kind, Slot::Role, Slot::Name];
 /// The labels: the server's socket and the client's.
 fn labels() -> Vec<SiteLabel> {
     let label = |export: &str, side: Option<&str>| SiteLabel {
+        new: false,
         by_origin: false,
         yields: None,
         package: "@fixture/wire".to_string(),
@@ -957,6 +958,55 @@ fn a_lead_on_a_line_with_a_row_is_dropped() {
     assert_eq!(
         kept,
         vec![("src/a.ts", 20, None), ("src/b.ts", 5, Some("consumer"))]
+    );
+    assert_eq!(fold.lead_on_row_line, 2);
+}
+
+/// A message's sides run the other way from a route's: a publish is a call
+/// row, so a pub/sub producer lead on a publisher row's line is that row's
+/// site and is dropped, and one on a subscriber's line is kept; a pub/sub
+/// consumer lead is dropped on an endpoint row (carrick#3439 T1).
+#[test]
+fn a_pubsub_producer_lead_on_a_publisher_row_is_dropped() {
+    let mut calls = vec![blob_row(
+        OperationKey::pubsub("orders"),
+        "src/send.ts",
+        10,
+        None,
+    )];
+    let mut endpoints = vec![blob_row(
+        OperationKey::pubsub("orders"),
+        "src/listen.ts",
+        5,
+        None,
+    )];
+    let pubsub = |file: &str, line: u32, role: &str| PossibleCall {
+        kind: Some("pubsub".to_string()),
+        ..lead_at(file, line, Some(role))
+    };
+    let site = SiteRows {
+        enabled: true,
+        rows: Vec::new(),
+        leads: vec![
+            pubsub("src/send.ts", 10, "producer"),
+            pubsub("src/listen.ts", 5, "producer"),
+            pubsub("src/listen.ts", 5, "consumer"),
+            pubsub("src/send.ts", 10, "consumer"),
+        ],
+        ..SiteRows::default()
+    };
+    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
+    let kept: Vec<(&str, u32, Option<&str>)> = fold
+        .leads
+        .iter()
+        .map(|l| (l.file_path.as_str(), l.line_number, l.role.as_deref()))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![
+            ("src/listen.ts", 5, Some("producer")),
+            ("src/send.ts", 10, Some("consumer"))
+        ]
     );
     assert_eq!(fold.lead_on_row_line, 2);
 }

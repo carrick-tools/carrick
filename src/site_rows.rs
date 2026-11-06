@@ -1032,7 +1032,9 @@ pub fn fold_rows(
     }
     // A lead on a line the blob already holds a row at is that row's site.
     // A consumer lead matches a call row, a producer lead an endpoint row,
-    // and a lead with no role either.
+    // and a lead with no role either. A message's producer is the other way
+    // round: a publish is a call row and a subscriber an endpoint row, so a
+    // pub/sub producer lead matches a call row (carrick#3439 T1).
     let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
         rows.iter()
             .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
@@ -1040,7 +1042,10 @@ pub fn fold_rows(
     for lead in &site.leads {
         let on_call = held_at(calls, &lead.file_path, lead.line_number);
         let on_endpoint = held_at(endpoints, &lead.file_path, lead.line_number);
+        let pubsub = lead.kind.as_deref() == Some("pubsub");
         let held = match lead.role.as_deref() {
+            Some("consumer") if pubsub => on_endpoint,
+            Some("producer") if pubsub => on_call,
             Some("consumer") => on_call,
             Some("producer") => on_endpoint,
             _ => on_call || on_endpoint,

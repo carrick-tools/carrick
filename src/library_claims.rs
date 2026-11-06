@@ -217,7 +217,9 @@ impl ExportClaims {
             }
             // Written as a set, an override or a decorator, not called
             // (amendment 7): the readers of call sites do not read it yet.
-            if !claim.is_call_form() {
+            // An op written as a construction of its export is read at
+            // the `new` (carrick#3439).
+            if !claim.is_call_form() && !claim.is_new_form_op() {
                 continue;
             }
             let Some(id) = claim_id(&prefix, claim) else {
@@ -257,9 +259,26 @@ impl ExportClaims {
     /// names; anything the lists do not name is unlisted, and contests.
     fn classify(&self, receiver: &str, used: &MemberUse) -> MemberWire {
         if used.form == MakerForm::New {
-            let made = self.claims.iter().any(|claim| {
-                matches!(claim, LibraryClaim::Make { form: MakeForm::New, member, .. }
-                    if receiver == "export" && used.path.is_empty() && *member == used.member)
+            // A maker the export is built with, or an op written as the
+            // construction itself (`new SendMessageCommand({ ... })`).
+            let made = self.claims.iter().any(|claim| match claim {
+                LibraryClaim::Make {
+                    form: MakeForm::New,
+                    member,
+                    ..
+                } => receiver == "export" && used.path.is_empty() && *member == used.member,
+                LibraryClaim::Op {
+                    member,
+                    path,
+                    on,
+                    of,
+                    ..
+                } if claim.is_new_form_op() => {
+                    applies(*on, of.as_deref(), receiver)
+                        && *path == used.path
+                        && *member == used.member
+                }
+                _ => false,
             });
             return if made {
                 MemberWire::OnWire
@@ -573,6 +592,7 @@ fn selector<'a>(
     of: Option<&'a str>,
     path: &'a [String],
     member: Option<&'a str>,
+    new: bool,
 ) -> Selector<'a> {
     Selector {
         on: on.map(|on| match on {
@@ -583,6 +603,7 @@ fn selector<'a>(
         of,
         path,
         member,
+        new,
     }
 }
 
@@ -1013,7 +1034,13 @@ impl Reading<'_> {
             else {
                 continue;
             };
-            let selected = selector(*on, of.as_deref(), path, member.as_deref());
+            let selected = selector(
+                *on,
+                of.as_deref(),
+                path,
+                member.as_deref(),
+                claim.is_new_form_op(),
+            );
             if !self.site.selected_by(through, &selected) || !self.verified(id, &receiver) {
                 continue;
             }
@@ -1477,6 +1504,76 @@ mod tests {
         }))
     }
 
+    fn command_claims() -> ExportClaims {
+        export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "SendCommand", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "send", "member": null, "on": "export", "form": "new",
+                  "name": { "arg": 0, "key": "QueueUrl" }, "payload": { "arg": 0, "key": "Body" },
+                  "name_scope": { "scope": "global", "namespace": null } }
+            ]
+        }))
+    }
+
+    /// carrick#3439 T1: an op claimed in the `new` form is read where the
+    /// export is constructed, from the argument's key, and never where it is
+    /// called. A literal name is a publisher row; a name held in a parameter
+    /// states nothing; the check goes to the export receiver.
+    #[test]
+    fn a_new_form_op_states_a_row_at_the_construction() {
+        let command = command_claims();
+        let sites = sites_of(&[(
+            "src/send.ts",
+            "import { SendCommand } from \"@fixture/queue\";\n\
+            export function literal() {\n\
+            \x20 return new SendCommand({ QueueUrl: \"orders\", Body: \"x\" });\n\
+            }\n\
+            export function held(url: string) {\n\
+            \x20 return new SendCommand({ QueueUrl: url, Body: \"x\" });\n\
+            }\n\
+            export function bodyless() {\n\
+            \x20 return new SendCommand({ QueueUrl: \"no-body\" });\n\
+            }\n",
+        )]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let rows = read(&sites, &[command], verifier(&asked, all)).rows;
+        let stated: Vec<(u32, LibraryRowKind, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.kind, row.name.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(3, LibraryRowKind::Pubsub(PubsubRole::Publisher), "orders")],
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows[0].claim_ids,
+            vec!["@fixture/queue@2:SendCommand:op:send:():on:export:form:new"]
+        );
+        assert!(
+            asked
+                .borrow()
+                .iter()
+                .all(|check| check.receiver == "export"),
+            "{:?}",
+            asked.borrow()
+        );
+        // A plain call of the same export is a use the claims do not list:
+        // it contests the export, and no site states a row.
+        let called = sites_of(&[(
+            "src/call.ts",
+            "import { SendCommand } from \"@fixture/queue\";\n\
+            export function literal() {\n\
+            \x20 return new SendCommand({ QueueUrl: \"orders\", Body: \"x\" });\n\
+            }\n\
+            export function called() {\n\
+            \x20 return (SendCommand as any)({ QueueUrl: \"called\", Body: \"x\" });\n\
+            }\n",
+        )]);
+        assert!(rows_of(&called, &[command_claims()], all).is_empty());
+    }
+
     const BUS_SERVICE: &str = "import { bus } from \"@fixture/bus\";\n\
         export async function send(topic: string) {\n\
         \x20 await bus.publish(\"orders.created\", { id: 1 });\n\
@@ -1644,7 +1741,9 @@ mod tests {
                 { "kind": "op", "op": "receive", "member": "onerror", "of": "instance:new",
                   "form": "set" },
                 { "kind": "scope", "member": "controller", "of": "instance:new",
-                  "name": { "arg": 0 }, "form": "decorate" }
+                  "name": { "arg": 0 }, "form": "decorate" },
+                { "kind": "op", "op": "send", "member": null, "on": "export", "form": "new",
+                  "name": { "arg": 0, "key": "QueueUrl" } }
             ]
         }));
         let ids: Vec<String> = server
@@ -1652,9 +1751,14 @@ mod tests {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        // An op written as a construction of its export is read at the `new`
+        // (carrick#3439); the other forms are still not read.
         assert_eq!(
             ids,
-            vec!["fixture-server@2:Server:op:receive:on:of:instance:new"]
+            vec![
+                "fixture-server@2:Server:op:receive:on:of:instance:new",
+                "fixture-server@2:Server:op:send:():on:export:form:new"
+            ]
         );
     }
 

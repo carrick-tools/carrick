@@ -1,0 +1,11 @@
+{
+  "publishers": [
+    "src/queues.ts:8 https://sqs.example.test/000000000000/order-placed library_claim",
+    "src/topics.ts:8 arn:example:order-events library_claim"
+  ],
+  "possible_calls": [
+    "src/queues.ts:17 unanswered",
+    "src/queues.ts:29 unanswered",
+    "src/queues.ts:33 unanswered"
+  ]
+}

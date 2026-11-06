@@ -1454,6 +1454,19 @@ impl LibraryClaim {
         }
     }
 
+    /// Whether the claim is an op written as a construction of its export
+    /// (`new SendMessageCommand({ QueueUrl })`, `form: new`, carrick#3439).
+    /// A maker's own `new` is a `Make`, not an op.
+    pub fn is_new_form_op(&self) -> bool {
+        matches!(
+            self,
+            Self::Op {
+                form: Some(OpForm::New),
+                ..
+            }
+        )
+    }
+
     /// The claim as an op or maker check sends it: without its `result`, so
     /// the verdict on the claim is the one it had before results existed
     /// (carrick#2819). Every other claim is returned as it is.
