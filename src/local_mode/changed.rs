@@ -1133,7 +1133,10 @@ pub(super) fn judge(
                             .collect();
                     let producer_touched = producers.iter().any(|counterpart| {
                         repo_of.get(counterpart.service.as_str()).is_none_or(
-                            |&(producer_repo, _)| is_touched(producer_repo, &counterpart.file),
+                            |&(producer_repo, _)| {
+                                is_touched(producer_repo, &counterpart.file)
+                                    || rekeyed(before, rebuilt, strict, producer_repo, counterpart)
+                            },
                         )
                     });
                     if !producer_touched {
@@ -1361,6 +1364,41 @@ fn was_matched(before: &LocalIndex, strict: bool, repo: &str, operation: &Joined
                     && item.line == operation.line
                     && !item.counterparts.is_empty()
             })
+        })
+}
+
+/// Whether the rebuilt index reads a route at an old producer's file and line
+/// under another operation than the index held there (carrick#3412). The file
+/// is unchanged since the index, so its lines did not move: a route still read
+/// at that line under another path was re-keyed by something on its mount
+/// chain, which the work changed. Any route the index held there that is still
+/// read under its own key and dispatch case means nothing re-keyed it. No
+/// route read there at all is no evidence (a re-scan that did not re-extract
+/// the handler reads the same, carrick#3411), so it is false.
+fn rekeyed(
+    before: &LocalIndex,
+    rebuilt: &LocalIndex,
+    strict: bool,
+    repo: &str,
+    producer: &super::read_model::Counterpart,
+) -> bool {
+    let Some(line) = producer.line else {
+        return false;
+    };
+    let at_line = |item: &&IndexedItem| {
+        item.kind == super::read_model::ItemKind::Route && item.line == Some(line)
+    };
+    let old: Vec<&IndexedItem> = indexed_rows(before, repo, &producer.file)
+        .filter(at_line)
+        .collect();
+    let new: Vec<&IndexedItem> = indexed_rows(rebuilt, repo, &producer.file)
+        .filter(at_line)
+        .collect();
+    !old.is_empty()
+        && !new.is_empty()
+        && !old.iter().any(|old| {
+            new.iter()
+                .any(|new| old.key == new.key && (!strict || old.dispatch == new.dispatch))
         })
 }
 
@@ -2120,13 +2158,54 @@ mod tests {
     /// service `web`, now unmatched; `touched` says which files moved since
     /// the index.
     fn judged_untouched_call(touched: Touched) -> Vec<Problem> {
-        let before = index_of(vec![serde_json::json!({
+        let before = index_of(vec![gone_call()]);
+        judged_untouched_call_against(before, index_of(Vec::new()), touched)
+    }
+
+    /// The call at `client.ts:10` paired with the route at `h.ts:1`.
+    fn gone_call() -> serde_json::Value {
+        serde_json::json!({
             "kind": "call", "service": "web", "key": "http|GET|/gone", "dispatch": null,
             "method": "GET", "path": "/gone", "line": 10, "col": null, "source": "fact",
             "resolution_source": null, "evidence": null,
             "counterparts": [{"role": "producer", "service": "web", "file": "h.ts", "line": 1}],
             "verdict": null
-        })]);
+        })
+    }
+
+    /// A route row at `h.ts:1` under `key`.
+    fn route_at_h(key: &str) -> serde_json::Value {
+        let path = key.rsplit('|').next().unwrap();
+        serde_json::json!({
+            "kind": "route", "service": "web", "key": key, "dispatch": null,
+            "method": "GET", "path": path, "line": 1, "col": null, "source": "fact",
+            "resolution_source": null, "evidence": null,
+            "counterparts": [], "verdict": null
+        })
+    }
+
+    /// An index of service `web` whose rows sit in the files `files` names.
+    fn index_with_files(files: serde_json::Value) -> LocalIndex {
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "scanner_version": "0", "indexed_at": "", "repos": [{
+                "path": "/w/web", "name": "web",
+                "services": [{
+                    "name": "web", "commit": "", "indexed_at": "", "boundary": null,
+                    "routes": 0, "calls": 0
+                }],
+                "files": files
+            }]
+        }))
+        .expect("an index")
+    }
+
+    /// The untouched call at `client.ts:10`, now unmatched, judged against the
+    /// index `before` held and the one the re-scan `rebuilt`.
+    fn judged_untouched_call_against(
+        before: LocalIndex,
+        rebuilt: LocalIndex,
+        touched: Touched,
+    ) -> Vec<Problem> {
         let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
             "scanner_version": "0",
             "operations": [{
@@ -2145,7 +2224,6 @@ mod tests {
         let mut join = join;
         join.operations[0].resolution_source =
             Some(crate::agents::file_analyzer_agent::ResolutionSource::RequestSpec);
-        let rebuilt = index_of(Vec::new());
         let edited: BTreeSet<String> = ["edited.ts".to_string()].into();
         let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();
         judge(
@@ -2186,6 +2264,55 @@ mod tests {
             problems[0].outside_the_change && problems[0].fails,
             "{problems:?}"
         );
+    }
+
+    /// Only `edited.ts` changed since the index: the producer's `h.ts` did not.
+    fn only_edited_touched() -> Touched {
+        [("web".to_string(), Some(["edited.ts".to_string()].into()))].into()
+    }
+
+    /// The index held the call and its route at `h.ts:1`; `rebuilt_h` is what
+    /// the re-scan reads in `h.ts`.
+    fn judged_against_rebuilt_h(rebuilt_h: Vec<serde_json::Value>) -> Vec<Problem> {
+        let before = index_with_files(serde_json::json!({
+            "client.ts": [gone_call()],
+            "h.ts": [route_at_h("http|GET|/gone")]
+        }));
+        let rebuilt = index_with_files(serde_json::json!({ "h.ts": rebuilt_h }));
+        judged_untouched_call_against(before, rebuilt, only_edited_touched())
+    }
+
+    /// The producer's file is unchanged, but the re-scan reads its route at
+    /// the same line under another path: something on its mount chain moved
+    /// it, so the work took the call's route away (carrick#3412).
+    #[test]
+    fn an_untouched_call_whose_unchanged_producer_was_rekeyed_is_reported() {
+        let problems = judged_against_rebuilt_h(vec![route_at_h("http|GET|/moved")]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].kind, ProblemKind::NoRoute);
+        assert!(
+            problems[0].outside_the_change && problems[0].fails,
+            "{problems:?}"
+        );
+    }
+
+    /// The producer's route is not read at its line at all: that reads the
+    /// same as a re-scan that failed to re-extract it, so it stays drift.
+    #[test]
+    fn an_untouched_call_whose_unchanged_producer_vanished_is_still_drift() {
+        let problems = judged_against_rebuilt_h(Vec::new());
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// The route at that line is still read under its old key beside another
+    /// one: nothing re-keyed it, so the lost pairing is drift.
+    #[test]
+    fn an_untouched_call_whose_unchanged_producer_kept_its_key_is_still_drift() {
+        let problems = judged_against_rebuilt_h(vec![
+            route_at_h("http|GET|/gone"),
+            route_at_h("http|GET|/moved"),
+        ]);
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     /// A row outside the changed files counts as moved only when the index
