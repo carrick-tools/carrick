@@ -8257,11 +8257,13 @@ mod tests {
         assert!(arbitrated.changed.is_empty(), "{:?}", arbitrated.changed);
     }
 
-    /// The relation is a producer's response read only. A consumer call, a
-    /// status table named for a consumer, a borrowed pub/sub anchor and a
-    /// request whose depth the caller stated each keep the answer they had.
+    /// The relation decides a producer's response read and a consumer
+    /// call's result (N27 (i), `arbitration_drops_a_model_symbol_the_untyped_call_sends`)
+    /// only. A request body, a parameter, an expression, a status table named
+    /// for a producer read, a borrowed pub/sub anchor and a request whose
+    /// depth the caller stated each keep the answer they had.
     #[test]
-    fn a_relation_decides_nothing_outside_a_producers_response_read() {
+    fn a_relation_decides_nothing_outside_a_response_or_call_result_read() {
         let different = |kind: InferKind| {
             vec![related(
                 "Alias_Response",
@@ -8273,7 +8275,6 @@ mod tests {
         let plain = symbol_request("ItemDto", "Alias_Response", None);
 
         for kind in [
-            InferKind::CallResult,
             InferKind::RequestBody,
             InferKind::FunctionParam,
             InferKind::Expression,
