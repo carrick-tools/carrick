@@ -1,0 +1,10 @@
+{
+  "name": "@fx/paths",
+  "version": "1.0.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@fx/shared": "workspace:*"
+  }
+}

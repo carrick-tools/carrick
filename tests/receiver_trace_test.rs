@@ -861,6 +861,45 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
     assert_eq!(endpoint_rows(&again[1]).0, graph);
 }
 
+/// carrick#3213: a route path written as a template over a constant another
+/// package exports, where that constant is itself a template over exported
+/// constants (`${LOGIN_PATH}/:id`, `LOGIN_PATH = `${AUTH_BASE}/login``),
+/// keeps its row: the trace reads the whole path as the compiler types it
+/// and serves the route there. The bare use of the same constant keeps its
+/// row too, as do both uses of a constant this service builds on another
+/// package's (`RESET_PATH`). A constant whose template holds a value read
+/// at runtime (`STATUS_PATH`) folds to nothing: that site stays guessed and
+/// the reader's row there is withdrawn.
+#[test]
+fn a_route_path_over_a_nested_template_constant_keeps_its_row() {
+    let (on, fallbacks) = scan_fixture_reading("receiver-route-nested-template");
+    let (graph, _) = endpoint_rows(&on);
+    let main: Vec<&String> = graph.iter().filter(|row| row.contains("main.ts")).collect();
+    for want in [
+        "main.ts:8 GET /auth/login ",
+        "main.ts:9 GET /auth/login/:id ",
+        "main.ts:10 POST /account/profile/:section ",
+        "main.ts:12 GET /auth/reset ",
+        "main.ts:13 GET /auth/reset/:token ",
+    ] {
+        assert!(
+            main.iter().any(|row| row.contains(want)),
+            "{want}: {main:#?}"
+        );
+    }
+    assert!(
+        main.iter().all(|row| !row.contains("main.ts:11 ")),
+        "{main:#?}"
+    );
+    let counts = route_counts(&fallbacks);
+    assert!(
+        counts
+            .iter()
+            .any(|count| count.ends_with(" routes_guessed_withdrawn=1")),
+        "{counts:#?}"
+    );
+}
+
 /// carrick#3207: the same tree as the types-only package's, with the host
 /// making its app through the server package's `default` export while the
 /// store labels `register` on the named export alone. The host's `register`

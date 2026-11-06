@@ -1,0 +1,19 @@
+{
+  "services": [
+    {
+      "serviceName": "server",
+      "directory": "packages/server",
+      "tsconfig": "tsconfig.json"
+    },
+    {
+      "serviceName": "paths",
+      "directory": "packages/paths",
+      "tsconfig": "tsconfig.json"
+    },
+    {
+      "serviceName": "shared",
+      "directory": "packages/shared",
+      "tsconfig": "tsconfig.json"
+    }
+  ]
+}

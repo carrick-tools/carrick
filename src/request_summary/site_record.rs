@@ -544,6 +544,103 @@ fn stated_whole(
     }
 }
 
+/// The text of `pieces` with each value the code names read as the one
+/// string the compiler types it as (carrick#3213): `${LOGIN_PATH}/:id`
+/// where `LOGIN_PATH` is a constant built as `${AUTH_BASE}/login`, in this
+/// package or another. The compiler folds the constant's template through
+/// every package it reaches, so the type is the whole text. `None` unless
+/// at least one piece is such a value and every other piece is literal: a
+/// parameter, a value typed `string` or a union, or anything else the code
+/// does not state as one string leaves the text unstated.
+fn folded_text(pieces: &[super::Piece], literals: &dyn Fn(&str) -> Vec<String>) -> Option<String> {
+    let mut folded = false;
+    let text: String = pieces
+        .iter()
+        .map(|piece| match piece {
+            super::Piece::Lit(text) => Some(text.clone()),
+            super::Piece::Opaque { text, .. } => match literals(text).as_slice() {
+                [one] => {
+                    folded = true;
+                    Some(one.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Option<String>>()?;
+    (folded && !text.is_empty()).then_some(text)
+}
+
+/// The literals the compiler's type for the name written as `ident` among
+/// `names` stands for: one, or each of a union's.
+fn name_literals(names: &[CompilerName], ident: &str) -> Vec<String> {
+    names
+        .iter()
+        .find(|name| name.text == ident)
+        .and_then(|name| name.type_text.as_deref())
+        .map(literals_of_type)
+        .unwrap_or_default()
+}
+
+/// A route site's own path read through the compiler ([`folded_text`],
+/// carrick#3213), for the trace to compose its full path from before any
+/// record is written. Each file is parsed once.
+pub(super) struct NameFold<'r> {
+    sources: Sources<'r>,
+    positions: Option<&'r PositionIndex>,
+}
+
+impl<'r> NameFold<'r> {
+    pub(super) fn new(inputs: &'r RequestSummaryInputs, root: &'r Path) -> Self {
+        NameFold {
+            sources: Sources {
+                root,
+                files: HashMap::new(),
+            },
+            positions: inputs.positions.as_ref(),
+        }
+    }
+
+    /// `site`'s name, folded: `None` where it names no value or one the
+    /// compiler does not type as one string.
+    pub(super) fn own_path(&mut self, site: &DecidedSite) -> Option<String> {
+        let positions = self.positions?;
+        if !site
+            .name
+            .iter()
+            .any(|piece| matches!(piece, super::Piece::Opaque { .. }))
+        {
+            return None;
+        }
+        let parts = {
+            let parsed = self.sources.get(&site.file)?;
+            let mut finder = CallFinder {
+                parsed,
+                target: (site.span_start, site.span_end),
+                handing: Vec::new(),
+                found: None,
+            };
+            parsed.module.visit_with(&mut finder);
+            finder.found?
+        };
+        let idents: Vec<(String, Span)> = site
+            .name_args
+            .iter()
+            .filter_map(|index| parts.in_args.get(*index))
+            .flat_map(|written| written.idents.iter().cloned())
+            .collect();
+        let root = self.sources.root;
+        let names = compiler_names(
+            &mut self.sources,
+            Some(positions),
+            root,
+            &site.file,
+            &idents,
+        );
+        folded_text(&site.name, &|ident| name_literals(&names, ident))
+    }
+}
+
 /// The text of `pieces` when every one is literal and the text is not empty.
 fn literal_text(pieces: &[super::Piece]) -> Option<String> {
     let text: String = pieces
@@ -1358,14 +1455,7 @@ fn record(
     }
     let names = compiler_names(sources, positions, root, file, &idents);
     // The literals a name's type stands for: one, or each of a union's.
-    let literals = |ident: &str| -> Vec<String> {
-        names
-            .iter()
-            .find(|name| name.text == ident)
-            .and_then(|name| name.type_text.as_deref())
-            .map(literals_of_type)
-            .unwrap_or_default()
-    };
+    let literals = |ident: &str| -> Vec<String> { name_literals(&names, ident) };
 
     // The functions the call runs, two levels down.
     // Each is the function the call above enters, read at the call inside
@@ -1433,12 +1523,19 @@ fn record(
             }
             // Else, for HTTP, the target the request summaries compose from
             // the same pieces (carrick#2519): a base, literal segments, and
-            // each parameter or unread value a whole segment.
-            stated_whole(sources.get(file), &site.name, &name_exprs, &literals).or_else(|| {
-                let text = site.name_text()?;
-                stated.value(&text, place(PlaceFrom::TemplateLiteral, &at));
-                Some(BTreeSet::from([text]))
-            })
+            // each parameter or unread value a whole segment. Else the
+            // template with each value it names read as the one string the
+            // compiler types it as (carrick#3213).
+            match stated_whole(sources.get(file), &site.name, &name_exprs, &literals) {
+                Some(values) => Some(values),
+                None => site
+                    .name_text()
+                    .or_else(|| folded_text(&site.name, &literals))
+                    .map(|text| {
+                        stated.value(&text, place(PlaceFrom::TemplateLiteral, &at));
+                        BTreeSet::from([text])
+                    }),
+            }
         }
         (None, false) => None,
     };
@@ -1897,6 +1994,46 @@ mod tests {
     use crate::position_rows::{FLAG_ANY, FileRows, Header, Row, RowsFile, content_hash};
 
     const WEB: &str = "services/web/src/";
+
+    /// carrick#3213: a name written as a template folds only where every
+    /// value it names is typed as one string and the rest is literal. A
+    /// union, a `string`, a parameter or a name with no type leaves it
+    /// unstated, as does a template that names no value.
+    #[test]
+    fn a_template_folds_only_where_every_value_is_typed_as_one_string() {
+        use super::super::Piece;
+        let opaque = |text: &str| Piece::Opaque {
+            text: text.to_string(),
+            end: super::super::Root::Hole(super::super::HoleReason::UnreadExpression),
+            link: None,
+        };
+        let literals = |ident: &str| -> Vec<String> {
+            match ident {
+                "LOGIN" => vec!["/auth/login".to_string()],
+                "KIND" => vec!["a".to_string(), "b".to_string()],
+                _ => Vec::new(),
+            }
+        };
+        let lit = |text: &str| Piece::Lit(text.to_string());
+        assert_eq!(
+            folded_text(&[opaque("LOGIN"), lit("/:id")], &literals),
+            Some("/auth/login/:id".to_string())
+        );
+        assert_eq!(
+            folded_text(&[lit("/v1"), opaque("LOGIN")], &literals),
+            Some("/v1/auth/login".to_string())
+        );
+        assert_eq!(folded_text(&[opaque("KIND"), lit("/x")], &literals), None);
+        assert_eq!(folded_text(&[opaque("base"), lit("/x")], &literals), None);
+        assert_eq!(
+            folded_text(
+                &[opaque("LOGIN"), Piece::Param(0, "id".to_string())],
+                &literals
+            ),
+            None
+        );
+        assert_eq!(folded_text(&[lit("/x")], &literals), None);
+    }
 
     /// An identifier row at the first `needle` in `text`, offset `skip` into
     /// it, `len` long.
