@@ -35,8 +35,10 @@ function countsPhrase(counts: WorkspaceCounts | null): string | null {
  * The section as written, markers included. Ends in one newline.
  *
  * The words are the rules block measured in carrick-cloud#2991 (21 graded runs
- * per arm on one build: reused 17/21 against 5/21). Only the counts and the
- * scope clause vary; edit nothing else without a new measurement.
+ * per arm on one build: reused 17/21 against 5/21), plus rule 5's contract
+ * sentence: without it agents ran `check --changed` on 0 of 7 tasks that add a
+ * call to another service, against 6 of 7 on the previous section. Only the
+ * counts and the scope clause vary; edit nothing else without a new measurement.
  */
 export function renderCheckSection(scope: SkillScope, counts: WorkspaceCounts | null): string {
   const phrase = countsPhrase(counts);
@@ -71,7 +73,9 @@ export function renderCheckSection(scope: SkillScope, counts: WorkspaceCounts | 
     "4. Use grep and Read to confirm and to read code once Carrick has told you",
     "   where to look.",
     "5. After you edit a file, run `carrick check <file>` on that one file (one",
-    "   file per call). In your final summary,",
+    "   file per call). When your change touches a route, a call to another service,",
+    "   an event or a type another service reads, run `carrick check --changed`",
+    "   before you say it is done. In your final summary,",
     "   say what Carrick found and what you changed because of it.",
     END,
     "",
