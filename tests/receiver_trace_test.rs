@@ -1645,3 +1645,92 @@ fn client_receivers_in_every_held_form_are_sites() {
     .collect();
     assert_eq!(stated, want);
 }
+
+/// Each mount-graph row's stored address (`docs/address-chain.md`), by
+/// `file:line METHOD full_path`; `null` where the row carries none.
+fn endpoint_addresses(blobs: &Blobs) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for row in blob["mount_graph"]["endpoints"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            out.insert(
+                format!(
+                    "{} {} {}",
+                    row["file_location"].as_str().unwrap_or_default(),
+                    row["method"].as_str().unwrap_or_default(),
+                    row["full_path"].as_str().unwrap_or_default(),
+                ),
+                row.get("address")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    out
+}
+
+/// Address chain S1 (carrick-cloud#3083): a route the trace serves from the
+/// top stores the parts its address is composed of, outermost first, each
+/// with the `file:line` that states it. The mount's prefix is a constant
+/// another file declares, so it is stored folded, with that file; the route's
+/// own path is the last part. A route under a mount whose prefix is set at
+/// run time is not served from the top (S1 writes no headless row), so no
+/// row there carries an address.
+#[test]
+fn a_traced_route_stores_the_parts_of_its_address() {
+    let on = scan_fixture("address-chain-express");
+    let addresses = endpoint_addresses(&on);
+    let part = |kind: &str, at: &str, member: &str, piece: serde_json::Value| {
+        serde_json::json!({
+            "kind": kind,
+            "dimension": "path",
+            "at": at,
+            "member": member,
+            "value": { "value": "text", "values": [[piece]] },
+            "via": "label",
+        })
+    };
+    assert_eq!(
+        addresses.get("src/server.ts:8 GET /api/orders/:id"),
+        Some(&serde_json::json!({
+            "parts": [
+                part(
+                    "mount",
+                    "src/server.ts:13",
+                    "mount",
+                    serde_json::json!({ "piece": "folded", "text": "/api", "from": "src/config.ts" }),
+                ),
+                part(
+                    "own",
+                    "src/server.ts:8",
+                    "get",
+                    serde_json::json!({ "piece": "lit", "text": "/orders/:id" }),
+                ),
+            ],
+            "reading": "whole",
+        })),
+        "{addresses:#?}"
+    );
+    assert_eq!(
+        addresses.get("src/server.ts:10 GET /health"),
+        Some(&serde_json::json!({
+            "parts": [part(
+                "own",
+                "src/server.ts:10",
+                "get",
+                serde_json::json!({ "piece": "lit", "text": "/health" }),
+            )],
+            "reading": "whole",
+        })),
+        "{addresses:#?}"
+    );
+    for (row, address) in &addresses {
+        if row.starts_with("src/server.ts:9 ") {
+            assert!(address.is_null(), "{row}: {address}");
+        }
+    }
+}
