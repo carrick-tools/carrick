@@ -32,7 +32,15 @@ test("a missing AGENTS.md is created holding the check section", () => {
     assert.equal(body, SECTION);
     assert.ok(body.includes("## Carrick: use it while you work, not only at the end\n\nThis workspace (3 repositories, 43 services) is indexed by Carrick. The\n"));
     assert.ok(body.includes("5. After you edit a file, run `carrick check <file>` on that one file"));
-    assert.ok(!body.includes("When your change touches a route"));
+    // Rule 5 keeps the contract check: without this sentence agents ran
+    // `check --changed` on 0 of 7 tasks that add a call to another service
+    // (carrick-cloud#2991, impact-2026-11-06-contract-new).
+    assert.ok(
+      body.includes(
+        "When your change touches a route, a call to another service,\n   an event or a type another service reads, run `carrick check --changed`\n   before you say it is done.",
+      ),
+    );
+    assert.ok(!body.includes("## Carrick check\n"));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
