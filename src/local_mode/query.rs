@@ -908,10 +908,19 @@ pub fn answers_unavailable_sentence(lost: &crate::boundary::ModelAnswersUnavaila
         format!("{} routes and calls are", lost.rows)
     };
     format!(
-        "the index was written at {}, which this clone does not have and could not fetch from \
+        "{ANSWERS_UNAVAILABLE_LEAD}{}, which this clone does not have and could not fetch from \
          origin, so {missing} missing. Run `git fetch origin`, then check again.",
         lost.commit.chars().take(7).collect::<String>(),
     )
+}
+
+/// How [`answers_unavailable_sentence`] begins; a re-check's `reason` that
+/// starts with it covered nothing (carrick#3413).
+const ANSWERS_UNAVAILABLE_LEAD: &str = "the index was written at ";
+
+/// Whether a re-check's `reason` is the answers-unavailable sentence.
+pub fn is_answers_unavailable(reason: &str) -> bool {
+    reason.starts_with(ANSWERS_UNAVAILABLE_LEAD)
 }
 
 /// What the scan did with the model rows of the files edited since the hosted

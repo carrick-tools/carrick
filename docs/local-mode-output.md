@@ -638,7 +638,7 @@ carrick check: not checked: library facts unavailable: Carrick's library store c
 ```
 
 `--json` carries the same sentence as `not_checked`. `check <file> --recheck`
-reports it as `recheck.ran` `none` with it as `recheck.reason`, and exits 2. A
+reports it as `recheck.ran` `none` with it as `recheck.reason`, and exits 2; so does an index commit the clone does not hold (its "routes and calls are missing" sentence, carrick#3413). A
 store that answered, including with no claims for a package, and a signed-in
 run that reaches the store, print and exit as before. The CI runner is
 untouched: it signs in with OIDC, and a local-mode check does not run there.

@@ -912,6 +912,13 @@ fn inside(
         None,
         Some(plan),
     )?;
+    // A re-scan that could not replay the index's model answers has lost every
+    // row only the model stated: not a pass, as in the plain check's `answer`
+    // (carrick#3413).
+    let lost = super::changed::answers_lost(&rejoined.index, std::iter::once(&name));
+    if !lost.is_empty() {
+        return Err(lost.join(" "));
+    }
     if let Some(sentence) = library_unavailable(&rejoined.index, [&name]) {
         return Err(sentence.to_string());
     }

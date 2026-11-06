@@ -737,7 +737,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
 
 /// The sentence for each re-scanned repo whose scan could not replay the
 /// index's model answers (carrick#3000), in repo order.
-fn answers_lost<'a>(
+pub(super) fn answers_lost<'a>(
     rebuilt: &LocalIndex,
     scanned: impl Iterator<Item = &'a String>,
 ) -> Vec<String> {
