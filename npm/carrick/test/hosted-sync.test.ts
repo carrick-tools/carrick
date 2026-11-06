@@ -89,6 +89,13 @@ test("a record of another shape reads as none", (t) => {
   assert.equal(lastSync(workspace.root), null);
   fs.writeFileSync(file, JSON.stringify(record([behind])));
   assert.deepEqual(lastSync(workspace.root)?.repos, [behind]);
+  // A full refresh rewrote the snapshot after the record: the copy the
+  // record names is no longer the one on disk.
+  const snapshot = path.join(path.dirname(file), "snapshot.json");
+  fs.writeFileSync(snapshot, "{}");
+  const later = new Date(fs.statSync(file).mtimeMs + 1000);
+  fs.utimesSync(snapshot, later, later);
+  assert.equal(lastSync(workspace.root), null);
 });
 
 function writeRecord(root: string, value: SyncRecord): void {

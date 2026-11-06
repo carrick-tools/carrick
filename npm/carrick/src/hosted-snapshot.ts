@@ -51,10 +51,15 @@ export type SyncRecord = {
  * the snapshot beside it.
  */
 export function lastSync(root: string): SyncRecord | null {
+  const dir = path.join(root, ".carrick", "hosted");
+  const file = path.join(dir, "last-sync.json");
   try {
-    const parsed = JSON.parse(
-      fs.readFileSync(path.join(root, ".carrick", "hosted", "last-sync.json"), "utf8"),
-    ) as Partial<SyncRecord> | null;
+    // A full `carrick refresh` rewrites the snapshot and not this record, so
+    // a snapshot newer than the record means the copy it describes is gone.
+    // The move writes the record after the snapshot, so its own run passes.
+    const snapshot = fs.statSync(path.join(dir, "snapshot.json"), { throwIfNoEntry: false });
+    if (snapshot && snapshot.mtimeMs > fs.statSync(file).mtimeMs) return null;
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<SyncRecord> | null;
     if (
       parsed?.schema !== "carrick.hosted-sync/0" ||
       typeof parsed.at !== "string" ||
