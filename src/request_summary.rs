@@ -2036,6 +2036,23 @@ pub fn extract_file_ir(
                 _ => {}
             }
         }
+        // `export default { async fetch() {} }`: the extractor keys its
+        // members `default.<member>` (carrick#830). No binding names the
+        // object, so nothing writes through it (carrick#3370).
+        if let ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) = item
+            && let Expr::Object(object) =
+                crate::graphql_document_sites::unwrap_expression(&export.expr)
+        {
+            lift_object_members(
+                &reader,
+                "default",
+                object,
+                module_scope,
+                definition_keys,
+                &mut lifted_members,
+                &mut file,
+            );
+        }
     }
     // A getter of a lazily built client (carrick#1790), with how this module
     // uses its binding, so that every call of it can be accounted for
@@ -2062,7 +2079,18 @@ pub fn extract_file_ir(
         for item in &module.body {
             match item {
                 ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
-                    reader.walk(&*export.expr, &scope, &mut module_level);
+                    match crate::graphql_document_sites::unwrap_expression(&export.expr) {
+                        Expr::Object(object) if !lifted_members.is_empty() => {
+                            walk_object_except(
+                                &reader,
+                                object,
+                                &lifted_members,
+                                &scope,
+                                &mut module_level,
+                            );
+                        }
+                        _ => reader.walk(&*export.expr, &scope, &mut module_level),
+                    }
                 }
                 // `export default function () {}`: no name keys it, so it is
                 // read here, as a detached function.
