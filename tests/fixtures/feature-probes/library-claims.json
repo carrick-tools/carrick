@@ -1,0 +1,147 @@
+{
+ "library_claims": [
+  {
+   "package": "@fixture/http",
+   "version": "1.0.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "@fixture/http",
+     "export": "http",
+     "role": "http_client",
+     "side": "client",
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [
+      {
+       "op": "request",
+       "member": "post",
+       "on": "export",
+       "name": {
+        "arg": 0
+       },
+       "payload": {
+        "arg": 1
+       },
+       "method": "POST",
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  },
+  {
+   "package": "@fixture/queue",
+   "version": "2.4.1",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "@fixture/queue",
+     "export": "bus",
+     "role": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [
+      {
+       "op": "send",
+       "member": "publish",
+       "on": "export",
+       "name": {
+        "arg": 0
+       },
+       "payload": {
+        "arg": 1
+       },
+       "name_scope": {
+        "scope": "global",
+        "namespace": null
+       },
+       "picker": "fixture-picker"
+      },
+      {
+       "op": "receive",
+       "member": "subscribe",
+       "on": "export",
+       "name": {
+        "arg": 0
+       },
+       "handler": {
+        "arg": 1
+       },
+       "name_scope": {
+        "scope": "global",
+        "namespace": null
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": [
+      "*"
+     ]
+    }
+   ]
+  },
+  {
+   "package": "fixture-server",
+   "version": "1.0.0",
+   "status": "answered",
+   "exports": [
+    {
+     "specifier": "fixture-server",
+     "export": "default",
+     "role": "server_framework",
+     "side": null,
+     "makes": [
+      {
+       "form": "call",
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "op": "receive",
+       "member": "get",
+       "of": "instance:()",
+       "name": {
+        "arg": 0
+       },
+       "handler": {
+        "arg": 1
+       },
+       "method": "GET",
+       "picker": "fixture-picker"
+      },
+      {
+       "op": "receive",
+       "member": "post",
+       "of": "instance:()",
+       "name": {
+        "arg": 0
+       },
+       "handler": {
+        "arg": 1
+       },
+       "method": "POST",
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  }
+ ]
+}
