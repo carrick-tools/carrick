@@ -6195,6 +6195,78 @@ fn check_changed_does_not_name_a_call_an_untouched_producers_rescan_left_with_no
     assert_ne!(code, Some(1), "{json:#}");
 }
 
+/// The carry fixture with its handler-less route descriptors removed before
+/// the index, so only the handlers in `routes.ts` serve the web's calls, and
+/// its mount prefix then edited in `server.ts`: the routes in `routes.ts`, a
+/// file the work did not touch, are read at the same lines under another
+/// path (carrick#3412).
+fn carry_workspace_with_a_moved_mount() -> tempfile::TempDir {
+    let workspace = carry_workspace_with(|root| {
+        std::fs::remove_file(root.join("items-api/src/openapi.ts")).expect("remove the docs");
+    });
+    edit(
+        &workspace.path().join("items-api/src/server.ts"),
+        "prefix: '/api/v1'",
+        "prefix: '/api/v2'",
+    );
+    workspace
+}
+
+/// The web's calls the index matched, now reaching no route, as `file` rows.
+fn stranded_client_rows<'a>(
+    rows: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> Vec<&'a serde_json::Value> {
+    rows.into_iter()
+        .filter(|row| row["file"] == "items-web/src/client.ts" && row["after"] == "no_route")
+        .collect()
+}
+
+/// A mount prefix edit in `server.ts` moves the routes `routes.ts` declares.
+/// That file is unchanged, yet the work took the web's routes away, so
+/// `check --changed` names the calls.
+#[test]
+#[serial]
+fn check_changed_names_the_calls_a_mount_prefix_edit_strands() {
+    let workspace = carry_workspace_with_a_moved_mount();
+    let root = workspace.path();
+
+    let (_, json) = carry_check_changed(root);
+    let problems = json["problems"].as_array().into_iter().flatten();
+    let stranded = stranded_client_rows(problems);
+    assert!(
+        !stranded.is_empty(),
+        "the client calls are named:\n{json:#}"
+    );
+    for row in stranded {
+        assert_eq!(row["kind"], "no_route", "{json:#}");
+        assert_eq!(row["outside_the_change"], true, "{json:#}");
+    }
+}
+
+/// The same edit through the per-edit re-check of `server.ts`.
+#[test]
+#[serial]
+fn a_recheck_of_a_mount_prefix_edit_names_the_calls_it_strands() {
+    let workspace = carry_workspace_with_a_moved_mount();
+    let root = workspace.path();
+
+    let answer = recheck_json(root, "items-api/src/server.ts", &AMPLE);
+    assert_ne!(
+        answer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answer:#}"
+    );
+    let moved = moved_of(&answer);
+    let stranded = stranded_client_rows(&moved);
+    assert!(
+        !stranded.is_empty(),
+        "the client calls are named:\n{answer:#}"
+    );
+    for row in stranded {
+        assert_eq!(row["before"], "matched", "{answer:#}");
+    }
+}
+
 /// The shop with `Widget` moved out of the route file into `types.ts`.
 fn shop_with_widget_in_a_types_file() -> tempfile::TempDir {
     workspace_prepared(SHOP, &["shop"], |repo| {

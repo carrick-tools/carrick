@@ -21,6 +21,7 @@ model's answer. The cassettes under `cassettes/analyze-file/` are that answer.
 | two lines above the plugin, `connected` renamed in the line-4 handler | carry all three rows (now at lines 6, 11, 16), re-type from the tree, and fail `check --changed` on the line-6 route |
 | the line-9 path literal changed | not carry that row (`registration_line_changed`), carry the other two |
 | the named handler's body changed | not carry the line-14 row (`hint_outside_registration_changed`), carry the other two |
+| `openapi.ts` removed before the index, then `server.ts`'s prefix changed to `/api/v2` | not carry the mount row (`registration_line_changed`); read the three `routes.ts` routes at their same lines under another path; name the `items-web` calls they served as no route, in `check --changed` and in the re-check of `server.ts` (carrick#3412) |
 
 Cassette line numbers are the fixture's line numbers: changing a line in
 `routes.ts` changes this key in the same commit. The receiver is named `api`,

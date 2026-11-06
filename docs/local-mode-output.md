@@ -255,9 +255,14 @@ counts when the index held the same row at the same line with a resolved,
 compatible pair and the re-join now mismatches it, or when the index matched a
 call to a route and the re-join finds none, and a file of one of that call's
 old producers changed since the index (edited, added, deleted or renamed
-away). A call whose producers are all in unchanged files is re-scan drift: not
-listed, with one `rescan-drift` line in the debug log (on stderr when
-`CARRICK_RECHECK_DRIFT` is set). A route renamed in its own file
+away), or the re-scan still reads that producer's route at the same line under
+another path (a mount on its chain moved it, carrick#3412). Any other call
+whose producers are all in unchanged files is re-scan drift: not listed, with
+one `rescan-drift` line in the debug log (on stderr when
+`CARRICK_RECHECK_DRIFT` is set). A mount edit that removes a router's routes,
+rather than moving them, reads the same as drift and is not listed. Neither is
+a call that a handler-less route table still documenting the old path keeps
+matched. A route renamed in its own file
 lists the callers it strands, wherever they are. The rows of the edited file
 itself are `items`, not here.
 
@@ -695,8 +700,10 @@ never add to `routes`, `calls` or `type_checked`, which are about the changed
 files.
 
 - A call the index matched, whose old producer sits in a file changed since
-  the index, that now reaches no route. It is listed when it
-  fails, and with `--all` otherwise.
+  the index or is still read at the same line under another path (a mount on
+  its chain moved it), that now reaches no route. It is listed when it
+  fails, and with `--all` otherwise. A mount edit that removes the routes,
+  rather than moving them, reads as re-scan drift and is not listed.
 - A pair whose rebuilt verdict is a mismatch (`type_mismatch` or
   `method_mismatch`) and that the index did not already hold as a mismatch at
   the same line. If the index held it resolved and compatible, the work moved
