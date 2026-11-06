@@ -484,7 +484,11 @@ test("init replaces the scaffold's session-start entry and keeps its nudges and 
     ["carrick hook session-start"],
     "one session-start message",
   );
-  assert.deepEqual(written.hooks.UserPromptSubmit, [{ hooks: [pack("turn-reminder")] }]);
+  // The pack's reminder is kept, and the prompt lookup (carrick#3375) joins it.
+  assert.deepEqual(written.hooks.UserPromptSubmit, [
+    { hooks: [pack("turn-reminder")] },
+    { hooks: [{ type: "command", command: "carrick hook user-prompt", timeout: 5 }] },
+  ]);
   assert.deepEqual(written.hooks.PreToolUse, [
     { matcher: "Grep", hooks: [pack("search-gate")] },
     { matcher: "Bash", hooks: [pack("search-gate")] },

@@ -1,5 +1,11 @@
 #!/usr/bin/env node
-// UserPromptSubmit hook: the reuse nudge, on Codex (carrick#1335).
+// UserPromptSubmit hook, on both hosts: the prompt lookup (carrick#3375), and on
+// Codex the reuse nudge (carrick#1335).
+//
+// The lookup names up to three existing functions for the user's ask (see
+// `lookup.ts`). Everything below it is Codex-only: Claude Code has `Stop` and
+// `PostToolUse` to carry late answers and the nudge, so on Claude Code those
+// stay with them.
 //
 // Same nudge, same store, same once-per-set marking as the Stop hook this
 // package installs for Claude Code — `drain` is the shared half and the only
@@ -27,6 +33,7 @@ import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
 import { deliverLate } from "./late.ts";
 import { drain } from "./reuse.ts";
+import { promptLookup } from "./lookup.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 
@@ -34,6 +41,9 @@ const log = createLogger("carrick-user-prompt");
 
 type Payload = {
   session_id?: string;
+  /** The user's prompt text, on both hosts' `UserPromptSubmit` payloads. */
+  prompt?: string;
+  cwd?: string;
 };
 
 async function readStdin(): Promise<string> {
@@ -78,18 +88,34 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Finished background re-checks first (Codex has no Stop to carry them),
-  // then the reuse nudge, which is about what the whole task added.
-  const parts: string[] = [...deliverLate(session)];
-  const spoken = drain(session);
-  if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
-  else parts.push(spoken.line);
+  // Claude Code sets `CLAUDE_PROJECT_DIR` for every hook and Codex does not.
+  const codex = !process.env["CLAUDE_PROJECT_DIR"];
+  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? payload.cwd ?? process.cwd());
+  const parts: string[] = [];
+  let spoken: ReturnType<typeof drain> = null;
+  if (codex) {
+    // Finished background re-checks first (Codex has no Stop to carry them),
+    // then the reuse nudge, which is about what the whole task added.
+    parts.push(...deliverLate(session));
+    spoken = drain(session, root);
+    if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
+    else parts.push(spoken.line);
+  }
 
   // The same backstop the other hooks carry: this `carrick` is not the one
   // that set this workspace up (carrick#1372), once a day per workspace.
-  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
   const mismatch = root === null ? null : throttledVersionMismatch(root, currentVersion());
   if (mismatch) parts.push(mismatch);
+
+  if (typeof payload.prompt === "string" && payload.prompt !== "") {
+    const line = await promptLookup({
+      prompt: payload.prompt,
+      session,
+      root: root ?? process.env["CLAUDE_PROJECT_DIR"] ?? payload.cwd ?? process.cwd(),
+      log,
+    }).catch(() => null);
+    if (line) parts.push(line);
+  }
 
   if (parts.length === 0) return;
   process.stdout.write(emission(parts.join("\n\n")));

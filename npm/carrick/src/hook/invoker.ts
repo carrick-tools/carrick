@@ -8,7 +8,7 @@
 // inherits the process environment.
 
 /** The hooks that start the binary, and the value each sends. */
-export type HookInvoker = "post-edit" | "stop" | "session-start" | "post-read";
+export type HookInvoker = "post-edit" | "stop" | "session-start" | "post-read" | "user-prompt";
 
 export const INVOKER_ENV = "CARRICK_INVOKER";
 

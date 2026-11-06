@@ -13,7 +13,7 @@
 // must not read as a missing feature.
 
 import { z } from "zod";
-import { API_BASE } from "../auth/credentials.ts";
+import { post } from "../auth/api.ts";
 
 const project = z.object({
   slug: z.string(),
@@ -42,21 +42,11 @@ export async function listProjects(
   request: typeof fetch = fetch,
   signal?: AbortSignal,
 ): Promise<Project[] | null> {
-  let result: Response;
-  try {
-    result = await request(`${API_BASE}/types/check-or-upload`, {
-      method: "POST",
-      redirect: "error",
-      signal: AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]),
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "list-projects" }),
-    });
-  } catch {
-    // A request that never reached the server says nothing about whether the
-    // action exists, and the workspace read that precedes this one already
-    // reports an unreachable API. Fall back rather than fail the run.
-    return null;
-  }
+  // A request that never reached the server says nothing about whether the
+  // action exists, and the workspace read that precedes this one already
+  // reports an unreachable API. Fall back rather than fail the run.
+  const result = await post(token, { action: "list-projects" }, request, signal);
+  if (result === null) return null;
   if (result.status === 401) throw new Error(REJECTED);
   if (!result.ok) return null;
   let payload: unknown;

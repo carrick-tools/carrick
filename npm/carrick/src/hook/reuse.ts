@@ -53,6 +53,17 @@ export type SessionRecord = {
    * `checked.ts` compares it with the last `carrick check --changed`.
    */
   edited: Record<string, number>;
+  /**
+   * How many prompt lookups this session has made (carrick#3375). Counted when
+   * the request is sent, so a refused or timed-out one still counts.
+   */
+  lookups: number;
+  /**
+   * `file::name` of the functions a prompt lookup showed the model. Names and
+   * paths only, never the prompt; the edit-time check reads it so it does not
+   * name the same function twice.
+   */
+  named_by_lookup: string[];
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -89,6 +100,8 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     told: [],
     read: [],
     edited: {},
+    lookups: 0,
+    named_by_lookup: [],
     updated: "",
   };
   const file = sessionFile(sessionId, home);
@@ -124,6 +137,13 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
           (entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]),
         ),
       ),
+      lookups:
+        typeof record.lookups === "number" && Number.isFinite(record.lookups) && record.lookups > 0
+          ? Math.floor(record.lookups)
+          : 0,
+      named_by_lookup: Array.isArray(record.named_by_lookup)
+        ? record.named_by_lookup.filter((entry): entry is string => typeof entry === "string")
+        : [],
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -324,6 +344,24 @@ export function markRead(sessionId: string, file: string, home?: string): void {
   write(sessionId, current, home);
 }
 
+/** Count one prompt lookup against this session, and return the new count. */
+export function countLookup(sessionId: string, home?: string): number {
+  const current = readSession(sessionId, home);
+  current.lookups += 1;
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+  return current.lookups;
+}
+
+/** Remember which functions a prompt lookup showed, as `file::name`. */
+export function markNamedByLookup(sessionId: string, keys: string[], home?: string): void {
+  if (keys.length === 0) return;
+  const current = readSession(sessionId, home);
+  current.named_by_lookup = [...new Set([...current.named_by_lookup, ...keys])];
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
 /** What one delivery of the nudge said, for the hook that delivered it. */
 export type Drained = {
   /** The line to hand the model. */
@@ -346,23 +384,24 @@ export type Drained = {
  * is the point: a nudge that is written and not recorded fires again on the
  * next stop, and a task is several stops.
  */
-export function drain(sessionId: string, home?: string): Drained | null {
+export function drain(sessionId: string, root: string | null, home?: string): Drained | null {
   const current = readSession(sessionId, home);
   const waiting = pending(current);
   if (waiting.length === 0) return null;
-  const line = nudge(waiting);
+  const line = nudge(waiting, root === null ? "" : snapshotProjectSlug(root));
   markNudged(sessionId, waiting, home);
   return { line, named: waiting.length, found: current.found.length };
 }
 
 /**
  * The one line the Stop hook hands the model: how many functions, at most two
- * names, and the ask with the exact call (`functions: [{ name, file }]`). Short on purpose, and it starts with "Carrick:" so the
+ * names, and the ask with the exact call (`functions`, one `{ description }` each: the
+ * functions are new, so the index has no name to find). Short on purpose, and it starts with "Carrick:" so the
  * user can tell where it came from. The two limits on the answer (what the
  * index was taken at, and that the match is on what a function is described as
  * doing) live in the `carrick-reuse` skill, where the answer is read.
  */
-export function nudge(entries: NewFunction[]): string {
+export function nudge(entries: NewFunction[], slug = ""): string {
   const total = entries.length;
   const shown = entries.slice(0, 2).map((entry) => entry.name);
   const rest = total - shown.length;
@@ -372,5 +411,29 @@ export function nudge(entries: NewFunction[]): string {
       : shown.length === 2
         ? `${shown[0]} and ${shown[1]}`
         : shown[0]!;
-  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing \`functions: [{ name, file }]\`, one entry per new function. Then tell the user in one line what Carrick found.`;
+  const projectArg = slug === "" ? "" : `\`project: "${slug}"\` and `;
+  return `Carrick: this task added ${total} new function${total === 1 ? "" : "s"} (${list}). Check them for existing copies with one find_similar call, passing ${projectArg}\`functions\`, one \`{ description }\` per new function: one plain sentence saying what it does (new functions are not in the index yet, so a name is not found). Where it names an existing function that does the same job, or most of it, call that function instead: delete your copy, or, when the task asked for your function by name, keep the function but make its body call the existing one and add only what it lacks. Then tell the user in one line what Carrick found and what you changed.`;
+}
+
+/**
+ * The one project slug the workspace's cached hosted snapshot names, or ""
+ * when there is none or more than one (`find_similar` needs one project).
+ * `snapshot.json` is written by the hosted refresh: `resolution.repos[]`
+ * carries each connected repo's `project_slug`.
+ */
+export function snapshotProjectSlug(root: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), "utf8"));
+  } catch {
+    return "";
+  }
+  const repos = (parsed as { resolution?: { repos?: unknown } } | null)?.resolution?.repos;
+  if (!Array.isArray(repos)) return "";
+  const slugs = new Set<string>();
+  for (const repo of repos) {
+    const slug = (repo as { project_slug?: unknown } | null)?.project_slug;
+    if (typeof slug === "string" && slug !== "") slugs.add(slug);
+  }
+  return slugs.size === 1 ? [...slugs][0]! : "";
 }

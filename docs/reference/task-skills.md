@@ -223,7 +223,15 @@ nothing about them. A function added after a nudge is pending on its own.
 
 **The line is short and says where it came from.** It reads "Carrick: this task
 added N new functions (a, b and N-2 more). Check them for existing copies with
-one find_similar call, then tell the user in one line what Carrick found." Names
+one find_similar call, passing `project: "<slug>"` and `functions`, one
+`{ description }` per new function: one plain sentence saying what it does (new
+functions are not in the index yet, so a name is not found). Where it names an
+existing function that does the same job, or most of it, call that function
+instead: delete your copy, or, when the task asked for your function by name,
+keep the function but make its body call the existing one and add only what it
+lacks. Then tell the user in one line what Carrick found and what you changed."
+The project clause appears when the workspace's hosted snapshot names exactly
+one project. Names
 only, at most two, no paths; one and two functions read "(a)" and "(a and b)".
 Test, spec and story files are never recorded (`isCheckedSource`), and a
 function is keyed by its path relative to the nearest checkout top, so an edit
@@ -305,6 +313,34 @@ says so on the line that reports the file.
 the Claude ones, and only where the workspace holds a `.codex/` directory — that
 folder is Codex's project config layer and the one init writes into, so its
 absence means Codex is not set up here and doctor says nothing about it.
+
+## The prompt lookup (carrick#3375)
+
+Governed code: `npm/carrick/src/hook/lookup.ts`, run by `carrick hook
+user-prompt` (`npm/carrick/src/hook/user-prompt.ts`) on Claude Code and Codex.
+
+On a prompt of 12 words or more, the hook asks the project's index which
+functions already do part of the task and hands the model up to three of them,
+as `name (file:line)`, with the line "If one does the job, or most of it, call it
+rather than writing your own; if the task names a new function, make its body
+call the existing one and add only what it lacks." It makes at most 10 lookups per session, waits at
+most 3 seconds, and prints nothing on any failure, so it never holds a prompt
+past that.
+
+**What is sent.** The first 1,000 characters of the prompt, once, in the body of
+one `search-by-intent` request to the same endpoint the Carrick MCP tool uses,
+with your stored credential and the project id from
+`.carrick/hosted/snapshot.json`. Nothing else leaves the machine.
+
+**What is stored.** The prompt is stored and logged nowhere: not in the session
+record, not in a log, not on stdout. The session record keeps only how many
+lookups were made and the `file::name` of the functions shown, and the hook's
+one log line is counts (`lookup words=<n> ms=<n> rows=<n> status=<code>`). The
+server logs counts only.
+
+**Turning it off.** `CARRICK_CHANNEL=off` silences every Carrick surface,
+including this one. With no stored credential, no hosted snapshot, or a
+snapshot that names more than one project, the hook does nothing.
 
 ## Ordering against the cloud
 
