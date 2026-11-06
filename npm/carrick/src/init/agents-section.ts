@@ -37,8 +37,12 @@ function countsPhrase(counts: WorkspaceCounts | null): string | null {
  * The words are the rules block measured in carrick-cloud#2991 (21 graded runs
  * per arm on one build: reused 17/21 against 5/21), plus rule 5's contract
  * sentence: without it agents ran `check --changed` on 0 of 7 tasks that add a
- * call to another service, against 6 of 7 on the previous section. Only the
- * counts and the scope clause vary; edit nothing else without a new measurement.
+ * call to another service, against 6 of 7 on the previous section. Rule 5 asks
+ * for that check only where another service reads the change and leaves the
+ * per-file check to the edit hook init installs for Claude Code and Codex: the
+ * same 4 of 7 contract checks as the per-file wording, with no duplicate
+ * per-file calls (carrick-cloud#3068, D13). Only the counts and the scope clause
+ * vary; edit nothing else without a new measurement.
  */
 export function renderCheckSection(scope: SkillScope, counts: WorkspaceCounts | null): string {
   const phrase = countsPhrase(counts);
@@ -72,11 +76,11 @@ export function renderCheckSection(scope: SkillScope, counts: WorkspaceCounts | 
     "   similar endpoint or another API version, or a local copy of a type.",
     "4. Use grep and Read to confirm and to read code once Carrick has told you",
     "   where to look.",
-    "5. After you edit a file, run `carrick check <file>` on that one file (one",
-    "   file per call). When your change touches a route, a call to another service,",
-    "   an event or a type another service reads, run `carrick check --changed`",
-    "   before you say it is done. In your final summary,",
-    "   say what Carrick found and what you changed because of it.",
+    "5. Run `carrick check --changed` before you say it is done only when your change",
+    "   touches a route, a call to another service, an event or a type another",
+    "   service reads. Each file you edit is already checked for you, so a change no",
+    "   other service sees needs nothing more. In your final summary, say what",
+    "   Carrick found and what you changed because of it.",
     END,
     "",
   ].join("\n");

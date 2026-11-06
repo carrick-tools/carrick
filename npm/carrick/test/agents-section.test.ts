@@ -31,15 +31,16 @@ test("a missing AGENTS.md is created holding the check section", () => {
     const body = fs.readFileSync(file, "utf8");
     assert.equal(body, SECTION);
     assert.ok(body.includes("## Carrick: use it while you work, not only at the end\n\nThis workspace (3 repositories, 43 services) is indexed by Carrick. The\n"));
-    assert.ok(body.includes("5. After you edit a file, run `carrick check <file>` on that one file"));
-    // Rule 5 keeps the contract check: without this sentence agents ran
-    // `check --changed` on 0 of 7 tasks that add a call to another service
-    // (carrick-cloud#2991, impact-2026-11-06-contract-new).
+    // Rule 5 asks for the branch-wide check only where another service reads
+    // the change, and leaves the per-file check to the edit hook: the same
+    // contract check rate as the per-file wording (4 of 7) with no duplicate
+    // per-file calls (carrick-cloud#3068, impact-2026-11-06 rule5b, D13).
     assert.ok(
       body.includes(
-        "When your change touches a route, a call to another service,\n   an event or a type another service reads, run `carrick check --changed`\n   before you say it is done.",
+        "5. Run `carrick check --changed` before you say it is done only when your change\n   touches a route, a call to another service, an event or a type another\n   service reads. Each file you edit is already checked for you, so a change no\n   other service sees needs nothing more. In your final summary, say what\n   Carrick found and what you changed because of it.\n<!-- carrick:check end -->",
       ),
     );
+    assert.ok(!body.includes("carrick check <file>"));
     assert.ok(!body.includes("## Carrick check\n"));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
