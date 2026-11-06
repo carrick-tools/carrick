@@ -78,7 +78,7 @@ use swc_common::{
 };
 use swc_ecma_ast::{
     BinExpr, BinaryOp, BindingIdent, ExportSpecifier, Expr, Ident, Lit, ModuleDecl, ModuleItem,
-    Pat, Str, Tpl, TsEntityName, TsType, VarDeclarator,
+    Str, Tpl, TsEntityName,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
@@ -910,48 +910,6 @@ impl DispatchWitnesses {
     }
 }
 
-/// Reduce a TS type annotation to its primary symbol, stripping the same
-/// wrappers `primary_type_symbol` strips (`Promise<User[]>` -> `User`). Arrays
-/// and the `Promise`/`Array`/`ReadonlyArray` container generics unwrap to their
-/// element; a qualified name (`ns.Foo`) or a builtin has no borrowable symbol.
-/// Used to compare a request payload's declared type against the model's
-/// emitted response symbol.
-fn base_type_symbol(ty: &TsType) -> Option<String> {
-    match ty {
-        TsType::TsArrayType(arr) => base_type_symbol(&arr.elem_type),
-        TsType::TsParenthesizedType(inner) => base_type_symbol(&inner.type_ann),
-        TsType::TsTypeRef(type_ref) => {
-            let name = match &type_ref.type_name {
-                TsEntityName::Ident(id) => id.sym.to_string(),
-                TsEntityName::TsQualifiedName(_) => return None,
-            };
-            if matches!(name.as_str(), "Promise" | "Array" | "ReadonlyArray") {
-                return type_ref
-                    .type_params
-                    .as_ref()
-                    .and_then(|p| p.params.first())
-                    .and_then(|p| base_type_symbol(p));
-            }
-            Some(name)
-        }
-        _ => None,
-    }
-}
-
-/// Is `expr` a call, or an await/paren/cast wrapping one? Identifies a binding
-/// whose value comes FROM a call, so its type annotation is response-side
-/// evidence (`const r: AuditEvent = await axios.post(...)`).
-fn expr_is_call_like(expr: &Expr) -> bool {
-    match expr {
-        Expr::Await(a) => expr_is_call_like(&a.arg),
-        Expr::Paren(p) => expr_is_call_like(&p.expr),
-        Expr::TsAs(a) => expr_is_call_like(&a.expr),
-        Expr::TsNonNull(a) => expr_is_call_like(&a.expr),
-        Expr::Call(_) => true,
-        _ => false,
-    }
-}
-
 /// The payload expression text as a bare identifier (`event`), or `None` when
 /// it is anything else (`{ ... }`, `event.data`, `build()`) — the only shape
 /// whose declared type we can resolve from the binding table.
@@ -965,18 +923,6 @@ fn payload_bare_ident(text: &str) -> Option<&str> {
         Some(t)
     } else {
         None
-    }
-}
-
-/// Does the verbatim call text carry an explicit type-argument list (before the
-/// call's argument parens) naming `symbol`? Detects a response generic like
-/// `axios.post<AuditEvent>(...)` without re-parsing.
-fn call_text_has_type_generic(call_text: &str, symbol: &str) -> bool {
-    let head_end = call_text.find('(').unwrap_or(call_text.len());
-    let head = &call_text[..head_end];
-    match head.find('<') {
-        Some(lt) => contains_word(&head[lt..], symbol),
-        None => false,
     }
 }
 
@@ -1118,53 +1064,12 @@ impl Visit for TypeRefIdentCollector<'_> {
     }
 }
 
-/// Collects the AST evidence `suppress_borrowed_request_types` needs from one
-/// file in a single walk: every binding's declared primary type (params and
-/// typed `const`/`let`), and every type symbol MENTIONED in the annotation of a
-/// call-initialized binding (response-side evidence).
-#[derive(Default)]
-struct BindingTypeCollector {
-    /// binding identifier -> its declared primary type symbol.
-    binding_types: HashMap<String, String>,
-    /// All named type refs (any nesting depth) appearing in the annotation of a
-    /// call-initialized binding: `const r: Response<AuditEvent> = await
-    /// axios.post(...)` contributes `Response` and `AuditEvent`. Membership is
-    /// response-side evidence for that symbol — deliberately mention-based, not
-    /// primary-symbol equality, so a framework envelope never hides a real
-    /// response annotation (and never via a hardcoded wrapper-name list).
-    call_annotated_syms: HashSet<String>,
-}
-
-impl Visit for BindingTypeCollector {
-    fn visit_binding_ident(&mut self, n: &BindingIdent) {
-        if let Some(type_ann) = &n.type_ann
-            && let Some(sym) = base_type_symbol(&type_ann.type_ann)
-        {
-            self.binding_types.insert(n.id.sym.to_string(), sym);
-        }
-        n.visit_children_with(self);
-    }
-
-    fn visit_var_declarator(&mut self, n: &VarDeclarator) {
-        if let Pat::Ident(binding) = &n.name
-            && let (Some(type_ann), Some(init)) = (&binding.type_ann, n.init.as_deref())
-            && expr_is_call_like(init)
-        {
-            type_ann.type_ann.visit_with(&mut TypeRefIdentCollector {
-                syms: &mut self.call_annotated_syms,
-            });
-        }
-        n.visit_children_with(self);
-    }
-}
-
 /// Collects the per-binding annotation evidence the pub/sub borrow witness
 /// checks an explicit `primary_type_symbol` against (#413): for every
 /// annotated binding in the file (params and typed `const`/`let`), the set of
 /// type symbols MENTIONED at any nesting depth in that binding's annotation.
 ///
-/// Mention-based on purpose, mirroring `call_annotated_syms` in the HTTP
-/// sibling: `envelope: Envelope<OrderPlaced>` credits BOTH `Envelope` and
+/// Mention-based on purpose: `envelope: Envelope<OrderPlaced>` credits BOTH `Envelope` and
 /// `OrderPlaced` to `envelope`, so an explicit anchor that correctly names
 /// the INNER contract type of a wrapped payload is never witnessed as a
 /// borrow by its own wrapper annotation (the corpus-2 `order.placed`
@@ -1195,8 +1100,7 @@ impl Visit for AnnotationMentionsCollector {
 
 /// Deterministic borrow witness for a pub/sub explicit anchor (#413): AST
 /// evidence that `symbol` structurally cannot be the type of the payload the
-/// op's locator names. The pub/sub analogue of
-/// `suppress_borrowed_request_types`' binding-type check.
+/// op's locator names.
 ///
 /// Fires only when BOTH hold:
 /// 1. The payload binding itself is annotated, and that annotation never
@@ -2746,13 +2650,11 @@ impl FileOrchestrator {
             // defines it (blueprint row N10c).
             FileOrchestrator::validate_type_hints(adjusted, &pf.symbol_table);
 
-            // Deterministic extraction-flake guards (#361): drop a
-            // data-call response symbol that borrows the request type,
-            // and repair a graphql-over-HTTP target reported as the
-            // transport URL. Both re-parse the file, so both are gated
-            // on a candidate data call being present.
+            // Deterministic extraction-flake guard (#361): repair a
+            // graphql-over-HTTP target reported as the transport URL. A
+            // response symbol that borrows the request type is dropped by
+            // the sidecar's relation instead (blueprint row N27 (i)).
             let file_path = Path::new(&pf.path_str);
-            FileOrchestrator::suppress_borrowed_request_types(adjusted, file_path);
             FileOrchestrator::rewrite_graphql_document_targets(adjusted, file_path);
 
             // Read how each call's base resolves (carrick#649). LAST
@@ -7448,90 +7350,6 @@ impl FileOrchestrator {
             && imported.source.as_str() == stripped
         {
             *source = Some(stripped.to_string());
-        }
-    }
-
-    /// Suppress a `data_call.primary_type_symbol` that borrows the REQUEST
-    /// body's type (flake pattern 2, #361).
-    ///
-    /// `primary_type_symbol` on a data call names the call's RESULT type. When
-    /// the result is un-annotated but the request payload has a named type
-    /// (`axios.post(url, event)` with `event: AuditEvent`), the lite model
-    /// intermittently emits the request type (`AuditEvent`) into that
-    /// response-only slot. This corrupts the consumer's type contract with a
-    /// symbol the call never produces.
-    ///
-    /// The fix is deterministic and evidence-gated, mirroring
-    /// `normalize_import_extension`: we suppress ONLY when the emitted symbol is
-    /// demonstrably the request payload's declared type AND there is no
-    /// response-side type evidence. A shared request/response type that is
-    /// legitimately annotated — a call generic (`axios.post<AuditEvent>(...)`)
-    /// or an annotated result binding (`const r: AuditEvent = await ...`) — is
-    /// left untouched. When the payload is not a bare identifier (an object
-    /// literal, a member expression, a call) we cannot resolve its type from the
-    /// AST, so we never touch the row. We normalize against evidence, never
-    /// guess; the worst case is a missed suppression, never a nulled real type.
-    fn suppress_borrowed_request_types(result: &mut FileAnalysisResult, file_path: &Path) {
-        // Gate: only parse when a data call has both an emitted symbol and a
-        // bare-identifier payload (the only shape whose type we can resolve).
-        let needs_parse = result.data_calls.iter().any(|dc| {
-            dc.primary_type_symbol.is_some()
-                && dc
-                    .payload_expression_text
-                    .as_deref()
-                    .and_then(payload_bare_ident)
-                    .is_some()
-        });
-        if !needs_parse {
-            return;
-        }
-
-        let cm: Lrc<SourceMap> = Default::default();
-        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
-        let Some(module) = parse_file(file_path, &cm, &handler) else {
-            return;
-        };
-        let mut collector = BindingTypeCollector::default();
-        module.visit_with(&mut collector);
-
-        for dc in &mut result.data_calls {
-            let Some(symbol) = dc.primary_type_symbol.as_deref() else {
-                continue;
-            };
-            let Some(payload_ident) = dc
-                .payload_expression_text
-                .as_deref()
-                .and_then(payload_bare_ident)
-            else {
-                continue;
-            };
-            // The emitted (response) symbol must BE the request payload's
-            // declared type for this to be a borrow.
-            if collector
-                .binding_types
-                .get(payload_ident)
-                .map(String::as_str)
-                != Some(symbol)
-            {
-                continue;
-            }
-            // Response-side evidence that the type is legitimate, not borrowed:
-            // an explicit call generic, or any call-initialized binding in the
-            // file whose annotation MENTIONS this symbol at any depth
-            // (`const r: Response<AuditEvent> = await ...` counts for
-            // `AuditEvent` — envelope wrappers never hide real evidence).
-            let has_response_evidence = dc
-                .call_expression_text
-                .as_deref()
-                .is_some_and(|text| call_text_has_type_generic(text, symbol))
-                || collector.call_annotated_syms.contains(symbol);
-            if has_response_evidence {
-                continue;
-            }
-            // Borrow with no response evidence: drop it so the type falls to
-            // Unknown / sidecar inference instead of the wrong request type.
-            dc.primary_type_symbol = None;
-            dc.type_import_source = None;
         }
     }
 
@@ -22976,177 +22794,6 @@ export function publishWrapped(order: OrderPlaced): void {
             pubsub_operations: vec![],
             dispatch_tables: Vec::new(),
         }
-    }
-
-    #[test]
-    fn test_suppress_borrowed_request_type_nulls_request_only_symbol() {
-        // `event: AuditEvent` is the REQUEST payload; the call has no response
-        // annotation, so `AuditEvent` in the response slot is a borrow. A second
-        // call carries an explicit `<AuditEvent>` generic — a real response
-        // annotation that must survive.
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("audit.ts");
-        std::fs::write(
-            &file_path,
-            r#"
-import axios from "axios";
-export interface AuditEvent { paymentId: string; }
-export async function recordAuditEvent(event: AuditEvent): Promise<void> {
-  await axios.post("http://localhost:3099/audit/events", event);
-  await axios.post<AuditEvent>("http://localhost:3099/audit/echo", event);
-}
-"#,
-        )
-        .unwrap();
-
-        let mut result = result_with_data_calls(vec![
-            // Borrow: no response evidence -> must be nulled.
-            guard_data_call(
-                5,
-                "/audit/events",
-                Some(r#"axios.post("http://localhost:3099/audit/events", event)"#),
-                Some("event"),
-                Some("AuditEvent"),
-                Some("./types"),
-            ),
-            // Explicit call generic -> a real response annotation -> kept.
-            guard_data_call(
-                6,
-                "/audit/echo",
-                Some(r#"axios.post<AuditEvent>("http://localhost:3099/audit/echo", event)"#),
-                Some("event"),
-                Some("AuditEvent"),
-                Some("./types"),
-            ),
-        ]);
-
-        FileOrchestrator::suppress_borrowed_request_types(&mut result, &file_path);
-
-        // Borrow suppressed (both symbol and its import source).
-        assert_eq!(result.data_calls[0].primary_type_symbol, None);
-        assert_eq!(result.data_calls[0].type_import_source, None);
-        // Explicitly annotated response kept.
-        assert_eq!(
-            result.data_calls[1].primary_type_symbol.as_deref(),
-            Some("AuditEvent")
-        );
-        assert_eq!(
-            result.data_calls[1].type_import_source.as_deref(),
-            Some("./types")
-        );
-    }
-
-    #[test]
-    fn test_suppress_borrowed_request_type_keeps_annotated_result_binding() {
-        // A file where the SAME type is legitimately annotated on a
-        // call-initialized binding (`const echoed: AuditEvent = await ...`):
-        // that is response-side evidence, so the shared type must be kept.
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("echo.ts");
-        std::fs::write(
-            &file_path,
-            r#"
-import axios from "axios";
-export interface AuditEvent { paymentId: string; }
-export async function echoAudit(event: AuditEvent): Promise<AuditEvent> {
-  const echoed: AuditEvent = await axios.post("http://localhost:3099/audit/echo", event);
-  return echoed;
-}
-"#,
-        )
-        .unwrap();
-
-        let mut result = result_with_data_calls(vec![guard_data_call(
-            5,
-            "/audit/echo",
-            Some(r#"axios.post("http://localhost:3099/audit/echo", event)"#),
-            Some("event"),
-            Some("AuditEvent"),
-            Some("./types"),
-        )]);
-
-        FileOrchestrator::suppress_borrowed_request_types(&mut result, &file_path);
-
-        assert_eq!(
-            result.data_calls[0].primary_type_symbol.as_deref(),
-            Some("AuditEvent"),
-            "annotated result binding is response evidence; type must not be nulled"
-        );
-    }
-
-    #[test]
-    fn test_suppress_borrowed_request_type_keeps_wrapped_result_binding() {
-        // The result binding's annotation wraps the shared type in a generic
-        // envelope (`const r: Response<AuditEvent> = await ...`). Evidence is
-        // mention-based (any depth, no wrapper-name allowlist), so the symbol
-        // must be kept exactly like the bare-annotation case.
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("wrapped.ts");
-        std::fs::write(
-            &file_path,
-            r#"
-import axios from "axios";
-export interface AuditEvent { paymentId: string; }
-export interface Response<T> { data: T; status: number; }
-export async function echoAudit(event: AuditEvent): Promise<AuditEvent> {
-  const r: Response<AuditEvent> = await axios.post("http://localhost:3099/audit/echo", event);
-  return r.data;
-}
-"#,
-        )
-        .unwrap();
-
-        let mut result = result_with_data_calls(vec![guard_data_call(
-            6,
-            "/audit/echo",
-            Some(r#"axios.post("http://localhost:3099/audit/echo", event)"#),
-            Some("event"),
-            Some("AuditEvent"),
-            Some("./types"),
-        )]);
-
-        FileOrchestrator::suppress_borrowed_request_types(&mut result, &file_path);
-
-        assert_eq!(
-            result.data_calls[0].primary_type_symbol.as_deref(),
-            Some("AuditEvent"),
-            "a generic-wrapped result annotation is response evidence; type must not be nulled"
-        );
-    }
-
-    #[test]
-    fn test_suppress_borrowed_request_type_ignores_non_identifier_payload() {
-        // An object-literal payload has no resolvable binding type, so the row
-        // is untouched even though the symbol is set (we never guess).
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("obj.ts");
-        std::fs::write(
-            &file_path,
-            r#"
-import axios from "axios";
-export interface AuditEvent { paymentId: string; }
-export async function send(): Promise<void> {
-  await axios.post("http://localhost:3099/audit/events", { paymentId: "1" });
-}
-"#,
-        )
-        .unwrap();
-
-        let mut result = result_with_data_calls(vec![guard_data_call(
-            5,
-            "/audit/events",
-            Some(r#"axios.post("http://localhost:3099/audit/events", { paymentId: "1" })"#),
-            Some(r#"{ paymentId: "1" }"#),
-            Some("AuditEvent"),
-            Some("./types"),
-        )]);
-
-        FileOrchestrator::suppress_borrowed_request_types(&mut result, &file_path);
-
-        assert_eq!(
-            result.data_calls[0].primary_type_symbol.as_deref(),
-            Some("AuditEvent")
-        );
     }
 
     #[test]
