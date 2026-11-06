@@ -18,6 +18,13 @@
 //   somebody else's, one that was never written, and a root that is a link out of
 //   its harness folder are left alone.
 //
+// * The Carrick rules section in the folder's `AGENTS.md`, between its two marker
+//   comments and nowhere else (`agents-section.ts`), rewritten to what this CLI
+//   renders for the scope and counts in `.carrick/hosted/snapshot.json`. Never
+//   added where the markers are absent, and left alone when the snapshot is
+//   missing or does not name one project (a section that named a project is not
+//   downgraded).
+//
 // `.codex/hooks.json` is never written: a changed project hook is untrusted until
 // Codex records its hash (`codex.ts`), so only `carrick init` plus the user's
 // approval can move it.
@@ -27,7 +34,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { snapshotProjectSlug } from "../hook/reuse.ts";
 import { isNewer } from "../update.ts";
+import { AGENTS_FILE, renderCheckSection, withCheckSection, type WorkspaceCounts } from "./agents-section.ts";
 import {
   entriesAreStale,
   outdatedFiles,
@@ -121,15 +130,64 @@ function updateSkills(workspace: string): string[] {
   return changed;
 }
 
+/** Repos and services the snapshot's resolution holds; null where it cannot be read. */
+function snapshotCounts(workspace: string): WorkspaceCounts | null {
+  try {
+    const parsed: unknown = JSON.parse(
+      fs.readFileSync(path.join(workspace, ".carrick", "hosted", "snapshot.json"), "utf8"),
+    );
+    const repos = (parsed as { resolution?: { repos?: unknown } } | null)?.resolution?.repos;
+    if (!Array.isArray(repos) || repos.length === 0) return null;
+    let services = 0;
+    for (const repo of repos) {
+      const held = (repo as { services?: unknown } | null)?.services;
+      if (Array.isArray(held)) services += held.length;
+    }
+    return { repos: repos.length, services };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Our AGENTS.md section, rewritten when it differs from what this CLI renders for
+ * the snapshot. Returns the file written, or null. `log` says why a section was
+ * left alone.
+ */
+function updateAgentsSection(workspace: string, log: (message: string) => void): string | null {
+  const target = path.join(workspace, AGENTS_FILE);
+  try {
+    const existing = fs.readFileSync(target, "utf8");
+    if (!existing.includes("<!-- carrick:check start -->")) return null;
+    const slug = snapshotProjectSlug(workspace);
+    const counts = snapshotCounts(workspace);
+    if (slug === "" || counts === null) {
+      log("AGENTS.md section left as it is: no readable snapshot naming one project");
+      return null;
+    }
+    const body = withCheckSection(existing, renderCheckSection({ slug }, counts));
+    if (body === existing) return null;
+    writeAtomic(target, body);
+    return AGENTS_FILE;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Bring this workspace's Carrick files up to date for the running version.
  *
- * Returns the lines to print: one for the hook entries, one for the skills, none
+ * Returns the lines to print: one each for the hook entries, the skills and the AGENTS.md section, none
  * where nothing needed doing. Skipped whole when the running version is older
  * than the one recorded in `.carrick/cli-version` (the mismatch line tells the
  * person to replace that install, and a rewrite would downgrade the files).
  */
-export function bringUpToDate(workspace: string, projectDir: string, running: string | null): string[] {
+export function bringUpToDate(
+  workspace: string,
+  projectDir: string,
+  running: string | null,
+  log: (message: string) => void = () => {},
+): string[] {
   if (!running || !/^\d+\.\d+\.\d+$/.test(running)) return [];
   const recorded = recordedCliVersion(workspace);
   if (recorded !== null && isNewer(recorded, running)) return [];
@@ -142,6 +200,9 @@ export function bringUpToDate(workspace: string, projectDir: string, running: st
   if (skills.length > 0) {
     const roots = [...new Set(skills.map((file) => path.dirname(path.dirname(file))))];
     lines.push(`Carrick brought its task skills in ${roots.join(", ")} up to date for ${running}.`);
+  }
+  if (updateAgentsSection(workspace, log) !== null) {
+    lines.push(`Carrick brought its rules section in ${AGENTS_FILE} up to date for ${running}.`);
   }
   // The recorded version is what the mismatch line compares. Move it only when
   // nothing of ours is still old: a Codex hook file we may not touch keeps the

@@ -11,7 +11,8 @@ import { fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
 import { currentVersion } from "../src/update.ts";
 import { CODEX_HOOKS_FILE, codexHooks } from "../src/init/codex.ts";
 import { carrickHooks, mergeCarrickHooks } from "../src/init/settings.ts";
-import { updateHooks } from "../src/init/self-update.ts";
+import { renderCheckSection } from "../src/init/agents-section.ts";
+import { bringUpToDate, updateHooks } from "../src/init/self-update.ts";
 import { skillFile, SKILL_ROOTS, stamped, writeTaskSkills } from "../src/init/task-skills.ts";
 
 const LOCAL = path.join(".claude", "settings.local.json");
@@ -255,4 +256,72 @@ test("old Codex hooks keep the mismatch line honest: the version is not recorded
   const run = await session(workspace);
   assert.match(run.stdout, /Run `carrick init`/);
   assert.equal(fs.readFileSync(path.join(workspace.root, ".carrick", "cli-version"), "utf8").trim(), "0.0.1");
+});
+
+// The Carrick rules section in AGENTS.md follows the CLI (carrick-cloud#2991).
+const OLD_SECTION = ["<!-- carrick:check start -->", "## Carrick: an older rule set", "1. Old rule.", "<!-- carrick:check end -->", ""].join("\n");
+const SURROUND_BEFORE = "# Shop notes\n\nKeep handlers small.\n\n";
+const SURROUND_AFTER = "\n## Other\n\nStay kind.\n";
+
+function snapshot(root: string, repos: unknown): void {
+  put(root, path.join(".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos } }));
+}
+
+const TWO_REPOS = [
+  { project_slug: "shop-system", services: Array.from({ length: 20 }, (_, i) => `a${i}`) },
+  { project_slug: "shop-system", services: Array.from({ length: 23 }, (_, i) => `b${i}`) },
+];
+
+test("self-update rewrites our AGENTS.md section for the snapshot's project and counts", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  put(workspace.root, "AGENTS.md", SURROUND_BEFORE + OLD_SECTION + SURROUND_AFTER);
+  snapshot(workspace.root, TWO_REPOS);
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+  assert.equal(
+    fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"),
+    SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 }) + SURROUND_AFTER,
+  );
+  assert.ok(lines.some((line) => /rules section in AGENTS\.md/.test(line)));
+});
+
+test("self-update never adds the AGENTS.md section where the markers are absent", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  put(workspace.root, "AGENTS.md", SURROUND_BEFORE);
+  snapshot(workspace.root, TWO_REPOS);
+  bringUpToDate(workspace.root, workspace.root, running);
+  assert.equal(fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"), SURROUND_BEFORE);
+  const absent = makeWorkspace();
+  t.after(() => absent.cleanup());
+  snapshot(absent.root, TWO_REPOS);
+  bringUpToDate(absent.root, absent.root, running);
+  assert.ok(!fs.existsSync(path.join(absent.root, "AGENTS.md")));
+});
+
+test("self-update leaves a current AGENTS.md section unwritten", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const target = put(
+    workspace.root,
+    "AGENTS.md",
+    SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 }),
+  );
+  snapshot(workspace.root, TWO_REPOS);
+  const past = new Date(1_000_000);
+  fs.utimesSync(target, past, past);
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+  assert.equal(fs.statSync(target).mtimeMs, past.getTime());
+  assert.ok(!lines.some((line) => /rules section/.test(line)));
+});
+
+test("self-update leaves the AGENTS.md section alone, and says why, without a readable snapshot", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const body = SURROUND_BEFORE + OLD_SECTION;
+  put(workspace.root, "AGENTS.md", body);
+  const said: string[] = [];
+  bringUpToDate(workspace.root, workspace.root, running, (message) => said.push(message));
+  assert.equal(fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"), body);
+  assert.ok(said.some((message) => /AGENTS\.md section left/.test(message)));
 });
