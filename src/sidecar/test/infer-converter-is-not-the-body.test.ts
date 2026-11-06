@@ -34,9 +34,8 @@ const SERVICE_TS = `export interface Schema<Output, Input = Output> {
 }
 declare function schemaOf<T>(): Schema<T>;
 
-interface TransportBody {
-  json(): Promise<any>;
-}
+// The platform's response: its json() is the body read by declaration (blueprint row N33).
+type TransportBody = Response;
 declare function request(path: string): Promise<TransportBody>;
 declare function readRaw(path: string): Promise<unknown>;
 

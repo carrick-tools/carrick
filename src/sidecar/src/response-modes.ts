@@ -30,7 +30,7 @@
  * The published union is not changed by any of this.
  */
 
-import { Node, SyntaxKind, VariableDeclarationKind, type Symbol as TsSymbol } from 'ts-morph';
+import { Node, SyntaxKind, VariableDeclarationKind, type CallExpression, type Symbol as TsSymbol } from 'ts-morph';
 import { cannotComplete, stepsOnPath, type PathStep } from './failure-path.js';
 
 /**
@@ -97,13 +97,14 @@ const MAX_CHAIN = 32;
 /**
  * The modes of the union joined from `bodies`, or `undefined` when no message
  * read separates them. `join` builds a union text from member texts with the
- * rules the published union is built with. `isLibOrExternal` says whether a
- * symbol is declared by a TypeScript lib or an installed library.
+ * rules the published union is built with. `isBodyRead` says whether a call
+ * is the platform's `json()` body read (`platform-body-read.ts`, blueprint
+ * row N33).
  */
 export function readResponseModes(
   bodies: JoinedBody[],
   join: (texts: string[]) => string,
-  isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
+  isBodyRead: (call: CallExpression) => boolean
 ): ResponseModes | undefined {
   if (bodies.length < 2) return undefined;
   const boundary = smallestEnclosingFunction(bodies.map((body) => body.node));
@@ -126,7 +127,7 @@ export function readResponseModes(
   const constraints: Array<Map<string, Admits[]>> = bodies.map(() => new Map());
   for (const { step, byBody } of sides.values()) {
     if (new Set(byBody.values()).size < 2) continue;
-    const reading = readStep(step, isLibOrExternal);
+    const reading = readStep(step, isBodyRead);
     if (!reading) continue;
     if (reading.kind === 'unread') {
       for (const read of reading.reads) {
@@ -230,14 +231,14 @@ function admitsValue(admits: Admits, value: string): boolean {
 /** What `step`'s test reads of the incoming message, `undefined` when nothing. */
 function readStep(
   step: PathStep,
-  isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
+  isBodyRead: (call: CallExpression) => boolean
 ): TestReading | undefined {
-  if (step.kind === 'branch') return readCondition(step.condition, isLibOrExternal);
+  if (step.kind === 'branch') return readCondition(step.condition, isBodyRead);
 
   const subject = step.test.getExpression();
-  const read = messageRead(subject, isLibOrExternal);
+  const read = messageRead(subject, isBodyRead);
   if (!read) {
-    const inside = readsIn(subject, isLibOrExternal);
+    const inside = readsIn(subject, isBodyRead);
     return inside.length > 0 ? { kind: 'unread', reads: inside } : undefined;
   }
   // A body after the switch is reached by the values whose clauses run on
@@ -282,7 +283,7 @@ function readStep(
 /** What an `if` or conditional condition reads of the incoming message. */
 function readCondition(
   condition: Node,
-  isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
+  isBodyRead: (call: CallExpression) => boolean
 ): TestReading | undefined {
   let test = condition;
   let flipped = false;
@@ -314,7 +315,7 @@ function readCondition(
       const leftLiteral = stringLiteral(left);
       const value = rightLiteral ?? leftLiteral;
       const operand = rightLiteral !== undefined ? left : right;
-      const read = value !== undefined ? messageRead(operand, isLibOrExternal) : undefined;
+      const read = value !== undefined ? messageRead(operand, isBodyRead) : undefined;
       if (read && value !== undefined) {
         // True side admits the value when the test is an equality.
         const trueAdmitsValue = equal !== flipped;
@@ -331,7 +332,7 @@ function readCondition(
     }
   }
 
-  const inside = readsIn(condition, isLibOrExternal);
+  const inside = readsIn(condition, isBodyRead);
   return inside.length > 0 ? { kind: 'unread', reads: inside } : undefined;
 }
 
@@ -349,12 +350,12 @@ export function stringLiteral(node: Node | undefined): string | undefined {
 /** Every message read inside `node`, outermost reads only. */
 function readsIn(
   node: Node,
-  isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
+  isBodyRead: (call: CallExpression) => boolean
 ): Read[] {
   const found: Read[] = [];
   for (const candidate of [node, ...node.getDescendants()]) {
     if (found.some((read) => read.node.containsRange(candidate.getPos(), candidate.getEnd()))) continue;
-    const read = messageRead(candidate, isLibOrExternal);
+    const read = messageRead(candidate, isBodyRead);
     if (read) found.push(read);
   }
   return found;
@@ -378,13 +379,13 @@ type Link =
  */
 function messageRead(
   node: Node,
-  isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
+  isBodyRead: (call: CallExpression) => boolean
 ): Read | undefined {
   const links = chainOf(node, enclosingParameters(node), 0);
   if (!links || links.length === 0) return undefined;
   const field = fieldOf(links);
   if (field === undefined) return undefined;
-  return { location: locationOf(links, isLibOrExternal), field, node };
+  return { location: locationOf(links, isBodyRead), field, node };
 }
 
 function enclosingParameters(node: Node): Set<Node> {
@@ -439,8 +440,7 @@ function chainOf(node: Node, roots: Set<Node>, depth: number): Link[] | undefine
   if (Node.isNewExpression(node)) {
     const callee = node.getExpression();
     const [input] = node.getArguments();
-    if (!Node.isIdentifier(callee) || callee.getText() !== 'URL' || !input) return undefined;
-    if (!declaredByDefaultLib(callee.getSymbol())) return undefined;
+    if (!input || !declaredByDefaultLib(callee.getSymbol(), 'URL')) return undefined;
     const base = next(input);
     return base && [...base, { kind: 'url' }];
   }
@@ -504,7 +504,7 @@ function fieldOf(links: Link[]): string | undefined {
 
 function locationOf(
   links: Link[],
-  isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
+  isBodyRead: (call: CallExpression) => boolean
 ): MessageSource {
   const last = links[links.length - 1];
   if (
@@ -522,12 +522,10 @@ function locationOf(
       awaited.kind === 'await' &&
       json.kind === 'call' &&
       json.name === 'json' &&
-      json.args.length === 0 &&
-      Node.isCallExpression(json.call)
+      Node.isCallExpression(json.call) &&
+      isBodyRead(json.call)
     ) {
-      const callee = json.call.getExpression();
-      const symbol = Node.isPropertyAccessExpression(callee) ? callee.getNameNode().getSymbol() : undefined;
-      if (isLibOrExternal(symbol)) return 'body';
+      return 'body';
     }
   }
   return 'unplaced';

@@ -251,15 +251,14 @@ describe("carrick#1851: a body read taken in place on the call's value is the te
       assert.strictEqual(inferred.raw_text_read, true);
     });
 
-    it('takes a read on a call that is not awaited first', async () => {
-      // The request is a promise that reads its own body: the read's receiver
-      // is still the call's own value, and what it yields is the payload.
+    it("a request of the repository's own that reads its own body is not the platform's read (blueprint row N33)", async () => {
+      // The request is a promise that reads its own body, declared here, not
+      // by the runtime. Without a store label for its result the read is not
+      // taken, so the call answers its own value and no text read is claimed.
       const json = await infer('/chain/direct-json');
-      assert.strictEqual(collapse(json.type_string), 'Receipt');
-      assert.strictEqual(json.raw_text_read, undefined);
+      assert.strictEqual(collapse(json.type_string), '{ status: number; }');
       const text = await infer('/chain/direct-text');
-      assert.strictEqual(collapse(text.type_string), 'string');
-      assert.strictEqual(text.raw_text_read, true);
+      assert.strictEqual(text.raw_text_read, undefined);
     });
   });
 

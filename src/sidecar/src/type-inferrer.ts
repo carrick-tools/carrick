@@ -62,6 +62,14 @@ import { declarationSite } from './bundler.js';
 import { printedTypeHoldsTopType, relateSymbolToRead } from './symbol-relation.js';
 import { notePrintedType, PrintedTypes } from './printed-names.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
+import {
+  BINARY_BODY_READS,
+  isPlatformBodyRead,
+  JSON_READ,
+  RAW_TEXT_FORMAT,
+  WHOLE_BODY_READS,
+  type RuntimeFile,
+} from './platform-body-read.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
 import { readResponseModes, type JoinedBody, type MessageSource, type ResponseModes } from './response-modes.js';
 import { callInto, calledFunction, narrowByArguments } from './argument-modes.js';
@@ -264,6 +272,9 @@ const RESPONSE_HELPER_MAX_DEPTH = 4;
 /** Longest lead type text a provenance detail quotes (blueprint row N34). */
 const LEAD_TEXT_MAX = 200;
 
+/** The platform's raw-text read alone (carrick#1842). */
+const TEXT_READ: ReadonlySet<string> = new Set([RAW_TEXT_FORMAT]);
+
 /**
  * How many wrapper calls a handler bound to one is followed through
  * (carrick#2472 P3-2b): `wrap(trace(async (req, res) => …))` needs two. A
@@ -440,23 +451,6 @@ type SchemaDirection = 'input' | 'output';
  * these names; a type parameter alone also types response modes and fallbacks.
  */
 const BODY_MEMBER_NAMES = new Set(['data', 'body', 'json']);
-
-/**
- * The zero-argument reads that take the WHOLE body out of a transport response
- * (the platform `Response` and the clients that copy its shape): parsed as
- * JSON, or as raw text (carrick#1842).
- */
-const WHOLE_BODY_READS = new Set(['json', 'text']);
-
-/**
- * The other zero-argument reads the platform `Response` takes its whole body
- * out with, in a form that is neither JSON nor text. The expression that
- * holds one holds the body the call answered with (carrick#2112).
- */
-const BINARY_BODY_READS = new Set(['arrayBuffer', 'blob', 'bytes', 'formData']);
-
-/** The body format a caller names to read a response as raw text (carrick#1842). */
-const RAW_TEXT_FORMAT = 'text';
 
 interface DeclaredContract {
   text: string;
@@ -3739,15 +3733,37 @@ export class TypeInferrer {
     );
   }
 
-  /** `call` is `<receiver>.text()` with no arguments, and `accept` takes its receiver. */
+  /**
+   * `call` is the platform's `<receiver>.text()` (blueprint row N33), and
+   * `accept` takes its receiver.
+   */
   private isTextReadOf(call: CallExpression, accept: (receiver: Node) => boolean): boolean {
     const access = call.getExpression();
     return (
       Node.isPropertyAccessExpression(access) &&
-      access.getName() === RAW_TEXT_FORMAT &&
-      call.getArguments().length === 0 &&
+      isPlatformBodyRead(call, TEXT_READ, this.runtimeFile, 'undeclared_reads') &&
       accept(this.unwrapExpressionNode(access.getExpression()))
     );
+  }
+
+  /**
+   * Whether a declaring file is the runtime's, as `isExternalOrigin` answers
+   * it: the default library, an installed package, or Carrick's materialised
+   * runtime declarations.
+   */
+  private readonly runtimeFile: RuntimeFile = (file) =>
+    isExternalOrigin(this.project.getProgram().compilerObject, file, this.repoRoot, externalImportsOf(this.project));
+
+  /**
+   * `call` is one of the platform's whole-body reads (blueprint row N33).
+   * `undeclared` says whether a read on a receiver nothing declares counts.
+   */
+  isPlatformBodyRead(
+    call: CallExpression,
+    reads: ReadonlySet<string>,
+    undeclared: 'undeclared_reads' | 'platform_only'
+  ): boolean {
+    return isPlatformBodyRead(call, reads, this.runtimeFile, undeclared);
   }
 
   /**
@@ -6086,8 +6102,9 @@ export class TypeInferrer {
   }
 
   /**
-   * The zero-argument whole-body read that takes `receiver` as its receiver,
-   * `res.json()` or `res.text()`, or `undefined`. A text read is a body read
+   * The platform's zero-argument whole-body read that takes `receiver` as its
+   * receiver, `res.json()` or `res.text()`, or `undefined` (blueprint row N33:
+   * the receiver's declaration decides, not the name). A text read is a body read
    * like a json one (carrick#1842): without it, `return res.text()` left the
    * walk on the response binding and published the transport object. `reads`
    * names the reads asked for.
@@ -6110,7 +6127,7 @@ export class TypeInferrer {
       !call ||
       !Node.isCallExpression(call) ||
       call.getExpression() !== access ||
-      call.getArguments().length > 0
+      !isPlatformBodyRead(call, reads, this.runtimeFile, 'undeclared_reads')
     ) {
       return undefined;
     }
@@ -7890,7 +7907,10 @@ export class TypeInferrer {
       return readResponseModes(
         bodies,
         (texts) => distinctByText(texts, (text) => text).join(' | '),
-        (symbol) => this.symbolIsLibOrExternalOrigin(symbol)
+        // On main a receiver nothing declares was never read here, so it is not now.
+        (call) =>
+          this.isPlatformBodyRead(call, JSON_READ, 'platform_only') ||
+          this.statedParams.readsLabelledBody(call)
       );
     } catch (error) {
       this.log(`Response modes not read: ${error instanceof Error ? error.message : String(error)}`);

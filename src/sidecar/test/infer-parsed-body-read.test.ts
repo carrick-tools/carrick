@@ -35,9 +35,8 @@ const SERVICE_TS = `export interface PreferenceEnvelope {
   version: string;
 }
 
-interface TransportBody {
-  json(): Promise<any>;
-}
+// The platform's response: its json() is the body read by declaration (blueprint row N33).
+type TransportBody = Response;
 
 declare function request(path: string): Promise<TransportBody>;
 function parseEnvelope(value: unknown): PreferenceEnvelope { return value as PreferenceEnvelope; }
@@ -109,7 +108,7 @@ describe('carrick#1382: a body read is a floor, not a ceiling', () => {
           module: 'esnext',
           moduleResolution: 'bundler',
           target: 'es2022',
-          lib: ['es2022'],
+          lib: ['es2022', 'dom'],
           skipLibCheck: true,
         },
         include: ['src'],

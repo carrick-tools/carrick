@@ -42,6 +42,7 @@ import { typeToStringAsDeclared } from './print-type.js';
 import { deferredResultNeedsUndefined } from './retype-deferred.js';
 import { resolvedDeclaration, typeArgumentOnlySelects } from './retype-selector.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
+import { JSON_READ } from './platform-body-read.js';
 import type {
   InferRequestItem,
   RetypeDiagnostic,
@@ -358,7 +359,7 @@ export class Retyper {
     // `.json()`: the payload is that read, so the cast goes there
     // (carrick#1493). The call's own result is not the payload and is not
     // touched.
-    const reads = bodyReadsOf(call);
+    const reads = bodyReadsOf(call, (read) => this.inferrer.isPlatformBodyRead(read, JSON_READ, 'undeclared_reads'));
     if (typeof reads === 'string') return reads;
     if (reads.length > 0) {
       const edits = reads.map(bodyReadEdit);
@@ -760,7 +761,10 @@ function returnsUndeclared(node: Node): boolean {
  * may have its body read out of view, so an agreement here would claim reads
  * the diff cannot see.
  */
-function bodyReadsOf(call: CallExpression): CallExpression[] | string {
+function bodyReadsOf(
+  call: CallExpression,
+  isBodyRead: (read: CallExpression) => boolean
+): CallExpression[] | string {
   if (isBodyRead(call)) return checkedBodyReads([call]);
 
   let top: Node = call;
@@ -770,7 +774,7 @@ function bodyReadsOf(call: CallExpression): CallExpression[] | string {
   ) {
     top = top.getParentOrThrow();
   }
-  const chained = bodyReadOn(top);
+  const chained = bodyReadOn(top, isBodyRead);
   if (chained) return checkedBodyReads([chained]);
 
   const name = responseBinding(top);
@@ -779,7 +783,7 @@ function bodyReadsOf(call: CallExpression): CallExpression[] | string {
   const reads: CallExpression[] = [];
   let handedOn = false;
   for (const ref of name.findReferencesAsNodes()) {
-    const read = bodyReadOn(ref);
+    const read = bodyReadOn(ref, isBodyRead);
     if (read) {
       reads.push(read);
       continue;
@@ -1088,30 +1092,22 @@ function carriesBody(status: number): boolean {
  */
 const NO_CONTENT_STATUSES: ReadonlySet<number> = new Set([204, 205]);
 
-/** `node.json()` with no arguments, where `node` is the receiver. */
-function bodyReadOn(node: Node): CallExpression | undefined {
+/**
+ * `node.json()` with no arguments, where `node` is the receiver and
+ * `isBodyRead` takes the call as the platform's body read (blueprint row N33).
+ */
+function bodyReadOn(
+  node: Node,
+  isBodyRead: (read: CallExpression) => boolean
+): CallExpression | undefined {
   const access = node.getParent();
-  if (
-    !access ||
-    !Node.isPropertyAccessExpression(access) ||
-    access.getExpression() !== node ||
-    access.getName() !== 'json'
-  ) {
+  if (!access || !Node.isPropertyAccessExpression(access) || access.getExpression() !== node) {
     return undefined;
   }
   const read = access.getParent();
   return read && Node.isCallExpression(read) && read.getExpression() === access && isBodyRead(read)
     ? read
     : undefined;
-}
-
-function isBodyRead(call: CallExpression): boolean {
-  const callee = call.getExpression();
-  return (
-    Node.isPropertyAccessExpression(callee) &&
-    callee.getName() === 'json' &&
-    call.getArguments().length === 0
-  );
 }
 
 function isAssignmentOperator(kind: SyntaxKind): boolean {
