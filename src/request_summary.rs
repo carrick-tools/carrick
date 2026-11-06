@@ -7082,43 +7082,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             Callee::Expr(callee) => self.reader.text(callee.span()),
             _ => String::new(),
         };
-        let mut args: Vec<Value> = Vec::with_capacity(call.args.len());
-        for (index, arg) in call.args.iter().enumerate() {
-            let written_in = WrittenIn::argument(call_site, &callee_text, index);
-            let value = match &*arg.expr {
-                Expr::Arrow(arrow) => {
-                    let mut nested = self.reader.arrow(
-                        arrow,
-                        self.scope.fields,
-                        self.scope.module,
-                        &self.captured(),
-                    );
-                    nested.written_in = Some(written_in);
-                    self.ir.nested.push(nested);
-                    Value::Callback(self.ir.nested.len() - 1)
-                }
-                Expr::Fn(fn_expr) => {
-                    // A `function` expression binds its own `this`.
-                    let mut nested = self.reader.function(
-                        &fn_expr.function,
-                        None,
-                        self.scope.module,
-                        &self.captured(),
-                    );
-                    nested.written_in = Some(written_in);
-                    self.ir.nested.push(nested);
-                    Value::Callback(self.ir.nested.len() - 1)
-                }
-                expr => {
-                    // A function written inside the argument (`{ plugins:
-                    // [{ configureServer() {} }] }`) sits at a key path in it.
-                    self.guard.place_functions_in(expr, &written_in);
-                    expr.visit_with(self);
-                    self.reader.eval(expr, self.scope)
-                }
-            };
-            args.push(value);
-        }
+        let args = self.read_args(call_site, &callee_text, &call.args);
         if let Callee::Expr(callee) = &call.callee {
             callee.visit_with(self);
         }
@@ -7487,8 +7451,25 @@ impl Visit for CallWalker<'_, '_, '_> {
 
     fn visit_opt_call(&mut self, call: &OptCall) {
         self.ir.unfollowed = true;
-        self.record_optional_call(call);
-        call.visit_children_with(self);
+        // The arguments are read as a call's are (carrick#3389): a
+        // listener written in place is a function of its own, and a name
+        // is a value the site can state.
+        let call_site = self.reader.site(call.span);
+        let callee_text = self.reader.text(call.callee.span());
+        let args = self.read_args(call_site, &callee_text, &call.args);
+        call.callee.visit_with(self);
+        self.record_optional_call(call, args);
+        // The same call as a message role reads it, as a plain call is
+        // (carrick#3389): `sock?.on(…)` is the site `sock.on(…)` is.
+        if let Some(site) = self.reader.library_site(
+            call.span,
+            MakerForm::Call,
+            &call.callee,
+            &call.args,
+            self.scope,
+        ) {
+            self.ir.library.push(site);
+        }
     }
 
     fn visit_tagged_tpl(&mut self, tagged: &TaggedTpl) {
@@ -7498,6 +7479,56 @@ impl Visit for CallWalker<'_, '_, '_> {
 }
 
 impl CallWalker<'_, '_, '_> {
+    /// What each argument of a call written here holds. A function written
+    /// as an argument is read as a function of its own (nested), the rest as
+    /// values; both a call (`send(…)`) and an optional call (`sock?.on(…)`,
+    /// carrick#3389) read them so.
+    fn read_args(
+        &mut self,
+        call_site: Site,
+        callee_text: &str,
+        args: &[ExprOrSpread],
+    ) -> Vec<Value> {
+        let mut values: Vec<Value> = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            let written_in = WrittenIn::argument(call_site, callee_text, index);
+            let value = match &*arg.expr {
+                Expr::Arrow(arrow) => {
+                    let mut nested = self.reader.arrow(
+                        arrow,
+                        self.scope.fields,
+                        self.scope.module,
+                        &self.captured(),
+                    );
+                    nested.written_in = Some(written_in);
+                    self.ir.nested.push(nested);
+                    Value::Callback(self.ir.nested.len() - 1)
+                }
+                Expr::Fn(fn_expr) => {
+                    // A `function` expression binds its own `this`.
+                    let mut nested = self.reader.function(
+                        &fn_expr.function,
+                        None,
+                        self.scope.module,
+                        &self.captured(),
+                    );
+                    nested.written_in = Some(written_in);
+                    self.ir.nested.push(nested);
+                    Value::Callback(self.ir.nested.len() - 1)
+                }
+                expr => {
+                    // A function written inside the argument (`{ plugins:
+                    // [{ configureServer() {} }] }`) sits at a key path in it.
+                    self.guard.place_functions_in(expr, &written_in);
+                    expr.visit_with(self);
+                    self.reader.eval(expr, self.scope)
+                }
+            };
+            values.push(value);
+        }
+        values
+    }
+
     /// What a callback written here can read: this body's constants, its
     /// parameters and the keys it reads of them, and the library instances
     /// this body holds.

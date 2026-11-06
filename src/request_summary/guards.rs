@@ -1457,7 +1457,7 @@ impl CallWalker<'_, '_, '_> {
     /// discovery and the rows' call targets alone (carrick#2431): its
     /// callee, where it is written and the objects its member chain reads.
     /// The summaries compose none of these.
-    pub(super) fn record_optional_call(&mut self, call: &OptCall) {
+    pub(super) fn record_optional_call(&mut self, call: &OptCall, args: Vec<Value>) {
         let callee = match unwrap_expression(&call.callee) {
             Expr::Ident(ident) => ident.sym.to_string(),
             Expr::Member(member) => member_prop(member).unwrap_or_default(),
@@ -1467,10 +1467,12 @@ impl CallWalker<'_, '_, '_> {
             },
             _ => String::new(),
         };
+        let spread = call.args.iter().any(|arg| arg.spread.is_some());
+        let bound = &self.guard.bound;
         self.ir.optional_calls.push(CallIr {
             site: self.reader.site(call.span),
             callee,
-            args: Vec::new(),
+            args,
             request: None,
             waited: false,
             inert: false,
@@ -1480,23 +1482,24 @@ impl CallWalker<'_, '_, '_> {
                 _ => None,
             },
             receiver: None,
-            site_args: None,
+            site_args: (!spread).then(|| {
+                call.args
+                    .iter()
+                    .map(|arg| super::library_sites::site_arg(&arg.expr, self.scope))
+                    .collect()
+            }),
             spread_from: None,
             name_line: self.reader.line(call.callee.span()),
             jsx: false,
-            arg_subjects: Vec::new(),
-            callee_subject: None,
+            arg_subjects: self.reader.arg_subjects(&call.args, self.scope, bound),
+            callee_subject: Some(self.reader.subject(&call.callee, self.scope, bound)),
             callee_text: self.reader.text(call.callee.span()),
-            callee_values: self
-                .reader
-                .callee_values(&call.callee, self.scope, &self.guard.bound),
-            arg_values: self
-                .reader
-                .arg_values(&call.args, self.scope, &self.guard.bound),
+            callee_values: self.reader.callee_values(&call.callee, self.scope, bound),
+            arg_values: self.reader.arg_values(&call.args, self.scope, bound),
             tested: None,
-            handed: Vec::new(),
-            names: Vec::new(),
-            spread_args: Vec::new(),
+            handed: self.reader.handed(&call.args, self.scope, bound),
+            names: self.reader.arg_names(&call.args, self.scope),
+            spread_args: self.reader.spread_args(&call.args, self.scope),
             receiver_spans: super::discovery::receiver_spans(&call.callee),
             receiver_object: super::discovery::receiver_object(&call.callee),
             instance: self.reader.instance_ir(Some(&call.callee), &[], self.scope),
