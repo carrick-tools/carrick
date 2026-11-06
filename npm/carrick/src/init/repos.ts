@@ -1,3 +1,4 @@
+import { realPath } from "../fs-util.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -161,15 +162,6 @@ export function siblingRepos(
       exists(path.join(repo, ".git")) &&
       JS_MANIFESTS.some((manifest) => exists(path.join(repo, manifest))),
   );
-}
-
-/** A path with its symlinks resolved, or as given where it cannot be. */
-export function realPath(target: string): string {
-  try {
-    return fs.realpathSync(target);
-  } catch {
-    return path.resolve(target);
-  }
 }
 
 /**

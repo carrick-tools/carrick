@@ -36,6 +36,7 @@
 //     along with the notice.
 
 import fs from "node:fs";
+import { defaultExists } from "./fs-util.ts";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -64,14 +65,6 @@ export type FindOptions = {
   exists?: (target: string) => boolean;
   real?: (target: string) => string;
 };
-
-function defaultExists(target: string): boolean {
-  try {
-    return fs.existsSync(target);
-  } catch {
-    return false;
-  }
-}
 
 function defaultReal(target: string): string {
   try {

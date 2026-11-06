@@ -23,6 +23,7 @@
 // Reference: `docs/reference/task-skills.md`, "The reuse nudge" — the three
 // parts, the channel measurement behind this shape, and what Codex lacks.
 
+import { readStdin } from "./stdin.ts";
 import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
 import { drain } from "./reuse.ts";
@@ -36,12 +37,6 @@ const log = createLogger("carrick-stop");
 type Payload = {
   session_id?: string;
 };
-
-async function readStdin(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString("utf8");
-}
 
 /** The one channel a Stop hook has that the model reads. */
 export function emission(context: string): string {

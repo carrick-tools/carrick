@@ -13,6 +13,7 @@
 // these repos the workspace holds, installs the local tools for them, and
 // reads their index in.
 
+import { realPath } from "../fs-util.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { readCredential, type Credential } from "../auth/credentials.ts";
@@ -25,7 +26,6 @@ import {
   selectRepos,
   siblingRepos,
   initFolderAbove,
-  realPath,
   repoRoots,
   repoIdentity,
   type RepoIdentity,

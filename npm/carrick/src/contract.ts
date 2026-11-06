@@ -8,6 +8,8 @@
 // string rather than rejected, so a CLI that learns a new verdict result still
 // renders a line here instead of nothing.
 
+import { isRecord } from "./fs-util.ts";
+
 /** A count with up to 200 of its reasons, mirroring `Counted` in src/boundary.rs. */
 export type Counted = {
   total: number;
@@ -466,10 +468,6 @@ export type StatusResult = {
   type_check?: TypeCheckState;
   services: StatusService[];
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /**
  * Parse CLI stdout into a `CheckResult`, or `null` when it is not one.

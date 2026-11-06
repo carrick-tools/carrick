@@ -25,6 +25,7 @@
 //
 // Reference: `docs/reference/task-skills.md`, "Where they are written".
 
+import { realPath } from "../fs-util.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -119,19 +120,10 @@ function git(repo: string, args: string[]): string | null {
   return result.stdout;
 }
 
-/** A path with its symlinks resolved, or as given where it cannot be. */
-function real(target: string): string {
-  try {
-    return fs.realpathSync(target);
-  } catch {
-    return path.resolve(target);
-  }
-}
-
 /** Whether this folder is the top of a git repository, not a folder inside one. */
 export function ownRepository(repo: string): boolean {
   const top = git(repo, ["rev-parse", "--show-toplevel"])?.trim();
-  return top !== undefined && top !== "" && real(top) === real(repo);
+  return top !== undefined && top !== "" && realPath(top) === realPath(repo);
 }
 
 /**

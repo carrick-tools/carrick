@@ -44,7 +44,7 @@
 // there is no path to give, the site stays in the message text with no URI, and
 // no diagnostic is mirrored onto a file this machine cannot point at.
 
-import fs from "node:fs";
+import { defaultExists } from "./fs-util.ts";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -235,14 +235,6 @@ function messageTail(item: CheckItem): string[] {
     );
   }
   return parts;
-}
-
-function defaultExists(target: string): boolean {
-  try {
-    return fs.existsSync(target);
-  } catch {
-    return false;
-  }
 }
 
 /**

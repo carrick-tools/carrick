@@ -18,6 +18,8 @@
 // does because it owns a status bar item. It decides placement, never whether
 // the boundary is stated at all. See diagnostics.ts for what it changes.
 
+import { isRecord } from "./fs-util.ts";
+
 export type Surfaces = {
   /** Publish verdict diagnostics at all. */
   diagnostics: boolean;
@@ -46,10 +48,6 @@ export const DEFAULT_SURFACES: Surfaces = {
   codeLens: true,
   boundarySurface: false,
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /**
  * The `carrick` block of whatever a client sent, flat or nested.

@@ -19,6 +19,7 @@
 // It exits 0 whatever happens. An edit never fails because Carrick had nothing
 // to say, could not find its binary, or timed out.
 
+import { readStdin } from "./stdin.ts";
 import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
@@ -82,12 +83,6 @@ function emit(context: string): void {
       },
     }),
   );
-}
-
-async function readStdin(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString("utf8");
 }
 
 async function main(): Promise<void> {

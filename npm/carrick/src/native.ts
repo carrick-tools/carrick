@@ -13,7 +13,7 @@
 // told where it is with CARRICK_SIDECAR_DIR (src/main.rs reads it first).
 
 import { spawnSync } from "node:child_process";
-import fs from "node:fs";
+import { defaultExists } from "./fs-util.ts";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -67,14 +67,6 @@ function defaultResolveManifest(specifier: string): string {
   // Resolved from this file, so the lookup follows the install that owns this
   // copy of the package rather than the caller's cwd.
   return createRequire(import.meta.url).resolve(specifier);
-}
-
-function defaultExists(target: string): boolean {
-  try {
-    return fs.existsSync(target);
-  } catch {
-    return false;
-  }
 }
 
 /** The one variable that points this package at a scanner binary of your own. */

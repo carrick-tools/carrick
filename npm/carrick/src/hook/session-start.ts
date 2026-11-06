@@ -17,6 +17,7 @@
 // (`codex-rs/hooks/src/engine/output_parser.rs`, `parse_session_start`), so
 // there the lines go out as that JSON. Claude Code keeps the plain print.
 
+import { readStdin } from "./stdin.ts";
 import { status } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
@@ -47,11 +48,8 @@ function versionLine(): string | null {
   return updateNotice(currentVersion(), state?.latest ?? null, { env: process.env });
 }
 
-async function readStdin(): Promise<string> {
-  if (process.stdin.isTTY) return "";
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString("utf8");
+async function readStdinUnlessTty(): Promise<string> {
+  return process.stdin.isTTY ? "" : readStdin();
 }
 
 /**
@@ -85,7 +83,7 @@ async function main(): Promise<void> {
     return;
   }
   const lines: string[] = [];
-  const codex = runByCodex(process.env, await readStdin());
+  const codex = runByCodex(process.env, await readStdinUnlessTty());
   const choice = resolveRoot({
     clientRoot: process.cwd(),
     projectDir: process.env["CLAUDE_PROJECT_DIR"] ?? null,
