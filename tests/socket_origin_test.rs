@@ -2,9 +2,8 @@
 //! (carrick#1670 T2).
 //!
 //! Drives the real scanner binary on `.`, over a committed copy of
-//! `tests/fixtures/socket-origin/`, offline, with the fixture's cassettes and
-//! the switches every cloud scan runs (site questions, position rows, fact
-//! files, receiver trace and site payloads). The store labels the fixture's
+//! `tests/fixtures/socket-origin/`, offline, with the fixture's cassettes.
+//! The store labels the fixture's
 //! `Peer` socket `by_origin`: it has no side of its own, so the side of each
 //! `Peer` call is where its instance came from. One a `Hub` hands to the
 //! function it runs is the server's end; one the service makes with `new` is
@@ -72,9 +71,8 @@ fn row(side: &str, key: &str, file_path: &str) -> Row {
     }
 }
 
-/// The socket rows of each service of a scan of the fixture, sorted, with
-/// the five switches on or all off.
-fn scan(switches: bool) -> BTreeMap<String, Vec<Row>> {
+/// The socket rows of each service of a scan of the fixture, sorted.
+fn scan() -> BTreeMap<String, Vec<Row>> {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir(), &repo);
@@ -106,19 +104,6 @@ fn scan(switches: bool) -> BTreeMap<String, Vec<Row>> {
             "CARRICK_SIDECAR_DIR",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
         );
-    for name in [
-        "CARRICK_SITE_QUESTIONS",
-        "CARRICK_POSITION_ROWS",
-        "CARRICK_FACT_FILES",
-        "CARRICK_RECEIVER_TRACE",
-        "CARRICK_SITE_PAYLOADS",
-    ] {
-        if switches {
-            cmd.env(name, "1");
-        } else {
-            cmd.env_remove(name);
-        }
-    }
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -186,9 +171,9 @@ fn scan(switches: bool) -> BTreeMap<String, Vec<Row>> {
     services
 }
 
-fn with_switches() -> &'static BTreeMap<String, Vec<Row>> {
+fn scanned() -> &'static BTreeMap<String, Vec<Row>> {
     static ROWS: OnceLock<BTreeMap<String, Vec<Row>>> = OnceLock::new();
-    ROWS.get_or_init(|| scan(true))
+    ROWS.get_or_init(scan)
 }
 
 /// Peers a hub hands to the function it runs are the server's end: written in
@@ -197,7 +182,7 @@ fn with_switches() -> &'static BTreeMap<String, Vec<Row>> {
 /// side its own export is on.
 #[test]
 fn a_peer_a_hub_hands_in_is_the_servers_end() {
-    let rows = &with_switches()["hub"];
+    let rows = &scanned()["hub"];
     for expected in [
         row(
             "calls",
@@ -236,7 +221,7 @@ fn a_peer_a_hub_hands_in_is_the_servers_end() {
 /// side.
 #[test]
 fn a_field_set_from_a_constructor_parameter_carries_its_origin() {
-    let rows = &with_switches()["hub"];
+    let rows = &scanned()["hub"];
     for expected in [
         row(
             "endpoints",
@@ -271,7 +256,7 @@ fn a_field_set_from_a_constructor_parameter_carries_its_origin() {
 /// guess would put it.
 #[test]
 fn a_peer_the_service_makes_is_the_clients_end() {
-    let rows = &with_switches()["peer"];
+    let rows = &scanned()["peer"];
     for expected in [
         row(
             "calls",
@@ -300,7 +285,7 @@ fn a_peer_the_service_makes_is_the_clients_end() {
 /// The two services state one key for each event, so they pair.
 #[test]
 fn the_two_services_pair_on_both_events() {
-    let services = with_switches();
+    let services = scanned();
     let keys = |service: &str, side: &str| -> Vec<String> {
         services[service]
             .iter()
@@ -327,7 +312,7 @@ fn the_two_services_pair_on_both_events() {
 /// claim.
 #[test]
 fn every_socket_row_is_a_library_claim() {
-    for (service, rows) in with_switches() {
+    for (service, rows) in scanned() {
         for row in rows {
             assert_eq!(
                 row.source.as_deref(),
@@ -335,14 +320,5 @@ fn every_socket_row_is_a_library_claim() {
                 "{service}: {row:?}"
             );
         }
-    }
-}
-
-/// With every switch off there are no site rows and no instance walk, so the
-/// scan states no socket row here.
-#[test]
-fn with_the_switches_off_no_side_is_read() {
-    for (service, rows) in scan(false) {
-        assert_eq!(rows, Vec::<Row>::new(), "{service}");
     }
 }

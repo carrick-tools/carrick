@@ -399,11 +399,14 @@ async fn a_deno_install_asks_the_store_about_its_public_packages() {
 }
 
 /// With `NPM_CONFIG_REGISTRY` naming another host, the Deno install proves
-/// no package public: the store is asked nothing, and the rows are those of
-/// no claims.
+/// no package public: the store is asked once, about the language's and the
+/// runtime's own libraries alone (`lib:` and `node:` keys, which no registry
+/// serves: `Asked::with_default_library` asks them with no package beside
+/// them), and the
+/// rows are those of no claims.
 #[tokio::test]
 #[serial]
-async fn a_deno_install_set_to_another_registry_asks_the_store_nothing() {
+async fn a_deno_install_set_to_another_registry_asks_the_store_about_no_package() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, cassette) = deno_fixture_copy(tmp.path());
     mock_env(&cassette);
@@ -414,7 +417,11 @@ async fn a_deno_install_set_to_another_registry_asks_the_store_nothing() {
     let data = scan(&repo, Some(&sidecar)).await;
     // SAFETY: as above.
     unsafe { std::env::remove_var("NPM_CONFIG_REGISTRY") };
-    assert_eq!(store_requests() - before, 0, "nothing qualifies");
+    assert_eq!(
+        store_requests() - before,
+        1,
+        "the language's own library, no registry package"
+    );
     assert_eq!(message_rows(&data, &repo), rows_without_claims());
 }
 

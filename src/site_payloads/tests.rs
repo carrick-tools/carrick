@@ -376,14 +376,6 @@ fn a_slot_takes_over_its_alias_and_nothing_else() {
     assert!(slotted_aliases(&[]).is_empty());
 }
 
-#[test]
-fn the_switch_is_on_only_at_one() {
-    assert!(enabled_from(Some("1")));
-    for off in [None, Some("0"), Some("true"), Some(""), Some("yes")] {
-        assert!(!enabled_from(off), "{off:?}");
-    }
-}
-
 /// The seam: every infer kind this module sends is a kind the sidecar's
 /// request type declares, spelled as the scanner writes it.
 #[test]

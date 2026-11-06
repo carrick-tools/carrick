@@ -272,7 +272,6 @@ fn offline_env() {
         std::env::set_var(carrick::engine::durability::RETRY_DELAY_ENV, "0");
         std::env::remove_var(carrick::retry_budget::BUDGET_ENV);
         std::env::remove_var(carrick::engine::setup_ahead::IN_FLIGHT_ENV);
-        std::env::remove_var(carrick::position_rows::POSITION_ROWS_ENV);
         std::env::remove_var("CARRICK_MOCK_FIXTURE_DIR");
         std::env::remove_var(carrick::scan_health::ALLOW_PARTIAL_ENV);
         std::env::remove_var("GITHUB_EVENT_NAME");
@@ -1395,38 +1394,6 @@ async fn asking_ahead_makes_the_requests_the_loop_made_and_writes_the_same_index
     assert_eq!(asked_ahead, asked_in_the_loop);
     assert_eq!(index_written(&ahead), index_written(&in_the_loop));
     for storage in [&ahead, &in_the_loop] {
-        assert!(storage.scan_failed.lock().unwrap().is_empty());
-    }
-}
-
-/// carrick#2413 slice G1: with the walks on, each service's setup is asked
-/// once its own walk has ended, before the loop. That changes when a setup
-/// is asked and nothing else: a first index with the walks makes the
-/// requests and writes the index a first index without them does.
-#[tokio::test]
-#[serial]
-async fn walking_before_the_loop_makes_the_same_setup_requests_and_index() {
-    offline_env();
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = three_service_repo(tmp.path());
-
-    let (unwalked, asked_unwalked) = first_index(&repo).await;
-    // SAFETY: every test in this binary is `#[serial]`.
-    unsafe { std::env::set_var(carrick::position_rows::POSITION_ROWS_ENV, "1") };
-    let (walked, asked_walked) = first_index(&repo).await;
-    unsafe { std::env::remove_var(carrick::position_rows::POSITION_ROWS_ENV) };
-
-    assert_eq!(asked_unwalked, [3, 18, 3]);
-    assert_eq!(asked_walked, asked_unwalked);
-    // Rows add the calls the code left open (carrick#813) and nothing else.
-    let mut with_rows = index_written(&walked);
-    for service in &mut with_rows {
-        let service = service.as_object_mut().unwrap();
-        service.remove("unfollowed_member_calls");
-        service.remove("unfollowed_member_calls_total");
-    }
-    assert_eq!(with_rows, index_written(&unwalked));
-    for storage in [&walked, &unwalked] {
         assert!(storage.scan_failed.lock().unwrap().is_empty());
     }
 }

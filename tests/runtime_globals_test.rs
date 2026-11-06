@@ -3,19 +3,15 @@
 //!
 //! Drives the real scanner binary offline over `tests/fixtures/runtime-globals/`
 //! as the Action does (`carrick <dir>`, the root service) with the type
-//! sidecar live, `CARRICK_POSITION_ROWS=1` and `CARRICK_SITE_QUESTIONS=1`.
+//! sidecar live.
 //! The fixture's service sets `"lib": ["ES2022"]` and `"types": ["node"]`, so
 //! `fetch` is declared by the runtime's types
 //! (`@types/node/web-globals/fetch.d.ts`), not by a default-library file.
 //! `src/orders.ts` calls `fetch(path, { method })` in a helper, and
 //! `placeOrder` (line 7) calls the helper with `"/api/orders"` and `"POST"`.
 //! The cassette answers the key `node:web-globals/fetch` with `fetch`'s
-//! HTTP claims.
-//!
-//! | switch | the store | `POST /api/orders` at `src/orders.ts:7` |
-//! |---|---|---|
-//! | off | not asked | stated by the request summaries |
-//! | `CARRICK_SITE_QUESTIONS=1` | asked for `node:web-globals/fetch`, answered | the same row |
+//! HTTP claims. The store is asked for `node:web-globals/fetch` and answers,
+//! and `POST /api/orders` is stated at `src/orders.ts:7`.
 //!
 //! The request summaries already state this minimal shape, so the row alone
 //! cannot tell the ask from its absence; the boundary's library counters,
@@ -30,8 +26,8 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runtime-globals")
 }
 
-/// The blob one offline scan of `repo` writes, with `env` set.
-fn scan(repo: &Path, env: &[(&str, &str)]) -> serde_json::Value {
+/// The blob one offline scan of `repo` writes.
+fn scan(repo: &Path) -> serde_json::Value {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
@@ -45,12 +41,7 @@ fn scan(repo: &Path, env: &[(&str, &str)]) -> serde_json::Value {
             format!("{}/", repo.join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env_remove("CARRICK_ALLOW_MISSING_TYPES")
-        .env_remove("CARRICK_SITE_QUESTIONS");
-    for (name, value) in env {
-        cmd.env(name, value);
-    }
+        .env_remove("CARRICK_ALLOW_MISSING_TYPES");
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -110,7 +101,7 @@ fn calls_at_orders(blob: &serde_json::Value) -> Vec<String> {
 
 #[test]
 fn a_global_the_runtime_declares_is_asked_and_its_answer_read() {
-    let on = scan(&fixture_dir(), &[("CARRICK_SITE_QUESTIONS", "1")]);
+    let on = scan(&fixture_dir());
     // The store was asked, and its answer read: the boundary counts the
     // packages left pending or failed only for a scan that asked. Without
     // the runtime's key the service asks nothing (it imports no package and
@@ -129,20 +120,5 @@ fn a_global_the_runtime_declares_is_asked_and_its_answer_read() {
         calls_at_orders(&on),
         vec!["POST /api/orders@src/orders.ts:7".to_string()],
         "on: the helper's caller states the request"
-    );
-}
-
-#[test]
-fn with_site_questions_off_nothing_is_asked() {
-    let off = scan(&fixture_dir(), &[]);
-    assert!(
-        off["boundary"].get("library_packages_pending").is_none(),
-        "off: the store was not asked: {}",
-        off["boundary"]
-    );
-    assert_eq!(
-        calls_at_orders(&off),
-        vec!["POST /api/orders@src/orders.ts:7".to_string()],
-        "off: the summaries state the request as before"
     );
 }

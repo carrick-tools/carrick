@@ -75,8 +75,7 @@ fn committed_copy_of(tmp: &Path, fixture: &str, edit: impl FnOnce(&Path)) -> Pat
     repo
 }
 
-/// One scan of `repo` as the Action runs it, with every fact-layer switch on
-/// as a cloud scan runs (carrick#3283), into `store`, with `flags`; the
+/// One scan of `repo` as the Action runs it, into `store`, with `flags`; the
 /// stored blob of each service by name. A store shared by two scans lets the
 /// second read the first's generation, so `isolated` is off for those.
 fn scan(
@@ -117,12 +116,7 @@ fn scan_with(
         .env(
             "CARRICK_SIDECAR_DIR",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
-        )
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1")
-        .env("CARRICK_RECEIVER_TRACE", "1")
-        .env("CARRICK_FACT_FILES", "1")
-        .env("CARRICK_SITE_PAYLOADS", "1");
+        );
     if isolated {
         cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
     } else {
@@ -495,14 +489,6 @@ fn sourced_call_rows(blob: &serde_json::Value) -> Vec<String> {
     rows
 }
 
-/// The fact-layer switches [`scan_with`] leaves to the caller, on: with the
-/// two it sets, a scan in the form a cloud scan runs (carrick#3283).
-const ON_FORM: [(&str, &str); 3] = [
-    ("CARRICK_RECEIVER_TRACE", "1"),
-    ("CARRICK_FACT_FILES", "1"),
-    ("CARRICK_SITE_PAYLOADS", "1"),
-];
-
 /// carrick#2618, `tests/fixtures/sibling-wrapper/README.md`: every
 /// operation the app reaches through the client ends with exactly one fact
 /// row. Scanned once with no reader answer for `api.ts` (the reader states
@@ -538,7 +524,7 @@ fn each_operation_through_a_client_wrapper_keeps_one_fact_row() {
             }
         });
         let store = tempfile::tempdir().unwrap();
-        let (blobs, _) = scan_with(&repo, store.path(), &[], true, &ON_FORM);
+        let (blobs, _) = scan_with(&repo, store.path(), &[], true, &[]);
         assert_eq!(
             sourced_call_rows(blob_of(&blobs, "app")),
             WRAPPER_ROWS,

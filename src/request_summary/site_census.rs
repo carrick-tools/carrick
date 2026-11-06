@@ -19,8 +19,8 @@
 //!
 //! With a scan's blobs dir, a `routes` section reads the route sites against
 //! that scan's endpoint rows (carrick#2474 R1): by what holds the receiver
-//! and how discovery reached them (a sites file from `discovery_census` with
-//! `CARRICK_RECEIVER_TRACE=1` names both), recall, extras, and the
+//! and how discovery reached them (a sites file from `discovery_census`
+//! names both), recall, extras, and the
 //! mount-shaped sites apart. It also counts the route sites by where their
 //! instance walks end, a labelled maker's result or a hole by its reason,
 //! and by how many ends each has, one per caller that hands an instance in

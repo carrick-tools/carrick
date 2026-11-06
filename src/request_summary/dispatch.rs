@@ -741,10 +741,9 @@ mod tests {
 }
 
 /// The handler records and dispatch rows on real repos (carrick#2474 R4b):
-/// offline. Each repo needs a flag-on scan's rows (`<blobs>/positions`),
-/// discovery's sites for it written by `discovery_census` with
-/// `CARRICK_RECEIVER_TRACE=1`, the store's answer for its packages, and the
-/// scan's blobs:
+/// offline. Each repo needs a scan's rows (`<blobs>/positions`),
+/// discovery's sites for it written by `discovery_census`, the store's
+/// answer for its packages, and the scan's blobs:
 ///
 /// `CARRICK_DISPATCH_CENSUS='<label>=<repo>=<positions dir>=<sites.json>=<store answer>=<blobs dir>[;…]'
 /// [CARRICK_DISPATCH_CENSUS_OUT=<file>] [CARRICK_DISPATCH_CENSUS_RECORDS_DIR=<dir>]

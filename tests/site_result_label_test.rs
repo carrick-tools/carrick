@@ -1,8 +1,8 @@
 //! A leaf site row's call result takes the library store's `result` label
 //! (carrick#2910, slice 1).
 //!
-//! Drives the real scanner binary on `.` in production form (every fact-layer
-//! switch on), over the committed `tests/fixtures/call-through-result-label/`
+//! Drives the real scanner binary on `.` in production form, over the
+//! committed `tests/fixtures/call-through-result-label/`
 //! (see its README): the client package's wrappers each make one call of an
 //! invented library client, and the store labels `get` with the member `data`,
 //! `send` with the whole value and `ping` with nothing. The client blob's
@@ -103,12 +103,7 @@ fn scan(labelled: bool) -> Scan {
         .env(
             "CARRICK_SIDECAR_DIR",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
-        )
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1")
-        .env("CARRICK_FACT_FILES", "1")
-        .env("CARRICK_RECEIVER_TRACE", "1")
-        .env("CARRICK_SITE_PAYLOADS", "1");
+        );
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",

@@ -12,9 +12,8 @@
 //! - **Never an edge, never an input.** Nothing in matching, the type check
 //!   or findings reads the rows; the cloud shows them beside `callers`,
 //!   labelled "not followed".
-//! - **Rows only.** Written when the run walks the compiler's position rows
-//!   (`CARRICK_POSITION_ROWS=1`); without them both keys are absent and the
-//!   blob is byte for byte what it was.
+//! - **Rows only.** Written from the compiler's position rows; a service
+//!   whose walk left none has neither key.
 //! - **Cap.** At most [`MAX_PER_SERVICE`] rows per service, sorted by file
 //!   then line; `unfollowed_member_calls_total` is the exact count.
 //! - **Spelling.** The keys and the reason words are what the reader reads;

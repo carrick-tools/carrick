@@ -310,8 +310,8 @@ fn sidecar_available() -> bool {
     node && built
 }
 
-/// The fixture scanned as a fact-layer scan runs, with the compiler's
-/// per-position rows (`CARRICK_POSITION_ROWS=1`), once for the whole binary.
+/// The fixture scanned as every scan runs, with the compiler's per-position
+/// rows, once for the whole binary.
 fn blobs_with_rows() -> &'static Blobs {
     static SCAN: OnceLock<Blobs> = OnceLock::new();
     SCAN.get_or_init(|| {
@@ -324,7 +324,6 @@ fn blobs_with_rows() -> &'static Blobs {
         let mut cmd = scan_command(&repo, &storage);
         cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
-            .env("CARRICK_POSITION_ROWS", "1")
             .env("HOME", &home);
         run(cmd);
         read_blobs(&storage)
@@ -668,9 +667,14 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         assert_eq!(response_verdicts_at(file, line), []);
     }
     // With `chained.ts` lines 9, 20 and 21: a callback's call and a call a
-    // promise method is read off carry no type either (carrick#2832).
+    // promise method is read off carry no type either (carrick#2832). With
+    // `inline-commands.ts` lines 9, 13, 22 and `inline-hooks.ts:6` too: every
+    // scan walks with the compiler's rows (`position_rows::destination` has
+    // no switch), which correct those four (carrick#2822), and a corrected
+    // call through drops the type anchored at the caller's call there as at
+    // the other eighteen.
     assert!(
-        settled_line().contains("(18 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(22 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -976,10 +980,13 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 #[test]
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
-    // Eleven rows in `commands.ts` the model alone states, the one at
-    // `nested.ts:7`, and the three in `inline-commands.ts`, which only a scan
-    // with the compiler's rows follows (carrick#2822).
-    assert_eq!(boundary["model_only_rows"], 15, "{boundary}");
+    // Eleven rows in `commands.ts` the model alone states and the one at
+    // `nested.ts:7`. The three in `inline-commands.ts` (lines 9, 13, 22) are
+    // corrected, not the model's alone: every scan now walks with the
+    // compiler's rows (`position_rows::destination` has no switch), which
+    // follow them (carrick#2822), as `a_method_called_on_a_factorys_value_…`
+    // and `a_wrapper_over_a_factorys_value_…` assert.
+    assert_eq!(boundary["model_only_rows"], 12, "{boundary}");
     let untyped: Vec<String> = boundary["calls_without_expected_type"]["reasons"]
         .as_array()
         .unwrap()
@@ -1021,8 +1028,15 @@ fn a_call_into_the_client_the_model_left_unstated_states_the_request_it_reaches(
             corrected("GET", "/api/v1/runs/:id", 5),
         ]
     );
-    // Without the compiler's rows nothing types the table's parameter.
-    assert_eq!(rows_in(blobs(), "cli", TOOLS, 9), []);
+    // Only the compiler types the table's parameter, and every scan now
+    // walks with its rows (`position_rows::destination` has no switch): the
+    // call states the request it reaches, the row
+    // `every_call_into_the_client_states_its_request_with_no_model_row`
+    // asserts for the same line.
+    assert_eq!(
+        rows_in(blobs(), "cli", TOOLS, 9),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
 }
 
 /// The fixture with the model's answers for the CLI's commands and the web's
@@ -1051,7 +1065,6 @@ fn unanswered() -> &'static Blobs {
         let mut cmd = scan_command(&repo, &storage);
         cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
-            .env("CARRICK_POSITION_ROWS", "1")
             .env("HOME", &home);
         run(cmd);
         read_blobs(&storage)

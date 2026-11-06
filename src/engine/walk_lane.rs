@@ -48,7 +48,7 @@ pub(super) type WalkEnded = oneshot::Receiver<()>;
 
 /// Where a service's rows go this run, from the repo name and the service
 /// name: [`crate::position_rows::destination`] in a scan.
-pub(super) type Place = Arc<dyn Fn(&str, Option<&str>) -> Option<Destination> + Send + Sync>;
+pub(super) type Place = Arc<dyn Fn(&str, Option<&str>) -> Destination + Send + Sync>;
 
 /// The services the walk of a declared service reaches, by declared
 /// position ([`super::siblings::SiblingRegistry::walks_read_by`]); none when
@@ -120,11 +120,6 @@ impl Slots {
             let _ = slot.set(walked);
         }
     }
-}
-
-/// Whether this run walks the rows at all.
-pub(super) fn requested() -> bool {
-    std::env::var(crate::position_rows::POSITION_ROWS_ENV).as_deref() == Ok("1")
 }
 
 /// One heard [`WalkEnded`] per service, and the senders the lane drops as
@@ -428,15 +423,13 @@ fn walk(
         label,
         peak_mb: None,
     };
-    let Some(out) = place(
-        &super::get_repository_name(&canonical),
-        service.service_name.as_deref(),
-    ) else {
-        return no_rows(scan_root, label);
-    };
     let Some(recipe) = recipe else {
         return no_rows(scan_root, label);
     };
+    let out = place(
+        &super::get_repository_name(&canonical),
+        service.service_name.as_deref(),
+    );
     let files = service_files(repo_path, service, &scan_root);
     let service_root = super::service_sidecar_root(repo_path, service);
     let walk = crate::position_rows::ServiceWalk {
@@ -476,7 +469,6 @@ mod tests {
         let store = store.to_path_buf();
         Arc::new(move |repo, service| {
             crate::position_rows::destination_from(
-                Some("1"),
                 Some(&store),
                 &std::env::temp_dir(),
                 repo,

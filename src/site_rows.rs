@@ -56,9 +56,9 @@
 //!   possible call, `uncorroborated`. Kind and role are always the label's,
 //!   so in practice: a row whose name the model answered needs an agreeing
 //!   reader row.
-//! - **Switch.** Nothing here runs unless `CARRICK_SITE_QUESTIONS=1`
-//!   ([`SiteRows::enabled`]); with it off the blob is byte for byte as
-//!   before.
+//! - **Ran.** Nothing folds unless the site pass read the service
+//!   ([`SiteRows::enabled`]); a service it never read keeps its blob as the
+//!   other passes wrote it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -181,7 +181,8 @@ impl SiteRow {
 /// A service's site rows and possible calls, before the fold.
 #[derive(Debug, Clone, Default)]
 pub struct SiteRows {
-    /// Whether the switch was on: off, nothing folds and nothing is written.
+    /// Whether the site pass read the service: unread, nothing folds and
+    /// nothing is written.
     pub enabled: bool,
     pub rows: Vec<SiteRow>,
     /// The sites that are possible calls whatever the fold does: leads,

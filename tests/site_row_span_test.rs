@@ -4,8 +4,7 @@
 //! The scanner's spans are SWC's (bytes from 1); the sidecar locates in
 //! TypeScript positions (UTF-16 units from 0). The fixture is the
 //! library-store one, with a comment of multi-byte characters before the
-//! publish (`src/orders.ts`), scanned as the Action scans it with
-//! `CARRICK_POSITION_ROWS=1` and `CARRICK_SITE_QUESTIONS=1`. The real
+//! publish (`src/orders.ts`), scanned as the Action scans it. The real
 //! sidecar answers; a shim in front of it records each `infer` request.
 
 use std::fs;
@@ -98,9 +97,7 @@ fn scan(repo: &Path) -> Scan {
             format!("{}/", repo.join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_SIDECAR_DIR", &shim)
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1");
+        .env("CARRICK_SIDECAR_DIR", &shim);
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",

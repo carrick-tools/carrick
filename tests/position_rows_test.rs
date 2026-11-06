@@ -14,9 +14,7 @@
 //! 3. the walk is record-only: a walk process that dies of memory or misses
 //!    its deadline records nothing for the run, restarts nothing and leaves no
 //!    rows file;
-//! 4. off means off: a scan without `CARRICK_POSITION_ROWS=1` asks no walk
-//!    and writes no `positions/` directory, and a scan with it writes the rows
-//!    and the same blob;
+//! 4. every scan writes the rows, and a walk that dies loses no blob;
 //! 5. every service's walk has exited before the first analysis sidecar
 //!    starts (carrick#2413 slice G1).
 //!
@@ -507,7 +505,6 @@ struct Scan {
     /// Each stored blob, by file name, with the run's own stamps removed.
     blobs: BTreeMap<String, serde_json::Value>,
     positions: Option<PathBuf>,
-    starts: usize,
     actions: Vec<String>,
     /// `start <pid> <earlier pids alive>` and `action <pid> <action> <out>`
     /// lines, in order.
@@ -519,13 +516,7 @@ struct Scan {
 
 /// One scan of `repo`. With no `store` the blobs go to the mock store and
 /// none is read back; `tmp`, when given, is the scan's `TMPDIR`.
-fn scan(
-    repo: &Path,
-    rows_on: bool,
-    die_on_walk: bool,
-    store: Option<&Path>,
-    tmp: Option<&Path>,
-) -> Scan {
+fn scan(repo: &Path, die_on_walk: bool, store: Option<&Path>, tmp: Option<&Path>) -> Scan {
     let notes = tempfile::tempdir().expect("notes dir");
     let shim = shim(notes.path(), die_on_walk);
     let cache = tempfile::tempdir().expect("cache dir");
@@ -546,12 +537,14 @@ fn scan(
         .env("CARRICK_FAIL_ON_TYPE_MEMORY", "1")
         .env("CARRICK_PROGRESS", "1")
         .env("CARRICK_SIDECAR_DIR", &shim);
-    if rows_on {
-        cmd.env("CARRICK_POSITION_ROWS", "1");
-    } else {
-        cmd.env_remove("CARRICK_POSITION_ROWS");
-    }
     for var in [
+        // The retired fact-layer switches (carrick#3283): removed, so the
+        // environment cannot mask a scanner that still reads one.
+        "CARRICK_SITE_QUESTIONS",
+        "CARRICK_POSITION_ROWS",
+        "CARRICK_RECEIVER_TRACE",
+        "CARRICK_FACT_FILES",
+        "CARRICK_SITE_PAYLOADS",
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
         "GITHUB_EVENT_NAME",
@@ -603,7 +596,6 @@ fn scan(
     Scan {
         blobs,
         positions: positions.filter(|positions| positions.exists()),
-        starts: read("starts").lines().count(),
         actions: read("actions").lines().map(str::to_string).collect(),
         events: read("events").lines().map(str::to_string).collect(),
         rows: String::from_utf8_lossy(&output.stderr)
@@ -685,8 +677,7 @@ fn two_service_repo(root: &Path) -> PathBuf {
 }
 
 /// carrick#2413 slice G1: every service's walk runs before the loop, so
-/// each walk's process has exited before the first analysis sidecar starts,
-/// and the blobs are the ones a scan without walks writes.
+/// each walk's process has exited before the first analysis sidecar starts.
 #[test]
 fn every_walk_ends_before_the_first_analysis_sidecar_starts() {
     if !sidecar_available() {
@@ -696,10 +687,8 @@ fn every_walk_ends_before_the_first_analysis_sidecar_starts() {
     let dir = tempfile::tempdir().unwrap();
     let repo = two_service_repo(&fs::canonicalize(dir.path()).unwrap());
 
-    let off_store = tempfile::tempdir().unwrap();
-    let off = scan(&repo, false, false, Some(off_store.path()), None);
     let on_store = tempfile::tempdir().unwrap();
-    let on = scan(&repo, true, false, Some(on_store.path()), None);
+    let on = scan(&repo, false, Some(on_store.path()), None);
 
     let split = |line: &String| line.split(' ').map(str::to_string).collect::<Vec<_>>();
     let walks: BTreeSet<String> = on
@@ -748,14 +737,10 @@ fn every_walk_ends_before_the_first_analysis_sidecar_starts() {
             "a walk's process was alive when an analysis sidecar started: {starts:?}"
         );
     }
-    assert_eq!(off.blobs.len(), 2, "one blob a service");
-    assert_eq!(
-        on.blobs, off.blobs,
-        "walking ahead of the loop moved a blob"
-    );
+    assert_eq!(on.blobs.len(), 2, "one blob a service");
 }
 
-/// carrick#2413: with no local store (the Action, the cloud runner) the flag
+/// carrick#2413: with no local store (the Action, the cloud runner) the scan
 /// still walks, into a directory of the run's own under the OS temp dir,
 /// outside the repo, and the rows file and the directory are gone when the
 /// scan ends.
@@ -768,7 +753,7 @@ fn without_a_store_the_walk_writes_to_the_temp_dir_and_cleans_up() {
     let (_dir, repo) = materialise();
     let tmp = tempfile::tempdir().unwrap();
     let tmp_root = fs::canonicalize(tmp.path()).unwrap();
-    let on = scan(&repo, true, false, None, Some(&tmp_root));
+    let on = scan(&repo, false, None, Some(&tmp_root));
     // `TMPDIR` is canonical, so the path the scan sends is under it as
     // written.
     let out = assert_walk_first(&on.events);
@@ -794,40 +779,29 @@ fn without_a_store_the_walk_writes_to_the_temp_dir_and_cleans_up() {
     );
 }
 
-/// Off means off; on writes the rows and the same blob; a walk that dies of
+/// Every scan writes the rows, with no switch set; a walk that dies of
 /// memory under `CARRICK_FAIL_ON_TYPE_MEMORY=1` leaves the scan to finish,
-/// with the same blob and no rows. Each scan states, for a parent reading
-/// its stderr, what its service read the rows as (`off`, `read`, `missing`).
+/// with the same blobs stored and no rows. Each scan states, for a parent
+/// reading its stderr, what its service read the rows as (`read`,
+/// `missing`).
 #[test]
-fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
+fn every_scan_writes_rows_and_a_dead_walk_loses_no_blob() {
     if !sidecar_available() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
     }
     let (_dir, repo) = materialise();
-
-    let off_store = tempfile::tempdir().unwrap();
-    let off = scan(&repo, false, false, Some(off_store.path()), None);
-    assert!(
-        off.positions.is_none(),
-        "a scan without the flag wrote rows"
-    );
-    assert!(
-        !off.actions.iter().any(|action| action == "position_rows"),
-        "a scan without the flag asked for a walk"
-    );
-    assert!(!off.blobs.is_empty(), "the scan stored no blob");
     let read_as = |scan: &Scan| -> BTreeSet<String> {
         scan.rows.iter().map(|(_, rows)| rows.clone()).collect()
     };
-    assert_eq!(read_as(&off), BTreeSet::from(["off".to_string()]));
 
     let on_store = tempfile::tempdir().unwrap();
-    let on = scan(&repo, true, false, Some(on_store.path()), None);
+    let on = scan(&repo, false, Some(on_store.path()), None);
+    assert!(!on.blobs.is_empty(), "the scan stored no blob");
     let rows_file = on
         .positions
         .as_ref()
-        .expect("a scan with the flag wrote rows")
+        .expect("the scan wrote rows")
         .join(format!(
             "{}.jsonl.gz",
             on.blobs.keys().next().unwrap().trim_end_matches(".json")
@@ -835,22 +809,41 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
     let rows = read_rows_file(&rows_file).expect("the scan's rows file reads");
     assert_eq!(rows.files.len(), service_files(&repo).len());
     assert_eq!(
-        on.starts,
-        off.starts + 1,
-        "the walk is one process of its own"
+        on.actions
+            .iter()
+            .filter(|action| *action == "position_rows")
+            .count(),
+        1,
+        "one walk for the one service"
     );
     assert_walk_first(&on.events);
-    // Rows add the calls the code left open (carrick#813) and nothing else.
-    let mut on_blobs = on.blobs.clone();
+
+    let died_store = tempfile::tempdir().unwrap();
+    let died = scan(&repo, true, Some(died_store.path()), None);
+    assert!(
+        died.actions.iter().any(|action| action == "position_rows"),
+        "the walk was not asked"
+    );
+    let left: Vec<_> = died
+        .positions
+        .iter()
+        .flat_map(|dir| fs::read_dir(dir).unwrap())
+        .collect();
+    assert!(left.is_empty(), "a walk that died left files: {left:?}");
+    assert_eq!(read_as(&died), BTreeSet::from(["missing".to_string()]));
+    // A walk that died leaves the scan to finish: the same blobs are stored.
+    assert_eq!(
+        died.blobs.keys().collect::<Vec<_>>(),
+        on.blobs.keys().collect::<Vec<_>>(),
+        "a walk that died lost a blob"
+    );
+    // Rows state the calls the code left open (carrick#813).
     let mut left_open = Vec::new();
-    for blob in on_blobs.values_mut() {
-        let blob = blob.as_object_mut().expect("a blob is an object");
-        if let Some(rows) = blob.remove("unfollowed_member_calls") {
+    for blob in on.blobs.values() {
+        if let Some(rows) = blob.get("unfollowed_member_calls") {
             left_open.extend(rows.as_array().expect("rows are a list").clone());
         }
-        blob.remove("unfollowed_member_calls_total");
     }
-    assert_eq!(on_blobs, off.blobs, "writing rows moved the blob");
     assert_eq!(
         left_open
             .iter()
@@ -873,27 +866,12 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
             .iter()
             .map(|(service, _)| service)
             .collect::<Vec<_>>(),
-        off.rows
+        died.rows
             .iter()
             .map(|(service, _)| service)
             .collect::<Vec<_>>(),
         "one line a service"
     );
-
-    let died_store = tempfile::tempdir().unwrap();
-    let died = scan(&repo, true, true, Some(died_store.path()), None);
-    assert!(
-        died.actions.iter().any(|action| action == "position_rows"),
-        "the walk was not asked"
-    );
-    let left: Vec<_> = died
-        .positions
-        .iter()
-        .flat_map(|dir| fs::read_dir(dir).unwrap())
-        .collect();
-    assert!(left.is_empty(), "a walk that died left files: {left:?}");
-    assert_eq!(died.blobs, off.blobs, "a walk that died moved the blob");
-    assert_eq!(read_as(&died), BTreeSet::from(["missing".to_string()]));
 }
 
 /// carrick#1604: a service with no config at its root, scanned with rows on,
@@ -941,7 +919,7 @@ fn imports_resolve_through_the_nearest_config_of_a_service_with_none_at_its_root
             &repo,
         );
         let store = tempfile::tempdir().unwrap();
-        let on = scan(&repo, true, false, Some(store.path()), None);
+        let on = scan(&repo, false, Some(store.path()), None);
         let rows_file = on
             .positions
             .as_ref()
@@ -1101,10 +1079,9 @@ fn census() {
 
 /// The calls a scan of `tests/fixtures/position-rows-names/` states, run as
 /// the Action runs it (`.` from the repo root) with the real sidecar, with
-/// or without the walk, and with or without its module that imports a
-/// package nothing declares (`src/other.ts`). Each call as its file, line,
-/// source, method and URL.
-fn names_scan_calls(rows_on: bool, unfollowable: bool) -> BTreeSet<String> {
+/// or without its module that imports a package nothing declares
+/// (`src/other.ts`). Each call as its file, line, source, method and URL.
+fn names_scan_calls(unfollowable: bool) -> BTreeSet<String> {
     let dir = tempfile::tempdir().expect("temp dir");
     let repo = fs::canonicalize(dir.path())
         .expect("canonical temp dir")
@@ -1126,11 +1103,6 @@ fn names_scan_calls(rows_on: bool, unfollowable: bool) -> BTreeSet<String> {
         .env("CARRICK_SKIP_INTENTS", "1")
         .env_remove("CARRICK_SIDECAR_DIR")
         .env_remove("CARRICK_LOCAL_STORAGE_DIR");
-    if rows_on {
-        cmd.env("CARRICK_POSITION_ROWS", "1");
-    } else {
-        cmd.env_remove("CARRICK_POSITION_ROWS");
-    }
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_ACTIONS",
@@ -1167,20 +1139,16 @@ fn names_scan_calls(rows_on: bool, unfollowable: bool) -> BTreeSet<String> {
 
 /// carrick#2413 slice B, end to end (carrick#2402): a request whose URL is
 /// built from a constant another module declares (`api.ts`, called from
-/// `page.ts`). Without the walk, a module that imports a package nothing
-/// declares and only calls it turns every imported constant off, so the
-/// summary states the call with the constant unread. With the walk, that
-/// module changes nothing: the scan states what it states without it.
+/// `page.ts`). A module that imports a package nothing declares and only
+/// calls it changes nothing: the scan states what it states without it, and
+/// never the call with the constant unread.
 #[test]
 fn an_unrelated_unfollowable_import_changes_no_call_with_rows() {
     if !sidecar_available() {
         return;
     }
     let unread = "services/names/src/page.ts:4 request_summary GET ${API_BASE}/users";
-    let followable = names_scan_calls(false, false);
+    let followable = names_scan_calls(false);
     assert!(!followable.contains(unread), "{followable:#?}");
-    let off = names_scan_calls(false, true);
-    assert!(off.contains(unread), "{off:#?}");
-    assert_eq!(names_scan_calls(true, true), followable);
-    assert_eq!(names_scan_calls(true, false), followable);
+    assert_eq!(names_scan_calls(true), followable);
 }

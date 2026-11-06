@@ -1,9 +1,8 @@
 //! The files the fact layer sends to the file reader (carrick#2613). The
 //! engine builds this from the library store's first answer, before the
-//! reader dispatches. With `CARRICK_FACT_FILES=1` ([`enabled`]) the
-//! orchestrator reads it to choose the reader's files (ticket T3); without,
-//! it only logs how it compares with the files the hand-written signals
-//! select (ticket T1).
+//! reader dispatches. The orchestrator reads it to choose the reader's files
+//! (ticket T3), and logs how it compares with the files the hand-written
+//! signals select (ticket T1).
 //!
 //! A file is a fact file when any of these holds (decisions D1-D2 on
 //! carrick#2440's plan):
@@ -27,15 +26,6 @@ use super::decided_sites::Decided;
 use super::discovery::Discovery;
 use crate::library_store::FirstAnswer;
 use crate::services::type_sidecar::LibraryRole;
-
-/// The switch: on only when set to `1`.
-pub const SWITCH: &str = "CARRICK_FACT_FILES";
-
-/// Whether the fact layer chooses the file reader's files
-/// (`CARRICK_FACT_FILES=1`, decision D6). Off: it only logs them.
-pub fn enabled() -> bool {
-    std::env::var(SWITCH).is_ok_and(|value| value == "1")
-}
 
 /// The reason a call is not followed to the end when the walk found no site
 /// and passed a call it could not follow inside

@@ -3,9 +3,7 @@
 //!
 //! Drives the real scanner binary on `.`, over a committed copy of
 //! `tests/fixtures/socket-bus-yield/`, offline, with the fixture's cassettes.
-//! With the switches every cloud scan runs (site questions, position rows,
-//! fact files, receiver trace and site payloads), a call on an instance of a
-//! socket class the store labels is a decided site whose row is a socket row,
+//! A call on an instance of a socket class the store labels is a decided site whose row is a socket row,
 //! even where the receiver is a parameter and no library row can be read.
 //! The event pass records the same `emit` as a pub/sub publisher with no
 //! source; before the fix that row held the site and the socket row was
@@ -71,9 +69,8 @@ fn row(side: &str, key: &str, file_path: &str, source: Option<&str>) -> Row {
     }
 }
 
-/// The pub/sub and socket rows of a scan of the fixture, sorted, with the
-/// five switches on or all off.
-fn scan(switches: bool) -> Vec<Row> {
+/// The pub/sub and socket rows of a scan of the fixture, sorted.
+fn scan() -> Vec<Row> {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir(), &repo);
@@ -105,20 +102,6 @@ fn scan(switches: bool) -> Vec<Row> {
             "CARRICK_SIDECAR_DIR",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
         );
-    let names = [
-        "CARRICK_SITE_QUESTIONS",
-        "CARRICK_POSITION_ROWS",
-        "CARRICK_FACT_FILES",
-        "CARRICK_RECEIVER_TRACE",
-        "CARRICK_SITE_PAYLOADS",
-    ];
-    for name in names {
-        if switches {
-            cmd.env(name, "1");
-        } else {
-            cmd.env_remove(name);
-        }
-    }
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -181,16 +164,16 @@ fn scan(switches: bool) -> Vec<Row> {
     rows
 }
 
-fn with_switches() -> &'static [Row] {
+fn scanned() -> &'static [Row] {
     static ROWS: OnceLock<Vec<Row>> = OnceLock::new();
-    ROWS.get_or_init(|| scan(true))
+    ROWS.get_or_init(scan)
 }
 
 /// The emit on a parameter is a socket call, stated by its site row, and no
 /// pub/sub row stands for it.
 #[test]
 fn a_socket_site_row_holds_its_call_against_the_bus_row() {
-    let rows = with_switches();
+    let rows = scanned();
     let at = format!("{ANNOUNCE}:4");
     assert!(
         rows.contains(&row(
@@ -212,7 +195,7 @@ fn a_socket_site_row_holds_its_call_against_the_bus_row() {
 /// row.
 #[test]
 fn a_model_pubsub_twin_folds_onto_a_socket_site_row() {
-    let rows = with_switches();
+    let rows = scanned();
     let at = format!("{TWIN}:4");
     assert!(
         rows.contains(&row(
@@ -226,21 +209,5 @@ fn a_model_pubsub_twin_folds_onto_a_socket_site_row() {
     assert!(
         !rows.iter().any(|row| row.key == "pubsub|chat.read"),
         "the model's pub/sub twin folded: {rows:#?}"
-    );
-}
-
-/// With every switch off there are no site rows, so nothing yields: the scan
-/// states what it stated before the fix, the event pass's publisher, now naming its pass (carrick#3091; the
-/// model is not asked about `src/twin.ts` with the switches off).
-#[test]
-fn with_the_switches_off_the_bus_row_stands() {
-    assert_eq!(
-        scan(false),
-        vec![row(
-            "calls",
-            "pubsub|chat.sent",
-            &format!("{ANNOUNCE}:4"),
-            Some("event_bus")
-        )]
     );
 }

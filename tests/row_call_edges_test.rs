@@ -5,8 +5,7 @@
 //! member reached through a destructured parameter. A receiver the compiler
 //! types `any` states no edge.
 //!
-//! Scanned as the Action scans it, with `CARRICK_POSITION_ROWS=1`; the real
-//! sidecar walks the rows. `src/api-client.ts` declares the class, the
+//! Scanned as the Action scans it; the real sidecar walks the rows. `src/api-client.ts` declares the class, the
 //! other files call it. See `tests/fixtures/row-call-edges/`.
 
 use std::collections::BTreeSet;
@@ -43,8 +42,7 @@ fn scan_edges() -> BTreeSet<(String, String, String, u64)> {
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
         .env("CARRICK_MOCK_ALL", "1")
-        .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_POSITION_ROWS", "1");
+        .env("CARRICK_SKIP_INTENTS", "1");
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",

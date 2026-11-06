@@ -66,7 +66,7 @@ struct Scan {
 
 /// Scan a committed copy of the fixture on `.`, offline, replaying the
 /// answer set `set`.
-fn scan(set: &str, trace: bool) -> Scan {
+fn scan(set: &str) -> Scan {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir(), &repo);
@@ -91,11 +91,6 @@ fn scan(set: &str, trace: bool) -> Scan {
             format!("{}/", answers_dir(set).display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1");
-    if trace {
-        cmd.env("CARRICK_POSITION_ROWS", "1")
-            .env("CARRICK_SITE_QUESTIONS", "1")
-            .env("CARRICK_RECEIVER_TRACE", "1");
-    }
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -137,7 +132,7 @@ fn scan(set: &str, trace: bool) -> Scan {
 
 fn listed() -> &'static Scan {
     static SCAN: OnceLock<Scan> = OnceLock::new();
-    SCAN.get_or_init(|| scan("listed", false))
+    SCAN.get_or_init(|| scan("listed"))
 }
 
 /// `(file, line, method, path)` of a row.
@@ -237,7 +232,7 @@ fn routes_with_made_up_ids_are_stated_by_the_dispatch_rows() {
             .expect("read the dispatched answer key"),
     )
     .expect("the answer key is JSON");
-    let scan = scan("dispatched", true);
+    let scan = scan("dispatched");
     let leads: BTreeSet<(String, u64)> = scan.blob["possible_calls"]
         .as_array()
         .into_iter()

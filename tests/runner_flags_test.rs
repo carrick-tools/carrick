@@ -872,10 +872,7 @@ fn walk_scan_from_a_stored_peak(beta_dies: BetaDies) -> TypedScan {
     let store = tmp.path().join("store");
     std::fs::write(&lived, "written first, so beta lives").unwrap();
     sidecar_stand_in(&home, &lived, false, BetaDies::Once);
-    let env = [
-        ("CARRICK_POSITION_ROWS", "1"),
-        ("CARRICK_SIDECAR_MAX_OLD_SPACE_MB", "4096"),
-    ];
+    let env = [("CARRICK_SIDECAR_MAX_OLD_SPACE_MB", "4096")];
     let first = typed_scan_into(&repo, &home, &lived, false, &env, Some(&store));
     assert_eq!(first.code, Some(0), "{}\n{}", first.stderr, first.log);
     let (path, mut blob) = stored_blob_file(&store, "beta");

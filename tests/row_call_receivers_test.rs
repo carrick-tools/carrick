@@ -4,8 +4,7 @@
 //! destructured or union-typed binding, an optional call. A receiver typed
 //! `any`, or by an interface no definition is declared on, states no edge.
 //!
-//! Scanned as the Action scans it, with `CARRICK_POSITION_ROWS=1`; the real
-//! sidecar walks the rows. See `tests/fixtures/row-call-receivers/`. Each
+//! Scanned as the Action scans it; the real sidecar walks the rows. See `tests/fixtures/row-call-receivers/`. Each
 //! method of `Client` wraps a different protocol's stub transport (HTTP,
 //! GraphQL, socket, queue, RPC); the edges are function to function, so the
 //! protocol does not change them.
@@ -35,7 +34,7 @@ fn sidecar_available() -> bool {
 }
 
 /// Every edge of the scan's blob: (caller, callee, callee file, call line).
-fn scan_edges(rows: bool) -> BTreeSet<(String, String, String, u64)> {
+fn scan_edges() -> BTreeSet<(String, String, String, u64)> {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
@@ -44,11 +43,7 @@ fn scan_edges(rows: bool) -> BTreeSet<(String, String, String, u64)> {
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
         .env("CARRICK_MOCK_ALL", "1")
-        .env("CARRICK_SKIP_INTENTS", "1")
-        .env_remove("CARRICK_POSITION_ROWS");
-    if rows {
-        cmd.env("CARRICK_POSITION_ROWS", "1");
-    }
+        .env("CARRICK_SKIP_INTENTS", "1");
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -112,7 +107,7 @@ fn every_member_call_the_resolver_left_takes_its_edge_from_the_call_row() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
     }
-    let edges = scan_edges(true);
+    let edges = scan_edges();
     for (caller, callee, line) in [
         // `const c = await ctx.getClient(); c.getUser()` (HTTP).
         (Some("viaMethodFactory"), "Client.getUser", 7),
@@ -147,30 +142,11 @@ fn no_edge_without_a_definition() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
     }
-    let edges = scan_edges(true);
+    let edges = scan_edges();
     for caller in ["viaInterface", "viaAny"] {
         assert!(
             !edges.iter().any(|(from, ..)| from == caller),
             "{caller} states no edge: {edges:#?}"
         );
     }
-}
-
-#[test]
-fn no_rows_no_new_edges() {
-    if !sidecar_available() {
-        eprintln!("Skipping: node or the built sidecar is missing");
-        return;
-    }
-    // Without the position rows the resolver alone states the edges: the one
-    // receiver it follows by name (`ctx: Context`), as on main before the
-    // call row was asked. Nothing the widened rows pass adds an edge here.
-    let edges = scan_edges(false);
-    let expected: BTreeSet<Edge> = BTreeSet::from([(
-        "viaMethodFactory".to_string(),
-        "Context.getClient".to_string(),
-        "src/context.ts".to_string(),
-        6,
-    )]);
-    assert_eq!(edges, expected);
 }

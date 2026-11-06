@@ -563,8 +563,8 @@ struct ServiceAhead {
     position: usize,
     config: Config,
     stored: Option<StoredSetup>,
-    /// Heard once the service's walk has ended, when the run walks
-    /// (carrick#2413 slice G1).
+    /// Heard once the service's walk has ended (carrick#2413 slice G1);
+    /// `None` only in tests that walk nothing.
     walked: Option<WalkEnded>,
 }
 
@@ -678,7 +678,7 @@ impl SetupsAhead {
     /// Start asking for the setups of `services`, in order. `stored` is the
     /// part of a service's previous generation its setup is decided on.
     /// `walked` is heard as each service's walk ends, position for position,
-    /// and is empty when the run walks nothing: each setup is planned once
+    /// and is empty only in tests that walk nothing: each setup is planned once
     /// its own walk is over ([`once_walked`]).
     ///
     /// Asks nothing when the scan uses no model, or [`IN_FLIGHT_ENV`] is `0`.

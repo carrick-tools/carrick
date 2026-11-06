@@ -48,9 +48,9 @@ use crate::services::type_sidecar::{LibraryClaim, LibraryRole};
 /// The roles this scanner reads rows for: the store spends nothing on others.
 pub const ROLES: [&str; 3] = ["broker", "socket", "in_process_bus"];
 
-/// Every network role the store answers (carrick-cloud#2377), asked when
-/// site questions are on ([`crate::site_questions::enabled`], carrick#2436):
-/// discovery and the site labels read all of them. The message roles come
+/// Every network role the store answers (carrick-cloud#2377), asked by
+/// every scan (carrick#2436, carrick#3283): discovery and the site labels
+/// read all of them. The message roles come
 /// first, in [`ROLES`]' order. Library rows still read the message roles
 /// only ([`crate::library_claims::read`]), so a claim of another role feeds
 /// discovery and the site rows and states no library row.
@@ -62,16 +62,6 @@ pub const NETWORK_ROLES: [&str; 6] = [
     "graphql_client",
     "server_framework",
 ];
-
-/// The roles a scan asks the store for: every network role with site
-/// questions on, the message roles alone with them off.
-pub fn roles_for(site_questions: bool) -> &'static [&'static str] {
-    if site_questions {
-        &NETWORK_ROLES
-    } else {
-        &ROLES
-    }
-}
 
 /// The store's route.
 pub const ROUTE: &str = "/library-claims";
@@ -1850,22 +1840,15 @@ mod tests {
         );
     }
 
-    /// carrick#2436: with site questions off the request is today's, byte for
-    /// byte. On, it asks every network role the store answers for the same
-    /// packages, and so does the re-ask of a package still being built.
+    /// carrick#2436: the scan asks every network role the store answers for
+    /// its packages, and so does the re-ask of a package still being built.
     #[test]
-    fn the_request_asks_every_network_role_only_with_site_questions_on() {
+    fn the_request_asks_every_network_role() {
         let dir = tempfile::tempdir().unwrap();
         install_package(dir.path(), "lib", "1.0.0");
         npm_lockfile(dir.path(), &[("lib", PUBLIC_TGZ)]);
         let asked = request(&specifiers(&["lib"]), &install_at(dir.path())).unwrap();
-        let off = asked.clone().with_roles(roles_for(false));
-        assert_eq!(off, asked);
-        assert_eq!(
-            serde_json::to_string(&off.request).unwrap(),
-            r#"{"roles":["broker","socket","in_process_bus"],"packages":[{"package":"lib","version":"1.0.0","specifiers":["lib"]}]}"#
-        );
-        let on = asked.with_roles(roles_for(true));
+        let on = asked.with_roles(&NETWORK_ROLES);
         assert_eq!(
             serde_json::to_string(&on.request).unwrap(),
             r#"{"roles":["broker","socket","in_process_bus","http_client","graphql_client","server_framework"],"packages":[{"package":"lib","version":"1.0.0","specifiers":["lib"]}]}"#

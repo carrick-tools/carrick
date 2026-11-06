@@ -1,13 +1,10 @@
-//! The receiver trace's switch (carrick#2474 R1).
+//! The receiver trace (carrick#2474 R1).
 //!
 //! Drives the real scanner binary on `.`, as the Action runs it, over a
 //! committed copy of `tests/fixtures/receiver-trace/repo` (one root service),
 //! offline, with the fixture's store answer replayed as the library store's.
-//! With the fact layer on (`CARRICK_POSITION_ROWS=1`,
-//! `CARRICK_SITE_QUESTIONS=1`) and `CARRICK_RECEIVER_TRACE` unset, the routes
-//! only the trace finds leave nothing in the blob; with it set they reach
-//! the blob as the site pass writes route sites. With the fact layer off the
-//! switch changes no byte.
+//! The routes only the trace finds reach the blob as the site pass writes
+//! route sites.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -52,15 +49,14 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// removed.
 type Blobs = BTreeMap<String, String>;
 
-/// One offline scan of a committed copy of the fixture: the fact layer on or
-/// off, and the trace switch set to `trace` or unset.
-fn scan(fact_layer: bool, trace: Option<&str>) -> Blobs {
-    scan_fixture("receiver-trace", fact_layer, trace)
+/// One offline scan of a committed copy of the fixture.
+fn scan() -> Blobs {
+    scan_fixture("receiver-trace")
 }
 
 /// [`scan`] of the fixture `name`.
-fn scan_fixture(name: &str, fact_layer: bool, trace: Option<&str>) -> Blobs {
-    scan_runs(name, &[], fact_layer, trace, 1).remove(0)
+fn scan_fixture(name: &str) -> Blobs {
+    scan_runs(name, &[], 1).remove(0)
 }
 
 /// Each service's fallbacks line, by service name (`(root)` for the
@@ -69,58 +65,27 @@ type Fallbacks = BTreeMap<String, BTreeMap<String, serde_json::Value>>;
 
 /// [`scan_fixture`], with the fallbacks lines the scan states to a parent
 /// that reads them (`CARRICK_PROGRESS=1`).
-fn scan_fixture_reading(name: &str, fact_layer: bool, trace: Option<&str>) -> (Blobs, Fallbacks) {
-    scan_runs_reading(name, &[], fact_layer, trace, 1, true).remove(0)
+fn scan_fixture_reading(name: &str) -> (Blobs, Fallbacks) {
+    scan_runs_reading(name, &[], 1, true).remove(0)
 }
 
 /// `runs` scans of one committed copy of the fixture `name`, with `extra`
 /// files written into it before the commit, sharing one store and cache:
 /// every scan after the first takes the incremental path. The blobs after
 /// each scan.
-fn scan_runs(
-    name: &str,
-    extra: &[(&str, &str)],
-    fact_layer: bool,
-    trace: Option<&str>,
-    runs: usize,
-) -> Vec<Blobs> {
-    scan_runs_reading(name, extra, fact_layer, trace, runs, false)
+fn scan_runs(name: &str, extra: &[(&str, &str)], runs: usize) -> Vec<Blobs> {
+    scan_runs_reading(name, extra, runs, false)
         .into_iter()
         .map(|(blobs, _)| blobs)
         .collect()
-}
-
-/// The two fact-layer switches [`scan_cmd`] leaves to the caller, on: with
-/// `fact_layer` and the trace, a scan in the form a cloud scan runs.
-const ON_FORM: [(&str, &str); 2] = [("CARRICK_FACT_FILES", "1"), ("CARRICK_SITE_PAYLOADS", "1")];
-
-/// [`scan_fixture_reading`] in the form a cloud scan runs: every fact-layer
-/// switch on.
-fn scan_fixture_on_form(name: &str) -> (Blobs, Fallbacks) {
-    scan_runs_with(name, &[], true, Some("1"), 1, true, &ON_FORM).remove(0)
 }
 
 /// [`scan_runs`], and, with `reading`, each scan's fallbacks lines.
 fn scan_runs_reading(
     name: &str,
     extra: &[(&str, &str)],
-    fact_layer: bool,
-    trace: Option<&str>,
     runs: usize,
     reading: bool,
-) -> Vec<(Blobs, Fallbacks)> {
-    scan_runs_with(name, extra, fact_layer, trace, runs, reading, &[])
-}
-
-/// [`scan_runs_reading`] with `env` set on every scan.
-fn scan_runs_with(
-    name: &str,
-    extra: &[(&str, &str)],
-    fact_layer: bool,
-    trace: Option<&str>,
-    runs: usize,
-    reading: bool,
-    env: &[(&str, &str)],
 ) -> Vec<(Blobs, Fallbacks)> {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
@@ -134,8 +99,7 @@ fn scan_runs_with(
     let storage = tmp.path().join("storage");
     std::fs::create_dir_all(&storage).unwrap();
     let home = tmp.path().join("home");
-    let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home, fact_layer, trace);
-    cmd.envs(env.iter().copied());
+    let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home);
     cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
     if reading {
         cmd.env("CARRICK_PROGRESS", "1");
@@ -163,15 +127,7 @@ fn scan_runs_with(
 
 /// The scanner on `.` in `repo`, offline, with the fixture `name`'s store
 /// answer replayed, a store at `storage`, and a home and cache under `tmp`.
-fn scan_cmd(
-    name: &str,
-    tmp: &Path,
-    repo: &Path,
-    storage: &Path,
-    home: &Path,
-    fact_layer: bool,
-    trace: Option<&str>,
-) -> Command {
+fn scan_cmd(name: &str, tmp: &Path, repo: &Path, storage: &Path, home: &Path) -> Command {
     let cassettes = tmp.join("cassettes");
     std::fs::create_dir_all(cassettes.join("library-claims")).unwrap();
     std::fs::copy(
@@ -204,9 +160,13 @@ fn scan_cmd(
         )
         .env("CARRICK_SKIP_INTENTS", "1");
     for var in [
-        "CARRICK_POSITION_ROWS",
+        // The retired fact-layer switches (carrick#3283): removed, so the
+        // environment cannot mask a scanner that still reads one.
         "CARRICK_SITE_QUESTIONS",
+        "CARRICK_POSITION_ROWS",
         "CARRICK_RECEIVER_TRACE",
+        "CARRICK_FACT_FILES",
+        "CARRICK_SITE_PAYLOADS",
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
         "GITHUB_EVENT_NAME",
@@ -221,13 +181,6 @@ fn scan_cmd(
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     ] {
         cmd.env_remove(var);
-    }
-    if fact_layer {
-        cmd.env("CARRICK_POSITION_ROWS", "1")
-            .env("CARRICK_SITE_QUESTIONS", "1");
-    }
-    if let Some(trace) = trace {
-        cmd.env("CARRICK_RECEIVER_TRACE", trace);
     }
     cmd
 }
@@ -321,15 +274,11 @@ fn possible_calls(blobs: &Blobs) -> Vec<String> {
 
 /// carrick#2474 R1: the routes only the trace finds (a parameter, a
 /// callback's parameter, a field set from a constructor parameter) reach
-/// the blob only with the switch set to `1`: as rows where the trace serves
-/// them from the top (R3 S1), otherwise as route sites with no owner.
-/// Unset, the blob holds the route sites found without it. With the fact
-/// layer off the switch changes no byte.
+/// the blob: as rows where the trace serves them from the top (R3 S1),
+/// otherwise as route sites with no owner.
 #[test]
-fn the_receiver_trace_switch_moves_only_what_it_finds() {
-    let off = scan(true, None);
-    assert_eq!(possible_calls(&off), vec!["src/app.ts:25 get".to_string()]);
-    let on = scan(true, Some("1"));
+fn the_receiver_trace_moves_only_what_it_finds() {
+    let on = scan();
     assert_eq!(
         possible_calls(&on),
         vec![
@@ -343,10 +292,6 @@ fn the_receiver_trace_switch_moves_only_what_it_finds() {
             // read through the `new` that hands it the app (carrick#1670 T3).
         ]
     );
-    // Only `1` turns it on.
-    assert_eq!(scan(true, Some("true")), off);
-    // With the fact layer off the switch changes no byte.
-    assert_eq!(scan(false, Some("1")), scan(false, None));
 }
 
 /// Every HTTP endpoint row of the blobs' mount graphs, as `file:line METHOD
@@ -394,43 +339,25 @@ fn endpoint_rows(blobs: &Blobs) -> (Vec<String>, Vec<String>) {
     (graph, flat)
 }
 
-/// carrick#2474 R3 S1: with the switch on, every route the trace serves at
-/// a full path from the top (the answer key
-/// `each_route_is_composed_under_its_scopes_and_mounts`) is a mount-graph
-/// row at its line, `library_claim`, and so is the payload's flat row. The
-/// mock answer's rows that agree are kept and relabelled; the two read
-/// without their plugin prefixes (`items.ts`, the route's own path) take
-/// the traced path, keeping their owner (carrick#2474 row 4, R5b). No row
-/// is removed. A route the
-/// trace cannot place (a callback option, a plugin nothing calls, a mount
-/// it cannot verify) keeps today's reading, a possible call. With the
-/// switch off, or with the fact layer off, nothing moves.
+/// carrick#2474 R3 S1: every route the trace serves at a full path from the
+/// top (the answer key `each_route_is_composed_under_its_scopes_and_mounts`)
+/// is a mount-graph row at its line, `library_claim`, and so is the
+/// payload's flat row. The mock answer's rows that agree are kept and
+/// relabelled; the two read without their plugin prefixes (`items.ts`, the
+/// route's own path) take the traced path, keeping their owner (carrick#2474
+/// row 4, R5b). No row of the mock answer is removed. A route the trace
+/// cannot place (a callback option, a plugin nothing calls, a mount it
+/// cannot verify) keeps today's reading, a possible call.
 #[test]
 fn traced_routes_take_their_composed_paths() {
-    let off = scan_fixture("receiver-scopes", true, None);
-    let (off_graph, _) = endpoint_rows(&off);
+    // The rows the mock reader states, at their lines and methods.
     let mock = vec![
         "src/index.ts:14 GET /bare model app",
         "src/index.ts:19 GET /health model app",
         "src/items.ts:12 GET /items model app",
         "src/items.ts:8 GET /leaf model app",
     ];
-    assert_eq!(off_graph, mock);
-    assert_eq!(
-        possible_calls(&off),
-        vec![
-            "src/admin.ts:8 get",
-            "src/aliased.ts:8 get",
-            "src/extra.ts:9 post",
-            "src/index.ts:46 get",
-            "src/reports.ts:9 get",
-            "src/shared.ts:8 get",
-            "src/users.ts:8 get",
-            "src/users.ts:9 post",
-        ]
-    );
-
-    let on = scan_fixture("receiver-scopes", true, Some("1"));
+    let on = scan_fixture("receiver-scopes");
     let (graph, flat) = endpoint_rows(&on);
     assert_eq!(
         graph,
@@ -467,7 +394,7 @@ fn traced_routes_take_their_composed_paths() {
         rows
     };
     assert_eq!(flat, flat_of_graph);
-    // Every row the switch-off scan states is still there, at its line and
+    // Every row the mock reader states is still there, at its line and
     // method.
     for row in &mock {
         let (site, _) = row.rsplit_once(" /").unwrap();
@@ -486,28 +413,19 @@ fn traced_routes_take_their_composed_paths() {
             "src/versioned.ts:28 get",
         ]
     );
-    assert_eq!(
-        scan_fixture("receiver-scopes", false, Some("1")),
-        scan_fixture("receiver-scopes", false, None)
-    );
 }
 
 /// carrick#1678 slice A: a verb called on the object a scope member returns
 /// (`items.at("/items").get(list)`, the made-up package's `at`) is a route
 /// whose path is the scope call's argument, served under the router's
-/// mount. With the switch on, the mount graph and the flat endpoints hold
-/// each at its line, `library_claim`, owned by the scope call's receiver
-/// (`items`, `r` inside the helper), never the scope member (`at`). The
-/// chain's later verb, a function-local constant, a `let` written twice and
-/// a result handed to a helper add no row. With the switch off, or with the
-/// fact layer off, nothing moves.
+/// mount. The mount graph and the flat endpoints hold each at its line,
+/// `library_claim`, owned by the scope call's receiver (`items`, `r` inside
+/// the helper), never the scope member (`at`). The chain's later verb, a
+/// function-local constant, a `let` written twice and a result handed to a
+/// helper add no row.
 #[test]
 fn routes_on_a_returned_scope_take_their_paths() {
-    let off = scan_fixture("receiver-scopes-chain", true, None);
-    let (off_graph, _) = endpoint_rows(&off);
-    assert_eq!(off_graph, Vec::<String>::new());
-
-    let on = scan_fixture("receiver-scopes-chain", true, Some("1"));
+    let on = scan_fixture("receiver-scopes-chain");
     let (graph, flat) = endpoint_rows(&on);
     assert_eq!(
         graph,
@@ -529,10 +447,6 @@ fn routes_on_a_returned_scope_take_their_paths() {
         rows
     };
     assert_eq!(flat, flat_of_graph);
-    assert_eq!(
-        scan_fixture("receiver-scopes-chain", false, Some("1")),
-        scan_fixture("receiver-scopes-chain", false, None)
-    );
 }
 
 /// Why each possible call's path is unread, as `file:line` to reason. A call
@@ -569,17 +483,15 @@ fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {
 /// registration with none), and a slot at or after it reads as unread. The
 /// registrations are on a local instance, on a parameter, and on a router
 /// whose members no declaration verifies for, so only the instance the
-/// maker builds names the op. Without the trace they stay no site.
+/// maker builds names the op.
 ///
 /// Every spread here is at or after the handler slot, so the path slot is
-/// read, and each instance is served from the top: with the trace on, the
-/// trace writes each one's row at its path (carrick#2474 R3 S1) and no
-/// possible call is left.
+/// read, and each instance is served from the top: the trace writes each
+/// one's row at its path (carrick#2474 R3 S1) and no possible call is left.
 #[test]
 fn a_spread_argument_leaves_the_slots_before_it_read() {
-    let on_blobs = scan_fixture("receiver-spread", true, Some("1"));
+    let on_blobs = scan_fixture("receiver-spread");
     let on = unread_reasons(&on_blobs);
-    let off = unread_reasons(&scan_fixture("receiver-spread", true, None));
     assert_eq!(on, BTreeMap::new());
     assert_eq!(
         endpoint_rows(&on_blobs).0,
@@ -593,28 +505,6 @@ fn a_spread_argument_leaves_the_slots_before_it_read() {
             "src/spread.ts:15 GET /by-id library_claim app",
             "src/spread.ts:16 POST /by-name library_claim app",
         ]
-    );
-    // The registrations with no spread, on the instances the maker builds.
-    for line in ["src/app.ts:20", "src/app.ts:29"] {
-        assert_eq!(off.get(line).map(String::as_str), Some("owner_unknown"));
-    }
-    for line in [
-        // A spread of a call after a handler; a spread at the handler slot.
-        "src/app.ts:21",
-        "src/app.ts:22",
-        // The same on the router whose declarations verify nothing.
-        "src/app.ts:30",
-        "src/app.ts:31",
-        // A parameter.
-        "src/spread.ts:15",
-        "src/spread.ts:16",
-    ] {
-        assert!(!off.contains_key(line), "{line}: no site without the trace");
-    }
-    // With the fact layer off the switch changes no byte.
-    assert_eq!(
-        scan_fixture("receiver-spread", false, Some("1")),
-        scan_fixture("receiver-spread", false, None)
     );
 }
 
@@ -637,13 +527,7 @@ const DECLARED_HEALTH: &str = r#"{
 /// scan's.
 #[test]
 fn a_rescan_keeps_the_declared_rows_at_a_traced_route() {
-    let scans = scan_runs(
-        "receiver-scopes",
-        &[("carrick.json", DECLARED_HEALTH)],
-        true,
-        Some("1"),
-        2,
-    );
+    let scans = scan_runs("receiver-scopes", &[("carrick.json", DECLARED_HEALTH)], 2);
     let (cold, _) = endpoint_rows(&scans[0]);
     let (warm, _) = endpoint_rows(&scans[1]);
     let health: Vec<&String> = cold
@@ -686,27 +570,16 @@ export default api;
 "#;
 
 /// carrick#2730: a table's keys share their loop's call span, and each key's
-/// record finds its own site by the key. With the trace on, each key is its
-/// own route, written at its handler's line, and no key's path sits at
-/// another key's line. The trace off writes none of them.
+/// record finds its own site by the key. Each key is its own route, written
+/// at its handler's line, and no key's path sits at another key's line.
 #[test]
 fn each_key_of_a_loop_registered_table_is_its_own_route() {
-    let table_rows = |trace: Option<&str>| -> Vec<String> {
-        let blobs = scan_runs(
-            "receiver-scopes",
-            &[("src/table.ts", LOOP_TABLE)],
-            true,
-            trace,
-            1,
-        )
-        .remove(0);
-        endpoint_rows(&blobs)
-            .0
-            .into_iter()
-            .filter(|row| row.starts_with("src/table.ts:"))
-            .collect()
-    };
-    let on = table_rows(Some("1"));
+    let blobs = scan_runs("receiver-scopes", &[("src/table.ts", LOOP_TABLE)], 1).remove(0);
+    let on: Vec<String> = endpoint_rows(&blobs)
+        .0
+        .into_iter()
+        .filter(|row| row.starts_with("src/table.ts:"))
+        .collect();
     let line_of = |name: &str| {
         LOOP_TABLE
             .lines()
@@ -728,7 +601,6 @@ fn each_key_of_a_loop_registered_table_is_its_own_route() {
     assert_eq!(at("show", "/t/show"), 1, "{on:#?}");
     assert_eq!(at("list", "/t/show"), 0, "{on:#?}");
     assert_eq!(at("show", "/t/list"), 0, "{on:#?}");
-    assert_ne!(on, table_rows(None));
 }
 
 /// Every HTTP producer manifest entry of the blobs, as `file:line METHOD
@@ -784,26 +656,10 @@ fn producer_manifest(blobs: &Blobs) -> Vec<String> {
 /// host's audit routes are the host's rows, composed through the scope call
 /// the routes package wrote (R5d): the one whose row holds types folds onto
 /// it, and the one whose row was added untyped stays, counted, so the
-/// documentation's types are not lost. With the switch off, or with the
-/// fact layer off, nothing moves.
+/// documentation's types are not lost.
 #[test]
 fn routes_across_services_take_the_receiving_scope() {
-    let off = scan_fixture("receiver-scopes-across", true, None);
-    let (off_graph, _) = endpoint_rows(&off);
-    // The mock answer's rows, each at its literal path, and the routes
-    // package's documentation.
-    let mock = vec![
-        "packages/routes/src/admin.ts:5 GET /admin/users model app",
-        "packages/routes/src/docs.ts:10 GET /api/v1/admin/users descriptor_route __route_descriptor__",
-        "packages/routes/src/docs.ts:16 POST /api/v1/admin/users descriptor_route __route_descriptor__",
-        "packages/routes/src/docs.ts:22 GET /api/v1/audit/events descriptor_route __route_descriptor__",
-        "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} descriptor_route __route_descriptor__",
-        "packages/routes/src/docs.ts:4 GET /api/v1/orders descriptor_route __route_descriptor__",
-        "packages/server/src/audit.ts:6 GET /audit/events model app",
-    ];
-    assert_eq!(off_graph, mock);
-
-    let (on, fallbacks) = scan_fixture_reading("receiver-scopes-across", true, Some("1"));
+    let (on, fallbacks) = scan_fixture_reading("receiver-scopes-across");
     let (graph, flat) = endpoint_rows(&on);
     assert_eq!(
         graph,
@@ -849,20 +705,9 @@ fn routes_across_services_take_the_receiving_scope() {
         );
     }
     // A corrected row's producer entries take its new key, byte for byte,
-    // and keep their alias; the folded documentation's entries go with it.
-    assert_eq!(
-        producer_manifest(&off),
-        vec![
-            "packages/routes/src/admin.ts:5 GET /admin/users response Endpoint_decf5c62b6c61845_Response_At436386aec40a3379",
-            "packages/routes/src/docs.ts:10 GET /api/v1/admin/users response Endpoint_bb1a686f5e4c54d2_Response_Atf1e0cb5a9f7b748a",
-            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users request Endpoint_e6205bbde80997f6_Request_At0138837ffadb39d2",
-            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users response Endpoint_f23468c0fbf2a02a_Response_At0138837ffadb39d2",
-            "packages/routes/src/docs.ts:22 GET /api/v1/audit/events response Endpoint_e2d4eb6e1675c5c9_Response_Ate98fc63c17a3e34a",
-            "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} response Endpoint_096ab5a590512c13_Response_At811f38cb9a8a62a6",
-            "packages/routes/src/docs.ts:4 GET /api/v1/orders response Endpoint_8cc6f21213a20a01_Response_Atc7ccf7294327f4bc",
-            "packages/server/src/audit.ts:6 GET /audit/events response Endpoint_cf8ea45ffddd4018_Response_Atde8b764d1203983c",
-        ]
-    );
+    // and keep their alias (the mock answer's: `admin.ts:5` was
+    // `GET /admin/users`, `audit.ts:6` `GET /audit/events`); the folded
+    // documentation's entries go with it.
     assert_eq!(
         producer_manifest(&on),
         vec![
@@ -931,11 +776,6 @@ fn routes_across_services_take_the_receiving_scope() {
     );
     assert_eq!(counts("app"), Vec::<String>::new());
     assert_eq!(counts("demo"), Vec::<String>::new());
-    // With the fact layer off the switch changes no byte.
-    assert_eq!(
-        scan_fixture("receiver-scopes-across", false, Some("1")),
-        scan_fixture("receiver-scopes-across", false, None)
-    );
 }
 
 /// carrick#2588: a routes package that uses its server package only through
@@ -944,22 +784,12 @@ fn routes_across_services_take_the_receiving_scope() {
 /// package, as a package imported as a value is. So its route calls reach the
 /// labels, end at its plugin's parameter, and take the scope prefix the
 /// plugin states (`opts.routePrefix ?? '/api/v1'`) at the join point, where
-/// the host registers the plugin on an app the labelled export made. Without
-/// the ask the routes package has no site, and its rows keep the mock
-/// answer's bare paths. With the switch off, nothing moves.
+/// the host registers the plugin on an app the labelled export made. The
+/// mock answer states the routes package's row at its bare path
+/// (`/widgets`), and the join corrects it in place.
 #[test]
 fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
-    let off = scan_fixture("receiver-scopes-types-only", true, None);
-    let (off_graph, _) = endpoint_rows(&off);
-    assert_eq!(
-        off_graph,
-        vec![
-            "packages/routes/src/widgets.ts:4 GET /widgets model widgetRoutes",
-            "packages/server/src/main.ts:7 GET /health model app",
-        ]
-    );
-
-    let (on, fallbacks) = scan_fixture_reading("receiver-scopes-types-only", true, Some("1"));
+    let (on, fallbacks) = scan_fixture_reading("receiver-scopes-types-only");
     let (graph, flat) = endpoint_rows(&on);
     assert_eq!(
         graph,
@@ -986,11 +816,6 @@ fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
             "routes routes_untraced_hole_entry_point=2",
         ]
     );
-    // With the fact layer off the switch changes no byte.
-    assert_eq!(
-        scan_fixture("receiver-scopes-types-only", false, Some("1")),
-        scan_fixture("receiver-scopes-types-only", false, None)
-    );
 }
 
 /// carrick#3237: in a package that uses its framework only through types,
@@ -1000,8 +825,7 @@ fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
 /// value (`${head}health`) is a guessed site and its row is withdrawn.
 #[test]
 fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
-    let off = scan_fixture("receiver-route-stated-head", true, None);
-    let (on, fallbacks) = scan_fixture_reading("receiver-route-stated-head", true, Some("1"));
+    let (on, fallbacks) = scan_fixture_reading("receiver-route-stated-head");
     let (graph, _) = endpoint_rows(&on);
     let family: Vec<&String> = graph
         .iter()
@@ -1032,10 +856,8 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
             && counts.contains(&"routes routes_guessed_withdrawn=1".to_string()),
         "{counts:#?}"
     );
-    // With the trace off the reader's rows are all there is.
-    assert_eq!(scan_fixture("receiver-route-stated-head", true, None), off);
     // An incremental re-scan gives the same rows.
-    let again = scan_runs("receiver-route-stated-head", &[], true, Some("1"), 2);
+    let again = scan_runs("receiver-route-stated-head", &[], 2);
     assert_eq!(endpoint_rows(&again[1]).0, graph);
 }
 
@@ -1046,15 +868,14 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
 /// the plugin's routes take the `/api/v1` scope prefix as `library_claim`
 /// rows, as they do for a host that imports the named export.
 ///
-/// Scanned in the form a cloud scan runs (carrick#3283). The reader's answer
-/// for `main.ts` is replayed from the fixture's `__llm__/analyze-file/`: the
+/// The reader's answer for `main.ts` is replayed from the fixture's `__llm__/analyze-file/`: the
 /// route at the line that writes it, folded onto the library row there. With
 /// the mock's own answer instead, the row would land one line low (the mock
 /// numbers the line after the source fence as line 1) on the `register`
 /// candidate the fact files keep at line 8, beside the library row.
 #[test]
 fn a_host_made_through_the_other_export_still_joins_the_plugins_routes() {
-    let (on, _) = scan_fixture_on_form("receiver-scopes-default-export");
+    let (on, _) = scan_fixture_reading("receiver-scopes-default-export");
     let (graph, _) = endpoint_rows(&on);
     assert_eq!(
         graph,
@@ -1073,7 +894,7 @@ fn a_host_made_through_the_other_export_still_joins_the_plugins_routes() {
 /// `library_claim` row.
 #[test]
 fn a_mount_on_an_app_made_through_the_other_export_still_prefixes_the_child() {
-    let (on, _) = scan_fixture_reading("receiver-scopes-default-export-mount", true, Some("1"));
+    let (on, _) = scan_fixture_reading("receiver-scopes-default-export-mount");
     let (graph, _) = endpoint_rows(&on);
     assert_eq!(
         graph,
@@ -1092,7 +913,7 @@ fn a_mount_on_an_app_made_through_the_other_export_still_prefixes_the_child() {
 /// under its prefix.
 #[test]
 fn an_adapter_mounted_on_an_app_made_through_the_other_export_serves_the_router() {
-    let (on, _) = scan_fixture_reading("procedure-router-default-export", true, Some("1"));
+    let (on, _) = scan_fixture_reading("procedure-router-default-export");
     let (graph, _) = endpoint_rows(&on);
     assert_eq!(
         graph,
@@ -1128,12 +949,10 @@ fn a_callback_option_written_as_a_method_is_read_like_an_arrow() {
     );
     assert_ne!(arrow, method, "the fixture no longer states the arrow form");
     let (arrow_blobs, arrow_counts) =
-        scan_runs_reading("receiver-scopes-across", &[], true, Some("1"), 1, true).remove(0);
+        scan_runs_reading("receiver-scopes-across", &[], 1, true).remove(0);
     let (method_blobs, method_counts) = scan_runs_reading(
         "receiver-scopes-across",
         &[("packages/server/src/server.ts", &method)],
-        true,
-        Some("1"),
         1,
         true,
     )
@@ -1171,15 +990,8 @@ export default app;
 /// route stayed untraced), and a literal `prefix` beside it is still read.
 #[test]
 fn a_method_beside_a_prefix_slot_leaves_the_slot_read() {
-    let (blobs, counts) = scan_runs_reading(
-        "receiver-scopes",
-        &[("src/hooks.ts", HOOKS)],
-        true,
-        Some("1"),
-        1,
-        true,
-    )
-    .remove(0);
+    let (blobs, counts) =
+        scan_runs_reading("receiver-scopes", &[("src/hooks.ts", HOOKS)], 1, true).remove(0);
     let rows: Vec<String> = endpoint_rows(&blobs)
         .0
         .into_iter()
@@ -1223,15 +1035,7 @@ fn scanned_then_server_edited(tmp: &Path) -> (PathBuf, PathBuf, Blobs) {
     run_git(&repo, &["commit", "-q", "-m", "init"]);
     let storage = tmp.join("storage");
     std::fs::create_dir_all(&storage).unwrap();
-    let mut first = scan_cmd(
-        name,
-        tmp,
-        &repo,
-        &storage,
-        &tmp.join("home-a"),
-        true,
-        Some("1"),
-    );
+    let mut first = scan_cmd(name, tmp, &repo, &storage, &tmp.join("home-a"));
     named(&mut first).env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
     let (stored, _) = run_scan(&mut first, &storage);
     let audit = repo.join("packages/server/src/audit.ts");
@@ -1251,8 +1055,6 @@ fn scan_changed_only(tmp: &Path, repo: &Path, storage: &Path) -> (Blobs, Fallbac
         repo,
         storage,
         &tmp.join("home-b"),
-        true,
-        Some("1"),
     );
     named(&mut scoped)
         .arg("--changed-only")
@@ -1322,8 +1124,6 @@ fn a_changed_only_scan_resolves_routes_across_a_carried_service() {
         &repo,
         &full_storage,
         &tmp.path().join("home-c"),
-        true,
-        Some("1"),
     );
     named(&mut full).env_remove("CARRICK_PROGRESS");
     let (full_blobs, _) = run_scan(&mut full, &full_storage);
@@ -1419,8 +1219,8 @@ fn a_carried_blob_without_boundaries_reads_as_one_with_none() {
 }
 
 /// carrick#2474 R6c: a procedure router's operations are named by the keys
-/// they sit under, and served under each adapter's mount. With the switch
-/// on, every procedure the four adapters serve is a row at its op call's
+/// they sit under, and served under each adapter's mount. Every procedure
+/// the four adapters serve is a row at its op call's
 /// line, at the endpoint the fetch adapter is handed (`/rpc`), under the
 /// root the middleware is mounted at (`/`), under the catch-all route the
 /// other middleware handles (`/api/rpc/*`), and under the catch-all mount
@@ -1433,16 +1233,11 @@ fn a_carried_blob_without_boundaries_reads_as_one_with_none() {
 /// no adapter serves, or a router the walk stops at (a `let` binding, a
 /// destructured one): each is counted, the stops apart from the unserved,
 /// and stays a possible call. The member the label states no method for is
-/// no site (the verifier refuses a key-named op with no method). With the
-/// switch off, or with the fact layer off, nothing moves.
+/// no site (the verifier refuses a key-named op with no method). The mock
+/// answer states no row for a call that writes no path.
 #[test]
 fn procedure_routes_take_their_key_paths() {
-    let off = scan_fixture("procedure-router", true, None);
-    let (off_graph, _) = endpoint_rows(&off);
-    // The mock answer states no row for a call that writes no path.
-    assert_eq!(off_graph, Vec::<String>::new());
-
-    let (on, fallbacks) = scan_fixture_reading("procedure-router", true, Some("1"));
+    let (on, fallbacks) = scan_fixture_reading("procedure-router");
     let (graph, flat) = endpoint_rows(&on);
     let served = |file_line: &str, method: &str, key_path: &str, owner: &str| -> Vec<String> {
         ["/api/rpc", "", "/rpc", "/x"]
@@ -1525,23 +1320,16 @@ fn procedure_routes_take_their_key_paths() {
             "src/server.ts:9 all",
         ]
     );
-    // With the fact layer off the switch changes no byte.
-    assert_eq!(
-        scan_fixture("procedure-router", false, Some("1")),
-        scan_fixture("procedure-router", false, None)
-    );
 }
 
-/// carrick#2775: with the switch on, a router mounted by a helper only tests
-/// import is served at its production mount alone (`/v1`), not unverified;
-/// a router whose only mount is made in an entry only a test imports keeps
-/// that mount (`/v2`);
-/// a router mounted path-less from a helper a production file also imports
-/// stays a possible call. With the switch unset, nothing is traced.
+/// carrick#2775: a router mounted by a helper only tests import is served
+/// at its production mount alone (`/v1`), not unverified; a router whose
+/// only mount is made in an entry only a test imports keeps that mount
+/// (`/v2`); a router mounted path-less from a helper a production file also
+/// imports stays a possible call.
 #[test]
 fn a_helper_only_tests_import_does_not_unverify_its_router() {
-    let name = "receiver-mount-test-helper";
-    let on = scan_fixture(name, true, Some("1"));
+    let on = scan_fixture("receiver-mount-test-helper");
     let (graph, _) = endpoint_rows(&on);
     assert_eq!(
         graph,
@@ -1552,10 +1340,4 @@ fn a_helper_only_tests_import_does_not_unverify_its_router() {
         ]
     );
     assert_eq!(possible_calls(&on), vec!["src/jobs.ts:8 get"]);
-    let off = scan_fixture(name, true, None);
-    let (graph, _) = endpoint_rows(&off);
-    assert!(
-        graph.iter().all(|row| !row.contains("library_claim")),
-        "{graph:#?}"
-    );
 }

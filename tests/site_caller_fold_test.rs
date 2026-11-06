@@ -2,9 +2,7 @@
 //! the request that function states.
 //!
 //! Drives the real scanner binary offline over `tests/fixtures/caller-fold/`
-//! as the Action runs it, with the compiler's position rows and the site
-//! questions on (`CARRICK_POSITION_ROWS=1`, `CARRICK_SITE_QUESTIONS=1`) and
-//! the type sidecar live.
+//! as the Action runs it, with the type sidecar live.
 //!
 //! `src/client.ts` declares `login` and `logout`, each a call of a local
 //! `send(path, body)` that hands its arguments to `http.post` on a package
@@ -17,12 +15,12 @@
 //! Answer key (a row "stands" whatever pass states it; at the callee lines
 //! the scan's own rows keep the site today):
 //!
-//! | line | reader states | switch off | switch on |
-//! |---|---|---|---|
-//! | `src/client.ts:12` | `POST /api/login` | a row | a row |
-//! | `src/client.ts:16`, `:17` | `POST /api/logout`, `POST /api/audit` | a row each | a row each |
-//! | `src/page.ts:4` (calls `login`) | `POST /api/login` | the reader's row | folded: no row |
-//! | `src/page.ts:9` (calls `logout`) | `DELETE /api/session` | the reader's row | the reader's row: the callee states other operations |
+//! | line | reader states | the scan |
+//! |---|---|---|
+//! | `src/client.ts:12` | `POST /api/login` | a row |
+//! | `src/client.ts:16`, `:17` | `POST /api/logout`, `POST /api/audit` | a row each |
+//! | `src/page.ts:4` (calls `login`) | `POST /api/login` | folded: no row |
+//! | `src/page.ts:9` (calls `logout`) | `DELETE /api/session` | the reader's row: the callee states other operations |
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,9 +71,8 @@ fn fixture_repo(tmp: &Path, name: &str) -> PathBuf {
     repo
 }
 
-/// The blob one offline scan of `repo` stores, with the site questions on
-/// or off.
-fn scan(repo: &Path, site_questions: bool) -> serde_json::Value {
+/// The blob one offline scan of `repo` stores.
+fn scan(repo: &Path) -> serde_json::Value {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
@@ -89,13 +86,7 @@ fn scan(repo: &Path, site_questions: bool) -> serde_json::Value {
             format!("{}/", repo.join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env_remove("CARRICK_ALLOW_MISSING_TYPES")
-        .env_remove("CARRICK_SITE_PAYLOADS")
-        .env_remove("CARRICK_SITE_QUESTIONS");
-    if site_questions {
-        cmd.env("CARRICK_SITE_QUESTIONS", "1");
-    }
+        .env_remove("CARRICK_ALLOW_MISSING_TYPES");
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -163,10 +154,8 @@ fn a_reader_row_at_a_call_of_a_function_that_states_the_request_folds_onto_it() 
     let tmp = tempfile::tempdir().unwrap();
     let repo = fixture_repo(tmp.path(), "caller-fold");
 
-    // Off: every line holds a row, the caller's copy of `/api/login` among
-    // them. This is the switch-off output that must not move, and the proof
-    // the reader states the second copy this test folds.
-    let off = calls(&scan(&repo, false));
+    // The reader's cassette states a row at each of these five lines, the
+    // caller's copy of `/api/login` among them.
     let places = [
         "src/client.ts:12",
         "src/client.ts:16",
@@ -174,18 +163,7 @@ fn a_reader_row_at_a_call_of_a_function_that_states_the_request_folds_onto_it() 
         "src/page.ts:4",
         "src/page.ts:9",
     ];
-    for place in places {
-        assert_eq!(at(&off, place).len(), 1, "{place} off: {off:#?}");
-    }
-    assert_eq!(off.len(), places.len(), "{off:#?}");
-    let caller = at(&off, "src/page.ts:4");
-    assert_eq!(
-        (caller[0].1.as_str(), caller[0].2.as_str()),
-        ("POST /api/login", "model"),
-        "{off:#?}"
-    );
-
-    let on = calls(&scan(&repo, true));
+    let on = calls(&scan(&repo));
     // The request stands once, at the call that decides its path.
     let login = at(&on, "src/client.ts:12");
     assert_eq!(login.len(), 1, "{on:#?}");
@@ -235,9 +213,14 @@ fn graph_calls(blob: &serde_json::Value) -> Vec<String> {
 /// `src/screens.ts` a hook calls `listItems` from a query package's
 /// callback, and three functions call the others. The reader's cassette
 /// names each caller's request wrongly: `GET /api/list`, `PATCH`, `POST
-/// /api/save`, and `GET /api/all`.
+/// /api/save`, and `GET /api/all`. Its `tag` row at `src/screens.ts:25`
+/// echoes an id no candidate lists (`unlisted:tag`): the scan lists only the
+/// `listItems()` site on that line, so the mock's `@line:25` placeholder
+/// would name that call (`agent_service::substitute_candidate_placeholders`)
+/// and state the `tag` row as a second reading of `listItems()`, which the
+/// call-through pass then corrects to `GET /api/items`.
 ///
-/// | line | reader states | switch on |
+/// | line | reader states | the scan |
 /// |---|---|---|
 /// | `src/client.ts:9`, `:13`, `:17` | the request | the fact row |
 /// | `src/screens.ts:5` (hook, `listItems`) | `GET /api/list` | folded: no row |
@@ -250,31 +233,7 @@ fn a_reader_row_that_disagrees_with_the_fact_its_callee_states_folds_onto_it() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = fixture_repo(tmp.path(), "caller-fold-disagree");
 
-    // Off: the reader's rows stand at the hook and at the unstated caller,
-    // the proof it states them. At the other two callers the old path's
-    // wrapper passes, where they still run, read the callee and drop the row
-    // as an echo; with them gone the reader's row stands there too.
-    let off = calls(&scan(&repo, false));
-    for place in ["src/screens.ts:9", "src/screens.ts:13"] {
-        assert!(
-            at(&off, place).iter().all(|row| row.2 == "model"),
-            "{place} off: {off:#?}"
-        );
-    }
-    for (place, operation) in [
-        ("src/screens.ts:5", "GET /api/list"),
-        ("src/screens.ts:17", "GET /api/all"),
-    ] {
-        let rows = at(&off, place);
-        assert_eq!(rows.len(), 1, "{place} off: {off:#?}");
-        assert_eq!(
-            (rows[0].1.as_str(), rows[0].2.as_str()),
-            (operation, "model"),
-            "{place} off: {off:#?}"
-        );
-    }
-
-    let blob = scan(&repo, true);
+    let blob = scan(&repo);
     let on = calls(&blob);
     // Each request stands once, at the call that writes it, as a fact.
     for (place, operation) in [
@@ -320,7 +279,7 @@ fn a_reader_row_that_disagrees_with_the_fact_its_callee_states_folds_onto_it() {
 /// graph keys them `itemsApi.replace` and `itemsApi.save`. `src/screens.ts`
 /// calls each; the reader's cassette names each caller's request wrongly.
 ///
-/// | line | reader states | switch on |
+/// | line | reader states | the scan |
 /// |---|---|---|
 /// | `src/client.ts:10`, `:13` | the request | the fact row |
 /// | `src/screens.ts:4` (`itemsApi.replace`) | `PATCH /api/items/:id` | folded: no row |
@@ -330,22 +289,7 @@ fn a_reader_row_at_a_call_of_an_object_literal_member_folds_onto_its_fact() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = fixture_repo(tmp.path(), "caller-fold-object");
 
-    // Off: a reader's row stands at each caller, the proof it states them.
-    // The old path's method re-key may restate the `replace` caller's verb
-    // from its callee; the row is still the reader's.
-    let off = calls(&scan(&repo, false));
-    for place in ["src/screens.ts:4", "src/screens.ts:8"] {
-        let rows = at(&off, place);
-        assert_eq!(rows.len(), 1, "{place} off: {off:#?}");
-        assert_eq!(rows[0].2, "model", "{place} off: {off:#?}");
-    }
-    assert_eq!(
-        at(&off, "src/screens.ts:8")[0].1,
-        "POST /api/save",
-        "{off:#?}"
-    );
-
-    let blob = scan(&repo, true);
+    let blob = scan(&repo);
     let on = calls(&blob);
     // Each request stands once, at the call that writes it, as a fact.
     for (place, operation) in [

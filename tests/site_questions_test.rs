@@ -10,10 +10,10 @@
 
 use carrick::agent_service::{AgentCallError, AgentService};
 use carrick::site_questions::{
-    self, Answered, HandlerQuestionsRequest, MAX_ASKED_COMPARISONS, MAX_REQUEST_BYTES,
+    Answered, HandlerQuestionsRequest, MAX_ASKED_COMPARISONS, MAX_REQUEST_BYTES,
     MAX_SITES_PER_REQUEST, NO_ANSWER_CODE, ROUTE, RouteChoice, SiteQuestion, SiteQuestionsRequest,
     SlotAnswer, SlotValue, TOO_LARGE_CODE, Unanswered, ask, ask_service, ask_within, batches,
-    enabled_from, parse_routes_answer, read_response,
+    parse_routes_answer, read_response,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -354,14 +354,6 @@ async fn a_site_over_the_ceiling_on_its_own_is_never_sent() {
     );
 }
 
-#[test]
-fn the_switch_is_on_only_at_one() {
-    assert!(enabled_from(Some("1")));
-    for off in [None, Some(""), Some("0"), Some("true"), Some("yes")] {
-        assert!(!enabled_from(off), "{off:?}");
-    }
-}
-
 fn site_requests() -> usize {
     carrick::agent_service::request_counts()
         .get(ROUTE)
@@ -369,12 +361,12 @@ fn site_requests() -> usize {
         .unwrap_or(0)
 }
 
-/// Offline, with the switch on, the answers come from the cassette
-/// (`<CARRICK_MOCK_FIXTURE_DIR>/site-questions/default.json`) at $0; with
-/// the switch off, nothing is sent at all.
+/// Offline, with no switch set (carrick#3283), the answers come from the
+/// cassette (`<CARRICK_MOCK_FIXTURE_DIR>/site-questions/default.json`) at
+/// $0.
 #[tokio::test]
 #[serial]
-async fn offline_the_cassette_answers_and_with_the_switch_off_nothing_is_sent() {
+async fn offline_the_cassette_answers() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("site-questions")).unwrap();
     std::fs::write(
@@ -389,19 +381,16 @@ async fn offline_the_cassette_answers_and_with_the_switch_off_nothing_is_sent() 
             "CARRICK_MOCK_FIXTURE_DIR",
             format!("{}/", dir.path().display()),
         );
-        std::env::remove_var(site_questions::SWITCH);
+        // The retired switch, removed so the environment cannot mask a
+        // scanner that still reads it.
+        std::env::remove_var("CARRICK_SITE_QUESTIONS");
+        std::env::remove_var("CARRICK_NO_MODEL");
     }
     let agent = AgentService::new();
     let req = request();
 
     let before = site_requests();
-    let off = ask_service(&agent, &req.repo, req.service.as_deref(), req.sites.clone()).await;
-    assert_eq!(site_requests(), before, "the switch is off: no request");
-    assert!(off.answered.is_empty() && off.unanswered.is_empty());
-
-    unsafe { std::env::set_var(site_questions::SWITCH, "1") };
     let on = ask_service(&agent, &req.repo, req.service.as_deref(), req.sites.clone()).await;
-    unsafe { std::env::remove_var(site_questions::SWITCH) };
     assert_eq!(on.question_set.as_deref(), Some("qs-cassette"));
     assert_eq!(on.answered.keys().collect::<Vec<_>>(), ["s-0001", "s-0002"]);
     // The cassette answers s-0003 retriable both times.
@@ -420,11 +409,9 @@ async fn offline_with_no_cassette_no_site_is_answered() {
             "CARRICK_MOCK_FIXTURE_DIR",
             format!("{}/", dir.path().display()),
         );
-        std::env::set_var(site_questions::SWITCH, "1");
     }
     let req = request();
     let out = ask_service(&AgentService::new(), &req.repo, None, req.sites).await;
-    unsafe { std::env::remove_var(site_questions::SWITCH) };
     assert!(out.answered.is_empty());
     assert!(out.unanswered.values().all(|u| u.code == NO_ANSWER_CODE));
 }

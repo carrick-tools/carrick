@@ -3,7 +3,7 @@
 //!
 //! Each decided site's record carries a request slot and a response slot
 //! ([`PayloadSlots`]): the expression that holds each payload, filled where
-//! the site's own call or handler states it. With the switch on, every type
+//! the site's own call or handler states it. Every type
 //! manifest entry at a site whose slot is filled is typed at that slot: its
 //! infer request is built from the slot, and any request the model reader's
 //! locator gave the same alias is dropped. An entry the reader stated with
@@ -11,9 +11,6 @@
 //! was a placeholder. The sidecar still prints the type and the check still
 //! judges it; only the place the type is read moves.
 //!
-//! - **Switch.** Nothing here runs unless `CARRICK_SITE_PAYLOADS=1`. Off,
-//!   no record is built for it and no request moves, so every blob is
-//!   byte-identical to a scan without this module.
 //! - **Join.** A manifest entry joins the record whose call is on the same
 //!   file and line, of the same protocol (an HTTP client's site for an HTTP
 //!   entry), on the same side (a call for a consumer, a handler for a
@@ -39,19 +36,6 @@ use crate::cloud_storage::{ManifestRole, ManifestTypeKind, TypeManifestEntry};
 use crate::operation::OperationKey;
 use crate::request_summary::site_record::{PayloadAt, PayloadSlots, SiteRecord};
 use crate::services::type_sidecar::{InferKind, InferRequestItem};
-
-/// The environment variable that turns slot-anchored capture on.
-pub const SWITCH: &str = "CARRICK_SITE_PAYLOADS";
-
-/// Whether slot-anchored capture is on for this run.
-pub fn enabled() -> bool {
-    enabled_from(std::env::var(SWITCH).ok().as_deref())
-}
-
-/// Whether a value of [`SWITCH`] turns it on: `1` only.
-pub fn enabled_from(value: Option<&str>) -> bool {
-    value == Some("1")
-}
 
 /// Which side of an operation a site is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

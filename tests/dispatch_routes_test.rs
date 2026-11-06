@@ -5,14 +5,12 @@
 //! service), offline, with the fixture's store answer replayed as the
 //! library store's, the handler questions answered from
 //! `handler-answers.json` (one repeat of the live test's stored answers,
-//! carrick#2474 comment 6358002149), and the fact layer on
-//! (`CARRICK_POSITION_ROWS=1`, `CARRICK_SITE_QUESTIONS=1`).
+//! carrick#2474 comment 6358002149).
 //!
-//! With `CARRICK_RECEIVER_TRACE=1` the blob holds the routes the rows key
-//! (`rows.expected.json`) states, each at its comparison's line, and its
-//! possible calls; the run log holds one `receiver trace: handler records`
-//! summary with the records key's counts. Unset, the blob holds none of
-//! them and the run log no summary.
+//! The blob holds the routes the rows key (`rows.expected.json`) states,
+//! each at its comparison's line, and its possible calls; the run log holds
+//! one `receiver trace: handler records` summary with the records key's
+//! counts.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -64,9 +62,8 @@ struct Scan {
     records: Vec<String>,
 }
 
-/// One offline scan of a committed copy of the fixture with the fact layer
-/// on, the trace switch set to `trace` or unset.
-fn scan(trace: Option<&str>) -> Scan {
+/// One offline scan of a committed copy of the fixture.
+fn scan() -> Scan {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir().join("repo"), &repo);
@@ -102,11 +99,8 @@ fn scan(trace: Option<&str>) -> Scan {
             "CARRICK_MOCK_FIXTURE_DIR",
             format!("{}/", cassettes.display()),
         )
-        .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_POSITION_ROWS", "1")
-        .env("CARRICK_SITE_QUESTIONS", "1");
+        .env("CARRICK_SKIP_INTENTS", "1");
     for var in [
-        "CARRICK_RECEIVER_TRACE",
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
         "GITHUB_EVENT_NAME",
@@ -121,9 +115,6 @@ fn scan(trace: Option<&str>) -> Scan {
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     ] {
         cmd.env_remove(var);
-    }
-    if let Some(trace) = trace {
-        cmd.env("CARRICK_RECEIVER_TRACE", trace);
     }
     let output = cmd.output().expect("spawn carrick");
     assert!(
@@ -241,34 +232,20 @@ fn key_rows(what: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// carrick#2474 R4b: with the switch set, a scan writes the rows key's
-/// routes, at their comparisons' lines, and its possible calls (beside the
-/// scan's own, which the switch leaves as they are), the same in two scans;
-/// no row carries a method the code did not choose. Unset, none.
+/// carrick#2474 R4b: a scan writes the rows key's routes, at their
+/// comparisons' lines, and its possible calls (beside the scan's own), the
+/// same in two scans; no row carries a method the code did not choose.
 #[test]
 fn a_scan_with_the_receiver_trace_writes_each_dispatch_row() {
-    let on = scan(Some("1"));
-    let off = scan(None);
+    let on = scan();
     assert_eq!(on.rows, key_rows("rows"));
+    let wanted = key_rows("possible_calls");
     assert!(
-        off.leads.is_subset(&on.leads),
-        "the switch drops none of the scan's own possible calls: {:#?}",
-        off.leads.difference(&on.leads).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        on.leads
-            .difference(&off.leads)
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        key_rows("possible_calls")
+        wanted.is_subset(&on.leads),
+        "every keyed possible call is written: {:#?}",
+        wanted.difference(&on.leads).collect::<Vec<_>>()
     );
     assert_eq!(on.records, key_records());
-    let again = scan(Some("1"));
+    let again = scan();
     assert_eq!(again.blobs, on.blobs, "two scans store the same blobs");
-    assert!(off.records.is_empty(), "unset, no record is counted");
-    assert!(
-        off.rows.is_empty(),
-        "unset, no dispatch row: {:#?}",
-        off.rows
-    );
 }
