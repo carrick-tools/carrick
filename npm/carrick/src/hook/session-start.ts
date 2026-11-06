@@ -103,10 +103,13 @@ async function main(): Promise<void> {
   // because this runs once per session and the agent about to work here is the
   // reader who can act on it (carrick#1372).
   if (choice.markerFound) {
-    // Claude Code only: Codex hook files are untrusted until the user approves a
-    // changed hash, so nothing here writes for it (`init/self-update.ts`).
-    const projectDir = process.env["CLAUDE_PROJECT_DIR"];
-    if (!codex && projectDir) {
+    // Both harnesses: Codex gets the AGENTS.md section and the skills, which it
+    // reads with no trust gate (carrick#3435). It has no `CLAUDE_PROJECT_DIR`, so
+    // the Claude Code settings files are left to a Claude Code session, and
+    // `.codex/hooks.json` is never written (`init/self-update.ts`).
+    // A by-hand run (neither harness) writes nothing.
+    const projectDir = codex ? null : process.env["CLAUDE_PROJECT_DIR"] || null;
+    if (codex || projectDir) {
       try {
         lines.push(...bringUpToDate(choice.root, projectDir, currentVersion(), (message) => log(message)));
       } catch (error) {
