@@ -261,6 +261,8 @@ const RESPONSE_INIT_MEMBER_NAMES = new Set<string>([
  * two; the bound is a backstop against a pathologically nested return.
  */
 const RESPONSE_HELPER_MAX_DEPTH = 4;
+/** Longest lead type text a provenance detail quotes (blueprint row N34). */
+const LEAD_TEXT_MAX = 200;
 
 /**
  * How many wrapper calls a handler bound to one is followed through
@@ -2451,10 +2453,11 @@ export class TypeInferrer {
    * call nothing resolves (its library is not installed), the return walk
    * reads no argument the source does not annotate, because it cannot tell a
    * response sender from a query. A located payload that is an ARGUMENT of
-   * such a returned call says which it is, so the same walk runs again with
-   * that callee taken as a sender: every success body the handler returns
-   * through it, error branches dropped as before. The located expression's
-   * own type is never what is published here.
+   * such a returned call is the model's word that it is a sender, and that is
+   * a lead, never an enforced type (blueprint row N34): the walk's honest
+   * `any` stands, and its `no_payload_evidence` provenance quotes the
+   * argument's reading. A send the service's labels name is read by the walk
+   * itself (`returnsLabelledSend`), so it never reaches this case.
    *
    * Returns `undefined` when the located expression is something the return
    * walk never looked at, so it is left to the readings below:
@@ -2512,23 +2515,30 @@ export class TypeInferrer {
       return walked;
     }
 
+    // Blueprint row N34: the callee resolves to nothing, so only the model's
+    // locator says the returned call is a response sender. That is a lead,
+    // never a type the check enforces: the row keeps its honest `any`, and the
+    // located argument's reading rides in the provenance for a reader.
     const sender = this.returnedSendHolding(returned, located);
-    const identity = sender ? this.calleeIdentity(sender) : undefined;
-    if (identity) {
-      const recovered = this.recoverPayloadFromResponseExpressions(
-        returned,
-        true,
-        this.wireFormatFor(request),
-        new Set([identity])
+    if (sender) {
+      // The printed type names a module the use site does not import by its
+      // declaring file, `import("/abs/path").Name`, and this text reaches a
+      // reader: keep the bare name, before truncation can split the path.
+      const lead = this.payloadCandidateOf(
+        this.peelTransparentExpression(located),
+        this.wireFormatFor(request)
+      ).typeString.replace(/import\("[^"]*"\)\./g, '');
+      const shown = lead.length > LEAD_TEXT_MAX ? `${lead.slice(0, LEAD_TEXT_MAX)}…` : lead;
+      walked.any_provenance = (walked.any_provenance ?? []).map((entry) =>
+        entry.reason === 'no_payload_evidence'
+          ? {
+              ...entry,
+              detail:
+                'the handler returns a call whose callee has no resolvable declaration; the model located ' +
+                `its argument as the body, which reads as \`${shown}\`, a lead the check does not enforce`,
+            }
+          : entry
       );
-      if (recovered) {
-        this.log(
-          `Return type at ${request.file_path}:${request.line_number} resolves to nothing; ` +
-            'the located payload is an argument of a call the handler returns, so that ' +
-            "call is a response sender and its success bodies are the route's"
-        );
-        return this.inferredFromRecoveredPayload(request, recovered);
-      }
     }
     return walked;
   }
@@ -7168,25 +7178,15 @@ export class TypeInferrer {
   private recoverPayloadFromResponseExpressions(
     expressions: Node[],
     statedOnly: boolean,
-    wire: WireFormat,
-    alsoSerialisers?: ReadonlySet<string>
+    wire: WireFormat
   ): RecoveredPayload | null {
     const candidates: PayloadCandidate[] = [];
 
     const returned = expressions.flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
     );
-    // `alsoSerialisers` are callees a caller has its own evidence for
-    // (`calleeIdentity` keys).
-    const serialisers = new Set<string>(alsoSerialisers ?? []);
-
     for (const expression of returned) {
-      const payloadNode = this.responseHelperPayloadNode(
-        expression,
-        0,
-        statedOnly,
-        serialisers
-      );
+      const payloadNode = this.responseHelperPayloadNode(expression, 0, statedOnly);
       if (!payloadNode) continue;
       candidates.push(this.payloadCandidateOf(payloadNode, wire));
     }
@@ -7957,21 +7957,6 @@ export class TypeInferrer {
   }
 
   /**
-   * Stable identity for a call's callee within one file: its resolved symbol
-   * when the compiler has one, else the callee's source text.
-   */
-  private calleeIdentity(call: Node): string | undefined {
-    if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) {
-      return undefined;
-    }
-    const callee = call.getExpression();
-    const symbol = callee.getSymbol();
-    if (symbol) return `symbol:${symbol.getFullyQualifiedName()}`;
-    const text = callee.getText().trim();
-    return text.length > 0 ? `text:${text}` : undefined;
-  }
-
-  /**
    * The payload argument of a returned response-helper call, or `undefined`.
    *
    * Walks the call's arguments in source order: the first whose type reads as a
@@ -7984,14 +7969,12 @@ export class TypeInferrer {
    * shape it returns when it succeeds.
    *
    * `statedOnly` narrows what counts as a payload to an argument the source
-   * annotates; see `recoverPayloadFromReturnStatements`. It is lifted for a
-   * callee a caller has its own evidence for (`serialisers`).
+   * annotates; see `recoverPayloadFromReturnStatements`.
    */
   private responseHelperPayloadNode(
     expression: Node,
     depth: number,
-    statedOnly: boolean,
-    serialisers: Set<string>
+    statedOnly: boolean
   ): Node | undefined {
     if (depth > RESPONSE_HELPER_MAX_DEPTH) return undefined;
 
@@ -8020,10 +8003,6 @@ export class TypeInferrer {
       return this.nodeCarriesPayloadContract(slotted, false) ? slotted : undefined;
     }
 
-    const identity = this.calleeIdentity(call);
-    const proven = identity !== undefined && serialisers.has(identity);
-    const effectiveStatedOnly = statedOnly && !proven;
-
     for (const [index, arg] of args.entries()) {
       // An options object BESIDE the body states how to send it, never what is
       // sent (carrick#1017): `new Response(null, { status: 204 })` has no body
@@ -8032,15 +8011,10 @@ export class TypeInferrer {
       // by construction, so the rule applies only past it.
       if (index > 0 && this.statesResponseInit(arg)) continue;
       const candidate = this.unwrapJsonStringifyArg(arg);
-      if (this.nodeCarriesPayloadContract(candidate, effectiveStatedOnly)) {
+      if (this.nodeCarriesPayloadContract(candidate, statedOnly)) {
         return candidate;
       }
-      const nested = this.responseHelperPayloadNode(
-        candidate,
-        depth + 1,
-        statedOnly,
-        serialisers
-      );
+      const nested = this.responseHelperPayloadNode(candidate, depth + 1, statedOnly);
       if (nested) return nested;
     }
     return undefined;
