@@ -38,7 +38,8 @@
 //! [`is_unknown_call_path`], [`match_verdict`], [`reportable_agreement`],
 //! [`classify_relationship`], [`method_matches`], and the body-dispatch trio [`dispatch_key`],
 //! [`dispatch_verdict`], [`match_verdict_with_dispatch`] /
-//! [`reportable_agreement_with_dispatch`]:
+//! [`reportable_agreement_with_dispatch`], and the pairing pair
+//! [`PairingPool`] / [`canonical_path`]:
 //!
 //! ```text
 //! cargo build --target wasm32-unknown-unknown -p carrick-match --features wasm
@@ -48,12 +49,23 @@
 //!
 //! Socket and pub/sub rows pair by exact key, and [`names_pair`] decides
 //! whether two rows that share a key may pair, given where each row's name
-//! means something ([`NameScope`], carrick#1663). It is native only: the
-//! cloud runs its own copy against the same test vectors.
+//! means something ([`NameScope`], carrick#1663).
+//!
+//! Which producer a call reaches, for every protocol, is one function:
+//! [`PairingPool::pair`] (and its one-shot form [`pair_winners`],
+//! carrick#3496). It folds the primitives above, `names_pair` included, and
+//! the `wasm` feature exports it as the class `PairingPool` (JSON in, JSON
+//! out) beside [`canonical_path`], so a surface pairs through it rather than
+//! re-composing the primitives. Its rule is the vector file
+//! `tests/fixtures/pairing.vectors.json`, run natively and over wasm.
 
 mod name_scope;
+mod pairing;
 
 pub use name_scope::{GLOBAL_SCOPE, NameScope, SERVICE_SCOPE, ScopedRow, names_pair};
+pub use pairing::{
+    Call, PairOutcome, Pairing, PairingPool, Producer, Routed, Winner, canonical_path, pair_winners,
+};
 
 /// The kind of source evidence backing one side of a match: a route
 /// definition (a server declaring the operation) or a call site (a client

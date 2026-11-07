@@ -13,7 +13,7 @@ crate-type = ["rlib", "cdylib"]
 [features]
 # Adds wasm-bindgen exports for Node.js consumers. Default off so the native
 # scanner build pulls in zero new external dependencies.
-wasm = ["dep:wasm-bindgen"]
+wasm = ["dep:wasm-bindgen", "serde", "dep:serde_json"]
 # Adds serde derives to the classification enums so consumers that serialize
 # match output (the scanner's `CrossRepoMatch`) can embed them directly.
 # Default off so the bare crate stays dependency-free.
@@ -25,6 +25,8 @@ serde = ["dep:serde"]
 # in .github/workflows/ci.yml in lockstep.
 wasm-bindgen = { version = "=0.2.126", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+# The wasm `PairingPool` takes and returns JSON (carrick#3496). Wasm only.
+serde_json = { version = "1.0.140", optional = true }
 
 [dev-dependencies]
 # The name-scope vectors test reads the JSON vector file and checks its pinned
