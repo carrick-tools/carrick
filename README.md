@@ -81,7 +81,6 @@ The MCP endpoint exposes the index as structured tools your agent can call direc
 | `get_service_dependencies` | Read npm dependencies and version conflicts, for one service or across the project |
 | `list_external_calls` | List outbound calls to external targets, such as SDK calls, external domains and env-var URLs |
 | `get_contract_pair` | Compare consumer and producer types, operation by operation |
-| `scaffold` | Generate Carrick setup files (the workflow, a Carrick skill, `carrick.json` and Claude Code hooks) |
 
 ## Keep the index current
 
