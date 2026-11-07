@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::workspace_resolver::WorkspaceIndex;
 
 /// The aliases that govern a service's module resolution
-/// ([`crate::config::Config::alias_tsconfig`]): the one input of
+/// ([`crate::config::Config::alias_scope`]): the one input of
 /// [`of`] that varies between the services of a repo.
-pub type AliasKey = Option<(PathBuf, PathBuf)>;
+pub type AliasKey = Option<crate::module_aliases::ServiceScope>;
 
 type SetKey = (PathBuf, AliasKey, Vec<String>);
 
@@ -295,10 +295,10 @@ mod tests {
             after_first.iter().all(|count| *count == 1),
             "{after_first:?}"
         );
-        let other_alias = Some((
-            PathBuf::from("apps/b"),
-            PathBuf::from("apps/b/tsconfig.json"),
-        ));
+        let other_alias = Some(crate::module_aliases::ServiceScope {
+            dir: PathBuf::from("apps/b"),
+            named: Some(PathBuf::from("apps/b/tsconfig.json")),
+        });
         for alias in [None, other_alias] {
             assert_eq!(
                 of(&cache, &root, &walked, &workspace, &alias, &patterns),

@@ -1684,12 +1684,9 @@ pub fn service_inputs(
     // every file they reach, resolved by the scanner's own resolver.
     let walk =
         crate::file_finder::walk_service(repo_path, service, &crate::packages::MANIFEST_SKIP_DIRS);
-    let service_tsconfig = service.alias_tsconfig();
     let index = crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
         root,
-        service_tsconfig
-            .as_ref()
-            .map(|(directory, config)| (directory.as_path(), config.as_path())),
+        service.alias_scope(root).as_ref(),
     );
     let canonical = |path: &Path| reads.canonical(path);
     let mut seen: BTreeSet<PathBuf> = walk.files.iter().map(|file| canonical(file)).collect();

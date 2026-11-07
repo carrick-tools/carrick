@@ -100,6 +100,7 @@ pub mod socket_io;
 pub mod swc_scanner;
 pub mod test_only_files;
 pub mod time_limits;
+pub(crate) mod tsconfig_program;
 pub mod type_manifest;
 pub mod unfollowed_calls;
 pub mod untrusted_yarn;

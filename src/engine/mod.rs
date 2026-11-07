@@ -10097,12 +10097,10 @@ fn service_module_index(
     repo_path: &str,
     config: &Config,
 ) -> crate::workspace_resolver::WorkspaceIndex {
-    let service_tsconfig = config.alias_tsconfig();
+    let repo_root = Path::new(repo_path);
     crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
-        Path::new(repo_path),
-        service_tsconfig
-            .as_ref()
-            .map(|(directory, tsconfig)| (directory.as_path(), tsconfig.as_path())),
+        repo_root,
+        config.alias_scope(repo_root).as_ref(),
     )
 }
 
@@ -11145,12 +11143,10 @@ fn discover_with_positions(
     // which is why only this index reads them; see
     // `docs/reference/module-resolution.md`.
     let repo_root = std::path::Path::new(repo_path);
-    let service_tsconfig = service.alias_tsconfig();
+    let service_scope = service.alias_scope(repo_root);
     let workspace = crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
         repo_root,
-        service_tsconfig
-            .as_ref()
-            .map(|(directory, config)| (directory.as_path(), config.as_path())),
+        service_scope.as_ref(),
     );
     // Every specifier matters only where some module holds an instance
     // another may import: that is the only reading it can turn off.
@@ -11184,7 +11180,7 @@ fn discover_with_positions(
             repo_root,
             &files,
             &workspace,
-            &service_tsconfig,
+            &service_scope,
             &service_ignore_patterns(service),
         );
         debug!(

@@ -35,6 +35,7 @@ use swc_ecma_ast::{AssignTarget, Expr, Module, ModuleDecl, ModuleItem, SimpleAss
 
 use crate::config::Config;
 use crate::file_finder::SOURCE_EXTENSIONS;
+use crate::tsconfig_program::ProgramRules;
 use crate::workspace_resolver::{WorkspaceIndex, normalize};
 
 /// Units listed per service; `truncated.directories` counts the rest.
@@ -54,8 +55,6 @@ pub const MAX_MANIFESTS: usize = 5;
 pub const DESCRIPTION_CHARS: usize = 200;
 /// Entries listed in a unit's `imports_from`.
 pub const MAX_IMPORTS_FROM: usize = 10;
-/// How deep `references` are followed: the bound `extends` has.
-const MAX_REFERENCE_DEPTH: usize = 16;
 
 /// What the service's governing program says about its files.
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy, Default)]
@@ -168,13 +167,7 @@ pub fn service_reach(repo: &Path, service: &Config, files: &[PathBuf]) -> Servic
         return ServiceReach::default();
     }
     let service_root = canonical(&repo.join(service.directory.as_deref().unwrap_or("")));
-    let modules = WorkspaceIndex::build_with_aliases(
-        repo,
-        service
-            .alias_tsconfig()
-            .as_ref()
-            .map(|(directory, tsconfig)| (directory.as_path(), tsconfig.as_path())),
-    );
+    let modules = WorkspaceIndex::build_with_aliases(repo, service.alias_scope(repo).as_ref());
     let walk = Walk::new(files);
     let internal = modules.internal_package_dirs();
     let mut roots = vec![false; files.len()];
@@ -213,7 +206,7 @@ pub fn service_reach(repo: &Path, service: &Config, files: &[PathBuf]) -> Servic
     }
 
     if let Some(config) = governing_config(repo, &service_root, service) {
-        let rules = program_rules(repo, &config, &internal);
+        let rules = ProgramRules::new(repo, &config, &internal);
         let config_dir = config.parent().unwrap_or(repo).to_path_buf();
         let matched: Vec<bool> = files.iter().map(|file| rules.lists(file)).collect();
         let narrows = files
@@ -538,144 +531,6 @@ fn governing_config(repo: &Path, service_root: &Path, service: &Config) -> Optio
         })
 }
 
-/// The files a program lists: the union, over a config and the configs its
-/// `references` name, of each one's `files`, and its `include` minus its
-/// `exclude`, each key decided by the nearest config in its `extends` chain
-/// that states it.
-#[derive(Default)]
-struct ProgramRules {
-    files: BTreeSet<PathBuf>,
-    /// Per config: its include patterns and its exclude patterns.
-    programs: Vec<(Vec<glob::Pattern>, Vec<glob::Pattern>)>,
-    read_any: bool,
-}
-
-impl ProgramRules {
-    fn is_empty(&self) -> bool {
-        !self.read_any
-    }
-
-    fn lists(&self, file: &Path) -> bool {
-        if self.files.contains(file) {
-            return true;
-        }
-        let options = glob::MatchOptions {
-            case_sensitive: true,
-            require_literal_separator: true,
-            require_literal_leading_dot: false,
-        };
-        self.programs.iter().any(|(include, exclude)| {
-            include
-                .iter()
-                .any(|pattern| pattern.matches_path_with(file, options))
-                && !exclude
-                    .iter()
-                    .any(|pattern| pattern.matches_path_with(file, options))
-        })
-    }
-}
-
-fn program_rules(repo: &Path, config: &Path, internal: &BTreeMap<String, PathBuf>) -> ProgramRules {
-    let mut rules = ProgramRules::default();
-    let mut pending: Vec<(PathBuf, usize)> = vec![(config.to_path_buf(), 0)];
-    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
-    while let Some((config, depth)) = pending.pop() {
-        if depth > MAX_REFERENCE_DEPTH || !visited.insert(config.clone()) {
-            continue;
-        }
-        let Ok(relative) = config.strip_prefix(repo) else {
-            continue;
-        };
-        let (chain, _) = crate::module_aliases::tsconfig_chain(repo, relative, internal);
-        let Some((_, own)) = chain.first() else {
-            continue;
-        };
-        rules.read_any = true;
-        let config_dir = config.parent().unwrap_or(repo).to_path_buf();
-        // The nearest config that states a key decides it, its entries
-        // relative to the config that declares it.
-        let stated = |key: &str| -> Option<(PathBuf, Vec<String>)> {
-            chain.iter().find_map(|(declared_in, json)| {
-                let entries = json.get(key)?.as_array()?;
-                Some((
-                    repo.join(declared_in.parent().unwrap_or(Path::new(""))),
-                    entries
-                        .iter()
-                        .filter_map(|entry| entry.as_str().map(str::to_string))
-                        .collect(),
-                ))
-            })
-        };
-        let files = stated("files");
-        let include = stated("include");
-        let exclude = stated("exclude");
-        if let Some((base, entries)) = &files {
-            rules.files.extend(
-                entries
-                    .iter()
-                    .map(|entry| canonical(&normalize(&base.join(entry)))),
-            );
-        }
-        let include = match (include, &files) {
-            (Some((base, entries)), _) => patterns(&base, &entries),
-            (None, Some(_)) => Vec::new(),
-            (None, None) => patterns(&config_dir, &["**/*".to_string()]),
-        };
-        let exclude = exclude
-            .map(|(base, entries)| patterns(&base, &entries))
-            .unwrap_or_default();
-        rules.programs.push((include, exclude));
-        if let Some(references) = own.get("references").and_then(serde_json::Value::as_array) {
-            for reference in references {
-                let Some(path) = reference.get("path").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let target = normalize(&config_dir.join(path));
-                let target = if target.is_dir() {
-                    target.join("tsconfig.json")
-                } else {
-                    target
-                };
-                if target.is_file() {
-                    pending.push((canonical(&target), depth + 1));
-                }
-            }
-        }
-    }
-    rules
-}
-
-/// Glob patterns for tsconfig `include`/`exclude` entries declared in
-/// `base`: an entry whose last segment has no wildcard and no extension names
-/// a directory (`<entry>/**/*`). The declaring directory is escaped; the
-/// entry's own wildcards stay wildcards.
-fn patterns(base: &Path, entries: &[String]) -> Vec<glob::Pattern> {
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let mut entry = entry.trim_start_matches("./").to_string();
-            let mut dir = base.to_path_buf();
-            while let Some(rest) = entry.strip_prefix("../") {
-                dir.pop();
-                entry = rest.to_string();
-            }
-            let entry = entry.trim_end_matches('/');
-            let last = entry.rsplit('/').next().unwrap_or("");
-            let names_dir = !last.contains(['*', '?']) && !last.contains('.');
-            // `Path::join("")` leaves a trailing separator.
-            let mut text = glob::Pattern::escape(dir.to_string_lossy().trim_end_matches('/'));
-            if !entry.is_empty() && entry != "." {
-                text.push('/');
-                text.push_str(entry);
-            }
-            if names_dir || entry.is_empty() || entry == "." {
-                text.push_str("/**/*");
-            }
-            glob::Pattern::new(&text).ok()
-        })
-        .collect()
-}
-
 /// One file's loads and whether it exports anything, from one parse.
 struct FileFacts {
     loads: Vec<String>,
@@ -883,7 +738,7 @@ fn offered_units(
             UnitKind::File => (Vec::new(), Vec::new()),
         };
         let own = configs.iter().any(|config| {
-            let rules = program_rules(repo, config, internal);
+            let rules = ProgramRules::new(repo, config, internal);
             members.iter().any(|&index| rules.lists(&files[index]))
         });
         let program = unit_program(service_program, own);
