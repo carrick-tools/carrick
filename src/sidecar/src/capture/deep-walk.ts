@@ -333,26 +333,52 @@ export function pathNamesAMember(path: string): boolean {
 }
 
 /**
- * True when every finding is an `any` the SOURCE declares under a named
- * member (carrick#2591): an OPEN member. The policy: an open member is never
+ * True when the other side declares `unknown` or `any` at exactly `path`
+ * (the same member, `[index]` element or nested member named on both sides).
+ * Anything is assignable there, so a sent `unknown` cannot mismatch. A list
+ * at the walk's cap may have stopped listing, so it vouches for nothing.
+ */
+function counterpartDeclaresTopAt(counterpart: readonly TypeProvenance[], path: string): boolean {
+  return (
+    counterpart.length < MAX_DEEP_FINDINGS &&
+    counterpart.some(
+      (c) => (c.kind === 'any' || c.kind === 'unknown') && c.reason === 'declared' && c.path === path
+    )
+  );
+}
+
+/**
+ * True when every finding is a top type the SOURCE declares under a named
+ * member: an OPEN member (carrick#2591). The policy: an open member is never
  * a mismatch, and the closed members are judged as for a fully typed pair.
  * `any` accepts and supplies every shape in the assignment the probe makes, so
  * the compiler already judges only the closed members.
  *
+ * `unknown` is open only on the side that RECEIVES the payload
+ * (`receiving`): any type is assignable to `unknown`, so no mismatch can hide
+ * there. On the sending side `unknown` rejects a narrower receiver, so it
+ * would read as a mismatch the policy forbids and stays a gate, except where
+ * the `counterpart` (the receiving side's findings) declares a top type at the
+ * same path: anything is assignable there.
+ *
  * Nothing else qualifies. A callable's return (`getData()`) is no data
- * member. An `unknown` member rejects a narrower counterparty
- * under assignment, so it would read as a mismatch the policy forbids; a
- * `budget_exhausted` sentinel, a root top type and an `any` an unresolved
- * import left say nothing about the author's intent. A list as long as the
- * walk's cap may have stopped listing, so it cannot vouch for every position.
+ * member. A `budget_exhausted` sentinel, a root top type and a top type an
+ * unresolved import left say nothing about the author's intent. A list as long
+ * as the walk's cap may have stopped listing, so it cannot vouch for every
+ * position.
  */
-export function onlyDeclaredOpenAny(findings: readonly TypeProvenance[]): boolean {
+export function onlyDeclaredOpenMembers(
+  findings: readonly TypeProvenance[],
+  receiving: boolean,
+  counterpart: readonly TypeProvenance[] = []
+): boolean {
   return (
     findings.length > 0 &&
     findings.length < MAX_DEEP_FINDINGS &&
     findings.every(
       (f) =>
-        f.kind === 'any' &&
+        (f.kind === 'any' ||
+          (f.kind === 'unknown' && (receiving || counterpartDeclaresTopAt(counterpart, f.path)))) &&
         f.reason === 'declared' &&
         pathNamesAMember(f.path) &&
         !f.path.includes('()')

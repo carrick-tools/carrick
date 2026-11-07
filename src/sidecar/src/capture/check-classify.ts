@@ -42,7 +42,7 @@ import {
 } from './check-probe.js';
 import { scrubDiagnostic, scrubPaths, type ScrubContext } from './check-scrub.js';
 import type { PairDeepFindings } from './check-deep.js';
-import { onlyDeclaredOpenAny } from './deep-walk.js';
+import { onlyDeclaredOpenMembers } from './deep-walk.js';
 import type { DispatchUnion } from './check-union.js';
 import {
   describeFieldReport,
@@ -583,7 +583,16 @@ function factness(input: ClassifyInput, strict = false): {
   for (const side of ['sent', 'expected'] as const) {
     // Open members only (carrick#2591): the closed members were judged and an
     // open one is never a mismatch, so the verdict is a fact about the type.
-    if (!strict && onlyDeclaredOpenAny(findings[side])) continue;
+    // A declared `unknown` is open on the receiving side alone.
+    if (
+      !strict &&
+      onlyDeclaredOpenMembers(
+        findings[side],
+        side === 'expected',
+        findings[side === 'sent' ? 'expected' : 'sent']
+      )
+    )
+      continue;
     const first = findings[side][0];
     if (!first) continue;
     const label = side === 'sent' ? input.plan.direction.sent : input.plan.direction.expected;
