@@ -1645,3 +1645,166 @@ fn client_receivers_in_every_held_form_are_sites() {
     .collect();
     assert_eq!(stated, want);
 }
+
+/// Each mount-graph row's stored address (`docs/reference/address-chain.md`), by
+/// `file:line METHOD full_path`; `null` where the row carries none.
+fn endpoint_addresses(blobs: &Blobs) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for row in blob["mount_graph"]["endpoints"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            out.insert(
+                format!(
+                    "{} {} {}",
+                    row["file_location"].as_str().unwrap_or_default(),
+                    row["method"].as_str().unwrap_or_default(),
+                    row["full_path"].as_str().unwrap_or_default(),
+                ),
+                row.get("address")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    out
+}
+
+/// Address chain S1 (carrick-cloud#3083): a route the trace serves from the
+/// top stores the parts its address is composed of, outermost first, each
+/// with the `file:line` that states it. The mount's prefix is a constant
+/// another file declares, so it is stored folded, with that file; the route's
+/// own path is the last part. A route under a mount whose prefix is set at
+/// run time is not served from the top (S1 writes no headless row), so no
+/// row there carries an address.
+#[test]
+fn a_traced_route_stores_the_parts_of_its_address() {
+    let on = scan_fixture("address-chain-express");
+    let addresses = endpoint_addresses(&on);
+    let part = |kind: &str, at: &str, member: &str, piece: serde_json::Value| {
+        serde_json::json!({
+            "kind": kind,
+            "dimension": "path",
+            "at": at,
+            "member": member,
+            "value": { "value": "text", "values": [[piece]] },
+            "via": "label",
+        })
+    };
+    assert_eq!(
+        addresses.get("src/server.ts:8 GET /api/orders/:id"),
+        Some(&serde_json::json!({
+            "parts": [
+                part(
+                    "mount",
+                    "src/server.ts:13",
+                    "mount",
+                    serde_json::json!({ "piece": "folded", "text": "/api", "from": "src/config.ts" }),
+                ),
+                part(
+                    "own",
+                    "src/server.ts:8",
+                    "get",
+                    serde_json::json!({ "piece": "lit", "text": "/orders/:id" }),
+                ),
+            ],
+            "reading": "whole",
+        })),
+        "{addresses:#?}"
+    );
+    assert_eq!(
+        addresses.get("src/server.ts:10 GET /health"),
+        Some(&serde_json::json!({
+            "parts": [part(
+                "own",
+                "src/server.ts:10",
+                "get",
+                serde_json::json!({ "piece": "lit", "text": "/health" }),
+            )],
+            "reading": "whole",
+        })),
+        "{addresses:#?}"
+    );
+    for (row, address) in &addresses {
+        if row.starts_with("src/server.ts:9 ") {
+            assert!(address.is_null(), "{row}: {address}");
+        }
+    }
+}
+
+/// Address chain S1 over carrick#3213's fold: a route path written as a
+/// template over a constant another package exports
+/// (`${LOGIN_PATH}/:id`) stores its own part as the compiler folded it: the
+/// constant's text, `folded` from the file in the other package that
+/// declares it, then the text the call writes.
+#[test]
+fn a_route_path_over_another_packages_constant_stores_where_it_is_declared() {
+    let on = scan_fixture("receiver-route-nested-template");
+    let addresses = endpoint_addresses(&on);
+    let (row, address) = addresses
+        .iter()
+        .find(|(row, _)| row.ends_with("main.ts:9 GET /auth/login/:id"))
+        .unwrap_or_else(|| panic!("{addresses:#?}"));
+    let own = address["parts"]
+        .as_array()
+        .and_then(|parts| parts.last())
+        .unwrap_or_else(|| panic!("{row}: {address}"));
+    assert_eq!(own["kind"], "own", "{row}: {address}");
+    assert_eq!(
+        own["value"]["values"],
+        serde_json::json!([[
+            { "piece": "folded", "text": "/auth/login", "from": "packages/paths/src/index.ts" },
+            { "piece": "lit", "text": "/:id" },
+        ]]),
+        "{row}: {address}"
+    );
+    assert_eq!(address["reading"], "whole", "{row}: {address}");
+}
+
+/// Address chain S1 over carrick#3484's fold: a route path folded only by
+/// the name fold (a `let` assigned once, an enum member, a constant
+/// object's entry) still states its
+/// pieces. Each value read off a declaration is `folded` from the file
+/// declaring it; only the text written at the registration is `lit`. Each row's path reads the same text as before the address existed.
+#[test]
+fn a_route_path_folded_by_the_name_fold_states_its_pieces() {
+    let on = scan_fixture("address-chain-folded");
+    let addresses = endpoint_addresses(&on);
+    let own_values = |row: &str| {
+        let address = addresses
+            .get(row)
+            .unwrap_or_else(|| panic!("{row}: {addresses:#?}"));
+        let own = address["parts"]
+            .as_array()
+            .and_then(|parts| parts.last())
+            .unwrap_or_else(|| panic!("{row}: {address}"));
+        assert_eq!(own["kind"], "own", "{row}: {address}");
+        own["value"]["values"].clone()
+    };
+    assert_eq!(
+        own_values("src/server.ts:17 GET /api/items"),
+        serde_json::json!([[
+            { "piece": "folded", "text": "/api", "from": "src/server.ts" },
+            { "piece": "lit", "text": "/items" },
+        ]]),
+        "{addresses:#?}"
+    );
+    assert_eq!(
+        own_values("src/server.ts:18 GET /items"),
+        serde_json::json!([[
+            { "piece": "folded", "text": "/items", "from": "src/server.ts" },
+        ]]),
+        "{addresses:#?}"
+    );
+    // An entry of a constant object, by a computed key.
+    assert_eq!(
+        own_values("src/server.ts:21 GET /other"),
+        serde_json::json!([[
+            { "piece": "folded", "text": "/other", "from": "src/server.ts" },
+        ]]),
+        "{addresses:#?}"
+    );
+}

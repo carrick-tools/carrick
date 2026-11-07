@@ -107,6 +107,14 @@ pub struct ResolvedEndpoint {
     /// could not be placed, and on graphs serialized before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler_span: Option<HandlerSpan>,
+    /// The parts this route's address is composed of, outermost first, each
+    /// with the `file:line` that states it (`docs/reference/address-chain.md`).
+    /// `None` means this scanner recorded none for the row (a graph
+    /// serialized before the field existed, or a row kind no slice records
+    /// yet), never that the route has no chain. Retention only: nothing in
+    /// matching reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<crate::address::Address>,
 }
 
 /// A 1-based, inclusive line range in an endpoint row's own file: the span of
@@ -737,6 +745,55 @@ mod tests {
 
     use crate::config::Config;
 
+    /// Address chain S1: a row with no recorded address writes no `address`
+    /// key, so a blob row with none is byte-identical to one written before
+    /// the field existed, and a row from such a blob reads as `None` ("not
+    /// recorded"); a recorded address reads back as written.
+    #[test]
+    fn a_row_written_before_addresses_reads_as_not_recorded() {
+        let row = ResolvedEndpoint {
+            view_module: false,
+            method: "GET".to_string(),
+            path: "/orders".to_string(),
+            full_path: "/api/orders".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "src/server.ts:8".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
+            dispatch: None,
+            handler_span: None,
+            address: None,
+        };
+        let old = serde_json::to_value(&row).unwrap();
+        assert!(old.get("address").is_none(), "{old}");
+        let read: ResolvedEndpoint = serde_json::from_value(old.clone()).unwrap();
+        assert!(read.address.is_none());
+
+        let mut recorded = old;
+        recorded["address"] = serde_json::json!({
+            "parts": [{
+                "kind": "own",
+                "dimension": "path",
+                "at": "src/server.ts:8",
+                "member": "get",
+                "value": { "value": "text", "values": [[{ "piece": "lit", "text": "/orders" }]] },
+                "via": "label",
+            }],
+            "reading": "whole",
+        });
+        let read: ResolvedEndpoint = serde_json::from_value(recorded.clone()).unwrap();
+        assert_eq!(
+            read.address.as_ref().map(|address| address.reading),
+            Some(crate::address::Reading::Whole)
+        );
+        assert_eq!(serde_json::to_value(&read).unwrap(), recorded);
+    }
+
     /// The retained fields are additive on the wire: a call with nothing to
     /// retain serialises to exactly the keys it always had, so a payload
     /// written by this scanner is byte-identical to one written before the
@@ -982,6 +1039,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         // Create config with internal domain
@@ -1262,6 +1320,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         let config = Config {
@@ -1310,6 +1369,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         let normalizer = UrlNormalizer::new(&Config::default());
         for method in ["GET", "POST"] {
@@ -1349,6 +1409,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         // No env vars declared: the injected base cannot be classified through
@@ -1386,6 +1447,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         let config = Config {
@@ -1424,6 +1486,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         let config = Config::default();
@@ -1462,6 +1525,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 handler_span: None,
+                address: None,
             });
         }
         let normalizer = UrlNormalizer::default_permissive();
@@ -1517,6 +1581,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         crate::cloud_storage::CloudRepoData {
             repo_name: repo.to_string(),

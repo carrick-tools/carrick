@@ -1825,6 +1825,13 @@ impl<'a> LinkedNames<'a> {
         split_text(self.resolve(file, pieces, 0)).0
     }
 
+    /// The module that declares the binding `named` names in `file`, found
+    /// as [`Self::reached`] finds it (address chain S1).
+    pub(super) fn declared_in(&self, file: &Path, named: &NamedRef) -> Option<PathBuf> {
+        self.reached(file, &named.binding)
+            .map(|((declared_in, _), _)| declared_in)
+    }
+
     /// What the module that declares the binding `named` names reads it as,
     /// where its `names` entry states nothing (carrick#2540): `None` for an
     /// entry of an object, a binding the scan cannot follow, or one the

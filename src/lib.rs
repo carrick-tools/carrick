@@ -1,3 +1,4 @@
+pub mod address;
 pub mod agent_service;
 pub mod agents;
 pub mod analysis_channel;
