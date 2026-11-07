@@ -208,6 +208,9 @@ fn the_vectors_are_well_formed() {
 #[test]
 fn every_case_pairs_exactly_its_expect() {
     let file = file();
+    // Every wrong case is named, not only the first, so a change to the rule
+    // shows its whole blast radius in one run.
+    let mut wrong = Vec::new();
     for case in file["cases"].as_array().expect("`cases` is an array") {
         let id = required(case, "id");
         let producers: Vec<Producer> = case["input"]["producers"]
@@ -218,13 +221,25 @@ fn every_case_pairs_exactly_its_expect() {
             .collect();
         let call = call(&case["input"]["call"]);
         let pooled = PairingPool::new(producers.clone()).pair(&call);
-        assert_eq!(as_json(&pooled), case["expect"], "case {id}");
         assert_eq!(
             pair_winners(&producers, &call),
             pooled,
             "case {id}: pair_winners and PairingPool disagree"
         );
+        let actual = as_json(&pooled);
+        if actual != case["expect"] {
+            wrong.push(format!(
+                "{id}\n  expect {}\n  actual {actual}",
+                case["expect"]
+            ));
+        }
     }
+    assert!(
+        wrong.is_empty(),
+        "{} case(s) wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 #[test]
