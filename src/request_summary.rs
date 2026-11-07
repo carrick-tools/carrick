@@ -1424,6 +1424,10 @@ pub struct FileIr {
     /// reads it (carrick#1665), keyed by its class (the class's span start)
     /// and the field. An HTTP reading reads the class's own field table.
     field_receivers: HashMap<(u32, String), ClientRef>,
+    /// Each getter an instance member of a class declares, by the class's span
+    /// start and the member's name: the key of its function in
+    /// [`Self::functions`] (carrick#3489 W4).
+    class_getters: HashMap<(u32, String), String>,
     /// What each module-scope binding a name may read through holds
     /// (carrick#1562): a `const` whose initialiser is text, a constant
     /// object this module keeps ([`BindingUse::keeps_entries`]), or a
@@ -4966,6 +4970,12 @@ impl Reader<'_> {
                     let mut ir =
                         self.function(&method.function, table(method.is_static), module, &none);
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
+                    if method.kind == MethodKind::Getter && !method.is_static {
+                        file.class_getters.insert(
+                            (fields.class, member_name.clone()),
+                            key(&member_name, false),
+                        );
+                    }
                     file.functions
                         .insert(key(&member_name, method.is_static), in_class(ir));
                 }
@@ -4976,6 +4986,12 @@ impl Reader<'_> {
                     let mut ir =
                         self.function(&method.function, table(method.is_static), module, &none);
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
+                    if method.kind == MethodKind::Getter && !method.is_static {
+                        file.class_getters.insert(
+                            (fields.class, member_name.clone()),
+                            key(&member_name, false),
+                        );
+                    }
                     file.functions
                         .insert(key(&member_name, method.is_static), in_class(ir));
                 }
