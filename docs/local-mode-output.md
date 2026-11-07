@@ -291,9 +291,8 @@ a function that was renamed appears as new and one rewritten under its old name
 does not. The synthetic `<module>` definition (this file's own top-level call
 sites, carrick#965) is never listed: nobody wrote it.
 
-It is what the end-of-task reuse nudge speaks from (carrick#1330): the
-PostToolUse hook records the names per session under `~/.carrick/sessions/` and
-prints nothing about them, and the Stop hook names the accumulated set once.
+No hook reads it: the end-of-task reuse nudge that named these functions
+(carrick#1330) was removed in carrick#3436.
 
 The items in one answer are all fresh or all indexed, never a mixture, and this
 block is the only thing that says which. `stale` and `changed_since_index` keep
