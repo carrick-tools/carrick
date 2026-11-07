@@ -1,0 +1,11 @@
+{
+  "name": "trailing-slash-route",
+  "private": true,
+  "dependencies": {
+    "express": "4.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "4.17.21",
+    "typescript": "5.6.3"
+  }
+}

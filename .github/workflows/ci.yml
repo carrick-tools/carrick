@@ -142,7 +142,7 @@ jobs:
           - shard: scan-3
             runner: cargo
             targets: >-
-              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test --test untrusted_tree_test --test manifest_hash_pin_test --test constant_names_test
+              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test --test untrusted_tree_test --test manifest_hash_pin_test --test constant_names_test --test trailing_slash_route_test
           - shard: scan-4
             runner: cargo
             targets: >-

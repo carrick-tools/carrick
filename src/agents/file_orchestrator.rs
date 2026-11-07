@@ -12390,7 +12390,11 @@ impl FileOrchestrator {
                 // An unmounted owner states no prefix of its own, so whatever
                 // the model wrote in front of the literal (a class decorator,
                 // a constructor base path) is the only prefix there is.
-                None => resolved.push(endpoint),
+                None => {
+                    let mut endpoint = endpoint;
+                    endpoint.full_path = carrick_match::canonical_path(&endpoint.full_path);
+                    resolved.push(endpoint);
+                }
             }
         }
         graph.endpoints = resolved;
@@ -12464,7 +12468,14 @@ impl FileOrchestrator {
         }
     }
 
+    /// The route a mount prefix and a registration path serve, written in
+    /// the canonical form (`carrick_match::canonical_path`) every stored
+    /// route key owes: no trailing slash, `/` for the root (carrick#3522).
     fn join_paths(prefix: &str, path: &str) -> String {
+        carrick_match::canonical_path(&Self::join_prefix_and_path(prefix, path))
+    }
+
+    fn join_prefix_and_path(prefix: &str, path: &str) -> String {
         let trimmed_prefix = prefix.trim_end_matches('/');
         let trimmed_path = path.trim_start_matches('/');
 
@@ -13152,6 +13163,22 @@ export * from "./aFetch.js";"#,
             ),
             "subpath import must match its package entry"
         );
+    }
+
+    #[test]
+    fn join_paths_writes_the_canonical_route_key() {
+        // carrick#3522: a trailing slash is not part of the stored key.
+        assert_eq!(
+            FileOrchestrator::join_paths("/api", "/environments/"),
+            "/api/environments"
+        );
+        assert_eq!(
+            FileOrchestrator::join_paths("", "/environments/"),
+            "/environments"
+        );
+        // The root route stays the root.
+        assert_eq!(FileOrchestrator::join_paths("", "/"), "/");
+        assert_eq!(FileOrchestrator::join_paths("/", "/"), "/");
     }
 
     #[test]

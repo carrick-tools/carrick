@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:2",
+      "line_number": 2,
+      "target": "/api/v1/environments",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch('/api/v1/environments')",
+      "call_expression_line": 2,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
