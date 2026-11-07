@@ -6715,6 +6715,10 @@ async fn site_rows_of(
     )
     .await;
     let mut rows = crate::site_rows::of(&decided, &records, &site_labels, &answers);
+    // The requests the service builds and returns for a caller to send
+    // (carrick#3470): candidate rows, folded as every site row is.
+    rows.rows
+        .extend(crate::site_rows::descriptor_rows(&decided));
     // With the receiver trace on, the routes hand-written dispatch chooses
     // (carrick#2474 R4b) join the site rows before the fold.
     if let Some((handlers, built)) = &handlers {
@@ -9444,6 +9448,13 @@ fn site_infer_requests(
                         alias(ManifestTypeKind::Request),
                         None,
                     ));
+                }
+                // A built request's anchor is its object literal, not a
+                // call: nothing there is a response (carrick#3470).
+                if row.source
+                    == crate::agents::file_analyzer_agent::ResolutionSource::RequestDescriptor
+                {
+                    continue;
                 }
                 let mut call_result = at(
                     &anchors.call,

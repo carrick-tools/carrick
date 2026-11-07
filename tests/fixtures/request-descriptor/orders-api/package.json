@@ -1,0 +1,8 @@
+{
+  "name": "@fixture/orders-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@remix-run/node": "^2.0.0"
+  }
+}

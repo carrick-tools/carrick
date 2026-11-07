@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "serviceName": "orders-api", "directory": "orders-api" },
+    { "serviceName": "ops-console", "directory": "ops-console" }
+  ]
+}

@@ -878,6 +878,10 @@ pub struct Decided {
     /// file only tests import makes them (carrick#2775), by `file:line`.
     /// Counted in the run log.
     pub test_only_mounts: Vec<String>,
+    /// The requests the service's functions build and return for a caller
+    /// to send, where nothing in the service calls the function
+    /// (carrick#3470, [`super::descriptors`]).
+    pub descriptors: Vec<super::descriptors::Descriptor>,
 }
 
 /// A discovered call whose request is decided lower down its chain
@@ -2580,6 +2584,15 @@ fn decide(
         }
         .of(&out, labels);
     }
+    // The requests the service's functions build and return, where nothing
+    // in the service calls the function (carrick#3470): a caller in a
+    // sibling's files is not one of the service's.
+    out.descriptors = super::descriptors::of(root, &inputs.files, |file, key| {
+        calls
+            .callers_of(file, key)
+            .iter()
+            .any(|caller| calls.is_own(caller.file))
+    });
     out
 }
 

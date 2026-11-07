@@ -1641,6 +1641,9 @@ impl ResolutionSource {
             // ranked with the route sources, which also never share a site.
             Self::GraphqlSchema | Self::GraphqlDocument | Self::SocketCall | Self::EventBus => 1,
             Self::InlineLiteral | Self::Model => 0,
+            // A built request (carrick#3470) is a site row at an object
+            // literal, never a call site the reader's passes compete for.
+            Self::RequestDescriptor => 0,
             // Never arbitrated here: a declared operation (carrick#831) is
             // not a statement about a call SITE, so it never competes for one.
             // The rows it produces are materialised into the graph after every
