@@ -1767,9 +1767,8 @@ fn a_route_path_over_another_packages_constant_stores_where_it_is_declared() {
 /// Address chain S1 over carrick#3484's fold: a route path folded only by
 /// the name fold (a `let` assigned once, an enum member, a constant
 /// object's entry) still states its
-/// pieces. The compiler gives the enum member a declaration, so that piece is
-/// `folded` from the file declaring it; the `let` has none, so its text is
-/// `lit`. Each row's path reads the same text as before the address existed.
+/// pieces. Each value read off a declaration is `folded` from the file
+/// declaring it; only the text written at the registration is `lit`. Each row's path reads the same text as before the address existed.
 #[test]
 fn a_route_path_folded_by_the_name_fold_states_its_pieces() {
     let on = scan_fixture("address-chain-folded");
@@ -1788,7 +1787,7 @@ fn a_route_path_folded_by_the_name_fold_states_its_pieces() {
     assert_eq!(
         own_values("src/server.ts:17 GET /api/items"),
         serde_json::json!([[
-            { "piece": "lit", "text": "/api" },
+            { "piece": "folded", "text": "/api", "from": "src/server.ts" },
             { "piece": "lit", "text": "/items" },
         ]]),
         "{addresses:#?}"
@@ -1800,14 +1799,7 @@ fn a_route_path_folded_by_the_name_fold_states_its_pieces() {
         ]]),
         "{addresses:#?}"
     );
-    // An entry of a constant object, by name and by a computed key.
-    assert_eq!(
-        own_values("src/server.ts:20 GET /things"),
-        serde_json::json!([[
-            { "piece": "folded", "text": "/things", "from": "src/server.ts" },
-        ]]),
-        "{addresses:#?}"
-    );
+    // An entry of a constant object, by a computed key.
     assert_eq!(
         own_values("src/server.ts:21 GET /other"),
         serde_json::json!([[

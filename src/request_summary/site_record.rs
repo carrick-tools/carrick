@@ -597,7 +597,7 @@ fn folded_values(
     file: &str,
     pieces: &[super::Piece],
     exprs: &[&Expr],
-) -> HashMap<String, String> {
+) -> HashMap<String, (String, Option<String>)> {
     let mut values = HashMap::new();
     let Some(positions) = positions else {
         return values;
@@ -615,8 +615,9 @@ fn folded_values(
         else {
             continue;
         };
-        if let Some(value) = fold::Fold::new(sources, positions, root).text(file, &expr) {
-            values.insert(text.clone(), value);
+        let mut fold = fold::Fold::new(sources, positions, root);
+        if let Some(value) = fold.text(file, &expr) {
+            values.insert(text.clone(), (value, fold.origin()));
         }
     }
     values
@@ -627,14 +628,18 @@ fn folded_values(
 /// ([`folded_values`]).
 fn piece_literals(
     names: &[CompilerName],
-    folded: &HashMap<String, String>,
+    folded: &HashMap<String, (String, Option<String>)>,
     text: &str,
 ) -> Vec<String> {
     let typed = name_literals(names, text);
     if !typed.is_empty() {
         return typed;
     }
-    folded.get(text).cloned().into_iter().collect()
+    folded
+        .get(text)
+        .map(|(value, _)| value.clone())
+        .into_iter()
+        .collect()
 }
 
 /// A route site's own path read through the compiler ([`folded_text`],
@@ -723,12 +728,14 @@ impl<'r> NameFold<'r> {
                     let declared = names
                         .iter()
                         .find(|name| &name.text == text)
-                        .and_then(|name| name.declaration.as_deref());
+                        .and_then(|name| name.declaration.as_deref())
+                        .map(|declaration| declaration_file(declaration).to_string())
+                        // A value read off a declaration the compiler names
+                        // for no ident of its own (an enum or object entry)
+                        // names the file the fold read it in.
+                        .or_else(|| folded.get(text).and_then(|(_, origin)| origin.clone()));
                     Some(match declared {
-                        Some(declaration) => crate::address::Piece::Folded {
-                            text: one,
-                            from: declaration_file(declaration).to_string(),
-                        },
+                        Some(from) => crate::address::Piece::Folded { text: one, from },
                         None => crate::address::Piece::Lit { text: one },
                     })
                 }
