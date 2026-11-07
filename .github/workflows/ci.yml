@@ -523,6 +523,32 @@ jobs:
             console.log('wasm smoke ok');
           "
 
+      # The pairing vectors (carrick#3496) through the wasm PairingPool and
+      # canonical_path, JSON in and JSON out as the cloud calls them. The
+      # native test (crates/carrick-match/tests/pairing_vectors.rs) runs the
+      # same file, so this is the native/wasm parity proof.
+      - name: Run the pairing vectors through the wasm PairingPool
+        run: |
+          node -e "
+            const assert = require('assert');
+            const m = require('./target/wasm-smoke/carrick_match.js');
+            const file = require('./crates/carrick-match/tests/fixtures/pairing.vectors.json');
+            for (const c of file.cases) {
+              const pool = new m.PairingPool(JSON.stringify(c.input.producers));
+              const got = JSON.parse(pool.pair(JSON.stringify(c.input.call)));
+              pool.free();
+              assert.deepStrictEqual(got, c.expect, 'case ' + c.id);
+            }
+            for (const row of file.canonical) {
+              assert.strictEqual(m.canonical_path(row.path), row.canonical_path, 'canonical_path ' + row.path);
+            }
+            for (const row of file.identity) {
+              assert.strictEqual(m.route_identity(row.path), row.route_identity, 'route_identity ' + row.path);
+            }
+            assert.throws(() => new m.PairingPool('not json'));
+            console.log('pairing vectors ok: ' + file.cases.length + ' cases');
+          "
+
   lint:
     name: Linting
     runs-on: ubuntu-latest

@@ -1,0 +1,1453 @@
+{
+  "title": "Which producer a call reaches (carrick-match pair_winners)",
+  "version": 1,
+  "contract": "carrick-tools/carrick#3496; implemented by carrick-match pair_winners (native + wasm) and run byte-identical by carrick-cloud lambdas/mcp-server (parity test). A change to this file is a contract change: change both copies and re-pin both sha256 values together.",
+  "rule": [
+    "Inputs are canonical keys as stored: producer full_path, consumer canonical path. The function never rewrites them (see canonical_path for the write-side form).",
+    "Non-HTTP (graphql, socket, pubsub): a producer pairs when protocol, name and (socket) direction are equal and names_pair(call, producer) holds. Every such producer is a winner. No ranking.",
+    "HTTP, in order: (1) a call path with no literal segment is unknown_call_path and pairs with nothing; (2) the pool is every HTTP producer, in every service including the caller's own, whose method serves the call's (method_matches: case-insensitive, producer ALL serves every method, consumer ALL only producer ALL); (3) producers whose path routes the call (match_agreement is defined) are ranked by agreement and only the maximal ones are kept, ties kept; nothing routes -> no_route; (4) each kept producer answers match_verdict_with_dispatch; (5) dispatch_outcome over those answers decides: matched -> winners are the matched producers; route_case_unknown -> winners are the dispatching producers whose case the call does not state (one edge to the route, case unknown); no_case_answers -> no winner; otherwise (best agreement 0: a bare catch-all or a param-only route) -> no_literal_agreement, no winner.",
+    "Every winner carries same_service (producer service == call service), relationship (producer_consumer for route-definition evidence, shared_external_contract for call-site evidence) and, for HTTP, call_param_over_route_literal (the call has a placeholder where this route states a literal: carrick#2004; the edge stands, the type check does not compare). These are facts, not filters: what a surface draws for them is its documented policy.",
+    "routed lists every maximal-agreement producer with its verdict, for reasons and near-miss text. It is empty for non-HTTP calls, unknown_call_path and no_route.",
+    "A case carrying expected_red pins today's answer for a product gap the case names: the answer is right for this function's rule and wrong for the product. Its expect is checked like any other; the marker says what turns the product green and must be removed by the change that does."
+  ],
+  "cases": [
+    {
+      "id": "all-route-serves-post-call",
+      "source": "probe cloud_vs_scanner.cjs case 1; carrick-cloud#962",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "ALL",
+            "path": "/graphql"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "POST",
+          "path": "/graphql"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "param-only-route-corroborates-nothing",
+      "source": "probe cloud_vs_scanner.cjs case 2",
+      "input": {
+        "producers": [
+          {
+            "service": "cms",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/:slug"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/about"
+        }
+      },
+      "expect": {
+        "outcome": "no_literal_agreement",
+        "winners": [],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "no_literal_agreement",
+            "agreement": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "unknown-call-path-pairs-with-nothing",
+      "source": "probe cloud_vs_scanner.cjs case 3",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/users/:id"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/:base/:rest"
+        }
+      },
+      "expect": {
+        "outcome": "unknown_call_path",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "bare-catch-all-route-corroborates-nothing",
+      "source": "probe cloud_vs_scanner.cjs case 4",
+      "input": {
+        "producers": [
+          {
+            "service": "spa",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/*"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/x"
+        }
+      },
+      "expect": {
+        "outcome": "no_literal_agreement",
+        "winners": [],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "catch_all_route",
+            "agreement": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "concrete-route-control",
+      "source": "probe cloud_vs_scanner.cjs case 5; rust_probe.out row 1",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/users/:id"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/users/42"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "prefixed-catch-all-pairs-on-its-prefix",
+      "source": "rust_probe.out row 3",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/*"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/users/7"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "optional-param-route-serves-the-bare-path",
+      "source": "rust_probe.out row 4",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/users/:id?"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/users"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "trailing-slash-route-is-not-canonical",
+      "source": "rust_probe.out row 5; audit I5. Stays no_route: the route-side writer owes canonical_path (address chain join), pairing does not rewrite stored keys",
+      "expected_red": "Wanted: matched. A trailing slash on a stored route key is a writer's mistake: the route-side writers owe canonical_path (carrick#3496 follow-up F1, with the address chain join). pair_winners never rewrites its inputs, so this case answers no_route until the stored key is canonical.",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/users/"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/users"
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "case-is-significant",
+      "source": "rust_probe.out row 6",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/Users/Me"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/users/me"
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "angle-bracket-param",
+      "source": "rust_probe.out row 8",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/orders/<id>"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/orders/9"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "template-hole-inside-a-route-segment-is-literal",
+      "source": "rust_probe.out row 9. Stays no_route until the address chain's gap reading (MatchedPartial, decision 2026-11-06 A7)",
+      "expected_red": "Wanted: matched_partial. A template hole inside one segment (v${n}) is literal text to the matcher. The address chain's gap reading (S3, decision 2026-11-06 A7) adds the partial outcome inside pair_winners; until then this case answers no_route.",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/v${n}/users"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/v2/users"
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "concrete-route-beats-a-catch-all-in-another-service",
+      "source": "carrick-match match_agreement doc (#381)",
+      "input": {
+        "producers": [
+          {
+            "service": "gateway",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/**"
+          },
+          {
+            "service": "chat",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/v1/chat/new"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/v1/chat/new"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 4,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 4
+          }
+        ]
+      }
+    },
+    {
+      "id": "equal-agreement-keeps-every-producer",
+      "source": "service-graph.ts fan-out comment",
+      "input": {
+        "producers": [
+          {
+            "service": "users-a",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/users/:id"
+          },
+          {
+            "service": "users-b",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/users/:uid"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/users/7"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          },
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          },
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "sibling-literal-route-outranks-the-callers-own-param-route",
+      "source": "carrick#1945 ranking rule",
+      "input": {
+        "producers": [
+          {
+            "service": "web",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/items/:id"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/items/special"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/items/special"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 2,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 2
+          }
+        ]
+      }
+    },
+    {
+      "id": "callers-own-literal-route-is-a-same-service-winner",
+      "source": "carrick#1926",
+      "input": {
+        "producers": [
+          {
+            "service": "web",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/items/new"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/items/:id"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/items/new"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 2,
+            "same_service": true,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 2
+          }
+        ]
+      }
+    },
+    {
+      "id": "callers-own-call-site-twin",
+      "source": "carrick#379; analyzer same-repo shared contract (no self edge)",
+      "input": {
+        "producers": [
+          {
+            "service": "web",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/ext/v1/thing",
+            "evidence": "call_site"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/ext/v1/thing"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 3,
+            "same_service": true,
+            "relationship": "shared_external_contract",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 3
+          }
+        ]
+      }
+    },
+    {
+      "id": "other-services-call-site-evidence",
+      "source": "carrick#379",
+      "input": {
+        "producers": [
+          {
+            "service": "partner",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/ext/v1/thing",
+            "evidence": "call_site"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/ext/v1/thing"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 3,
+            "same_service": false,
+            "relationship": "shared_external_contract",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 3
+          }
+        ]
+      }
+    },
+    {
+      "id": "method-differs",
+      "source": "method_matches",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/users"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/users"
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "consumer-all-reaches-only-producer-all",
+      "source": "method_matches doc",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/x"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "ALL",
+          "path": "/x"
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "method-compares-case-insensitively",
+      "source": "method_matches",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "get",
+            "path": "/x"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/x"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "call-placeholder-over-route-literal-is-flagged",
+      "source": "carrick#2004 (type check abstains, edge stands)",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "PATCH",
+            "path": "/things/move"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "PATCH",
+            "path": "/things/:thingId"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "PATCH",
+          "path": "/things/:id"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": true
+          },
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          },
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "flagged-literal-route-outranks-an-all-param-route",
+      "source": "carrick#2004 x #381: the type check today compares the all-param route the edge matcher never draws",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/a/b"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/:p/:q"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/a/:x"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": true
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "catch-all-prefix-matches-on-a-segment-boundary",
+      "source": "agreement_with_wildcards",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/**"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api2/x"
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "root-call-names-nothing",
+      "source": "is_unknown_call_path",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/"
+        }
+      },
+      "expect": {
+        "outcome": "unknown_call_path",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "dispatch-case-the-call-names",
+      "source": "carrick#831",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/rpc",
+            "dispatch": "body:action=upload"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/rpc",
+            "dispatch": "body:action=list"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "POST",
+          "path": "/rpc",
+          "dispatch": "body:action=list"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "dispatch_value_mismatch",
+            "agreement": 1
+          },
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "dispatch-case-unstated-keeps-one-edge-to-the-route",
+      "source": "carrick#2048; probe I1 dispatch-unknown (cloud lists it unmatched today)",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/rpc",
+            "dispatch": "body:action=upload"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/rpc",
+            "dispatch": "body:action=list"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "POST",
+          "path": "/rpc"
+        }
+      },
+      "expect": {
+        "outcome": "route_case_unknown",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "dispatch_value_unknown",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          },
+          {
+            "producer": 1,
+            "verdict": "dispatch_value_unknown",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "dispatch_value_unknown",
+            "agreement": 1
+          },
+          {
+            "producer": 1,
+            "verdict": "dispatch_value_unknown",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "dispatch-value-no-case-answers",
+      "source": "carrick#831",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/rpc",
+            "dispatch": "body:action=upload"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/rpc",
+            "dispatch": "body:action=list"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "POST",
+          "path": "/rpc",
+          "dispatch": "body:action=delete"
+        }
+      },
+      "expect": {
+        "outcome": "no_case_answers",
+        "winners": [],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "dispatch_value_mismatch",
+            "agreement": 1
+          },
+          {
+            "producer": 1,
+            "verdict": "dispatch_value_mismatch",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "non-dispatching-route-takes-any-dispatch",
+      "source": "DispatchVerdict::NotDispatching",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/rpc"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "POST",
+          "path": "/rpc",
+          "dispatch": "body:action=x"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "dispatch-on-another-field-is-unstated",
+      "source": "dispatch_verdict doc",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "POST",
+            "path": "/rpc",
+            "dispatch": "body:action=a"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "POST",
+          "path": "/rpc",
+          "dispatch": "body:kind=a"
+        }
+      },
+      "expect": {
+        "outcome": "route_case_unknown",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "dispatch_value_unknown",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "dispatch_value_unknown",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "all-route-with-dispatch",
+      "source": "carrick-cloud#962 open question (ALL producer types)",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "ALL",
+            "path": "/rpc",
+            "dispatch": "body:op=sync"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "PUT",
+          "path": "/rpc",
+          "dispatch": "body:op=sync"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "pubsub-exact-key-across-services",
+      "source": "exact_key_matches",
+      "input": {
+        "producers": [
+          {
+            "service": "svc-a",
+            "protocol": "pubsub",
+            "name": "orders.created"
+          }
+        ],
+        "call": {
+          "service": "svc-b",
+          "protocol": "pubsub",
+          "name": "orders.created"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "same_service": false,
+            "relationship": "producer_consumer"
+          }
+        ],
+        "routed": []
+      }
+    },
+    {
+      "id": "pubsub-same-service-is-a-winner-marked-same-service",
+      "source": "scanner drops the edge (#397), MCP graph draws it with same_service: per-surface policy",
+      "input": {
+        "producers": [
+          {
+            "service": "svc-a",
+            "protocol": "pubsub",
+            "name": "orders.created"
+          }
+        ],
+        "call": {
+          "service": "svc-a",
+          "protocol": "pubsub",
+          "name": "orders.created"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "same_service": true,
+            "relationship": "producer_consumer"
+          }
+        ],
+        "routed": []
+      }
+    },
+    {
+      "id": "service-scoped-name-stays-in-its-service",
+      "source": "name-scope-pairing.vectors.json rule",
+      "input": {
+        "producers": [
+          {
+            "service": "svc-a",
+            "protocol": "pubsub",
+            "name": "jobs.run",
+            "name_scope": {
+              "scope": "service",
+              "namespace": null
+            }
+          }
+        ],
+        "call": {
+          "service": "svc-b",
+          "protocol": "pubsub",
+          "name": "jobs.run"
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "namespaces-that-differ-never-pair",
+      "source": "name-scope-pairing.vectors.json rule",
+      "input": {
+        "producers": [
+          {
+            "service": "svc-a",
+            "protocol": "pubsub",
+            "name": "jobs.run",
+            "name_scope": {
+              "scope": "global",
+              "namespace": "a"
+            }
+          }
+        ],
+        "call": {
+          "service": "svc-b",
+          "protocol": "pubsub",
+          "name": "jobs.run",
+          "name_scope": {
+            "scope": "global",
+            "namespace": "b"
+          }
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "socket-direction-is-part-of-the-key",
+      "source": "OperationKey::Socket",
+      "input": {
+        "producers": [
+          {
+            "service": "rt",
+            "protocol": "socket",
+            "name": "chat:msg",
+            "direction": "client_to_server"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "socket",
+          "name": "chat:msg",
+          "direction": "server_to_client"
+        }
+      },
+      "expect": {
+        "outcome": "no_route",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "graphql-field-exact-key",
+      "source": "OperationKey::Graphql",
+      "input": {
+        "producers": [
+          {
+            "service": "gql",
+            "protocol": "graphql",
+            "name": "query|orders"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "graphql",
+          "name": "query|orders"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "same_service": false,
+            "relationship": "producer_consumer"
+          }
+        ],
+        "routed": []
+      }
+    }
+  ],
+  "identity": [
+    {
+      "path": "/orders/:id",
+      "route_identity": "/orders/:"
+    },
+    {
+      "path": "/orders/{id}",
+      "route_identity": "/orders/:"
+    },
+    {
+      "path": "/orders/[id]",
+      "route_identity": "/orders/:"
+    },
+    {
+      "path": "/orders/<id>",
+      "route_identity": "/orders/:"
+    },
+    {
+      "path": "/orders/${id}",
+      "route_identity": "/orders/:"
+    },
+    {
+      "path": "/orders/:id?",
+      "route_identity": "/orders/:?"
+    },
+    {
+      "path": "/files/[...rest]",
+      "route_identity": "/files/:"
+    },
+    {
+      "path": "/w/[slug]",
+      "route_identity": "/w/:"
+    },
+    {
+      "path": "/w/:slug",
+      "route_identity": "/w/:"
+    },
+    {
+      "path": "/users/",
+      "route_identity": "/users/"
+    },
+    {
+      "path": "/users",
+      "route_identity": "/users"
+    },
+    {
+      "path": "/users/:id?/posts",
+      "route_identity": "/users/:?/posts"
+    },
+    {
+      "path": "/v1/runs?x=1",
+      "route_identity": "/v1/runs?x=1"
+    },
+    {
+      "path": "/v${n}/users",
+      "route_identity": "/v${n}/users"
+    }
+  ],
+  "canonical": [
+    {
+      "path": "/users/",
+      "canonical_path": "/users"
+    },
+    {
+      "path": "/",
+      "canonical_path": "/"
+    },
+    {
+      "path": "",
+      "canonical_path": "/"
+    },
+    {
+      "path": "api/users",
+      "canonical_path": "/api/users"
+    },
+    {
+      "path": "//a//b/",
+      "canonical_path": "/a/b"
+    },
+    {
+      "path": "/Users/Me",
+      "canonical_path": "/Users/Me"
+    },
+    {
+      "path": "/users/:id?",
+      "canonical_path": "/users/:id?"
+    },
+    {
+      "path": "/api/v1/",
+      "canonical_path": "/api/v1"
+    }
+  ]
+}
