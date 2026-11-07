@@ -3644,6 +3644,7 @@ impl ServiceScan {
                 stop: place.stop.clone(),
                 log,
             });
+        let service_modules = service_module_index(repo_path, service);
         let _ = tokio::join!(
             orchestrator.analyze_files(
                 &files,
@@ -3652,6 +3653,7 @@ impl ServiceScan {
                 &detection,
                 &service_root,
                 Path::new(repo_path),
+                &service_modules,
                 &declared_dependencies,
                 &graphql_producer_hints,
                 &graphql_consumer_hints,
@@ -5334,6 +5336,7 @@ async fn analyze_current_repo_incremental(
                     &setup.detection,
                     &service_root,
                     Path::new(repo_path),
+                    &service_modules,
                     &declared_dependencies,
                     &graphql_producer_hints,
                     &graphql_consumer_hints,
@@ -6297,10 +6300,11 @@ fn scan_protocol_extractions(
     // Aliases resolve here as they do for the HTTP-twin drop: a page imports
     // its generated documents through the repo's path aliases as often as
     // through a relative specifier.
-    let workspace =
-        crate::workspace_resolver::WorkspaceIndex::build_with_aliases(Path::new(repo_path), None);
-    let document_sites =
-        crate::graphql_document_sites::collect_document_site_consumers(files, Some(&workspace));
+    // Under the service's own tsconfig, as its other passes (carrick#3497).
+    let document_sites = crate::graphql_document_sites::collect_document_site_consumers(
+        files,
+        Some(service_modules),
+    );
     // The detected socket clients gate the pass's unknown-direction half; its
     // Socket.IO rules are independent of them (carrick#1281).
     let sockets = crate::socket_io::scan_files(files, &detection.socket_clients);
@@ -13136,6 +13140,7 @@ async fn analyze_current_repo(
             &setup,
             &service_root_text,
             Path::new(repo_path),
+            &service_modules,
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,

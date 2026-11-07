@@ -4260,6 +4260,7 @@ mod tests {
                     &crate::framework_detector::DetectionResult::default(),
                     &root,
                     &root,
+                    &crate::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
                     &[],
                     &Default::default(),
                     &Default::default(),

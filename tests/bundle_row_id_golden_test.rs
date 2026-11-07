@@ -121,6 +121,7 @@ async fn dispatch(guidance: FrameworkGuidance) -> Vec<AnalyzeRow> {
             &detection(),
             &root,
             &root,
+            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
             &[],
             &Default::default(),
             &Default::default(),
