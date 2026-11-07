@@ -4957,6 +4957,64 @@ export function listen(): void {
         );
     }
 
+    /// carrick#3479: a name stated through a constant the compiler types
+    /// wider than its value (a `let` never reassigned, an enum or const enum
+    /// member, an entry under a computed key, a built-in over such parts) is
+    /// forced whole on every protocol: HTTP calls and routes, pub/sub topics
+    /// and socket events. A name with a part that does not fold is forced
+    /// nowhere.
+    #[test]
+    fn a_name_stated_through_constants_is_forced_on_every_protocol() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("constant-names", ".", "constant-names")
+        else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        let mut forced: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for record in &records {
+            let file = record
+                .state
+                .point
+                .at
+                .rsplit_once(':')
+                .map_or(record.state.point.at.as_str(), |(file, _)| file);
+            let entry = forced.entry(file.to_string()).or_default();
+            if let Some(name) = record.state.forced.get(&crate::site_questions::Slot::Name) {
+                entry.insert(name.clone());
+            }
+        }
+        let key: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/constant-names/rows.expected.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut wrong = Vec::new();
+        for (file, want) in key["names"].as_object().unwrap() {
+            let want = BTreeSet::from([want.as_str().unwrap().to_string()]);
+            let got = forced.get(file);
+            if got != Some(&want) {
+                wrong.push(format!("{file}: want {want:?}, got {got:?}"));
+            }
+        }
+        for file in key["unnamed"].as_array().unwrap() {
+            let file = file.as_str().unwrap();
+            match forced.get(file) {
+                Some(got) if got.is_empty() => {}
+                got => wrong.push(format!("{file}: want a site forcing no name, got {got:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// carrick#1678: a verb called on the object a scope member returns
     /// (`items.at("/items").get(list)`) is a route whose path is the scope
     /// call's argument and whose instance is the scope call's receiver: the

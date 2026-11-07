@@ -7,9 +7,12 @@
 //! Drives the real scanner binary on `.`, as the Action runs it, over a
 //! committed copy of `tests/fixtures/constant-names/repo` (one root
 //! service), offline, with the fixture's store answer replayed as the
-//! library store's. The key is `rows.expected.json`: each `named` file
-//! writes a fact row with that name, and each `unnamed` file, where a part
-//! does not fold, writes none and stays a possible call.
+//! library store's. The key is `rows.expected.json`: each file of `names`
+//! writes a fact row with that name, except a pub/sub file of `kind_asked`,
+//! whose broker label leaves the kind to the model, so it stays a possible
+//! call (its name is forced: the record-level test in discovery says so).
+//! Each `unnamed` file, where a part does not fold, writes no fact row and
+//! stays a possible call.
 //!
 //! Protocols: HTTP calls and routes, pub/sub topics, socket events.
 
@@ -161,8 +164,22 @@ fn a_name_stated_through_constants_is_a_fact_row() {
     let scan = scan();
     let key = key();
     let mut wrong = Vec::new();
-    for (file, want) in key["named"].as_object().unwrap() {
+    let kind_asked: BTreeSet<&str> = key["kind_asked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file.as_str().unwrap())
+        .collect();
+    for (file, want) in key["names"].as_object().unwrap() {
         let want = want.as_str().unwrap();
+        // A broker's label does not say topic or job name: the kind is
+        // asked, so the row waits on the answer whatever the name.
+        if kind_asked.contains(file.as_str()) {
+            if !scan.leads.contains(file) {
+                wrong.push(format!("{file}: want a possible call, got none"));
+            }
+            continue;
+        }
         let got = scan.named.get(file).cloned().unwrap_or_default();
         if got != BTreeSet::from([want.to_string()]) {
             wrong.push(format!("{file}: want {want}, got {got:?}"));

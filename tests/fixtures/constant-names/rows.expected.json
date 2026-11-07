@@ -1,5 +1,5 @@
 {
-  "named": {
+  "names": {
     "src/c-let.ts": "/c/let",
     "src/c-let-imported.ts": "/c/shared/items",
     "src/c-enum.ts": "/c/enum",
@@ -18,6 +18,10 @@
     "src/s-enum.ts": "room.joined",
     "src/s-let.ts": "room.left"
   },
+  "kind_asked": [
+    "src/q-enum.ts",
+    "src/q-join.ts"
+  ],
   "unnamed": [
     "src/c-let-reassigned.ts",
     "src/c-object-written.ts",
