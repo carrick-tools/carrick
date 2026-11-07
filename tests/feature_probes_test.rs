@@ -139,10 +139,10 @@ fn row_name(row: &serde_json::Value) -> String {
 /// collapse to one spelling.
 fn canon(name: &str) -> String {
     let mut s = name;
-    if s.starts_with("${") {
-        if let Some(end) = s.find('}') {
-            s = &s[end + 1..];
-        }
+    if s.starts_with("${")
+        && let Some(end) = s.find('}')
+    {
+        s = &s[end + 1..];
     }
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -184,21 +184,21 @@ fn outcomes(blob: &serde_json::Value, labels: &serde_json::Value) -> BTreeMap<St
         .collect();
     let mut manifest: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for m in blob["type_manifest"].as_array().into_iter().flatten() {
-        if m["type_kind"] == "request" {
-            if let Some(pid) = probe_of(m["file_path"].as_str().unwrap_or_default()) {
-                manifest
-                    .entry(pid)
-                    .or_default()
-                    .push(m["type_alias"].as_str().unwrap_or_default().to_string());
-            }
+        if m["type_kind"] == "request"
+            && let Some(pid) = probe_of(m["file_path"].as_str().unwrap_or_default())
+        {
+            manifest
+                .entry(pid)
+                .or_default()
+                .push(m["type_alias"].as_str().unwrap_or_default().to_string());
         }
     }
     let mut alias_text: BTreeMap<String, String> = BTreeMap::new();
     for line in blob["bundled_types"].as_str().unwrap_or_default().lines() {
-        if let Some(rest) = line.strip_prefix("export type ") {
-            if let Some((name, text)) = rest.split_once(" = ") {
-                alias_text.insert(name.to_string(), text.to_string());
-            }
+        if let Some(rest) = line.strip_prefix("export type ")
+            && let Some((name, text)) = rest.split_once(" = ")
+        {
+            alias_text.insert(name.to_string(), text.to_string());
         }
     }
     let typed = |pid: &str| {
