@@ -1559,3 +1559,54 @@ fn client_bases_follow_the_instance_walk() {
         );
     }
 }
+
+/// carrick#3044 S1: an HTTP client whose labels carry no `protocol` is
+/// judged under the #1564 rules, and a verified op there names the
+/// declaration of the member it judged, so every call of that member is a
+/// site whatever holds its receiver (a field, a getter, a call result, an
+/// alias, a `let`, a parameter, a coalesce). The labels of this fixture state
+/// no protocol, as the real store's http clients did before amendment 7.
+#[test]
+fn client_receivers_in_every_held_form_are_sites() {
+    let on = scan_fixture("receiver-forms-client");
+    let mut stated: Vec<String> = Vec::new();
+    for text in on.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for row in blob["calls"].as_array().cloned().unwrap_or_default() {
+            if row["resolution_source"] == "request_summary" {
+                stated.push(
+                    row["file_path"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .rsplit_once(':')
+                        .map_or_else(
+                            || row["file_path"].as_str().unwrap_or_default().to_string(),
+                            |(file, _)| file.to_string(),
+                        ),
+                );
+            }
+        }
+    }
+    stated.sort();
+    let want: Vec<String> = [
+        "m-binding",
+        "m-call-result",
+        "m-coalesce",
+        "m-const-alias",
+        "m-ctor-assign",
+        "m-destructured",
+        "m-field-init",
+        "m-getter",
+        "m-let",
+        "m-param-property-di",
+        "m-param-property",
+        "m-param",
+        "n-literal",
+        "t-call-result-receiver",
+        "t-class-field-client",
+    ]
+    .iter()
+    .map(|name| format!("src/{name}.ts"))
+    .collect();
+    assert_eq!(stated, want);
+}

@@ -143,3 +143,121 @@ describe('verify_library_claims: declarations of a verified op (carrick#2474)', 
     assert.strictEqual(bad.declarations, undefined);
   });
 });
+
+/**
+ * carrick#3044 S1: an http_client op without amendment-7 fields is judged
+ * under the #1564 rules (no `protocol`), and a verified op there carries the
+ * declarations of the member it judged, by the same rule as above: the
+ * property for a member typed by an interface with call signatures, the
+ * method otherwise. Makers and results carry none. The package is invented.
+ */
+const CLIENT = `export interface Put {
+  (url: string, data?: unknown): Promise<unknown>;
+  (url: string, options: object): Promise<unknown>;
+}
+export interface Inst {
+  get(url: string): Promise<unknown>;
+  post(url: string, data?: unknown): Promise<unknown>;
+  put: Put;
+}
+export interface Opts { baseURL?: string }
+export interface Mk { create(options?: Opts): Inst }
+export declare const http: Inst;
+declare const mk: Mk;
+export default mk;
+`;
+
+describe('verify_library_claims: an http client op names its member declaration (carrick#3044)', () => {
+  let root: string;
+  let client: SidecarClient;
+  let requestId = 0;
+
+  const P = 'fixture-client';
+  const check = (id: string, exported: string, receiver: string, claim: Record<string, unknown>) => ({
+    claim_id: id,
+    package: P,
+    export: exported,
+    role: 'http_client',
+    receiver,
+    claim,
+  });
+  // No `protocol`: the claim is read under the #1564 rules.
+  const request = (member: string, method: string, of: Record<string, string>, parts: Record<string, unknown> = {}) => ({
+    kind: 'op',
+    op: 'request',
+    member,
+    name: { arg: 0 },
+    payload: { arg: 1 },
+    method,
+    ...of,
+    ...parts,
+  });
+  const lineOf = (needle: string): number => CLIENT.split('\n').findIndex(line => line.includes(needle)) + 1;
+  const file = 'node_modules/fixture-client/index.d.ts';
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-claims-decl-http-'));
+    const write = (rel: string, text: string) => {
+      const target = path.join(root, rel);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, text);
+    };
+    write(
+      'tsconfig.json',
+      JSON.stringify({
+        compilerOptions: { target: 'es2020', module: 'commonjs', moduleResolution: 'node', strict: true, skipLibCheck: true, types: [] },
+        include: ['src/**/*.ts'],
+      })
+    );
+    write('package.json', JSON.stringify({ name: 'service' }));
+    write('src/index.ts', 'export const service = 1;\n');
+    write('node_modules/fixture-client/package.json', JSON.stringify({ name: P, version: '1.0.0', types: 'index.d.ts' }));
+    write('node_modules/fixture-client/index.d.ts', CLIENT);
+    client = new SidecarClient();
+    await client.start();
+    const ready = await client.send<{ status: string }>({ request_id: 'init', action: 'init', repo_root: root });
+    assert.strictEqual(ready.status, 'ready');
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('an http client op under the 1564 rules names its member declaration', async () => {
+    const response = await client.send<{
+      status: string;
+      verdicts?: Verdict[];
+      errors?: string[];
+    }>(
+      {
+        request_id: `decl-http-${requestId++}`,
+        action: 'verify_library_claims',
+        from_dir: root,
+        checks: [
+          check('e0', 'http', 'export', request('post', 'POST', { on: 'export' })),
+          check('e1', 'http', 'export', request('get', 'GET', { on: 'export' }, { payload: undefined })),
+          check('e2', 'http', 'export', request('put', 'PUT', { on: 'export' })),
+          check('m0', 'default', 'export', { kind: 'make', form: 'call', member: 'create', base: { arg: 0, key: 'baseURL' } }),
+          check('m1', 'default', 'instance:create', request('post', 'POST', { of: 'instance:create' })),
+          check('m2', 'default', 'instance:create', request('put', 'PUT', { of: 'instance:create' })),
+        ],
+      },
+      60_000
+    );
+    assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+    const [post, get, put, make, instPost, instPut] = response.verdicts!;
+    for (const verdict of [post, get, put, make, instPost, instPut]) {
+      assert.strictEqual(verdict.verdict, 'verified', JSON.stringify(verdict));
+    }
+    const post_line = lineOf('post(url: string, data?: unknown)');
+    assert.deepStrictEqual(post.declarations, [{ decl_file: file, decl_line: post_line }]);
+    assert.deepStrictEqual(get.declarations, [{ decl_file: file, decl_line: lineOf('get(url: string)') }]);
+    // A member typed by an interface with call signatures names the property.
+    assert.deepStrictEqual(put.declarations, [{ decl_file: file, decl_line: lineOf('put: Put;') }]);
+    assert.deepStrictEqual(instPost.declarations, [{ decl_file: file, decl_line: post_line }]);
+    assert.deepStrictEqual(instPut.declarations, [{ decl_file: file, decl_line: lineOf('put: Put;') }]);
+    // A maker names none: only an op names a member.
+    assert.strictEqual(make.declarations, undefined);
+  });
+});

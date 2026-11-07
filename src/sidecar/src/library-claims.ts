@@ -2283,6 +2283,19 @@ class DeclarationReader {
     if (claim.kind !== 'op' || claim.op !== 'request' || claim.handler || claim.ack || claim.path !== undefined) {
       return unchecked('claim_invalid');
     }
+    const outcome = this.judgeHttpOp(receiver, claim);
+    if (outcome.verdict !== 'verified') return outcome;
+    // The member it judged (carrick#3044 S1): the position row of a call of
+    // that member joins on it, whatever holds the call's receiver.
+    const callable = claim.member === null ? this.callSignatures(receiver) : this.callableProperty(receiver, claim.member);
+    if ('failure' in callable) return outcome;
+    const property = claim.member === null ? undefined : this.declaredProperty(receiver, claim.member);
+    const declarations = this.declarationsOf(property ? { ...callable, named: { property, holder: receiver } } : callable);
+    return declarations.length > 0 ? { ...outcome, declarations } : outcome;
+  }
+
+  /** The #1564 request check of an `op` claim already known to be an HTTP request shape. */
+  private judgeHttpOp(receiver: ts.Type, claim: OpClaim): Outcome {
     const name = claim.name;
     if (name !== undefined && !('arg' in name)) return unchecked('claim_invalid');
     if (claim.method_key) {

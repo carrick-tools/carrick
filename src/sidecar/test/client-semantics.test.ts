@@ -182,7 +182,7 @@ interface Result {
   receiver: string;
   verdict: 'verified' | 'failed' | 'unchecked';
   reason?: string;
-}
+  declarations?: Array<{ decl_file: string; decl_line: number }>;}
 interface Module {
   package: string;
   resolved_file?: string;
@@ -432,8 +432,11 @@ describe('verify_client_semantics (carrick#1564)', () => {
     // One result per check, in request order.
     assert.deepStrictEqual(pairs(results), pairs(checks));
     for (const result of results) {
+      // A verified request claim names its member's declarations (carrick#3044 S1).
+      const { declarations, ...rest } = result;
+      assert.ok(declarations === undefined || declarations.length > 0, `${result.claim_id}: declarations`);
       assert.deepStrictEqual(
-        result,
+        rest,
         { claim_id: result.claim_id, receiver: result.receiver, verdict: 'verified' },
         `${result.claim_id} @ ${result.receiver}`
       );
