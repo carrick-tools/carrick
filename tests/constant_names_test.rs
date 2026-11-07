@@ -170,7 +170,14 @@ fn a_name_stated_through_constants_is_a_fact_row() {
         .iter()
         .map(|file| file.as_str().unwrap())
         .collect();
-    for (file, want) in key["names"].as_object().unwrap() {
+    // A `let` base reads as a `const` one does: `${BASE}/items` and a host
+    // base alike (`same_as_const`).
+    let names = key["names"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .chain(key["same_as_const"].as_object().unwrap());
+    for (file, want) in names {
         let want = want.as_str().unwrap();
         // A broker's label does not say topic or job name: the kind is
         // asked, so the row waits on the answer whatever the name.

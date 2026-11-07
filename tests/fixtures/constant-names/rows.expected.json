@@ -18,6 +18,11 @@
     "src/s-enum.ts": "room.joined",
     "src/s-let.ts": "room.left"
   },
+  "same_as_const": {
+    "src/c-const-imported.ts": "/c/shared2/items",
+    "src/c-let-host.ts": "https://api.example.com/let-host",
+    "src/c-const-host.ts": "https://api.example.com/const-host"
+  },
   "kind_asked": [
     "src/q-enum.ts",
     "src/q-join.ts"
