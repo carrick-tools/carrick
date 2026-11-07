@@ -1050,6 +1050,23 @@ impl Visit for CallFinder<'_> {
         self.walk_args(text, line, &call.args);
     }
 
+    /// An optional call (`x?.m(..)`) is the call its plain twin is: the site
+    /// is the whole chain or its call part, and takes the same record.
+    fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
+        if let OptChainBase::Call(call) = &*chain.base {
+            let whole = (chain.span.lo.0, chain.span.hi.0) == self.target;
+            if whole || (call.span.lo.0, call.span.hi.0) == self.target {
+                self.take(call.span, Some(&call.callee), &call.args, false);
+            }
+            call.callee.visit_with(self);
+            let text = self.parsed.text_of(call.callee.span());
+            let line = self.parsed.line(call.span.lo.0);
+            self.walk_args(text, line, &call.args);
+        } else {
+            chain.visit_children_with(self);
+        }
+    }
+
     fn visit_new_expr(&mut self, new: &NewExpr) {
         let args = new.args.as_deref().unwrap_or_default();
         if (new.span.lo.0, new.span.hi.0) == self.target {
@@ -3170,5 +3187,51 @@ mod tests {
             .unwrap_or_else(|| panic!("{at}"));
         assert_eq!(download.basis.get(&Slot::Method), Some(&Basis::Label));
         assert_eq!(download.basis.get(&Slot::Name), Some(&Basis::Code));
+    }
+
+    /// carrick#3044 S3: an optional call (`wire?.emit(...)`) keeps the record
+    /// its plain twin has, on a send and on a receive. The record step found
+    /// calls and constructions only, so a decided optional site was dropped
+    /// with no record and no lead.
+    #[test]
+    fn an_optional_call_has_the_record_its_plain_twin_has() {
+        use super::super::decided_sites::tests::wire_label;
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let file = "src/slots/optional.ts";
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let send = wire_label("emit", "send", Some(1), None);
+        let on = wire_label("on", "receive", None, Some(1));
+        let calls = [
+            ("wire.emit(\"tick\", { at: 1 })", "wire.emit", &send),
+            ("wire?.emit(\"tick\", { at: 1 })", "wire?.emit", &send),
+            (
+                "wire?.on(\"user.joined\", (data) => {\n    console.log(data);\n  })",
+                "wire?.on",
+                &on,
+            ),
+        ];
+        let sites: Vec<_> = calls
+            .iter()
+            .map(|(call, callee, label)| bottom(&end_for(label, file, &text, call), callee))
+            .collect();
+        let labels = vec![send.clone(), on.clone()];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        let records = site_records(&inputs, &root, &decided, &labels);
+        let at = |needle: &str| {
+            let at = format!("{file}:{}", line_of(&text, needle));
+            records
+                .iter()
+                .find(|record| record.state.point.at == at)
+                .unwrap_or_else(|| panic!("no record at {at}: {records:?}"))
+        };
+        let (plain, optional, listen) = (at("wire.emit"), at("wire?.emit"), at("wire?.on"));
+        assert_eq!(optional.bucket, plain.bucket, "{:?}", optional.state);
+        assert_eq!(optional.state.forced, plain.state.forced);
+        assert_eq!(optional.lead, plain.lead);
+        assert_eq!(
+            listen.state.forced.get(&Slot::Name).map(String::as_str),
+            Some("user.joined")
+        );
     }
 }
