@@ -1,0 +1,3 @@
+{
+  "services": [{ "name": "constant-names", "directory": ".", "tsconfig": "tsconfig.json" }]
+}
