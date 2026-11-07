@@ -812,3 +812,58 @@ fn every_workspace_pattern_matching_nothing_is_still_refused() {
     );
     assert!(resolve(dir.path()).is_err());
 }
+
+/// The config a derived member names is the one the type sidecar picks for a
+/// service with none named (carrick#3497): the service root's own config under
+/// any of its names, else the nearest `tsconfig.json` above it.
+fn governing_config_of(variant: &str) -> Option<String> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/governing-config")
+        .join(variant);
+    let derived = resolve(&root).unwrap();
+    assert_eq!(derived.services.len(), 1, "{variant}: one member");
+    derived.services[0].tsconfig.clone()
+}
+
+#[test]
+fn derived_member_names_the_service_root_config_under_any_root_name() {
+    // Root `tsconfig.json` is `{}`; the member's own config is
+    // `tsconfig.app.json`, so the ancestor must not be named.
+    assert_eq!(
+        governing_config_of("a-ws").as_deref(),
+        Some("tsconfig.app.json")
+    );
+    // Control names: `tsconfig.json` at the member root stays itself.
+    assert_eq!(
+        governing_config_of("b-ws").as_deref(),
+        Some("tsconfig.json")
+    );
+    assert_eq!(
+        governing_config_of("pos-ws").as_deref(),
+        Some("tsconfig.json")
+    );
+    // A jsconfig-only member names its jsconfig.
+    assert_eq!(
+        governing_config_of("j-only").as_deref(),
+        Some("jsconfig.json")
+    );
+}
+
+#[test]
+fn derived_member_without_a_root_config_names_the_nearest_ancestor_tsconfig() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    );
+    write(root, "tsconfig.json", "{}");
+    write(root, "packages/a/package.json", r#"{"name":"a"}"#);
+    write(root, "packages/a/src/index.ts", "export const a = 1;");
+    let derived = resolve(root).unwrap();
+    assert_eq!(
+        derived.services[0].tsconfig.as_deref(),
+        Some("../../tsconfig.json")
+    );
+}
