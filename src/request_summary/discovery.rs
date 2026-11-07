@@ -1508,8 +1508,10 @@ impl<'a> Walker<'a> {
     /// whose claims they are, where each of those exports claims the member
     /// the same way (the store labels a package's factory under every name
     /// it is published as, `default` and a named export, and both name the
-    /// member's declaration). An op on what a scope member returns is one
-    /// only alone: its export also picks the scope label it is read under.
+    /// member's declaration), or where one claims it on the export and the
+    /// other on its type, which differ only in the receiver they name
+    /// (carrick#3044 S2). An op on what a scope member returns is one only
+    /// alone: its export also picks the scope label it is read under.
     /// `None` where they disagree.
     fn one_op<'d>(&self, ops: &'d [DeclaredOp]) -> Option<&'d DeclaredOp> {
         let (first, rest) = ops.split_first()?;
@@ -1525,7 +1527,7 @@ impl<'a> Walker<'a> {
                     .filter(|claim| {
                         matches!(claim, LibraryClaim::Op { member: Some(member), .. } if *member == op.member)
                     })
-                    .map(LibraryClaim::without_picker)
+                    .map(|claim| claim.without_picker().without_receiver())
                     .collect(),
             )
         };

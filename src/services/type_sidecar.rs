@@ -1494,6 +1494,23 @@ impl LibraryClaim {
         claim
     }
 
+    /// The claim without the receiver selector (`on`, `of`): an export label
+    /// and a type label that read a member the same way are equal apart from
+    /// which receivers they name (carrick#3044 S2).
+    pub fn without_receiver(&self) -> LibraryClaim {
+        let mut claim = self.clone();
+        match &mut claim {
+            LibraryClaim::Op { on, of, .. }
+            | LibraryClaim::Result { on, of, .. }
+            | LibraryClaim::Reserved { on, of, .. } => {
+                *on = None;
+                *of = None;
+            }
+            LibraryClaim::Make { .. } | LibraryClaim::Scope { .. } => {}
+        }
+        claim
+    }
+
     /// The `result` check for a make or op claim that carries a result: the
     /// same member, path, and receivers, asked on its own. `None` for a claim
     /// with no result and for any other kind.

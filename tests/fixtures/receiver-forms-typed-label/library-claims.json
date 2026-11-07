@@ -25,7 +25,8 @@
                 "arg": 1
               },
               "method": "POST",
-              "picker": "fixture-picker"
+              "picker": "fixture-picker",
+              "protocol": "http"
             }
           ],
           "reserved": [],
