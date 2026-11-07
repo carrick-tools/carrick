@@ -502,16 +502,16 @@ test("the session line is one line per service, with what it holds and how far i
   );
   assert.match(
     lines[1] ?? "",
-    /^- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7 \(/,
+    /^- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7$/,
   );
-  assert.match(lines[3] ?? "", /^- order-service at 9988776: 40 route\(s\), 61 call\(s\), changed since index: 120 \(/);
+  assert.match(lines[3] ?? "", /^- order-service at 9988776: 40 route\(s\), 61 call\(s\), changed since index: 120$/);
 });
 
 // A workspace of fifteen services printed about ninety lines into every
 // session: each service, then each service's boundary report. Above three
 // services the session gets the total, the services with something to do about
 // them, and the command that prints the rest (carrick#1365).
-test("a large workspace gets the services worth acting on, and a pointer to the rest", () => {
+test("a large workspace gets one count and the services worth acting on, and a pointer to the rest", () => {
   const base = statusFixture("status-workspace.json");
   const template = base.services[0]!;
   const services = Array.from({ length: 15 }, (_, index) => ({
@@ -522,28 +522,70 @@ test("a large workspace gets the services worth acting on, and a pointer to the 
     changed_since_index: index < 10 ? 1 : 0,
     stale_files: index < 10 ? ["src/a.ts"] : [],
     stale_files_total: index < 10 ? 1 : 0,
-    hosted_state: "enriched" as const,
-    boundary: undefined,
+    // Two of them wait on the cloud scan; the others have nothing to act on.
+    boundary: index < 2 ? { ...template.boundary, candidates_awaiting_model: 4 } : undefined,
+    hosted_state: index < 2 ? ("no_index_yet" as const) : ("enriched" as const),
     boundary_lines: ["boundary line nobody acts on at session start"],
   }));
   const lines = renderSessionStart({ ...base, services, repos: [] }).split("\n");
   assert.match(lines[0] ?? "", /^Carrick indexed 15 service\(s\).*: 30 route\(s\), 15 call\(s\)\.$/);
-  // Eight of the ten that moved, the other two counted, the five quiet ones
-  // nowhere, and no boundary report at all.
-  assert.equal(lines.filter((line) => line.startsWith("- svc-")).length, LISTED_SERVICES);
-  assert.ok(lines.includes("- +2 more service(s) with something to act on"));
-  assert.ok(!lines.some((line) => line.includes("svc-12")));
+  assert.equal(lines[1], "10 services have local changes since the index; `carrick status` lists them.");
+  // Only the two with something to act on are named; the eight that merely
+  // moved are in the count, and no boundary report prints.
+  assert.deepEqual(
+    lines.filter((line) => line.startsWith("- svc-")).map((line) => line.split(" ")[1]),
+    ["svc-0", "svc-1"],
+  );
+  assert.ok(!lines.some((line) => line.includes("src/a.ts")));
   assert.ok(!lines.some((line) => line.includes("boundary line nobody acts on")));
   assert.equal(lines.at(-1), BOUNDARY_POINTER);
-  assert.equal(lines.length, 1 + LISTED_SERVICES + 1 + 1);
+  assert.equal(lines.length, 1 + 1 + 2 + 1);
 });
 
-test("at most five stale files are named, and the rest are counted", () => {
+test("services past the listing cap are counted, not named", () => {
+  const base = statusFixture("status-workspace.json");
+  const template = base.services[0]!;
+  const services = Array.from({ length: LISTED_SERVICES + 2 }, (_, index) => ({
+    ...template,
+    service: `svc-${index}`,
+    changed_since_index: 0,
+    hosted_state: "no_index_yet" as const,
+  }));
+  const lines = renderSessionStart({ ...base, services, repos: [] }).split("\n");
+  assert.equal(lines.filter((line) => line.startsWith("- svc-")).length, LISTED_SERVICES);
+  assert.ok(lines.includes("- +2 more service(s) with something to act on"));
+});
+
+// One edit to a shared file moves every service that reads it. Session start
+// printed the same five paths on each of eight service lines (carrick#3477).
+test("one shared file edited under eight services names no path and is three lines", () => {
+  const base = statusFixture("status-workspace.json");
+  const template = base.services[0]!;
+  const services = Array.from({ length: 8 }, (_, index) => ({
+    ...template,
+    service: `lambda-${index}`,
+    changed_since_index: 1,
+    stale_files: ["_shared/db/client.ts"],
+    stale_files_total: 1,
+    boundary: undefined,
+    hosted_state: "enriched" as const,
+  }));
+  const repos = [
+    { repo: "/repos/mono", name: "mono", changed_since_index: 1, outside_every_service: 0, stale_files: [] },
+  ];
+  const rendered = renderSessionStart({ ...base, services, repos });
+  const lines = rendered.split("\n");
+  assert.doesNotMatch(rendered, /\.ts|_shared/, "no file path");
+  assert.equal(lines.length, 3);
+  assert.equal(lines[1], "8 services have local changes since the index; `carrick status` lists them.");
+  assert.equal(lines[2], BOUNDARY_POINTER);
+});
+
+test("a small workspace's service lines carry counts and no file paths", () => {
   const lines = renderSessionStart(statusFixture("status-workspace.json")).split("\n");
-  const first = lines[1] ?? "";
-  assert.match(first, /\(src\/routes\/users\.ts, src\/routes\/orders\.ts, src\/lib\/db\.ts, src\/lib\/http\.ts, src\/util\/format\.ts, \+2 more\)$/);
-  const truncated = lines[3] ?? "";
-  assert.match(truncated, /, \+115 more\)$/, "the count comes from stale_files_total, not the list");
+  assert.match(lines[1] ?? "", /changed since index: 7$/);
+  assert.match(lines[3] ?? "", /changed since index: 120$/, "the count comes from changed_since_index");
+  assert.ok(!lines.slice(1, 4).some((line) => line.includes("src/")));
 });
 
 test("every service states the count of what its own scan reads", () => {
@@ -599,8 +641,9 @@ test("files outside every service are the repo's line, not each service's", () =
   });
   assert.match(
     rendered,
-    /- monorepo: 2 file\(s\) changed outside every service \(carrick\.json, \.github\/workflows\/carrick\.yml\)/,
+    /- monorepo: 2 file\(s\) changed outside every service$/m,
   );
+  assert.doesNotMatch(rendered, /carrick\.json|workflows/, "the repo line counts files, it does not name them");
 });
 
 test("no index gives one line and the command that reads one in", () => {

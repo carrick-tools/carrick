@@ -30,7 +30,6 @@ import {
   movedLines,
   notCoveredLine,
   renderPostToolUse,
-  runClause,
   sessionCheckedLines,
   staleClause,
 } from "../render.ts";
@@ -94,13 +93,13 @@ function render(answer: Answer, settled: boolean): string {
   const result: CheckResult | undefined = answer.result;
   if (answer.state !== "answered" || result === undefined || result.error) {
     const reason = answer.failure ?? "the re-check gave no answer";
-    return `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.${runClause(settled)}`;
+    return `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.`;
   }
   if (!answersTheEdit(result)) {
     const reason = result.recheck?.reason;
     return reason
-      ? `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.${runClause(settled)}`
-      : `Carrick: ${where} was not re-checked here.${runClause(settled)}`;
+      ? `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.`
+      : `Carrick: ${where} was not re-checked here.`;
   }
   return renderPostToolUse(result, where, { uses: false, late: true, settled }) ?? "";
 }
@@ -293,9 +292,8 @@ export async function stopAnswers(session: string, options: StopOptions): Promis
     const files = [...new Set(unnamed.map((entry) => entry.relative))];
     const oldest = Math.max(...unnamed.map((entry) => at - Date.parse(entry.enqueued_at)));
     const seconds = Math.max(0, Math.round(oldest / 1000));
-    const settled = unnamed.every((entry) => settledAt(entry.root));
     lines.push(
-      `Carrick: the re-check of ${files.join(", ")} is still running after ${seconds} s.${runClause(settled)}`,
+      `Carrick: the re-check of ${files.join(", ")} is still running after ${seconds} s.`,
     );
   }
   return { lines };
