@@ -50,6 +50,8 @@ use swc_common::{BytePos, SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+mod fold;
+
 use super::RequestSummaryInputs;
 use super::decided_sites::{
     Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel, SlotBinding,
@@ -582,6 +584,59 @@ fn name_literals(names: &[CompilerName], ident: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The one text each value `pieces` names always is, by the value's text
+/// ([`fold::Fold`], carrick#3479): a `let` never assigned again, an enum
+/// member, an entry of a constant object, a built-in over such parts. The
+/// value is read at the expression the call writes for it among `exprs`
+/// (the site's name arguments, in `file`). A value that does not fold is
+/// left out.
+fn folded_values(
+    sources: &mut Sources<'_>,
+    positions: Option<&PositionIndex>,
+    root: &Path,
+    file: &str,
+    pieces: &[super::Piece],
+    exprs: &[&Expr],
+) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    let Some(positions) = positions else {
+        return values;
+    };
+    for piece in pieces {
+        let super::Piece::Opaque { text, .. } = piece else {
+            continue;
+        };
+        if values.contains_key(text) {
+            continue;
+        }
+        let Some(expr) = sources
+            .get(file)
+            .and_then(|parsed| expr_written_as(parsed, exprs, text))
+        else {
+            continue;
+        };
+        if let Some(value) = fold::Fold::new(sources, positions, root).text(file, &expr) {
+            values.insert(text.clone(), value);
+        }
+    }
+    values
+}
+
+/// The literals for the value written as `text`: the compiler's literal
+/// type for a name among `names`, else the one text it folds to
+/// ([`folded_values`]).
+fn piece_literals(
+    names: &[CompilerName],
+    folded: &HashMap<String, String>,
+    text: &str,
+) -> Vec<String> {
+    let typed = name_literals(names, text);
+    if !typed.is_empty() {
+        return typed;
+    }
+    folded.get(text).cloned().into_iter().collect()
+}
+
 /// A route site's own path read through the compiler ([`folded_text`],
 /// carrick#3213), for the trace to compose its full path from before any
 /// record is written. Each file is parsed once.
@@ -637,7 +692,20 @@ impl<'r> NameFold<'r> {
             &site.file,
             &idents,
         );
-        folded_text(&site.name, &|ident| name_literals(&names, ident))
+        let exprs: Vec<&Expr> = site
+            .name_args
+            .iter()
+            .filter_map(|index| parts.arg_exprs.get(*index))
+            .collect();
+        let folded = folded_values(
+            &mut self.sources,
+            Some(positions),
+            root,
+            &site.file,
+            &site.name,
+            &exprs,
+        );
+        folded_text(&site.name, &|text| piece_literals(&names, &folded, text))
     }
 }
 
@@ -1454,8 +1522,18 @@ fn record(
         idents.extend(written.idents.iter().cloned());
     }
     let names = compiler_names(sources, positions, root, file, &idents);
-    // The literals a name's type stands for: one, or each of a union's.
-    let literals = |ident: &str| -> Vec<String> { name_literals(&names, ident) };
+    // The literals a name's type stands for: one, or each of a union's;
+    // else the one text the value the name slot writes folds to
+    // (carrick#3479).
+    let folded = {
+        let exprs: Vec<&Expr> = site
+            .name_args
+            .iter()
+            .filter_map(|index| parts.arg_exprs.get(*index))
+            .collect();
+        folded_values(sources, positions, root, file, &site.name, &exprs)
+    };
+    let literals = |text: &str| -> Vec<String> { piece_literals(&names, &folded, text) };
 
     // The functions the call runs, two levels down.
     // Each is the function the call above enters, read at the call inside
@@ -1525,11 +1603,21 @@ fn record(
             // the same pieces (carrick#2519): a base, literal segments, and
             // each parameter or unread value a whole segment. Else the
             // template with each value it names read as the one string the
-            // compiler types it as (carrick#3213).
+            // compiler types it as (carrick#3213). A value the compiler
+            // types wider than the one text it always is (carrick#3479) is
+            // read before the target, as a constant the summaries link is:
+            // `${BASE}/items` with `let BASE = '/api'` is `/api/items`, not
+            // a base and a path.
+            let read_through = site.name.iter().any(|piece| {
+                matches!(piece, super::Piece::Opaque { text, .. }
+                    if folded.contains_key(text) && name_literals(&names, text).is_empty())
+            });
             match stated_whole(sources.get(file), &site.name, &name_exprs, &literals) {
                 Some(values) => Some(values),
-                None => site
-                    .name_text()
+                None => read_through
+                    .then(|| folded_text(&site.name, &literals))
+                    .flatten()
+                    .or_else(|| site.name_text())
                     .or_else(|| folded_text(&site.name, &literals))
                     .map(|text| {
                         stated.value(&text, place(PlaceFrom::TemplateLiteral, &at));
