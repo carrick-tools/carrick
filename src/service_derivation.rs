@@ -472,7 +472,8 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         {
             None
         } else {
-            nearest_tsconfig(&root, &directory)
+            crate::module_aliases::service_config(&root, relative)
+                .map(|config| relative_to_directory(&config, relative))
         };
         services.push(Config {
             service_name: name,
@@ -796,23 +797,23 @@ fn imported_members(
     found
 }
 
-fn nearest_tsconfig(root: &Path, directory: &Path) -> Option<String> {
-    let mut prefix = PathBuf::new();
-    for ancestor in directory.ancestors() {
-        if !ancestor.starts_with(root) {
-            break;
-        }
-        if ancestor.join("tsconfig.json").is_file() {
-            return Some(
-                prefix
-                    .join("tsconfig.json")
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
-        }
-        prefix.push("..");
+/// `config`, a repo-relative file, written as a path from `directory`, the
+/// repo-relative service directory: `..` for each directory of `directory` the
+/// file is not under, then the rest of the file's path.
+fn relative_to_directory(config: &Path, directory: &Path) -> String {
+    let shared = config
+        .components()
+        .zip(directory.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = PathBuf::new();
+    for _ in shared..directory.components().count() {
+        out.push("..");
     }
-    None
+    for part in config.components().skip(shared) {
+        out.push(part);
+    }
+    out.to_string_lossy().replace('\\', "/")
 }
 
 /// Whether a path `carrick.json` names, relative to the repository root,
