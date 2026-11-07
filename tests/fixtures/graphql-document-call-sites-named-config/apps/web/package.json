@@ -1,0 +1,10 @@
+{
+  "name": "shop-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@example/gql-client": "^1.0.0",
+    "@example/typed-document": "^1.0.0",
+    "graphql": "^16.9.0"
+  }
+}
