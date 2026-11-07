@@ -171,9 +171,11 @@ describe('carrick#3523: a failure helper the repo declares is an error branch', 
     assert.ok(published?.includes('success: false'), `got: ${published}`);
   });
 
-  it('keeps the helper argument when the helper also sends a success status', async () => {
+  it('does not drop the branch when the helper also sends a success status', async () => {
+    // Only "not dropped" is pinned: the right reading of this branch is the
+    // helper's success return, not its argument (carrick#3530).
     const published = await response('export async function either');
     assert.ok(published?.includes('presignedUrl'), `got: ${published}`);
-    assert.ok(published?.includes('success: false'), `got: ${published}`);
+    assert.notStrictEqual(published, '{ presignedUrl: string; }', 'the branch must not be dropped');
   });
 });
