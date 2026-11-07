@@ -10,8 +10,11 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
+  answerInHand,
+  CHANGED_BUDGET_MS,
   claimDelivery,
   enqueue,
+  enqueueChanged,
   ensureRunner,
   finishedFor,
   lockPath,
@@ -20,7 +23,12 @@ import {
   runQueue,
   takenDir,
 } from "../src/hook/rechecks.ts";
-import { fakeBin, fakeEnv } from "./helpers.ts";
+import { checkedSinceLastEdit } from "../src/hook/checked.ts";
+import { lateContext } from "../src/hook/late.ts";
+import { recordEdit } from "../src/hook/reuse.ts";
+import { sessionCoverage } from "../src/hook/stop-wait.ts";
+import { parseCheckResult } from "../src/contract.ts";
+import { fakeBin, fakeEnv, fixturePath } from "./helpers.ts";
 
 function scratch() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-rechecks-"));
@@ -214,6 +222,60 @@ test("each call carries the background budget and a timeout past it", async () =
     const [line] = fs.readFileSync(s.envLog, "utf8").split("\n").filter(Boolean);
     assert.deepEqual(JSON.parse(line!), { budget: "180000", timeout: "195000" });
     assert.ok(fs.existsSync(fakeBin));
+  } finally {
+    s.cleanup();
+  }
+});
+
+// The whole-change check a Stop queues when it cannot state the session's
+// check from the per-file answers (carrick#3466).
+
+test("a changed entry runs after every per-file entry, one per session and root, the newer superseding the older; the next carrier delivers it and its marker drops the clause", async () => {
+  const s = scratch();
+  try {
+    const now = Date.now();
+    recordEdit("s1", s.root, now - 1000, s.home, [s.file("a.ts")]);
+    const older = enqueueChanged(s.root, "s1", now, { home: s.home })!;
+    const newer = enqueueChanged(s.root, "s1", now + 1, { home: s.home })!;
+    enqueue(s.root, "s1", [s.file("a.ts")], now + 2, { home: s.home });
+    enqueue(s.root, "s2", [s.file("b.ts")], now + 3, { home: s.home });
+    await runQueue(s.root, { env: env(s), home: s.home });
+    assert.deepEqual(calls(s.log), ["a.ts", "b.ts", "--changed"], "the changed check runs last, once");
+    // Its own budget, above the per-file cap: a whole-change check takes longer.
+    const envs = fs.readFileSync(s.envLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { budget: string | null; timeout: string | null });
+    assert.equal(envs[2]!.budget, null, "no per-file re-check budget on the changed call");
+    assert.equal(envs[2]!.timeout, String(CHANGED_BUDGET_MS + 15_000));
+
+    const answers = finishedFor("s1", s.home);
+    assert.equal(answers.some((a) => a.seq === older.seq), false, "the older one is superseded, silently");
+    const changed = answers.find((a) => a.seq === newer.seq)!;
+    assert.equal(changed.kind, "changed");
+    assert.equal(changed.changed?.exit, 0);
+    const line = lateContext(changed, false, checkedSinceLastEdit("s1", s.root, s.home));
+    assert.equal(
+      line,
+      "Carrick ran `carrick check --changed` for this session's change: no contract problem in 2 changed files.",
+    );
+    // The binary's marker (exit 0, begun after the edit) settles later lines.
+    assert.equal(checkedSinceLastEdit("s1", s.root, s.home), true);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a file answered in hand counts as covered", () => {
+  const s = scratch();
+  try {
+    const now = Date.now();
+    recordEdit("s1", s.root, now, s.home, [s.file("a.ts")]);
+    const result = parseCheckResult(fs.readFileSync(fixturePath("check-clean.json"), "utf8"))!;
+    answerInHand(s.root, "s1", s.file("a.ts"), result, now, { home: s.home });
+    assert.deepEqual(pendingFor("s1", s.home), [], "nothing to wait for");
+    assert.deepEqual(finishedFor("s1", s.home), [], "nothing owed: the post-edit hook printed it");
+    const coverage = sessionCoverage("s1", s.root, s.home, now);
+    assert.equal(coverage.files, 1);
+    assert.deepEqual(coverage.gaps, []);
+    assert.equal(coverage.covered.length, 1);
   } finally {
     s.cleanup();
   }

@@ -641,6 +641,64 @@ export function problemItems(result: CheckResult): CheckItem[] {
   });
 }
 
+/** One problem of a `carrick.check-changed/0` answer (`Problem` in `src/local_mode/changed.rs`). */
+export type ChangedProblem = {
+  kind: string;
+  file: string;
+  line: number | null;
+  role: string;
+  method: string;
+  path: string;
+  other: string[];
+  reason: string;
+  fails: boolean;
+};
+
+/**
+ * What a background `carrick check --changed --json` answered: the fields
+ * the hooks print (`ChangedOutput` in `src/local_mode/changed.rs`), and the
+ * process exit code, which the payload does not carry.
+ */
+export type ChangedResult = {
+  schema: string;
+  exit: number;
+  files: number;
+  routes: number;
+  calls: number;
+  services: number;
+  failing: number;
+  type_checked: number;
+  problems: ChangedProblem[];
+  not_checked?: string;
+};
+
+const CHANGED_SCHEMA = "carrick.check-changed/0";
+
+/** Parse `carrick check --changed --json` stdout and its exit code, or `null`. */
+export function parseChangedResult(stdout: string, exit: number): ChangedResult | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || parsed["schema"] !== CHANGED_SCHEMA) return null;
+  const count = (key: string): number => (typeof parsed[key] === "number" ? (parsed[key] as number) : 0);
+  const result: ChangedResult = {
+    schema: CHANGED_SCHEMA,
+    exit,
+    files: count("files"),
+    routes: count("routes"),
+    calls: count("calls"),
+    services: count("services"),
+    failing: count("failing"),
+    type_checked: count("type_checked"),
+    problems: Array.isArray(parsed["problems"]) ? (parsed["problems"] as ChangedProblem[]) : [],
+  };
+  if (typeof parsed["not_checked"] === "string") result.not_checked = parsed["not_checked"];
+  return result;
+}
+
 /** Items that name a counterpart in another service, problem or not. */
 export function connectedItems(result: CheckResult): CheckItem[] {
   return (result.items ?? []).filter((item) => (item.counterparts ?? []).length > 0);

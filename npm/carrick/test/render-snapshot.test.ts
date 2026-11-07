@@ -19,8 +19,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { parseCheckResult, parseStatusResult } from "../src/contract.ts";
-import { renderPostToolUse, renderSessionStart } from "../src/render.ts";
+import { parseChangedResult, parseCheckResult, parseStatusResult } from "../src/contract.ts";
+import { changedLines, renderPostToolUse, renderSessionStart } from "../src/render.ts";
 import { fixturePath, testDir } from "./helpers.ts";
 
 const SNAPSHOT = fixturePath("agent-channel.snapshot.txt");
@@ -46,6 +46,13 @@ function render(): string {
     const status = parseStatusResult(raw);
     if (status) {
       blocks.push(`### ${name} :: renderSessionStart\n${renderSessionStart(status)}`);
+      continue;
+    }
+    // A `check --changed` payload carries no exit code: a failing problem is exit 1.
+    const probe = parseChangedResult(raw, 0);
+    if (probe) {
+      const changed = probe.failing > 0 ? { ...probe, exit: 1 } : probe;
+      blocks.push(`### ${name} :: changedLines\n${changedLines(changed)}`);
       continue;
     }
     blocks.push(`### ${name} :: neither schema`);

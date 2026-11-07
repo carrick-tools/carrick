@@ -24,8 +24,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { binary, check } from "../cli.ts";
-import type { CheckResult } from "../contract.ts";
+import { binary, check, checkChanged } from "../cli.ts";
+import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
 import { startDetached } from "./refresh.ts";
 import { safeId, sessionsDir, writeAtomic } from "./reuse.ts";
@@ -83,6 +83,13 @@ export type QueueEntry = {
   enqueued_at: string;
   /** How many runners died holding this entry. */
   attempts: number;
+  /**
+   * `changed`: one `carrick check --changed` for the session's whole change
+   * in `root` (`file` is `root`), queued by a Stop that could not state the
+   * check from the per-file answers (carrick#3466). It runs after every
+   * per-file entry and Stop never waits for it. Absent: one edited file.
+   */
+  kind?: "changed";
 };
 
 export type Answer = {
@@ -95,9 +102,28 @@ export type Answer = {
   enqueued_at: string;
   started_at: string | null;
   finished_at: string;
+  kind?: "changed";
   result?: CheckResult;
+  /** What a `changed` entry's `check --changed` answered. */
+  changed?: ChangedResult;
   failure?: string;
 };
+
+/** Whether an entry or answer is the session's whole-change check. */
+export function isChanged(entry: { kind?: string }): boolean {
+  return entry.kind === "changed";
+}
+
+/**
+ * How long the background `check --changed` may run, in ms: the binary's own
+ * default budget (`DEFAULT_BUDGET`, 300 s, in `src/local_mode/changed.rs`),
+ * given to it as `CARRICK_CHECK_BUDGET_MS`. Longer than the per-file cap
+ * because it re-reads every changed repo (measured 37-209 s, carrick#3466).
+ */
+export const CHANGED_BUDGET_MS = 300_000;
+
+/** How often the runner touches its lock while one call runs. */
+const LOCK_TOUCH_MS = 30_000;
 
 export type Pending = QueueEntry & { toldRunning: boolean };
 
@@ -212,6 +238,62 @@ export function enqueue(
     queued.push(entry);
   }
   return queued;
+}
+
+/**
+ * Queue one `carrick check --changed` for this session's change in `root`,
+ * behind every per-file entry (`nextEntry` runs it last). A newer one of the
+ * same session supersedes an older one that has not started. Null when the
+ * queue refused it.
+ */
+export function enqueueChanged(root: string, session: string, now: number, options: Options = {}): QueueEntry | null {
+  const seq = nextSeq(now);
+  const entry: QueueEntry = {
+    seq,
+    session,
+    file: root,
+    relative: ".",
+    root,
+    enqueued_at: new Date(now).toISOString(),
+    attempts: 0,
+    kind: "changed",
+  };
+  const pending = sessionPart(session, seq, "pending.json", options.home);
+  if (pending === null) return null;
+  const body = `${JSON.stringify(entry, null, 2)}\n`;
+  if (!writeAtomic(pending, body)) return null;
+  if (!createExclusive(path.join(queueDir(root), `${seq}.json`), body)) {
+    remove(pending);
+    return null;
+  }
+  return entry;
+}
+
+/**
+ * Record an answer the post-edit hook had in hand (no re-check queued) as the
+ * session's answer for that edit, already delivered: the hook printed it. It
+ * is what `sessionCoverage` (stop-wait.ts) reads for a file that was never
+ * queued (carrick#3466); `pendingFor` and `finishedFor` skip it.
+ */
+export function answerInHand(
+  root: string,
+  session: string,
+  file: string,
+  result: CheckResult,
+  now: number,
+  options: Options = {},
+): void {
+  const seq = nextSeq(now);
+  const at = new Date(now).toISOString();
+  const entry: QueueEntry = { seq, session, file, relative: path.relative(root, file), root, enqueued_at: at, attempts: 0 };
+  const pending = sessionPart(session, seq, "pending.json", options.home);
+  const answer = sessionPart(session, seq, "answer.json", options.home);
+  if (pending === null || answer === null) return;
+  // Delivered, then answered, then pending: no carrier ever reads it as owed
+  // to it, and no Stop ever waits for it.
+  if (!claimDelivery(session, seq, options.home, now)) return;
+  if (!writeAnswer(entry, "answered", now, now, { result }, options.home)) return;
+  writeAtomic(pending, `${JSON.stringify(entry, null, 2)}\n`);
 }
 
 // --- the runner's lock -----------------------------------------------------
@@ -358,9 +440,9 @@ function writeAnswer(
   state: AnswerState,
   startedAt: number | null,
   finishedAt: number,
-  body: { result?: CheckResult; failure?: string },
+  body: { result?: CheckResult; changed?: ChangedResult; failure?: string },
   home?: string,
-): void {
+): boolean {
   const answer: Answer = {
     seq: entry.seq,
     session: entry.session,
@@ -371,10 +453,11 @@ function writeAnswer(
     enqueued_at: entry.enqueued_at,
     started_at: startedAt === null ? null : new Date(startedAt).toISOString(),
     finished_at: new Date(finishedAt).toISOString(),
+    ...(isChanged(entry) ? { kind: "changed" as const } : {}),
     ...body,
   };
   const file = sessionPart(entry.session, entry.seq, "answer.json", home);
-  if (file !== null) writeAtomic(file, `${JSON.stringify(answer, null, 2)}\n`);
+  return file !== null && writeAtomic(file, `${JSON.stringify(answer, null, 2)}\n`);
 }
 
 function remove(file: string): void {
@@ -447,15 +530,20 @@ function nextEntry(
   const newest = new Map<string, string>();
   for (const { entry } of live) newest.set(`${entry.session}\0${entry.file}`, entry.seq);
   let chosen: QueueEntry | null = null;
+  // A `changed` entry runs only once no per-file entry is left: it never
+  // delays an answer a Stop waits for (carrick#3466).
+  let last: QueueEntry | null = null;
   for (const { name, entry } of live) {
     if (newest.get(`${entry.session}\0${entry.file}`) !== entry.seq) {
       writeAnswer(entry, "superseded", null, now, {}, home);
       remove(path.join(queueDir(root), name));
       continue;
     }
-    if (!skip.has(entry.seq)) chosen ??= entry;
+    if (skip.has(entry.seq)) continue;
+    if (isChanged(entry)) last ??= entry;
+    else chosen ??= entry;
   }
-  return chosen;
+  return chosen ?? last;
 }
 
 /** Claim an entry by renaming it into this runner's own folder. */
@@ -487,6 +575,13 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
     CARRICK_RECHECK_BUDGET_MS: String(cap),
     CARRICK_TIMEOUT_MS: String(cap + CALL_SLACK_MS),
   };
+  const { CARRICK_RECHECK_BUDGET_MS: _budget, ...base } = env;
+  void _budget;
+  const changedEnv: NodeJS.ProcessEnv = {
+    ...base,
+    CARRICK_CHECK_BUDGET_MS: String(CHANGED_BUDGET_MS),
+    CARRICK_TIMEOUT_MS: String(CHANGED_BUDGET_MS + CALL_SLACK_MS),
+  };
   const bin = options.bin ?? binary(env);
   // Entries this runner could not claim although their file stayed (a disk
   // that refuses the rename): answered once, then left alone for its life.
@@ -508,6 +603,24 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
       }
       touchLock(root, pid, clock());
       const startedAt = clock();
+      if (isChanged(entry)) {
+        // Longer than the per-file cap, so the lock is kept fresh while it
+        // runs: a lock older than cap + 60 s reads as dead to `ensureRunner`.
+        const keep = setInterval(() => touchLock(root, pid, clock()), LOCK_TOUCH_MS);
+        const outcome = await checkChanged({ cwd: root, limitMs: CHANGED_BUDGET_MS + CALL_SLACK_MS, env: changedEnv, bin });
+        clearInterval(keep);
+        const failure = outcome.failure ?? "the check gave no answer";
+        writeAnswer(
+          entry,
+          "answered",
+          startedAt,
+          clock(),
+          outcome.result ? { changed: outcome.result } : { failure },
+          options.home,
+        );
+        remove(taken);
+        continue;
+      }
       const outcome = await check(entry.relative, {
         cwd: root,
         recheck: true,
@@ -583,6 +696,25 @@ export function finishedFor(session: string, home?: string): Answer[] {
     if (answer === null || answer.state === "superseded") continue;
     if ((newest.get(answer.file) ?? seq) > seq) continue;
     out.push(answer);
+  }
+  return out;
+}
+
+/**
+ * The newest entry this session holds for each edited file, with its answer
+ * when there is one, delivered or not: what `sessionCoverage` reads. `changed`
+ * entries are not files and are left out.
+ */
+export function newestPerFile(session: string, home?: string): Map<string, { entry: QueueEntry; answer: Answer | null }> {
+  const all = sessionNames(session, home);
+  const out = new Map<string, { entry: QueueEntry; answer: Answer | null }>();
+  for (const name of all.filter((n) => n.endsWith(".pending.json"))) {
+    const entry = readJson<QueueEntry>(path.join(sessionsDir(home), name));
+    if (entry === null || isChanged(entry)) continue;
+    const held = out.get(entry.file);
+    if (held !== undefined && held.entry.seq > entry.seq) continue;
+    const answer = readJson<Answer>(path.join(sessionsDir(home), `${session}.recheck.${entry.seq}.answer.json`));
+    out.set(entry.file, { entry, answer });
   }
   return out;
 }

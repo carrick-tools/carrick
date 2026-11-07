@@ -32,7 +32,7 @@ import { markTold, recordEdit, toldKey, wasTold } from "./reuse.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
-import { enqueue, ensureRunner } from "./rechecks.ts";
+import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -129,8 +129,10 @@ async function main(): Promise<void> {
   const note = rootNote(choice);
   if (note) log(note);
   // Stamped before any line is built: a `carrick check --changed` that began
-  // earlier did not read this edit (`checked.ts`).
-  if (session) recordEdit(session, choice.root, Date.now());
+  // earlier did not read this edit (`checked.ts`). The files themselves are
+  // recorded once the probe has answered (below).
+  const editedAt = Date.now();
+  if (session) recordEdit(session, choice.root, editedAt);
 
   const contexts: string[] = [];
   // Files whose uses lines this message carries, remembered only once it is
@@ -167,10 +169,11 @@ async function main(): Promise<void> {
     if (context) rendered.set(index, context);
   }
 
+  const queued = new Set<string>();
   if (toQueue.length > 0 && session) {
-    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), Date.now());
+    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt);
     if (entries.length > 0) ensureRunner(choice.root);
-    const queued = new Set(entries.map((entry) => entry.file));
+    for (const entry of entries) queued.add(entry.file);
     for (const index of toQueue) {
       const result = answers.results[index] ?? null;
       if (queued.has(edited[index]!)) {
@@ -180,6 +183,22 @@ async function main(): Promise<void> {
         rendered.set(index, notRecheckedLine(relatives[index]!, result?.recheck?.reason));
       }
     }
+  }
+  // What the Stop hook states the session's check from (carrick#3466): each
+  // file, at the time its entry or in-hand answer carries, and every answer
+  // this hook had in hand as the session's answer for that edit. Only on the
+  // hook channel, which is the one that queues and speaks at Stop. A file the
+  // binary refused (`error`: no index, an unreadable one) is not recorded:
+  // there is no check to state, and a fallback would fail the same way.
+  if (session && channel.channel === "hook") {
+    const recorded: string[] = [];
+    for (const [index, file] of edited.entries()) {
+      const result = answers.results[index] ?? null;
+      if (result?.error) continue;
+      if (result !== null && !queued.has(file)) answerInHand(choice.root, session, file, result, editedAt);
+      if (result !== null || queued.has(file)) recorded.push(file);
+    }
+    if (recorded.length > 0) recordEdit(session, choice.root, editedAt, undefined, recorded);
   }
   // Delivered after this edit is queued, so an older answer for a file this
   // edit queues again is skipped (the newer entry carries it).

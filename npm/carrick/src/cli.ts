@@ -6,9 +6,11 @@
 
 import { execFile } from "node:child_process";
 import {
+  parseChangedResult,
   parseCheckResult,
   parseCheckResults,
   parseStatusResult,
+  type ChangedResult,
   type CheckResult,
   type StatusResult,
 } from "./contract.ts";
@@ -55,7 +57,7 @@ export type RecheckOptions = RunOptions & { recheck: true; limitMs: number; noRe
 async function run<T>(
   args: string[],
   options: RunOptions,
-  parse: (stdout: string) => T | null,
+  parse: (stdout: string, exit: number) => T | null,
 ): Promise<RunOutcome<T>> {
   const env = options.env ?? process.env;
   const bin = options.bin ?? binary(env);
@@ -73,7 +75,10 @@ async function run<T>(
       },
       (error, stdout) => {
         const ms = Date.now() - started;
-        const parsed = parse(stdout ?? "");
+        // A non-zero exit sets `error.code` to the number; a kill leaves it unset.
+        const code = (error as { code?: unknown } | null)?.code;
+        const exit = error ? (typeof code === "number" ? code : -1) : 0;
+        const parsed = parse(stdout ?? "", exit);
         if (parsed) {
           resolve({ result: parsed, failure: null, ms });
           return;
@@ -139,4 +144,14 @@ export async function status(
     ? ["status", "--workspace", options.workspace, "--json"]
     : ["status", "--json"];
   return await run(args, options, parseStatusResult);
+}
+
+/**
+ * `carrick check --changed --json`, run from the workspace root: the whole
+ * change against the main branch. Only the background runner calls it, for a
+ * Stop that could not state the session's check from the per-file re-checks
+ * (carrick#3466). The binary leaves its marker (`hook/checked.ts`) itself.
+ */
+export async function checkChanged(options: RunOptions): Promise<RunOutcome<ChangedResult>> {
+  return await run(["check", "--changed", "--json"], options, parseChangedResult);
 }

@@ -1,3 +1,10 @@
+### check-changed-clean.json :: changedLines
+Carrick ran `carrick check --changed` for this session's change: no contract problem in 2 changed files.
+
+### check-changed-problem.json :: changedLines
+Carrick ran `carrick check --changed` for this session's change: 1 contract problem in 1 changed file.
+- order-service/src/client.ts:14 call GET /users/:id: the response type does not match: email is missing (against user-service user-service/src/routes/users.ts:9).
+
 ### check-clean.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
 

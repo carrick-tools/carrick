@@ -357,7 +357,31 @@ test("the stop hook says nothing about the functions a task added (carrick#3436)
     env: fakeEnv({ HOME: home }),
   });
   assert.equal(stop.code, 0);
-  assert.equal(stop.stdout, "", "no reuse nudge, and no re-check was pending");
+  // The edit was answered in hand, so Stop states the session's check once
+  // (carrick#3466) and names no function.
+  assert.doesNotMatch(stop.stdout, /slugify|titleCase|search_by_intent/, "no reuse nudge");
+  assert.match(stop.stdout, /Carrick checked the 1 file this session edited \(user-service\): no route or call in it\./);
+  const again = await runHook("stop.ts", {
+    payload: { hook_event_name: "Stop", session_id: "sess-3", stop_hook_active: true },
+    env: fakeEnv({ HOME: home }),
+  });
+  assert.equal(again.stdout, "", "stated once per change");
+});
+
+test("an edit the binary refused (no index) gives Stop nothing to state and queues no check (carrick#3466)", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-refused" },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-not-indexed.json") }),
+  });
+  const stop = await runHook("stop.ts", {
+    payload: { hook_event_name: "Stop", session_id: "sess-refused" },
+    env: fakeEnv({ HOME: home }),
+  });
+  assert.equal(stop.stdout, "");
+  assert.equal(fs.existsSync(path.join(workspace.root, ".carrick", "rechecks", "queue")), false, "no check --changed queued");
 });
 
 test("the stop hook is silent with nothing recorded, no session, or the channel off", async (t) => {

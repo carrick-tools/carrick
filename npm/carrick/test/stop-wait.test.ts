@@ -11,11 +11,20 @@ import path from "node:path";
 
 import { spawn } from "node:child_process";
 
-import { fakeEnv, fixture, makeWorkspace, pluginDir, type HookRun } from "./helpers.ts";
-import type { CheckResult } from "../src/contract.ts";
-import { BACKGROUND_CAP_MS, enqueue, lockPath, STOP_TIMEOUT_S, STOP_WAIT_S } from "../src/hook/rechecks.ts";
+import { fakeEnv, fixture, fixturePath, makeWorkspace, pluginDir, type HookRun } from "./helpers.ts";
+import { parseChangedResult, type CheckResult } from "../src/contract.ts";
+import {
+  answerInHand,
+  BACKGROUND_CAP_MS,
+  enqueue,
+  enqueueChanged,
+  lockPath,
+  queueDir,
+  STOP_TIMEOUT_S,
+  STOP_WAIT_S,
+} from "../src/hook/rechecks.ts";
 import type { Answer, QueueEntry } from "../src/hook/rechecks.ts";
-import { checkMarkerPath } from "../src/hook/checked.ts";
+import { checkedSinceLastEdit, checkMarkerPath } from "../src/hook/checked.ts";
 import { recordEdit, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
 import { stopAnswers, waitSeconds } from "../src/hook/stop-wait.ts";
 import { carrickHooks } from "../src/init/settings.ts";
@@ -279,5 +288,182 @@ test("stop drops the clause from the still-running line when a clean check follo
   marker(workspace.root, 2_000_000, 0);
   const text = (await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n");
   assert.match(text, /is still running after \d+ s\.$/);
+  assert.doesNotMatch(text, CLAUSE);
+});
+
+// The Stop hook states the session's contract check from the per-file
+// re-checks (carrick#3466): one line when every edited file was answered after
+// its last edit, else it names the file, queues one `check --changed` behind
+// the re-checks and never waits for it.
+
+/** A re-check that re-read the edited service and left no service stale. */
+function reread(result: CheckResult, stale: string[] = []): CheckResult {
+  return {
+    ...result,
+    recheck: { ran: "extraction+types", elapsed_ms: 1, scope: { reread: ["user-service"], not_reread: [], stale } },
+  };
+}
+
+/** What the post-edit hook records before it probes: the file and its edit time. */
+function edit(root: string, home: string, file: string, at: number): void {
+  recordEdit(SESSION, root, at, home, [file]);
+}
+
+/** The `check --changed` entries waiting in the workspace's queue. */
+function changedQueued(root: string): QueueEntry[] {
+  const dir = queueDir(root);
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .map((name) => JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as QueueEntry)
+    .filter((entry) => entry.kind === "changed");
+}
+
+const CHECKED = /^Carrick checked the (\d+) files? this session edited \(([^)]*)\): /;
+const NOT_CHECKED = /^Carrick did not check the whole change: /;
+
+test("every edited file answered after its last edit: one checked-the-change line, no check clause, the per-answer lines folded into it", async (t) => {
+  const { workspace, home } = setup(t);
+  const other = path.join(workspace.service, "src", "routes", "orders.ts");
+  fs.writeFileSync(other, "export {};\n");
+  const at = Date.now() - 5000;
+  edit(workspace.root, home, workspace.file, at);
+  edit(workspace.root, home, other, at);
+  const entry = queue(workspace.root, home, workspace.file);
+  answer(home, entry, reread(problem()));
+  // Answered in hand by the post-edit probe: no re-check was queued.
+  answerInHand(workspace.root, SESSION, other, reread(clean()), Date.now(), { home });
+
+  const result = await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false });
+  const text = result.lines.join("\n");
+  const head = result.lines[0]!.split("\n")[0]!;
+  assert.match(head, CHECKED);
+  assert.equal(CHECKED.exec(head)![1], "2");
+  assert.equal(CHECKED.exec(head)![2], "user-service");
+  assert.match(head, /\d+ contract problems?\.$/);
+  assert.doesNotMatch(text, /^Carrick re-checked/m, "the per-answer headlines are folded into the one line");
+  assert.match(text, /^- \S*users\.ts:\d+:\d+ /m, "the problem lines of the answer this Stop claimed still print");
+  assert.doesNotMatch(text, CLAUSE);
+  assert.doesNotMatch(text, NOT_CHECKED);
+  assert.equal(changedQueued(workspace.root).length, 0, "nothing to fall back on");
+  assert.equal(checkedSinceLastEdit(SESSION, workspace.root, home), true, "later lines drop the clause");
+});
+
+test("a covered clean change is stated once, and again after the next edit is answered", async (t) => {
+  const { workspace, home } = setup(t);
+  edit(workspace.root, home, workspace.file, Date.now() - 5000);
+  answer(home, queue(workspace.root, home, workspace.file), reread(clean()));
+
+  const first = await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false });
+  assert.equal(first.lines.length, 1);
+  assert.match(first.lines[0]!, /^Carrick checked the 1 file this session edited \(user-service\): no route or call in it\.$/);
+  const second = await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false });
+  assert.deepEqual(second.lines, [], "not again without an edit");
+
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  assert.equal(checkedSinceLastEdit(SESSION, workspace.root, home), false, "an edit unsettles it");
+  answer(home, queue(workspace.root, home, workspace.file), reread(clean()));
+  const third = await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false });
+  assert.match(third.lines.join("\n"), CHECKED);
+});
+
+test("an edit after the answer is not covered: Stop names the file and queues check --changed", async (t) => {
+  const { workspace, home } = setup(t);
+  edit(workspace.root, home, workspace.file, Date.now() - 5000);
+  answer(home, queue(workspace.root, home, workspace.file), reread(clean()));
+  edit(workspace.root, home, workspace.file, Date.now() + 5000);
+
+  const text = (await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false })).lines.join("\n");
+  assert.doesNotMatch(text, CHECKED);
+  assert.match(text, /^Carrick did not check the whole change: user-service\/src\/routes\/users\.ts: it was edited after its last re-check\./m);
+  assert.equal(changedQueued(workspace.root).length, 1);
+});
+
+/** A fake clock: `sleep` moves it, so a test reads how long Stop waited. */
+function fakeClock() {
+  let now = Date.now();
+  return { now: () => now, sleep: async (ms: number) => void (now += Math.max(ms, 1)), at: () => now };
+}
+
+for (const [name, arrange, reason] of [
+  [
+    "an answer with a stale service",
+    (root: string, home: string, file: string) => answer(home, queue(root, home, file), reread(clean(), ["billing"])),
+    /1 service that reads it was judged at its indexed version \(billing\)/,
+  ],
+  [
+    "a deferred answer",
+    (root: string, home: string, file: string) => answer(home, queue(root, home, file), fixture("check-deferred.json")),
+    /this edit needs a re-scan, which this call was asked not to start/,
+  ],
+  [
+    "a failed answer",
+    (root: string, home: string, file: string) => stopped(home, queue(root, home, file)),
+    /the re-check ran past its budget/,
+  ],
+  [
+    "one still running past the wait",
+    (root: string, home: string, file: string) => {
+      liveRunner(root);
+      queue(root, home, file);
+    },
+    /its re-check is still running after \d+ s/,
+  ],
+] as const) {
+  test(`${name} makes Stop name the file, print no checked line, and queue one changed entry it does not wait for`, async (t) => {
+    const { workspace, home } = setup(t);
+    edit(workspace.root, home, workspace.file, Date.now() - 5000);
+    arrange(workspace.root, home, workspace.file);
+    const clock = fakeClock();
+    const started = clock.at();
+    const ensured: string[] = [];
+    const result = await stopAnswers(SESSION, {
+      waitS: 2,
+      home,
+      now: clock.now,
+      sleep: clock.sleep,
+      ensure: (root) => {
+        ensured.push(root);
+        return false;
+      },
+    });
+    const text = result.lines.join("\n");
+    assert.doesNotMatch(text, CHECKED);
+    const gap = text.split("\n").find((line) => NOT_CHECKED.test(line));
+    assert.ok(gap, text);
+    assert.match(gap!, /user-service\/src\/routes\/users\.ts: /);
+    assert.match(gap!, reason);
+    assert.match(gap!, /A background `carrick check --changed` is queued; its answer comes with the next Carrick line\.$/);
+    assert.doesNotMatch(text, CLAUSE);
+    assert.doesNotMatch(text, /is still running after \d+ s\.$/m, "a running file is named once, on the gap line");
+    assert.equal(changedQueued(workspace.root).length, 1);
+    assert.ok(ensured.includes(workspace.root), "a runner is made sure of for the queued check");
+    const waited = clock.at() - started;
+    assert.ok(waited <= 2000 + 250, `Stop waited only for the per-file entries (${waited} ms)`);
+
+    // The queued check is never waited for, and the change is not stated twice.
+    const again = fakeClock();
+    const from = again.at();
+    const second = await stopAnswers(SESSION, { waitS: 2, home, now: again.now, sleep: again.sleep, ensure: () => false });
+    if (name !== "one still running past the wait") assert.equal(again.at() - from, 0, "no wait for the changed entry");
+    assert.doesNotMatch(second.lines.join("\n"), NOT_CHECKED);
+    assert.equal(changedQueued(workspace.root).length, 1, "one changed entry, not one per Stop");
+  });
+}
+
+test("stop delivers a finished check --changed answer: its verdict, never a clause", async (t) => {
+  const { workspace, home } = setup(t);
+  const entry = enqueueChanged(workspace.root, SESSION, Date.now(), { home })!;
+  const changed = parseChangedResult(
+    fs.readFileSync(fixturePath("check-changed-problem.json"), "utf8"),
+    1,
+  )!;
+  writeAtomic(
+    path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.answer.json`),
+    `${JSON.stringify({ ...entry, state: "answered", started_at: entry.enqueued_at, finished_at: new Date().toISOString(), changed })}\n`,
+  );
+  const text = (await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false })).lines.join("\n");
+  assert.match(text, /^Carrick ran `carrick check --changed` for this session's change: 1 contract problem in 1 changed file\.$/m);
+  assert.match(text, /^- order-service\/src\/client\.ts:14 call GET \/users\/:id: the response type does not match: email is missing/m);
   assert.doesNotMatch(text, CLAUSE);
 });
