@@ -5259,6 +5259,8 @@ export function listen(): void {
         "src/ri-const-alias.ts:",
         "src/s-destructured.ts:",
         "src/s-local-alias.ts:",
+        "src/s-coalesce.ts:",
+        "src/s-flag.ts:",
     ];
 
     /// `ends` without the lines of the files named by `prefixes`.
@@ -5297,6 +5299,37 @@ export function listen(): void {
                 "src/ri-const-alias.ts:4 <- src/ri-const-alias.ts:4 root src/ri-const-alias.ts:2",
                 "src/s-destructured.ts:4 <- src/s-destructured.ts:4 root src/s-destructured.ts:2",
                 "src/s-local-alias.ts:3 <- src/s-local-alias.ts:3 unread",
+            ]),
+            "{got:#?}"
+        );
+    }
+
+    /// carrick#3489 W3: a receiver that is a fallback or a conditional
+    /// (`(opts.app ?? def).get(..)`, `(flag ? a : b).get(..)`) ends at each of
+    /// its sides: a side that is a module app is a root, a side that is a
+    /// parameter key no caller hands in is read as any parameter is.
+    #[test]
+    fn each_side_of_a_fallback_receiver_is_an_end() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-routes")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = only_files(
+            instance_ends(&decided),
+            &["src/s-coalesce.ts:", "src/s-flag.ts:"],
+        );
+        assert_eq!(
+            got,
+            texts(&[
+                "src/s-coalesce.ts:3 <- src/s-coalesce.ts:3 root src/s-coalesce.ts:2",
+                "src/s-coalesce.ts:3 <- src/s-coalesce.ts:4 unread",
+                "src/s-flag.ts:5 <- src/s-flag.ts:5 root src/s-flag.ts:2",
+                "src/s-flag.ts:5 <- src/s-flag.ts:5 root src/s-flag.ts:3",
             ]),
             "{got:#?}"
         );

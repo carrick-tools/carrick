@@ -548,6 +548,39 @@ fn routes_on_module_aliases_take_their_full_paths() {
     );
 }
 
+/// carrick#3489 W3: a route registered on a receiver that is a fallback or a
+/// conditional (`(opts.app ?? def).get(..)`, `(flag ? a : b).get(..)`) is a
+/// mount-graph row at its full path, `library_claim`, from the side that is a
+/// module app, with no unread lead at its line.
+#[test]
+fn a_fallback_receiver_route_takes_its_full_path() {
+    let on = scan_fixture("receiver-forms-routes");
+    let (graph, flat) = endpoint_rows(&on);
+    for (site, want) in [
+        (
+            "src/s-coalesce.ts:3",
+            "src/s-coalesce.ts:3 GET /p/s-coalesce library_claim",
+        ),
+        (
+            "src/s-flag.ts:5",
+            "src/s-flag.ts:5 GET /p/s-flag library_claim",
+        ),
+    ] {
+        assert!(
+            graph.iter().any(|row| row.starts_with(want)),
+            "{site}: {graph:#?}"
+        );
+        assert!(
+            flat.iter().any(|row| row.starts_with(want)),
+            "{site}: {flat:#?}"
+        );
+    }
+    let unread = unread_reasons(&on);
+    for site in ["src/s-coalesce.ts:3", "src/s-flag.ts:5"] {
+        assert!(!unread.contains_key(site), "{site}: {unread:#?}");
+    }
+}
+
 /// Why each possible call's path is unread, as `file:line` to reason. A call
 /// whose path is read and whose owner is not is `owner_unknown`.
 fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {
