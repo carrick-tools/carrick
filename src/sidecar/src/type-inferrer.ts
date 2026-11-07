@@ -8012,6 +8012,7 @@ export class TypeInferrer {
     // An error or redirect branch sends no success body (carrick#1161).
     const status = this.responseSiteStatus(call);
     if (status === 'error' || status === 'redirect') return undefined;
+    if (Node.isCallExpression(call) && this.callsFailureHelper(call, depth)) return undefined;
 
     // carrick#3053: a send the service's labels name carries its body in the
     // slot the label states, read as a labelled call send reads it.
@@ -8038,6 +8039,34 @@ export class TypeInferrer {
       if (nested) return nested;
     }
     return undefined;
+  }
+
+  /**
+   * True when a call's callee is a function this repository declares whose
+   * every returned branch is a send stating an error or redirect status, or a
+   * call to another such function (carrick#3523). `return failure(result)` is
+   * then an error branch, as `json({ error }, { status: 400 })` written inline
+   * is, and the value handed to it is never the success body. A callee that
+   * returns anything else (a success send, a status the source does not fix,
+   * a non-send) keeps the ordinary argument reading.
+   */
+  private callsFailureHelper(call: CallExpression, depth: number): boolean {
+    if (depth > RESPONSE_HELPER_MAX_DEPTH) return false;
+    let symbol = call.getExpression().getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    if (!symbol || this.symbolIsLibOrExternalOrigin(symbol)) return false;
+    const helper = this.builderFunctionOf(symbol);
+    if (!helper) return false;
+    const branches = this.returnedExpressions(helper).flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    if (branches.length === 0) return false;
+    return branches.every((branch) => {
+      const status = this.responseSiteStatus(branch);
+      if (status === 'error' || status === 'redirect') return true;
+      const inner = this.peelTransparentExpression(branch);
+      return Node.isCallExpression(inner) && this.callsFailureHelper(inner, depth + 1);
+    });
   }
 
   /**
