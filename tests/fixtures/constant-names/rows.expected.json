@@ -1,0 +1,26 @@
+{
+  "named": {
+    "src/c-let.ts": "/c/let",
+    "src/c-let-imported.ts": "/c/shared/items",
+    "src/c-enum.ts": "/c/enum",
+    "src/c-const-enum.ts": "/c/const-enum",
+    "src/c-enum-template.ts": "/c/enum-template/items",
+    "src/c-computed.ts": "/c/computed",
+    "src/c-join.ts": "/c/join",
+    "src/c-concat.ts": "/c/concat",
+    "src/c-replace.ts": "/c/replace/all",
+    "src/c-replace-all.ts": "/c/replace-all/replace-all",
+    "src/c-raw.ts": "/c/raw",
+    "src/r-enum.ts": "/r/enum",
+    "src/r-let.ts": "/r/let",
+    "src/q-enum.ts": "orders.created",
+    "src/q-join.ts": "orders.shipped",
+    "src/s-enum.ts": "room.joined",
+    "src/s-let.ts": "room.left"
+  },
+  "unnamed": [
+    "src/c-let-reassigned.ts",
+    "src/c-object-written.ts",
+    "src/c-replace-runtime.ts"
+  ]
+}
