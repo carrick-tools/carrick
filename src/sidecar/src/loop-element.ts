@@ -35,6 +35,7 @@
  */
 
 import { Node, SyntaxKind, type SourceFile, type VariableDeclaration } from 'ts-morph';
+import { peelValueWrappers } from './function-body.js';
 import { stringLiteral } from './response-modes.js';
 
 /** The rewrite that leaves only the picked element in the list. */
@@ -78,7 +79,7 @@ export function loopElementPick(registration: Node, routePath: string): LoopPick
   if (!Node.isCallExpression(registration)) return undefined;
   const pathArg = registration.getArguments()[0];
   if (!pathArg) return undefined;
-  const template = unwrap(pathArg);
+  const template = peelValueWrappers(pathArg);
   if (!Node.isTemplateExpression(template)) return undefined;
   const holes = template.getTemplateSpans().map((span) => span.getExpression());
   if (holes.length === 0 || !holes.every((hole) => Node.isIdentifier(hole))) return undefined;
@@ -127,23 +128,6 @@ export function loopElementPick(registration: Node, routePath: string): LoopPick
     index,
     of: elements.length,
   };
-}
-
-/** `node` through parentheses, `as` and `satisfies`. */
-function unwrap(node: Node): Node {
-  let at = node;
-  for (;;) {
-    if (
-      Node.isParenthesizedExpression(at) ||
-      Node.isAsExpression(at) ||
-      Node.isSatisfiesExpression(at) ||
-      Node.isTypeAssertion(at)
-    ) {
-      at = at.getExpression();
-    } else {
-      return at;
-    }
-  }
 }
 
 /** The name node a declaration binds, for a name declared by a variable, a parameter or a binding element. */
@@ -214,7 +198,7 @@ function enclosingLoop(registration: Node, holes: Node[]): Loop | undefined {
  * else, a spread included.
  */
 function listElements(list: Node): Node[] | undefined {
-  let literal = unwrap(list);
+  let literal = peelValueWrappers(list);
   if (Node.isIdentifier(literal)) {
     const declared = literal.getSymbol()?.getDeclarations()[0];
     if (!declared || !Node.isVariableDeclaration(declared)) return undefined;
@@ -227,14 +211,14 @@ function listElements(list: Node): Node[] | undefined {
     const readonly = hasConstAssertion(initializer);
     if (!readonly && mutatedInItsFile(declared)) return undefined;
     if (!readonly && declared.isExported()) return undefined;
-    literal = unwrap(initializer);
+    literal = peelValueWrappers(initializer);
   }
   if (!Node.isArrayLiteralExpression(literal)) return undefined;
   const elements = literal.getElements();
   if (elements.some((element) => Node.isSpreadElement(element) || Node.isOmittedExpression(element))) {
     return undefined;
   }
-  return elements.map(unwrap);
+  return elements.map((element) => peelValueWrappers(element));
 }
 
 function hasConstAssertion(node: Node): boolean {
@@ -281,7 +265,7 @@ function elementValue(element: Node, position: number): string | undefined {
   const items = element.getElements();
   if (items.some((item) => Node.isSpreadElement(item))) return undefined;
   const item = items[position];
-  return item ? stringLiteral(unwrap(item)) : undefined;
+  return item ? stringLiteral(peelValueWrappers(item)) : undefined;
 }
 
 /** A path segment that is a parameter, in either spelling. */
