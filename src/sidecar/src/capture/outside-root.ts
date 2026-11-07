@@ -16,7 +16,7 @@
  */
 
 import * as path from 'node:path';
-import { withoutExtension } from './installed-package.js';
+import { toPosix, withoutExtension } from './installed-package.js';
 import { rewriteSpecifiers } from './specifiers.js';
 
 /** Tree directory holding declarations of sources outside rootDir. */
@@ -56,7 +56,7 @@ export function placeEmittedTree(args: {
   const outsideFiles: string[] = [];
   for (const fileName of args.emitted.keys()) {
     sourceSideOf.set(fileName, sourceSidePath(fileName, args.staging, args.entryDir));
-    const rel = posix(path.relative(args.staging, fileName));
+    const rel = toPosix(path.relative(args.staging, fileName));
     if (escapes(rel)) {
       outsideFiles.push(fileName);
       continue;
@@ -68,7 +68,7 @@ export function placeEmittedTree(args: {
 
   const shared = commonDirectory([args.entryDir, ...outsideFiles.map((f) => path.dirname(path.resolve(f)))]);
   for (const fileName of outsideFiles) {
-    const rel = path.posix.join(OUTSIDE_DIR, posix(path.relative(shared, path.resolve(fileName))));
+    const rel = path.posix.join(OUTSIDE_DIR, toPosix(path.relative(shared, path.resolve(fileName))));
     relOf.set(fileName, rel);
     outside.set(path.resolve(fileName).replace(DECLARATION_EXT, ''), rel);
   }
@@ -110,7 +110,7 @@ export function placeEmittedTree(args: {
  * source's own path.
  */
 function sourceSidePath(fileName: string, staging: string, entryDir: string): string {
-  const rel = posix(path.relative(staging, fileName));
+  const rel = toPosix(path.relative(staging, fileName));
   return escapes(rel) ? path.resolve(fileName) : path.join(entryDir, rel);
 }
 
@@ -147,10 +147,6 @@ export function surfaceModuleInTree(args: {
     const target = path.resolve(surfaceDir, withoutExtension(spec));
     return held.has(target) || held.has(path.join(target, 'index'));
   };
-}
-
-function posix(p: string): string {
-  return p.split(path.sep).join('/');
 }
 
 function escapes(rel: string): boolean {

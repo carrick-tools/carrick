@@ -61,7 +61,7 @@ import { validateInferRequestItem } from './validators.js';
 import { declarationSite } from './bundler.js';
 import { printedTypeHoldsTopType, relateSymbolToRead } from './symbol-relation.js';
 import { notePrintedType, PrintedTypes } from './printed-names.js';
-import { externalImportsOf, isExternalOrigin } from './origin.js';
+import { expandOriginOf, externalImportsOf, isExternalOrigin } from './origin.js';
 import {
   BINARY_BODY_READS,
   isPlatformBodyRead,
@@ -86,13 +86,13 @@ import {
 } from './node-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import { importedNameOf, packageNameOf, type LabelledMembers } from './library-claims.js';
+import { constituentsOf } from './capture/index.js';
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
 import { loopElementPick, type LoopPick } from './loop-element.js';
 import {
   classifyStatusCodes,
-  constituents,
   httpStatus,
   statesNoBody,
   statesNoShape,
@@ -814,11 +814,7 @@ export class TypeInferrer {
    * classify one declaration two ways.
    */
   private expandOrigin(): ExpandOrigin {
-    return {
-      program: this.project.getProgram().compilerObject,
-      repoRoot: this.repoRoot,
-      imports: externalImportsOf(this.project),
-    };
+    return expandOriginOf(this.project, this.repoRoot);
   }
 
   /**
@@ -5262,7 +5258,7 @@ export class TypeInferrer {
           arg,
           new Set(
             entries.flatMap((entry) =>
-              constituents(checker.getTypeOfSymbolAtLocation(entry.symbol, at.compilerNode))
+              constituentsOf(checker.getTypeOfSymbolAtLocation(entry.symbol, at.compilerNode))
             )
           )
         );
@@ -5279,7 +5275,7 @@ export class TypeInferrer {
             const held = property.getTypeAtLocation(at);
             if (held.getText() === arg.getText()) return true;
             const values = tableValues.get(arg);
-            const heldTypes = constituents(held.compilerType);
+            const heldTypes = constituentsOf(held.compilerType);
             if (
               values &&
               heldTypes.length === values.size &&
