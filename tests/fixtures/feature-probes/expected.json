@@ -1,0 +1,642 @@
+{
+ "n-arbitrary-ns": {
+  "feature": "arbitrary-module-namespace-names",
+  "source": "test262",
+  "status": "covered"
+ },
+ "n-as-cast": {
+  "feature": "type assertion on the name (as, TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "n-asconst": {
+  "feature": "as const object (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "n-builder": {
+  "feature": "function returning the path (arrow-function return)",
+  "source": "test262 (arrow-function)",
+  "status": "covered"
+ },
+ "n-coalesce": {
+  "feature": "coalesce-expression (??)",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-computed": {
+  "feature": "computed-property-names",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-concat": {
+  "feature": "string concatenation (+)",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "n-conditional": {
+  "feature": "conditional (?:)",
+  "source": "ES5",
+  "status": "lead"
+ },
+ "n-const": {
+  "feature": "const",
+  "source": "test262",
+  "status": "covered"
+ },
+ "n-const-enum": {
+  "feature": "const enum (TS)",
+  "source": "TS",
+  "status": "lead"
+ },
+ "n-ctor-field": {
+  "feature": "constructor-assigned field (this.x = ...)",
+  "source": "ES5/class",
+  "status": "covered"
+ },
+ "n-default-param": {
+  "feature": "default-parameters",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-destr-assign": {
+  "feature": "destructuring-assignment",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-destructure": {
+  "feature": "destructuring-binding",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-enum": {
+  "feature": "enum (TS)",
+  "source": "TS",
+  "status": "lead"
+ },
+ "n-env": {
+  "feature": "process.env base (host global)",
+  "source": "Node host",
+  "status": "covered"
+ },
+ "n-field": {
+  "feature": "class-fields-public (instance field)",
+  "source": "test262",
+  "status": "covered"
+ },
+ "n-fromentries": {
+  "feature": "Object.fromEntries (built-in)",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-getter": {
+  "feature": "getter (accessor property)",
+  "source": "ES5",
+  "status": "lead"
+ },
+ "n-import-meta": {
+  "feature": "import.meta",
+  "source": "test262",
+  "status": "covered"
+ },
+ "n-imported": {
+  "feature": "import declaration (named import of a const)",
+  "source": "test262 (ES2015 modules)",
+  "status": "covered"
+ },
+ "n-imported-object": {
+  "feature": "imported const object member",
+  "source": "test262 (modules)",
+  "status": "lead"
+ },
+ "n-join": {
+  "feature": "Array.prototype.join (built-in)",
+  "source": "test262 (built-in)",
+  "status": "lead"
+ },
+ "n-json-module": {
+  "feature": "json-modules / import-attributes",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-let": {
+  "feature": "let",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-literal": {
+  "feature": "string literal (baseline)",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "n-literal-type": {
+  "feature": "string literal type (declared const, TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "n-logical-assign": {
+  "feature": "logical-assignment-operators (||=, ??=)",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-loop": {
+  "feature": "for-of over a literal array",
+  "source": "test262 (for-of)",
+  "status": "partial"
+ },
+ "n-map": {
+  "feature": "Map (built-in) holding the path",
+  "source": "test262 (Map)",
+  "status": "lead"
+ },
+ "n-namespace": {
+  "feature": "namespace (TS)",
+  "source": "TS",
+  "status": "lead"
+ },
+ "n-non-null": {
+  "feature": "non-null assertion on the name (!, TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "n-object-param-key": {
+  "feature": "object parameter key (destructured param)",
+  "source": "test262 (destructuring-binding)",
+  "status": "covered"
+ },
+ "n-object-rest": {
+  "feature": "object-rest",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-objprop": {
+  "feature": "object literal property read",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "n-path-alias": {
+  "feature": "tsconfig paths alias (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "n-private-field": {
+  "feature": "class-fields-private (#field)",
+  "source": "test262",
+  "status": "covered"
+ },
+ "n-reexport": {
+  "feature": "export ... from (re-export)",
+  "source": "test262 (ES2015 modules)",
+  "status": "covered"
+ },
+ "n-replace": {
+  "feature": "String.prototype.replace (built-in)",
+  "source": "test262 (built-in)",
+  "status": "lead"
+ },
+ "n-replaceall": {
+  "feature": "String.prototype.replaceAll (built-in)",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-satisfies": {
+  "feature": "satisfies (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "n-spread-key": {
+  "feature": "object-spread before the key",
+  "source": "test262 (object-spread)",
+  "status": "covered"
+ },
+ "n-star-as": {
+  "feature": "export-star-as-namespace-from-module",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-static-block": {
+  "feature": "class-static-block",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-static-field": {
+  "feature": "class-static-fields-public",
+  "source": "test262",
+  "status": "lead"
+ },
+ "n-str-concat": {
+  "feature": "String.prototype.concat (built-in)",
+  "source": "test262 (built-in)",
+  "status": "lead"
+ },
+ "n-tagged": {
+  "feature": "tagged template (String.raw)",
+  "source": "test262 (template)",
+  "status": "lead"
+ },
+ "n-template": {
+  "feature": "template",
+  "source": "test262",
+  "status": "covered"
+ },
+ "n-tl-type": {
+  "feature": "template literal type parameter (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "n-url": {
+  "feature": "URL (WHATWG built-in)",
+  "source": "platform built-in",
+  "status": "covered"
+ },
+ "pl-class": {
+  "feature": "class instance payload",
+  "source": "test262 (class)",
+  "status": "covered"
+ },
+ "pl-generic": {
+  "feature": "generic utility type payload (Partial<T>, TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "pl-interface": {
+  "feature": "interface-typed variable (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "pl-js-inferred": {
+  "feature": "JS file, inferred payload",
+  "source": "ES5",
+  "status": "partial"
+ },
+ "pl-json-stringify": {
+  "feature": "JSON.stringify payload (built-in)",
+  "source": "test262 (JSON)",
+  "status": "covered"
+ },
+ "pl-literal": {
+  "feature": "object literal payload",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "pl-satisfies": {
+  "feature": "satisfies payload (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "pl-spread": {
+  "feature": "object-spread payload",
+  "source": "test262",
+  "status": "covered"
+ },
+ "pl-type-import": {
+  "feature": "type-only import of the payload type (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "pl-wrapper": {
+  "feature": "payload through a wrapper parameter",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "q-enum": {
+  "feature": "enum topic (TS)",
+  "source": "TS",
+  "status": "lead"
+ },
+ "q-imported-const": {
+  "feature": "imported const topic",
+  "source": "test262 (modules)",
+  "status": "covered"
+ },
+ "q-literal": {
+  "feature": "topic literal (baseline)",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "q-subscribe-const": {
+  "feature": "subscriber with an as-const topic object",
+  "source": "TS",
+  "status": "covered"
+ },
+ "q-template": {
+  "feature": "template topic with const prefix",
+  "source": "test262 (template)",
+  "status": "covered"
+ },
+ "q-wrapper": {
+  "feature": "wrapper forwarding the topic",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "r-chained": {
+  "feature": "chained call on a returned this",
+  "source": "ES5",
+  "status": "not_reached"
+ },
+ "r-const-prefix": {
+  "feature": "template with a const prefix",
+  "source": "test262 (template)",
+  "status": "covered"
+ },
+ "r-enum": {
+  "feature": "enum route name (TS)",
+  "source": "TS",
+  "status": "lead"
+ },
+ "r-imported-app": {
+  "feature": "app imported from another module",
+  "source": "test262 (modules)",
+  "status": "covered"
+ },
+ "r-literal": {
+  "feature": "route literal (baseline)",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "r-loop": {
+  "feature": "for-of over a literal array (route per value)",
+  "source": "test262 (for-of)",
+  "status": "lead"
+ },
+ "r-param-app": {
+  "feature": "app passed as a parameter (register function)",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "r-shared-export": {
+  "feature": "package's own instance (named export)",
+  "source": "test262 (modules)",
+  "status": "lead"
+ },
+ "ri-array": {
+  "feature": "instance held in an array element",
+  "source": "ES5",
+  "status": "lead"
+ },
+ "ri-class-field": {
+  "feature": "class field holding an instance",
+  "source": "test262 (class-fields-public)",
+  "status": "not_reached"
+ },
+ "ri-const-alias": {
+  "feature": "const alias of an instance",
+  "source": "test262 (const)",
+  "status": "lead"
+ },
+ "ri-destructure": {
+  "feature": "destructured method of an instance",
+  "source": "test262 (destructuring-binding)",
+  "status": "not_reached"
+ },
+ "ri-getter": {
+  "feature": "getter returning an instance",
+  "source": "ES5",
+  "status": "not_reached"
+ },
+ "ri-optional": {
+  "feature": "optional-chaining on an instance",
+  "source": "test262",
+  "status": "not_reached"
+ },
+ "ri-param-property": {
+  "feature": "constructor parameter property holding an instance (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "t-array-held": {
+  "feature": "client held in an array element",
+  "source": "ES5",
+  "status": "not_reached"
+ },
+ "t-as-cast": {
+  "feature": "type assertion on the client (as, TS)",
+  "source": "TS",
+  "status": "not_reached"
+ },
+ "t-async": {
+  "feature": "async-functions wrapper",
+  "source": "test262",
+  "status": "covered"
+ },
+ "t-barrel": {
+  "feature": "re-exported client (barrel)",
+  "source": "test262 (modules)",
+  "status": "covered"
+ },
+ "t-call-apply": {
+  "feature": "Function.prototype.call (built-in)",
+  "source": "test262 (built-in)",
+  "status": "lead"
+ },
+ "t-call-result-receiver": {
+  "feature": "client returned by a function call",
+  "source": "ES5",
+  "status": "not_reached"
+ },
+ "t-callback": {
+  "feature": "function passed as an argument (callback)",
+  "source": "ES5",
+  "status": "lead"
+ },
+ "t-class-expr": {
+  "feature": "class expression",
+  "source": "test262 (class)",
+  "status": "not_reached"
+ },
+ "t-class-field-client": {
+  "feature": "class field holding the client",
+  "source": "test262 (class-fields-public)",
+  "status": "not_reached"
+ },
+ "t-class-method": {
+  "feature": "class method wrapper",
+  "source": "test262 (class)",
+  "status": "covered"
+ },
+ "t-closure": {
+  "feature": "returned closure (factory)",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "t-coalesce-receiver": {
+  "feature": "coalesce-expression choosing the client",
+  "source": "test262 (coalesce-expression)",
+  "status": "not_reached"
+ },
+ "t-computed-member": {
+  "feature": "computed member call (obj[key]())",
+  "source": "ES5",
+  "status": "not_reached"
+ },
+ "t-const-alias": {
+  "feature": "const alias of the client",
+  "source": "test262 (const)",
+  "status": "not_reached"
+ },
+ "t-cross-file-wrapper": {
+  "feature": "wrapper imported from another file",
+  "source": "test262 (modules)",
+  "status": "covered"
+ },
+ "t-destructure-method": {
+  "feature": "destructuring-binding of a method",
+  "source": "test262",
+  "status": "not_reached"
+ },
+ "t-destructured-receiver": {
+  "feature": "client destructured from an object",
+  "source": "test262 (destructuring-binding)",
+  "status": "not_reached"
+ },
+ "t-dynamic-import": {
+  "feature": "dynamic-import",
+  "source": "test262",
+  "status": "covered"
+ },
+ "t-explicit-resource": {
+  "feature": "explicit-resource-management (using)",
+  "source": "test262",
+  "status": "not_reached"
+ },
+ "t-extract-method": {
+  "feature": "method extracted to a const (bound)",
+  "source": "builtins: Function.prototype.bind",
+  "status": "not_reached"
+ },
+ "t-generator": {
+  "feature": "generators wrapper",
+  "source": "test262",
+  "status": "covered"
+ },
+ "t-getter-client": {
+  "feature": "getter returning the client",
+  "source": "ES5",
+  "status": "not_reached"
+ },
+ "t-iife": {
+  "feature": "immediately invoked function",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "t-inherited": {
+  "feature": "class extends (inherited method)",
+  "source": "test262 (class)",
+  "status": "covered"
+ },
+ "t-let-reassigned": {
+  "feature": "let reassigned between two clients",
+  "source": "test262 (let)",
+  "status": "not_reached"
+ },
+ "t-mixin": {
+  "feature": "Object.assign mixin (built-in)",
+  "source": "test262 (built-in)",
+  "status": "lead"
+ },
+ "t-named-alias": {
+  "feature": "import { x as y } (import alias)",
+  "source": "test262 (modules)",
+  "status": "covered"
+ },
+ "t-namespace-import": {
+  "feature": "import * as ns",
+  "source": "test262 (modules)",
+  "status": "covered"
+ },
+ "t-non-null": {
+  "feature": "non-null assertion (!, TS)",
+  "source": "TS",
+  "status": "not_reached"
+ },
+ "t-object-method": {
+  "feature": "object literal method wrapper",
+  "source": "ES5",
+  "status": "lead"
+ },
+ "t-optional-chain": {
+  "feature": "optional-chaining (?.)",
+  "source": "test262",
+  "status": "not_reached"
+ },
+ "t-param-client": {
+  "feature": "client passed as a typed parameter",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "t-param-property": {
+  "feature": "constructor parameter property (TS)",
+  "source": "TS",
+  "status": "not_reached"
+ },
+ "t-private-method": {
+  "feature": "class-methods-private (#method)",
+  "source": "test262",
+  "status": "covered"
+ },
+ "t-promise-then": {
+  "feature": "Promise.prototype.then callback (built-in)",
+  "source": "test262 (Promise)",
+  "status": "covered"
+ },
+ "t-proxy": {
+  "feature": "Proxy around the client (built-in)",
+  "source": "test262 (Proxy)",
+  "status": "not_reached"
+ },
+ "t-reflect": {
+  "feature": "Reflect.apply (built-in)",
+  "source": "test262 (Reflect)",
+  "status": "lead"
+ },
+ "t-require": {
+  "feature": "CommonJS require (host)",
+  "source": "Node host",
+  "status": "covered"
+ },
+ "t-rest-spread": {
+  "feature": "rest-parameters + spread arguments",
+  "source": "test262",
+  "status": "lead"
+ },
+ "t-satisfies-client": {
+  "feature": "satisfies on an object holding the client (TS)",
+  "source": "TS",
+  "status": "covered"
+ },
+ "t-static-method": {
+  "feature": "class static method wrapper",
+  "source": "test262 (class)",
+  "status": "covered"
+ },
+ "t-super": {
+  "feature": "super",
+  "source": "test262",
+  "status": "lead"
+ },
+ "t-tla": {
+  "feature": "top-level-await",
+  "source": "test262",
+  "status": "covered"
+ },
+ "t-typed-const": {
+  "feature": "const with a declared interface type (TS)",
+  "source": "TS",
+  "status": "not_reached"
+ },
+ "t-wrapper-arrow": {
+  "feature": "arrow-function wrapper",
+  "source": "test262 (arrow-function)",
+  "status": "covered"
+ },
+ "t-wrapper-fn": {
+  "feature": "function declaration wrapper (param forwarded)",
+  "source": "ES5",
+  "status": "covered"
+ },
+ "t-wrapper-in-object-method": {
+  "feature": "path forwarded through an object literal method",
+  "source": "ES5",
+  "status": "lead"
+ }
+}

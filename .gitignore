@@ -121,3 +121,14 @@ examples/*/output/
 
 # Carrick writes a machine-path-keyed Deno runtime cache under a scanned fixture (carrick#1266)
 tests/fixtures/**/.carrick/
+!tests/fixtures/feature-probes/repo/node_modules/
+!tests/fixtures/feature-probes/repo/node_modules/fixture-server/
+!tests/fixtures/feature-probes/repo/node_modules/fixture-server/package.json
+!tests/fixtures/feature-probes/repo/node_modules/fixture-server/index.d.ts
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/http/
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/http/package.json
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/http/index.d.ts
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/queue/
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/queue/package.json
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/queue/index.d.ts

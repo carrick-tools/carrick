@@ -76,7 +76,7 @@ jobs:
           - shard: n1
             runner: nextest
             targets: >-
-              --test client_semantics_test --test url_bases_through_bindings_test --test nonhttp_source_labels_test --test literal_base_url_test --test object_export_surface_test --test file_centric_analysis_test --test output_contract_test
+              --test client_semantics_test --test url_bases_through_bindings_test --test nonhttp_source_labels_test --test literal_base_url_test --test object_export_surface_test --test file_centric_analysis_test --test output_contract_test --test feature_probes_test
           - shard: n2
             runner: nextest
             partitioned: --test local_mode_test

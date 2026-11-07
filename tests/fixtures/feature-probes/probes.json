@@ -1,0 +1,898 @@
+{
+ "n-arbitrary-ns": {
+  "carries": "name",
+  "expect": "/p/n-arbitrary-ns",
+  "feature": "arbitrary-module-namespace-names",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-as-cast": {
+  "carries": "name",
+  "expect": "/p/n-as-cast",
+  "feature": "type assertion on the name (as, TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-asconst": {
+  "carries": "name",
+  "expect": "/p/n-asconst",
+  "feature": "as const object (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-builder": {
+  "carries": "name",
+  "expect": "/p/n-builder",
+  "feature": "function returning the path (arrow-function return)",
+  "kind": "call",
+  "source": "test262 (arrow-function)"
+ },
+ "n-coalesce": {
+  "carries": "name",
+  "expect": "/p/n-coalesce",
+  "feature": "coalesce-expression (??)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-computed": {
+  "carries": "name",
+  "expect": "/p/n-computed",
+  "feature": "computed-property-names",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-concat": {
+  "carries": "name",
+  "expect": "/p/n-concat/:param",
+  "feature": "string concatenation (+)",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "n-conditional": {
+  "carries": "name",
+  "expect": "/p/n-conditional-a|/p/n-conditional-b",
+  "feature": "conditional (?:)",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "n-const": {
+  "carries": "name",
+  "expect": "/p/n-const",
+  "feature": "const",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-const-enum": {
+  "carries": "name",
+  "expect": "/p/n-const-enum",
+  "feature": "const enum (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-ctor-field": {
+  "carries": "name",
+  "expect": "/p/n-ctor-field",
+  "feature": "constructor-assigned field (this.x = ...)",
+  "kind": "call",
+  "source": "ES5/class"
+ },
+ "n-default-param": {
+  "carries": "name",
+  "expect": "/p/n-default-param",
+  "feature": "default-parameters",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-destr-assign": {
+  "carries": "name",
+  "expect": "/p/n-destr-assign",
+  "feature": "destructuring-assignment",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-destructure": {
+  "carries": "name",
+  "expect": "/p/n-destructure",
+  "feature": "destructuring-binding",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-enum": {
+  "carries": "name",
+  "expect": "/p/n-enum",
+  "feature": "enum (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-env": {
+  "carries": "name",
+  "expect": "/p/n-env",
+  "feature": "process.env base (host global)",
+  "kind": "call",
+  "source": "Node host"
+ },
+ "n-field": {
+  "carries": "name",
+  "expect": "/p/n-field",
+  "feature": "class-fields-public (instance field)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-fromentries": {
+  "carries": "name",
+  "expect": "/p/n-fromentries",
+  "feature": "Object.fromEntries (built-in)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-getter": {
+  "carries": "name",
+  "expect": "/p/n-getter",
+  "feature": "getter (accessor property)",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "n-import-meta": {
+  "carries": "name",
+  "expect": "/p/n-import-meta",
+  "feature": "import.meta",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-imported": {
+  "carries": "name",
+  "expect": "/p/n-imported",
+  "feature": "import declaration (named import of a const)",
+  "kind": "call",
+  "source": "test262 (ES2015 modules)"
+ },
+ "n-imported-object": {
+  "carries": "name",
+  "expect": "/p/n-imported-object",
+  "feature": "imported const object member",
+  "kind": "call",
+  "source": "test262 (modules)"
+ },
+ "n-join": {
+  "carries": "name",
+  "expect": "/p/n-join",
+  "feature": "Array.prototype.join (built-in)",
+  "kind": "call",
+  "source": "test262 (built-in)"
+ },
+ "n-json-module": {
+  "carries": "name",
+  "expect": "/p/n-json-module",
+  "feature": "json-modules / import-attributes",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-let": {
+  "carries": "name",
+  "expect": "/p/n-let",
+  "feature": "let",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-literal": {
+  "carries": "name",
+  "expect": "/p/n-literal",
+  "feature": "string literal (baseline)",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "n-literal-type": {
+  "carries": "name",
+  "expect": "/p/n-literal-type",
+  "feature": "string literal type (declared const, TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-logical-assign": {
+  "carries": "name",
+  "expect": "/p/n-logical-assign",
+  "feature": "logical-assignment-operators (||=, ??=)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-loop": {
+  "carries": "name",
+  "expect": "/p/n-loop/a|/p/n-loop/b",
+  "feature": "for-of over a literal array",
+  "kind": "call",
+  "source": "test262 (for-of)"
+ },
+ "n-map": {
+  "carries": "name",
+  "expect": "/p/n-map",
+  "feature": "Map (built-in) holding the path",
+  "kind": "call",
+  "source": "test262 (Map)"
+ },
+ "n-namespace": {
+  "carries": "name",
+  "expect": "/p/n-namespace",
+  "feature": "namespace (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-non-null": {
+  "carries": "name",
+  "expect": "/p/n-non-null",
+  "feature": "non-null assertion on the name (!, TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-object-param-key": {
+  "carries": "name",
+  "expect": "/p/n-object-param-key",
+  "feature": "object parameter key (destructured param)",
+  "kind": "call",
+  "source": "test262 (destructuring-binding)"
+ },
+ "n-object-rest": {
+  "carries": "name",
+  "expect": "/p/n-object-rest",
+  "feature": "object-rest",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-objprop": {
+  "carries": "name",
+  "expect": "/p/n-objprop",
+  "feature": "object literal property read",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "n-path-alias": {
+  "carries": "name",
+  "expect": "/p/n-path-alias",
+  "feature": "tsconfig paths alias (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-private-field": {
+  "carries": "name",
+  "expect": "/p/n-private-field",
+  "feature": "class-fields-private (#field)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-reexport": {
+  "carries": "name",
+  "expect": "/p/n-reexport",
+  "feature": "export ... from (re-export)",
+  "kind": "call",
+  "source": "test262 (ES2015 modules)"
+ },
+ "n-replace": {
+  "carries": "name",
+  "expect": "/p/n-replace/:param",
+  "feature": "String.prototype.replace (built-in)",
+  "kind": "call",
+  "source": "test262 (built-in)"
+ },
+ "n-replaceall": {
+  "carries": "name",
+  "expect": "/p/n-replaceall/:param",
+  "feature": "String.prototype.replaceAll (built-in)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-satisfies": {
+  "carries": "name",
+  "expect": "/p/n-satisfies",
+  "feature": "satisfies (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-spread-key": {
+  "carries": "name",
+  "expect": "/p/n-spread-key",
+  "feature": "object-spread before the key",
+  "kind": "call",
+  "source": "test262 (object-spread)"
+ },
+ "n-star-as": {
+  "carries": "name",
+  "expect": "/p/n-star-as",
+  "feature": "export-star-as-namespace-from-module",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-static-block": {
+  "carries": "name",
+  "expect": "/p/n-static-block",
+  "feature": "class-static-block",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-static-field": {
+  "carries": "name",
+  "expect": "/p/n-static-field",
+  "feature": "class-static-fields-public",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-str-concat": {
+  "carries": "name",
+  "expect": "/p/n-str-concat",
+  "feature": "String.prototype.concat (built-in)",
+  "kind": "call",
+  "source": "test262 (built-in)"
+ },
+ "n-tagged": {
+  "carries": "name",
+  "expect": "/p/n-tagged",
+  "feature": "tagged template (String.raw)",
+  "kind": "call",
+  "source": "test262 (template)"
+ },
+ "n-template": {
+  "carries": "name",
+  "expect": "/p/n-template/:param",
+  "feature": "template",
+  "kind": "call",
+  "source": "test262"
+ },
+ "n-tl-type": {
+  "carries": "name",
+  "expect": "/p/n-tl-type",
+  "feature": "template literal type parameter (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "n-url": {
+  "carries": "name",
+  "expect": "/p/n-url",
+  "feature": "URL (WHATWG built-in)",
+  "kind": "call",
+  "source": "platform built-in"
+ },
+ "pl-class": {
+  "carries": "payload",
+  "expect": "/p/pl-class",
+  "feature": "class instance payload",
+  "kind": "payload",
+  "source": "test262 (class)"
+ },
+ "pl-generic": {
+  "carries": "payload",
+  "expect": "/p/pl-generic",
+  "feature": "generic utility type payload (Partial<T>, TS)",
+  "kind": "payload",
+  "source": "TS"
+ },
+ "pl-interface": {
+  "carries": "payload",
+  "expect": "/p/pl-interface",
+  "feature": "interface-typed variable (TS)",
+  "kind": "payload",
+  "source": "TS"
+ },
+ "pl-js-inferred": {
+  "carries": "payload",
+  "expect": "/p/pl-js-inferred",
+  "feature": "JS file, inferred payload",
+  "kind": "payload",
+  "source": "ES5"
+ },
+ "pl-json-stringify": {
+  "carries": "payload",
+  "expect": "/p/pl-json-stringify",
+  "feature": "JSON.stringify payload (built-in)",
+  "kind": "payload",
+  "source": "test262 (JSON)"
+ },
+ "pl-literal": {
+  "carries": "payload",
+  "expect": "/p/pl-literal",
+  "feature": "object literal payload",
+  "kind": "payload",
+  "source": "ES5"
+ },
+ "pl-satisfies": {
+  "carries": "payload",
+  "expect": "/p/pl-satisfies",
+  "feature": "satisfies payload (TS)",
+  "kind": "payload",
+  "source": "TS"
+ },
+ "pl-spread": {
+  "carries": "payload",
+  "expect": "/p/pl-spread",
+  "feature": "object-spread payload",
+  "kind": "payload",
+  "source": "test262"
+ },
+ "pl-type-import": {
+  "carries": "payload",
+  "expect": "/p/pl-type-import",
+  "feature": "type-only import of the payload type (TS)",
+  "kind": "payload",
+  "source": "TS"
+ },
+ "pl-wrapper": {
+  "carries": "payload",
+  "expect": "/p/pl-wrapper",
+  "feature": "payload through a wrapper parameter",
+  "kind": "payload",
+  "source": "ES5"
+ },
+ "q-enum": {
+  "carries": "name",
+  "expect": "q-enum",
+  "feature": "enum topic (TS)",
+  "kind": "pubsub",
+  "source": "TS"
+ },
+ "q-imported-const": {
+  "carries": "name",
+  "expect": "q-imported-const",
+  "feature": "imported const topic",
+  "kind": "pubsub",
+  "source": "test262 (modules)"
+ },
+ "q-literal": {
+  "carries": "name",
+  "expect": "q-literal",
+  "feature": "topic literal (baseline)",
+  "kind": "pubsub",
+  "source": "ES5"
+ },
+ "q-subscribe-const": {
+  "carries": "name",
+  "expect": "q-subscribe",
+  "feature": "subscriber with an as-const topic object",
+  "kind": "pubsub",
+  "source": "TS"
+ },
+ "q-template": {
+  "carries": "name",
+  "expect": "q-template.created",
+  "feature": "template topic with const prefix",
+  "kind": "pubsub",
+  "source": "test262 (template)"
+ },
+ "q-wrapper": {
+  "carries": "target",
+  "expect": "q-wrapper",
+  "feature": "wrapper forwarding the topic",
+  "kind": "pubsub",
+  "source": "ES5"
+ },
+ "r-chained": {
+  "carries": "target",
+  "expect": "/p/r-chained-b",
+  "feature": "chained call on a returned this",
+  "kind": "endpoint",
+  "source": "ES5"
+ },
+ "r-const-prefix": {
+  "carries": "name",
+  "expect": "/p/r-const-prefix/items",
+  "feature": "template with a const prefix",
+  "kind": "endpoint",
+  "source": "test262 (template)"
+ },
+ "r-enum": {
+  "carries": "name",
+  "expect": "/p/r-enum",
+  "feature": "enum route name (TS)",
+  "kind": "endpoint",
+  "source": "TS"
+ },
+ "r-imported-app": {
+  "carries": "target",
+  "expect": "/p/r-imported-app",
+  "feature": "app imported from another module",
+  "kind": "endpoint",
+  "source": "test262 (modules)"
+ },
+ "r-literal": {
+  "carries": "name",
+  "expect": "/p/r-literal",
+  "feature": "route literal (baseline)",
+  "kind": "endpoint",
+  "source": "ES5"
+ },
+ "r-loop": {
+  "carries": "name",
+  "expect": "/p/r-loop/daily|/p/r-loop/weekly",
+  "feature": "for-of over a literal array (route per value)",
+  "kind": "endpoint",
+  "source": "test262 (for-of)"
+ },
+ "r-param-app": {
+  "carries": "target",
+  "expect": "/p/r-param-app",
+  "feature": "app passed as a parameter (register function)",
+  "kind": "endpoint",
+  "source": "ES5"
+ },
+ "r-shared-export": {
+  "carries": "target",
+  "expect": "/p/r-shared",
+  "feature": "package's own instance (named export)",
+  "kind": "endpoint",
+  "source": "test262 (modules)"
+ },
+ "ri-array": {
+  "carries": "target",
+  "expect": "/p/ri-array",
+  "feature": "instance held in an array element",
+  "kind": "endpoint",
+  "source": "ES5"
+ },
+ "ri-class-field": {
+  "carries": "target",
+  "expect": "/p/ri-class-field",
+  "feature": "class field holding an instance",
+  "kind": "endpoint",
+  "source": "test262 (class-fields-public)"
+ },
+ "ri-const-alias": {
+  "carries": "target",
+  "expect": "/p/ri-const-alias",
+  "feature": "const alias of an instance",
+  "kind": "endpoint",
+  "source": "test262 (const)"
+ },
+ "ri-destructure": {
+  "carries": "target",
+  "expect": "/p/ri-destructure",
+  "feature": "destructured method of an instance",
+  "kind": "endpoint",
+  "source": "test262 (destructuring-binding)"
+ },
+ "ri-getter": {
+  "carries": "target",
+  "expect": "/p/ri-getter",
+  "feature": "getter returning an instance",
+  "kind": "endpoint",
+  "source": "ES5"
+ },
+ "ri-optional": {
+  "carries": "target",
+  "expect": "/p/ri-optional",
+  "feature": "optional-chaining on an instance",
+  "kind": "endpoint",
+  "source": "test262"
+ },
+ "ri-param-property": {
+  "carries": "target",
+  "expect": "/p/ri-param-property",
+  "feature": "constructor parameter property holding an instance (TS)",
+  "kind": "endpoint",
+  "source": "TS"
+ },
+ "t-array-held": {
+  "carries": "target",
+  "expect": "/p/t-array-held",
+  "feature": "client held in an array element",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-as-cast": {
+  "carries": "target",
+  "expect": "/p/t-as-cast",
+  "feature": "type assertion on the client (as, TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "t-async": {
+  "carries": "target",
+  "expect": "/p/t-async",
+  "feature": "async-functions wrapper",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-barrel": {
+  "carries": "target",
+  "expect": "/p/t-barrel",
+  "feature": "re-exported client (barrel)",
+  "kind": "call",
+  "source": "test262 (modules)"
+ },
+ "t-call-apply": {
+  "carries": "target",
+  "expect": "/p/t-call-apply",
+  "feature": "Function.prototype.call (built-in)",
+  "kind": "call",
+  "source": "test262 (built-in)"
+ },
+ "t-call-result-receiver": {
+  "carries": "target",
+  "expect": "/p/t-call-result-receiver",
+  "feature": "client returned by a function call",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-callback": {
+  "carries": "target",
+  "expect": "/p/t-callback",
+  "feature": "function passed as an argument (callback)",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-class-expr": {
+  "carries": "target",
+  "expect": "/p/t-class-expr",
+  "feature": "class expression",
+  "kind": "call",
+  "source": "test262 (class)"
+ },
+ "t-class-field-client": {
+  "carries": "target",
+  "expect": "/p/t-class-field-client",
+  "feature": "class field holding the client",
+  "kind": "call",
+  "source": "test262 (class-fields-public)"
+ },
+ "t-class-method": {
+  "carries": "target",
+  "expect": "/p/t-class-method",
+  "feature": "class method wrapper",
+  "kind": "call",
+  "source": "test262 (class)"
+ },
+ "t-closure": {
+  "carries": "target",
+  "expect": "/p/t-closure",
+  "feature": "returned closure (factory)",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-coalesce-receiver": {
+  "carries": "target",
+  "expect": "/p/t-coalesce-receiver",
+  "feature": "coalesce-expression choosing the client",
+  "kind": "call",
+  "source": "test262 (coalesce-expression)"
+ },
+ "t-computed-member": {
+  "carries": "target",
+  "expect": "/p/t-computed-member",
+  "feature": "computed member call (obj[key]())",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-const-alias": {
+  "carries": "target",
+  "expect": "/p/t-const-alias",
+  "feature": "const alias of the client",
+  "kind": "call",
+  "source": "test262 (const)"
+ },
+ "t-cross-file-wrapper": {
+  "carries": "target",
+  "expect": "/p/t-cross-file-wrapper",
+  "feature": "wrapper imported from another file",
+  "kind": "call",
+  "source": "test262 (modules)"
+ },
+ "t-destructure-method": {
+  "carries": "target",
+  "expect": "/p/t-destructure-method",
+  "feature": "destructuring-binding of a method",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-destructured-receiver": {
+  "carries": "target",
+  "expect": "/p/t-destructured-receiver",
+  "feature": "client destructured from an object",
+  "kind": "call",
+  "source": "test262 (destructuring-binding)"
+ },
+ "t-dynamic-import": {
+  "carries": "target",
+  "expect": "/p/t-dynamic-import",
+  "feature": "dynamic-import",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-explicit-resource": {
+  "carries": "target",
+  "expect": "/p/t-using",
+  "feature": "explicit-resource-management (using)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-extract-method": {
+  "carries": "target",
+  "expect": "/p/t-extract-method",
+  "feature": "method extracted to a const (bound)",
+  "kind": "call",
+  "source": "builtins: Function.prototype.bind"
+ },
+ "t-generator": {
+  "carries": "target",
+  "expect": "/p/t-generator",
+  "feature": "generators wrapper",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-getter-client": {
+  "carries": "target",
+  "expect": "/p/t-getter-client",
+  "feature": "getter returning the client",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-iife": {
+  "carries": "target",
+  "expect": "/p/t-iife",
+  "feature": "immediately invoked function",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-inherited": {
+  "carries": "target",
+  "expect": "/p/t-inherited",
+  "feature": "class extends (inherited method)",
+  "kind": "call",
+  "source": "test262 (class)"
+ },
+ "t-let-reassigned": {
+  "carries": "target",
+  "expect": "/p/t-let-reassigned",
+  "feature": "let reassigned between two clients",
+  "kind": "call",
+  "source": "test262 (let)"
+ },
+ "t-mixin": {
+  "carries": "target",
+  "expect": "/p/t-mixin",
+  "feature": "Object.assign mixin (built-in)",
+  "kind": "call",
+  "source": "test262 (built-in)"
+ },
+ "t-named-alias": {
+  "carries": "target",
+  "expect": "/p/t-named-alias",
+  "feature": "import { x as y } (import alias)",
+  "kind": "call",
+  "source": "test262 (modules)"
+ },
+ "t-namespace-import": {
+  "carries": "target",
+  "expect": "/p/t-namespace-import",
+  "feature": "import * as ns",
+  "kind": "call",
+  "source": "test262 (modules)"
+ },
+ "t-non-null": {
+  "carries": "target",
+  "expect": "/p/t-non-null",
+  "feature": "non-null assertion (!, TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "t-object-method": {
+  "carries": "target",
+  "expect": "/p/t-object-method",
+  "feature": "object literal method wrapper",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-optional-chain": {
+  "carries": "target",
+  "expect": "/p/t-optional-chain",
+  "feature": "optional-chaining (?.)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-param-client": {
+  "carries": "target",
+  "expect": "/p/t-param-client",
+  "feature": "client passed as a typed parameter",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-param-property": {
+  "carries": "target",
+  "expect": "/p/t-param-property",
+  "feature": "constructor parameter property (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "t-private-method": {
+  "carries": "target",
+  "expect": "/p/t-private-method",
+  "feature": "class-methods-private (#method)",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-promise-then": {
+  "carries": "target",
+  "expect": "/p/t-promise-then",
+  "feature": "Promise.prototype.then callback (built-in)",
+  "kind": "call",
+  "source": "test262 (Promise)"
+ },
+ "t-proxy": {
+  "carries": "target",
+  "expect": "/p/t-proxy",
+  "feature": "Proxy around the client (built-in)",
+  "kind": "call",
+  "source": "test262 (Proxy)"
+ },
+ "t-reflect": {
+  "carries": "target",
+  "expect": "/p/t-reflect",
+  "feature": "Reflect.apply (built-in)",
+  "kind": "call",
+  "source": "test262 (Reflect)"
+ },
+ "t-require": {
+  "carries": "target",
+  "expect": "/p/t-require",
+  "feature": "CommonJS require (host)",
+  "kind": "call",
+  "source": "Node host"
+ },
+ "t-rest-spread": {
+  "carries": "target",
+  "expect": "/p/t-rest-spread",
+  "feature": "rest-parameters + spread arguments",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-satisfies-client": {
+  "carries": "target",
+  "expect": "/p/t-satisfies-client",
+  "feature": "satisfies on an object holding the client (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "t-static-method": {
+  "carries": "target",
+  "expect": "/p/t-static-method",
+  "feature": "class static method wrapper",
+  "kind": "call",
+  "source": "test262 (class)"
+ },
+ "t-super": {
+  "carries": "target",
+  "expect": "/p/t-super",
+  "feature": "super",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-tla": {
+  "carries": "target",
+  "expect": "/p/t-tla",
+  "feature": "top-level-await",
+  "kind": "call",
+  "source": "test262"
+ },
+ "t-typed-const": {
+  "carries": "target",
+  "expect": "/p/t-typed-const",
+  "feature": "const with a declared interface type (TS)",
+  "kind": "call",
+  "source": "TS"
+ },
+ "t-wrapper-arrow": {
+  "carries": "target",
+  "expect": "/p/t-wrapper-arrow",
+  "feature": "arrow-function wrapper",
+  "kind": "call",
+  "source": "test262 (arrow-function)"
+ },
+ "t-wrapper-fn": {
+  "carries": "target",
+  "expect": "/p/t-wrapper-fn",
+  "feature": "function declaration wrapper (param forwarded)",
+  "kind": "call",
+  "source": "ES5"
+ },
+ "t-wrapper-in-object-method": {
+  "carries": "target",
+  "expect": "/p/t-wrapper-in-object-method",
+  "feature": "path forwarded through an object literal method",
+  "kind": "call",
+  "source": "ES5"
+ }
+}
