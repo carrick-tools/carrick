@@ -505,6 +505,49 @@ fn routes_on_a_maker_field_take_their_full_paths() {
     }
 }
 
+/// carrick#3489 W2: a route registered on a module-scope alias of an
+/// instance, or on a key of a module object literal destructured into a
+/// `const`, is a mount-graph row at its full path, `library_claim`, with no
+/// unread lead at its line. An alias a function declares is not read by this
+/// rule: it places no row.
+#[test]
+fn routes_on_module_aliases_take_their_full_paths() {
+    let on = scan_fixture("receiver-forms-routes");
+    let (graph, flat) = endpoint_rows(&on);
+    for (site, want) in [
+        (
+            "src/ri-const-alias.ts:4",
+            "src/ri-const-alias.ts:4 GET /p/ri-const-alias library_claim",
+        ),
+        (
+            "src/s-destructured.ts:4",
+            "src/s-destructured.ts:4 GET /p/s-destructured library_claim",
+        ),
+    ] {
+        let rows: Vec<&String> = graph
+            .iter()
+            .filter(|row| row.starts_with(&format!("{site} ")))
+            .collect();
+        assert_eq!(rows.len(), 1, "{site}: {graph:#?}");
+        assert!(rows[0].starts_with(want), "{site}: {graph:#?}");
+        assert!(
+            flat.iter().any(|row| row.starts_with(want)),
+            "{site}: {flat:#?}"
+        );
+    }
+    let unread = unread_reasons(&on);
+    for site in ["src/ri-const-alias.ts:4", "src/s-destructured.ts:4"] {
+        assert!(!unread.contains_key(site), "{site}: {unread:#?}");
+    }
+    assert!(
+        graph
+            .iter()
+            .filter(|row| row.starts_with("src/s-local-alias.ts:3 "))
+            .all(|row| !row.contains("library_claim")),
+        "{graph:#?}"
+    );
+}
+
 /// Why each possible call's path is unread, as `file:line` to reason. A call
 /// whose path is read and whose owner is not is `owner_unknown`.
 fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {
