@@ -407,12 +407,12 @@
  "t-array-held": {
   "feature": "client held in an array element",
   "source": "ES5",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-as-cast": {
   "feature": "type assertion on the client (as, TS)",
   "source": "TS",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-async": {
   "feature": "async-functions wrapper",
@@ -432,7 +432,7 @@
  "t-call-result-receiver": {
   "feature": "client returned by a function call",
   "source": "ES5",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-callback": {
   "feature": "function passed as an argument (callback)",
@@ -447,7 +447,7 @@
  "t-class-field-client": {
   "feature": "class field holding the client",
   "source": "test262 (class-fields-public)",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-class-method": {
   "feature": "class method wrapper",
@@ -462,7 +462,7 @@
  "t-coalesce-receiver": {
   "feature": "coalesce-expression choosing the client",
   "source": "test262 (coalesce-expression)",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-computed-member": {
   "feature": "computed member call (obj[key]())",
@@ -472,7 +472,7 @@
  "t-const-alias": {
   "feature": "const alias of the client",
   "source": "test262 (const)",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-cross-file-wrapper": {
   "feature": "wrapper imported from another file",
@@ -487,7 +487,7 @@
  "t-destructured-receiver": {
   "feature": "client destructured from an object",
   "source": "test262 (destructuring-binding)",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-dynamic-import": {
   "feature": "dynamic-import",
@@ -512,7 +512,7 @@
  "t-getter-client": {
   "feature": "getter returning the client",
   "source": "ES5",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-iife": {
   "feature": "immediately invoked function",
@@ -527,7 +527,7 @@
  "t-let-reassigned": {
   "feature": "let reassigned between two clients",
   "source": "test262 (let)",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-mixin": {
   "feature": "Object.assign mixin (built-in)",
@@ -547,7 +547,7 @@
  "t-non-null": {
   "feature": "non-null assertion (!, TS)",
   "source": "TS",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-object-method": {
   "feature": "object literal method wrapper",
@@ -557,7 +557,7 @@
  "t-optional-chain": {
   "feature": "optional-chaining (?.)",
   "source": "test262",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-param-client": {
   "feature": "client passed as a typed parameter",
@@ -567,7 +567,7 @@
  "t-param-property": {
   "feature": "constructor parameter property (TS)",
   "source": "TS",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-private-method": {
   "feature": "class-methods-private (#method)",
@@ -582,7 +582,7 @@
  "t-proxy": {
   "feature": "Proxy around the client (built-in)",
   "source": "test262 (Proxy)",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-reflect": {
   "feature": "Reflect.apply (built-in)",
@@ -622,7 +622,7 @@
  "t-typed-const": {
   "feature": "const with a declared interface type (TS)",
   "source": "TS",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-wrapper-arrow": {
   "feature": "arrow-function wrapper",
