@@ -3,8 +3,10 @@
 //!
 //! Design: carrick-cloud
 //! `docs/internal/decisions/2026-11-07-one-value-resolver.md` (sections 2.1
-//! to 2.7 and 3). This is step S0: discovery's value walk (carrick#2432)
-//! lifted here unchanged, so every later reader grows from one walk.
+//! to 2.7 and 3). Step S0 lifted discovery's value walk (carrick#2432) here
+//! unchanged, so every later reader grows from one walk. Step S1 added the
+//! binding table and the one write census (section 2.4): a module binding
+//! is its initialiser and every value written to it ([`ModuleBinding`]).
 //!
 //! Two halves:
 //!
@@ -30,7 +32,7 @@
 
 use super::row_calls::Reach;
 use super::*;
-use crate::position_rows::Kind;
+use crate::position_rows::{Kind, Row};
 use std::cell::{Cell, RefCell};
 
 /// How many object literals deep an argument's keys are read (the decision
@@ -41,6 +43,173 @@ const MAX_VALUE_DEPTH: usize = 4;
 /// one value may be read through (D7 sets the second at 8 hops; S0 keeps
 /// today's 16 so nothing moves).
 pub(super) const MAX_VALUES: usize = 16;
+
+/// How many values one query reads before it answers that it cannot say
+/// (the decision record's step cap, D7, set from the S0 census: at most 917
+/// steps over 57,099 queries in the largest repo read). A query over it
+/// answers one value nothing reads, never the part it read.
+const MAX_QUERY_STEPS: usize = 2048;
+
+/// A module-scope binding (`const`, `let` or `var`) and every value written
+/// to it (carrick#3504 S1, the decision record's section 2.4): its
+/// initialiser and each assignment the write census places. Keyed in
+/// [`FileIr::module_bindings`] by the 1-based line its name is declared on and the
+/// name, as a compiler row names a declaration.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ModuleBinding {
+    /// What the initialiser may hold, read in module scope. Empty when the
+    /// declaration has none.
+    pub(super) init: Vec<ValueAt>,
+    /// The instance the initialiser holds, as the receiver trace reads one.
+    pub(super) init_held: Option<HeldInstance>,
+    /// Where each plain assignment to the binding starts (`name = value`),
+    /// anywhere in the module: its value is in the [`BindingWrite`] of the
+    /// body it is written in.
+    pub(super) writes: Vec<u32>,
+    /// Something writes the binding in a form whose value no reader states:
+    /// a compound or logical assignment, an update, a destructuring target,
+    /// a loop head, a second declaration, or `with` or `eval` in the module
+    /// (soundness rule 1). An importer cannot assign a module's binding
+    /// (rule 2), so the module's own census is complete.
+    pub(super) unplaceable: bool,
+}
+
+/// A plain assignment `name = value` written directly in a body (not in a
+/// function written inside it), with what the value may hold read in that
+/// body's scope.
+#[derive(Debug, Clone)]
+pub(super) struct BindingWrite {
+    /// Where the assignment starts.
+    pub(super) at: u32,
+    pub(super) values: Vec<ValueAt>,
+    /// The instance the value holds, as the receiver trace reads one.
+    pub(super) held: Option<HeldInstance>,
+}
+
+/// Every write of every binding in a module, by binding (the one write
+/// census, section 2.4). Syntax alone: it places where each plain
+/// assignment starts and marks every other form of write.
+#[derive(Default)]
+struct WriteCensus {
+    writes: HashMap<BindingKey, Vec<u32>>,
+    unplaceable: HashSet<BindingKey>,
+    declared: HashMap<BindingKey, usize>,
+    /// `with` or a direct `eval` may write any binding.
+    opaque: bool,
+}
+
+/// Every binding a pattern writes.
+#[derive(Default)]
+struct PatternNames(Vec<BindingKey>);
+
+impl Visit for PatternNames {
+    fn visit_binding_ident(&mut self, binding: &BindingIdent) {
+        self.0.push(ident_key(&binding.id));
+    }
+}
+
+impl WriteCensus {
+    fn mark(&mut self, pat: &impl VisitWith<PatternNames>) {
+        let mut names = PatternNames::default();
+        pat.visit_with(&mut names);
+        self.unplaceable.extend(names.0);
+    }
+}
+
+impl Visit for WriteCensus {
+    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+        match &assign.left {
+            AssignTarget::Simple(SimpleAssignTarget::Ident(binding)) => {
+                let key = ident_key(&binding.id);
+                if assign.op == AssignOp::Assign {
+                    self.writes.entry(key).or_default().push(assign.span.lo.0);
+                } else {
+                    self.unplaceable.insert(key);
+                }
+            }
+            AssignTarget::Pat(pat) => self.mark(pat),
+            _ => {}
+        }
+        assign.visit_children_with(self);
+    }
+
+    fn visit_update_expr(&mut self, update: &UpdateExpr) {
+        if let Expr::Ident(ident) = crate::graphql_document_sites::unwrap_expression(&update.arg) {
+            self.unplaceable.insert(ident_key(ident));
+        }
+        update.visit_children_with(self);
+    }
+
+    fn visit_for_head(&mut self, head: &ForHead) {
+        if let ForHead::Pat(pat) = head {
+            self.mark(&**pat);
+        }
+        head.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        let mut names = PatternNames::default();
+        declarator.name.visit_with(&mut names);
+        for name in names.0 {
+            *self.declared.entry(name).or_default() += 1;
+        }
+        declarator.visit_children_with(self);
+    }
+
+    fn visit_with_stmt(&mut self, with: &WithStmt) {
+        self.opaque = true;
+        with.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Callee::Expr(callee) = &call.callee
+            && matches!(&**callee, Expr::Ident(ident) if ident.sym == "eval")
+        {
+            self.opaque = true;
+        }
+        call.visit_children_with(self);
+    }
+
+    fn visit_ts_type(&mut self, _: &TsType) {}
+}
+
+/// Each module-scope binding a plain name declares, with its initialiser
+/// read in module scope and every write the census finds (carrick#3504 S1).
+pub(super) fn module_bindings(
+    module: &Module,
+    source_map: &Lrc<SourceMap>,
+    reader: &Reader<'_>,
+    scope: &Scope<'_>,
+) -> HashMap<(u32, String), ModuleBinding> {
+    let mut census = WriteCensus::default();
+    module.visit_with(&mut census);
+    let mut out: HashMap<(u32, String), ModuleBinding> = HashMap::new();
+    for item in &module.body {
+        let Some(var) = module_var_decl(item) else {
+            continue;
+        };
+        for declarator in &var.decls {
+            let Pat::Ident(ident) = &declarator.name else {
+                continue;
+            };
+            let key = ident_key(&ident.id);
+            let line = source_map.lookup_char_pos(ident.id.span.lo).line as u32;
+            let init = declarator.init.as_deref();
+            let binding = ModuleBinding {
+                init: init
+                    .map(|init| reader.value_of(init, scope, &guards::Bound::default()))
+                    .unwrap_or_default(),
+                init_held: init.and_then(|init| reader.held(init, scope)),
+                writes: census.writes.get(&key).cloned().unwrap_or_default(),
+                unplaceable: census.opaque
+                    || census.unplaceable.contains(&key)
+                    || census.declared.get(&key).copied().unwrap_or(0) > 1,
+            };
+            out.insert((line, ident.id.sym.to_string()), binding);
+        }
+    }
+    out
+}
 
 /// One value a callee, an argument, a parameter's default or a `return` may
 /// hold, read where it is written.
@@ -579,6 +748,14 @@ pub(super) struct Resolver<'a> {
     /// How many resolver calls are open, and the step count when the
     /// outermost one opened.
     open: Cell<(usize, usize)>,
+    /// The open query has read more than [`MAX_QUERY_STEPS`] values: every
+    /// read until it closes holds nothing, and it answers so.
+    capped: Cell<bool>,
+    /// The step cap: [`MAX_QUERY_STEPS`], lowered by tests.
+    cap: usize,
+    /// The module bindings being read (carrick#3504 S1): a binding written
+    /// with its own value adds nothing (soundness rule 7).
+    bindings_reading: RefCell<HashSet<(PathBuf, u32, String)>>,
 }
 
 /// What the resolver read (carrick#3504 S0): every value read, how many
@@ -589,6 +766,9 @@ pub(super) struct Census {
     pub(super) steps: usize,
     pub(super) queries: usize,
     pub(super) max_query_steps: usize,
+    /// The queries that read more than [`MAX_QUERY_STEPS`] values and
+    /// answered that they cannot say.
+    pub(super) capped_queries: usize,
 }
 
 /// One open resolver call; the outermost one closing ends a query.
@@ -602,6 +782,9 @@ impl Drop for Query<'_, '_> {
             let mut census = self.0.census.get();
             census.queries += 1;
             census.max_query_steps = census.max_query_steps.max(census.steps - start);
+            if self.0.capped.get() {
+                census.capped_queries += 1;
+            }
             self.0.census.set(census);
         }
     }
@@ -621,7 +804,43 @@ impl<'a> Resolver<'a> {
             fields_reading: RefCell::new(HashSet::new()),
             census: Cell::new(Census::default()),
             open: Cell::new((0, 0)),
+            capped: Cell::new(false),
+            cap: MAX_QUERY_STEPS,
+            bindings_reading: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// The same resolver with a lower step cap.
+    #[cfg(test)]
+    pub(super) fn with_cap(mut self, cap: usize) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Whether the open query is over the step cap: what it reads now is
+    /// not all the value holds, so no consumer keeps it.
+    pub(super) fn capping(&self) -> bool {
+        self.capped.get()
+    }
+
+    /// Counts one value read; `true` once the open query is over the cap.
+    fn step(&self) -> bool {
+        let mut census = self.census.get();
+        census.steps += 1;
+        self.census.set(census);
+        if census.steps - self.open.get().1 > self.cap {
+            self.capped.set(true);
+        }
+        self.capped.get()
+    }
+
+    /// What a resolver call answers: what it read, or, when it is the
+    /// outermost call of a query over the cap, one value nothing reads.
+    fn settle<R: Default>(&self, out: Vec<Held<R>>) -> Vec<Held<R>> {
+        if self.open.get().0 == 1 && self.capped.get() {
+            return vec![Held::Reached(R::default())];
+        }
+        out
     }
 
     /// What the resolver has read so far.
@@ -633,6 +852,7 @@ impl<'a> Resolver<'a> {
     fn enter(&self) -> Query<'_, 'a> {
         let (depth, start) = self.open.get();
         let start = if depth == 0 {
+            self.capped.set(false);
             self.census.get().steps
         } else {
             start
@@ -691,9 +911,21 @@ impl<'a> Resolver<'a> {
         at_caller: bool,
     ) -> Vec<Held<F::Reached>> {
         let _query = self.enter();
-        let mut census = self.census.get();
-        census.steps += 1;
-        self.census.set(census);
+        if self.step() {
+            return self.settle(Vec::new());
+        }
+        let out = self.read_in(follow, file, value, invoke, at_caller);
+        self.settle(out)
+    }
+
+    fn read_in<F: Follow<'a>>(
+        &self,
+        follow: &mut F,
+        file: &'a Path,
+        value: &ValueAt,
+        invoke: Invoke<'a>,
+        at_caller: bool,
+    ) -> Vec<Held<F::Reached>> {
         let nothing = || vec![Held::Reached(F::Reached::default())];
         match value {
             ValueAt::Param { depth, index, keys } => {
@@ -724,7 +956,16 @@ impl<'a> Resolver<'a> {
                     Reach::Function(target, key) => {
                         vec![Held::Reached(follow.definition(target, key, invoke))]
                     }
-                    _ => nothing(),
+                    // A name the compiler declares as a module binding is
+                    // every value written to it (carrick#3504 S1).
+                    _ if *member => nothing(),
+                    _ => self
+                        .row_at(file, *lo, *hi, kind)
+                        .and_then(|row| self.declared_binding(row))
+                        .and_then(|(path, line, symbol)| {
+                            self.binding_values(follow, path, line, &symbol, invoke)
+                        })
+                        .unwrap_or_else(nothing),
                 }
             }
             ValueAt::Returned { lo, hi, member } => {
@@ -885,7 +1126,7 @@ impl<'a> Resolver<'a> {
             }
         }
         self.fields_reading.borrow_mut().remove(&reading);
-        Some(out)
+        Some(self.settle(out))
     }
 
     /// Whether every value `call`'s callee may hold is a field whose class
@@ -958,7 +1199,7 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
-        out
+        self.settle(out)
     }
 
     /// The values the parameter `param` (how many functions out of the body
@@ -1018,8 +1259,121 @@ impl<'a> Resolver<'a> {
             }
         }
         passing.pop();
-        values
+        self.settle(values)
     }
+
+    /// The compiler row of the kind `kind` at `lo..hi` (discovery numbering)
+    /// in `file`.
+    fn row_at(&self, file: &Path, lo: u32, hi: u32, kind: Kind) -> Option<&'a Row> {
+        let inputs = self.inputs_for(file);
+        let ir = inputs.files.get(file)?;
+        inputs
+            .positions
+            .as_ref()?
+            .lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind)
+            .ok()
+    }
+
+    /// The module binding `row` names, when its declaration is one a file
+    /// of the run declares at module scope: the file as the inputs key it,
+    /// the declaration's line and its name.
+    pub(super) fn declared_binding(&self, row: &Row) -> Option<(&'a Path, u32, String)> {
+        if !super::discovery::in_repo(row) {
+            return None;
+        }
+        let (decl_file, line, symbol) = (row.decl_file()?, row.decl_line()?, row.symbol()?);
+        let declaring = self.inputs.positions.as_ref()?.path_of(decl_file);
+        let (path, ir) = self
+            .inputs_for(&declaring)
+            .files
+            .get_key_value(&declaring)?;
+        ir.module_bindings
+            .contains_key(&(line, symbol.to_string()))
+            .then(|| (path.as_path(), line, symbol.to_string()))
+    }
+
+    /// Every value the module binding `symbol`, declared on `line` of `file`,
+    /// may hold when `invoke` runs it (carrick#3504 S1, soundness rule 1):
+    /// its initialiser and each value an assignment writes, a write of the
+    /// writing function's parameter read at that function's callers. A
+    /// write the census cannot place, and a parameter no caller fills, add
+    /// one value nothing reads, so no consumer agrees on the rest alone.
+    /// `None` where `file` declares no such binding.
+    pub(super) fn binding_values<F: Follow<'a>>(
+        &self,
+        follow: &mut F,
+        file: &'a Path,
+        line: u32,
+        symbol: &str,
+        invoke: Invoke<'a>,
+    ) -> Option<Vec<Held<F::Reached>>> {
+        let _query = self.enter();
+        let ir = self.inputs_for(file).files.get(file)?;
+        let binding = ir.module_bindings.get(&(line, symbol.to_string()))?;
+        let nothing = || Held::Reached(F::Reached::default());
+        let reading = (file.to_path_buf(), line, symbol.to_string());
+        if !self.bindings_reading.borrow_mut().insert(reading.clone()) {
+            return Some(Vec::new());
+        }
+        let mut out = Vec::new();
+        // A write no reader states: the binding may hold anything besides
+        // the values below.
+        if binding.unplaceable {
+            out.push(nothing());
+        }
+        for value in &binding.init {
+            out.extend(self.read_value(follow, file, value, invoke, false));
+        }
+        for at in &binding.writes {
+            let Some((key, write)) = placed_write(ir, *at) else {
+                out.push(nothing());
+                continue;
+            };
+            for value in &write.values {
+                match (value, key) {
+                    (
+                        ValueAt::Param {
+                            depth: 0,
+                            index,
+                            keys,
+                        },
+                        Some(key),
+                    ) => {
+                        let filled = self.callers_pass(
+                            follow,
+                            (file, Some(key), 0),
+                            (0, *index, keys),
+                            invoke,
+                            &mut Vec::new(),
+                        );
+                        if filled.is_empty() {
+                            out.push(nothing());
+                        }
+                        out.extend(filled);
+                    }
+                    (ValueAt::Param { .. }, _) => out.push(nothing()),
+                    (other, _) => out.extend(self.read_value(follow, file, other, invoke, false)),
+                }
+            }
+        }
+        self.bindings_reading.borrow_mut().remove(&reading);
+        Some(self.settle(out))
+    }
+}
+
+/// The plain assignment starting at `at`, written directly in a definition
+/// of `ir` (with its key) or at module level (`None`). `None` for one
+/// written inside a function written in a body: what runs that function
+/// decides when it writes (an S1 gap; the binding holds nothing readable).
+pub(super) fn placed_write(ir: &FileIr, at: u32) -> Option<(Option<&str>, &BindingWrite)> {
+    fn find(body: &FnIr, at: u32) -> Option<&BindingWrite> {
+        body.binding_writes.iter().find(|write| write.at == at)
+    }
+    let mut keys: Vec<&String> = ir.functions.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .find_map(|key| find(&ir.functions[key], at).map(|write| (Some(key.as_str()), write)))
+        .or_else(|| find(&ir.module_level, at).map(|write| (None, write)))
 }
 
 #[cfg(test)]
@@ -1259,5 +1613,32 @@ mod tests {
             [Got::End(End::Nothing), definition("sendGo")]
         );
         assert_eq!(read("spread.ts", 20), [definition("sendGo")]);
+    }
+
+    /// carrick#3504 S1: a query that reads more values than the step cap
+    /// answers one value nothing reads, never the part it read, and the
+    /// census counts it. The next query starts under the cap again.
+    #[test]
+    fn a_query_over_the_step_cap_answers_that_it_cannot_say() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]).with_cap(1);
+        assert_eq!(
+            callee(&resolver, &on.inputs, "cycle.ts", 12),
+            [Got::End(End::Nothing)]
+        );
+        assert_eq!(resolver.census().capped_queries, 1);
+        assert_eq!(
+            callee(&resolver, &on.inputs, "spread.ts", 20),
+            [definition("sendGo")]
+        );
+        assert_eq!(resolver.census().capped_queries, 1);
+        let uncapped = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            callee(&uncapped, &on.inputs, "cycle.ts", 12),
+            [definition("sendItems")]
+        );
+        assert_eq!(uncapped.census().capped_queries, 0);
     }
 }

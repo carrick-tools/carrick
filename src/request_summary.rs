@@ -1129,6 +1129,10 @@ struct FnIr {
     /// the message-role field rule (carrick#1665). Taken out by the class
     /// that reads them ([`library_sites::take_field_writes`]).
     field_writes: Vec<FieldWriteIr>,
+    /// Each plain assignment of a name written directly in this body, with
+    /// what the value may hold read in its scope: a module binding's writes
+    /// the value resolver reads (carrick#3504 S1).
+    binding_writes: Vec<resolve::BindingWrite>,
     /// Parameters the body calls (`produce()`), by position.
     invoked_params: BTreeSet<usize>,
     /// Function expressions passed as call arguments, referenced from a
@@ -1466,6 +1470,11 @@ pub struct FileIr {
     /// `share_lazy_clients`). A class member that returns one is no binding
     /// a call names, so it is not here.
     getters: HashMap<String, OwnGetter>,
+    /// Each module-scope binding a plain name declares, by the 1-based line
+    /// its name is declared on and the name, as a compiler row names it:
+    /// its initialiser and every write (the value resolver's binding table,
+    /// carrick#3504 S1).
+    module_bindings: HashMap<(u32, String), resolve::ModuleBinding>,
     /// Where this file starts in the discovery source map
     /// ([`Self::swc_start`]).
     source_start: u32,
@@ -1705,6 +1714,17 @@ pub fn extract_file_ir(
         shadowed_clients: HashSet::new(),
         returned_consts: HashMap::new(),
         destructured: HashSet::new(),
+        lets: module
+            .body
+            .iter()
+            .filter_map(module_var_decl)
+            .filter(|var| var.kind != VarDeclKind::Const)
+            .flat_map(|var| &var.decls)
+            .filter_map(|declarator| match &declarator.name {
+                Pat::Ident(ident) => Some(ident_key(&ident.id)),
+                _ => None,
+            })
+            .collect(),
         imports: HashSet::new(),
         uses: uses.uses,
         object_consts: object_consts(module),
@@ -2214,6 +2234,7 @@ pub fn extract_file_ir(
             }
         }
         file.module_level = module_level;
+        file.module_bindings = resolve::module_bindings(module, source_map, &reader, &scope);
     }
     // What a row stated in another module needs to say about a client's
     // base the way this module's own rows say it (carrick#1568). Any file
@@ -2486,6 +2507,10 @@ struct ModuleScope {
     /// binds ([`destructured_keys`], carrick#3489 W2): a module name whose
     /// instance [`FileIr::module_instance`] follows.
     destructured: HashSet<String>,
+    /// Each module-scope `let` or `var` a plain name declares: the instance
+    /// it holds is each value written to it, read through the binding table
+    /// (carrick#3489 W5, carrick#3504 S1).
+    lets: HashSet<BindingKey>,
     /// Import bindings no scope below declares again, other than namespace
     /// imports: each may hold an instance the module it names declares
     /// (carrick#1568).
@@ -4741,7 +4766,11 @@ impl Reader<'_> {
                 (scope.module.imports.contains(name)
                     || scope.module.shadowed_clients.contains(name)
                     || scope.module.destructured.contains(name)
-                    || scope.module.consts.contains_key(&key))
+                    || scope.module.consts.contains_key(&key)
+                    // A module `let` (carrick#3489 W5) other than a lazy
+                    // client a getter builds (carrick#1790).
+                    || (scope.module.lets.contains(&key)
+                        && !scope.module.lazy_clients.contains_key(&key)))
                 .then_some(HeldInstance::Imported(ident.span.lo.0, ident.span.hi.0))
             }
             call @ (Expr::Call(_) | Expr::New(_)) => self
@@ -7594,6 +7623,22 @@ impl Visit for CallWalker<'_, '_, '_> {
     fn visit_assign_expr(&mut self, assign: &AssignExpr) {
         if let Some(write) = self.reader.field_write(assign, self.scope) {
             self.ir.field_writes.push(write);
+        }
+        // `name = value`: a write the value resolver reads for a module
+        // binding (carrick#3504 S1).
+        if assign.op == AssignOp::Assign
+            && matches!(
+                assign.left,
+                AssignTarget::Simple(SimpleAssignTarget::Ident(_))
+            )
+        {
+            self.ir.binding_writes.push(resolve::BindingWrite {
+                at: assign.span.lo.0,
+                values: self
+                    .reader
+                    .value_of(&assign.right, self.scope, &guards::Bound::default()),
+                held: self.reader.held(&assign.right, self.scope),
+            });
         }
         assign.visit_children_with(self);
     }
