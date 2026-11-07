@@ -4,6 +4,7 @@ import {
   BOUNDARY_POINTER,
   LISTED_SERVICES,
   MAX_EDIT_LINE_CHARS,
+  CHECK_BEFORE_DONE,
   answersTheEdit,
   notRecheckedLine,
   pendingLine,
@@ -922,6 +923,13 @@ test("a payload without uses lines renders exactly as before", () => {
     assert.equal(parsed.uses_lines, undefined, name);
     assert.equal(renderPostToolUse(parsed), renderPostToolUse(parsed, undefined, { uses: true }), name);
   }
+});
+
+test("the session-start check line is short and names both exit codes", () => {
+  assert.equal(
+    CHECK_BEFORE_DONE,
+    "When your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done. Exit 1 is a contract problem; exit 2 means nothing could be checked.",
+  );
 });
 
 test("an edit names the rows outside the file that it moved, and calls an unjudged one no break", () => {

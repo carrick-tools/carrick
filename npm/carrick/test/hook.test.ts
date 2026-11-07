@@ -245,8 +245,8 @@ test("under Codex the session line goes out as additionalContext; Claude Code ke
   assert.deepEqual(Object.keys(wire), ["hookSpecificOutput"]);
   const output = wire["hookSpecificOutput"] as { hookEventName: string; additionalContext: string };
   assert.equal(output.hookEventName, "SessionStart");
-  // Rule 5 and the post-edit line say `check --changed`; session start does not (carrick#3437).
-  assert.doesNotMatch(plain.stdout, /check --changed/);
+  // Both carry the finish-line check.
+  assert.match(plain.stdout, /\nWhen your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done\. Exit 1 is a contract problem; exit 2 means nothing could be checked\.\n$/);
   // The same text Claude Code is given, byte for byte.
   assert.equal(`${output.additionalContext}\n`, plain.stdout);
 });
