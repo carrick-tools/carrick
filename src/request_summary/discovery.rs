@@ -4564,6 +4564,44 @@ export function listen(): void {
         assert_eq!(got, want, "{got:#?}");
     }
 
+    /// carrick#3488: a client the library-site reader does not hold (a
+    /// parameter, a constructor parameter property) is walked to the maker
+    /// call each caller hands in. That root is where its base is read: a
+    /// helper handed two instances ends at both; a class nothing constructs
+    /// ends at no root.
+    #[test]
+    fn a_client_held_in_a_parameter_ends_at_the_maker_its_caller_hands_in() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-client-base")
+        else {
+            return;
+        };
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &[]);
+        let got: Vec<String> = instance_ends(&decided)
+            .into_iter()
+            .filter(|line| {
+                [
+                    "m-param.ts",
+                    "m-param-property.ts",
+                    "m-param-property-di.ts",
+                    "m-two-bases.ts",
+                ]
+                .iter()
+                .any(|file| line.starts_with(&format!("src/{file}:")))
+            })
+            .collect();
+        assert_eq!(
+            got,
+            texts(&[
+                "src/m-param-property-di.ts:2 <- src/m-param-property-di.ts:2 unread",
+                "src/m-param-property.ts:2 <- src/m-param-property.ts:3 root src/m-param-property.ts:3",
+                "src/m-param.ts:2 <- src/m-param.ts:3 root src/m-param.ts:3",
+                "src/m-two-bases.ts:2 <- src/m-two-bases.ts:3 root src/m-two-bases.ts:3",
+                "src/m-two-bases.ts:2 <- src/m-two-bases.ts:4 root src/m-two-bases.ts:4",
+            ]),
+            "{got:#?}"
+        );
+    }
+
     /// carrick#2474 R2b: with the receiver trace on, each route site names
     /// the full path it is served at, per instance end: the prefixes of the
     /// scopes a labelled member opens (a plugin it runs, handed by name,

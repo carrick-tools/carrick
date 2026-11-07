@@ -452,6 +452,7 @@ fn a_by_origin_label_takes_its_side_from_the_instance_ends() {
             export: "connect".to_string(),
             member: None,
             receiver: "instance:()".to_string(),
+            made: None,
         },
     };
     let direction = |instances: Vec<InstanceEnd>| {

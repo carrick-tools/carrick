@@ -65,7 +65,8 @@ mod procedures;
 pub use boundaries::RouteBoundaries;
 pub use composed::Composed;
 pub use instances::{
-    InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel, origin_side,
+    InstanceAt, InstanceEnd, InstanceHole, MakerCall, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
+    origin_side,
 };
 pub use procedures::{Procedure, ProcedureLabels};
 
@@ -2617,13 +2618,73 @@ enum MadeBase {
     Unstated,
 }
 
+/// The base one maker call of `export` was handed, as the export's make
+/// claim for the maker's form and member reads it (`create({ baseURL })`):
+/// `None` where no claim names a base slot or the call was not handed one.
+/// Shared by the library-site reader's makers ([`made_base`]) and the roots
+/// an instance walk ends at ([`walked_base`], carrick#3488).
+fn maker_base(
+    export: &crate::library_claims::ExportClaims,
+    form: super::MakerForm,
+    member: Option<&str>,
+    args: &[super::SiteArg],
+) -> MadeBase {
+    use crate::services::type_sidecar::{LibraryClaim, MakeForm};
+    let slot = export.claims.iter().find_map(|claim| match claim {
+        LibraryClaim::Make {
+            form: claimed,
+            member: claimed_member,
+            base,
+            ..
+        } if claimed_member.as_deref() == member
+            && matches!(
+                (claimed, form),
+                (MakeForm::Call, super::MakerForm::Call) | (MakeForm::New, super::MakerForm::New)
+            ) =>
+        {
+            base.as_ref()
+        }
+        _ => None,
+    });
+    let Some(slot) = slot else {
+        return MadeBase::None;
+    };
+    let (arg, key) = (slot.arg as usize, slot.key.as_deref());
+    if !super::library_sites::arg_supplied(args, arg, key) {
+        return MadeBase::None;
+    }
+    match super::library_sites::arg_literal(args, arg, key) {
+        Some(text) => MadeBase::Text(text.to_string()),
+        None => MadeBase::Unstated,
+    }
+}
+
+/// One instance's base from the bases of its makers: every maker handed the
+/// same literal, or none handed one. Makers that disagree, or a base one
+/// maker does not state as text, are `Unstated`.
+fn agreed_base(bases: impl IntoIterator<Item = MadeBase>) -> MadeBase {
+    let mut seen: BTreeSet<Option<String>> = BTreeSet::new();
+    for base in bases {
+        match base {
+            MadeBase::Unstated => return MadeBase::Unstated,
+            MadeBase::None => seen.insert(None),
+            MadeBase::Text(text) => seen.insert(Some(text)),
+        };
+    }
+    let mut seen = seen.into_iter();
+    match (seen.next(), seen.next()) {
+        (None | Some(None), None) => MadeBase::None,
+        (Some(Some(text)), None) => MadeBase::Text(text),
+        _ => MadeBase::Unstated,
+    }
+}
+
 /// The base the instance `site` is called through was made with, as the
 /// claims of its export say a maker's base is read (`create({ baseURL })`).
 fn made_base(
     site: &super::LibrarySite,
     exports: &[crate::library_claims::ExportClaims],
 ) -> MadeBase {
-    use crate::services::type_sidecar::{LibraryClaim, MakeForm};
     let super::SiteReceiver::Instance(makers) = &site.receiver else {
         return MadeBase::None;
     };
@@ -2633,39 +2694,48 @@ fn made_base(
     else {
         return MadeBase::None;
     };
-    let mut bases: BTreeSet<Option<&str>> = BTreeSet::new();
-    for maker in makers {
-        let slot = export.claims.iter().find_map(|claim| match claim {
-            LibraryClaim::Make {
-                form, member, base, ..
-            } if *member == maker.member
-                && matches!(
-                    (form, maker.form),
-                    (MakeForm::Call, super::MakerForm::Call)
-                        | (MakeForm::New, super::MakerForm::New)
-                ) =>
-            {
-                base.as_ref()
-            }
-            _ => None,
-        });
-        let base = match slot {
-            Some(slot) if maker.supplies(slot.arg as usize, slot.key.as_deref()) => {
-                match maker.literal(slot.arg as usize, slot.key.as_deref()) {
-                    Some(text) => Some(text),
-                    None => return MadeBase::Unstated,
-                }
-            }
-            _ => None,
+    match agreed_base(
+        makers
+            .iter()
+            .map(|maker| maker_base(export, maker.form, maker.member.as_deref(), &maker.args)),
+    ) {
+        MadeBase::Text(_) if site.contested => MadeBase::Unstated,
+        base => base,
+    }
+}
+
+/// The base a site's instance was made with, read at the labelled maker
+/// calls its instance walk ends at (carrick#3488): where the library-site
+/// reader holds no instance for the call (a parameter, a constructor
+/// parameter property). Each root gives its maker's base and a hole gives
+/// nothing: one known instance that states its base is that base, roots
+/// that disagree are `Unstated`, and no root is `None`. A walk root carries
+/// no record of uses that may change the base (the reader's `contested`):
+/// it is read as made.
+fn walked_base(
+    instances: &[InstanceEnd],
+    exports: &[crate::library_claims::ExportClaims],
+) -> MadeBase {
+    agreed_base(instances.iter().filter_map(|end| {
+        let InstanceAt::Root {
+            package,
+            export,
+            member,
+            made: Some(made),
+            ..
+        } = &end.end
+        else {
+            return None;
         };
-        bases.insert(base);
-    }
-    match bases.into_iter().collect::<Vec<_>>().as_slice() {
-        [None] | [] => MadeBase::None,
-        [Some(_)] if site.contested => MadeBase::Unstated,
-        [Some(text)] => MadeBase::Text((*text).to_string()),
-        _ => MadeBase::Unstated,
-    }
+        Some(
+            exports
+                .iter()
+                .find(|claims| claims.package == *package && claims.export == *export)
+                .map_or(MadeBase::None, |claims| {
+                    maker_base(claims, made.form, member.as_deref(), &made.args)
+                }),
+        )
+    }))
 }
 
 impl Decided {
@@ -2725,14 +2795,19 @@ impl Decided {
             if site.end.role != "http_client" || site.key.is_some() || site.name.is_empty() {
                 return true;
             }
-            let Some(called) = at.get(&(
+            // The reader's makers first; where it holds no instance for the
+            // call, the roots the instance walk ends at (carrick#3488).
+            let base = match at.get(&(
                 site.end.file.clone(),
                 site.end.span_start,
                 site.end.span_end,
-            )) else {
-                return true;
+            )) {
+                Some(called) if matches!(called.receiver, super::SiteReceiver::Instance(_)) => {
+                    made_base(called, exports)
+                }
+                _ => walked_base(&site.instances, exports),
             };
-            match made_base(called, exports) {
+            match base {
                 MadeBase::None => true,
                 MadeBase::Unstated => false,
                 MadeBase::Text(base) => {
@@ -4820,6 +4895,95 @@ pub(crate) mod tests {
             names_at(&unclaimed, INSTANCES)[0].1.as_deref(),
             Some("/invoices")
         );
+    }
+
+    /// carrick#3488: where the library-site reader holds no instance for a
+    /// call (a parameter, a constructor parameter property), the base comes
+    /// from the maker calls the instance walk ends at. One root, or roots
+    /// that agree, give their base, a hole beside them included; roots that
+    /// disagree, or a base a maker does not state as text, leave the site
+    /// out; holes alone, or a maker handed no base, leave the path as it was.
+    #[test]
+    fn a_site_the_reader_holds_no_instance_for_takes_its_roots_base() {
+        use super::super::{SiteArg, SiteObject};
+        let made = |base: Option<Option<&str>>, line: u32| InstanceEnd {
+            at: format!("src/a.ts:{line}"),
+            end: InstanceAt::Root {
+                file: "src/a.ts".to_string(),
+                line,
+                package: "@fixture/http".to_string(),
+                export: "default".to_string(),
+                member: Some("create".to_string()),
+                receiver: "instance:create".to_string(),
+                made: Some(MakerCall {
+                    form: super::super::MakerForm::Call,
+                    args: vec![SiteArg {
+                        object: Some(SiteObject {
+                            fields: base
+                                .map(|text| ("baseURL".to_string(), text.map(str::to_string)))
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                }),
+            },
+        };
+        let hole = InstanceEnd {
+            at: "src/a.ts:9".to_string(),
+            end: InstanceAt::Hole {
+                reason: InstanceHole::EntryPoint,
+                text: None,
+                boundary: None,
+            },
+        };
+        let a = Some(Some("https://a.test/v1"));
+        let cases: Vec<(&str, Vec<InstanceEnd>, Option<&str>)> = vec![
+            (
+                "one root",
+                vec![made(a, 1)],
+                Some("https://a.test/v1/status"),
+            ),
+            (
+                "two roots agree",
+                vec![made(a, 1), made(a, 2)],
+                Some("https://a.test/v1/status"),
+            ),
+            (
+                "a root and a hole",
+                vec![made(a, 1), hole.clone()],
+                Some("https://a.test/v1/status"),
+            ),
+            (
+                "two roots disagree",
+                vec![made(a, 1), made(Some(Some("https://b.test")), 2)],
+                None,
+            ),
+            ("a base not stated", vec![made(Some(None), 1)], None),
+            (
+                "a root with a base and one without",
+                vec![made(a, 1), made(None, 2)],
+                None,
+            ),
+            ("no base handed", vec![made(None, 1)], Some("/status")),
+            ("holes only", vec![hole.clone()], Some("/status")),
+        ];
+        let root = decided_fixture();
+        for (case, instances, want) in cases {
+            let (mut decided, _, _) =
+                decided_at(INSTANCES, &["plain.get(\"/status\")"], &http_get_label());
+            assert_eq!(decided.sites.len(), 1, "{case}");
+            decided.sites[0].instances = instances;
+            let left = decided.carry_instance_bases(
+                &root,
+                &crate::request_summary::LibrarySites::default(),
+                &http_claims(),
+            );
+            let got = decided.sites.first().and_then(|site| site.name_text());
+            assert_eq!(got.as_deref(), want, "{case}");
+            assert_eq!(left, usize::from(want.is_none()), "{case}");
+        }
     }
 
     /// carrick#2541: a leading value that reads as several paths is never
