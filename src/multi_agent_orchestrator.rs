@@ -93,6 +93,9 @@ impl MultiAgentOrchestrator {
         service_root: &str,
         // The repository root, for the workspace package map (carrick#666).
         repo_root: &std::path::Path,
+        // The service's module index, aliases read under its own tsconfig
+        // (carrick#3497).
+        service_modules: &crate::workspace_resolver::WorkspaceIndex,
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
@@ -143,6 +146,7 @@ impl MultiAgentOrchestrator {
                 &framework_detection,
                 std::path::Path::new(service_root),
                 repo_root,
+                service_modules,
                 &packages.declared_dependency_names(),
                 graphql_producer_hints,
                 graphql_consumer_hints,

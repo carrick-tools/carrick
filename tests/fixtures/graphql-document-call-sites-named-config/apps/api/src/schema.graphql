@@ -1,0 +1,21 @@
+type Query {
+  orders: [Order!]!
+  shippingZones: [Zone!]!
+  carriers: [Carrier!]!
+}
+
+type Mutation {
+  placeOrder(id: ID!): Order!
+}
+
+type Order {
+  id: ID!
+}
+
+type Zone {
+  code: String!
+}
+
+type Carrier {
+  name: String!
+}

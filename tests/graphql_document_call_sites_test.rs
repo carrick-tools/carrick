@@ -110,7 +110,7 @@ fn scan(repo: &Path, types: Types) -> Scan {
         .env("CARRICK_MOCK_ALL", "1")
         .env(
             "CARRICK_MOCK_FIXTURE_DIR",
-            format!("{}/", fixture_dir().join("__llm__").display()),
+            format!("{}/", repo.join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1");
     match types {
@@ -168,9 +168,30 @@ fn rows(items: &[(&str, &str)]) -> BTreeSet<(String, String)> {
         .collect()
 }
 
+/// The same tree with the web service's alias moved into `tsconfig.app.json`,
+/// which `carrick.json` names (carrick#3497). Cassettes are the original's.
+fn named_config_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/graphql-document-call-sites-named-config")
+}
+
 #[test]
 fn consumer_rows_sit_at_the_calls_that_execute_compiled_documents() {
-    let scan = scan(&fixture_dir(), Types::Optional);
+    assert_answer_key(&fixture_dir());
+}
+
+/// The `@/` import resolves under the config `carrick.json` names, not only
+/// under a `tsconfig.json` beside the service: the three document passes
+/// (GraphQL sites, schema-builder reader, document-site HTTP drop) read the
+/// service's module index (carrick#3497). Affects GraphQL rows (the document
+/// sites) and the HTTP twin drop.
+#[test]
+fn document_rows_resolve_aliases_under_the_named_config() {
+    assert_answer_key(&named_config_fixture_dir());
+}
+
+fn assert_answer_key(repo: &Path) {
+    let scan = scan(repo, Types::Optional);
 
     assert_eq!(
         scan.rows("shop-web", "calls", "graphql"),

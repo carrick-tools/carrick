@@ -2316,6 +2316,9 @@ impl FileOrchestrator {
         // a `@scope/pkg` specifier names is a property of the whole tree's
         // manifests, not of one service's directory (carrick#666).
         repo_root: &Path,
+        // The service's module index: aliases resolve under the tsconfig that
+        // governs the service, as its other passes read them (carrick#3497).
+        service_modules: &WorkspaceIndex,
         // Package names the service's own package.json declares. Second input to
         // the routing-convention bootstrap, so a file-routed service is
         // recognized from its manifest even when framework detection names only
@@ -2844,9 +2847,7 @@ impl FileOrchestrator {
         let mut schema_builder_reader = (graphql_producer_hints.has_schema_fields()
             && !framework_detection.data_fetchers.is_empty())
         .then(|| {
-            crate::graphql_schema_builder::PackageValueReader::new(Some(
-                WorkspaceIndex::build_with_aliases(repo_root, None),
-            ))
+            crate::graphql_schema_builder::PackageValueReader::new(Some(service_modules.clone()))
         });
         // Whether any file answered yes above (carrick#3200).
         let mut builds_graphql_schema_in_code = false;
@@ -4793,11 +4794,10 @@ impl FileOrchestrator {
         // disk the callee's other sites are what show it executes documents.
         // Resolved through the repo's aliases as well: this runs after the
         // model, so following more specifiers changes nothing it was asked.
-        let alias_workspace = WorkspaceIndex::build_with_aliases(repo_root, None);
         stats.graphql_document_site_drops =
             crate::graphql_document_sites::suppress_document_site_http_rows(
                 &mut file_results,
-                Some(&alias_workspace),
+                Some(service_modules),
             );
         if stats.graphql_document_site_drops.total() > 0 {
             debug!(

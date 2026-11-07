@@ -99,6 +99,7 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
             &express_detection(),
             &root,
             &root,
+            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
             &[],
             &Default::default(),
             &Default::default(),

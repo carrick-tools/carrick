@@ -180,6 +180,7 @@ async fn analyze(answers: Vec<(String, FileAnalysisResult)>) -> FileCentricAnaly
             },
             &root,
             &root,
+            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
             &[],
             &Default::default(),
             &Default::default(),

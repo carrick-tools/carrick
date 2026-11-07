@@ -141,6 +141,7 @@ impl Routes {
                 &self.detection,
                 &self.root,
                 &self.root,
+                &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&self.root, None),
                 &[],
                 &Default::default(),
                 &Default::default(),
