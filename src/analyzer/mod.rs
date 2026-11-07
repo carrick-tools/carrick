@@ -24,8 +24,6 @@ use std::{
 use tracing::{debug, warn};
 
 // Regexes are compiled once and reused across every endpoint/type-string pass.
-static ROUTE_PARAM_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r":([\w]+)").unwrap());
 static IMPORT_PATH_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"import\("([^"]+)"\)\.(\w+)"#).unwrap());
 static ARRAY_GENERIC_RE: LazyLock<regex::Regex> =
@@ -402,14 +400,71 @@ impl ApiEndpointDetails {
         self.service_name.as_deref().or(self.repo_name.as_deref())
     }
 
-    /// This row as one side of a name-scope pairing
-    /// ([`carrick_match::names_pair`]). An unattributed row reads as the
-    /// empty service, so two of them are one service, as they are in a
-    /// single-service run.
+    /// This row as one side of a name-scope check
+    /// ([`carrick_match::names_pair`]) for a verdict join. An unattributed
+    /// row reads as the empty service, so two of them are one service, as
+    /// they are in a single-service run.
     fn scoped(&self) -> carrick_match::ScopedRow<'_> {
         carrick_match::ScopedRow {
             service: self.service_id().unwrap_or_default(),
             name_scope: self.name_scope.as_ref(),
+        }
+    }
+
+    /// This GraphQL, socket or pub/sub row's key in the forms the pairing
+    /// pool reads (carrick#3496): protocol label, name and direction, as
+    /// [`carrick_match::Producer`] documents them. An HTTP key has no exact
+    /// key and projects to `None`s; it pairs through the mount graph's pool.
+    fn exact_key_fields(&self) -> (String, Option<String>, Option<String>) {
+        match &self.key {
+            OperationKey::Http { .. } => ("http".to_string(), None, None),
+            OperationKey::Graphql { kind, field } => (
+                "graphql".to_string(),
+                Some(format!("{}|{}", kind.as_str(), field)),
+                None,
+            ),
+            OperationKey::Socket { event, direction } => (
+                "socket".to_string(),
+                Some(event.clone()),
+                Some(
+                    match direction {
+                        crate::operation::SocketDirection::ClientToServer => "client_to_server",
+                        crate::operation::SocketDirection::ServerToClient => "server_to_client",
+                        crate::operation::SocketDirection::Unknown => "unknown",
+                    }
+                    .to_string(),
+                ),
+            ),
+            OperationKey::Pubsub { topic } => ("pubsub".to_string(), Some(topic.clone()), None),
+        }
+    }
+
+    /// This producer row as a pairing-pool producer. An unattributed row
+    /// reads as the empty service, so two of them are one service, as they
+    /// are in a single-service run.
+    fn exact_key_producer(&self) -> carrick_match::Producer {
+        let (protocol, name, direction) = self.exact_key_fields();
+        carrick_match::Producer {
+            service: self.service_id().unwrap_or_default().to_string(),
+            protocol,
+            name,
+            direction,
+            name_scope: self.name_scope.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// This call row as a pairing-pool call, attributed as
+    /// [`Self::exact_key_producer`] attributes a producer.
+    fn exact_key_call(&self) -> carrick_match::Call {
+        let (protocol, name, direction) = self.exact_key_fields();
+        carrick_match::Call {
+            service: self.service_id().unwrap_or_default().to_string(),
+            protocol,
+            name,
+            direction,
+            name_scope: self.name_scope.clone(),
+            ..Default::default()
         }
     }
 }
@@ -1766,7 +1821,6 @@ pub struct Analyzer {
     pub mounts: Vec<Mount>,
     pub apps: HashMap<String, AppContext>,
     config: Config,
-    endpoint_router: Option<matchit::Router<Vec<(String, String)>>>,
     all_repo_packages: HashMap<String, Packages>, // repo_name -> packages
     detected_data_fetchers: Vec<String>,
     mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
@@ -1972,7 +2026,6 @@ impl Analyzer {
             mounts: Vec::new(),
             apps: HashMap::new(),
             config,
-            endpoint_router: None,
             all_repo_packages: HashMap::new(),
             detected_data_fetchers: Vec::new(),
             mount_graph: None,
@@ -2565,6 +2618,9 @@ impl Analyzer {
         // Create URL normalizer once for all calls
         let normalizer = UrlNormalizer::new(&self.config);
         let call_bases = bases_by_call(mount_graph);
+        // Every route in every service, indexed once for the whole call loop.
+        let pool = mount_graph.http_pairing_pool();
+        let pool_endpoints = mount_graph.get_resolved_endpoints();
 
         // For each call, try to find matching endpoint using mount graph.
         // This is the HTTP matcher: non-HTTP operations are dispatched to
@@ -2650,97 +2706,87 @@ impl Analyzer {
                 })
             };
 
-            match mount_graph.find_matching_endpoints_with_normalizer(
-                &lookup_url,
-                method,
-                &normalizer,
-            ) {
-                None => {
-                    // URL was identified as external - skip it
+            // External targets, and a URL that was one opaque variable we
+            // could not resolve (e.g. `${url}`), name no path to pair:
+            // reporting them produces bogus "missing endpoint" noise.
+            let normalized = normalizer.normalize(&lookup_url);
+            if normalized.is_external || normalized.is_unresolved {
+                continue;
+            }
+            // The env-var edge keys on the extracted path (identical to the
+            // pre-typed matcher); the plain edge re-normalizes the raw target.
+            let normalized_path = if is_env_route {
+                miss_path.clone()
+            } else {
+                normalized.path
+            };
+            // Which producers this call reaches, and what the call is to the
+            // routes as a whole, is `carrick_match`'s one pairing rule
+            // (carrick#3496): a call path with no literal segment pairs with
+            // nothing (#537); the routes whose method serves the call are
+            // ranked and only the most literal are kept (#381), so a
+            // catch-all never shadows a concrete route and a route that
+            // agrees on no literal (`GET /*`) routes the call without
+            // pairing; each kept route answers for the dispatch case the
+            // call states (carrick#831); and the answers decide the call
+            // (carrick#2048). The cloud's MCP tools still run their own copy
+            // of this rule until #3496 slice 4 moves them onto the same
+            // pool over wasm.
+            let pairing = pool.pair(&carrick_match::Call {
+                service: consumer_repo_by_call
+                    .get(&(
+                        method.to_uppercase(),
+                        target.to_string(),
+                        call.file_path.display().to_string(),
+                    ))
+                    .cloned()
+                    .unwrap_or_default(),
+                protocol: "http".to_string(),
+                method: Some(method.to_string()),
+                path: Some(normalized_path.clone()),
+                dispatch: crate::dispatch::Dispatch::key_of(call.dispatch.as_ref()),
+                ..Default::default()
+            });
+            for routed in &pairing.routed {
+                if matches!(
+                    routed.verdict,
+                    carrick_match::MatchVerdict::DispatchValueUnknown
+                        | carrick_match::MatchVerdict::DispatchValueMismatch
+                ) {
+                    let endpoint = &pool_endpoints[routed.producer];
+                    debug!(
+                        "Dispatch case declined {} {} for {}: {:?}",
+                        endpoint.method, endpoint.full_path, call_site, routed.verdict
+                    );
                 }
-                Some(matching_endpoints) if !matching_endpoints.is_empty() => {
-                    // The env-var edge keys on the extracted path (identical
-                    // to the pre-typed matcher); the plain edge re-normalizes
-                    // the raw target.
-                    let normalized_path = if is_env_route {
-                        miss_path.clone()
-                    } else {
-                        normalizer.normalize(&lookup_url).path
-                    };
-                    // #537: the consumer's own path never resolved to a
-                    // literal segment (`/*`, a wholly-interpolated template,
-                    // empty). The call names no operation, so no producer may
-                    // claim it — and a catch-all producer will otherwise route
-                    // every one of them, which is how a handful of
-                    // path-less calls became a handful of confident-looking
-                    // edges against one SPA fallback. Report it UNMATCHED, the
-                    // same as when no producer matched at all: the reason is
-                    // the extraction gap on this side, not the absence of a
-                    // producer.
-                    if carrick_match::is_unknown_call_path(&normalized_path) {
-                        unpaired_calls.extend(unpaired());
-                        missing
-                            .entry((method.to_string(), miss_path))
-                            .or_default()
-                            .insert(call_site);
-                        continue;
-                    }
-                    // The case this call states for a dispatching producer's
-                    // field (carrick#831), computed once for the whole
-                    // producer loop. `None` is a call that states nothing —
-                    // against a plain route that is every call there has ever
-                    // been, and against a dispatching one it is the reason the
-                    // pair cannot be drawn.
-                    let call_dispatch = crate::dispatch::Dispatch::key_of(call.dispatch.as_ref());
-                    // Each producer's answer about this call: a case it names
-                    // (or a route that dispatches on nothing), a dispatching
-                    // route whose case the call does not state, or a case the
-                    // call names another value of.
-                    let mut matched = Vec::new();
-                    let mut case_unknown = Vec::new();
-                    let mut case_mismatched = 0u32;
-                    for endpoint in matching_endpoints {
-                        // #381: a pairing with zero literal agreement — a
-                        // wildcard-only producer (`GET /*`) absorbing an
-                        // arbitrary call — carries no signal. The call is
-                        // ROUTED (so it is not a missing endpoint) but not
-                        // MATCHED: no verified mark, no cross-repo edge.
-                        // Non-zero pairs are already the most specific
-                        // available (the mount graph filters to maximal
-                        // agreement). `reportable_agreement` is the shared
-                        // definition of that rule (#537) — the cloud and the
-                        // MCP server run the same one over wasm.
-                        //
-                        // The dispatch form of it (carrick#831) adds the one
-                        // question the path cannot answer: when this producer
-                        // is one case of a body-dispatching handler, does the
-                        // call send its value? Ranking is unaffected — the
-                        // cases of one route share a path, so they scored
-                        // identically above and the maximal-agreement filter
-                        // has already kept all of them or none.
-                        let verdict = carrick_match::match_verdict_with_dispatch(
-                            &endpoint.full_path,
-                            &normalized_path,
-                            crate::dispatch::Dispatch::key_of(endpoint.dispatch.as_ref()),
-                            call_dispatch.clone(),
-                        );
-                        match verdict {
-                            carrick_match::MatchVerdict::Matched => matched.push(endpoint),
-                            carrick_match::MatchVerdict::DispatchValueUnknown
-                            | carrick_match::MatchVerdict::DispatchValueMismatch => {
-                                debug!(
-                                    "Dispatch case declined {} {} for {}: {:?}",
-                                    endpoint.method, endpoint.full_path, call_site, verdict
-                                );
-                                if verdict == carrick_match::MatchVerdict::DispatchValueUnknown {
-                                    case_unknown.push(endpoint);
-                                } else {
-                                    case_mismatched += 1;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+            }
+
+            match pairing.outcome {
+                // #537: the consumer's own path never resolved to a literal
+                // segment (`/*`, a wholly-interpolated template, empty). The
+                // call names no operation, so no producer may claim it, and
+                // a catch-all producer would otherwise route every one of
+                // them. Report it UNMATCHED: the reason is the extraction gap
+                // on this side, not the absence of a producer.
+                //
+                // Or the call states a dispatch value no case of the route
+                // answers (carrick#831): recorded UNMATCHED for the same
+                // reason, or it matched nothing and is reported nowhere.
+                carrick_match::PairOutcome::UnknownCallPath
+                | carrick_match::PairOutcome::NoCaseAnswers => {
+                    unpaired_calls.extend(unpaired());
+                    missing
+                        .entry((method.to_string(), miss_path))
+                        .or_default()
+                        .insert(call_site);
+                }
+                // #381: the best route agrees on no literal (a wildcard-only
+                // or param-only producer absorbing an arbitrary call). The
+                // call is ROUTED, so it is not a missing endpoint, but not
+                // MATCHED: no verified mark, no cross-repo edge.
+                carrick_match::PairOutcome::NoLiteralAgreement => {}
+                carrick_match::PairOutcome::Matched
+                | carrick_match::PairOutcome::RouteCaseUnknown => {
                     // The dispatch case is part of an operation's identity,
                     // so it is part of the consumed key: without it the nine
                     // operations behind one route are one verified endpoint,
@@ -2753,50 +2799,23 @@ impl Analyzer {
                             crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
                         )
                     };
-                    // What the call is to those producers as a whole
-                    // (carrick#2048), decided where the cloud can read the
-                    // same rule.
-                    let drawn = match carrick_match::dispatch_outcome(
-                        matched.len() as u32,
-                        case_unknown.len() as u32,
-                        case_mismatched,
-                    ) {
-                        carrick_match::DispatchOutcome::Matched => {
-                            for endpoint in &matched {
-                                matched_endpoints.insert(consumed_key(endpoint));
-                            }
-                            matched
-                        }
-                        // The call reaches a route that dispatches, and states
-                        // no value its cases can be told apart by. The route
-                        // exists, so this is never a missing endpoint: the
-                        // call keeps an edge to the route, with its case
-                        // unknown. An edge's key is the route's and holds no
-                        // case, so the cases' edges for this call are one edge
-                        // after `sort_dedup_cross_repo_matches`. Any case may
-                        // be the one it sends, so none of them is reported as
-                        // having no consumer.
-                        carrick_match::DispatchOutcome::RouteCaseUnknown => {
-                            for endpoint in &case_unknown {
-                                matched_endpoints.insert(consumed_key(endpoint));
-                            }
-                            case_unknown
-                        }
-                        // The call states a value no case of the route
-                        // answers (carrick#831). Record it UNMATCHED for the
-                        // same reason #537 records a path-less call: the
-                        // alternative is a call that matched nothing and is
-                        // reported nowhere.
-                        carrick_match::DispatchOutcome::NoCaseAnswers => {
-                            unpaired_calls.extend(unpaired());
-                            missing
-                                .entry((method.to_string(), miss_path))
-                                .or_default()
-                                .insert(call_site.clone());
-                            Vec::new()
-                        }
-                        carrick_match::DispatchOutcome::NotMatched => Vec::new(),
-                    };
+                    // `RouteCaseUnknown`: the call reaches a route that
+                    // dispatches, and states no value its cases can be told
+                    // apart by. The route exists, so this is never a missing
+                    // endpoint: the call keeps an edge to the route, with its
+                    // case unknown. An edge's key is the route's and holds no
+                    // case, so the cases' edges for this call are one edge
+                    // after `sort_dedup_cross_repo_matches`. Any case may be
+                    // the one it sends, so none of them is reported as having
+                    // no consumer.
+                    let drawn: Vec<&crate::mount_graph::ResolvedEndpoint> = pairing
+                        .winners
+                        .iter()
+                        .map(|winner| &pool_endpoints[winner.producer])
+                        .collect();
+                    for endpoint in &drawn {
+                        matched_endpoints.insert(consumed_key(endpoint));
+                    }
                     for endpoint in drawn {
                         let Some(edge) = Self::build_cross_repo_match(
                             call,
@@ -2852,7 +2871,7 @@ impl Analyzer {
                         }
                     }
                 }
-                Some(_) => {
+                carrick_match::PairOutcome::NoRoute => {
                     // No producer under this method — retry with an EXACT
                     // path match (param-name-agnostic, never wildcarding a
                     // param against a concrete segment) ignoring the method,
@@ -3157,12 +3176,14 @@ impl Analyzer {
     /// URL or mount hierarchy to normalize. Returns `(findings, verified,
     /// cross_repo_matches)`.
     ///
-    /// A call pairs with a producer row when their keys are equal and
-    /// [`carrick_match::names_pair`] allows it: a name scoped to one service
-    /// pairs only inside it, and two namespaces never pair (carrick#1663). A
-    /// row that states no `name_scope` adds no restriction, so an index
-    /// written before the field pairs as it did. The cloud reads the same
-    /// rule, so the PR check and the cloud agree on which rows pair.
+    /// Which producer rows a call pairs with is
+    /// [`carrick_match::PairingPool::pair`] (carrick#3496): keys equal and
+    /// [`carrick_match::names_pair`] allows it, so a name scoped to one
+    /// service pairs only inside it, and two namespaces never pair
+    /// (carrick#1663). A row that states no `name_scope` adds no restriction,
+    /// so an index written before the field pairs as it did. The cloud's MCP
+    /// tools still run their own copy of the name-scope rule until #3496
+    /// slice 4 moves them onto the same pool over wasm.
     ///
     /// If no producer of the protocol is indexed anywhere, consumers are
     /// skipped silently: the producing service may simply not be scanned,
@@ -3191,18 +3212,17 @@ impl Analyzer {
             .collect();
         let no_producer = producers.is_empty();
         let mut unpaired = crate::pr_baseline::RunUnpaired::default();
-        // The producer rows under each exact key, by their index in
-        // `producers`. Several rows can legitimately share one key — two
+        // The producer rows, indexed once: a winner's `producer` is its index
+        // in `producers`. Several rows can legitimately share one key (two
         // services exposing the same GraphQL field, several listeners for one
-        // socket event — and the name-scope rule decides, row by row, which
-        // of them a call pairs with.
-        let mut producers_by_key: HashMap<&OperationKey, Vec<usize>> = HashMap::new();
-        for (index, endpoint) in producers.iter().enumerate() {
-            producers_by_key
-                .entry(&endpoint.key)
-                .or_default()
-                .push(index);
-        }
+        // socket event), and the pool's name-scope rule decides, row by row,
+        // which of them a call pairs with (carrick#3496).
+        let pool = carrick_match::PairingPool::new(
+            producers
+                .iter()
+                .map(|endpoint| endpoint.exact_key_producer())
+                .collect(),
+        );
 
         // (label, name) → call sites, BTree-keyed so same-op call sites
         // collapse into one finding in deterministic order.
@@ -3227,14 +3247,11 @@ impl Analyzer {
             if !seen_calls.insert(dedup) {
                 continue;
             }
-            let pairs_with: Vec<usize> = producers_by_key
-                .get(&call.key)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|&index| {
-                    carrick_match::names_pair(call.scoped(), producers[index].scoped())
-                })
+            let pairs_with: Vec<usize> = pool
+                .pair(&call.exact_key_call())
+                .winners
+                .iter()
+                .map(|winner| winner.producer)
                 .collect();
             if pairs_with.is_empty() {
                 let (label, name) = call.key.display_labels();
@@ -3458,41 +3475,6 @@ impl Analyzer {
             }
         }
         new_endpoints
-    }
-
-    fn normalize_route_params(&self, route: &str) -> String {
-        // Replace all parameter placeholders with a consistent name.
-        ROUTE_PARAM_RE.replace_all(route, "{param}").to_string()
-    }
-
-    pub fn build_endpoint_router(&mut self) {
-        let mut router = matchit::Router::new();
-
-        // Use a HashMap to collect all endpoints by path before inserting into router
-        let mut path_to_endpoints: HashMap<String, Vec<(String, String)>> = HashMap::new();
-
-        for endpoint in &self.endpoints {
-            let Some((method, route)) = endpoint.key.as_http() else {
-                continue;
-            };
-            let normalized_route = self.normalize_route_params(route);
-
-            path_to_endpoints
-                .entry(normalized_route)
-                .or_default()
-                .push((route.to_string(), method.to_string()));
-        }
-
-        debug!("Unique endpoint paths: {}", path_to_endpoints.len());
-
-        // Now insert each unique path once, with a collection of route-method pairs
-        for (path, route_methods) in path_to_endpoints {
-            if let Err(e) = router.insert(&path, route_methods) {
-                warn!("Could not add route to router: {}", e);
-            }
-        }
-
-        self.endpoint_router = Some(router);
     }
 
     pub fn get_results(&self) -> ApiAnalysisResult {
@@ -9622,5 +9604,270 @@ mod tests {
             )]
         );
         assert!(findings.is_empty(), "got {findings:?}");
+    }
+
+    /// A call path with no literal segment names no operation, so it pairs
+    /// with nothing before any method is asked (carrick#3496 slice 2: the
+    /// pool checks the unknown path first). A param-only route under another
+    /// method is therefore no wrong-verb candidate: the call is missing.
+    #[test]
+    fn unknown_call_path_is_missing_before_any_wrong_verb_lookup() {
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer
+            .calls
+            .push(http_call("POST", "/:a/:b", "web/src/client.ts:4"));
+        let mut mount_graph = MountGraph::new();
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/:x/:y", "api"));
+        mount_graph
+            .data_calls
+            .push(data_call_in("POST", "/:a/:b", "web/src/client.ts:4", "web"));
+
+        let (findings, _verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert!(edges.is_empty(), "got {edges:?}");
+        let kinds: Vec<&str> = findings
+            .iter()
+            .map(Finding::kind)
+            .filter(|kind| *kind != "orphaned_endpoint")
+            .collect();
+        assert_eq!(kinds, vec!["missing_endpoint"], "got {findings:?}");
+    }
+
+    /// The pinned pairing vectors (`crates/carrick-match/tests/fixtures/
+    /// pairing.vectors.json`, carrick#3496) run through the scanner's own
+    /// call path: each case's producers and call become mount-graph routes
+    /// and data calls (HTTP) or index rows (GraphQL, socket, pub/sub), the
+    /// analyzer's matchers run, and what they report must be what the
+    /// case's `expect` means for the scanner's edges and missing rows. So a
+    /// scanner that stops asking `carrick_match::PairingPool`, or reads its
+    /// answer differently, fails here and not only on a replay.
+    #[test]
+    fn pairing_vectors_hold_through_the_scanners_matchers() {
+        use sha2::{Digest, Sha256};
+
+        const VECTORS: &[u8] =
+            include_bytes!("../../crates/carrick-match/tests/fixtures/pairing.vectors.json");
+        // The crate pins the same file (`crates/carrick-match/tests/
+        // pairing_vectors.rs` `PINNED_SHA256`); re-pin both together.
+        const PINNED_SHA256: &str =
+            "f6a4081e8d1271e96d700b23087abe26093251077db4ac8fc3490b81fa2a42c7";
+        let digest: String = Sha256::digest(VECTORS)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(digest, PINNED_SHA256, "the pairing vector file moved");
+
+        let file: serde_json::Value = serde_json::from_slice(VECTORS).expect("vector JSON");
+        let cases = file["cases"].as_array().expect("cases");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let id = case["id"].as_str().expect("case id");
+            let producers: Vec<carrick_match::Producer> =
+                serde_json::from_value(case["input"]["producers"].clone())
+                    .unwrap_or_else(|err| panic!("{id}: producers: {err}"));
+            let call: carrick_match::Call = serde_json::from_value(case["input"]["call"].clone())
+                .unwrap_or_else(|err| panic!("{id}: call: {err}"));
+            let expect = &case["expect"];
+            let outcome = expect["outcome"].as_str().expect("outcome");
+            let winners = expect["winners"].as_array().expect("winners");
+            if call.protocol == "http" {
+                check_http_vector(id, &producers, &call, outcome, winners);
+            } else {
+                check_exact_key_vector(id, &producers, &call, outcome, winners);
+            }
+        }
+    }
+
+    /// A vector's `dispatch_key` string (`body:action=list`) as the row's
+    /// dispatch object.
+    fn vector_dispatch(key: Option<&str>) -> Option<crate::dispatch::Dispatch> {
+        let (location, rest) = key?.split_once(':').expect("location:field=value");
+        let (field, value) = rest.split_once('=').expect("field=value");
+        Some(crate::dispatch::Dispatch {
+            location: match location {
+                "body" => crate::dispatch::DispatchLocation::Body,
+                "header" => crate::dispatch::DispatchLocation::Header,
+                other => panic!("dispatch location {other}"),
+            },
+            field: field.to_string(),
+            value: value.to_string(),
+        })
+    }
+
+    fn vector_kinds(findings: &[Finding]) -> Vec<&'static str> {
+        findings
+            .iter()
+            .map(Finding::kind)
+            .filter(|kind| !matches!(*kind, "orphaned_endpoint" | "shared_external_contract"))
+            .collect()
+    }
+
+    fn check_http_vector(
+        id: &str,
+        producers: &[carrick_match::Producer],
+        call: &carrick_match::Call,
+        outcome: &str,
+        winners: &[serde_json::Value],
+    ) {
+        let method = call.method.as_deref().expect("http call method");
+        let path = call.path.as_deref().expect("http call path");
+        let file = format!("{}/src/client.ts:1", call.service);
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut details = http_call(method, path, &file);
+        details.dispatch = vector_dispatch(call.dispatch.as_deref());
+        analyzer.calls.push(details);
+        let mut mount_graph = MountGraph::new();
+        for (index, producer) in producers.iter().enumerate() {
+            let mut endpoint = resolved_in(
+                producer.method.as_deref().expect("http producer method"),
+                producer.path.as_deref().expect("http producer path"),
+                &producer.service,
+            );
+            endpoint.file_location = format!("{}/src/server.ts:{}", producer.service, index + 1);
+            endpoint.evidence = producer.evidence;
+            endpoint.dispatch = vector_dispatch(producer.dispatch.as_deref());
+            mount_graph.endpoints.push(endpoint);
+        }
+        let mut data_call = data_call_in(method, path, &file, &call.service);
+        data_call.dispatch = vector_dispatch(call.dispatch.as_deref());
+        mount_graph.data_calls.push(data_call);
+
+        let (findings, _verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+        let drawn: BTreeSet<(String, String)> = edges
+            .iter()
+            .map(|edge| (edge.producer_repo.clone(), edge.producer_key.clone()))
+            .collect();
+        // Every winner is an edge, the caller's own route included
+        // (carrick#1926), except the caller's own call-site twin (#379).
+        let wanted: BTreeSet<(String, String)> = winners
+            .iter()
+            .map(|winner| &producers[winner["producer"].as_u64().expect("index") as usize])
+            .filter(|producer| {
+                producer.evidence == carrick_match::MatchEvidence::RouteDefinition
+                    || producer.service != call.service
+            })
+            .map(|producer| {
+                (
+                    producer.service.clone(),
+                    OperationKey::http(
+                        producer.method.as_deref().unwrap_or_default(),
+                        producer.path.clone().unwrap_or_default(),
+                    )
+                    .canonical(),
+                )
+            })
+            .collect();
+        assert_eq!(drawn, wanted, "{id}: edges; findings {findings:?}");
+        let kinds = vector_kinds(&findings);
+        match outcome {
+            "matched" | "route_case_unknown" | "no_literal_agreement" => {
+                assert!(kinds.is_empty(), "{id}: {outcome} reports {findings:?}")
+            }
+            "unknown_call_path" | "no_case_answers" => {
+                assert_eq!(kinds, vec!["missing_endpoint"], "{id}: {findings:?}")
+            }
+            // No route under the call's method: missing, or a wrong verb on
+            // a route declared at exactly this path.
+            "no_route" => assert!(
+                kinds == vec!["missing_endpoint"] || kinds == vec!["method_mismatch"],
+                "{id}: {findings:?}"
+            ),
+            other => panic!("{id}: outcome {other}"),
+        }
+    }
+
+    /// A vector row's key: GraphQL `<kind>|<field>`, socket event plus the
+    /// serde direction, pub/sub topic.
+    fn vector_key(protocol: &str, name: &str, direction: Option<&str>) -> OperationKey {
+        use crate::operation::{GraphqlOperationKind, SocketDirection};
+        match protocol {
+            "graphql" => {
+                let (kind, field) = name.split_once('|').expect("<kind>|<field>");
+                let kind = match kind {
+                    "query" => GraphqlOperationKind::Query,
+                    "mutation" => GraphqlOperationKind::Mutation,
+                    "subscription" => GraphqlOperationKind::Subscription,
+                    other => panic!("graphql kind {other}"),
+                };
+                OperationKey::graphql(kind, field)
+            }
+            "socket" => OperationKey::socket(
+                name,
+                match direction.expect("socket direction") {
+                    "client_to_server" => SocketDirection::ClientToServer,
+                    "server_to_client" => SocketDirection::ServerToClient,
+                    "unknown" => SocketDirection::Unknown,
+                    other => panic!("socket direction {other}"),
+                },
+            ),
+            "pubsub" => OperationKey::pubsub(name),
+            other => panic!("protocol {other}"),
+        }
+    }
+
+    fn check_exact_key_vector(
+        id: &str,
+        producers: &[carrick_match::Producer],
+        call: &carrick_match::Call,
+        outcome: &str,
+        winners: &[serde_json::Value],
+    ) {
+        let row = |protocol: &str,
+                   name: Option<&str>,
+                   direction: Option<&str>,
+                   service: &str,
+                   file: String,
+                   name_scope: Option<carrick_match::NameScope>| {
+            let mut details = graphql_details(
+                vector_key(protocol, name.expect("exact-key name"), direction),
+                &file,
+            );
+            details.service_name = Some(service.to_string());
+            details.name_scope = name_scope;
+            details
+        };
+        let mut analyzer = Analyzer::new(Config::default());
+        for (index, producer) in producers.iter().enumerate() {
+            analyzer.endpoints.push(row(
+                &producer.protocol,
+                producer.name.as_deref(),
+                producer.direction.as_deref(),
+                &producer.service,
+                format!("{}/src/server.ts:{}", producer.service, index + 1),
+                producer.name_scope.clone(),
+            ));
+        }
+        analyzer.calls.push(row(
+            &call.protocol,
+            call.name.as_deref(),
+            call.direction.as_deref(),
+            &call.service,
+            format!("{}/src/client.ts:1", call.service),
+            call.name_scope.clone(),
+        ));
+        let protocol = analyzer.calls[0].key.protocol();
+
+        let (findings, _verified, edges) = analyzer.analyze_exact_key_matches(protocol);
+        let drawn: BTreeSet<String> = edges
+            .iter()
+            .map(|edge| edge.producer_repo.clone())
+            .collect();
+        // GraphQL, socket and pub/sub draw no same-service edge (#397/#410);
+        // the pair still keeps the call off the missing list.
+        let wanted: BTreeSet<String> = winners
+            .iter()
+            .map(|winner| &producers[winner["producer"].as_u64().expect("index") as usize])
+            .filter(|producer| producer.service != call.service)
+            .map(|producer| producer.service.clone())
+            .collect();
+        assert_eq!(drawn, wanted, "{id}: edges; findings {findings:?}");
+        let kinds = vector_kinds(&findings);
+        match outcome {
+            "matched" => assert!(kinds.is_empty(), "{id}: {findings:?}"),
+            "no_route" => assert_eq!(kinds, vec!["missing_endpoint"], "{id}: {findings:?}"),
+            other => panic!("{id}: outcome {other}"),
+        }
     }
 }

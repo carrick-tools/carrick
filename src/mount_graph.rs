@@ -528,55 +528,29 @@ impl MountGraph {
             .collect()
     }
 
-    /// Find all endpoints that match a given URL pattern with URL normalization
-    ///
-    /// This method handles real-world URL patterns:
-    /// - Full URLs: `https://user-service.internal/users/123` → matches `/users/:id`
-    /// - Env var patterns: `ENV_VAR:SERVICE_URL:/users/123` → matches `/users/:id`
-    /// - Template literals: `${API_URL}/users/${id}` → matches `/users/:id`
-    /// - Query strings are stripped: `/users?page=1` → matches `/users`
-    ///
-    /// Returns `None` if the URL is identified as external (should be skipped).
-    /// Returns `Some(vec)` with matching endpoints (may be empty if no match found).
-    ///
-    /// A call pairs with the MOST SPECIFIC producers available (#381): among
-    /// all routing matches, only the candidates with maximal literal
-    /// agreement are returned. A catch-all mount (`/api/**`, agreement 1)
-    /// therefore never shadows a concrete route (`/api/v1/chat/new`,
-    /// agreement 4) declared elsewhere in the org; it is returned only when
-    /// nothing more specific matches. The relative selection is
-    /// data-derived — no absolute specificity threshold.
-    pub fn find_matching_endpoints_with_normalizer(
-        &self,
-        url: &str,
-        method: &str,
-        normalizer: &UrlNormalizer,
-    ) -> Option<Vec<&ResolvedEndpoint>> {
-        let normalized = normalizer.normalize(url);
-
-        // Skip external calls and calls whose URL was a single opaque variable
-        // we couldn't resolve (e.g. `${url}`) — there's no path to match, and
-        // reporting them produces bogus "missing endpoint" noise.
-        if normalized.is_external || normalized.is_unresolved {
-            return None;
-        }
-
-        let scored: Vec<(&ResolvedEndpoint, u32)> = self
-            .endpoints
-            .iter()
-            .filter(|endpoint| carrick_match::method_matches(&endpoint.method, method))
-            .filter_map(|endpoint| {
-                carrick_match::match_agreement(&endpoint.full_path, &normalized.path)
-                    .map(|agreement| (endpoint, agreement))
-            })
-            .collect();
-        let best = scored.iter().map(|(_, a)| *a).max().unwrap_or(0);
-
-        Some(
-            scored
-                .into_iter()
-                .filter(|(_, agreement)| *agreement == best)
-                .map(|(endpoint, _)| endpoint)
+    /// The HTTP pairing pool over this graph's endpoints, in endpoint order:
+    /// a [`carrick_match::Winner::producer`] index is an index into
+    /// [`Self::get_resolved_endpoints`]. Which producer a call reaches is
+    /// decided by [`carrick_match::PairingPool::pair`], the one pairing rule
+    /// (carrick#3496); the caller normalizes the call's URL first and skips
+    /// external and unresolved targets before asking the pool.
+    pub fn http_pairing_pool(&self) -> carrick_match::PairingPool {
+        carrick_match::PairingPool::new(
+            self.endpoints
+                .iter()
+                .map(|endpoint| carrick_match::Producer {
+                    service: endpoint
+                        .service_name
+                        .clone()
+                        .or_else(|| endpoint.repo_name.clone())
+                        .unwrap_or_default(),
+                    protocol: "http".to_string(),
+                    method: Some(endpoint.method.clone()),
+                    path: Some(endpoint.full_path.clone()),
+                    dispatch: crate::dispatch::Dispatch::key_of(endpoint.dispatch.as_ref()),
+                    evidence: endpoint.evidence,
+                    ..Default::default()
+                })
                 .collect(),
         )
     }
@@ -587,7 +561,7 @@ impl MountGraph {
     /// exactly this path under a different verb" (method mismatch — a
     /// contract risk, not a connectivity gap).
     ///
-    /// Unlike [`find_matching_endpoints_with_normalizer`] this does NOT
+    /// Unlike the pairing pool ([`Self::http_pairing_pool`]) this does NOT
     /// wildcard params against concrete segments: `POST /users/:id` must not
     /// turn a missing `GET /users/list` into a "wrong verb" risk. Segments
     /// match literally or param-to-param only (param names are not identity).
@@ -993,7 +967,8 @@ mod tests {
 
         // Test: Full internal URL should match
         let normalizer = UrlNormalizer::new(&config);
-        let _result = graph.find_matching_endpoints_with_normalizer(
+        let _result = routed(
+            &graph,
             "https://user-service.internal/users/123",
             "GET",
             &normalizer,
@@ -1272,7 +1247,8 @@ mod tests {
 
         // Test: Internal env var pattern should match
         let normalizer = UrlNormalizer::new(&config);
-        let result = graph.find_matching_endpoints_with_normalizer(
+        let result = routed(
+            &graph,
             "ENV_VAR:ORDER_SERVICE_URL:/orders",
             "POST",
             &normalizer,
@@ -1281,7 +1257,8 @@ mod tests {
         assert_eq!(result.unwrap().len(), 1);
 
         // Test: External env var pattern should return None
-        let result = graph.find_matching_endpoints_with_normalizer(
+        let result = routed(
+            &graph,
             "ENV_VAR:STRIPE_API:/v1/charges",
             "POST",
             &normalizer,
@@ -1313,15 +1290,11 @@ mod tests {
         });
         let normalizer = UrlNormalizer::new(&Config::default());
         for method in ["GET", "POST"] {
-            let matched = graph
-                .find_matching_endpoints_with_normalizer("/rpc", method, &normalizer)
-                .expect("an internal path");
+            let matched = routed(&graph, "/rpc", method, &normalizer).expect("an internal path");
             assert_eq!(matched.len(), 1, "{method} /rpc must reach the ALL route");
             assert_eq!(graph.find_matching_endpoints("/rpc", method).len(), 1);
         }
-        let other_path = graph
-            .find_matching_endpoints_with_normalizer("/other", "POST", &normalizer)
-            .expect("an internal path");
+        let other_path = routed(&graph, "/other", "POST", &normalizer).expect("an internal path");
         assert!(other_path.is_empty());
     }
 
@@ -1360,7 +1333,7 @@ mod tests {
             &canonical
         ));
 
-        let result = graph.find_matching_endpoints_with_normalizer(&canonical, "GET", &normalizer);
+        let result = routed(&graph, &canonical, "GET", &normalizer);
         let matched = result.expect("injected-base consumer key must reach the matcher");
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].full_path, "/api/v1/widgets/:id");
@@ -1395,7 +1368,8 @@ mod tests {
 
         // Test: Template literal should be normalized and matched
         let normalizer = UrlNormalizer::new(&config);
-        let result = graph.find_matching_endpoints_with_normalizer(
+        let result = routed(
+            &graph,
             "${API_URL}/users/${userId}/orders/${orderId}",
             "GET",
             &normalizer,
@@ -1430,11 +1404,7 @@ mod tests {
 
         // Test: Query string should be stripped before matching
         let normalizer = UrlNormalizer::new(&config);
-        let result = graph.find_matching_endpoints_with_normalizer(
-            "/users?page=1&limit=10",
-            "GET",
-            &normalizer,
-        );
+        let result = routed(&graph, "/users?page=1&limit=10", "GET", &normalizer);
         assert!(result.is_some());
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -1467,9 +1437,7 @@ mod tests {
         let normalizer = UrlNormalizer::default_permissive();
 
         // The concrete route out-ranks the catch-all for its own path.
-        let result = graph
-            .find_matching_endpoints_with_normalizer("/api/v1/chat/new", "GET", &normalizer)
-            .expect("internal path");
+        let result = routed(&graph, "/api/v1/chat/new", "GET", &normalizer).expect("internal path");
         assert_eq!(
             result
                 .iter()
@@ -1480,9 +1448,7 @@ mod tests {
         );
 
         // With no better candidate, the catch-all is still the router truth.
-        let result = graph
-            .find_matching_endpoints_with_normalizer("/api/v2/other", "GET", &normalizer)
-            .expect("internal path");
+        let result = routed(&graph, "/api/v2/other", "GET", &normalizer).expect("internal path");
         assert_eq!(
             result
                 .iter()
@@ -1490,6 +1456,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/api/**"]
         );
+    }
+
+    /// The routes the pairing pool ranks `url` onto (its maximal-agreement
+    /// `routed` set), after the normalization the analyzer runs first; `None`
+    /// for a target the normalizer marks external or unresolved. What these
+    /// tests asked of the matcher before it moved into `carrick_match`
+    /// (carrick#3496 slice 2).
+    fn routed<'g>(
+        graph: &'g MountGraph,
+        url: &str,
+        method: &str,
+        normalizer: &UrlNormalizer,
+    ) -> Option<Vec<&'g ResolvedEndpoint>> {
+        let normalized = normalizer.normalize(url);
+        if normalized.is_external || normalized.is_unresolved {
+            return None;
+        }
+        let pairing = graph.http_pairing_pool().pair(&carrick_match::Call {
+            protocol: "http".to_string(),
+            method: Some(method.to_string()),
+            path: Some(normalized.path),
+            ..Default::default()
+        });
+        Some(
+            pairing
+                .routed
+                .iter()
+                .map(|routed| &graph.get_resolved_endpoints()[routed.producer])
+                .collect(),
+        )
     }
 
     // The path-matching unit tests (optional segments, symmetric params, param

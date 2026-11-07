@@ -118,7 +118,7 @@ fn the_join_pairs_calls_through_a_host_a_sibling_declares_internal() {
 /// yet its `POST /v1/send` meets `ledger-api`'s route of the same path). This
 /// is the opposite of carrick-cloud#656 (an undeclared host cannot be told from
 /// a third party). Not fixed in this slice; see the carrick issue filed for
-/// `src/mount_graph.rs` `find_matching_endpoints_with_normalizer`. When that is
+/// the analyzer's HTTP pairing (`src/analyzer/mod.rs` `http_matches`). When that is
 /// fixed, flip this assertion and delete this note.
 #[test]
 fn the_join_pairs_a_host_nobody_declares_by_its_path_today() {
