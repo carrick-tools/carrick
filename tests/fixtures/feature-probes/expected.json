@@ -382,7 +382,7 @@
  "ri-const-alias": {
   "feature": "const alias of an instance",
   "source": "test262 (const)",
-  "status": "lead"
+  "status": "covered"
  },
  "ri-destructure": {
   "feature": "destructured method of an instance",

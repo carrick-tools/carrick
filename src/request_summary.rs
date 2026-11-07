@@ -1672,6 +1672,7 @@ pub fn extract_file_ir(
         lazy_clients: HashMap::new(),
         shadowed_clients: HashSet::new(),
         returned_consts: HashMap::new(),
+        destructured: HashSet::new(),
         imports: HashSet::new(),
         uses: uses.uses,
         object_consts: object_consts(module),
@@ -1773,6 +1774,47 @@ pub fn extract_file_ir(
             && decl.kind == VarDeclKind::Const
         {
             for declarator in &decl.decls {
+                if let (Pat::Object(pattern), Some(init)) = (&declarator.name, &declarator.init) {
+                    // `const { key: alias } = object`: each alias holds what
+                    // `const alias = <the key's value>` would
+                    // (carrick#3489 W2).
+                    let found: Vec<(String, Option<ClientRef>, Option<String>)> = {
+                        let scope = Scope::module(&module_scope);
+                        destructured_keys(pattern, init, &module_scope)
+                            .into_iter()
+                            .map(|(alias, value)| {
+                                (
+                                    alias.0.to_string(),
+                                    reader.written_instance(value, &scope),
+                                    match crate::graphql_document_sites::unwrap_expression(value) {
+                                        Expr::Ident(target) => Some(target.sym.to_string()),
+                                        _ => None,
+                                    },
+                                )
+                            })
+                            .collect()
+                    };
+                    for (name, client, target) in found {
+                        module_scope.destructured.insert(name.clone());
+                        match (client, target) {
+                            (Some(client), _) => {
+                                let client = module_scope.with_uses(client, &name);
+                                if redeclared.declares_name(&name) {
+                                    module_scope.shadowed_clients.insert(name.clone());
+                                    file.shadowed_clients.insert(name, client);
+                                } else {
+                                    file.module_clients.insert(name.clone(), client.clone());
+                                    module_scope.receivers.insert(name, client);
+                                }
+                            }
+                            (None, Some(target)) => {
+                                file.module_aliases.insert(name, target);
+                            }
+                            (None, None) => {}
+                        }
+                    }
+                    continue;
+                }
                 let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) else {
                     continue;
                 };
@@ -2408,6 +2450,10 @@ struct ModuleScope {
     /// initialises, by name, at the call's span (discovery numbering):
     /// [`HeldInstance::Returned`] (carrick#2474 R2b).
     returned_consts: HashMap<String, (u32, u32)>,
+    /// Each module-scope `const` a destructuring of a module object literal
+    /// binds ([`destructured_keys`], carrick#3489 W2): a module name whose
+    /// instance [`FileIr::module_instance`] follows.
+    destructured: HashSet<String>,
     /// Import bindings no scope below declares again, other than namespace
     /// imports: each may hold an instance the module it names declares
     /// (carrick#1568).
@@ -4657,8 +4703,13 @@ impl Reader<'_> {
                 if let Some((lo, hi)) = scope.module.returned_consts.get(name) {
                     return Some(HeldInstance::Returned(*lo, *hi));
                 }
+                // An import, or a module-scope `const` (an alias of another
+                // module binding, carrick#3489 W2): the declaration the
+                // compiler names is read for the instance it holds.
                 (scope.module.imports.contains(name)
-                    || scope.module.shadowed_clients.contains(name))
+                    || scope.module.shadowed_clients.contains(name)
+                    || scope.module.destructured.contains(name)
+                    || scope.module.consts.contains_key(&key))
                 .then_some(HeldInstance::Imported(ident.span.lo.0, ident.span.hi.0))
             }
             call @ (Expr::Call(_) | Expr::New(_)) => self
@@ -6928,6 +6979,49 @@ fn keyed_names(object: &ObjectPat) -> Vec<(BindingKey, String)> {
                 Pat::Ident(binding) => Some((ident_key(&binding.id), prop_name(&kv.key)?)),
                 _ => None,
             },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The bindings `const <pattern> = init` binds to one key of a module object
+/// literal, each with the key's value expression (carrick#3489 W2): `init`
+/// names a module `const` object literal that nothing writes through, and the
+/// literal has no spread and states the key once. A binding with a default,
+/// a rest element, a computed key or a nested pattern is left out.
+fn destructured_keys<'o>(
+    pattern: &ObjectPat,
+    init: &Expr,
+    module: &'o ModuleScope,
+) -> Vec<(BindingKey, &'o Expr)> {
+    let Expr::Ident(source) = crate::graphql_document_sites::unwrap_expression(init) else {
+        return Vec::new();
+    };
+    let Some(object) = module.object_lits.get(&ident_key(source)) else {
+        return Vec::new();
+    };
+    if module.written_through(&source.sym) {
+        return Vec::new();
+    }
+    let mut stated: HashMap<String, Vec<Option<&Expr>>> = HashMap::new();
+    for prop in &object.props {
+        let PropOrSpread::Prop(prop) = prop else {
+            return Vec::new();
+        };
+        match &**prop {
+            Prop::KeyValue(kv) => match prop_name(&kv.key) {
+                Some(key) => stated.entry(key).or_default().push(Some(&kv.value)),
+                None => return Vec::new(),
+            },
+            // A shorthand key states a name, not an expression to take.
+            Prop::Shorthand(ident) => stated.entry(ident.sym.to_string()).or_default().push(None),
+            _ => return Vec::new(),
+        }
+    }
+    keyed_names(pattern)
+        .into_iter()
+        .filter_map(|(binding, key)| match stated.get(&key)?.as_slice() {
+            [Some(value)] => Some((binding, *value)),
             _ => None,
         })
         .collect()
