@@ -146,15 +146,26 @@ describe('a service with no config at its root', () => {
 });
 
 describe('a service whose config the loader finds', () => {
-  it('keeps one default project, as before', () => {
+  // carrick#3497 ruling R-N1: the nearest config inside the service whose
+  // program lists the file types it, as the language service picks it; the
+  // service config takes what no nearer config lists.
+  it('types a nested config\'s files under it and keeps the rest in the default project', () => {
     const root = writeRepo({
-      'tsconfig.json': JSON.stringify({ include: ['src'] }),
+      'tsconfig.json': JSON.stringify({ include: ['src', 'nested'] }),
       'src/a.ts': 'export const a = 1;\n',
       'nested/tsconfig.json': '{}',
       'nested/b.ts': 'export const b = 1;\n',
+      'src/only/tsconfig.json': JSON.stringify({ include: ['listed'] }),
+      'src/only/c.ts': 'export const c = 1;\n',
+      'src/lib/tsconfig.json': '{}',
+      'src/lib/e.js': 'export const e = 1;\n',
     });
     const loader = load(root);
     assert.strictEqual(loader.projectKeyFor(path.join(root, 'src/a.ts')), '');
-    assert.strictEqual(loader.projectKeyFor(path.join(root, 'nested/b.ts')), '');
+    assert.strictEqual(loader.projectKeyFor(path.join(root, 'nested/b.ts')), path.join(root, 'nested/tsconfig.json'));
+    // A config that does not list the file is passed over for one further up.
+    assert.strictEqual(loader.projectKeyFor(path.join(root, 'src/only/c.ts')), '');
+    // So is one without allowJs, for a JavaScript file.
+    assert.strictEqual(loader.projectKeyFor(path.join(root, 'src/lib/e.js')), '');
   });
 });

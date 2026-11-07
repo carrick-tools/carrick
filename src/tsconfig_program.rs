@@ -10,8 +10,12 @@
 //! Every path here is absolute and canonical: callers pass a canonical repo
 //! root and configs under it.
 //!
-//! Known limit: glob membership ignores the compiler's extension rules (a
-//! `.js` file listed without `allowJs`).
+//! A project's membership ([`Program::lists`]) applies the compiler's
+//! extension rule: a JavaScript file is listed only under `allowJs` (on by
+//! default in a `jsconfig.json`). Derive reach reads the globs alone, so a
+//! JavaScript service under a TypeScript-only config keeps its reach. Known
+//! limit: the compiler's default `exclude` (`node_modules`, `outDir`) is not
+//! applied.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -33,11 +37,32 @@ pub(crate) struct Program {
     exclude: Vec<glob::Pattern>,
     /// The configs its own `references` name, absolute, in declared order.
     references: Vec<PathBuf>,
+    /// Whether the program takes JavaScript files (`allowJs`).
+    allow_js: bool,
 }
 
+/// The extensions a program takes with and without `allowJs`, as the
+/// compiler's `getSupportedExtensions` lists them.
+const TS_EXTENSIONS: [&str; 4] = ["ts", "tsx", "mts", "cts"];
+const JS_EXTENSIONS: [&str; 4] = ["js", "jsx", "mjs", "cjs"];
+
 impl Program {
-    /// Whether this config's own program lists `file` (absolute).
+    /// Whether this config's own program lists `file` (absolute), as the
+    /// compiler's file list does: named in its `files`, or a source file of a
+    /// kind it takes under its `include` minus its `exclude`.
     pub(crate) fn lists(&self, file: &Path) -> bool {
+        if self.files.contains(file) {
+            return true;
+        }
+        let extension = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let takes = TS_EXTENSIONS.contains(&extension)
+            || (self.allow_js && JS_EXTENSIONS.contains(&extension));
+        takes && self.matches(file)
+    }
+
+    /// Whether `file` (absolute) is in its `files`, or matches its `include`
+    /// and not its `exclude`, whatever its extension.
+    fn matches(&self, file: &Path) -> bool {
         if self.files.contains(file) {
             return true;
         }
@@ -75,6 +100,11 @@ impl Program {
                 ))
             })
         };
+        // A `jsconfig.json` takes JavaScript unless its chain says otherwise.
+        let allow_js = chain
+            .iter()
+            .find_map(|(_, json)| json.get("compilerOptions")?.get("allowJs")?.as_bool())
+            .unwrap_or_else(|| config.file_name() == Some("jsconfig.json".as_ref()));
         let files = stated("files");
         let include = stated("include");
         let exclude = stated("exclude");
@@ -121,6 +151,7 @@ impl Program {
             include,
             exclude,
             references,
+            allow_js,
         })
     }
 }
@@ -177,7 +208,7 @@ impl ProgramRules {
     }
 
     pub(crate) fn lists(&self, file: &Path) -> bool {
-        self.programs.iter().any(|program| program.lists(file))
+        self.programs.iter().any(|program| program.matches(file))
     }
 }
 
@@ -193,17 +224,14 @@ pub(crate) struct ProjectGraph {
 }
 
 impl ProjectGraph {
-    /// `None` when the config cannot be read or references nothing, so the
-    /// config itself owns every file.
+    /// `None` when the config cannot be read.
     pub(crate) fn new(
         repo: &Path,
         config: &Path,
         internal: &BTreeMap<String, PathBuf>,
     ) -> Option<Self> {
         let order = search_order(repo, config, internal);
-        if order.first()?.references.is_empty() {
-            return None;
-        }
+        order.first()?;
         let index: BTreeMap<&Path, usize> = order
             .iter()
             .enumerate()
@@ -238,15 +266,15 @@ impl ProjectGraph {
 
     /// The config that owns `file` (absolute): the first project in search
     /// order that lists it while no project in its own reference closure
-    /// does; the config the graph was built from when none does.
-    pub(crate) fn owner_of(&self, file: &Path) -> &Path {
+    /// does. `None` when no project in the graph lists it.
+    pub(crate) fn owner_of(&self, file: &Path) -> Option<&Path> {
         self.order
             .iter()
             .zip(&self.closures)
             .find(|(program, closure)| {
                 program.lists(file) && !closure.iter().any(|&i| self.order[i].lists(file))
             })
-            .map_or(&self.order[0].config, |(program, _)| &program.config)
+            .map(|(program, _)| program.config.as_path())
     }
 
     /// Every config in the graph, in search order.

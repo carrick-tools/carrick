@@ -89,11 +89,21 @@ export class ProjectGraph {
    */
   ownerOf(file: string): ServiceProject {
     if (!this.hasReferences) return this.named;
+    return this.listingOwnerOf(file) ?? this.named;
+  }
+
+  /**
+   * `ownerOf` when some project in the graph lists `file`, the named config
+   * included; undefined when none does (carrick#3497: a config that lists a
+   * file nowhere is passed over for one further up).
+   */
+  listingOwnerOf(file: string): ServiceProject | undefined {
     const key = fileKey(file);
+    if (!this.hasReferences) return this.namedFiles.has(key) ? this.named : undefined;
     const owner = this.projects().find(
       (entry) => entry.files.has(key) && !this.closure(entry.project).some((reached) => reached.files.has(key))
     );
-    return owner?.project ?? this.named;
+    return owner?.project;
   }
 
   /**

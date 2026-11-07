@@ -15,10 +15,11 @@
 //! [`crate::workspace_resolver::WorkspaceIndex`]'s job, so there is one
 //! extension and index-file rule for every kind of specifier.
 //!
-//! Which tsconfig or jsconfig governs a file is one rule, the type sidecar's
-//! ([`Governing`], carrick#3497), so call edges and types read a file under
-//! the same config; `docs/reference/module-resolution.md` ("Which config
-//! governs a file") states it.
+//! Which tsconfig or jsconfig governs a file is one rule, the language
+//! service's ([`Governing`], carrick#3497), which the type sidecar applies
+//! too, so call edges and types read a file under the same config;
+//! `docs/reference/module-resolution.md` ("Which config governs a file")
+//! states it.
 //!
 //! An alias defined only in code (a bundler's `resolve.alias`, a Babel plugin
 //! option) is not config and is not read. The call graph counts the imports it
@@ -56,15 +57,15 @@ pub struct ServiceScope {
     pub named: Option<PathBuf>,
 }
 
-/// Rule steps 1-3 of `docs/reference/module-resolution.md` (carrick#3497),
-/// the type sidecar's `findTsConfig` and `findServiceTsconfig`: the `named`
+/// The service config, the fallback in `docs/reference/module-resolution.md`
+/// (carrick#3497), as the type sidecar's `findTsConfig` and `findServiceTsconfig`: the `named`
 /// config when it is a file and not a Deno config; else the first of
 /// [`SERVICE_ROOT_NAMES`] in the service directory; else, when a directory
 /// above the service holds a `tsconfig.json` (up to the repo root
 /// inclusive), the service root's own `jsconfig.json` if it has one,
-/// otherwise that ancestor config. `None` leaves each file to its own
-/// config (step 4). Every path is relative to `repo_root`; the repo root
-/// itself is the empty path.
+/// otherwise that ancestor config. This is the fallback of [`Governing`],
+/// for a file no config inside the service lists. Every path is relative to
+/// `repo_root`; the repo root itself is the empty path.
 pub(crate) fn service_config(
     repo_root: &Path,
     service_dir: &Path,
@@ -100,19 +101,23 @@ pub(crate) fn service_config(
 }
 
 /// The config each file of one service is read under (carrick#3497): the
-/// type sidecar's rule, steps 1-5 of `docs/reference/module-resolution.md`.
-/// Built once per service, so every question about a file is a lookup.
+/// one the TypeScript language service picks, the rule in
+/// `docs/reference/module-resolution.md` ("Which config governs a file").
+/// The nearest config above the file, inside the service, whose program
+/// (or a project it references) lists the file; else the service config.
+/// The type sidecar's `GoverningConfigs` is the same rule. Built once per
+/// service, so every question about a file is a lookup.
 #[derive(Debug, Clone)]
 pub(crate) struct Governing {
     /// The service directory, repo-relative.
     dir: PathBuf,
-    /// Steps 1-3; `None` reads each file under its own config (step 4).
+    /// The fallback ([`service_config`]); `None` for none.
     service: Option<PathBuf>,
-    /// Step 4: directory under the service -> the tsconfig (else jsconfig)
-    /// in it, repo-relative.
+    /// Directory under the service -> the tsconfig (else jsconfig) in it,
+    /// repo-relative.
     per_dir: BTreeMap<PathBuf, PathBuf>,
-    /// Step 5: config -> its `references` graph, for the configs that have
-    /// one.
+    /// Config -> the projects it and its `references` reach, for every
+    /// config above that could be read.
     graphs: BTreeMap<PathBuf, ProjectGraph>,
     canonical_root: PathBuf,
 }
@@ -127,15 +132,11 @@ impl Governing {
         internal_package_dirs: &BTreeMap<String, PathBuf>,
     ) -> Self {
         let service = service_config(repo_root, &scope.dir, scope.named.as_deref());
-        let per_dir: BTreeMap<PathBuf, PathBuf> = if service.is_some() {
-            BTreeMap::new()
-        } else {
-            config_dirs
-                .iter()
-                .filter(|(dir, _)| dir.starts_with(&scope.dir))
-                .map(|(dir, config)| (dir.clone(), config.clone()))
-                .collect()
-        };
+        let per_dir: BTreeMap<PathBuf, PathBuf> = config_dirs
+            .iter()
+            .filter(|(dir, _)| dir.starts_with(&scope.dir))
+            .map(|(dir, config)| (dir.clone(), config.clone()))
+            .collect();
         let canonical_root = canonical(repo_root);
         let graphs = service
             .iter()
@@ -166,15 +167,17 @@ impl Governing {
     /// The config that governs `file` (repo-relative, under the service
     /// directory), repo-relative; `None` for no config.
     pub(crate) fn governing_config(&self, file: &Path) -> Option<PathBuf> {
-        let chosen = match &self.service {
-            Some(config) => config.clone(),
-            None => self.nearest_own_config(file)?,
-        };
-        let Some(graph) = self.graphs.get(&chosen) else {
-            return Some(chosen);
-        };
-        let owner = graph.owner_of(&self.canonical_root.join(file));
-        Some(self.relative(owner).unwrap_or(chosen))
+        let absolute = self.canonical_root.join(file);
+        if let Some(owner) = self.nearest_listing(file, &absolute) {
+            return Some(owner);
+        }
+        let service = self.service.as_ref()?;
+        let owner = self
+            .graphs
+            .get(service)
+            .and_then(|graph| graph.owner_of(&absolute))
+            .and_then(|owner| self.relative(owner));
+        Some(owner.unwrap_or_else(|| service.clone()))
     }
 
     /// Every config [`Self::governing_config`] can answer, repo-relative.
@@ -191,15 +194,24 @@ impl Governing {
         configs
     }
 
-    /// Step 4: the nearest config from the file's directory up to the service
-    /// directory inclusive, stopping after a `node_modules` directory.
-    fn nearest_own_config(&self, file: &Path) -> Option<PathBuf> {
+    /// The owner, repo-relative, under the nearest config from the file's
+    /// directory up to the service directory inclusive whose program or a
+    /// project it references lists the file (a solution config hands the
+    /// file to the reference that lists it); a config that lists it nowhere
+    /// is passed over. The climb stops after a `node_modules` directory.
+    fn nearest_listing(&self, file: &Path, absolute: &Path) -> Option<PathBuf> {
         for dir in file.ancestors().skip(1) {
             if !dir.starts_with(&self.dir) {
                 return None;
             }
-            if let Some(config) = self.per_dir.get(dir) {
-                return Some(config.clone());
+            let owner = self
+                .per_dir
+                .get(dir)
+                .and_then(|config| self.graphs.get(config))
+                .and_then(|graph| graph.owner_of(absolute))
+                .and_then(|owner| self.relative(owner));
+            if owner.is_some() {
+                return owner;
             }
             if dir == self.dir || dir.file_name() == Some("node_modules".as_ref()) {
                 return None;
@@ -984,11 +996,62 @@ mod tests {
     }
 
     #[test]
-    fn step_1_a_named_config_governs_and_a_missing_one_falls_through() {
+    fn the_nearest_config_that_lists_the_file_governs_it() {
         let repo = tree(&[
-            ("web/tsconfig.json", "{}"),
-            ("web/tsconfig.custom.json", "{}"),
+            ("tsconfig.json", r#"{"include":["src"]}"#),
+            ("src/invoicing/tsconfig.json", "{}"),
         ]);
+        assert_eq!(
+            governing(&repo, "", None, "src/invoicing/a.ts").as_deref(),
+            Some("src/invoicing/tsconfig.json"),
+            "a nested config inside the service governs its own files"
+        );
+        assert_eq!(
+            governing(&repo, "", None, "src/b.ts").as_deref(),
+            Some("tsconfig.json")
+        );
+    }
+
+    #[test]
+    fn a_config_that_does_not_list_the_file_is_passed_over() {
+        let repo = tree(&[
+            ("web/jsconfig.json", "{}"),
+            ("web/src/tsconfig.json", r#"{"include":["other"]}"#),
+            ("web/src/lib/tsconfig.json", "{}"),
+        ]);
+        assert_eq!(
+            governing(&repo, "web", None, "web/src/a.ts").as_deref(),
+            Some("web/jsconfig.json"),
+            "outside its include"
+        );
+        assert_eq!(
+            governing(&repo, "web", None, "web/src/lib/a.js").as_deref(),
+            Some("web/jsconfig.json"),
+            "a JavaScript file under a config without allowJs"
+        );
+        assert_eq!(
+            governing(&repo, "web", None, "web/src/lib/a.ts").as_deref(),
+            Some("web/src/lib/tsconfig.json")
+        );
+    }
+
+    #[test]
+    fn the_service_config_is_the_fallback_named_first() {
+        let repo = tree(&[
+            ("web/tsconfig.json", r#"{"include":["src"]}"#),
+            ("web/tsconfig.custom.json", r#"{"include":["src"]}"#),
+        ]);
+        assert_eq!(
+            governing(
+                &repo,
+                "web",
+                Some("web/tsconfig.custom.json"),
+                "web/scripts/a.ts"
+            )
+            .as_deref(),
+            Some("web/tsconfig.custom.json"),
+            "no config above lists it: the named one"
+        );
         assert_eq!(
             governing(
                 &repo,
@@ -997,30 +1060,26 @@ mod tests {
                 "web/src/a.ts"
             )
             .as_deref(),
-            Some("web/tsconfig.custom.json")
+            Some("web/tsconfig.json"),
+            "the nearest config that lists it outranks the named one"
         );
         assert_eq!(
-            governing(&repo, "web", Some("web/gone.json"), "web/src/a.ts").as_deref(),
+            governing(&repo, "web", Some("web/gone.json"), "web/scripts/a.ts").as_deref(),
             Some("web/tsconfig.json")
         );
-    }
-
-    #[test]
-    fn step_2_a_service_root_name_outranks_an_ancestor() {
         let repo = tree(&[
             ("tsconfig.json", "{}"),
-            ("web/tsconfig.app.json", "{}"),
-            ("web/src/tsconfig.json", "{}"),
+            ("web/tsconfig.app.json", r#"{"include":["src"]}"#),
         ]);
         assert_eq!(
-            governing(&repo, "web", None, "web/src/a.ts").as_deref(),
+            governing(&repo, "web", None, "web/scripts/a.ts").as_deref(),
             Some("web/tsconfig.app.json"),
-            "the root name governs every file, a nearer config included"
+            "a service root name outranks an ancestor"
         );
     }
 
     #[test]
-    fn step_3_an_ancestor_tsconfig_unless_the_service_has_a_jsconfig() {
+    fn an_ancestor_tsconfig_is_the_fallback_unless_the_service_has_a_jsconfig() {
         let repo = tree(&[("tsconfig.json", "{}"), ("api/package.json", "{}")]);
         assert_eq!(
             governing(&repo, "api", None, "api/src/a.ts").as_deref(),
@@ -1034,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn step_4_each_file_takes_its_nearest_config_within_the_service() {
+    fn each_file_takes_its_nearest_config_within_the_service() {
         let repo = tree(&[
             ("jsconfig.json", "{}"),
             ("web/jsconfig.json", "{}"),
@@ -1054,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn step_5_a_referencing_config_hands_each_file_to_its_owner() {
+    fn a_solution_config_hands_each_file_to_the_reference_that_lists_it() {
         let repo = tree(&[
             (
                 "web/tsconfig.json",

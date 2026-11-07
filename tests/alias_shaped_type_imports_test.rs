@@ -30,9 +30,10 @@
 //! - a `#name` specifier, which Node resolves through the importer's own
 //!   `package.json` `imports` and never through a tsconfig `paths` entry, so
 //!   writing one in `paths` tests the wrong rule;
-//! - a `tsconfig` named for the service in `carrick.json`, which governs
-//!   every file under the service directory IN PLACE OF the nearest config
-//!   (carrick#1104) and would shadow the three configs under test.
+//! - a `tsconfig` named for the service in `carrick.json`, which is the
+//!   service's fallback config (carrick#3497): it governs only the files no
+//!   nearer config lists, so it would test the fallback, not the three
+//!   configs under test.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

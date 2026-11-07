@@ -14,16 +14,21 @@
  * A service-root `jsconfig.json` ranks after those names and before an
  * ancestor `tsconfig.json` (carrick#3497): tsserver types a JavaScript file
  * under the jsconfig beside it, not under a config above. Where no ancestor
- * config exists the answer stays undefined, as before: the service is then
- * typed per file by `fileConfigPath`, which reads the same jsconfig.
+ * config exists the answer stays undefined, as before: each file is then
+ * typed by `GoverningConfigs` alone, which reads the same jsconfig.
  *
  * The walk stops at the scan root, inclusive: a config outside the scanned
  * tree is never read. With no scan root, or a service outside it, only the
  * service root is searched.
+ *
+ * The service config is the fallback of the per-file rule
+ * (`GoverningConfigs`, carrick#3497): a file a config inside the service
+ * lists is typed under that config.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { ProjectGraph } from './project-references.js';
 
 /** The names a service root is searched for, in order. */
 const SERVICE_ROOT_NAMES = ['tsconfig.json', 'tsconfig.build.json', 'tsconfig.app.json'];
@@ -71,41 +76,83 @@ export function realPath(p: string): string {
 const FILE_CONFIG_NAMES = ['tsconfig.json', 'jsconfig.json'];
 
 /**
- * The config an editor types `file` under, for a service with none at its
- * root (carrick#1604): the nearest `tsconfig.json`, then `jsconfig.json`, in
- * each directory from the file's up to the service root, inclusive. The
- * climb stops after a directory named `node_modules`, as tsserver's does. A file
- * outside the service root, or with no config on its way up, has none.
+ * The config each file of one service is typed under (carrick#1604,
+ * carrick#3497 ruling R-N1): the one the TypeScript language service picks.
+ * From the file's directory up to the service root, inclusive, each directory's
+ * `tsconfig.json`, else `jsconfig.json`, is asked whether its program, or a
+ * project it references, lists the file; the first that does types it (a
+ * solution config hands the file to the reference that lists it). A config
+ * that lists the file nowhere is passed over. The climb stops after a
+ * directory named `node_modules`, as tsserver's does. A file no config inside
+ * the service lists falls back to the service config (`findServiceTsconfig`
+ * or the named one) and the project of its references that lists the file,
+ * else to that config itself; with no service config, to none.
  *
- * `known` caches the answer per directory; pass one map for one service so
- * its files share the climb.
+ * The scanner's `module_aliases::Governing` is the same rule, and
+ * `tests/module_resolution_parity_test.rs` holds both to the compiler's own
+ * answer.
  */
-export function fileConfigPath(
-  file: string,
-  serviceRoot: string,
-  known: Map<string, string | undefined> = new Map()
-): string | undefined {
-  const root = path.resolve(serviceRoot);
-  const climbed: string[] = [];
-  let found: string | undefined;
-  let dir = path.dirname(path.resolve(file));
-  for (;;) {
-    const from = path.relative(root, dir);
-    if (from.startsWith('..') || path.isAbsolute(from)) break;
-    if (known.has(dir)) {
-      found = known.get(dir);
-      break;
-    }
-    climbed.push(dir);
-    const name = FILE_CONFIG_NAMES.find((n) => fs.existsSync(path.join(dir, n)));
-    if (name !== undefined) {
-      found = path.join(dir, name);
-      break;
-    }
-    // tsserver looks in a `node_modules` directory itself, then stops.
-    if (dir === root || path.basename(dir) === 'node_modules') break;
-    dir = path.dirname(dir);
+export class GoverningConfigs {
+  private readonly root: string;
+  /** Directory -> the config in it, for every directory a climb visited. */
+  private readonly dirConfigs = new Map<string, string | undefined>();
+  /** Config -> its projects; undefined for one that cannot be read. */
+  private readonly graphs = new Map<string, { graph: ProjectGraph; reported: number } | undefined>();
+
+  /**
+   * @param serviceRoot the service directory
+   * @param serviceConfig the fallback config, absolute, or undefined for none
+   * @param report where a config or reference that cannot be read is named
+   */
+  constructor(
+    serviceRoot: string,
+    private readonly serviceConfig: string | undefined,
+    private readonly report: (diagnostic: string) => void = () => {}
+  ) {
+    this.root = path.resolve(serviceRoot);
   }
-  for (const d of climbed) known.set(d, found);
-  return found;
+
+  /** Absolute path of the config that types `file`, or undefined for none. */
+  configFor(file: string): string | undefined {
+    const absolute = path.resolve(file);
+    let dir = path.dirname(absolute);
+    for (;;) {
+      const from = path.relative(this.root, dir);
+      if (from.startsWith('..') || path.isAbsolute(from)) break;
+      const config = this.configIn(dir);
+      const owner = config === undefined ? undefined : this.listingOwner(config, absolute);
+      if (owner !== undefined) return owner;
+      // tsserver looks in a `node_modules` directory itself, then stops.
+      if (dir === this.root || path.basename(dir) === 'node_modules') break;
+      dir = path.dirname(dir);
+    }
+    if (this.serviceConfig === undefined) return undefined;
+    return this.listingOwner(this.serviceConfig, absolute) ?? this.serviceConfig;
+  }
+
+  private configIn(dir: string): string | undefined {
+    if (!this.dirConfigs.has(dir)) {
+      const name = FILE_CONFIG_NAMES.find((n) => fs.existsSync(path.join(dir, n)));
+      this.dirConfigs.set(dir, name === undefined ? undefined : path.join(dir, name));
+    }
+    return this.dirConfigs.get(dir);
+  }
+
+  /** The project reached from `config` that lists `file`, absolute. */
+  private listingOwner(config: string, file: string): string | undefined {
+    if (!this.graphs.has(config)) {
+      try {
+        this.graphs.set(config, { graph: new ProjectGraph(config), reported: 0 });
+      } catch (err) {
+        this.report(`tsconfig ${config} could not be read and was skipped: ${err instanceof Error ? err.message : String(err)}`);
+        this.graphs.set(config, undefined);
+      }
+    }
+    const entry = this.graphs.get(config);
+    if (entry === undefined) return undefined;
+    const owner = entry.graph.listingOwnerOf(file);
+    entry.graph.diagnostics.slice(entry.reported).forEach(this.report);
+    entry.reported = entry.graph.diagnostics.length;
+    return owner?.configPath;
+  }
 }

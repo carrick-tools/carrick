@@ -112,8 +112,8 @@ fn alias_in_a_member_jsconfig_resolves() {
     assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
 }
 
-/// The service names no config: the rule finds `tsconfig.app.json` at its
-/// root (step 2) rather than the nearest `tsconfig.json`, the root's `{}`.
+/// The service names no config and holds no `tsconfig.json`: the fallback is
+/// the `tsconfig.app.json` at its root, not the repo root's `{}` above it.
 #[test]
 fn a_named_service_without_a_tsconfig_reads_its_root_app_config() {
     let calls = scan_calls("a-cj");
@@ -131,7 +131,7 @@ fn a_lone_app_config_governs_the_repo() {
 }
 
 /// The member's `tsconfig.json` lists nothing and references
-/// `tsconfig.app.json`, which lists the file: the reference owns it (step 5).
+/// `tsconfig.app.json`, which lists the file: the reference owns it.
 #[test]
 fn a_referencing_member_config_hands_the_file_to_its_reference() {
     let calls = scan_calls("b-ws");
@@ -147,7 +147,8 @@ fn a_referencing_config_scanned_alone_hands_the_file_to_its_reference() {
 }
 
 /// A service-root `jsconfig.json` under a root `tsconfig.json` `{}`: the
-/// jsconfig outranks the ancestor (step 3), as in the type sidecar.
+/// jsconfig, inside the service, lists the file before the ancestor is
+/// reached, as in the type sidecar.
 #[test]
 fn a_member_jsconfig_outranks_an_ancestor_tsconfig() {
     let calls = scan_calls("j-under-cj");
