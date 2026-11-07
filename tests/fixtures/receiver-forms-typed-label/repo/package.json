@@ -1,0 +1,8 @@
+{
+  "name": "receiver-forms-typed-label",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "@fixture/http": "^1.0.0"
+  }
+}

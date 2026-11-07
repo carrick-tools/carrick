@@ -5156,6 +5156,51 @@ export function listen(): void {
         );
     }
 
+    /// carrick#3044 S2: a package labels its client under the export that
+    /// holds an instance (`http`, `on: export`) and under the type of that
+    /// instance (`Client`, `of: type`); both ops stand on the one
+    /// declaration `Client.post`. They read the member the same way, so they
+    /// are one op: a call whose receiver is `a ?? http` or a function's
+    /// result is a site by the member's declaration, and none is ambiguous.
+    #[test]
+    fn an_export_label_and_a_type_label_on_one_declaration_are_one_op() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-typed-label")
+        else {
+            return;
+        };
+        let discovery = discover(
+            &on.inputs,
+            &Labels::traced(&exports, &declarations),
+            &on.repo,
+        );
+        assert_eq!(discovery.counts.get("declaration_ambiguous"), None);
+        let mut got: Vec<String> = discovery
+            .sites
+            .iter()
+            .filter(|site| site.end.is_some())
+            .map(|site| {
+                let reached = site.reached.map_or("-".to_string(), |by| {
+                    serde_json::to_value(by)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
+                format!("{} {reached}", site.file)
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            texts(&[
+                "src/t-call-result-receiver.ts declaration",
+                "src/t-coalesce-receiver.ts declaration",
+                "src/t-typed-const.ts name",
+            ]),
+            "{got:#?}"
+        );
+    }
+
     /// carrick#3207: the routes package registers its plugin on an app it is
     /// handed; the host makes that app through the package's `default` export
     /// while the store labels `register` on the named export alone. The
