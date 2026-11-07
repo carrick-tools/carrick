@@ -45,6 +45,7 @@ use crate::services::type_sidecar::{
     MakeForm, NameScope, NameScopeKind, OpForm, OpName, ScopeForm, SemanticsResult,
     SemanticsVerdict,
 };
+use crate::site_rows::RowSide;
 
 /// Which end of a socket an export makes. A classification the types
 /// cannot carry: it only ever picks a direction, never a fact of its own.
@@ -54,6 +55,17 @@ pub enum Side {
     Client,
     Server,
     Both,
+}
+
+impl Side {
+    /// The word the label and the row writers spell a side with.
+    pub fn word(self) -> &'static str {
+        match self {
+            Side::Client => "client",
+            Side::Server => "server",
+            Side::Both => "both",
+        }
+    }
 }
 
 /// How an export's side is decided (label structure v2, carrick#2434). A
@@ -771,14 +783,7 @@ impl LibraryRow {
     /// [`carrick_match::NameScope`]): the claim's scope spelled `global` or
     /// `service`, and its namespace.
     pub fn wire_scope(&self) -> carrick_match::NameScope {
-        carrick_match::NameScope {
-            scope: match self.name_scope.scope {
-                NameScopeKind::Global => carrick_match::GLOBAL_SCOPE,
-                NameScopeKind::Service => carrick_match::SERVICE_SCOPE,
-            }
-            .to_string(),
-            namespace: self.name_scope.namespace.clone(),
-        }
+        wire_scope_of(&self.name_scope)
     }
 }
 
@@ -1147,13 +1152,13 @@ fn slot_key(slot: &ClaimSlot) -> Option<&str> {
 }
 
 /// The row an op states for a role. A socket's direction is the export's
-/// side's; one that serves both sides, or says nothing, states nothing. An
+/// side's; one that serves both sides is `UNKNOWN` (carrick#3498), and one that
+/// says nothing states nothing. An
 /// export the store marks `by_origin` is passed no side: its side is decided
 /// per receiver at a decided site (docs/reference/client-semantics.md,
 /// "Message roles"). A `request` or an `execute` is no message row.
 fn row_kind(role: LibraryRole, op: LibraryOp, side: Option<Side>) -> Option<LibraryRowKind> {
     use LibraryRowKind::{Pubsub, Socket};
-    use SocketDirection::{ClientToServer, ServerToClient};
     Some(match (role, op, side) {
         (LibraryRole::Broker | LibraryRole::InProcessBus, LibraryOp::Send, _) => {
             Pubsub(PubsubRole::Publisher)
@@ -1161,22 +1166,17 @@ fn row_kind(role: LibraryRole, op: LibraryOp, side: Option<Side>) -> Option<Libr
         (LibraryRole::Broker | LibraryRole::InProcessBus, LibraryOp::Receive, _) => {
             Pubsub(PubsubRole::Subscriber)
         }
-        (LibraryRole::Socket, LibraryOp::Send, Some(Side::Client)) => Socket {
-            direction: ClientToServer,
-            listener: false,
-        },
-        (LibraryRole::Socket, LibraryOp::Receive, Some(Side::Client)) => Socket {
-            direction: ServerToClient,
-            listener: true,
-        },
-        (LibraryRole::Socket, LibraryOp::Send, Some(Side::Server)) => Socket {
-            direction: ServerToClient,
-            listener: false,
-        },
-        (LibraryRole::Socket, LibraryOp::Receive, Some(Side::Server)) => Socket {
-            direction: ClientToServer,
-            listener: true,
-        },
+        (LibraryRole::Socket, op @ (LibraryOp::Send | LibraryOp::Receive), side) => {
+            let row = if op == LibraryOp::Send {
+                RowSide::Call
+            } else {
+                RowSide::Endpoint
+            };
+            Socket {
+                direction: crate::message_key::socket_direction(side.map(Side::word), row)?,
+                listener: row == RowSide::Endpoint,
+            }
+        }
         _ => return None,
     })
 }
@@ -1185,17 +1185,29 @@ fn row_kind(role: LibraryRole, op: LibraryOp, side: Option<Side>) -> Option<Libr
 /// its service (D4, carrick#1564 comment 5940360418), whatever the claim
 /// says; a claim that says nothing is read as `service` too, the direction
 /// that only ever loses an edge.
-fn scoped(role: LibraryRole, scope: Option<NameScope>) -> NameScope {
-    match (role, scope) {
-        (LibraryRole::InProcessBus, scope) => NameScope {
-            scope: NameScopeKind::Service,
-            namespace: scope.and_then(|scope| scope.namespace),
+pub(crate) fn scoped(role: LibraryRole, scope: Option<NameScope>) -> NameScope {
+    let claimed = scope.map(|scope| wire_scope_of(&scope));
+    let written =
+        crate::message_key::name_scope(role == LibraryRole::InProcessBus, claimed, None, None);
+    NameScope {
+        scope: if written.scope == carrick_match::GLOBAL_SCOPE {
+            NameScopeKind::Global
+        } else {
+            NameScopeKind::Service
         },
-        (_, Some(scope)) => scope,
-        (_, None) => NameScope {
-            scope: NameScopeKind::Service,
-            namespace: None,
-        },
+        namespace: written.namespace,
+    }
+}
+
+/// A claim's scope as the index writes it.
+pub(crate) fn wire_scope_of(scope: &NameScope) -> carrick_match::NameScope {
+    carrick_match::NameScope {
+        scope: match scope.scope {
+            NameScopeKind::Global => carrick_match::GLOBAL_SCOPE,
+            NameScopeKind::Service => carrick_match::SERVICE_SCOPE,
+        }
+        .to_string(),
+        namespace: scope.namespace.clone(),
     }
 }
 
@@ -2139,7 +2151,21 @@ mod tests {
                 },
             ]
         );
-        assert!(kinds(Some("both")).is_empty());
+        // A library that serves both ends gives the unknown direction, as the
+        // site-row writer does (carrick#3498); one that says nothing, none.
+        assert_eq!(
+            kinds(Some("both")),
+            vec![
+                LibraryRowKind::Socket {
+                    direction: SocketDirection::Unknown,
+                    listener: false
+                },
+                LibraryRowKind::Socket {
+                    direction: SocketDirection::Unknown,
+                    listener: true
+                },
+            ]
+        );
         assert!(kinds(None).is_empty());
     }
 

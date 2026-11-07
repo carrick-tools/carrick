@@ -225,6 +225,11 @@ pub struct SiteLabel {
     /// `by_origin` socket's side (carrick#1670).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yields: Option<crate::services::type_sidecar::Yields>,
+    /// The scope the op's claim states for its name (carrick#3498), read by
+    /// [`crate::message_key::name_scope`]. Never sent: the label's wire shape
+    /// is unchanged.
+    #[serde(skip)]
+    pub name_scope: Option<crate::services::type_sidecar::NameScope>,
 }
 
 /// The scope member an op is claimed on the result of (carrick#1678):
@@ -316,6 +321,7 @@ impl SiteLabel {
                         request: op.request,
                         scope: None,
                         yields: op.yields,
+                        name_scope: None,
                     });
                 }
             }
@@ -375,6 +381,7 @@ impl SiteLabel {
                         request: None,
                         scope: None,
                         yields: None,
+                        name_scope: None,
                     });
                     continue;
                 }
@@ -401,6 +408,7 @@ impl SiteLabel {
                     method_default,
                     request,
                     yields,
+                    name_scope,
                     ..
                 } = claim
                 else {
@@ -441,6 +449,10 @@ impl SiteLabel {
                     runs: None,
                     request: request.as_deref().cloned(),
                     yields: yields.as_deref().cloned(),
+                    name_scope: match name.as_deref() {
+                        Some(OpName::Slot(_)) => name_scope.clone(),
+                        _ => None,
+                    },
                     scope: of
                         .as_deref()
                         .and_then(crate::library_claims::scope_step)
@@ -3108,6 +3120,7 @@ pub(crate) mod tests {
                     new: false,
                     by_origin: false,
                     yields: None,
+                    name_scope: None,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("post".into()),
@@ -3131,6 +3144,7 @@ pub(crate) mod tests {
                     new: false,
                     by_origin: false,
                     yields: None,
+                    name_scope: None,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("send".into()),
@@ -3964,6 +3978,7 @@ pub(crate) mod tests {
             new: false,
             by_origin: false,
             yields: None,
+            name_scope: None,
             package: "@fixture/wire".into(),
             export: "connect".into(),
             member: Some(member.into()),
@@ -3987,6 +4002,7 @@ pub(crate) mod tests {
             new: false,
             by_origin: false,
             yields: None,
+            name_scope: None,
             package: "lib:lib.dom.d.ts".into(),
             export: "fetch".into(),
             member: None,
@@ -4018,6 +4034,7 @@ pub(crate) mod tests {
             new: false,
             by_origin: false,
             yields: None,
+            name_scope: None,
             package: "node:child_process".into(),
             export: "ChildProcess".into(),
             member: Some("send".into()),
@@ -4633,6 +4650,7 @@ pub(crate) mod tests {
             new: false,
             by_origin: false,
             yields: None,
+            name_scope: None,
             name: None,
             handler: Some(ArgSlot { arg: 0, key: None }),
             scope: Some(LabelScope {
@@ -4835,6 +4853,7 @@ pub(crate) mod tests {
             new: false,
             by_origin: false,
             yields: None,
+            name_scope: None,
             package: "@fixture/http".into(),
             export: "default".into(),
             member: Some("get".into()),
