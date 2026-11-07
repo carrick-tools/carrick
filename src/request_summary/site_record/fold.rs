@@ -51,6 +51,8 @@ pub(super) struct Fold<'s, 'r> {
     positions: &'s PositionIndex,
     root: &'s Path,
     steps: usize,
+    /// The files whose declarations the fold has read through.
+    read_from: Vec<String>,
 }
 
 impl<'s, 'r> Fold<'s, 'r> {
@@ -64,6 +66,23 @@ impl<'s, 'r> Fold<'s, 'r> {
             positions,
             root,
             steps: 0,
+            read_from: Vec::new(),
+        }
+    }
+
+    /// The one file every declaration this fold read lives in: where the
+    /// folded value came from. `None` where it read none, or several.
+    pub(super) fn origin(&self) -> Option<String> {
+        match self.read_from.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    }
+
+    /// Notes that a declaration in `file` was read.
+    fn read(&mut self, file: &str) {
+        if !self.read_from.iter().any(|seen| seen == file) {
+            self.read_from.push(file.to_string());
         }
     }
 
@@ -146,7 +165,9 @@ impl<'s, 'r> Fold<'s, 'r> {
             return Some(one.clone());
         }
         let (decl_file, decl_line) = (row.decl_file()?.to_string(), row.decl_line()?);
-        match self.declared(&decl_file, decl_line, ident.sym.as_ref())? {
+        let declared = self.declared(&decl_file, decl_line, ident.sym.as_ref())?;
+        self.read(&decl_file);
+        match declared {
             Declared::Value { init, .. } => self.text(&decl_file, &init),
             Declared::Enum(_) => None,
         }
@@ -172,6 +193,10 @@ impl<'s, 'r> Fold<'s, 'r> {
             .unwrap_or_default()
             .as_slice()
         {
+            if let Some(decl_file) = row.decl_file().filter(|file| in_repo(file)) {
+                let decl_file = decl_file.to_string();
+                self.read(&decl_file);
+            }
             return Some(one.clone());
         }
         let Expr::Ident(object) = super::super::unwrap_value(&member.obj) else {
@@ -187,7 +212,9 @@ impl<'s, 'r> Fold<'s, 'r> {
             )
             .ok()?;
         let (decl_file, decl_line) = (row.decl_file()?.to_string(), row.decl_line()?);
-        match self.declared(&decl_file, decl_line, object.sym.as_ref())? {
+        let declared = self.declared(&decl_file, decl_line, object.sym.as_ref())?;
+        self.read(&decl_file);
+        match declared {
             Declared::Enum(members) => {
                 let init = members.iter().find_map(|entry| {
                     let name = match &entry.id {

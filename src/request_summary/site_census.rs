@@ -391,7 +391,7 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
             census.composed.push(format!(
                 "{at} {method} {} <- {}",
                 composed_text(composed),
-                composed.edges.join(" > ")
+                composed.edges().join(" > ")
             ));
         }
         let site = (method, name, at);

@@ -5791,6 +5791,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -5887,6 +5888,7 @@ mod tests {
                 resolution_source: producer_source,
                 dispatch: None,
                 handler_span: None,
+                address: None,
             });
             mount_graph.data_calls.push(DataFetchingCall {
                 method: "GET".to_string(),
@@ -6177,6 +6179,7 @@ mod tests {
             resolution_source: Some(FileBasedRoute),
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -6260,6 +6263,7 @@ mod tests {
             resolution_source: Some(FileBasedRoute),
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         // The one call row the scan holds in that file is on another line,
         // and there is no pub/sub call row at all.
@@ -6651,6 +6655,7 @@ mod tests {
                 resolution_source: source,
                 dispatch: None,
                 handler_span: None,
+                address: None,
             });
         }
         mount_graph.data_calls.push(DataFetchingCall {
@@ -6711,6 +6716,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 handler_span: None,
+                address: None,
             });
         }
 
@@ -6804,6 +6810,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: Some(case(value)),
                 handler_span: None,
+                address: None,
             });
         }
 
@@ -6889,6 +6896,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: Some(case(value)),
                 handler_span: None,
+                address: None,
             });
         }
         mount_graph.data_calls.push(DataFetchingCall {
@@ -7018,6 +7026,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -7085,6 +7094,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -7153,6 +7163,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
@@ -7171,6 +7182,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -7287,6 +7299,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         // repo-beta: the identical call to the same external endpoint.
         mount_graph.data_calls.push(DataFetchingCall {
@@ -7374,6 +7387,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -7443,6 +7457,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -7503,6 +7518,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            address: None,
         }
     }
 

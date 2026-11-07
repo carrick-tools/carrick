@@ -597,7 +597,7 @@ fn folded_values(
     file: &str,
     pieces: &[super::Piece],
     exprs: &[&Expr],
-) -> HashMap<String, String> {
+) -> HashMap<String, (String, Option<String>)> {
     let mut values = HashMap::new();
     let Some(positions) = positions else {
         return values;
@@ -615,8 +615,9 @@ fn folded_values(
         else {
             continue;
         };
-        if let Some(value) = fold::Fold::new(sources, positions, root).text(file, &expr) {
-            values.insert(text.clone(), value);
+        let mut fold = fold::Fold::new(sources, positions, root);
+        if let Some(value) = fold.text(file, &expr) {
+            values.insert(text.clone(), (value, fold.origin()));
         }
     }
     values
@@ -627,14 +628,18 @@ fn folded_values(
 /// ([`folded_values`]).
 fn piece_literals(
     names: &[CompilerName],
-    folded: &HashMap<String, String>,
+    folded: &HashMap<String, (String, Option<String>)>,
     text: &str,
 ) -> Vec<String> {
     let typed = name_literals(names, text);
     if !typed.is_empty() {
         return typed;
     }
-    folded.get(text).cloned().into_iter().collect()
+    folded
+        .get(text)
+        .map(|(value, _)| value.clone())
+        .into_iter()
+        .collect()
 }
 
 /// A route site's own path read through the compiler ([`folded_text`],
@@ -656,9 +661,14 @@ impl<'r> NameFold<'r> {
         }
     }
 
-    /// `site`'s name, folded: `None` where it names no value or one the
-    /// compiler does not type as one string.
-    pub(super) fn own_path(&mut self, site: &DecidedSite) -> Option<String> {
+    /// `site`'s name, folded, with its pieces as an address part states them
+    /// (`docs/reference/address-chain.md`): each value the compiler typed as
+    /// one string is `folded` from the file that declares it. `None` where
+    /// it names no value or one the compiler does not type as one string.
+    pub(super) fn own_path(
+        &mut self,
+        site: &DecidedSite,
+    ) -> Option<(String, Vec<crate::address::Piece>)> {
         let positions = self.positions?;
         if !site
             .name
@@ -705,7 +715,43 @@ impl<'r> NameFold<'r> {
             &site.name,
             &exprs,
         );
-        folded_text(&site.name, &|text| piece_literals(&names, &folded, text))
+        let text = folded_text(&site.name, &|text| piece_literals(&names, &folded, text))?;
+        // `folded_text` read every piece as a literal, a name the compiler
+        // types as one string, or a value that folds to one text.
+        let pieces = site
+            .name
+            .iter()
+            .map(|piece| match piece {
+                super::Piece::Lit(text) => Some(crate::address::Piece::Lit { text: text.clone() }),
+                super::Piece::Opaque { text, .. } => {
+                    let [one] = piece_literals(&names, &folded, text).try_into().ok()?;
+                    let declared = names
+                        .iter()
+                        .find(|name| &name.text == text)
+                        .and_then(|name| name.declaration.as_deref())
+                        .map(|declaration| declaration_file(declaration).to_string())
+                        // A value read off a declaration the compiler names
+                        // for no ident of its own (an enum or object entry)
+                        // names the file the fold read it in.
+                        .or_else(|| folded.get(text).and_then(|(_, origin)| origin.clone()));
+                    Some(match declared {
+                        Some(from) => crate::address::Piece::Folded { text: one, from },
+                        None => crate::address::Piece::Lit { text: one },
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((text, pieces))
+    }
+}
+
+/// The file of a compiler row's declaration (`file:line`, or the file
+/// alone).
+fn declaration_file(declaration: &str) -> &str {
+    match declaration.rsplit_once(':') {
+        Some((file, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => file,
+        _ => declaration,
     }
 }
 

@@ -51,11 +51,12 @@ use serde::{Deserialize, Serialize};
 
 use super::super::constructions::Constructed;
 use super::super::{
-    CallIr, ClientRef, HeldInstance, KeyState, Link, MadeBy, MakerForm, Piece,
-    RequestSummaryInputs, Value, ValueAt, Way,
+    CallIr, ClientRef, FoldPiece, HeldInstance, KeyState, Link, MadeBy, MakerForm, Piece,
+    RequestSummaryInputs, Root, Value, ValueAt, Way,
 };
 use super::boundaries::{Boundary, FnAt};
 use super::{Calls, Placed, filled, holds_parameter, relative, to_definition};
+use crate::address;
 use crate::position_rows::{FLAG_ANY, FLAG_DECLARATION_UNNAMED, Kind};
 
 /// A maker the store labels: the package (as the store keys it), the
@@ -331,6 +332,10 @@ pub enum InstanceAt {
         member: String,
         #[serde(flatten)]
         prefix: Prefix,
+        /// What the prefix slot states as an address part's value
+        /// ([`InstanceWalk::value_of`]).
+        #[serde(skip)]
+        value: address::Value,
         package: String,
         export: String,
         receiver: String,
@@ -1050,11 +1055,13 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             let [(label, receiver)] = matched.as_slice() else {
                 return false;
             };
+            let prefix = self.prefix_of(host, &label.name, None);
             let scope = InstanceAt::Scope {
                 file: relative(self.root, host.file),
                 line: host.call.site.line,
                 member: label.member.clone(),
-                prefix: self.prefix_of(host, &label.name, None),
+                value: self.value_of(host, &label.name, &prefix),
+                prefix,
                 package: label.package.clone(),
                 export: label.export.clone(),
                 receiver: receiver.to_string(),
@@ -1103,6 +1110,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                         file: relative(self.root, host.file),
                         line: host.call.site.line,
                         member: label.member.clone(),
+                        value: self.value_of(host, &label.name, &prefix),
                         prefix,
                         package: package.clone(),
                         export: export.clone(),
@@ -1860,6 +1868,89 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         }
     }
 
+    /// What the slot `name` of `placed`'s call states as an address part's
+    /// value (`docs/reference/address-chain.md`), where `prefix` is what
+    /// [`Self::prefix_of`] read there: each stated value as its pieces, a
+    /// piece read through a constant with the module that declares it, and
+    /// a value not read as text as unknown pieces with why. A value read
+    /// through the callers of a parameter is stated as its text.
+    pub(super) fn value_of(
+        &self,
+        placed: &Placed<'a>,
+        name: &(usize, Option<String>),
+        prefix: &Prefix,
+    ) -> address::Value {
+        match prefix {
+            Prefix::Unstated => address::Value::Unstated,
+            Prefix::Stated { values } => address::Value::Text {
+                values: values
+                    .iter()
+                    .map(|value| {
+                        self.folded_pieces(placed, name, value).unwrap_or_else(|| {
+                            vec![address::Piece::Lit {
+                                text: value.clone(),
+                            }]
+                        })
+                    })
+                    .collect(),
+            },
+            Prefix::Unread { text } => {
+                let conditional = slot_alternatives(placed, name).is_some();
+                let pieces = match slot_pieces(placed, name) {
+                    Ok(pieces) if !pieces.is_empty() => pieces
+                        .iter()
+                        .map(|piece| address_piece(piece, conditional))
+                        .collect(),
+                    _ => vec![address::Piece::Unknown {
+                        written: text.clone().unwrap_or_default(),
+                        reason: address::UnknownReason::Unread,
+                        reads: Vec::new(),
+                    }],
+                };
+                address::Value::Text {
+                    values: vec![pieces],
+                }
+            }
+        }
+    }
+
+    /// The pieces of `value`, the text the slot `name` of `placed`'s call
+    /// states, where that text holds a piece read through a constant
+    /// ([`super::super::InstanceIr::folds`]); `None` where none does.
+    fn folded_pieces(
+        &self,
+        placed: &Placed<'a>,
+        name: &(usize, Option<String>),
+        value: &str,
+    ) -> Option<Vec<address::Piece>> {
+        let (arg, key) = name;
+        let fold = placed
+            .call
+            .instance
+            .folds
+            .iter()
+            .find(|fold| fold.arg == *arg && fold.key == *key)?;
+        let text: String = fold
+            .pieces
+            .iter()
+            .map(|piece| match piece {
+                FoldPiece::Lit(text) | FoldPiece::Folded { text, .. } => text.as_str(),
+            })
+            .collect();
+        (text == value).then(|| {
+            fold.pieces
+                .iter()
+                .map(|piece| match piece {
+                    FoldPiece::Lit(text) => address::Piece::Lit { text: text.clone() },
+                    FoldPiece::Folded { text, from } => address::Piece::Folded {
+                        text: text.clone(),
+                        from: relative(self.root, from),
+                    },
+                })
+                .collect()
+        })
+    }
+
     /// Add the text each of `ways` (read in `placed`'s body) states to
     /// `values`. A parameter takes what each caller of its function hands
     /// in, and what each member that runs the function hands it; one
@@ -2015,6 +2106,51 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// it in.
     pub(super) fn at_call(&self, file: &Path, call: &CallIr) -> String {
         format!("{}:{}", relative(self.root, file), call.site.line)
+    }
+}
+
+/// One piece of a prefix slot this pass does not read as text, as an
+/// address piece: text the call writes stays text, and anything else is
+/// unknown with why. `conditional` says the slot is written through a
+/// conditional or a default.
+fn address_piece(piece: &Piece, conditional: bool) -> address::Piece {
+    use address::UnknownReason;
+    let unknown =
+        |written: &str, reason: UnknownReason, reads: Vec<String>| address::Piece::Unknown {
+            written: written.to_string(),
+            reason,
+            reads,
+        };
+    match piece {
+        Piece::Lit(text) => address::Piece::Lit { text: text.clone() },
+        Piece::Opaque {
+            end: Root::Env { name, .. },
+            text,
+            ..
+        } => unknown(text, UnknownReason::RuntimeEnv, vec![name.clone()]),
+        _ if conditional => {
+            let written = match piece {
+                Piece::Opaque { text, .. } => text.as_str(),
+                _ => "",
+            };
+            unknown(written, UnknownReason::Conditional, Vec::new())
+        }
+        Piece::Param(_, name) | Piece::ParamKey(_, _, name) => {
+            unknown(name, UnknownReason::Parameter, Vec::new())
+        }
+        Piece::Outer(_, inner) => match &**inner {
+            Piece::Param(_, name) | Piece::ParamKey(_, _, name) => {
+                unknown(name, UnknownReason::Parameter, Vec::new())
+            }
+            _ => unknown("", UnknownReason::Parameter, Vec::new()),
+        },
+        Piece::Opaque {
+            end: Root::Param(..) | Root::Outer(..),
+            text,
+            ..
+        } => unknown(text, UnknownReason::Parameter, Vec::new()),
+        Piece::Opaque { text, .. } => unknown(text, UnknownReason::Unread, Vec::new()),
+        Piece::Query | Piece::Unknown => unknown("", UnknownReason::Unread, Vec::new()),
     }
 }
 

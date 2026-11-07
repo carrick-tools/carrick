@@ -1076,6 +1076,30 @@ struct InstanceIr {
     receiver_value: Option<Value>,
     receiver_held: Option<HeldInstance>,
     args: Vec<ArgHeld>,
+    /// The argument slots whose text [`RequestSummaryInputs::linked`] read
+    /// through a module-scope constant, piece by piece as they read before
+    /// the read made them one text (address chain S1): where a prefix is
+    /// read from, the trace stores each such piece with the module that
+    /// declares it. Read by the trace alone.
+    folds: Vec<SlotFold>,
+}
+
+/// One argument slot (an argument, or a key of an object-literal one) whose
+/// text holds a piece read through a module-scope constant
+/// ([`InstanceIr::folds`]).
+#[derive(Debug, Clone)]
+struct SlotFold {
+    arg: usize,
+    key: Option<String>,
+    pieces: Vec<FoldPiece>,
+}
+
+/// A piece of a [`SlotFold`]: text written at the call, or text read
+/// through a constant, with the module that declares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FoldPiece {
+    Lit(String),
+    Folded { text: String, from: PathBuf },
 }
 
 /// What a call's argument puts in place of the callee's spread of that
@@ -1497,6 +1521,8 @@ pub struct FileIr {
 type LinkedReads = (
     HashMap<(PathBuf, library_sites::NamedRef), String>,
     HashMap<(PathBuf, library_sites::NamedRef), Held>,
+    // The module that declares each linked binding (address chain S1).
+    HashMap<(PathBuf, library_sites::NamedRef), PathBuf>,
 );
 
 /// What a module-scope binding hands an importer where its text cannot be
@@ -4899,6 +4925,7 @@ impl Reader<'_> {
             receiver_value,
             receiver_held,
             args,
+            folds: Vec::new(),
         }
     }
 
@@ -8528,9 +8555,13 @@ impl RequestSummaryInputs {
         let past = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
         let mut resolved = HashMap::new();
         let mut held = HashMap::new();
+        let mut declared = HashMap::new();
         for (file, named) in wanted {
             if past() {
                 return None;
+            }
+            if let Some(at) = names.declared_in(&file, &named) {
+                declared.insert((file.clone(), named.clone()), at);
             }
             let piece = library_sites::TextPiece::Named(Box::new(named.clone()));
             if let Some(text) = names.text(&file, &[piece]) {
@@ -8540,13 +8571,41 @@ impl RequestSummaryInputs {
             }
         }
         // A read the deadline cut short is no reading.
-        (!past()).then_some((resolved, held))
+        (!past()).then_some((resolved, held, declared))
     }
 
-    /// The files with each linked piece read as `reads` says.
-    fn read_through(mut self, (resolved, held): LinkedReads) -> Self {
+    /// The files with each linked piece read as `reads` says. First, each
+    /// call's argument slot that holds a piece read whole as text records
+    /// its pieces with the module that declares each such one
+    /// ([`InstanceIr::folds`]), since the read joins them into one text.
+    fn read_through(mut self, (resolved, held, declared): LinkedReads) -> Self {
         if resolved.is_empty() && held.is_empty() {
             return self;
+        }
+        let folded = |scope: &Path, piece: &Piece| -> Option<FoldPiece> {
+            let Piece::Opaque {
+                link: Some(link), ..
+            } = piece
+            else {
+                return None;
+            };
+            let Link::Named(named) = &**link else {
+                return None;
+            };
+            let key = (scope.to_path_buf(), named.clone());
+            let text = match (resolved.get(&key), held.get(&key)) {
+                (Some(text), _) | (None, Some(Held::Text(text))) => text,
+                _ => return None,
+            };
+            Some(FoldPiece::Folded {
+                text: text.clone(),
+                from: declared.get(&key)?.clone(),
+            })
+        };
+        for (path, ir) in &mut self.files {
+            ir.visit_calls(&mut |call| {
+                call.instance.folds = slot_folds(&call.args, &|piece| folded(path, piece));
+            });
         }
         for (path, ir) in &mut self.files {
             ir.visit_pieces(path, &mut |scope, pieces| {
@@ -8678,9 +8737,77 @@ impl FnIr {
             nested.visit_pieces(scope, visit);
         }
     }
+
+    /// Calls `visit` with each call of this body, nested functions included.
+    fn visit_calls(&mut self, visit: &mut dyn FnMut(&mut CallIr)) {
+        for call in &mut self.calls {
+            visit(call);
+        }
+        for nested in self.nested.iter_mut().chain(&mut self.detached) {
+            nested.visit_calls(visit);
+        }
+    }
+}
+
+/// Each argument slot of `args` (an argument, or a key of an object-literal
+/// one) whose text is pieces written at the call and at least one `folded`
+/// reads as text through a constant ([`InstanceIr::folds`]).
+fn slot_folds(args: &[Value], folded: &dyn Fn(&Piece) -> Option<FoldPiece>) -> Vec<SlotFold> {
+    let pieces_of = |pieces: &[Piece]| -> Option<Vec<FoldPiece>> {
+        let mut out = Vec::new();
+        let mut any = false;
+        for piece in pieces {
+            match (folded(piece), piece) {
+                (Some(fold), _) => {
+                    any = true;
+                    out.push(fold);
+                }
+                (None, Piece::Lit(text)) => out.push(FoldPiece::Lit(text.clone())),
+                (None, _) => return None,
+            }
+        }
+        any.then_some(out)
+    };
+    let mut out = Vec::new();
+    for (arg, value) in args.iter().enumerate() {
+        match value {
+            Value::Str(pieces) => {
+                if let Some(pieces) = pieces_of(pieces) {
+                    out.push(SlotFold {
+                        arg,
+                        key: None,
+                        pieces,
+                    });
+                }
+            }
+            Value::Obj(object) => {
+                for (key, value) in &object.fields {
+                    if let Value::Str(pieces) = value
+                        && let Some(pieces) = pieces_of(pieces)
+                    {
+                        out.push(SlotFold {
+                            arg,
+                            key: Some(key.clone()),
+                            pieces,
+                        });
+                    }
+                }
+            }
+            Value::Callback(_) => {}
+        }
+    }
+    out
 }
 
 impl FileIr {
+    /// Calls `visit` with each call the file's bodies make.
+    fn visit_calls(&mut self, visit: &mut dyn FnMut(&mut CallIr)) {
+        for ir in self.functions.values_mut() {
+            ir.visit_calls(visit);
+        }
+        self.module_level.visit_calls(visit);
+    }
+
     /// Calls `visit` with each list of pieces the file keeps, with the file
     /// they were read in.
     fn visit_pieces(&mut self, path: &Path, visit: &mut dyn FnMut(&Path, &mut Vec<Piece>)) {

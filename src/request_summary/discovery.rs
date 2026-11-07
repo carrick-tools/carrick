@@ -4504,7 +4504,7 @@ export function listen(): void {
                 };
                 let mut line = format!("{}:{} <- {what}", site.file, site.line);
                 if edges {
-                    line = format!("{line} via {}", composed.edges.join(" > "));
+                    line = format!("{line} via {}", composed.edges().join(" > "));
                 }
                 out.push(line);
             }
@@ -5491,7 +5491,9 @@ export function listen(): void {
             "src/items.ts:3 <- /root/root/items (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /root > src/nullish.ts:7 register -",
             "src/items.ts:3 <- ? (entry_point) via src/spread-sets.ts:5 register ? > src/spread-sets.ts:7 register -",
             "src/items.ts:3 <- ? (entry_point) via src/spread-value.ts:5 register ? > src/spread-value.ts:7 register -",
-            "src/items.ts:3 <- ? (entry_point) via src/unread.ts:5 register ? > src/unread.ts:7 register -",
+            // The unread prefix renders as its address part's unknown piece,
+            // as written (address chain S1).
+            "src/items.ts:3 <- ? (entry_point) via src/unread.ts:5 register ?opts.prefix > src/unread.ts:7 register -",
             "src/nullish.ts:8 <- /root/root/health (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /root",
             "src/orders.ts:3 <- /b/orders (entry_point) via src/two-scopes.ts:12 register /b > src/two-scopes.ts:14 register -",
             "src/orders.ts:3 <- /orders (entry_point) via src/no-options.ts:5 register - > src/no-options.ts:6 register -",

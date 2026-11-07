@@ -288,6 +288,7 @@ pub fn apply_declared_operations(
                         value: operation.value.clone(),
                     }),
                     handler_span: None,
+                    address: None,
                 });
                 written += 1;
             }
@@ -799,6 +800,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             handler_span: None,
+            address: None,
         });
 
         apply_declared_operations(
@@ -847,6 +849,7 @@ mod tests {
                 value: value.to_string(),
             }),
             handler_span: None,
+            address: None,
         };
         // Inference found two of the three, and misread one of them.
         graph.endpoints.push(inferred("search-by-intent"));
