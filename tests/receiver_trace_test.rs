@@ -1763,3 +1763,56 @@ fn a_route_path_over_another_packages_constant_stores_where_it_is_declared() {
     );
     assert_eq!(address["reading"], "whole", "{row}: {address}");
 }
+
+/// Address chain S1 over carrick#3484's fold: a route path folded only by
+/// the name fold (a `let` assigned once, an enum member, a constant
+/// object's entry) still states its
+/// pieces. The compiler gives the enum member a declaration, so that piece is
+/// `folded` from the file declaring it; the `let` has none, so its text is
+/// `lit`. Each row's path reads the same text as before the address existed.
+#[test]
+fn a_route_path_folded_by_the_name_fold_states_its_pieces() {
+    let on = scan_fixture("address-chain-folded");
+    let addresses = endpoint_addresses(&on);
+    let own_values = |row: &str| {
+        let address = addresses
+            .get(row)
+            .unwrap_or_else(|| panic!("{row}: {addresses:#?}"));
+        let own = address["parts"]
+            .as_array()
+            .and_then(|parts| parts.last())
+            .unwrap_or_else(|| panic!("{row}: {address}"));
+        assert_eq!(own["kind"], "own", "{row}: {address}");
+        own["value"]["values"].clone()
+    };
+    assert_eq!(
+        own_values("src/server.ts:17 GET /api/items"),
+        serde_json::json!([[
+            { "piece": "lit", "text": "/api" },
+            { "piece": "lit", "text": "/items" },
+        ]]),
+        "{addresses:#?}"
+    );
+    assert_eq!(
+        own_values("src/server.ts:18 GET /items"),
+        serde_json::json!([[
+            { "piece": "folded", "text": "/items", "from": "src/server.ts" },
+        ]]),
+        "{addresses:#?}"
+    );
+    // An entry of a constant object, by name and by a computed key.
+    assert_eq!(
+        own_values("src/server.ts:20 GET /things"),
+        serde_json::json!([[
+            { "piece": "folded", "text": "/things", "from": "src/server.ts" },
+        ]]),
+        "{addresses:#?}"
+    );
+    assert_eq!(
+        own_values("src/server.ts:21 GET /other"),
+        serde_json::json!([[
+            { "piece": "folded", "text": "/other", "from": "src/server.ts" },
+        ]]),
+        "{addresses:#?}"
+    );
+}

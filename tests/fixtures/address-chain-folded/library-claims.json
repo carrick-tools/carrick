@@ -1,0 +1,55 @@
+{
+  "library_claims": [
+    {
+      "package": "fixture-chain-server",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-chain-server",
+          "export": "server",
+          "role": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [
+            {
+              "member": "mount",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "mounts": {
+                "arg": 1
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "get",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "GET",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

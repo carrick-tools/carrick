@@ -1,0 +1,8 @@
+{
+  "name": "address-chain-folded",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-chain-server": "^1.0.0"
+  }
+}
