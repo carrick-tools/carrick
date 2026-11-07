@@ -221,9 +221,10 @@ pub struct NotTypeChecked {
     pub path: String,
     /// The verdict's own detail, or that there was none.
     pub reason: String,
-    /// A call row read from a request the code builds and returns
-    /// (carrick#3470). Its matched method and path are a check, so it never
-    /// makes the run read as "nothing type-checked".
+    /// A pair whose call rows are all read from a request the code builds
+    /// and returns (carrick#3470): the call itself, or every caller of the
+    /// route (carrick#3532). Its matched method and path are a check, so it
+    /// never makes the run read as "nothing type-checked".
     #[serde(skip)]
     pub descriptor: bool,
 }
@@ -1020,7 +1021,10 @@ pub(super) fn judge(
                     .verdict
                     .as_ref()
                     .map_or_else(|| "no verdict".to_string(), |v| one_line(&v.detail)),
-                descriptor: built_request(operation),
+                descriptor: match operation.role {
+                    Role::Consumer => built_request(operation),
+                    Role::Producer => only_built_requests(&item.counterparts, join),
+                },
             });
             continue;
         }
@@ -1745,6 +1749,29 @@ fn built_request(operation: &JoinedOperation) -> bool {
     operation.role == Role::Consumer
         && operation.resolution_source
             == Some(crate::agents::file_analyzer_agent::ResolutionSource::RequestDescriptor)
+}
+
+/// Every call row a route pairs with is a built request (carrick#3532): its
+/// matched method and path are the check such a pair can have, as for the
+/// call side. A counterpart with no call row of its own, or sharing its line
+/// with a call that is not built, keeps the pair counted as unjudged.
+fn only_built_requests(
+    counterparts: &[super::read_model::Counterpart],
+    join: &super::LocalJoin,
+) -> bool {
+    counterparts.iter().all(|counterpart| {
+        let mut calls = join
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation.role == Role::Consumer
+                    && operation.service == counterpart.service
+                    && operation.file == counterpart.file
+                    && operation.line == counterpart.line
+            })
+            .peekable();
+        calls.peek().is_some() && calls.all(built_request)
+    })
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {

@@ -385,3 +385,90 @@ fn check_changed_on_a_branch_adding_builders_fails_on_none() {
         "the unmatched candidate is listed and does not fail:\n{listed}"
     );
 }
+
+/// The fixture's route whose only matched callers are built requests.
+const LOOKUP_ROUTE: &str = "orders-api/app/routes/api.v2.orders.$orderId.ts";
+
+/// `check --changed` on `repo` after a branch that commits `edits`, run once
+/// the workspace is refreshed on main.
+fn check_changed_after(dir: &Path, edits: &[(&str, &str)]) -> std::process::Output {
+    let repo = dir.join("repo");
+    git(&repo, &["checkout", "-q", "-b", "edit-route"]);
+    for (file, text) in edits {
+        std::fs::write(repo.join(file), text).unwrap();
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "edit route"]);
+    local(&repo, &["check", "--changed"])
+}
+
+/// `check --changed` on a branch that edits only a route whose matched
+/// callers are all built requests exits 0 (carrick#3532): a matched method
+/// and path is the check such a pair can have, whichever side changed.
+#[test]
+fn check_changed_on_a_route_whose_callers_are_built_requests_exits_0() {
+    let (dir, _) = workspace(None);
+    assert!(
+        local(dir.path(), &["refresh", "--workspace", "."])
+            .status
+            .success()
+    );
+    let edited = "// GET /api/v2/orders/:orderId, now with its currency.\n\n\
+export type Order = {\n  id: string;\n  total: number;\n  currency: string;\n};\n\n\
+export async function loader({ params }: { params: { orderId: string } }): Promise<Order> {\n  \
+return { id: String(params.orderId), total: 0, currency: \"EUR\" };\n}\n";
+    let checked = check_changed_after(dir.path(), &[(LOOKUP_ROUTE, edited)]);
+    let text = String::from_utf8_lossy(&checked.stdout).into_owned();
+    assert_eq!(checked.status.code(), Some(0), "{text}");
+}
+
+/// A route whose matched caller is a call the code sends, with no verdict
+/// the type check could reach, still makes the run exit 2: only built
+/// requests stand in for a type check.
+#[test]
+fn check_changed_on_a_route_with_an_unjudged_sent_call_still_exits_2() {
+    const INVOICE_ROUTE: &str = "orders-api/app/routes/api.v2.invoices.$invoiceId.ts";
+    let route = |marker: &str| {
+        format!(
+            "// GET /api/v2/invoices/:invoiceId{marker}\n\n\
+export async function loader({{ params }}: {{ params: {{ invoiceId: string }} }}): Promise<any> {{\n  \
+return {{ id: String(params.invoiceId) }};\n}}\n"
+        )
+    };
+    let (dir, _) = workspace(None);
+    let repo = dir.path().join("repo");
+    std::fs::write(repo.join(INVOICE_ROUTE), route("")).unwrap();
+    // A call the code sends, through a wrapper the local check reads with
+    // no model: a fact row, matched to the route above, never judged.
+    std::fs::write(
+        repo.join("ops-console/src/send.ts"),
+        "export async function send<T>(url: string, options: { method: string }): Promise<T> {\n  \
+const response = await fetch(url, options);\n  return (await response.json()) as T;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("ops-console/src/invoice-reader.ts"),
+        "import { send } from \"./send.js\";\n\n\
+export type Invoice = { id: string };\n\n\
+export class InvoiceReader {\n  constructor(private readonly baseUrl: string) {}\n\n  \
+readInvoice(invoiceId: string): Promise<Invoice> {\n    \
+return send<Invoice>(`${this.baseUrl}/api/v2/invoices/${invoiceId}`, { method: \"GET\" });\n  }\n}\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "invoice route and reader"]);
+    assert!(
+        local(dir.path(), &["refresh", "--workspace", "."])
+            .status
+            .success()
+    );
+    let checked = check_changed_after(dir.path(), &[(INVOICE_ROUTE, &route(", edited."))]);
+    let text = String::from_utf8_lossy(&checked.stdout).into_owned();
+    assert!(
+        text.contains("checked 1 route and 0 calls")
+            && text.contains("1 not type-checked")
+            && !text.contains("built request"),
+        "the route's one pair is unjudged and its call is no built request:\n{text}"
+    );
+    assert_eq!(checked.status.code(), Some(2), "{text}");
+}
