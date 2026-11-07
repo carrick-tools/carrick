@@ -5,7 +5,8 @@
  * function, so they type the service under the same options.
  *
  * The service root is searched first, for the names a service keeps its own
- * config under. Above it, the search is `tsc`'s own when it is run with no
+ * config under (`jsconfig.json` last: tsserver types a JavaScript file under
+ * the jsconfig beside it, carrick#3497). Above it, the search is `tsc`'s own when it is run with no
  * `-p`: the nearest `tsconfig.json` in an ancestor directory. A layout that
  * keeps one config above several services (their module resolution, `paths`,
  * `lib`) is typed under that config, as the repo's own `tsc` types it; without
@@ -20,7 +21,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 /** The names a service root is searched for, in order. */
-const SERVICE_ROOT_NAMES = ['tsconfig.json', 'tsconfig.build.json', 'tsconfig.app.json'];
+const SERVICE_ROOT_NAMES = ['tsconfig.json', 'tsconfig.build.json', 'tsconfig.app.json', 'jsconfig.json'];
 
 /** The name an ancestor directory is searched for, as `tsc` searches. */
 const ANCESTOR_NAME = 'tsconfig.json';
