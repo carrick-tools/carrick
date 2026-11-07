@@ -5123,6 +5123,41 @@ export function listen(): void {
         Some(composed_lines(&decided, true))
     }
 
+    /// carrick#3489 W1: a class field that every write in its class sets to
+    /// one maker's instance (an initialiser, or the constructor) is that
+    /// instance: the site's end is the maker, and so is the end of a
+    /// sub-router handed to a mount by the field (`this.router`). A field
+    /// written twice, with two makers' arguments, or by a class that lets
+    /// `this` escape, is read for no instance, so its end is unread; a field
+    /// the constructor takes as a parameter is still that parameter's, and an
+    /// app a package builds itself is still outside this service.
+    #[test]
+    fn a_field_a_maker_initialises_or_the_constructor_writes_is_that_instance() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-routes")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = instance_ends(&decided);
+        assert_eq!(
+            got,
+            texts(&[
+                "src/ri-class-field.ts:2 <- src/ri-class-field.ts:2 root src/ri-class-field.ts:2",
+                "src/ri-param-property.ts:3 <- src/ri-param-property.ts:4 root src/ri-param-property.ts:4",
+                "src/s-ctor-assign.ts:2 <- src/s-ctor-assign.ts:2 root src/s-ctor-assign.ts:2",
+                "src/s-escape.ts:3 <- src/s-escape.ts:3 unread",
+                "src/s-mount.ts:6 <- src/s-mount.ts:6 root src/s-mount.ts:4",
+                "src/s-shared.ts:2 <- src/s-shared.ts:2 outside_service",
+                "src/s-twice.ts:2 <- src/s-twice.ts:2 unread",
+            ]),
+            "{got:#?}"
+        );
+    }
+
     /// carrick#3185: a package publishes its factory as the module, as a
     /// named export and as `default`, and the store labels the same route
     /// ops under both names but the `register` scope under the named one

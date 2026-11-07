@@ -1,0 +1,8 @@
+{
+  "name": "receiver-forms-routes",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "fixture-server": "^1.0.0"
+  }
+}

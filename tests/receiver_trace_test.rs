@@ -449,6 +449,62 @@ fn routes_on_a_returned_scope_take_their_paths() {
     assert_eq!(flat, flat_of_graph);
 }
 
+/// carrick#3489 W1: a route registered on a class field that every write in
+/// its class sets to one maker's instance is a mount-graph row at its full
+/// path, `library_claim`, with no model row and no unread lead at its line;
+/// a sub-router held in such a field and mounted under a prefix takes it.
+/// A field written twice, or by a class that lets `this` escape, stays read
+/// for no instance, as it was.
+#[test]
+fn routes_on_a_maker_field_take_their_full_paths() {
+    let on = scan_fixture("receiver-forms-routes");
+    let (graph, flat) = endpoint_rows(&on);
+    let at = |site: &str| -> Vec<&String> {
+        graph
+            .iter()
+            .filter(|row| row.starts_with(&format!("{site} ")))
+            .collect()
+    };
+    for (site, want) in [
+        (
+            "src/ri-class-field.ts:2",
+            "src/ri-class-field.ts:2 GET /p/ri-class-field library_claim",
+        ),
+        (
+            "src/s-ctor-assign.ts:2",
+            "src/s-ctor-assign.ts:2 GET /p/s-ctor-assign library_claim",
+        ),
+        (
+            "src/s-mount.ts:6",
+            "src/s-mount.ts:6 GET /api/p/s-mount library_claim",
+        ),
+    ] {
+        let rows = at(site);
+        assert_eq!(rows.len(), 1, "{site}: {graph:#?}");
+        assert!(rows[0].starts_with(want), "{site}: {graph:#?}");
+        assert!(
+            flat.iter().any(|row| row.starts_with(want)),
+            "{site}: {flat:#?}"
+        );
+    }
+    let unread = unread_reasons(&on);
+    for site in [
+        "src/ri-class-field.ts:2",
+        "src/s-ctor-assign.ts:2",
+        "src/s-mount.ts:6",
+    ] {
+        assert!(!unread.contains_key(site), "{site}: {unread:#?}");
+    }
+    // Nothing a field several makers write, or a class that lets `this`
+    // leave, is placed at a path.
+    for site in ["src/s-twice.ts:2", "src/s-escape.ts:3"] {
+        assert!(
+            at(site).iter().all(|row| !row.contains("library_claim")),
+            "{site}: {graph:#?}"
+        );
+    }
+}
+
 /// Why each possible call's path is unread, as `file:line` to reason. A call
 /// whose path is read and whose owner is not is `owner_unknown`.
 fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {
