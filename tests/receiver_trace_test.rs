@@ -1380,3 +1380,83 @@ fn a_helper_only_tests_import_does_not_unverify_its_router() {
     );
     assert_eq!(possible_calls(&on), vec!["src/jobs.ts:8 get"]);
 }
+
+/// Every HTTP call row of the blobs, as `file:line path source`.
+fn call_rows(blobs: &Blobs) -> Vec<String> {
+    let mut out = Vec::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for row in blob["calls"].as_array().cloned().unwrap_or_default() {
+            if row["key"]["protocol"] != "http" {
+                continue;
+            }
+            out.push(format!(
+                "{} {} {}",
+                row["file_path"].as_str().unwrap_or_default(),
+                row["key"]["path"].as_str().unwrap_or_default(),
+                row["resolution_source"].as_str().unwrap_or_default(),
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// carrick#3488: a client made with a base URL and handed to the call
+/// through a parameter or a constructor parameter property goes to that
+/// base, as one the library-site reader holds does: the instance walk ends
+/// at the maker call, and the base is read there. A class nothing in the
+/// service constructs keeps its host-free path (no root). A helper handed
+/// two clients with different bases states neither: no row.
+#[test]
+fn client_bases_follow_the_instance_walk() {
+    let on = scan_fixture("receiver-forms-client-base");
+    let rows = call_rows(&on);
+    let at = |file: &str| -> Vec<&str> {
+        rows.iter()
+            .filter(|row| row.starts_with(&format!("src/{file}:")))
+            .map(String::as_str)
+            .collect()
+    };
+    assert_eq!(
+        at("m-param.ts"),
+        vec!["src/m-param.ts:2 https://m.test/p/m-param request_summary"],
+        "{rows:#?}"
+    );
+    assert_eq!(
+        at("m-param-property.ts"),
+        vec!["src/m-param-property.ts:2 https://m.test/p/m-param-property request_summary"],
+        "{rows:#?}"
+    );
+    assert_eq!(
+        at("m-param-property-di.ts"),
+        vec!["src/m-param-property-di.ts:2 /p/m-param-property-di request_summary"],
+        "{rows:#?}"
+    );
+    assert_eq!(at("m-two-bases.ts"), Vec::<&str>::new(), "{rows:#?}");
+    // Sites the reader holds keep their rows.
+    for (file, path) in [
+        (
+            "m-binding.ts",
+            "src/m-binding.ts:3 https://m.test/p/m-binding",
+        ),
+        (
+            "m-call-result.ts",
+            "src/m-call-result.ts:3 https://m.test/p/m-call-result",
+        ),
+        (
+            "m-field-init.ts",
+            "src/m-field-init.ts:2 https://m.test/p/m-field-init",
+        ),
+        (
+            "m-ctor-assign.ts",
+            "src/m-ctor-assign.ts:2 https://m.test/p/m-ctor-assign",
+        ),
+    ] {
+        assert_eq!(
+            at(file),
+            vec![format!("{path} request_summary").as_str()],
+            "{rows:#?}"
+        );
+    }
+}
