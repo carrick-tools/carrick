@@ -40,19 +40,35 @@ const HTTP: &str = "http";
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct Producer {
     pub service: String,
-    /// `http`, `graphql`, `socket` or `pubsub`.
+    /// `http`, `graphql`, `socket` or `pubsub`: the blob's `OperationKey`
+    /// tag. Socket rows are `socket`, not `Protocol::Websocket`'s
+    /// `websocket`. Any other label falls through to the exact-key arm and
+    /// answers `no_route` for every call, with no error. A missing
+    /// `protocol` (or `service`) reads as `""` and does the same.
     pub protocol: String,
     /// HTTP only. [`ANY_METHOD`] serves every method.
     pub method: Option<String>,
     /// HTTP only: the route's full path as stored.
     pub path: Option<String>,
-    /// Non-HTTP: the operation key's name as the index carries it.
+    /// Non-HTTP: the operation key's name as the index carries it. GraphQL
+    /// is `<kind>|<field>` with the kind as the blob serialises it
+    /// (`query|orders`; the cloud's operation id is `graphql|<kind>|<field>`).
+    /// Passing the field alone pairs a query with a mutation of the same
+    /// field name. Socket is the event name, pub/sub the topic.
     pub name: Option<String>,
-    /// Socket only.
+    /// Socket only: the blob's serde form, `client_to_server` or
+    /// `server_to_client`, not the display label (`CLIENT->SERVER`).
     pub direction: Option<String>,
     /// HTTP only: the [`crate::dispatch_key`] of the case this producer
-    /// answers, when its handler dispatches on a request field.
+    /// answers, when its handler dispatches on a request field. The blob's
+    /// `{location, field, value}` dispatch object is rejected (the call
+    /// throws); pass the string `dispatch_key` builds from it.
     pub dispatch: Option<String>,
+    /// `route_definition` (the default) or `call_site`. The blob carries
+    /// `call_site_evidence: true`, not an `evidence` string: map it to
+    /// `evidence: "call_site"`. Spreading a blob row into a `Producer`
+    /// drops it without an error, and the caller's own twin then pairs as a
+    /// route definition. An unknown string throws.
     pub evidence: MatchEvidence,
     pub name_scope: Option<NameScope>,
 }
@@ -64,14 +80,18 @@ pub struct Producer {
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct Call {
     pub service: String,
+    /// Same labels as [`Producer::protocol`].
     pub protocol: String,
     pub method: Option<String>,
     /// HTTP only: the call's canonical path.
     pub path: Option<String>,
+    /// Same forms as [`Producer::name`] (GraphQL `<kind>|<field>`).
     pub name: Option<String>,
+    /// Same serde form as [`Producer::direction`].
     pub direction: Option<String>,
     /// HTTP only: the dispatch value the call states, as a
-    /// [`crate::dispatch_key`].
+    /// [`crate::dispatch_key`]. The blob's dispatch object is rejected, as
+    /// on [`Producer::dispatch`].
     pub dispatch: Option<String>,
     pub name_scope: Option<NameScope>,
 }
@@ -385,7 +405,9 @@ fn call_param_over_route_literal(route_path: &str, call_path: &str) -> bool {
 /// The form a writer stores a path in: one leading `/`, no empty segment
 /// (`//` collapsed), no trailing `/` except the root, and `/` for an empty
 /// path. Case and `?` optional markers are kept. Pairing never applies it:
-/// it compares stored keys as written.
+/// it compares stored keys as written. This is only the slash steps; it is
+/// not the blob's `DataFetchingCall.canonical_path`, which is the scanner's
+/// whole consumer key.
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn canonical_path(path: &str) -> String {
     let segments: Vec<&str> = path.split('/').filter(|seg| !seg.is_empty()).collect();
