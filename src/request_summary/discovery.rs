@@ -5238,7 +5238,7 @@ export function listen(): void {
             &declarations.verified_scopes,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
-        let got = instance_ends(&decided);
+        let got = without_files(instance_ends(&decided), MODULE_ALIAS_FILES);
         assert_eq!(
             got,
             texts(&[
@@ -5249,6 +5249,54 @@ export function listen(): void {
                 "src/s-mount.ts:6 <- src/s-mount.ts:6 root src/s-mount.ts:4",
                 "src/s-shared.ts:2 <- src/s-shared.ts:2 outside_service",
                 "src/s-twice.ts:2 <- src/s-twice.ts:2 unread",
+            ]),
+            "{got:#?}"
+        );
+    }
+
+    /// The `receiver-forms-routes` files carrick#3489 W2 reads.
+    const MODULE_ALIAS_FILES: &[&str] = &[
+        "src/ri-const-alias.ts:",
+        "src/s-destructured.ts:",
+        "src/s-local-alias.ts:",
+    ];
+
+    /// `ends` without the lines of the files named by `prefixes`.
+    fn without_files(ends: Vec<String>, prefixes: &[&str]) -> Vec<String> {
+        ends.into_iter()
+            .filter(|end| !prefixes.iter().any(|prefix| end.starts_with(prefix)))
+            .collect()
+    }
+
+    /// `ends` for the files named by `prefixes` alone.
+    fn only_files(ends: Vec<String>, prefixes: &[&str]) -> Vec<String> {
+        ends.into_iter()
+            .filter(|end| prefixes.iter().any(|prefix| end.starts_with(prefix)))
+            .collect()
+    }
+
+    /// carrick#3489 W2: a module-scope `const` that names another module
+    /// binding holds what it holds, and so does a key of a module object
+    /// literal destructured into a `const`: the site's end is the maker.
+    /// An alias declared inside a function is not read by this rule.
+    #[test]
+    fn a_module_alias_or_destructured_key_holds_its_source_instance() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-routes")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = only_files(instance_ends(&decided), MODULE_ALIAS_FILES);
+        assert_eq!(
+            got,
+            texts(&[
+                "src/ri-const-alias.ts:4 <- src/ri-const-alias.ts:4 root src/ri-const-alias.ts:2",
+                "src/s-destructured.ts:4 <- src/s-destructured.ts:4 root src/s-destructured.ts:2",
+                "src/s-local-alias.ts:3 <- src/s-local-alias.ts:3 unread",
             ]),
             "{got:#?}"
         );
