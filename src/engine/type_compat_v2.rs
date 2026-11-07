@@ -1646,6 +1646,33 @@ struct ServiceEntry<'a> {
     service_id: &'a str,
     has_surface: bool,
     entry: &'a TypeManifestEntry,
+    /// Where the entry's name means something, read off the repo's operation
+    /// row at the entry's site (carrick#3520). `None`: the site states none.
+    name_scope: Option<carrick_match::NameScope>,
+}
+
+/// The name scope each of a repo's non-HTTP operation rows states, by
+/// `(role, canonical key, file, line)`: the site identity a manifest entry
+/// carries. The scanner's edge writer reads the same field off the same rows
+/// ([`crate::analyzer::ApiEndpointDetails::name_scope`]), so the pool built
+/// from these entries pairs as the edges do.
+fn name_scopes_by_site(
+    repo: &CloudRepoData,
+) -> HashMap<(ManifestRole, String, String, u32), carrick_match::NameScope> {
+    let rows = |rows: &[crate::analyzer::ApiEndpointDetails], role: ManifestRole| {
+        rows.iter()
+            .filter_map(|row| {
+                let scope = row.name_scope.clone()?;
+                let (file, line) =
+                    crate::type_manifest::parse_file_location(&row.file_path.display().to_string());
+                Some(((role, row.key.canonical(), file, line), scope))
+            })
+            .collect::<Vec<_>>()
+    };
+    rows(&repo.endpoints, ManifestRole::Producer)
+        .into_iter()
+        .chain(rows(&repo.calls, ManifestRole::Consumer))
+        .collect()
 }
 
 /// The sentence a call to a route that dispatches on a request field reads
@@ -1745,11 +1772,20 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
             continue;
         };
         let call_cases = cases_by_site(&repo.calls);
+        let scopes = name_scopes_by_site(repo);
         for entry in entries {
             let side = ServiceEntry {
                 service_id,
                 has_surface,
                 entry,
+                name_scope: scopes
+                    .get(&(
+                        entry.role,
+                        entry.key.canonical(),
+                        entry.file_path.clone(),
+                        entry.line_number,
+                    ))
+                    .cloned(),
             };
             match entry.role {
                 ManifestRole::Producer => producers.push(side),
@@ -1802,6 +1838,7 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                     protocol,
                     name,
                     direction,
+                    name_scope: producer.name_scope.clone(),
                     ..Default::default()
                 });
                 exact_entries.push(producer);
@@ -1842,6 +1879,7 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                 protocol,
                 name,
                 direction,
+                name_scope: consumer.name_scope.clone(),
                 ..Default::default()
             });
             pairs.extend(
@@ -9335,6 +9373,111 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
         assert_eq!(pairs[0].producer_service, "billing");
         assert_eq!(pairs[0].consumer_service, "orders-engine");
+    }
+
+    /// An operation row at a manifest entry's site, stating `scope`.
+    fn scoped_row(
+        key: OperationKey,
+        file: &str,
+        line: u32,
+        scope: Option<&str>,
+    ) -> crate::analyzer::ApiEndpointDetails {
+        crate::analyzer::ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key,
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(format!("{file}:{line}")),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: None,
+            schema_binding: None,
+            undeclared_selection: None,
+            handler_span: None,
+            name_scope: scope.map(|scope| carrick_match::NameScope {
+                scope: scope.to_string(),
+                namespace: None,
+            }),
+            library_semantics: Vec::new(),
+            inference: None,
+        }
+    }
+
+    /// A producer in one service and a consumer in another, both on `key`,
+    /// each stating `scope` on its operation row.
+    fn two_service_repos(key: OperationKey, scope: Option<&str>) -> [CloudRepoData; 2] {
+        let mut producer = repo(
+            "worker",
+            Some("billing"),
+            vec![entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P",
+                "src/subscriber.ts",
+                4,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+        producer
+            .endpoints
+            .push(scoped_row(key.clone(), "src/subscriber.ts", 4, scope));
+        let mut consumer = repo(
+            "orders",
+            Some("orders-engine"),
+            vec![entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C",
+                "src/publisher.ts",
+                21,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+        consumer
+            .calls
+            .push(scoped_row(key, "src/publisher.ts", 21, scope));
+        [producer, consumer]
+    }
+
+    /// A name scoped to its own service pairs inside that service only, as the
+    /// scanner's edges pair it (carrick#3520): the type check builds no pair
+    /// across two services for a socket event or a topic. A global name, and a
+    /// row that states no scope, still pair.
+    #[test]
+    fn build_pairs_service_scoped_names_do_not_cross_services() {
+        let keys = [
+            OperationKey::socket(
+                "order:placed",
+                crate::operation::SocketDirection::ClientToServer,
+            ),
+            OperationKey::pubsub("order.placed"),
+        ];
+        for key in keys {
+            let scoped = two_service_repos(key.clone(), Some("service"));
+            assert!(
+                build_check_pairs(&scoped).is_empty(),
+                "{key:?} pairs across services though its name is service-scoped"
+            );
+            for control in [Some("global"), None] {
+                let repos = two_service_repos(key.clone(), control);
+                assert_eq!(
+                    build_check_pairs(&repos).len(),
+                    1,
+                    "{key:?} with scope {control:?} must still pair"
+                );
+            }
+        }
     }
 
     /// A missing capture surface — and ONLY a missing surface — pre-verdicts
