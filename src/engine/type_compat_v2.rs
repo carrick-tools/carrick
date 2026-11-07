@@ -4139,6 +4139,101 @@ mod tests {
         }
     }
 
+    /// One route of a mount graph, as a scan states it at `site`
+    /// (`file:line`).
+    fn route_at(
+        method: &str,
+        full_path: &str,
+        site: &str,
+        dispatch: Option<crate::dispatch::Dispatch>,
+    ) -> crate::mount_graph::ResolvedEndpoint {
+        crate::mount_graph::ResolvedEndpoint {
+            view_module: false,
+            method: method.to_string(),
+            path: full_path.to_string(),
+            full_path: full_path.to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: site.to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
+            dispatch,
+            handler_span: None,
+            address: None,
+        }
+    }
+
+    /// The fixtures in this module state a manifest and, mostly, no mount
+    /// graph. A scan builds every HTTP producer entry from a mount-graph
+    /// route at the entry's site (`build_type_manifest_entries`), one route
+    /// per dispatch case its endpoint rows carry. This gives each repo that
+    /// states no graph the one its manifest was built from, so the check
+    /// pairs over the routes as a scan states them (carrick#3496 R10). A
+    /// repo that states its own graph keeps it.
+    fn with_route_graphs(repos: &[CloudRepoData]) -> Vec<CloudRepoData> {
+        repos
+            .iter()
+            .cloned()
+            .map(|mut repo| {
+                if repo.mount_graph.is_some() {
+                    return repo;
+                }
+                let mut graph = crate::mount_graph::MountGraph::new();
+                let mut seen = HashSet::new();
+                for entry in repo.type_manifest.iter().flatten() {
+                    let Some((method, path)) = entry.key.as_http() else {
+                        continue;
+                    };
+                    if entry.role != ManifestRole::Producer {
+                        continue;
+                    }
+                    let site = format!("{}:{}", entry.file_path, entry.line_number);
+                    let mut cases: Vec<Option<crate::dispatch::Dispatch>> = repo
+                        .endpoints
+                        .iter()
+                        .filter(|row| {
+                            row.key.as_http() == Some((method, path))
+                                && row.file_path == PathBuf::from(&site)
+                        })
+                        .map(|row| row.dispatch.clone())
+                        .collect();
+                    if cases.is_empty() {
+                        cases.push(None);
+                    }
+                    for dispatch in cases {
+                        let key = crate::dispatch::Dispatch::key_of(dispatch.as_ref());
+                        if seen.insert((method.to_string(), path.to_string(), site.clone(), key)) {
+                            graph
+                                .endpoints
+                                .push(route_at(method, path, &site, dispatch));
+                        }
+                    }
+                }
+                repo.mount_graph = Some(graph);
+                repo
+            })
+            .collect()
+    }
+
+    /// [`super::build_check_pairs`] over [`with_route_graphs`].
+    fn build_check_pairs(repos: &[CloudRepoData]) -> Vec<BuiltPair> {
+        super::build_check_pairs(&with_route_graphs(repos))
+    }
+
+    /// [`super::run_check`] over [`with_route_graphs`].
+    fn run_check(
+        sidecar: &TypeSidecar,
+        repos: &[CloudRepoData],
+        local_consumers: &LocalConsumers,
+        settle: Option<&super::super::pair_settle::SettleFrom>,
+    ) -> Vec<PairCheckOutcome> {
+        super::run_check(sidecar, &with_route_graphs(repos), local_consumers, settle)
+    }
+
     /// A peer that last uploaded under an older artifact schema is not judged
     /// against its stored stub: its declaration text can name a path that
     /// exists only on the machine that captured it (carrick#1174, carrick#1204)
@@ -8382,6 +8477,213 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     }
 
     // ---- build_check_pairs ------------------------------------------------
+
+    /// The `(producer alias, identity)` of each pair a `web` call
+    /// `method path` builds against `api`'s routes, each route with a
+    /// producer entry at its own site.
+    fn http_pairs(routes: &[(&str, &str)], method: &str, path: &str) -> Vec<(String, String)> {
+        let producers = routes
+            .iter()
+            .enumerate()
+            .map(|(index, (route_method, route_path))| {
+                entry(
+                    OperationKey::http(*route_method, *route_path),
+                    ManifestRole::Producer,
+                    ManifestTypeKind::Response,
+                    &format!("P{index}"),
+                    "src/routes.ts",
+                    index as u32 + 1,
+                    ManifestTypeState::Explicit,
+                )
+            })
+            .collect();
+        let consumer = entry(
+            OperationKey::http(method, path),
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            "C",
+            "src/client.ts",
+            12,
+            ManifestTypeState::Explicit,
+        );
+        build_check_pairs(&[
+            repo("api", None, producers, Some(fake_artifact())),
+            repo("web", None, vec![consumer], Some(fake_artifact())),
+        ])
+        .into_iter()
+        .map(|pair| (pair.producer_alias, pair.identity))
+        .collect()
+    }
+
+    /// carrick#3496 slice 3: the check pairs a call with the route the
+    /// pairing pool says it reaches, so a route registered for every method
+    /// serves a `POST` call (cloud#962), and the verdict lands on the edge
+    /// the analyzer draws to it (`http|ALL|/graphql`).
+    #[test]
+    fn build_pairs_an_all_route_pairs_a_post_call_and_its_verdict_joins_the_edge() {
+        let pairs = build_check_pairs(&[
+            repo(
+                "api",
+                None,
+                vec![entry(
+                    OperationKey::http("ALL", "/graphql"),
+                    ManifestRole::Producer,
+                    ManifestTypeKind::Response,
+                    "P_graphql",
+                    "src/server.ts",
+                    4,
+                    ManifestTypeState::Explicit,
+                )],
+                Some(fake_artifact()),
+            ),
+            repo(
+                "web",
+                None,
+                vec![entry(
+                    OperationKey::http("POST", "/graphql"),
+                    ManifestRole::Consumer,
+                    ManifestTypeKind::Response,
+                    "C_graphql",
+                    "src/client.ts",
+                    12,
+                    ManifestTypeState::Explicit,
+                )],
+                Some(fake_artifact()),
+            ),
+        ]);
+        assert_eq!(pairs.len(), 1, "the ALL route serves the POST call");
+        assert_eq!(pairs[0].producer_alias, "P_graphql");
+        assert_eq!(pairs[0].pseudo_method, "ALL");
+
+        let outcome = outcome_for(
+            &pairs[0],
+            VerdictBucket::Compatible,
+            None,
+            None,
+            true,
+            None,
+            Vec::new(),
+        );
+        let key = OperationKey::http("ALL", "/graphql").canonical();
+        let mut edges = vec![crate::analyzer::CrossRepoMatch {
+            producer_repo: "api".to_string(),
+            producer_key: key.clone(),
+            consumer_repo: "web".to_string(),
+            consumer_key: key,
+            consumer_location: Some("src/client.ts:12".to_string()),
+            match_score: 1.0,
+            type_compatible: None,
+            type_verdict: None,
+            mismatch_reason: None,
+            producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
+        }];
+        crate::analyzer::apply_pair_outcomes(&[outcome], &mut edges);
+        assert_eq!(edges[0].type_compatible, Some(true));
+    }
+
+    /// Routes the pairing pool says a call reaches are paired: a prefixed
+    /// catch-all, an optional placeholder the call leaves out, and a
+    /// placeholder spelled `<id>` (carrick#3496 slice 3).
+    #[test]
+    fn build_pairs_pair_the_routes_the_pool_reaches() {
+        for (route, call) in [
+            ("/api/*", "/api/users/7"),
+            ("/users/:id?", "/users"),
+            ("/orders/<id>", "/orders/9"),
+        ] {
+            assert_eq!(
+                http_pairs(&[("GET", route)], "GET", call),
+                vec![("P0".to_string(), route.to_string())],
+                "{route} serves {call}"
+            );
+        }
+    }
+
+    /// Routes the pairing pool says a call does not reach, or reaches
+    /// without corroborating a literal, build no pair: a param-only route,
+    /// another case, a literal hole inside a segment, a trailing slash the
+    /// call does not write (carrick#3496 slice 3).
+    #[test]
+    fn build_pairs_skip_the_routes_the_pool_does_not_pair() {
+        for (route, call) in [
+            ("/:slug", "/about"),
+            ("/Users/Me", "/users/me"),
+            ("/v${n}/users", "/v2/users"),
+            ("/api/users/", "/api/users"),
+        ] {
+            assert_eq!(
+                http_pairs(&[("GET", route)], "GET", call),
+                Vec::<(String, String)>::new(),
+                "{route} is not paired with {call}"
+            );
+        }
+    }
+
+    /// The call's placeholder stands where the most literal route states a
+    /// literal (carrick#2004): that route wins the call, and is not
+    /// compared. The all-placeholder route it outranks is not compared
+    /// either: the call does not reach it.
+    #[test]
+    fn build_pairs_a_flagged_literal_route_outranks_an_all_param_route() {
+        assert_eq!(
+            http_pairs(&[("GET", "/a/b"), ("GET", "/:p/:q")], "GET", "/a/:x"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    /// R10 (carrick#3496): the check ranks the routes the analyzer ranks,
+    /// so a specific route with no producer entry wins the call over a
+    /// vaguer route that has one, and nothing is compared: the call never
+    /// reaches the vaguer route.
+    #[test]
+    fn build_pairs_rank_every_route_not_only_the_typed_ones() {
+        let mut api = repo(
+            "api",
+            None,
+            vec![entry(
+                OperationKey::http("GET", "/users/:id"),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P_param",
+                "src/routes.ts",
+                9,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph
+            .endpoints
+            .push(route_at("GET", "/users/me", "src/routes.ts:5", None));
+        graph
+            .endpoints
+            .push(route_at("GET", "/users/:id", "src/routes.ts:9", None));
+        api.mount_graph = Some(graph);
+        let web = repo(
+            "web",
+            None,
+            vec![entry(
+                OperationKey::http("GET", "/users/me"),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C_me",
+                "src/client.ts",
+                12,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+        let pairs = build_check_pairs(&[api, web]);
+        assert!(
+            pairs.is_empty(),
+            "{:?}",
+            pairs
+                .iter()
+                .map(|pair| &pair.producer_alias)
+                .collect::<Vec<_>>()
+        );
+    }
 
     /// HTTP keeps only the most specific producer for a consumer, and the
     /// consumer's own service is ranked with the rest (carrick#1945): a

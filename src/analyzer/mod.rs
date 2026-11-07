@@ -392,6 +392,34 @@ where
     }))
 }
 
+/// A GraphQL, socket or pub/sub key in the forms the pairing pool reads
+/// (carrick#3496): protocol label, name and direction, as
+/// [`carrick_match::Producer`] documents them. An HTTP key has no exact key
+/// and projects to `None`s; it pairs through the mount graph's pool.
+pub(crate) fn exact_key_fields(key: &OperationKey) -> (String, Option<String>, Option<String>) {
+    match key {
+        OperationKey::Http { .. } => ("http".to_string(), None, None),
+        OperationKey::Graphql { kind, field } => (
+            "graphql".to_string(),
+            Some(format!("{}|{}", kind.as_str(), field)),
+            None,
+        ),
+        OperationKey::Socket { event, direction } => (
+            "socket".to_string(),
+            Some(event.clone()),
+            Some(
+                match direction {
+                    crate::operation::SocketDirection::ClientToServer => "client_to_server",
+                    crate::operation::SocketDirection::ServerToClient => "server_to_client",
+                    crate::operation::SocketDirection::Unknown => "unknown",
+                }
+                .to_string(),
+            ),
+        ),
+        OperationKey::Pubsub { topic } => ("pubsub".to_string(), Some(topic.clone()), None),
+    }
+}
+
 impl ApiEndpointDetails {
     /// The service this row belongs to, `service_name ?? repo_name`, as the
     /// cross-repo merge stamps it and the cloud reads it. `None` outside
@@ -411,39 +439,11 @@ impl ApiEndpointDetails {
         }
     }
 
-    /// This GraphQL, socket or pub/sub row's key in the forms the pairing
-    /// pool reads (carrick#3496): protocol label, name and direction, as
-    /// [`carrick_match::Producer`] documents them. An HTTP key has no exact
-    /// key and projects to `None`s; it pairs through the mount graph's pool.
-    fn exact_key_fields(&self) -> (String, Option<String>, Option<String>) {
-        match &self.key {
-            OperationKey::Http { .. } => ("http".to_string(), None, None),
-            OperationKey::Graphql { kind, field } => (
-                "graphql".to_string(),
-                Some(format!("{}|{}", kind.as_str(), field)),
-                None,
-            ),
-            OperationKey::Socket { event, direction } => (
-                "socket".to_string(),
-                Some(event.clone()),
-                Some(
-                    match direction {
-                        crate::operation::SocketDirection::ClientToServer => "client_to_server",
-                        crate::operation::SocketDirection::ServerToClient => "server_to_client",
-                        crate::operation::SocketDirection::Unknown => "unknown",
-                    }
-                    .to_string(),
-                ),
-            ),
-            OperationKey::Pubsub { topic } => ("pubsub".to_string(), Some(topic.clone()), None),
-        }
-    }
-
     /// This producer row as a pairing-pool producer. An unattributed row
     /// reads as the empty service, so two of them are one service, as they
     /// are in a single-service run.
     fn exact_key_producer(&self) -> carrick_match::Producer {
-        let (protocol, name, direction) = self.exact_key_fields();
+        let (protocol, name, direction) = exact_key_fields(&self.key);
         carrick_match::Producer {
             service: self.service_id().unwrap_or_default().to_string(),
             protocol,
@@ -457,7 +457,7 @@ impl ApiEndpointDetails {
     /// This call row as a pairing-pool call, attributed as
     /// [`Self::exact_key_producer`] attributes a producer.
     fn exact_key_call(&self) -> carrick_match::Call {
-        let (protocol, name, direction) = self.exact_key_fields();
+        let (protocol, name, direction) = exact_key_fields(&self.key);
         carrick_match::Call {
             service: self.service_id().unwrap_or_default().to_string(),
             protocol,
