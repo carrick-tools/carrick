@@ -182,7 +182,7 @@ interface Result {
   receiver: string;
   verdict: 'verified' | 'failed' | 'unchecked';
   reason?: string;
-}
+  declarations?: Array<{ decl_file: string; decl_line: number }>;}
 interface Module {
   package: string;
   resolved_file?: string;
