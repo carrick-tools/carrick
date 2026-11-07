@@ -35,6 +35,38 @@ const MAX_EXTENDS_DEPTH: usize = 16;
 /// directory, as it does for the TypeScript language service.
 pub(crate) const TS_CONFIG_NAMES: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
 
+/// The names a service root is searched for, in order (carrick#3497). The
+/// type sidecar's `SERVICE_ROOT_NAMES` is the same list.
+const SERVICE_ROOT_NAMES: [&str; 4] = [
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "tsconfig.app.json",
+    "jsconfig.json",
+];
+
+/// The config that governs a service that names none (carrick#3497), as the
+/// type sidecar's `findServiceTsconfig` finds it: the first of
+/// [`SERVICE_ROOT_NAMES`] in the service directory, else the nearest
+/// `tsconfig.json` in a directory above it, up to the repo root inclusive.
+/// Both arguments and the answer are relative to `repo_root`; the repo root
+/// itself is the empty path.
+pub(crate) fn service_config(repo_root: &Path, service_dir: &Path) -> Option<PathBuf> {
+    if let Some(name) = SERVICE_ROOT_NAMES
+        .iter()
+        .find(|name| repo_root.join(service_dir).join(name).is_file())
+    {
+        return Some(service_dir.join(name));
+    }
+    let mut dir = service_dir;
+    while let Some(parent) = dir.parent() {
+        if repo_root.join(parent).join("tsconfig.json").is_file() {
+            return Some(parent.join("tsconfig.json"));
+        }
+        dir = parent;
+    }
+    None
+}
+
 /// A tsconfig `paths` map in declaration order: pattern -> its targets.
 pub(crate) type PathsMap = Vec<(String, Vec<String>)>;
 
