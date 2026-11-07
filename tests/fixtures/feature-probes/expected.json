@@ -397,7 +397,7 @@
  "ri-optional": {
   "feature": "optional-chaining on an instance",
   "source": "test262",
-  "status": "not_reached"
+  "status": "covered"
  },
  "ri-param-property": {
   "feature": "constructor parameter property holding an instance (TS)",
