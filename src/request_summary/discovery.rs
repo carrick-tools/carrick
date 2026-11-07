@@ -5238,7 +5238,10 @@ export function listen(): void {
             &declarations.verified_scopes,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
-        let got = without_files(instance_ends(&decided), MODULE_ALIAS_FILES);
+        let got = without_files(
+            without_files(instance_ends(&decided), MODULE_ALIAS_FILES),
+            GETTER_FILES,
+        );
         assert_eq!(
             got,
             texts(&[
@@ -5260,6 +5263,9 @@ export function listen(): void {
         "src/s-destructured.ts:",
         "src/s-local-alias.ts:",
     ];
+
+    /// The `receiver-forms-routes` files carrick#3489 W4 reads.
+    const GETTER_FILES: &[&str] = &["src/ri-getter.ts:", "src/s-getter-builds.ts:"];
 
     /// `ends` without the lines of the files named by `prefixes`.
     fn without_files(ends: Vec<String>, prefixes: &[&str]) -> Vec<String> {
@@ -5297,6 +5303,31 @@ export function listen(): void {
                 "src/ri-const-alias.ts:4 <- src/ri-const-alias.ts:4 root src/ri-const-alias.ts:2",
                 "src/s-destructured.ts:4 <- src/s-destructured.ts:4 root src/s-destructured.ts:2",
                 "src/s-local-alias.ts:3 <- src/s-local-alias.ts:3 unread",
+            ]),
+            "{got:#?}"
+        );
+    }
+
+    /// carrick#3489 W4: a class getter holds what it returns: a getter that
+    /// returns a module-scope instance ends at that instance's maker, and one
+    /// that builds the instance ends at the maker it calls.
+    #[test]
+    fn a_getter_holds_what_it_returns() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-routes")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = only_files(instance_ends(&decided), GETTER_FILES);
+        assert_eq!(
+            got,
+            texts(&[
+                "src/ri-getter.ts:3 <- src/ri-getter.ts:3 root src/ri-getter.ts:2",
+                "src/s-getter-builds.ts:2 <- src/s-getter-builds.ts:2 root src/s-getter-builds.ts:2",
             ]),
             "{got:#?}"
         );

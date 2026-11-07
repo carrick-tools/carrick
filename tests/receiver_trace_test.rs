@@ -548,6 +548,41 @@ fn routes_on_module_aliases_take_their_full_paths() {
     );
 }
 
+/// carrick#3489 W4: a route registered on `this.app` where `app` is a class
+/// getter is a mount-graph row at its full path, `library_claim`, with no
+/// unread lead at its line: the getter returns a module-scope instance, or
+/// builds one.
+#[test]
+fn a_getter_receiver_route_takes_its_full_path() {
+    let on = scan_fixture("receiver-forms-routes");
+    let (graph, flat) = endpoint_rows(&on);
+    for (site, want) in [
+        (
+            "src/ri-getter.ts:3",
+            "src/ri-getter.ts:3 GET /p/ri-getter library_claim",
+        ),
+        (
+            "src/s-getter-builds.ts:2",
+            "src/s-getter-builds.ts:2 GET /p/s-getter-builds library_claim",
+        ),
+    ] {
+        let rows: Vec<&String> = graph
+            .iter()
+            .filter(|row| row.starts_with(&format!("{site} ")))
+            .collect();
+        assert_eq!(rows.len(), 1, "{site}: {graph:#?}");
+        assert!(rows[0].starts_with(want), "{site}: {graph:#?}");
+        assert!(
+            flat.iter().any(|row| row.starts_with(want)),
+            "{site}: {flat:#?}"
+        );
+    }
+    let unread = unread_reasons(&on);
+    for site in ["src/ri-getter.ts:3", "src/s-getter-builds.ts:2"] {
+        assert!(!unread.contains_key(site), "{site}: {unread:#?}");
+    }
+}
+
 /// Why each possible call's path is unread, as `file:line` to reason. A call
 /// whose path is read and whose owner is not is `owner_unknown`.
 fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {
