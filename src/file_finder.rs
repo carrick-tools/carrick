@@ -1284,12 +1284,9 @@ pub fn walk_service_quietly(
         file.ignored &= !named_here.contains(&file.path);
     }
     let (files, ignored_files) = keep_what_is_imported(files, || {
-        let service_tsconfig = service.alias_tsconfig();
         crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
             root,
-            service_tsconfig
-                .as_ref()
-                .map(|(directory, tsconfig)| (directory.as_path(), tsconfig.as_path())),
+            service.alias_scope(root).as_ref(),
         )
     });
 

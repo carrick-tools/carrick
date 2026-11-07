@@ -35,7 +35,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::module_aliases::{
-    AliasTarget, ModuleAliases, TS_CONFIG_NAMES, collect_string_leaves, match_pattern,
+    AliasTarget, ModuleAliases, ServiceScope, TS_CONFIG_NAMES, collect_string_leaves, match_pattern,
 };
 use crate::packages::{MANIFEST_SKIP_DIRS, deno_workspace_manifest_paths, read_manifest};
 
@@ -258,21 +258,21 @@ impl WorkspaceIndex {
     }
 
     /// [`WorkspaceIndex::build`], plus the aliases the repo's config files
-    /// declare (carrick#1104). `service_tsconfig` is the service directory and
-    /// the `tsconfig` its `carrick.json` entry names, both relative to the
-    /// repo root; it governs every file under that directory in place of the
-    /// nearest config.
+    /// declare (carrick#1104). `scope` is the service the index is built for
+    /// ([`crate::config::Config::alias_scope`]): its files are read under the
+    /// config the one rule picks for them (carrick#3497), every other file
+    /// under the nearest config above it.
     ///
     /// Used by the surfaces that feed no analyzer input: the call graph's
     /// edges, the GraphQL named-resolver hop, and every type request the
     /// sidecar is sent (`engine::service_module_index`, carrick#1416). The
     /// analyzer-input path keeps [`WorkspaceIndex::build`] until carrick#474.
     /// See `docs/reference/module-resolution.md`.
-    pub fn build_with_aliases(repo_root: &Path, service_tsconfig: Option<(&Path, &Path)>) -> Self {
-        Self::build_inner(repo_root, Some(service_tsconfig))
+    pub fn build_with_aliases(repo_root: &Path, scope: Option<&ServiceScope>) -> Self {
+        Self::build_inner(repo_root, Some(scope))
     }
 
-    fn build_inner(repo_root: &Path, aliases: Option<Option<(&Path, &Path)>>) -> Self {
+    fn build_inner(repo_root: &Path, aliases: Option<Option<&ServiceScope>>) -> Self {
         let mut declared: BTreeSet<String> = BTreeSet::new();
         let mut dev_declared: BTreeSet<String> = BTreeSet::new();
         let mut internal_names: BTreeSet<String> = BTreeSet::new();
@@ -326,7 +326,7 @@ impl WorkspaceIndex {
             declared.remove(name);
         }
 
-        let aliases = aliases.map(|service_tsconfig| {
+        let aliases = aliases.map(|scope| {
             let configs: Vec<PathBuf> = tree
                 .iter()
                 .filter_map(|path| path.strip_prefix(repo_root).ok().map(Path::to_path_buf))
@@ -335,7 +335,7 @@ impl WorkspaceIndex {
                 .iter()
                 .map(|(name, package)| (name.clone(), package.dir.clone()))
                 .collect();
-            ModuleAliases::build(repo_root, &configs, &package_dirs, service_tsconfig)
+            ModuleAliases::build(repo_root, &configs, &package_dirs, scope)
         });
 
         WorkspaceIndex {
@@ -348,6 +348,13 @@ impl WorkspaceIndex {
             internal_packages,
             aliases,
         }
+    }
+
+    /// The config the service's rule reads `file` (repo-relative) under,
+    /// repo-relative (carrick#3497). `None` for a file outside the service,
+    /// an index built without a service, or a file no config governs.
+    pub fn governing_config(&self, file: &Path) -> Option<PathBuf> {
+        self.aliases.as_ref()?.governing_config(file)
     }
 
     /// `extends` values an alias-reading index could not follow to a config
@@ -1543,7 +1550,10 @@ mod tests {
         );
         let service = WorkspaceIndex::build_with_aliases(
             repo.path(),
-            Some((Path::new("api"), Path::new("tsconfig.app.json"))),
+            Some(&ServiceScope {
+                dir: PathBuf::from("api"),
+                named: Some(PathBuf::from("api/tsconfig.app.json")),
+            }),
         );
         assert_eq!(
             service.resolve(Path::new("api/src/x.ts"), "@/m"),

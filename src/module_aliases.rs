@@ -15,6 +15,11 @@
 //! [`crate::workspace_resolver::WorkspaceIndex`]'s job, so there is one
 //! extension and index-file rule for every kind of specifier.
 //!
+//! Which tsconfig or jsconfig governs a file is one rule, the type sidecar's
+//! ([`Governing`], carrick#3497), so call edges and types read a file under
+//! the same config; `docs/reference/module-resolution.md` ("Which config
+//! governs a file") states it.
+//!
 //! An alias defined only in code (a bundler's `resolve.alias`, a Babel plugin
 //! option) is not config and is not read. The call graph counts the imports it
 //! could not resolve instead of dropping them silently; see
@@ -25,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::packages::read_jsonc_config;
+use crate::tsconfig_program::{ProjectGraph, canonical};
 use crate::workspace_resolver::normalize;
 
 /// How many `extends` hops are followed before a chain is treated as a cycle.
@@ -37,34 +43,177 @@ pub(crate) const TS_CONFIG_NAMES: [&str; 2] = ["tsconfig.json", "jsconfig.json"]
 
 /// The names a service root is searched for, in order (carrick#3497). The
 /// type sidecar's `SERVICE_ROOT_NAMES` is the same list.
-const SERVICE_ROOT_NAMES: [&str; 4] = [
-    "tsconfig.json",
-    "tsconfig.build.json",
-    "tsconfig.app.json",
-    "jsconfig.json",
-];
+const SERVICE_ROOT_NAMES: [&str; 3] = ["tsconfig.json", "tsconfig.build.json", "tsconfig.app.json"];
 
-/// The config that governs a service that names none (carrick#3497), as the
-/// type sidecar's `findServiceTsconfig` finds it: the first of
-/// [`SERVICE_ROOT_NAMES`] in the service directory, else the nearest
-/// `tsconfig.json` in a directory above it, up to the repo root inclusive.
-/// Both arguments and the answer are relative to `repo_root`; the repo root
+/// The service an alias index is built for (carrick#3497): the files under
+/// `dir` take the config [`Governing::governing_config`] picks, every other
+/// file the nearest config above it. Both paths are repo-relative.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ServiceScope {
+    /// The service directory; the repo root is the empty path.
+    pub dir: PathBuf,
+    /// The `tsconfig` the service's `carrick.json` names, joined onto `dir`.
+    pub named: Option<PathBuf>,
+}
+
+/// Rule steps 1-3 of `docs/reference/module-resolution.md` (carrick#3497),
+/// the type sidecar's `findTsConfig` and `findServiceTsconfig`: the `named`
+/// config when it is a file and not a Deno config; else the first of
+/// [`SERVICE_ROOT_NAMES`] in the service directory; else, when a directory
+/// above the service holds a `tsconfig.json` (up to the repo root
+/// inclusive), the service root's own `jsconfig.json` if it has one,
+/// otherwise that ancestor config. `None` leaves each file to its own
+/// config (step 4). Every path is relative to `repo_root`; the repo root
 /// itself is the empty path.
-pub(crate) fn service_config(repo_root: &Path, service_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn service_config(
+    repo_root: &Path,
+    service_dir: &Path,
+    named: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(named) = named {
+        let deno = named
+            .file_name()
+            .is_some_and(|name| name == "deno.json" || name == "deno.jsonc");
+        if !deno && repo_root.join(named).is_file() {
+            return Some(normalize(named));
+        }
+    }
     if let Some(name) = SERVICE_ROOT_NAMES
         .iter()
         .find(|name| repo_root.join(service_dir).join(name).is_file())
     {
         return Some(service_dir.join(name));
     }
+    let own_jsconfig = service_dir.join("jsconfig.json");
+    let own_jsconfig = repo_root
+        .join(&own_jsconfig)
+        .is_file()
+        .then_some(own_jsconfig);
     let mut dir = service_dir;
     while let Some(parent) = dir.parent() {
         if repo_root.join(parent).join("tsconfig.json").is_file() {
-            return Some(parent.join("tsconfig.json"));
+            return Some(own_jsconfig.unwrap_or_else(|| parent.join("tsconfig.json")));
         }
         dir = parent;
     }
     None
+}
+
+/// The config each file of one service is read under (carrick#3497): the
+/// type sidecar's rule, steps 1-5 of `docs/reference/module-resolution.md`.
+/// Built once per service, so every question about a file is a lookup.
+#[derive(Debug, Clone)]
+pub(crate) struct Governing {
+    /// The service directory, repo-relative.
+    dir: PathBuf,
+    /// Steps 1-3; `None` reads each file under its own config (step 4).
+    service: Option<PathBuf>,
+    /// Step 4: directory under the service -> the tsconfig (else jsconfig)
+    /// in it, repo-relative.
+    per_dir: BTreeMap<PathBuf, PathBuf>,
+    /// Step 5: config -> its `references` graph, for the configs that have
+    /// one.
+    graphs: BTreeMap<PathBuf, ProjectGraph>,
+    canonical_root: PathBuf,
+}
+
+impl Governing {
+    /// `config_dirs` is directory -> the tsconfig or jsconfig in it (tsconfig
+    /// first), repo-relative, as the manifest walk found them.
+    pub(crate) fn new(
+        repo_root: &Path,
+        scope: &ServiceScope,
+        config_dirs: &BTreeMap<PathBuf, PathBuf>,
+        internal_package_dirs: &BTreeMap<String, PathBuf>,
+    ) -> Self {
+        let service = service_config(repo_root, &scope.dir, scope.named.as_deref());
+        let per_dir: BTreeMap<PathBuf, PathBuf> = if service.is_some() {
+            BTreeMap::new()
+        } else {
+            config_dirs
+                .iter()
+                .filter(|(dir, _)| dir.starts_with(&scope.dir))
+                .map(|(dir, config)| (dir.clone(), config.clone()))
+                .collect()
+        };
+        let canonical_root = canonical(repo_root);
+        let graphs = service
+            .iter()
+            .chain(per_dir.values())
+            .filter_map(|config| {
+                let graph = ProjectGraph::new(
+                    &canonical_root,
+                    &canonical(&repo_root.join(config)),
+                    internal_package_dirs,
+                )?;
+                Some((config.clone(), graph))
+            })
+            .collect();
+        Governing {
+            dir: scope.dir.clone(),
+            service,
+            per_dir,
+            graphs,
+            canonical_root,
+        }
+    }
+
+    /// Whether `file` (repo-relative) is the service's own.
+    pub(crate) fn covers(&self, file: &Path) -> bool {
+        file.starts_with(&self.dir)
+    }
+
+    /// The config that governs `file` (repo-relative, under the service
+    /// directory), repo-relative; `None` for no config.
+    pub(crate) fn governing_config(&self, file: &Path) -> Option<PathBuf> {
+        let chosen = match &self.service {
+            Some(config) => config.clone(),
+            None => self.nearest_own_config(file)?,
+        };
+        let Some(graph) = self.graphs.get(&chosen) else {
+            return Some(chosen);
+        };
+        let owner = graph.owner_of(&self.canonical_root.join(file));
+        Some(self.relative(owner).unwrap_or(chosen))
+    }
+
+    /// Every config [`Self::governing_config`] can answer, repo-relative.
+    pub(crate) fn configs(&self) -> BTreeSet<PathBuf> {
+        let mut configs: BTreeSet<PathBuf> = self
+            .service
+            .iter()
+            .chain(self.per_dir.values())
+            .cloned()
+            .collect();
+        for graph in self.graphs.values() {
+            configs.extend(graph.configs().filter_map(|config| self.relative(config)));
+        }
+        configs
+    }
+
+    /// Step 4: the nearest config from the file's directory up to the service
+    /// directory inclusive, stopping after a `node_modules` directory.
+    fn nearest_own_config(&self, file: &Path) -> Option<PathBuf> {
+        for dir in file.ancestors().skip(1) {
+            if !dir.starts_with(&self.dir) {
+                return None;
+            }
+            if let Some(config) = self.per_dir.get(dir) {
+                return Some(config.clone());
+            }
+            if dir == self.dir || dir.file_name() == Some("node_modules".as_ref()) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn relative(&self, absolute: &Path) -> Option<PathBuf> {
+        absolute
+            .strip_prefix(&self.canonical_root)
+            .ok()
+            .map(Path::to_path_buf)
+    }
 }
 
 /// A tsconfig `paths` map in declaration order: pattern -> its targets.
@@ -107,9 +256,11 @@ pub(crate) struct ModuleAliases {
     /// the config and its chain set neither `paths` nor `baseUrl`, which still
     /// governs the directory and stops the walk up).
     ts_configs: BTreeMap<PathBuf, Option<TsPathMapping>>,
-    /// The service's `carrick.json` `tsconfig`, governing every file under the
-    /// service directory.
-    service_ts: Option<(PathBuf, Option<TsPathMapping>)>,
+    /// The rule for the service's own files (carrick#3497); files outside it,
+    /// and every file when there is no service, take the nearest config.
+    governing: Option<Governing>,
+    /// Config -> its mapping, for every config `governing` can answer.
+    governing_mappings: BTreeMap<PathBuf, Option<TsPathMapping>>,
     /// package.json directory -> its `imports` field.
     package_imports: BTreeMap<PathBuf, Option<serde_json::Value>>,
     /// Deno import maps, most specific scope first.
@@ -211,14 +362,13 @@ fn target_root(base: &Path, declared: &str) -> String {
 impl ModuleAliases {
     /// Read every config the tree holds. `configs` is the repo-relative list
     /// of `package.json`, `deno.json(c)`, `tsconfig.json` and `jsconfig.json`
-    /// files the manifest walk found; `service_tsconfig` is the service
-    /// directory and the config `carrick.json` names for it, both
-    /// repo-relative.
+    /// files the manifest walk found; `scope` is the service the index is
+    /// built for, if any.
     pub(crate) fn build(
         repo_root: &Path,
         configs: &[PathBuf],
         internal_package_dirs: &BTreeMap<String, PathBuf>,
-        service_tsconfig: Option<(&Path, &Path)>,
+        scope: Option<&ServiceScope>,
     ) -> Self {
         let mut aliases = ModuleAliases::default();
         let mut ts_dirs: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
@@ -248,16 +398,17 @@ impl ModuleAliases {
                 _ => {}
             }
         }
-        for (dir, config) in ts_dirs {
-            let mapping = aliases.ts_mapping(repo_root, &config, internal_package_dirs);
-            aliases.ts_configs.insert(dir, mapping);
+        for (dir, config) in &ts_dirs {
+            let mapping = aliases.ts_mapping(repo_root, config, internal_package_dirs);
+            aliases.ts_configs.insert(dir.clone(), mapping);
         }
-        if let Some((service_dir, tsconfig)) = service_tsconfig {
-            let config = normalize(&service_dir.join(tsconfig));
-            if repo_root.join(&config).is_file() {
+        if let Some(scope) = scope {
+            let governing = Governing::new(repo_root, scope, &ts_dirs, internal_package_dirs);
+            for config in governing.configs() {
                 let mapping = aliases.ts_mapping(repo_root, &config, internal_package_dirs);
-                aliases.service_ts = Some((service_dir.to_path_buf(), mapping));
+                aliases.governing_mappings.insert(config, mapping);
             }
+            aliases.governing = Some(governing);
         }
         // Deepest scope first; within one scope a `scopes` block before the
         // plain `imports`; then by path so the order is a property of the tree.
@@ -321,11 +472,11 @@ impl ModuleAliases {
                 }
             }
         }
-        let ts = self.ts_configs.values().filter_map(Option::as_ref).chain(
-            self.service_ts
-                .iter()
-                .filter_map(|(_, mapping)| mapping.as_ref()),
-        );
+        let ts = self
+            .ts_configs
+            .values()
+            .chain(self.governing_mappings.values())
+            .filter_map(Option::as_ref);
         for mapping in ts {
             for (pattern, targets) in &mapping.paths {
                 for target in targets {
@@ -384,8 +535,11 @@ impl ModuleAliases {
                 .collect();
         }
 
-        let mapping = match &self.service_ts {
-            Some((dir, mapping)) if from_file.starts_with(dir) => mapping.as_ref(),
+        let mapping = match &self.governing {
+            Some(governing) if governing.covers(from_file) => governing
+                .governing_config(from_file)
+                .and_then(|config| self.governing_mappings.get(&config))
+                .and_then(Option::as_ref),
             _ => self.nearest_ts_mapping(from_file),
         };
         let Some(mapping) = mapping else {
@@ -431,8 +585,20 @@ impl ModuleAliases {
         targets
     }
 
-    /// The governing tsconfig mapping: the nearest directory, from the
-    /// importer's own up to the repo root, that holds a tsconfig or jsconfig.
+    /// The config the service's rule reads `from_file` (repo-relative) under,
+    /// repo-relative; `None` for a file outside the service, or with no
+    /// service or no config (carrick#3497).
+    pub(crate) fn governing_config(&self, from_file: &Path) -> Option<PathBuf> {
+        self.governing
+            .as_ref()
+            .filter(|governing| governing.covers(from_file))?
+            .governing_config(from_file)
+    }
+
+    /// The mapping for a file outside the service (rule D2 of carrick#3497):
+    /// the nearest directory, from the importer's own up to the repo root,
+    /// that holds a tsconfig or jsconfig. See
+    /// `docs/reference/module-resolution.md`.
     fn nearest_ts_mapping(&self, from_file: &Path) -> Option<&TsPathMapping> {
         from_file
             .ancestors()
@@ -780,5 +946,176 @@ pub(crate) fn collect_string_leaves(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one rule for which config governs a file (carrick#3497), a test
+    //! per step. `tests/module_resolution_parity_test.rs` holds the same
+    //! layouts against the type sidecar's built rule.
+
+    use super::*;
+    use crate::workspace_resolver::WorkspaceIndex;
+
+    fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        for (path, contents) in files {
+            let path = repo.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        repo
+    }
+
+    fn governing(
+        repo: &tempfile::TempDir,
+        dir: &str,
+        named: Option<&str>,
+        file: &str,
+    ) -> Option<String> {
+        let scope = ServiceScope {
+            dir: PathBuf::from(dir),
+            named: named.map(PathBuf::from),
+        };
+        WorkspaceIndex::build_with_aliases(repo.path(), Some(&scope))
+            .governing_config(Path::new(file))
+            .map(|config| config.to_string_lossy().replace('\\', "/"))
+    }
+
+    #[test]
+    fn step_1_a_named_config_governs_and_a_missing_one_falls_through() {
+        let repo = tree(&[
+            ("web/tsconfig.json", "{}"),
+            ("web/tsconfig.custom.json", "{}"),
+        ]);
+        assert_eq!(
+            governing(
+                &repo,
+                "web",
+                Some("web/tsconfig.custom.json"),
+                "web/src/a.ts"
+            )
+            .as_deref(),
+            Some("web/tsconfig.custom.json")
+        );
+        assert_eq!(
+            governing(&repo, "web", Some("web/gone.json"), "web/src/a.ts").as_deref(),
+            Some("web/tsconfig.json")
+        );
+    }
+
+    #[test]
+    fn step_2_a_service_root_name_outranks_an_ancestor() {
+        let repo = tree(&[
+            ("tsconfig.json", "{}"),
+            ("web/tsconfig.app.json", "{}"),
+            ("web/src/tsconfig.json", "{}"),
+        ]);
+        assert_eq!(
+            governing(&repo, "web", None, "web/src/a.ts").as_deref(),
+            Some("web/tsconfig.app.json"),
+            "the root name governs every file, a nearer config included"
+        );
+    }
+
+    #[test]
+    fn step_3_an_ancestor_tsconfig_unless_the_service_has_a_jsconfig() {
+        let repo = tree(&[("tsconfig.json", "{}"), ("api/package.json", "{}")]);
+        assert_eq!(
+            governing(&repo, "api", None, "api/src/a.ts").as_deref(),
+            Some("tsconfig.json")
+        );
+        let repo = tree(&[("tsconfig.json", "{}"), ("web/jsconfig.json", "{}")]);
+        assert_eq!(
+            governing(&repo, "web", None, "web/src/a.js").as_deref(),
+            Some("web/jsconfig.json")
+        );
+    }
+
+    #[test]
+    fn step_4_each_file_takes_its_nearest_config_within_the_service() {
+        let repo = tree(&[
+            ("jsconfig.json", "{}"),
+            ("web/jsconfig.json", "{}"),
+            ("web/src/feature/tsconfig.json", "{}"),
+            ("api/src/a.ts", ""),
+        ]);
+        assert_eq!(
+            governing(&repo, "web", None, "web/src/a.js").as_deref(),
+            Some("web/jsconfig.json")
+        );
+        assert_eq!(
+            governing(&repo, "web", None, "web/src/feature/a.ts").as_deref(),
+            Some("web/src/feature/tsconfig.json")
+        );
+        // Nothing within the service, and an ancestor jsconfig is not read.
+        assert_eq!(governing(&repo, "api", None, "api/src/a.ts"), None);
+    }
+
+    #[test]
+    fn step_5_a_referencing_config_hands_each_file_to_its_owner() {
+        let repo = tree(&[
+            (
+                "web/tsconfig.json",
+                r#"{"files":[],"references":[{"path":"./tsconfig.app.json"},{"path":"./tsconfig.node.json"}]}"#,
+            ),
+            (
+                "web/tsconfig.node.json",
+                r#"{"include":["vite.config.ts"]}"#,
+            ),
+            // The app config lists `src/shared` and references `shared`,
+            // which lists it too: the reference owns it.
+            (
+                "web/tsconfig.app.json",
+                r#"{"include":["src"],"references":[{"path":"./src/shared"}]}"#,
+            ),
+            ("web/src/shared/tsconfig.json", r#"{"include":["."]}"#),
+        ]);
+        let of = |file: &str| governing(&repo, "web", None, file);
+        assert_eq!(of("web/src/a.ts").as_deref(), Some("web/tsconfig.app.json"));
+        assert_eq!(
+            of("web/src/shared/a.ts").as_deref(),
+            Some("web/src/shared/tsconfig.json")
+        );
+        assert_eq!(
+            of("web/vite.config.ts").as_deref(),
+            Some("web/tsconfig.node.json")
+        );
+        assert_eq!(
+            of("web/scripts/a.ts").as_deref(),
+            Some("web/tsconfig.json"),
+            "no project lists it: the chosen config"
+        );
+    }
+
+    #[test]
+    fn a_file_outside_the_service_takes_the_nearest_config() {
+        let repo = tree(&[
+            (
+                "web/tsconfig.app.json",
+                r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+            ),
+            (
+                "lib/tsconfig.json",
+                r#"{"compilerOptions":{"paths":{"@/*":["./own/*"]}}}"#,
+            ),
+            ("lib/own/m.ts", ""),
+            ("web/src/m.ts", ""),
+        ]);
+        let scope = ServiceScope {
+            dir: PathBuf::from("web"),
+            named: None,
+        };
+        let index = WorkspaceIndex::build_with_aliases(repo.path(), Some(&scope));
+        assert_eq!(index.governing_config(Path::new("lib/x.ts")), None);
+        assert_eq!(
+            index.resolve(Path::new("lib/x.ts"), "@/m"),
+            crate::workspace_resolver::Resolution::Internal(PathBuf::from("lib/own/m.ts"))
+        );
+        assert_eq!(
+            index.resolve(Path::new("web/src/x.ts"), "@/m"),
+            crate::workspace_resolver::Resolution::Internal(PathBuf::from("web/src/m.ts"))
+        );
     }
 }

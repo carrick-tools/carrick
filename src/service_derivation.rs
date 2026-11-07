@@ -472,7 +472,14 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         {
             None
         } else {
-            crate::module_aliases::service_config(&root, relative)
+            // A lone root `jsconfig.json` is named too, so the derived entry
+            // states the config explicitly; both sides then read every file
+            // of the service under it (carrick#3497).
+            crate::module_aliases::service_config(&root, relative, None)
+                .or_else(|| {
+                    let jsconfig = relative.join("jsconfig.json");
+                    root.join(&jsconfig).is_file().then_some(jsconfig)
+                })
                 .map(|config| relative_to_directory(&config, relative))
         };
         services.push(Config {
