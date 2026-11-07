@@ -39,6 +39,7 @@
  * pass the same value, has no such mode.
  */
 
+import { functionBodyOf, peelValueWrappers } from './function-body.js';
 import { Node, SyntaxKind, type CallExpression, type Identifier, type Symbol as TsSymbol } from 'ts-morph';
 import { stepsOnPath } from './failure-path.js';
 
@@ -73,25 +74,7 @@ export interface ArgumentNarrowing {
 export function calledFunction(call: CallExpression): Node | undefined {
   let symbol = call.getExpression().getSymbol();
   if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol();
-  const declarations = symbol?.getDeclarations() ?? [];
-  if (declarations.length !== 1) return undefined;
-  const [declaration] = declarations;
-  if (
-    (Node.isFunctionDeclaration(declaration) || Node.isMethodDeclaration(declaration)) &&
-    declaration.getBody()
-  ) {
-    return declaration;
-  }
-  if (Node.isVariableDeclaration(declaration) || Node.isPropertyAssignment(declaration)) {
-    let initializer = declaration.getInitializer();
-    while (initializer && (Node.isParenthesizedExpression(initializer) || Node.isAsExpression(initializer))) {
-      initializer = initializer.getExpression();
-    }
-    if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))) {
-      return initializer;
-    }
-  }
-  return undefined;
+  return functionBodyOf(symbol?.getDeclarations() ?? []);
 }
 
 /** The one call in `caller` that runs `callee`, or `undefined` for none or several. */
@@ -220,7 +203,7 @@ const UNDEFINED: Stated = { kind: 'value', value: undefined };
 
 /** What one argument expression states. */
 function statedBy(arg: Node): Stated | undefined {
-  const expression = peel(arg);
+  const expression = peelValueWrappers(arg);
   if (Node.isStringLiteral(expression) || Node.isNoSubstitutionTemplateLiteral(expression)) {
     return { kind: 'value', value: expression.getLiteralValue() };
   }
@@ -238,7 +221,7 @@ function statedBy(arg: Node): Stated | undefined {
 
 /** What an argument states about one of its members, when it is an object literal. */
 function statedMember(arg: Node, member: string): Stated | undefined {
-  const literal = peel(arg);
+  const literal = peelValueWrappers(arg);
   if (!Node.isObjectLiteralExpression(literal)) return undefined;
   let found: Stated | undefined;
   let spread = false;
@@ -319,28 +302,15 @@ function isWritten(node: Node): boolean {
   return false;
 }
 
-function peel(node: Node): Node {
-  let current = node;
-  while (
-    Node.isParenthesizedExpression(current) ||
-    Node.isAsExpression(current) ||
-    Node.isNonNullExpression(current) ||
-    Node.isSatisfiesExpression(current)
-  ) {
-    current = current.getExpression();
-  }
-  return current;
-}
-
 /** The entry a test operand reads, when it reads a stated value. */
 function entryOf(node: Node, binding: Binding): Entry | undefined {
-  const operand = peel(node);
+  const operand = peelValueWrappers(node);
   if (Node.isIdentifier(operand)) {
     const symbol = operand.getSymbol();
     return symbol ? binding.direct.get(symbol) : undefined;
   }
   if (Node.isPropertyAccessExpression(operand)) {
-    const object = peel(operand.getExpression());
+    const object = peelValueWrappers(operand.getExpression());
     const symbol = Node.isIdentifier(object) ? object.getSymbol() : undefined;
     return symbol ? binding.members.get(symbol)?.get(operand.getName()) : undefined;
   }
@@ -353,7 +323,7 @@ function statedOperand(node: Node, binding: Binding): Stated | undefined {
 
 /** The literal a test operand is, when it is one. */
 function literalOperand(node: Node): Stated | undefined {
-  const operand = peel(node);
+  const operand = peelValueWrappers(node);
   if (Node.isVoidExpression(operand)) return UNDEFINED;
   if (
     Node.isStringLiteral(operand) ||
@@ -384,7 +354,7 @@ function compare(stated: Stated, literal: Stated, loose: boolean): boolean | und
 
 /** True, false, or `undefined` when the stated arguments do not decide `condition`. */
 function evaluate(condition: Node, binding: Binding): boolean | undefined {
-  const test = peel(condition);
+  const test = peelValueWrappers(condition);
   if (Node.isPrefixUnaryExpression(test) && test.getOperatorToken() === SyntaxKind.ExclamationToken) {
     const inner = evaluate(test.getOperand(), binding);
     return inner === undefined ? undefined : !inner;
