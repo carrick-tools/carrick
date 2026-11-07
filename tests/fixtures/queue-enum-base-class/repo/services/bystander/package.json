@@ -1,0 +1,7 @@
+{
+  "name": "bystander",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@fx/queue-kit": "1.0.0" },
+  "main": "src/index.ts"
+}

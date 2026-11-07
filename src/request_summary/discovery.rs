@@ -4804,6 +4804,64 @@ export function listen(): void {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// carrick#3527, as it reads today (the guard S2 widens reach past): a
+    /// queue name handed to a function by its caller, or written as an enum
+    /// member at the library call, is forced; a name read from the opaque
+    /// `this.topic` of a base class is a site with no forced name; and no
+    /// record forces a job name (`job`, `direct-job`) as the queue's name.
+    #[test]
+    fn a_topic_name_read_today_stays_read() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("queue-enum-base-class-one", ".", "jobs")
+        else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        // Each record's point, with the name it forces (None: forced nowhere).
+        let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for record in &records {
+            forced
+                .entry(record.state.point.at.clone())
+                .or_default()
+                .push(
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned(),
+                );
+        }
+        let at = |point: &str| forced.get(point).cloned();
+        assert_eq!(
+            at("src/c3-param.ts:9"),
+            Some(vec![Some("alpha-jobs".to_string())]),
+            "{forced:#?}"
+        );
+        assert_eq!(
+            at("src/c1-direct.ts:10"),
+            Some(vec![Some("beta-jobs".to_string())]),
+            "{forced:#?}"
+        );
+        assert_eq!(
+            at("src/consumer-base.ts:9"),
+            Some(vec![None]),
+            "{forced:#?}"
+        );
+        for names in forced.values() {
+            for name in names.iter().flatten() {
+                assert!(
+                    name != "job" && name != "direct-job",
+                    "a job name is forced as a queue name: {forced:#?}"
+                );
+            }
+        }
+    }
+
     /// carrick#1678: a verb called on the object a scope member returns
     /// (`items.at("/items").get(list)`) is a route whose path is the scope
     /// call's argument and whose instance is the scope call's receiver: the

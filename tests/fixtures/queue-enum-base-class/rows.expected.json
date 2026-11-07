@@ -1,0 +1,7 @@
+{
+  "services": ["bystander", "queue-kit", "runner", "sender", "topics"],
+  "sender_possible_calls": [
+    "services/sender/src/send.ts:4 unanswered",
+    "services/sender/src/send.ts:8 unanswered"
+  ]
+}

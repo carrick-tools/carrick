@@ -1,0 +1,579 @@
+{
+ "library_claims": [
+  {
+   "package": "bullmq",
+   "version": "5.12.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "bullmq",
+     "export": "FlowProducer",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "key_labels": {
+        "minimumVersion": "not_name",
+        "prefix": "not_name",
+        "recommendedMinimumVersion": "not_name"
+       },
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "member": "addBulk",
+       "of": "instance:new",
+       "op": "send",
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [
+      {
+       "member": "emit",
+       "name": "error",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "emit",
+       "name": "ioredis:close",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "error",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "ioredis:close",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "error",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "ioredis:close",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "error",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "ioredis:close",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      }
+     ],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "Job",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "Queue",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "key_labels": {
+        "minimumVersion": "not_name",
+        "prefix": "not_name",
+        "recommendedMinimumVersion": "not_name"
+       },
+       "member": null,
+       "name": {
+        "arg": 0
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "key_labels": {
+        "jobId": "not_name",
+        "repeatJobKey": "not_name"
+       },
+       "member": "add",
+       "name": {
+        "bound": "maker"
+       },
+       "of": "instance:new",
+       "op": "send",
+       "payload": {
+        "arg": 1
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [
+      {
+       "member": "emit",
+       "name": "cleaned",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "emit",
+       "name": "error",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "emit",
+       "name": "ioredis:close",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "emit",
+       "name": "paused",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "emit",
+       "name": "progress",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "emit",
+       "name": "removed",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "emit",
+       "name": "resumed",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "emit",
+       "name": "waiting",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "cleaned",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "error",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "ioredis:close",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "paused",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "progress",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "removed",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "resumed",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "off",
+       "name": "waiting",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "cleaned",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "error",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "ioredis:close",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "paused",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "progress",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "removed",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "resumed",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "on",
+       "name": "waiting",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "cleaned",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "error",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "ioredis:close",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "paused",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "progress",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "removed",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "resumed",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "once",
+       "name": "waiting",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "clean",
+       "name": "paused",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "getJobCountByTypes",
+       "name": "paused",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "getJobCountByTypes",
+       "name": "waiting",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "getJobCounts",
+       "name": "paused",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "getJobCounts",
+       "name": "waiting",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "getJobs",
+       "name": "paused",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      },
+      {
+       "member": "getJobs",
+       "name": "waiting",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      }
+     ],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "QueueBase",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "key_labels": {
+        "minimumVersion": "not_name",
+        "prefix": "not_name",
+        "recommendedMinimumVersion": "not_name"
+       },
+       "member": null,
+       "name": {
+        "arg": 0
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "QueueEvents",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "QueueGetters",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "RedisConnection",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "key_labels": {
+        "clientInfoTag": "not_name",
+        "connectionName": "not_name",
+        "host": "not_name",
+        "keyPrefix": "not_name",
+        "name": "not_name",
+        "password": "not_name",
+        "path": "not_name",
+        "sentinelPassword": "not_name",
+        "sentinelUsername": "not_name",
+        "username": "not_name"
+       },
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "Repeat",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "key_labels": {
+        "minimumVersion": "not_name",
+        "prefix": "not_name",
+        "recommendedMinimumVersion": "not_name"
+       },
+       "member": null,
+       "name": {
+        "arg": 0
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "key_labels": {
+        "jobId": "not_name",
+        "repeatJobKey": "not_name"
+       },
+       "member": "addNextRepeatableJob",
+       "name": {
+        "arg": 0
+       },
+       "of": "instance:new",
+       "op": "send",
+       "payload": {
+        "arg": 1
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "Scripts",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "Worker",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [
+      {
+       "op": "receive",
+       "member": null,
+       "on": "export",
+       "form": "new",
+       "name": {
+        "arg": 0
+       },
+       "handler": {
+        "arg": 1
+       },
+       "name_scope": {
+        "scope": "global"
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "bullmq",
+     "export": "removeAllQueueData",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  }
+ ]
+}
