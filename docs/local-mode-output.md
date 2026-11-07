@@ -658,10 +658,12 @@ on the summary line as `not type-checked`, listed with `--all` and in the JSON
 as `not_type_checked` (`file`, `line`, `role`, `method`, `path`, `reason`),
 and never counted as a pass. When the changed files hold such pairs, none was
 type-checked (`type_checked` is 0) and nothing fails, the run exits 2. A run
-that judged some pairs exits by those. A pair whose call is a built request
-(`request_descriptor`) is still counted and listed as not type-checked, but
-does not make the run exit 2: its matched method and path are the check it
-can have, so a branch that only adds request builders exits 0.
+that judged some pairs exits by those. A pair whose calls are all built
+requests (`request_descriptor`) is still counted and listed as not
+type-checked, but does not make the run exit 2: its matched method and path
+are the check it can have. That holds whichever side changed, so a branch
+that only adds request builders exits 0, and so does one that only changes a
+route those builders alone call (carrick#3532).
 
 A check that
 covered none of the files it was asked about exits 2, which no verdict uses:
