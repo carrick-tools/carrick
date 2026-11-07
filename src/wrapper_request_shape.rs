@@ -85,7 +85,7 @@ pub(crate) fn literal_string(expr: &Expr) -> Option<String> {
 }
 
 /// The property name of an object-literal member, when it is a plain key.
-fn prop_key_name(prop: &PropOrSpread) -> Option<String> {
+pub(crate) fn prop_key_name(prop: &PropOrSpread) -> Option<String> {
     let PropOrSpread::Prop(prop) = prop else {
         return None;
     };
@@ -188,6 +188,14 @@ fn bag_verb(
         BagMethod::Open => verb,
         BagMethod::Absent => absent(verb),
     }
+}
+
+/// The method a request a function builds and returns states
+/// (carrick#3470): the literal at `method`, GET where no entry can write one
+/// (as `fetch` defaults), and `None` where a value nothing here reads, a
+/// spread or a computed key may write it.
+pub(crate) fn built_request_method(obj: &ObjectLit) -> Option<String> {
+    bag_verb(obj, None, |_| Some("GET".to_string()))
 }
 
 /// Whether an object literal looks like a request-options bag: it carries at

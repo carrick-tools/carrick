@@ -417,6 +417,56 @@ impl Visit for ShapeReader {
     }
 }
 
+/// Every object literal in `module` that is a function's return value, as
+/// the span `(lo, hi)` of the literal (carrick#3470): a `return` argument or
+/// an arrow's expression body, through the wrappers that do not change it
+/// and a local name given that one value, read as [`return_shapes`] reads a
+/// returned name. A literal taken apart (`const { a } = {...}`) or nested in
+/// another value is not one.
+pub fn returned_objects(module: &swc_ecma_ast::Module) -> HashSet<(u32, u32)> {
+    #[derive(Default)]
+    struct ObjectReader {
+        objects: HashSet<(u32, u32)>,
+    }
+    impl ObjectReader {
+        fn read(&mut self, returned: Vec<&Expr>, body: &dyn VisitWithScope) {
+            let mut scope = Scope::default();
+            body.collect(&mut scope);
+            for expr in returned {
+                let value = resolve(expr, &scope);
+                if let (Expr::Object(object), false) = (value.expr, value.part) {
+                    self.objects.insert((object.span.lo.0, object.span.hi.0));
+                }
+            }
+        }
+    }
+    impl Visit for ObjectReader {
+        fn visit_function(&mut self, function: &Function) {
+            if let Some(body) = &function.body {
+                let mut returns = Returns::default();
+                body.visit_with(&mut returns);
+                self.read(returns.exprs.iter().collect(), &BodyRef::Block(body));
+            }
+            function.visit_children_with(self);
+        }
+
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            match &*arrow.body {
+                ArrowFunctionBody::FunctionBody(block) => {
+                    let mut returns = Returns::default();
+                    block.visit_with(&mut returns);
+                    self.read(returns.exprs.iter().collect(), &BodyRef::Block(block));
+                }
+                ArrowFunctionBody::Expr(expr) => self.read(vec![&**expr], &BodyRef::Expr(expr)),
+            }
+            arrow.visit_children_with(self);
+        }
+    }
+    let mut reader = ObjectReader::default();
+    module.visit_with(&mut reader);
+    reader.objects
+}
+
 fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {
     let mut shapes = Vec::new();
     for expr in returned {

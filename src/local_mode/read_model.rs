@@ -677,6 +677,7 @@ mod tests {
             GraphqlDocument,
             SocketCall,
             EventBus,
+            RequestDescriptor,
         ];
         for source in &all {
             match source {
@@ -684,7 +685,7 @@ mod tests {
                 | EnvBasePath | LiteralBasePath | NewUrl | FileBasedRoute | DescriptorRoute
                 | ClassController | DecoratorRoute | ReceiverType | InlineLiteral
                 | LibraryClaim | Model | DeclaredOperation | GraphqlSchema | GraphqlDocument
-                | SocketCall | EventBus => {}
+                | SocketCall | EventBus | RequestDescriptor => {}
             }
         }
         all
@@ -708,10 +709,14 @@ mod tests {
                 assert_eq!(local, Source::Fact, "{source:?}");
             }
         }
-        // The cloud's `isCandidateSource` names exactly these two.
+        // The cloud's `isCandidateSource` names exactly these three.
         assert_eq!(
             candidates,
-            vec![ResolutionSource::InlineLiteral, ResolutionSource::Model]
+            vec![
+                ResolutionSource::InlineLiteral,
+                ResolutionSource::Model,
+                ResolutionSource::RequestDescriptor
+            ]
         );
     }
 }

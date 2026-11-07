@@ -211,7 +211,10 @@ impl ConsumerRole {
             | S::GraphqlSchema
             | S::GraphqlDocument
             | S::SocketCall
-            | S::EventBus => None,
+            | S::EventBus
+            // A built request (carrick#3470) is sent by whoever takes it,
+            // which the site does not show: no call role describes it.
+            | S::RequestDescriptor => None,
         }
     }
 }

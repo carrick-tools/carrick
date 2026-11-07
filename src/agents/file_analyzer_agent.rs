@@ -308,6 +308,13 @@ pub enum ResolutionSource {
     /// A publish or subscribe on an in-process event bus the bus pass reads
     /// (carrick#3091).
     EventBus,
+    /// An HTTP request a function builds and returns for a caller to send
+    /// (carrick#3470): `return { url: `${base}/v2/orders/${id}`, method:
+    /// "GET", headers }` in a function nothing in its service calls. A
+    /// candidate: the code states the target, not that anything sends it,
+    /// and its base is a parameter nothing fills. See
+    /// [`crate::request_summary::descriptors`].
+    RequestDescriptor,
 }
 
 impl ResolutionSource {
@@ -318,6 +325,8 @@ impl ResolutionSource {
     ///
     /// `InlineLiteral` is a candidate: the literal fixes the path of a row the
     /// model returned (#332), so the row exists because the model stated it.
+    /// `RequestDescriptor` is one because the code builds the request and
+    /// sends it nowhere the scan sees (carrick#3470).
     ///
     /// The cloud's `isCandidateSource` (carrick-cloud
     /// `lambdas/mcp-server/src/utils/resolution-source.ts`) states the same
@@ -326,7 +335,10 @@ impl ResolutionSource {
     /// `matches!` over the candidate variants; any other shape fails that
     /// check.
     pub fn is_candidate(self) -> bool {
-        matches!(self, Self::Model | Self::InlineLiteral)
+        matches!(
+            self,
+            Self::Model | Self::InlineLiteral | Self::RequestDescriptor
+        )
     }
 }
 

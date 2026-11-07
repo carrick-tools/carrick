@@ -1,0 +1,5 @@
+{
+  "name": "request-descriptor",
+  "private": true,
+  "workspaces": ["orders-api", "ops-console"]
+}

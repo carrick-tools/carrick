@@ -186,6 +186,11 @@ mod library_sites;
 mod alternatives;
 use alternatives::{Alternation, Alternatives};
 
+// The requests a function builds and returns for a caller to send
+// (carrick#3470): stated as candidate rows where nothing in the service
+// calls the function.
+pub mod descriptors;
+
 // What each function compares a request value against, and where that value
 // comes from (carrick#2386): the receive side of the same IR. Only tests and
 // the offline census read it so far, so the binary sees it as unused.
@@ -1211,6 +1216,9 @@ struct FnIr {
     /// back, for a callee an own factory returns (carrick#2432). Read by
     /// discovery alone.
     returned_values: Vec<ValueAt>,
+    /// Each request this body builds and returns for a caller to send
+    /// (carrick#3470, [`descriptors`]). Read by that pass alone.
+    built_requests: Vec<descriptors::BuiltRequest>,
 }
 
 impl FnIr {
@@ -1802,6 +1810,7 @@ pub fn extract_file_ir(
     let reader = Reader {
         source_map,
         builder_depth: std::cell::Cell::new(0),
+        returned_objects: crate::return_flow::returned_objects(module),
     };
     module_scope.guards = guards::ModuleGuards::of(module, &imports, definition_keys, &reader);
 
@@ -4733,6 +4742,9 @@ struct Reader<'a> {
     /// How many builder calls deep [`Reader::eval`] is reading
     /// (carrick#1562): a builder that calls itself stops at the cap.
     builder_depth: std::cell::Cell<usize>,
+    /// The object literals some function of the module returns, by span
+    /// ([`crate::return_flow::returned_objects`], carrick#3470).
+    returned_objects: HashSet<(u32, u32)>,
 }
 
 impl Reader<'_> {
@@ -7616,6 +7628,20 @@ impl Visit for CallWalker<'_, '_, '_> {
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
         declarator.visit_children_with(self);
         self.bind_block(declarator);
+    }
+
+    // A request the body builds and returns (carrick#3470), read with the
+    // scope the literal is written in.
+    fn visit_object_lit(&mut self, object: &ObjectLit) {
+        if self
+            .reader
+            .returned_objects
+            .contains(&(object.span.lo.0, object.span.hi.0))
+            && let Some(built) = descriptors::BuiltRequest::read(self.reader, object, self.scope)
+        {
+            self.ir.built_requests.push(built);
+        }
+        object.visit_children_with(self);
     }
 
     // `this.queue = new Queue("emails")`: a maker write, as the message-role

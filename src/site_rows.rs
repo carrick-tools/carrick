@@ -963,6 +963,66 @@ pub fn of(
     out
 }
 
+/// The rows the requests a service's functions build and return state
+/// (carrick#3470, [`crate::request_summary::descriptors`]): one HTTP call
+/// row at each object literal, source `request_descriptor`, a candidate.
+///
+/// No site question asked anything, so the row carries no inference, stands
+/// wherever no fact holds its line and is mirrored into the graph as the
+/// fold mirrors a fact; its source is what makes it a candidate. It is
+/// anchored at the literal, with its body typed as a request body. The
+/// literal is no call, so nothing types a response there.
+pub fn descriptor_rows(decided: &Decided) -> Vec<SiteRow> {
+    decided
+        .descriptors
+        .iter()
+        .map(|descriptor| {
+            let at = &descriptor.at;
+            let key = OperationKey::http(&descriptor.method, descriptor.target.clone());
+            SiteRow {
+                file: at.file.clone(),
+                line: at.line,
+                key,
+                side: RowSide::Call,
+                source: ResolutionSource::RequestDescriptor,
+                inference: None,
+                in_band: true,
+                name_scope: None,
+                anchors: TypeAnchors {
+                    call: at.clone(),
+                    payload: None,
+                    payload_at: descriptor.body.clone(),
+                    handler: None,
+                    key: None,
+                },
+                lead: PossibleCall {
+                    file_path: at.file.clone(),
+                    line_number: at.line,
+                    span_start: at.span_start,
+                    span_end: at.span_end,
+                    kind: Some("http".to_string()),
+                    role: Some("consumer".to_string()),
+                    labelled_end: None,
+                    unread: crate::possible_calls::Unread {
+                        slot: "path".to_string(),
+                        reason: UnreadReason::NameNeverBound,
+                    },
+                    trace_depth: 0,
+                },
+                needs_reader: false,
+                through: false,
+                within: Vec::new(),
+                base: crate::call_base::stated_base(
+                    &descriptor.target,
+                    descriptor.base_end.as_ref(),
+                    &Default::default(),
+                    &Default::default(),
+                ),
+            }
+        })
+        .collect()
+}
+
 /// What the fold did, for the type manifest and the possible calls.
 #[derive(Debug, Clone, Default)]
 pub struct SiteFold {

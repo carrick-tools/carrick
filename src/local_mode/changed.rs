@@ -165,6 +165,12 @@ pub struct Problem {
     /// `fact`, `candidate` or `not_stated`: whether the rows behind this are
     /// ones the source states.
     pub source: String,
+    /// A call row read from a request the code builds and returns
+    /// (`request_descriptor`, carrick#3470), not from a call seen sent.
+    /// Counted on the summary line as its own kind, never as a model
+    /// candidate.
+    #[serde(skip)]
+    pub descriptor: bool,
     /// The index held this problem before the change began: same file, same
     /// operation. Printed, and never fails the run.
     pub already_indexed: bool,
@@ -215,6 +221,11 @@ pub struct NotTypeChecked {
     pub path: String,
     /// The verdict's own detail, or that there was none.
     pub reason: String,
+    /// A call row read from a request the code builds and returns
+    /// (carrick#3470). Its matched method and path are a check, so it never
+    /// makes the run read as "nothing type-checked".
+    #[serde(skip)]
+    pub descriptor: bool,
 }
 
 /// The words a customer reads about pairs the check could not judge. Kept
@@ -307,9 +318,11 @@ impl ChangedOutput {
     }
 
     /// The changed files hold matched pairs and the check judged none of them
-    /// (carrick#3012). A pass would read the same, so it is not one.
+    /// (carrick#3012). A pass would read the same, so it is not one. A pair
+    /// whose call is a built request (carrick#3470) does not count: matching
+    /// its method and path is the check it can have.
     fn nothing_type_checked(&self) -> bool {
-        self.type_checked == 0 && !self.not_type_checked.is_empty()
+        self.type_checked == 0 && self.not_type_checked.iter().any(|row| !row.descriptor)
     }
 
     /// Problems the index, written by another scanner build, cannot date.
@@ -1007,6 +1020,7 @@ pub(super) fn judge(
                     .verdict
                     .as_ref()
                     .map_or_else(|| "no verdict".to_string(), |v| one_line(&v.detail)),
+                descriptor: built_request(operation),
             });
             continue;
         }
@@ -1088,6 +1102,7 @@ pub(super) fn judge(
             source: finding
                 .and_then(|finding| finding.edge_source.clone())
                 .unwrap_or_else(|| "not_stated".to_string()),
+            descriptor: built_request(operation),
             already_indexed: already,
             unconfirmed: false,
             outside_the_change: !in_change,
@@ -1176,6 +1191,7 @@ pub(super) fn judge(
                         "the index matched this call, and no service serves it now".to_string()
                     },
                     source: source.as_str().to_string(),
+                    descriptor: built_request(operation),
                     already_indexed: already,
                     unconfirmed,
                     outside_the_change: !is_changed(repo, &file),
@@ -1295,6 +1311,7 @@ pub(super) fn judge(
             other: Vec::new(),
             reason,
             source: Source::Fact.as_str().to_string(),
+            descriptor: false,
             already_indexed: false,
             unconfirmed: !confirmed,
             outside_the_change: true,
@@ -1653,6 +1670,8 @@ enum Unlisted {
     AlreadyIndexed,
     Unconfirmed,
     Candidate,
+    /// A call read from a request the code builds and returns (carrick#3470).
+    BuiltRequest,
     NotStated,
     OutsideNotJudged,
 }
@@ -1663,6 +1682,7 @@ impl Unlisted {
             Unlisted::AlreadyIndexed => " [already in the index, does not fail]",
             Unlisted::Unconfirmed => " [unconfirmed: the base is set at run time, does not fail]",
             Unlisted::Candidate => " [model candidate, does not fail]",
+            Unlisted::BuiltRequest => " [built request not seen sent, does not fail]",
             Unlisted::NotStated => " [source not stated, does not fail]",
             Unlisted::OutsideNotJudged => OUTSIDE_NOT_JUDGED_NOTE,
         }
@@ -1673,6 +1693,11 @@ impl Unlisted {
             Unlisted::AlreadyIndexed => format!("{count} already in the index"),
             Unlisted::Unconfirmed => format!("{count} unconfirmed"),
             Unlisted::Candidate => plural(count, "model candidate", "model candidates"),
+            Unlisted::BuiltRequest => plural(
+                count,
+                "built request not seen sent",
+                "built requests not seen sent",
+            ),
             Unlisted::NotStated => format!("{count} with no stated source"),
             Unlisted::OutsideNotJudged => outside_not_judged_counted(count),
         }
@@ -1698,6 +1723,7 @@ impl Problem {
             _ if self.not_judged_before => Some(Unlisted::OutsideNotJudged),
             _ if self.already_indexed => Some(Unlisted::AlreadyIndexed),
             _ if self.unconfirmed => Some(Unlisted::Unconfirmed),
+            _ if self.descriptor => Some(Unlisted::BuiltRequest),
             (false, "candidate") => Some(Unlisted::Candidate),
             (false, _) => Some(Unlisted::NotStated),
         }
@@ -1711,6 +1737,14 @@ fn join_and(parts: &[String]) -> String {
         [one] => one.clone(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// A call row read from a request the code builds and returns, not from a
+/// call seen sent (carrick#3470).
+fn built_request(operation: &JoinedOperation) -> bool {
+    operation.role == Role::Consumer
+        && operation.resolution_source
+            == Some(crate::agents::file_analyzer_agent::ResolutionSource::RequestDescriptor)
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {
@@ -1754,6 +1788,7 @@ mod tests {
             other: Vec::new(),
             reason: "no service in this workspace serves it".to_string(),
             source: if fails { "fact" } else { "candidate" }.to_string(),
+            descriptor: false,
             already_indexed: false,
             unconfirmed: false,
             outside_the_change: false,
@@ -1909,6 +1944,7 @@ mod tests {
             method: "GET".to_string(),
             path: "/t".to_string(),
             reason: "no verdict".to_string(),
+            descriptor: false,
         };
         let out = ChangedOutput {
             calls: 1,
@@ -2494,6 +2530,52 @@ mod tests {
         assert!(
             !everything.contains("unconfirmed"),
             "nothing is hidden, so nothing is counted as hidden:\n{everything}"
+        );
+    }
+
+    /// A call read from a request the code builds and returns is counted as
+    /// its own kind, never as a model candidate (carrick#3470).
+    #[test]
+    fn built_requests_are_counted_as_their_own_kind() {
+        let built = |path: &str| {
+            let mut row = problem(ProblemKind::NoRoute, false);
+            row.descriptor = true;
+            row.path = path.to_string();
+            row
+        };
+        let one = ChangedOutput {
+            routes: 0,
+            calls: 1,
+            files: 1,
+            services: 2,
+            problems: vec![built("/b")],
+            failing: 0,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        assert_eq!(
+            one.render(false).lines().next().unwrap(),
+            "carrick check: checked 0 routes and 1 call in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route, plus 1 built request not seen sent, \
+             run with --all to list them"
+        );
+        assert!(
+            one.render(true)
+                .contains("GET /b: no service in this workspace serves it [built request not seen sent, does not fail]"),
+            "{}",
+            one.render(true)
+        );
+        let mut candidate = problem(ProblemKind::NoRoute, false);
+        candidate.path = "/c".to_string();
+        let mixed = ChangedOutput {
+            problems: vec![built("/b"), built("/d"), candidate],
+            ..one
+        };
+        assert_eq!(
+            mixed.render(false).lines().next().unwrap(),
+            "carrick check: checked 0 routes and 1 call in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route, plus 1 model candidate and \
+             2 built requests not seen sent, run with --all to list them"
         );
     }
 

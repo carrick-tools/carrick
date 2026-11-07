@@ -264,7 +264,7 @@
         "col": { "type": ["integer", "null"], "minimum": 1 },
         "source": {
           "enum": ["fact", "candidate", "not_stated"],
-          "description": "fact = a deterministic pass stated it; candidate = the model stated the row (resolution_source model, or inline_literal: a model row whose path is a literal in the source). Candidate rows are model answers from the scan that built the index, or replayed hosted model answers on unchanged files. not_stated = the row recorded no source."
+          "description": "fact = a deterministic pass stated it; candidate = the model stated the row (resolution_source model, or inline_literal: a model row whose path is a literal in the source), or the code builds a request it does not send (resolution_source request_descriptor: a function nothing in its service calls returns { url, method, ... }). Model candidates are answers from the scan that built the index, or replayed hosted model answers on unchanged files. not_stated = the row recorded no source."
         },
         "resolution_source": {
           "type": ["string", "null"],
