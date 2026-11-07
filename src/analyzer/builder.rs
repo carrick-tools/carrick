@@ -83,9 +83,6 @@ impl AnalyzerBuilder {
             analyzer.endpoints = endpoints;
         }
 
-        // Build the router
-        analyzer.build_endpoint_router();
-
         if !self.skip_type_resolution {
             analyzer.resolve_types_for_endpoints(self.cm.clone());
         }
