@@ -807,22 +807,29 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             self.hole(at, InstanceHole::Unread, None);
             return;
         };
-        let here = (placed.file.to_path_buf(), key.to_string());
+        let at = self.at(&placed);
+        self.up_from(placed.file, key, own, at);
+    }
+
+    /// Walk up every caller of the definition `key` of `file`, whose
+    /// receiver, as its own body reads it, is `own`; `at` names the walk's
+    /// position for its ends.
+    fn up_from(&mut self, file: &Path, key: &str, own: Vec<Piece>, at: String) {
+        let here = (file.to_path_buf(), key.to_string());
         if self.passing.contains(&here) {
             return;
         }
         if !self
             .walked
-            .insert((placed.file.to_path_buf(), key.to_string(), own.clone()))
+            .insert((file.to_path_buf(), key.to_string(), own.clone()))
         {
             return;
         }
-        let callers = self.calls.callers_of(placed.file, key);
+        let callers = self.calls.callers_of(file, key);
         // A library member may run the function as well as code calling
         // it: each scope a labelled member opens for it is an end too
         // (carrick#2474 R2b).
-        let hosts = self.hosts_of(placed.file, key);
-        let at = self.at(&placed);
+        let hosts = self.hosts_of(file, key);
         let param = match own.as_slice() {
             [Piece::Param(index, _)] => Some(*index),
             _ => None,
@@ -836,13 +843,12 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             match (hosts.is_empty(), scoped) {
                 (true, _) => {
                     // Another service may call it (carrick#2474 R5a).
-                    let boundary =
-                        param
-                            .zip(self.fn_at(placed.file, key))
-                            .map(|(param, function)| Boundary::EntryParam {
-                                function,
-                                param: param as u32,
-                            });
+                    let boundary = param.zip(self.fn_at(file, key)).map(|(param, function)| {
+                        Boundary::EntryParam {
+                            function,
+                            param: param as u32,
+                        }
+                    });
                     self.boundary_hole(at, InstanceHole::EntryPoint, boundary);
                 }
                 (false, false) => self.hole(at, InstanceHole::RunsByLibrary, None),
@@ -1574,8 +1580,67 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             .cloned();
         match client {
             Some(client) => self.client(&client, &declaring, at),
+            None if self.module_binding(&declaring, line, symbol, &at) => {}
             None => self.hole(at, InstanceHole::Unread, Some(symbol.to_string())),
         }
+    }
+
+    /// The instances the module binding `symbol`, declared on `line` of
+    /// `file`, holds (carrick#3489 W5, carrick#3504 S1): each value written
+    /// to it, its initialiser and every assignment, is an end (the walk's
+    /// per-end rule). A write of the writing function's parameter walks up
+    /// that function's callers; a write the census cannot place, or whose
+    /// value names no instance, is a hole. `false` where the file declares
+    /// no such binding.
+    fn module_binding(&mut self, file: &Path, line: u32, symbol: &str, at: &str) -> bool {
+        let inputs = self.inputs;
+        let Some(ir) = inputs.files.get(file) else {
+            return false;
+        };
+        let Some(binding) = ir.module_bindings.get(&(line, symbol.to_string())) else {
+            return false;
+        };
+        let here = (file.to_path_buf(), format!("{line}:{symbol}"));
+        if !self.factories.insert(here.clone()) {
+            return true;
+        }
+        let unread = Some(symbol.to_string());
+        if binding.unplaceable {
+            self.hole(at.to_string(), InstanceHole::Unread, unread);
+        } else {
+            match &binding.init_held {
+                Some(held) => self.held(held, file, at.to_string()),
+                // An initialiser that names no instance.
+                None if !binding.init.is_empty() => {
+                    self.hole(at.to_string(), InstanceHole::Unread, unread.clone())
+                }
+                // No initialiser: the binding holds nothing until written.
+                None => {}
+            }
+            for start in &binding.writes {
+                match super::super::resolve::placed_write(ir, *start) {
+                    Some((Some(key), write))
+                        if matches!(
+                            write.values.as_slice(),
+                            [ValueAt::Param { depth: 0, keys, .. }] if keys.is_empty()
+                        ) =>
+                    {
+                        let [ValueAt::Param { index, .. }] = write.values.as_slice() else {
+                            continue;
+                        };
+                        let own = vec![Piece::Param(*index, symbol.to_string())];
+                        self.up_from(file, key, own, at.to_string());
+                    }
+                    Some((_, write)) => match &write.held {
+                        Some(held) => self.held(held, file, at.to_string()),
+                        None => self.hole(at.to_string(), InstanceHole::Unread, unread.clone()),
+                    },
+                    None => self.hole(at.to_string(), InstanceHole::Unread, unread.clone()),
+                }
+            }
+        }
+        self.factories.remove(&here);
+        true
     }
 
     /// Whether `call`, written in `file`, is a library call

@@ -1866,3 +1866,48 @@ fn a_mounted_routes_manifest_entry_names_its_full_path() {
         "the mounted route is checked: {checked:#?}"
     );
 }
+
+/// carrick#3489 W5 (carrick#3504 S1): a route registered on a module `let`
+/// whose values include a maker's instance is a mount-graph row at its full
+/// path, `library_claim`, with no unread lead at its line. A `let` a
+/// destructuring writes is not read: it places no row at a path.
+#[test]
+fn a_let_receiver_route_takes_its_full_path() {
+    let on = scan_fixture("receiver-let-routes");
+    let (graph, flat) = endpoint_rows(&on);
+    let at = |site: &str| -> Vec<&String> {
+        graph
+            .iter()
+            .filter(|row| row.starts_with(&format!("{site} ")))
+            .collect()
+    };
+    // A `let` nothing writes again, and one an exported setter writes its
+    // parameter to: the root end places the route (the walk's per-end
+    // rule), the setter's entry point beside it.
+    for (site, want) in [
+        (
+            "src/s-let-never.ts:3",
+            "src/s-let-never.ts:3 GET /p/s-let-never library_claim",
+        ),
+        (
+            "src/s-let.ts:4",
+            "src/s-let.ts:4 GET /p/s-let library_claim",
+        ),
+    ] {
+        let rows = at(site);
+        assert_eq!(rows.len(), 1, "{site}: {graph:#?}");
+        assert!(rows[0].starts_with(want), "{site}: {graph:#?}");
+        assert!(
+            flat.iter().any(|row| row.starts_with(want)),
+            "{site}: {flat:#?}"
+        );
+        assert!(!unread_reasons(&on).contains_key(site));
+    }
+    // A write the census cannot place: no row at a path.
+    assert!(
+        at("src/s-let-unplaced.ts:4")
+            .iter()
+            .all(|row| !row.contains("library_claim")),
+        "{graph:#?}"
+    );
+}

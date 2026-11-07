@@ -1709,7 +1709,17 @@ impl<'a> Walker<'a> {
         if call.invokes_param.is_some() {
             return Outcome::stopped(INJECTED_CALLEE);
         }
-        match self.reach(file, call) {
+        let reach = self.reach(file, call);
+        // A callee the compiler declares as a module binding (`const s =
+        // send; s(…)`, a `let` written elsewhere): every value written to it
+        // (carrick#3504 S1).
+        if reach == Reach::NoFunction
+            && !construction
+            && let Some(values) = self.binding_callee(file, call, invoke)
+        {
+            return self.agree(values, invoke, Vec::new(), OF_VALUES);
+        }
+        match reach {
             Reach::Function(target, key) => {
                 let hop = self.hop(&target, &key);
                 let id = (target, key);
@@ -1767,6 +1777,20 @@ impl<'a> Walker<'a> {
             Reach::NoFunction => Outcome::default(),
             Reach::Unknown(reason) => Outcome::stopped(super::row_calls::hole_key(reason)),
         }
+    }
+
+    /// What the module binding `call`'s row names as its callee may hold
+    /// (carrick#3504 S1): `None` where the row names no module binding of
+    /// the run.
+    fn binding_callee(
+        &mut self,
+        file: &'a Path,
+        call: &'a CallIr,
+        invoke: Invoke<'a>,
+    ) -> Option<Vec<Held<'a>>> {
+        let resolver = self.values;
+        let (path, line, symbol) = resolver.declared_binding(self.row(file, call)?)?;
+        resolver.binding_values(self, path, line, &symbol, invoke)
     }
 
     /// What the functions written at `call` reach, each at an argument
@@ -1833,7 +1857,9 @@ impl<'a> Walker<'a> {
                     .stop
                     .as_ref()
                     .is_some_and(|(_, reason)| reason == "cycle");
-            if !cycle_stop {
+            // A definition read inside a resolver query over its step cap
+            // is not all it reaches (carrick#3504 S1).
+            if !cycle_stop && !self.values.capping() {
                 self.memo.insert(id.clone(), out.clone());
             }
         }
@@ -2397,12 +2423,13 @@ pub fn discover_with(
     if std::env::var_os("CARRICK_RESOLVER_CENSUS").is_some() {
         let census = values.census();
         crate::errln!(
-            "carrick-resolver-census root={} files={} queries={} max_query_steps={} steps={}",
+            "carrick-resolver-census root={} files={} queries={} max_query_steps={} steps={} capped_queries={}",
             root.display(),
             inputs.files.len(),
             census.queries,
             census.max_query_steps,
-            census.steps
+            census.steps,
+            census.capped_queries
         );
     }
     let ambiguous = walker.ambiguous.get();
@@ -2865,6 +2892,76 @@ mod tests {
                 .unanswered_at
                 .contains_key(&span("client.ts", "transmit(path, body)")),
             "a direct call records no passed package"
+        );
+    }
+
+    /// carrick#3504 S1 (#3485 rows 1-2): a callee held in a module `const`
+    /// alias is the function the alias names, and one held in a module `let`
+    /// is every value written to it, its initialiser and each assignment.
+    /// Values that reach different ends, a write of an exported setter's
+    /// parameter, a write the census cannot place (a destructuring target,
+    /// a write inside a callback) keep the call undecided. The answer key is
+    /// `tests/fixtures/callee-values/README.md`.
+    #[test]
+    fn a_callee_held_in_a_module_const_or_let_is_each_value_written_to_it() {
+        let Some(on) = walked("callee-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/callee-values/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        // What the walk records at `file:line`: `site` for a call decided
+        // to one end, else each stop (a site kept with a stop, or the
+        // reason the call was not followed).
+        let at = |file: &str, line: u32| -> Vec<String> {
+            let mut out: Vec<String> = discovery
+                .sites
+                .iter()
+                .chain(&discovery.unfollowed)
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .map(|site| match (&site.end, &site.stop) {
+                    (Some(end), None) => format!("site {}", end.export),
+                    (_, Some(stop)) => stop.clone(),
+                    (None, None) => "none".to_string(),
+                })
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        };
+        let decided = ["site fetch".to_string()];
+        assert_eq!(at("f-direct.ts", 4), decided, "the control");
+        assert_eq!(at("f-alias.ts", 6), decided, "a module const alias");
+        assert_eq!(at("f-let-never.ts", 6), decided, "a let never written");
+        assert_eq!(
+            at("f-let-agree.ts", 10),
+            decided,
+            "a let whose two values reach one end"
+        );
+        let several = ["several_values".to_string()];
+        assert_eq!(
+            at("f-let.ts", 10),
+            several,
+            "a let one write sets to a function that sends nothing"
+        );
+        assert_eq!(
+            at("f-let-param.ts", 10),
+            several,
+            "a let an exported setter writes its parameter to"
+        );
+        assert_eq!(
+            at("f-let-unplaced.ts", 10),
+            several,
+            "a let a destructuring writes"
+        );
+        assert_eq!(
+            at("f-let-nested.ts", 12),
+            several,
+            "a let a callback writes"
         );
     }
 
@@ -4955,6 +5052,35 @@ export function listen(): void {
                 "src/ri-const-alias.ts:4 <- src/ri-const-alias.ts:4 root src/ri-const-alias.ts:2",
                 "src/s-destructured.ts:4 <- src/s-destructured.ts:4 root src/s-destructured.ts:2",
                 "src/s-local-alias.ts:3 <- src/s-local-alias.ts:3 unread",
+            ]),
+            "{got:#?}"
+        );
+    }
+
+    /// carrick#3489 W5 (carrick#3504 S1): a module `let` holds every value
+    /// written to it. Its initialiser's maker is a root; a write of an
+    /// exported setter's parameter, which nothing in the service calls, is
+    /// an entry point; a write the census cannot place (a destructuring
+    /// target) leaves the binding unread. The answer key is
+    /// `tests/fixtures/receiver-let-routes/README.md`.
+    #[test]
+    fn a_module_let_ends_at_every_value_written_to_it() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-let-routes") else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = instance_ends(&decided);
+        assert_eq!(
+            got,
+            texts(&[
+                "src/s-let-never.ts:3 <- src/s-let-never.ts:3 root src/s-let-never.ts:2",
+                "src/s-let-unplaced.ts:4 <- src/s-let-unplaced.ts:4 unread",
+                "src/s-let.ts:4 <- src/s-let.ts:4 entry_point",
+                "src/s-let.ts:4 <- src/s-let.ts:4 root src/s-let.ts:2",
             ]),
             "{got:#?}"
         );
