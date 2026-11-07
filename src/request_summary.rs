@@ -1067,6 +1067,48 @@ impl Way {
     }
 }
 
+/// The two sides of a fallback (`a ?? b`, `a || b`) or a conditional
+/// (`c ? a : b`).
+struct Branches<'e> {
+    first: &'e Expr,
+    second: &'e Expr,
+    /// The second side is a default for the first, not a branch of its own.
+    fallback: bool,
+}
+
+/// How `expr` branches, if it does.
+fn branches(expr: &Expr) -> Option<Branches<'_>> {
+    match expr {
+        Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
+            Some(Branches {
+                first: &bin.left,
+                second: &bin.right,
+                fallback: true,
+            })
+        }
+        Expr::Cond(cond) => Some(Branches {
+            first: &cond.cons,
+            second: &cond.alt,
+            fallback: false,
+        }),
+        _ => None,
+    }
+}
+
+/// Every side `expr` branches into, through each nested branch (`a ?? (b ||
+/// c)` gives `a`, `b`, `c`); `expr` itself where it does not branch.
+fn leaves(expr: &Expr) -> Vec<&Expr> {
+    let expr = unwrap_value(expr);
+    match branches(expr) {
+        Some(Branches { first, second, .. }) => {
+            let mut out = leaves(first);
+            out.extend(leaves(second));
+            out
+        }
+        None => vec![expr],
+    }
+}
+
 /// What the receiver trace reads at one call (carrick#2474 R2a): the
 /// receiver object's value as the body reads it (a parameter, a key of
 /// one, an enclosing function's), the instance the receiver holds where
@@ -1075,6 +1117,11 @@ impl Way {
 struct InstanceIr {
     receiver_value: Option<Value>,
     receiver_held: Option<HeldInstance>,
+    /// A receiver that is a fallback or a conditional (`(a ?? b).get(..)`,
+    /// `(flag ? a : b).get(..)`): each branch's value and held instance, read
+    /// as a single receiver is (carrick#3489 W3). Empty for any other
+    /// receiver, and then `receiver_value` and `receiver_held` are its.
+    receiver_ways: Vec<(Option<Value>, Option<HeldInstance>)>,
     args: Vec<ArgHeld>,
 }
 
@@ -4757,22 +4804,22 @@ impl Reader<'_> {
 
     fn ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Way> {
         match unwrap_value(expr) {
-            // `opts.prefix ?? '/api'`: the left side, then the default.
-            Expr::Bin(bin) if bin.op == BinaryOp::NullishCoalescing => {
-                let mut ways = self.ways(&bin.left, scope);
-                ways.extend(Way::defaulted(self.ways(&bin.right, scope)));
-                ways
-            }
-            // `opts.prefix || '/api'`.
-            Expr::Bin(bin) if bin.op == BinaryOp::LogicalOr => {
-                let mut ways = self.ways(&bin.left, scope);
-                ways.extend(Way::defaulted(self.ways(&bin.right, scope)));
-                ways
-            }
-            // `opts.legacy ? '/legacy' : '/api'`: each branch.
-            Expr::Cond(cond) => {
-                let mut ways = self.ways(&cond.cons, scope);
-                ways.extend(self.ways(&cond.alt, scope));
+            // `opts.prefix ?? '/api'` (the left side, then the default),
+            // `opts.prefix || '/api'`, and `opts.legacy ? '/legacy' : '/api'`
+            // (each branch).
+            expr if branches(expr).is_some() => {
+                let Branches {
+                    first,
+                    second,
+                    fallback,
+                } = branches(expr).expect("branches checked");
+                let mut ways = self.ways(first, scope);
+                let second = self.ways(second, scope);
+                if fallback {
+                    ways.extend(Way::defaulted(second));
+                } else {
+                    ways.extend(second);
+                }
                 ways
             }
             // A parameter with a default: what a caller hands in, then
@@ -4809,10 +4856,24 @@ impl Reader<'_> {
             },
             _ => None,
         });
-        let receiver_value = object
-            .filter(|object| matches!(unwrap_value(object), Expr::Ident(_) | Expr::Member(_)))
-            .map(|object| self.eval(unwrap_value(object), scope));
-        let receiver_held = object.and_then(|object| self.held(object, scope));
+        // A receiver that branches reads as each of its sides instead.
+        let receiver_ways: Vec<(Option<Value>, Option<HeldInstance>)> = object
+            .filter(|object| branches(unwrap_value(object)).is_some())
+            .map(|object| {
+                leaves(object)
+                    .into_iter()
+                    .map(|side| (self.receiver_value(side, scope), self.held(side, scope)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (receiver_value, receiver_held) = if receiver_ways.is_empty() {
+            (
+                object.and_then(|object| self.receiver_value(object, scope)),
+                object.and_then(|object| self.held(object, scope)),
+            )
+        } else {
+            (None, None)
+        };
         let args = args
             .iter()
             .map(|arg| {
@@ -4894,8 +4955,16 @@ impl Reader<'_> {
         InstanceIr {
             receiver_value,
             receiver_held,
+            receiver_ways,
             args,
         }
+    }
+
+    /// The value of a receiver as the body reads it: for a name or a member
+    /// read only, since a call's value is no parameter.
+    fn receiver_value(&self, object: &Expr, scope: &Scope<'_>) -> Option<Value> {
+        matches!(unwrap_value(object), Expr::Ident(_) | Expr::Member(_))
+            .then(|| self.eval(unwrap_value(object), scope))
     }
 
     fn text(&self, span: Span) -> String {

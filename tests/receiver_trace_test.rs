@@ -549,35 +549,32 @@ fn routes_on_module_aliases_take_their_full_paths() {
 }
 
 /// carrick#3489 W3: a route registered on a receiver that is a fallback or a
-/// conditional (`(opts.app ?? def).get(..)`, `(flag ? a : b).get(..)`) is a
-/// mount-graph row at its full path, `library_claim`, from the side that is a
-/// module app, with no unread lead at its line.
+/// conditional (`(opts.app ?? def).get(..)`, `(flag ? a : b).get(..)`) is
+/// read to its instances now: the conditional's two apps are both roots, so
+/// that route is traced and stopped only where no row can be written for it
+/// (`routes_untraced_owner_unknown`: a receiver that is no binding has no
+/// symbol to own a row). The fallback whose left side is a key no caller
+/// hands in ends at an unread hole, so it stays untraced as any hole is
+/// (`hole_unread`). Neither is `no_instance` any more, and neither places a
+/// row.
 #[test]
-fn a_fallback_receiver_route_takes_its_full_path() {
-    let on = scan_fixture("receiver-forms-routes");
-    let (graph, flat) = endpoint_rows(&on);
-    for (site, want) in [
-        (
-            "src/s-coalesce.ts:3",
-            "src/s-coalesce.ts:3 GET /p/s-coalesce library_claim",
-        ),
-        (
-            "src/s-flag.ts:5",
-            "src/s-flag.ts:5 GET /p/s-flag library_claim",
-        ),
-    ] {
+fn a_fallback_receiver_route_is_read_to_its_instances() {
+    let (on, fallbacks) = scan_fixture_reading("receiver-forms-routes");
+    assert_eq!(
+        route_counts(&fallbacks),
+        vec![
+            "web routes_untraced_hole_outside_service=1",
+            "web routes_untraced_hole_unread=4",
+            "web routes_untraced_owner_unknown=1",
+        ],
+        "{fallbacks:#?}"
+    );
+    let (graph, _) = endpoint_rows(&on);
+    for site in ["src/s-coalesce.ts:3 ", "src/s-flag.ts:5 "] {
         assert!(
-            graph.iter().any(|row| row.starts_with(want)),
+            graph.iter().all(|row| !row.starts_with(site)),
             "{site}: {graph:#?}"
         );
-        assert!(
-            flat.iter().any(|row| row.starts_with(want)),
-            "{site}: {flat:#?}"
-        );
-    }
-    let unread = unread_reasons(&on);
-    for site in ["src/s-coalesce.ts:3", "src/s-flag.ts:5"] {
-        assert!(!unread.contains_key(site), "{site}: {unread:#?}");
     }
 }
 

@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::constructions::Constructed;
 use super::super::{
-    CallIr, ClientRef, HeldInstance, KeyState, Link, MadeBy, MakerForm, Piece,
+    CallIr, ClientRef, HeldInstance, InstanceIr, KeyState, Link, MadeBy, MakerForm, Piece,
     RequestSummaryInputs, Value, Way,
 };
 use super::boundaries::{Boundary, FnAt};
@@ -703,12 +703,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// call).
     pub(super) fn of(self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
         let last = down[down.len() - 1];
-        let instance = &last.call.instance;
-        self.of_value(
-            down,
-            instance.receiver_value.as_ref(),
-            instance.receiver_held.as_ref(),
-        )
+        self.of_receiver(down, &last.call.instance)
     }
 
     /// The instance ends of the site whose calls are `down`, when its
@@ -716,12 +711,31 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// (carrick#1678): the instance is the scope call's receiver's, which
     /// `scope` reads in the body of the labelled call's function.
     pub(super) fn of_scoped(self, down: &[Placed<'a>], scope: &Placed<'a>) -> Vec<InstanceEnd> {
-        let instance = &scope.call.instance;
-        self.of_value(
-            down,
-            instance.receiver_value.as_ref(),
-            instance.receiver_held.as_ref(),
-        )
+        self.of_receiver(down, &scope.call.instance)
+    }
+
+    /// The instance ends of the receiver `instance` reads: each side of a
+    /// fallback or a conditional is its own end, the walk of each as a single
+    /// receiver's (carrick#3489 W3).
+    fn of_receiver(mut self, down: &[Placed<'a>], instance: &InstanceIr) -> Vec<InstanceEnd> {
+        if instance.receiver_ways.is_empty() {
+            return self.of_value(
+                down,
+                instance.receiver_value.as_ref(),
+                instance.receiver_held.as_ref(),
+            );
+        }
+        let last = down[down.len() - 1];
+        for (value, held) in &instance.receiver_ways {
+            // A side the syntax does not place fails closed, as a hole.
+            if value.is_none() && held.is_none() {
+                let at = self.at(&last);
+                self.hole(at, InstanceHole::Unread, None);
+                continue;
+            }
+            self.read(down, value.as_ref(), held.as_ref());
+        }
+        self.ends
     }
 
     /// The instance ends of what `placed`'s call is handed at `arg`
@@ -753,13 +767,20 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         value: Option<&Value>,
         held: Option<&HeldInstance>,
     ) -> Vec<InstanceEnd> {
+        self.read(down, value, held);
+        self.ends
+    }
+
+    /// Adds the ends of one receiver, read as `value` and `held`, to
+    /// `self.ends`.
+    fn read(&mut self, down: &[Placed<'a>], value: Option<&Value>, held: Option<&HeldInstance>) {
         let last = down[down.len() - 1];
         let Some(value) = value else {
             if let Some(held) = held {
                 let at = self.at(&last);
                 self.held(held, last.file, at);
             }
-            return self.ends;
+            return;
         };
         let mut pieces = value.pieces();
         if !holds_parameter(&pieces) {
@@ -769,7 +790,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 None if self.field(last.file, &pieces) => {}
                 None => self.hole(at, InstanceHole::Unread, opaque_text(&pieces)),
             }
-            return self.ends;
+            return;
         }
         // Down the site's own chain first: the deciding caller's value is
         // the one this site was decided by.
@@ -777,17 +798,16 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             let below = down[k + 1];
             let Some(own) = to_definition(&pieces, below.depth) else {
                 self.callback(&below, &pieces);
-                return self.ends;
+                return;
             };
             let caller = down[k];
             pieces = filled(&own, caller.call);
             if !holds_parameter(&pieces) {
                 self.handed(&caller, &own, &pieces);
-                return self.ends;
+                return;
             }
         }
         self.up(down[0], pieces);
-        self.ends
     }
 
     /// Walk up every caller of the definition `placed` is written in,

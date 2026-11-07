@@ -5238,7 +5238,10 @@ export function listen(): void {
             &declarations.verified_scopes,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
-        let got = without_files(instance_ends(&decided), MODULE_ALIAS_FILES);
+        let got = without_files(
+            without_files(instance_ends(&decided), MODULE_ALIAS_FILES),
+            FALLBACK_FILES,
+        );
         assert_eq!(
             got,
             texts(&[
@@ -5259,9 +5262,10 @@ export function listen(): void {
         "src/ri-const-alias.ts:",
         "src/s-destructured.ts:",
         "src/s-local-alias.ts:",
-        "src/s-coalesce.ts:",
-        "src/s-flag.ts:",
     ];
+
+    /// The `receiver-forms-routes` files carrick#3489 W3 reads.
+    const FALLBACK_FILES: &[&str] = &["src/s-coalesce.ts:", "src/s-flag.ts:"];
 
     /// `ends` without the lines of the files named by `prefixes`.
     fn without_files(ends: Vec<String>, prefixes: &[&str]) -> Vec<String> {
@@ -5319,10 +5323,7 @@ export function listen(): void {
             &declarations.verified_scopes,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
-        let got = only_files(
-            instance_ends(&decided),
-            &["src/s-coalesce.ts:", "src/s-flag.ts:"],
-        );
+        let got = only_files(instance_ends(&decided), FALLBACK_FILES);
         assert_eq!(
             got,
             texts(&[
