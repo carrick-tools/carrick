@@ -32,7 +32,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::super::RequestSummaryInputs;
-use super::super::values::ValueAt;
+use super::super::resolve::ValueAt;
 use super::composed::Mounts;
 use super::instances::{
     InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,

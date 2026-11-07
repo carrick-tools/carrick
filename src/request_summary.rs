@@ -233,10 +233,12 @@ pub(crate) mod implementations;
 // logged by a scan with the receiver trace on and dropped.
 pub(crate) mod dispatch;
 
-// What a callee that is a value may hold, read where each value is written,
-// for discovery's value walk (carrick#2432).
-mod values;
-use values::ValueAt;
+// The value resolver (carrick#3504): what a value may hold, lowered where
+// it is written and followed through callers, defaults, constructions and
+// returns. Discovery's value walk reads callees through it (carrick#2432).
+// Design: carrick-cloud docs/internal/decisions/2026-11-07-one-value-resolver.md
+mod resolve;
+use resolve::ValueAt;
 
 // What each construction of a class passes, across the service, for the
 // fields its constructor sets from a parameter (carrick#2452 slice 2).
@@ -4518,7 +4520,7 @@ struct Scope<'a> {
     /// What each key of a destructured parameter, and each local the body
     /// declares once and never assigns again, may hold, the enclosing
     /// functions' included (carrick#2432). Read by discovery's value walk
-    /// alone ([`values::ValueAt`]).
+    /// alone ([`resolve::ValueAt`]).
     held: HashMap<BindingKey, Vec<ValueAt>>,
     /// The functions the body declares once and never assigns again, by where
     /// each node starts, for what a `return` of the name hands back
