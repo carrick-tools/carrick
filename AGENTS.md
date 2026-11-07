@@ -112,3 +112,38 @@ If you need to touch a Lambda, Terraform, or a prompt, the change goes in `carri
 Reading or writing documentation, or running evals? Start at `docs/README.md` — the map. It says where everything lives and where new docs go; don't place a doc without it. Otherwise ignore `docs/`.
 
 The Carrick → carrick-cloud split landed in 2026-05. Follow-up work (OAuth dashboard, ELv2 relicense + flip public, etc.) is tracked as GitHub issues.
+
+<!-- carrick:check start -->
+## Carrick: use it while you work, not only at the end
+
+This workspace (one repository, 1 service) is indexed by Carrick. The
+`mcp__carrick__*` tools answer questions about code outside the file you are
+editing more completely than grep: across every service and every protocol
+(HTTP routes, socket events, pub/sub topics), including callers reached through
+SDKs, wrappers, client instances and untyped helpers that share no searchable
+name with what you changed. Pass `project: "scanner-evals"` on every Carrick
+call.
+
+1. Before you write a new function, helper or utility, call `search_by_intent`
+   (or `find_similar`) with a plain-English description of what it does. If
+   something in any package already does the job, or most of it, import it and
+   call it instead of writing your own. When the task names a new function or
+   file, still create it, but make its body call the existing function and add
+   only what the existing one lacks. Never leave a second copy of logic that
+   already exists.
+2. Before you change a route, a request or response shape, an event payload or
+   an exported function, call `get_operation` (method and path, or the event or
+   topic name) or `get_callers`, and update or explicitly clear every consumer
+   it lists, in every repository.
+3. Before you write code that calls another service's endpoint or handles its
+   event, call `get_endpoint_types` (or `get_contract_pair`) and use the real
+   request and response types it returns. Never take a shape from the ticket, a
+   similar endpoint or another API version, or a local copy of a type.
+4. Use grep and Read to confirm and to read code once Carrick has told you
+   where to look.
+5. Run `carrick check --changed` before you say it is done only when your change
+   touches a route, a call to another service, an event or a type another
+   service reads. Each file you edit is already checked for you, so a change no
+   other service sees needs nothing more. In your final summary, say what
+   Carrick found and what you changed because of it.
+<!-- carrick:check end -->

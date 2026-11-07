@@ -39,6 +39,40 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "carrick hook post-edit",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "carrick hook post-read",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "carrick hook stop --wait-s 200",
+            "timeout": 210,
+            "statusMessage": "Carrick: waiting for the re-check of your last edit"
+          }
+        ]
+      }
     ]
   }
 }
