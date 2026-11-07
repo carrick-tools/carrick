@@ -1568,6 +1568,14 @@ fn client_bases_follow_the_instance_walk() {
         "{rows:#?}"
     );
     assert_eq!(at("m-two-bases.ts"), Vec::<&str>::new(), "{rows:#?}");
+    // A module `let` the binding table reads (carrick#3489 W5): its
+    // initialiser's maker is the one root; the exported setter's parameter
+    // is an entry point, which states no base.
+    assert_eq!(
+        at("m-let.ts"),
+        vec!["src/m-let.ts:4 https://m.test/p/m-let request_summary"],
+        "{rows:#?}"
+    );
     // Sites the reader holds keep their rows.
     for (file, path) in [
         (

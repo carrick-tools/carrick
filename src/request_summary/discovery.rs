@@ -2895,6 +2895,106 @@ mod tests {
         );
     }
 
+    /// Discovery over `tests/fixtures/callee-values` with its one label.
+    fn callee_values_discovery() -> Option<Discovery> {
+        let on = walked("callee-values", "services/web", "web", &[], true)?;
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/callee-values/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        Some(discover(&on.inputs, &Labels::of_answer(&answer), &on.repo))
+    }
+
+    /// What the walk records at `file:line`: `site` for a call decided to
+    /// one end, else each stop (a site kept with a stop, or the reason the
+    /// call was not followed).
+    fn recorded_at(discovery: &Discovery, file: &str, line: u32) -> Vec<String> {
+        let mut out: Vec<String> = discovery
+            .sites
+            .iter()
+            .chain(&discovery.unfollowed)
+            .filter(|site| site.file.ends_with(file) && site.line == line)
+            .map(|site| match (&site.end, &site.stop) {
+                (Some(end), None) => format!("site {}", end.export),
+                (_, Some(stop)) => stop.clone(),
+                (None, None) => "none".to_string(),
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// carrick#3504 S1b (#3485 row 2): a callee held in a function's own
+    /// `let` that the body writes again is every value written to it, read
+    /// through the same binding table and write census as a module
+    /// binding: its initialiser and each assignment, a value of the
+    /// function's parameter read at its callers. Values that reach
+    /// different ends, a parameter no caller fills, and a write inside a
+    /// callback keep the call undecided. The answer key is
+    /// `tests/fixtures/callee-values/README.md`.
+    #[test]
+    fn a_callee_held_in_a_function_local_let_is_each_value_written_to_it() {
+        let Some(discovery) = callee_values_discovery() else {
+            return;
+        };
+        let decided = vec!["site fetch".to_string()];
+        let several = vec!["several_values".to_string()];
+        let wrong: Vec<String> = [
+            (
+                "f-local-agree.ts",
+                8,
+                &decided,
+                "two values that reach one end",
+            ),
+            (
+                "f-local-assigned.ts",
+                6,
+                &decided,
+                "declared bare, written once",
+            ),
+            (
+                "f-local-param-called.ts",
+                8,
+                &decided,
+                "a parameter its one caller fills",
+            ),
+            (
+                "f-local-init-param.ts",
+                8,
+                &decided,
+                "initialised from a filled parameter",
+            ),
+            (
+                "f-local-let.ts",
+                8,
+                &several,
+                "one write to a function that sends nothing",
+            ),
+            (
+                "f-local-param.ts",
+                8,
+                &several,
+                "a parameter no caller fills",
+            ),
+            (
+                "f-local-nested.ts",
+                8,
+                &several,
+                "a write inside a callback",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(file, line, want, form)| {
+            let got = recorded_at(&discovery, file, line);
+            (got != *want).then(|| format!("{file}:{line} ({form}): {got:?}, want {want:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// carrick#3504 S1 (#3485 rows 1-2): a callee held in a module `const`
     /// alias is the function the alias names, and one held in a module `let`
     /// is every value written to it, its initialiser and each assignment.
@@ -2904,35 +3004,10 @@ mod tests {
     /// `tests/fixtures/callee-values/README.md`.
     #[test]
     fn a_callee_held_in_a_module_const_or_let_is_each_value_written_to_it() {
-        let Some(on) = walked("callee-values", "services/web", "web", &[], true) else {
+        let Some(discovery) = callee_values_discovery() else {
             return;
         };
-        let text = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/callee-values/library-claims.json"),
-        )
-        .unwrap();
-        let answer = crate::library_store::parse_answer(&text);
-        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
-        // What the walk records at `file:line`: `site` for a call decided
-        // to one end, else each stop (a site kept with a stop, or the
-        // reason the call was not followed).
-        let at = |file: &str, line: u32| -> Vec<String> {
-            let mut out: Vec<String> = discovery
-                .sites
-                .iter()
-                .chain(&discovery.unfollowed)
-                .filter(|site| site.file.ends_with(file) && site.line == line)
-                .map(|site| match (&site.end, &site.stop) {
-                    (Some(end), None) => format!("site {}", end.export),
-                    (_, Some(stop)) => stop.clone(),
-                    (None, None) => "none".to_string(),
-                })
-                .collect();
-            out.sort();
-            out.dedup();
-            out
-        };
+        let at = |file: &str, line: u32| recorded_at(&discovery, file, line);
         let decided = ["site fetch".to_string()];
         assert_eq!(at("f-direct.ts", 4), decided, "the control");
         assert_eq!(at("f-alias.ts", 6), decided, "a module const alias");

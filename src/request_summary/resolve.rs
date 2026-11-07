@@ -50,13 +50,18 @@ pub(super) const MAX_VALUES: usize = 16;
 /// answers one value nothing reads, never the part it read.
 const MAX_QUERY_STEPS: usize = 2048;
 
-/// A module-scope binding (`const`, `let` or `var`) and every value written
-/// to it (carrick#3504 S1, the decision record's section 2.4): its
+/// A binding and every value written to it (the decision record's section
+/// 2.4): a module-scope `const`, `let` or `var` (carrick#3504 S1), or a
+/// function's own `let` or `var` its body writes again (S1b). Its
 /// initialiser and each assignment the write census places. Keyed in
-/// [`FileIr::module_bindings`] by the 1-based line its name is declared on and the
-/// name, as a compiler row names a declaration.
+/// [`FileIr::module_bindings`] by the 1-based line its name is declared on
+/// and the name, as a compiler row names a declaration.
 #[derive(Debug, Clone, Default)]
 pub(super) struct ModuleBinding {
+    /// The function whose body declares it, by its key in
+    /// [`FileIr::functions`]; `None` for a module binding. A parameter its
+    /// initialiser reads is that function's, read at its callers.
+    pub(super) declared_in: Option<String>,
     /// What the initialiser may hold, read in module scope. Empty when the
     /// declaration has none.
     pub(super) init: Vec<ValueAt>,
@@ -72,6 +77,18 @@ pub(super) struct ModuleBinding {
     /// (soundness rule 1). An importer cannot assign a module's binding
     /// (rule 2), so the module's own census is complete.
     pub(super) unplaceable: bool,
+}
+
+/// A function's own `let` or `var` that its body writes again
+/// (carrick#3504 S1b), with its initialiser read in the body's scope: the
+/// binding table takes it under the function's key, with the census's
+/// writes.
+#[derive(Debug, Clone)]
+pub(super) struct LocalBinding {
+    pub(super) key: BindingKey,
+    /// The 1-based line its name is declared on.
+    pub(super) line: u32,
+    pub(super) init: Vec<ValueAt>,
 }
 
 /// A plain assignment `name = value` written directly in a body (not in a
@@ -203,15 +220,24 @@ impl Visit for WriteCensus {
 }
 
 /// Each module-scope binding a plain name declares, with its initialiser
-/// read in module scope and every write the census finds (carrick#3504 S1).
+/// read in module scope and every write the census finds (carrick#3504 S1),
+/// and each function's own `let` its body writes again, under the
+/// function's key (S1b). Two bindings declared on one line with one name
+/// are each unplaceable: no row says which one a use means.
 pub(super) fn module_bindings(
     module: &Module,
     source_map: &Lrc<SourceMap>,
     reader: &Reader<'_>,
     scope: &Scope<'_>,
+    functions: &HashMap<String, FnIr>,
 ) -> HashMap<(u32, String), ModuleBinding> {
     let mut census = WriteCensus::default();
     module.visit_with(&mut census);
+    let unplaceable = |key: &BindingKey| {
+        census.opaque
+            || census.unplaceable.contains(key)
+            || census.declared.get(key).copied().unwrap_or(0) > 1
+    };
     let mut out: HashMap<(u32, String), ModuleBinding> = HashMap::new();
     for item in &module.body {
         let Some(var) = module_var_decl(item) else {
@@ -225,16 +251,36 @@ pub(super) fn module_bindings(
             let line = source_map.lookup_char_pos(ident.id.span.lo).line as u32;
             let init = declarator.init.as_deref();
             let binding = ModuleBinding {
+                declared_in: None,
                 init: init
                     .map(|init| reader.value_of(init, scope, &guards::Bound::default()))
                     .unwrap_or_default(),
                 init_held: init.and_then(|init| reader.held(init, scope)),
                 writes: census.writes.get(&key).cloned().unwrap_or_default(),
-                unplaceable: census.opaque
-                    || census.unplaceable.contains(&key)
-                    || census.declared.get(&key).copied().unwrap_or(0) > 1,
+                unplaceable: unplaceable(&key),
             };
             out.insert((line, ident.id.sym.to_string()), binding);
+        }
+    }
+    let mut keys: Vec<&String> = functions.keys().collect();
+    keys.sort();
+    for function in keys {
+        for local in &functions[function].local_bindings {
+            let binding = ModuleBinding {
+                declared_in: Some(function.clone()),
+                init: local.init.clone(),
+                init_held: None,
+                writes: census.writes.get(&local.key).cloned().unwrap_or_default(),
+                unplaceable: unplaceable(&local.key),
+            };
+            match out.entry((local.line, local.key.0.clone())) {
+                std::collections::hash_map::Entry::Occupied(mut taken) => {
+                    taken.get_mut().unplaceable = true;
+                }
+                std::collections::hash_map::Entry::Vacant(free) => {
+                    free.insert(binding);
+                }
+            }
         }
     }
     out
@@ -1351,8 +1397,36 @@ impl<'a> Resolver<'a> {
         if binding.unplaceable {
             out.push(nothing());
         }
+        // A value written in the body of the function `key` of `file`: a
+        // parameter of it is what its callers pass there.
+        let mut written = |out: &mut Vec<Held<F::Reached>>,
+                           value: &ValueAt,
+                           key: Option<&'a str>| match (value, key) {
+            (
+                ValueAt::Param {
+                    depth: 0,
+                    index,
+                    keys,
+                },
+                Some(key),
+            ) => {
+                let filled = self.callers_pass(
+                    follow,
+                    (file, Some(key), 0),
+                    (0, *index, keys),
+                    invoke,
+                    &mut Vec::new(),
+                );
+                if filled.is_empty() {
+                    out.push(nothing());
+                }
+                out.extend(filled);
+            }
+            (ValueAt::Param { .. }, _) => out.push(nothing()),
+            (other, _) => out.extend(self.read_value(follow, file, other, invoke, false)),
+        };
         for value in &binding.init {
-            out.extend(self.read_value(follow, file, value, invoke, false));
+            written(&mut out, value, binding.declared_in.as_deref());
         }
         for at in &binding.writes {
             let Some((key, write)) = placed_write(ir, *at) else {
@@ -1360,35 +1434,35 @@ impl<'a> Resolver<'a> {
                 continue;
             };
             for value in &write.values {
-                match (value, key) {
-                    (
-                        ValueAt::Param {
-                            depth: 0,
-                            index,
-                            keys,
-                        },
-                        Some(key),
-                    ) => {
-                        let filled = self.callers_pass(
-                            follow,
-                            (file, Some(key), 0),
-                            (0, *index, keys),
-                            invoke,
-                            &mut Vec::new(),
-                        );
-                        if filled.is_empty() {
-                            out.push(nothing());
-                        }
-                        out.extend(filled);
-                    }
-                    (ValueAt::Param { .. }, _) => out.push(nothing()),
-                    (other, _) => out.extend(self.read_value(follow, file, other, invoke, false)),
-                }
+                written(&mut out, value, key);
             }
         }
         self.bindings_reading.borrow_mut().remove(&reading);
         Some(self.settle(out))
     }
+}
+
+/// The parameter of `function` a write hands a binding whole, when `values`
+/// (what the write's value may hold) is that one parameter: as the
+/// function's body reads it, by its own name (`next` in `set(next) { app =
+/// next; }`). `None` for a parameter that binds no single name (a
+/// destructuring or a rest).
+pub(super) fn written_param(function: &FnIr, values: &[ValueAt]) -> Option<Vec<Piece>> {
+    let [
+        ValueAt::Param {
+            depth: 0,
+            index,
+            keys,
+        },
+    ] = values
+    else {
+        return None;
+    };
+    if !keys.is_empty() {
+        return None;
+    }
+    let name = &function.params.get(*index)?.as_ref()?.key.0;
+    Some(vec![Piece::Param(*index, name.clone())])
 }
 
 /// The plain assignment starting at `at`, written directly in a definition
@@ -1710,6 +1784,29 @@ mod tests {
         ] {
             assert!(census_of(source).1, "{source}");
         }
+    }
+
+    /// carrick#3504 S1b: a setter that writes its own parameter to a module
+    /// binding (`set(next) { app = next; }`) hands the binding that
+    /// parameter, named as the setter's body names it (`next`), not by the
+    /// binding's name (`app`).
+    #[test]
+    fn a_setter_write_names_the_setter_parameter() {
+        let Some(on) = walked("receiver-let-routes", ".", "web", &[], false) else {
+            return;
+        };
+        let ir = &on.inputs.files[&on.path("src/s-let.ts")];
+        let binding = &ir.module_bindings[&(2, "app".to_string())];
+        let [start] = binding.writes.as_slice() else {
+            panic!("one write: {:?}", binding.writes);
+        };
+        let (Some(key), write) = placed_write(ir, *start).expect("the write is placed") else {
+            panic!("the write is in a function");
+        };
+        assert_eq!(
+            written_param(&ir.functions[key], &write.values),
+            Some(vec![Piece::Param(0, "next".to_string())])
+        );
     }
 
     /// carrick#3504 S1: a query that reads more values than the step cap
