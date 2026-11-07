@@ -13,7 +13,7 @@ import * as assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { SidecarClient } from './helpers.js';
+import { SidecarClient, replySendClaims } from './helpers.js';
 
 const KIT_DTS = `export interface Res {
   statusCode: number;
@@ -36,6 +36,8 @@ export interface TypedRes<B> {
   cookie(name: string, value: string, options?: { httpOnly?: boolean; maxAge?: number }): TypedRes<B>;
 }
 export interface Req { body: unknown }
+export declare const reply: Res;
+export declare const typedReply: TypedRes<unknown>;
 export declare class App {
   put(path: string, handler: (req: Req, res: any) => void | Promise<void>): App;
   post(path: string, handler: (req: Req, res: Res) => void | Promise<void>): App;
@@ -167,6 +169,7 @@ describe('carrick#2463 a located error send on a row away from its handler', () 
           expression_line: lineOf(expressionText, ROUTES_TS.indexOf(after)),
         },
       ],
+      server_claims: replySendClaims('res-kit', repoDir, ['reply','typedReply'], ['json', 'send']),
     });
     return (res.inferred_types ?? []).find((t) => t.alias === alias);
   }

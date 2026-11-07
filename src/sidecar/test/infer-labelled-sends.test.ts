@@ -133,12 +133,12 @@ describe('carrick#2472 C2: labelled sends in the response-site walk', () => {
     return rest;
   };
 
-  it('A: a header setter before the error branch leaves the last success send the body, with and without labels', async () => {
-    for (const labels of [false, true]) {
-      const got = collapse((await infer('A', "{ error: 'bad', code: 1 }", labels))?.type_string);
-      assert.match(got, /total: number/, `labels=${labels}: ${got}`);
-      assert.doesNotMatch(got, /error/, `labels=${labels}: ${got}`);
-    }
+  it('A: a header setter before the error branch leaves the last success send the body when it is labelled', async () => {
+    const unlabelled = await infer('A', "{ error: 'bad', code: 1 }", false);
+    assert.strictEqual(reason(unlabelled), 'no_success_payload', 'without labels the statement send does not end the path');
+    const got = collapse((await infer('A', "{ error: 'bad', code: 1 }", true))?.type_string);
+    assert.match(got, /total: number/, got);
+    assert.doesNotMatch(got, /error/, got);
   });
 
   it('B: a success send in the else branch of an if is the body when it is labelled', async () => {
@@ -158,8 +158,8 @@ describe('carrick#2472 C2: labelled sends in the response-site walk', () => {
   });
 
   it('D: a trailing cookie setter is not the body; the labelled send before it is', async () => {
-    const unlabelled = collapse((await infer('D', "{ error: 'no session', code: 2 }", false))?.type_string);
-    assert.match(unlabelled, /^\{ id: string;? \}$/, `without labels the cookie value is read as the body: ${unlabelled}`);
+    const unlabelled = await infer('D', "{ error: 'no session', code: 2 }", false);
+    assert.strictEqual(reason(unlabelled), 'no_success_payload', 'without labels no statement send is read as the body');
     const got = collapse((await infer('D', "{ error: 'no session', code: 2 }", true))?.type_string);
     assert.match(got, /total: number/, got);
     assert.doesNotMatch(got, /\|/, `the cookie value joins no union: ${got}`);
