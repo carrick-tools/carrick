@@ -36,6 +36,7 @@ use crate::position_rows::{Kind, Row};
 use std::cell::{Cell, RefCell};
 
 mod text;
+mod text_reader;
 
 pub(super) use text::text_of;
 
@@ -1021,11 +1022,13 @@ pub(super) struct Resolver<'a> {
     siblings: &'a [&'a RequestSummaryInputs],
     /// Each function's callers, through what the rows say each call reaches:
     /// what fills a parameter a value is read from (carrick#2432).
-    callers: super::decided_sites::Calls<'a>,
+    /// Built on first use: the text reader never asks.
+    callers: std::cell::OnceCell<super::decided_sites::Calls<'a>>,
     /// Each class of the service read through its constructions, with them
     /// (carrick#2452): what fills a field its constructor sets from a
     /// parameter.
-    constructed: super::constructions::Constructed<'a>,
+    /// Built on first use: the text reader never asks.
+    constructed: std::cell::OnceCell<super::constructions::Constructed<'a>>,
     /// How many own factories' returns the value being read is inside.
     returns_depth: Cell<usize>,
     /// The fields being read through their constructions (carrick#2452): a
@@ -1047,6 +1050,9 @@ pub(super) struct Resolver<'a> {
     /// The module bindings being read (carrick#3504 S1): a binding written
     /// with its own value adds nothing (soundness rule 7).
     bindings_reading: RefCell<HashSet<(PathBuf, u32, String)>>,
+    /// The declarations being read for their text (carrick#3504 S2): a
+    /// value that reads itself holds no text.
+    texts_reading: RefCell<HashSet<(PathBuf, u32, String)>>,
 }
 
 /// What the resolver read (carrick#3504 S0): every value read, how many
@@ -1090,8 +1096,8 @@ impl<'a> Resolver<'a> {
         Resolver {
             inputs,
             siblings,
-            callers: super::decided_sites::Calls::through_reach(inputs),
-            constructed: super::constructions::constructed(inputs),
+            callers: std::cell::OnceCell::new(),
+            constructed: std::cell::OnceCell::new(),
             returns_depth: Cell::new(0),
             fields_reading: RefCell::new(HashSet::new()),
             census: Cell::new(Census::default()),
@@ -1099,7 +1105,20 @@ impl<'a> Resolver<'a> {
             capped: Cell::new(false),
             cap: MAX_QUERY_STEPS,
             bindings_reading: RefCell::new(HashSet::new()),
+            texts_reading: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Each function's callers ([`Self::callers`]'s index).
+    fn callers(&self) -> &super::decided_sites::Calls<'a> {
+        self.callers
+            .get_or_init(|| super::decided_sites::Calls::through_reach(self.inputs))
+    }
+
+    /// Each class read through its constructions.
+    fn constructed(&self) -> &super::constructions::Constructed<'a> {
+        self.constructed
+            .get_or_init(|| super::constructions::constructed(self.inputs))
     }
 
     /// The same resolver with a lower step cap.
@@ -1352,9 +1371,10 @@ impl<'a> Resolver<'a> {
         &'a super::constructions::FieldOrigin,
         Vec<super::decided_sites::Placed<'a>>,
     )> {
-        let built = match self.constructed.built.get(&(file, class)) {
+        let constructed = self.constructed();
+        let built = match constructed.built.get(&(file, class)) {
             Some(built) => built.clone(),
-            None if self.constructed.refused.contains(&(file, class)) => return None,
+            None if constructed.refused.contains(&(file, class)) => return None,
             None => Vec::new(),
         };
         let origin = self.inputs.files.get(file)?.class_origins.get(&class)?;
@@ -1534,7 +1554,7 @@ impl<'a> Resolver<'a> {
         }
         passing.push(id);
         let callee = defaults_of(self.function(file, key));
-        let callers: Vec<_> = self.callers.callers_of(file, key).to_vec();
+        let callers: Vec<_> = self.callers().callers_of(file, key).to_vec();
         let mut values = Vec::new();
         if callers.is_empty() {
             // Nothing calls it: what it holds is its default, if any.

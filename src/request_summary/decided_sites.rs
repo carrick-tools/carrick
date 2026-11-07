@@ -2501,7 +2501,7 @@ fn decide(
     let mounts = match (makers, &index) {
         (Some(makers), Some(index)) => {
             let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
-            let mut fold = super::site_record::NameFold::new(inputs, root);
+            let mut fold = super::site_record::NameFold::new(inputs, siblings, root);
             for site in &mut out.sites {
                 (site.composed, site.composed_trimmed) = match site.name_text() {
                     Some(own) => composed::compose(&site.instances, Some(&own), &mounts),

@@ -4164,7 +4164,7 @@ export function listen(): void {
         let decided =
             super::super::decided_sites::decided_sites(&on.inputs, &on.repo, &discovered, &labels);
         let records =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         (decided, records)
     }
 
@@ -4290,7 +4290,7 @@ export function listen(): void {
         let (untraced, records) = records_of(&on, &exports, &discovery);
         assert!(untraced.sites.iter().all(|site| site.instances.is_empty()));
         let traced =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         assert_eq!(
             serde_json::to_string(
                 &traced
@@ -4510,7 +4510,7 @@ export function listen(): void {
         // Records keep their state byte for byte, so no site's sha moves.
         let (_, records) = records_of(&on, &exports, &discovery);
         let traced =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         assert_eq!(
             serde_json::to_string(
                 &traced
@@ -4590,8 +4590,13 @@ export function listen(): void {
         let labels = SiteLabel::from_exports(&exports);
         let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
         let served = |decided: &super::super::decided_sites::Decided| {
-            let records =
-                super::super::site_record::site_records(&on.inputs, &on.repo, decided, &labels);
+            let records = super::super::site_record::site_records(
+                &on.inputs,
+                &[],
+                &on.repo,
+                decided,
+                &labels,
+            );
             let routes = crate::site_rows::traced(decided, &records);
             let mut served: Vec<String> = routes
                 .routes
@@ -4654,7 +4659,7 @@ export function listen(): void {
         let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         let routes = crate::site_rows::traced(&decided, &records);
         let served: Vec<String> = routes
             .routes
@@ -4709,7 +4714,7 @@ export function listen(): void {
         let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         let routes = crate::site_rows::traced(&decided, &records);
         let mut guessed: Vec<String> = routes
             .guessed
@@ -4752,7 +4757,7 @@ export function listen(): void {
         let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         let routes = crate::site_rows::traced(&decided, &records);
         let mut served: Vec<String> = routes
             .routes
@@ -4839,7 +4844,7 @@ export function listen(): void {
         let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         let mut forced: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for record in &records {
             let file = record
@@ -4993,7 +4998,7 @@ export function listen(): void {
         // argument, forced by the code with no call argument to ask for.
         let labels = SiteLabel::from_exports(&exports);
         let records =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         let routes = crate::site_rows::traced(&decided, &records);
         let mut served: Vec<String> = routes
             .routes

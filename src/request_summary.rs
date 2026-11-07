@@ -1629,6 +1629,13 @@ impl FileIr {
         lo.saturating_sub(self.source_start) + SWC_SPAN_BASE
     }
 
+    /// A span start in SWC numbering (a fresh parse of this file's source,
+    /// as the records' reader makes) in discovery numbering: the inverse of
+    /// [`Self::swc_start`].
+    pub(crate) fn discovery_start(&self, lo: u32) -> u32 {
+        lo.saturating_sub(SWC_SPAN_BASE) + self.source_start
+    }
+
     /// The import bindings whose declaring module the summaries read, the
     /// modules the file loads, and, when `every_specifier`, every specifier
     /// it loads a module by ([`crate::call_graph::resolve_call_edges`]'s

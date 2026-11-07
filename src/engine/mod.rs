@@ -7068,8 +7068,13 @@ fn site_records_of(
         unplaced = decided.unplaced.len(),
         "site questions: sites left to the summaries, sites with an unstated instance base, calls that hand a maker its function, sites named a reserved name, labelled calls the call index holds no call for"
     );
-    let records =
-        crate::request_summary::site_record::site_records(inputs, root, &decided, &labels);
+    let records = crate::request_summary::site_record::site_records(
+        inputs,
+        context.siblings,
+        root,
+        &decided,
+        &labels,
+    );
     SiteRecordsOf {
         discovered: discovery.sites.len(),
         reached_label,
