@@ -16,6 +16,7 @@
  *   cut to the variants a success-status send through the parameter carries.
  */
 
+import { functionBodyOf } from './function-body.js';
 import {
   Node,
   SyntaxKind,
@@ -313,24 +314,7 @@ export class StatedParams {
   private repoFunction(callee: Node): HandlerFunction | undefined {
     let symbol = callee.getSymbol();
     if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
-    for (const declaration of symbol?.getDeclarations() ?? []) {
-      if (!this.isRepoFile(declaration.getSourceFile())) continue;
-      if (
-        Node.isFunctionDeclaration(declaration) ||
-        Node.isMethodDeclaration(declaration) ||
-        Node.isArrowFunction(declaration) ||
-        Node.isFunctionExpression(declaration)
-      ) {
-        return declaration.getBody() ? declaration : undefined;
-      }
-      if (Node.isVariableDeclaration(declaration) || Node.isPropertyAssignment(declaration)) {
-        const initializer = declaration.getInitializer();
-        if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))) {
-          return initializer;
-        }
-      }
-    }
-    return undefined;
+    return functionBodyOf((symbol?.getDeclarations() ?? []).filter((d) => this.isRepoFile(d.getSourceFile())));
   }
 
   // ===========================================================================

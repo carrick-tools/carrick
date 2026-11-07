@@ -43,6 +43,7 @@ import {
   ts,
 } from 'ts-morph';
 import { typeToStringAsDeclared } from './print-type.js';
+import { functionBodyOf, peelValueWrappers } from './function-body.js';
 import type {
   InferRequestItem,
   InferResult,
@@ -7797,17 +7798,7 @@ export class TypeInferrer {
    * expression.
    */
   private builderFunctionOf(symbol: TsSymbol): BuilderFunction | undefined {
-    const bodies: BuilderFunction[] = [];
-    for (const declaration of symbol.getDeclarations()) {
-      if (Node.isFunctionDeclaration(declaration) && declaration.getBody()) {
-        bodies.push(declaration);
-      } else if (Node.isVariableDeclaration(declaration)) {
-        const initializer = declaration.getInitializer();
-        const fn = initializer ? this.peelTransparentExpression(initializer) : undefined;
-        if (fn && (Node.isArrowFunction(fn) || Node.isFunctionExpression(fn))) bodies.push(fn);
-      }
-    }
-    return bodies.length === 1 ? bodies[0] : undefined;
+    return functionBodyOf(symbol.getDeclarations(), { methods: false });
   }
 
   /**
@@ -8952,9 +8943,8 @@ export class TypeInferrer {
   private asHandlerFunction(node: Node, followWrapperCalls = true): FunctionLike | undefined {
     const expr = this.unwrapExpressionNode(node);
 
-    if (Node.isArrowFunction(expr) || Node.isFunctionExpression(expr)) {
-      return expr;
-    }
+    const inline = functionBodyOf([peelValueWrappers(expr)], { methods: false });
+    if (inline) return inline;
 
     if (Node.isIdentifier(expr)) {
       for (const def of expr.getDefinitionNodes()) {
@@ -8983,7 +8973,9 @@ export class TypeInferrer {
     followWrapperCalls = true
   ): FunctionLike | undefined {
     if (Node.isFunctionDeclaration(decl)) {
-      return decl;
+      // A declaration with no body anywhere (`declare function`) is still the
+      // handler's function; its body is out of reach, which callers read.
+      return functionBodyOf(decl.getSymbol()?.getDeclarations() ?? [decl], { methods: false }) ?? decl;
     }
 
     if (Node.isArrowFunction(decl) || Node.isFunctionExpression(decl)) {
@@ -9004,10 +8996,9 @@ export class TypeInferrer {
     if (varDecl) {
       const initializer = varDecl.getInitializer();
       if (initializer) {
+        const direct = functionBodyOf([varDecl], { methods: false });
+        if (direct) return direct;
         const inner = this.unwrapExpressionNode(initializer);
-        if (Node.isArrowFunction(inner) || Node.isFunctionExpression(inner)) {
-          return inner;
-        }
         if (followWrapperCalls && Node.isCallExpression(inner)) {
           return this.functionWrappedBy(inner, 0);
         }
@@ -10947,51 +10938,24 @@ export class TypeInferrer {
   private passThroughFunction(call: CallExpression, index: number): FunctionLike | undefined {
     let symbol = call.getExpression().getSymbol();
     if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
-    for (const declaration of symbol?.getDeclarations() ?? []) {
-      const fn =
-        Node.isFunctionDeclaration(declaration) || Node.isMethodDeclaration(declaration)
-          ? declaration
-          : Node.isVariableDeclaration(declaration)
-            ? this.unwrapExpressionNode(declaration.getInitializer())
-            : undefined;
-      if (
-        !fn ||
-        !(Node.isFunctionDeclaration(fn) ||
-          Node.isMethodDeclaration(fn) ||
-          Node.isArrowFunction(fn) ||
-          Node.isFunctionExpression(fn)) ||
-        !fn.getBody() ||
-        fn.getSourceFile().isDeclarationFile() ||
-        fn.getSourceFile().isInNodeModules()
-      ) {
-        continue;
-      }
-      const parameter = fn.getParameters()[index];
-      const parameterSymbol = parameter?.getNameNode().getSymbol()?.compilerSymbol;
-      if (!parameter || parameter.isRestParameter() || !parameterSymbol) continue;
-
-      const returned = this.returnedExpressions(fn);
-      let returnsArgument = false;
-      const everyReturnPasses = returned.every((expression) => {
-        let node: Node = expression;
-        while (
-          Node.isParenthesizedExpression(node) ||
-          Node.isAsExpression(node) ||
-          Node.isTypeAssertion(node) ||
-          Node.isSatisfiesExpression(node) ||
-          Node.isNonNullExpression(node)
-        ) {
-          node = node.getExpression();
-        }
-        if (Node.isIdentifier(node) && node.getSymbol()?.compilerSymbol === parameterSymbol) {
-          returnsArgument = true;
-          return true;
-        }
-        return this.isEmptyDefault(node);
-      });
-      if (everyReturnPasses && returnsArgument) return fn;
+    const fn = functionBodyOf(symbol?.getDeclarations() ?? []);
+    if (!fn || fn.getSourceFile().isDeclarationFile() || fn.getSourceFile().isInNodeModules()) {
+      return undefined;
     }
-    return undefined;
+    const parameter = fn.getParameters()[index];
+    const parameterSymbol = parameter?.getNameNode().getSymbol()?.compilerSymbol;
+    if (!parameter || parameter.isRestParameter() || !parameterSymbol) return undefined;
+
+    let returnsArgument = false;
+    const everyReturnPasses = this.returnedExpressions(fn).every((expression) => {
+      const node = peelValueWrappers(expression);
+      if (Node.isIdentifier(node) && node.getSymbol()?.compilerSymbol === parameterSymbol) {
+        returnsArgument = true;
+        return true;
+      }
+      return this.isEmptyDefault(node);
+    });
+    return everyReturnPasses && returnsArgument ? fn : undefined;
   }
 
   /** `{}`, `[]`, `null` or `undefined`: a default that states no member. */

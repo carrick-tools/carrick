@@ -39,6 +39,7 @@
  * pass the same value, has no such mode.
  */
 
+import { functionBodyOf } from './function-body.js';
 import { Node, SyntaxKind, type CallExpression, type Identifier, type Symbol as TsSymbol } from 'ts-morph';
 import { stepsOnPath } from './failure-path.js';
 
@@ -73,25 +74,7 @@ export interface ArgumentNarrowing {
 export function calledFunction(call: CallExpression): Node | undefined {
   let symbol = call.getExpression().getSymbol();
   if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol();
-  const declarations = symbol?.getDeclarations() ?? [];
-  if (declarations.length !== 1) return undefined;
-  const [declaration] = declarations;
-  if (
-    (Node.isFunctionDeclaration(declaration) || Node.isMethodDeclaration(declaration)) &&
-    declaration.getBody()
-  ) {
-    return declaration;
-  }
-  if (Node.isVariableDeclaration(declaration) || Node.isPropertyAssignment(declaration)) {
-    let initializer = declaration.getInitializer();
-    while (initializer && (Node.isParenthesizedExpression(initializer) || Node.isAsExpression(initializer))) {
-      initializer = initializer.getExpression();
-    }
-    if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))) {
-      return initializer;
-    }
-  }
-  return undefined;
+  return functionBodyOf(symbol?.getDeclarations() ?? []);
 }
 
 /** The one call in `caller` that runs `callee`, or `undefined` for none or several. */
