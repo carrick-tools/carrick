@@ -4133,7 +4133,7 @@ mod tests {
                         .iter()
                         .filter(|row| {
                             row.key.as_http() == Some((method, path))
-                                && row.file_path == PathBuf::from(&site)
+                                && row.file_path.as_path() == std::path::Path::new(&site)
                         })
                         .map(|row| row.dispatch.clone())
                         .collect();
@@ -8423,7 +8423,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             .enumerate()
             .map(|(index, (route_method, route_path))| {
                 entry(
-                    OperationKey::http(*route_method, *route_path),
+                    OperationKey::http(route_method, *route_path),
                     ManifestRole::Producer,
                     ManifestTypeKind::Response,
                     &format!("P{index}"),
