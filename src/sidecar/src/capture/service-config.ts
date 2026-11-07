@@ -5,12 +5,17 @@
  * function, so they type the service under the same options.
  *
  * The service root is searched first, for the names a service keeps its own
- * config under (`jsconfig.json` last: tsserver types a JavaScript file under
- * the jsconfig beside it, carrick#3497). Above it, the search is `tsc`'s own when it is run with no
+ * config under. Above it, the search is `tsc`'s own when it is run with no
  * `-p`: the nearest `tsconfig.json` in an ancestor directory. A layout that
  * keeps one config above several services (their module resolution, `paths`,
  * `lib`) is typed under that config, as the repo's own `tsc` types it; without
  * it, every import only that config resolves read `any`.
+ *
+ * A service-root `jsconfig.json` ranks after those names and before an
+ * ancestor `tsconfig.json` (carrick#3497): tsserver types a JavaScript file
+ * under the jsconfig beside it, not under a config above. Where no ancestor
+ * config exists the answer stays undefined, as before: the service is then
+ * typed per file by `fileConfigPath`, which reads the same jsconfig.
  *
  * The walk stops at the scan root, inclusive: a config outside the scanned
  * tree is never read. With no scan root, or a service outside it, only the
@@ -21,7 +26,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 /** The names a service root is searched for, in order. */
-const SERVICE_ROOT_NAMES = ['tsconfig.json', 'tsconfig.build.json', 'tsconfig.app.json', 'jsconfig.json'];
+const SERVICE_ROOT_NAMES = ['tsconfig.json', 'tsconfig.build.json', 'tsconfig.app.json'];
+
+/** The root config tsserver types a JavaScript service under, after the names above. */
+const SERVICE_ROOT_JSCONFIG = 'jsconfig.json';
 
 /** The name an ancestor directory is searched for, as `tsc` searches. */
 const ANCESTOR_NAME = 'tsconfig.json';
@@ -33,6 +41,8 @@ export function findServiceTsconfig(serviceRoot: string, scanRoot?: string): str
     const candidate = path.join(root, name);
     if (fs.existsSync(candidate)) return candidate;
   }
+  const jsconfig = path.join(root, SERVICE_ROOT_JSCONFIG);
+  const ownJsconfig = fs.existsSync(jsconfig) ? jsconfig : undefined;
   if (scanRoot === undefined) return undefined;
   // Containment is decided on real paths, so a symlink on either end cannot
   // hide the service inside the scan root or place it outside; the walk then
@@ -43,7 +53,7 @@ export function findServiceTsconfig(serviceRoot: string, scanRoot?: string): str
   for (let level = fromBound.split(path.sep).length; level > 0; level--) {
     dir = path.dirname(dir);
     const candidate = path.join(dir, ANCESTOR_NAME);
-    if (fs.existsSync(candidate)) return candidate;
+    if (fs.existsSync(candidate)) return ownJsconfig ?? candidate;
   }
   return undefined;
 }
