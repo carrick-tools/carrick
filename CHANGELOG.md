@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.3.147](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.146...carrick-v0.3.147) (2026-11-07)
+
+
+### Features
+
+* **hooks:** Stop states the session's contract check from the per-file re-checks ([#3466](https://github.com/carrick-tools/carrick/issues/3466)) ([#3474](https://github.com/carrick-tools/carrick/issues/3474)) ([3704f36](https://github.com/carrick-tools/carrick/commit/3704f360a1d2c2c209c69c8eb9af39eddc465b0e))
+* **match:** one pairing function for every protocol, with pinned vectors ([#3496](https://github.com/carrick-tools/carrick/issues/3496) slice 1) ([#3508](https://github.com/carrick-tools/carrick/issues/3508)) ([386a7c8](https://github.com/carrick-tools/carrick/commit/386a7c8159da2f8864e31dc4cf9137d67c3899bc))
+
+
+### Bug Fixes
+
+* **derive:** derived carrick.json names the governing config ([#3497](https://github.com/carrick-tools/carrick/issues/3497) S1) ([#3507](https://github.com/carrick-tools/carrick/issues/3507)) ([3a4af1d](https://github.com/carrick-tools/carrick/commit/3a4af1de2c207624de2aa6a979d19a0bef70b515))
+* **discovery:** an export label and a type label on one declaration are one op ([#3044](https://github.com/carrick-tools/carrick/issues/3044) S2) ([#3487](https://github.com/carrick-tools/carrick/issues/3487)) ([df75afb](https://github.com/carrick-tools/carrick/commit/df75afb258484ab9e8e68e14d27ae88dfa97d503))
+* **graphql:** document passes resolve aliases under the service's tsconfig ([#3497](https://github.com/carrick-tools/carrick/issues/3497) S3) ([#3505](https://github.com/carrick-tools/carrick/issues/3505)) ([f8eeb8b](https://github.com/carrick-tools/carrick/commit/f8eeb8bc4834b6ba789fcac844d1aa335f1fc4a6))
+* **instances:** a client's base comes from its instance's maker wherever the walk ends there ([#3488](https://github.com/carrick-tools/carrick/issues/3488)) ([#3492](https://github.com/carrick-tools/carrick/issues/3492)) ([946b8d1](https://github.com/carrick-tools/carrick/commit/946b8d193b4a069dea0a59a33728e5cee190fa19))
+* **instances:** a field holding a maker's instance is that instance ([#3489](https://github.com/carrick-tools/carrick/issues/3489) W1) ([#3491](https://github.com/carrick-tools/carrick/issues/3491)) ([3d79509](https://github.com/carrick-tools/carrick/commit/3d79509bf2129533374318a257ed5b9cb993dfa7))
+* **instances:** a getter holds what it returns ([#3489](https://github.com/carrick-tools/carrick/issues/3489) W4) ([#3512](https://github.com/carrick-tools/carrick/issues/3512)) ([560471d](https://github.com/carrick-tools/carrick/commit/560471d8654d36ff7b75c2837f777415779cded4))
+* **instances:** a module alias or destructured key holds its source instance ([#3489](https://github.com/carrick-tools/carrick/issues/3489) W2) ([#3495](https://github.com/carrick-tools/carrick/issues/3495)) ([e655ff2](https://github.com/carrick-tools/carrick/commit/e655ff237595f8462db7eea7602a9c33e3cd33c9))
+* **names:** fold names stated through let, enum members, constant keys and string built-ins ([#3484](https://github.com/carrick-tools/carrick/issues/3484)) ([339772a](https://github.com/carrick-tools/carrick/commit/339772ae5006014b17155e79ec3ec1c3863c4870))
+* **recheck:** root files no service reads leave other services un-stale ([#3465](https://github.com/carrick-tools/carrick/issues/3465)) ([#3475](https://github.com/carrick-tools/carrick/issues/3475)) ([a51d3ed](https://github.com/carrick-tools/carrick/commit/a51d3ed3bd02f901cffc9f9cbd8c4bb43cc954b2))
+* **sidecar:** an HTTP client op under the 1564 rules names its member declaration ([#3044](https://github.com/carrick-tools/carrick/issues/3044) S1) ([#3486](https://github.com/carrick-tools/carrick/issues/3486)) ([53205bc](https://github.com/carrick-tools/carrick/commit/53205bc7ec740a4291d42a22b3001897b22370b2))
+* **sidecar:** service-root names include jsconfig.json ([#3497](https://github.com/carrick-tools/carrick/issues/3497) S0) ([#3506](https://github.com/carrick-tools/carrick/issues/3506)) ([c094492](https://github.com/carrick-tools/carrick/commit/c0944923306e048642f24a50959875986d6ccef8))
+* **site-record:** an optional call keeps the record its plain twin has ([#3044](https://github.com/carrick-tools/carrick/issues/3044) S3) ([#3490](https://github.com/carrick-tools/carrick/issues/3490)) ([4ed077a](https://github.com/carrick-tools/carrick/commit/4ed077a500351bc214076c14047e170b596d9b56))
+* **tests:** end two local-mode flakes: log before record, private TMPDIR ([#3494](https://github.com/carrick-tools/carrick/issues/3494)) ([01b87e4](https://github.com/carrick-tools/carrick/commit/01b87e415a65ca27286d4835711d07dd32854c42)), closes [#3456](https://github.com/carrick-tools/carrick/issues/3456)
+
 ## [0.3.146](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.145...carrick-v0.3.146) (2026-11-06)
 
 
