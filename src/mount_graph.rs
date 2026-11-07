@@ -594,16 +594,20 @@ impl MountGraph {
 
     /// Whether two paths name the same declared route once param NAMES are
     /// ignored: same segment count, and each segment pair is literally equal
-    /// or a param on BOTH sides (`:id` vs `:param`). Trailing `?` optional
+    /// or a param on BOTH sides in any spelling (`:id`, `{id}`, `<id>`, `[id]`, `${id}`; `carrick_match::route_identity`). Trailing `?` optional
     /// markers are ignored for the comparison.
     pub(crate) fn paths_equal_modulo_param_names(a: &str, b: &str) -> bool {
+        let (a, b) = (
+            carrick_match::route_identity(a),
+            carrick_match::route_identity(b),
+        );
         let a_segments: Vec<&str> = a.split('/').collect();
         let b_segments: Vec<&str> = b.split('/').collect();
         a_segments.len() == b_segments.len()
-            && a_segments.iter().zip(&b_segments).all(|(a_seg, b_seg)| {
-                let (a_seg, b_seg) = (a_seg.trim_end_matches('?'), b_seg.trim_end_matches('?'));
-                a_seg == b_seg || (Self::is_param_segment(a_seg) && Self::is_param_segment(b_seg))
-            })
+            && a_segments
+                .iter()
+                .zip(&b_segments)
+                .all(|(a_seg, b_seg)| a_seg.trim_end_matches('?') == b_seg.trim_end_matches('?'))
     }
 
     // Path-matching semantics live in the `carrick-match` crate (the single
@@ -718,6 +722,46 @@ mod tests {
     use super::*;
 
     use crate::config::Config;
+
+    /// carrick#3496 slice 2b: the wrong-verb lookup reads param identity
+    /// through `route_identity`, so `<id>` and `${id}` routes are found
+    /// beside `:id`, and a literal still is not a param.
+    #[test]
+    fn wrong_verb_lookup_reads_every_param_spelling() {
+        let mut graph = MountGraph::new();
+        for (path, owner) in [
+            ("/orders/<id>", "a"),
+            ("/items/${id}", "b"),
+            ("/orders/list", "c"),
+        ] {
+            graph.endpoints.push(ResolvedEndpoint {
+                view_module: false,
+                method: "POST".to_string(),
+                path: path.to_string(),
+                full_path: path.to_string(),
+                handler: None,
+                owner: owner.to_string(),
+                file_location: "server.ts:1".to_string(),
+                middleware_chain: vec![],
+                repo_name: None,
+                service_name: None,
+                provenance: Default::default(),
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
+                resolution_source: None,
+                dispatch: None,
+                handler_span: None,
+                address: None,
+            });
+        }
+        let normalizer = UrlNormalizer::new(&Config::default());
+        let found = |url: &str| {
+            graph
+                .find_exact_path_matches_any_method(url, &normalizer)
+                .map(|rows| rows.iter().map(|r| r.owner.clone()).collect::<Vec<_>>())
+        };
+        assert_eq!(found("/orders/:id"), Some(vec!["a".to_string()]));
+        assert_eq!(found("/items/:id"), Some(vec!["b".to_string()]));
+    }
 
     /// Address chain S1: a row with no recorded address writes no `address`
     /// key, so a blob row with none is byte-identical to one written before
