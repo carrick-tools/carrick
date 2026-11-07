@@ -138,7 +138,7 @@ jobs:
           - shard: scan-5
             runner: cargo
             targets: >-
-              --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test
+              --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test --test optional_calls_test
           - shard: scan-3
             runner: cargo
             targets: >-
