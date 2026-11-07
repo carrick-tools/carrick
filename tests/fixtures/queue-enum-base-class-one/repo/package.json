@@ -1,0 +1,8 @@
+{
+  "name": "queue-enum-probe",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "bullmq": "5.12.0"
+  }
+}

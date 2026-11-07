@@ -1,0 +1,9 @@
+{
+  "services": [
+    { "name": "sender", "directory": "services/sender", "tsconfig": "tsconfig.json" },
+    { "name": "runner", "directory": "services/runner", "tsconfig": "tsconfig.json" },
+    { "name": "bystander", "directory": "services/bystander", "tsconfig": "tsconfig.json" },
+    { "name": "queue-kit", "directory": "packages/queue-kit", "tsconfig": "tsconfig.json" },
+    { "name": "topics", "directory": "packages/topics", "tsconfig": "tsconfig.json" }
+  ]
+}
