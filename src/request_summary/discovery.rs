@@ -2395,10 +2395,14 @@ pub fn discover_with(
     // The value resolver's step census (carrick#3504 S0): what sets its
     // step cap, read on the replay box. Off by default; never in the blob.
     if std::env::var_os("CARRICK_RESOLVER_CENSUS").is_some() {
+        let census = values.census();
         crate::errln!(
-            "carrick-resolver-census service_root={} steps={}",
+            "carrick-resolver-census root={} files={} queries={} max_query_steps={} steps={}",
             root.display(),
-            values.steps()
+            inputs.files.len(),
+            census.queries,
+            census.max_query_steps,
+            census.steps
         );
     }
     let ambiguous = walker.ambiguous.get();

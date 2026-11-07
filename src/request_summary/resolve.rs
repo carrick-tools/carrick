@@ -573,9 +573,38 @@ pub(super) struct Resolver<'a> {
     /// read (`new Fork({ send: this.send })` in a method of `Fork`) adds
     /// nothing.
     fields_reading: RefCell<HashSet<(&'a Path, u32, String)>>,
-    /// How many values were read: the census that sets the decision
-    /// record's step cap (D7). It counts and never stops a read.
-    steps: Cell<usize>,
+    /// The step census that sets the decision record's per-query step cap
+    /// (D7). It counts and never stops a read.
+    census: Cell<Census>,
+    /// How many resolver calls are open, and the step count when the
+    /// outermost one opened.
+    open: Cell<(usize, usize)>,
+}
+
+/// What the resolver read (carrick#3504 S0): every value read, how many
+/// queries (outermost resolver calls, the ends their consumer followed
+/// inside them included), and the most values one query read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Census {
+    pub(super) steps: usize,
+    pub(super) queries: usize,
+    pub(super) max_query_steps: usize,
+}
+
+/// One open resolver call; the outermost one closing ends a query.
+struct Query<'r, 'a>(&'r Resolver<'a>);
+
+impl Drop for Query<'_, '_> {
+    fn drop(&mut self) {
+        let (depth, start) = self.0.open.get();
+        self.0.open.set((depth - 1, start));
+        if depth == 1 {
+            let mut census = self.0.census.get();
+            census.queries += 1;
+            census.max_query_steps = census.max_query_steps.max(census.steps - start);
+            self.0.census.set(census);
+        }
+    }
 }
 
 impl<'a> Resolver<'a> {
@@ -590,13 +619,26 @@ impl<'a> Resolver<'a> {
             constructed: super::constructions::constructed(inputs),
             returns_depth: Cell::new(0),
             fields_reading: RefCell::new(HashSet::new()),
-            steps: Cell::new(0),
+            census: Cell::new(Census::default()),
+            open: Cell::new((0, 0)),
         }
     }
 
-    /// How many values the resolver has read.
-    pub(super) fn steps(&self) -> usize {
-        self.steps.get()
+    /// What the resolver has read so far.
+    pub(super) fn census(&self) -> Census {
+        self.census.get()
+    }
+
+    /// Opens a resolver call for the census.
+    fn enter(&self) -> Query<'_, 'a> {
+        let (depth, start) = self.open.get();
+        let start = if depth == 0 {
+            self.census.get().steps
+        } else {
+            start
+        };
+        self.open.set((depth + 1, start));
+        Query(self)
     }
 
     /// The inputs that hold `file`: this service's, else the first sibling's
@@ -648,7 +690,10 @@ impl<'a> Resolver<'a> {
         invoke: Invoke<'a>,
         at_caller: bool,
     ) -> Vec<Held<F::Reached>> {
-        self.steps.set(self.steps.get() + 1);
+        let _query = self.enter();
+        let mut census = self.census.get();
+        census.steps += 1;
+        self.census.set(census);
         let nothing = || vec![Held::Reached(F::Reached::default())];
         match value {
             ValueAt::Param { depth, index, keys } => {
@@ -789,6 +834,7 @@ impl<'a> Resolver<'a> {
         field: &str,
         invoke: Invoke<'a>,
     ) -> Option<Vec<Held<F::Reached>>> {
+        let _query = self.enter();
         let (origin, from, built) = self.field_origin(file, class, field)?;
         let reading = (file, class, field.to_string());
         if !self.fields_reading.borrow_mut().insert(reading.clone()) {
@@ -867,6 +913,7 @@ impl<'a> Resolver<'a> {
         defaults: Option<Defaults<'a>>,
         invoke: Invoke<'a>,
     ) -> Vec<Held<F::Reached>> {
+        let _query = self.enter();
         let mut written: Vec<ValueAt> = Vec::new();
         let mut defaulted = at.is_none();
         if let Some(at) = at {
@@ -928,6 +975,7 @@ impl<'a> Resolver<'a> {
         invoke: Invoke<'a>,
         passing: &mut Vec<(PathBuf, String)>,
     ) -> Vec<Held<F::Reached>> {
+        let _query = self.enter();
         let (file, key, depth) = at;
         let (out, index, keys) = param;
         // A parameter of a function written in the body: what runs it
@@ -1153,7 +1201,12 @@ mod tests {
             [Got::End(End::Nothing)],
             "the global itself"
         );
-        assert!(resolver.steps() > 0, "the census counts every value read");
+        // Five queries above opened from outside the resolver; each reads at
+        // least the callee value itself.
+        let census = resolver.census();
+        assert!(census.queries >= 5, "{census:?}");
+        assert!(census.max_query_steps >= 1, "{census:?}");
+        assert!(census.steps >= census.max_query_steps, "{census:?}");
     }
 
     /// What an in-repo factory returns is read through its call, and
