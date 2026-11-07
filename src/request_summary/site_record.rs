@@ -1050,6 +1050,23 @@ impl Visit for CallFinder<'_> {
         self.walk_args(text, line, &call.args);
     }
 
+    /// An optional call (`x?.m(..)`) is the call its plain twin is: the site
+    /// is the whole chain or its call part, and takes the same record.
+    fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
+        if let OptChainBase::Call(call) = &*chain.base {
+            let whole = (chain.span.lo.0, chain.span.hi.0) == self.target;
+            if whole || (call.span.lo.0, call.span.hi.0) == self.target {
+                self.take(call.span, Some(&call.callee), &call.args, false);
+            }
+            call.callee.visit_with(self);
+            let text = self.parsed.text_of(call.callee.span());
+            let line = self.parsed.line(call.span.lo.0);
+            self.walk_args(text, line, &call.args);
+        } else {
+            chain.visit_children_with(self);
+        }
+    }
+
     fn visit_new_expr(&mut self, new: &NewExpr) {
         let args = new.args.as_deref().unwrap_or_default();
         if (new.span.lo.0, new.span.hi.0) == self.target {
