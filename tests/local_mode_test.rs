@@ -699,12 +699,14 @@ fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
     edit(&route_file, "activeCount: number", "activeCount: string");
     edit(&route_file, "activeCount: 3", "activeCount: \"3\"");
 
-    let before = recheck_temp_dirs();
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    let before = recheck_temp_dirs(temp.path());
     let started = Instant::now();
     let degraded: serde_json::Value = serde_json::from_str(&run_with_env(
         root,
         &["check", route, "--workspace", ".", "--recheck", "--json"],
-        &[("CARRICK_RECHECK_BUDGET_MS", "1")],
+        &[("CARRICK_RECHECK_BUDGET_MS", "1"), ("TMPDIR", tmpdir)],
     ))
     .expect("check --recheck --json was not JSON");
 
@@ -742,7 +744,7 @@ fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
         started.elapsed()
     );
     assert_eq!(
-        recheck_temp_dirs(),
+        recheck_temp_dirs(temp.path()),
         before,
         "a re-check leaves no temporary generation behind, including one it killed"
     );
@@ -939,8 +941,11 @@ fn a_comment_only_edit_is_answered_without_a_re_scan() {
         "// a note\nexport async function",
     );
 
-    let before = recheck_temp_dirs();
-    let answered: serde_json::Value = serde_json::from_str(&run(root, &args)).expect("JSON");
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    let before = recheck_temp_dirs(temp.path());
+    let answered: serde_json::Value =
+        serde_json::from_str(&run_with_env(root, &args, &[("TMPDIR", tmpdir)])).expect("JSON");
     assert_eq!(answered["stale"], serde_json::json!(false), "{answered:#}");
     assert!(
         answered["changed_since_index"].as_u64() >= Some(1),
@@ -972,7 +977,7 @@ fn a_comment_only_edit_is_answered_without_a_re_scan() {
         "no \"unresolved since your edit\" caveat on an unmoved row: {answered:#}"
     );
     assert_eq!(
-        recheck_temp_dirs(),
+        recheck_temp_dirs(temp.path()),
         before,
         "no re-scan generation was started"
     );
@@ -1062,11 +1067,20 @@ fn an_edit_the_scan_reads_differently_is_still_re_scanned() {
     }
 }
 
-/// Temporary generations a re-check has left in the system temp directory.
-/// Compared before and after rather than required to be empty: another test
-/// binary may be running one of its own (carrick#592).
-fn recheck_temp_dirs() -> usize {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+/// A temp directory of the test's own, handed to the re-check as `TMPDIR`.
+///
+/// The re-check stages its generation under the system temp directory, and
+/// nextest runs every other test in a process of its own beside this one: a
+/// count taken in the shared directory moved whenever another test's re-check
+/// came or went between the two reads (carrick#3456).
+fn private_temp() -> tempfile::TempDir {
+    tempfile::tempdir().expect("a private temp dir")
+}
+
+/// Temporary generations a re-check has left in `temp`, the directory it was
+/// handed as `TMPDIR` by [`private_temp`].
+fn recheck_temp_dirs(temp: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(temp) else {
         return 0;
     };
     entries
@@ -4868,6 +4882,9 @@ fn a_no_rescan_recheck_answers_at_once_and_starts_nothing() {
     let workspace = shop();
     let root = workspace.path();
     index(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    let probe_env = [AMPLE[0], ("TMPDIR", tmpdir)];
     let probe = |file: &str| -> serde_json::Value {
         let text = run_with_env(
             root,
@@ -4880,7 +4897,7 @@ fn a_no_rescan_recheck_answers_at_once_and_starts_nothing() {
                 "--no-rescan",
                 "--json",
             ],
-            &AMPLE,
+            &probe_env,
         );
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
     };
@@ -4922,7 +4939,7 @@ fn a_no_rescan_recheck_answers_at_once_and_starts_nothing() {
         "activeCount: number",
         "activeCount: string",
     );
-    let before = recheck_temp_dirs();
+    let before = recheck_temp_dirs(temp.path());
     let deferred = probe(SHOP_CLIENT);
     assert_eq!(
         deferred["recheck"]["deferred"],
@@ -4943,7 +4960,11 @@ fn a_no_rescan_recheck_answers_at_once_and_starts_nothing() {
         indexed_results,
         "the verdicts are the indexed ones, not a re-check's:\n{deferred:#}"
     );
-    assert_eq!(recheck_temp_dirs(), before, "no staged generation was left");
+    assert_eq!(
+        recheck_temp_dirs(temp.path()),
+        before,
+        "no staged generation was left"
+    );
     for kept in ["recheck-misses.json", "working"] {
         assert!(
             !root.join(".carrick").join(kept).exists(),

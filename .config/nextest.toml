@@ -3,16 +3,9 @@
 # `#[serial]` only orders tests inside one process, so a test that must not
 # overlap another is named here instead.
 
-[test-groups]
-# `carrick check --recheck` writes a `carrick-recheck-*` generation into the
-# system temp directory. The budget test counts those before and after its own
-# run, so no other re-check may run beside it. These three are the only tests
-# that re-check (carrick#2151).
-recheck-temp = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'binary(=local_mode_test) & (test(=an_edit_is_re_judged_before_the_index_catches_up) | test(=a_re_check_names_the_functions_the_index_does_not_hold) | test(=a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking))'
-test-group = 'recheck-temp'
+# A test that counts the `carrick-recheck-*` generations a re-check stages
+# hands that re-check a temp directory of its own as `TMPDIR` rather than
+# claiming the shared one here (carrick#3456).
 
 # Both assert a 300 ms median for a read, which another running test's CPU use
 # would inflate. Claiming every slot keeps them alone on the machine.
