@@ -1093,7 +1093,7 @@ mod tests {
         file: &str,
         line: u32,
     ) -> (&'a Path, Option<&'a str>, u8, &'a CallIr) {
-        fn find<'a>(body: &'a FnIr, depth: u8, line: u32) -> Option<(u8, &'a CallIr)> {
+        fn find(body: &FnIr, depth: u8, line: u32) -> Option<(u8, &CallIr)> {
             body.read_calls()
                 .map(|(call, _)| call)
                 .find(|call| call.site.line == line && !call.callee_values.is_empty())
