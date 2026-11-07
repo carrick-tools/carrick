@@ -1808,3 +1808,61 @@ fn a_route_path_folded_by_the_name_fold_states_its_pieces() {
         "{addresses:#?}"
     );
 }
+
+/// carrick#3496 slice 3: the type check pairs a call over the merged mount
+/// graph's routes and takes the producer's type from the manifest entry at
+/// the winning route's site. That join holds only if every producer entry's
+/// key path is the route's `full_path` at that site, mounted prefix
+/// included: a router mounted under a prefix is where the two could part
+/// (one of them written before the trace rewrites a route's `full_path`).
+#[test]
+fn a_mounted_routes_manifest_entry_names_its_full_path() {
+    let on = scan_fixture("address-chain-express");
+    let mut checked = Vec::new();
+    for text in on.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        let manifest = blob["type_manifest"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no type manifest: {blob:#}"));
+        for row in blob["mount_graph"]["endpoints"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let location = row["file_location"].as_str().unwrap();
+            let (file, line) = location.rsplit_once(':').unwrap();
+            let line: u64 = line.parse().unwrap();
+            let method = row["method"].as_str().unwrap().to_uppercase();
+            let full_path = row["full_path"].as_str().unwrap();
+            let paths: Vec<&str> = manifest
+                .iter()
+                .filter(|entry| {
+                    entry["role"] == "producer"
+                        && entry["file_path"] == file
+                        && entry["line_number"] == line
+                        && entry["method"] == method.as_str()
+                })
+                .filter_map(|entry| entry["path"].as_str())
+                .collect();
+            assert!(
+                !paths.is_empty() && paths.iter().all(|path| *path == full_path),
+                "{location} {method} {full_path}: producer entries name {paths:?}; producer entries: {:?}",
+                manifest
+                    .iter()
+                    .filter(|entry| entry["role"] == "producer")
+                    .map(|entry| format!(
+                        "{}:{} {}",
+                        entry["file_path"], entry["line_number"], entry["path"]
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            checked.push(format!("{location} {method} {full_path}"));
+        }
+    }
+    assert!(
+        checked
+            .iter()
+            .any(|row| row == "src/server.ts:8 GET /api/orders/:id"),
+        "the mounted route is checked: {checked:#?}"
+    );
+}
