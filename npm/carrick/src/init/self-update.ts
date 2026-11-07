@@ -42,7 +42,7 @@ import path from "node:path";
 
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 import { isNewer } from "../update.ts";
-import { AGENTS_FILE, renderCheckSection, withCheckSection, type WorkspaceCounts } from "./agents-section.ts";
+import { AGENTS_FILE, CLAUDE_FILE, renderCheckSection, withCheckSection, type WorkspaceCounts } from "./agents-section.ts";
 import {
   entriesAreStale,
   outdatedFiles,
@@ -174,6 +174,30 @@ function updateAgentsSection(workspace: string, log: (message: string) => void):
 }
 
 /**
+ * The same block in a CLAUDE.md the workspace has (carrick#3515): refreshed, or
+ * added where the file exists without it. Only in a workspace whose AGENTS.md
+ * holds our marker, so a folder init never wrote to is left alone. Returns the
+ * file written, or null.
+ */
+function updateClaudeSection(workspace: string): string | null {
+  const target = path.join(workspace, CLAUDE_FILE);
+  try {
+    const agents = fs.readFileSync(path.join(workspace, AGENTS_FILE), "utf8");
+    if (!agents.includes("<!-- carrick:check start -->")) return null;
+    const existing = fs.readFileSync(target, "utf8");
+    const slug = snapshotProjectSlug(workspace);
+    const counts = snapshotCounts(workspace);
+    if (slug === "" || counts === null) return null;
+    const body = withCheckSection(existing, renderCheckSection({ slug }, counts));
+    if (body === existing) return null;
+    writeAtomic(target, body);
+    return CLAUDE_FILE;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Bring this workspace's Carrick files up to date for the running version.
  *
  * Returns the lines to print: one each for the hook entries, the skills and the AGENTS.md section, none
@@ -200,8 +224,11 @@ export function bringUpToDate(
     const roots = [...new Set(skills.map((file) => path.dirname(path.dirname(file))))];
     lines.push(`Carrick brought its task skills in ${roots.join(", ")} up to date for ${running}.`);
   }
-  if (updateAgentsSection(workspace, log) !== null) {
-    lines.push(`Carrick brought its rules section in ${AGENTS_FILE} up to date for ${running}.`);
+  const written = [updateAgentsSection(workspace, log), updateClaudeSection(workspace)].filter(
+    (file): file is string => file !== null,
+  );
+  if (written.length > 0) {
+    lines.push(`Carrick brought its rules section in ${written.join(" and ")} up to date for ${running}.`);
   }
   // The recorded version is what the mismatch line compares. Move it only when
   // nothing of ours is still old: a Codex hook file we may not touch keeps the

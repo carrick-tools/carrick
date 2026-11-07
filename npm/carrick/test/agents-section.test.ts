@@ -8,11 +8,15 @@ import path from "node:path";
 
 import {
   AGENTS_FILE,
+  CLAUDE_FILE,
   hasAgentsSection,
+  hasClaudeSection,
   removeAgentsSection,
+  removeClaudeSection,
   renderCheckSection,
   withCheckSection,
   writeAgentsSection,
+  writeClaudeSection,
 } from "../src/init/agents-section.ts";
 
 const SCOPE = { slug: "shop-system" };
@@ -140,6 +144,53 @@ test("remove deletes the new span and nothing else", () => {
     writeAgentsSection(dir, SCOPE, COUNTS);
     assert.equal(removeAgentsSection(dir), "section removed");
     assert.equal(fs.readFileSync(file, "utf8"), theirs);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The same block in an existing CLAUDE.md (carrick#3515): a subfolder session
+// never follows an `@AGENTS.md` import, so the block is written inline.
+test("a team CLAUDE.md gets the block below its own text, and none is created where there is none", () => {
+  const { dir } = folder();
+  try {
+    assert.equal(writeClaudeSection(dir, SCOPE, COUNTS), null);
+    assert.ok(!fs.existsSync(path.join(dir, CLAUDE_FILE)));
+    fs.writeFileSync(path.join(dir, CLAUDE_FILE), "# Team rules\n\nKeep handlers small.\n");
+    assert.equal(writeClaudeSection(dir, SCOPE, COUNTS), "written");
+    assert.equal(fs.readFileSync(path.join(dir, CLAUDE_FILE), "utf8"), `# Team rules\n\nKeep handlers small.\n\n${SECTION}`);
+    assert.equal(writeClaudeSection(dir, SCOPE, COUNTS), "unchanged");
+    assert.ok(hasClaudeSection(dir));
+    assert.ok(!fs.existsSync(path.join(dir, AGENTS_FILE)));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a CLAUDE.md that only imports AGENTS.md gets the inline block too", () => {
+  const { dir } = folder();
+  try {
+    fs.writeFileSync(path.join(dir, CLAUDE_FILE), "@AGENTS.md\n");
+    assert.equal(writeClaudeSection(dir, SCOPE, COUNTS), "written");
+    assert.equal(fs.readFileSync(path.join(dir, CLAUDE_FILE), "utf8"), `@AGENTS.md\n\n${SECTION}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("remove takes the block out of CLAUDE.md and keeps the file, even where it held only the block", () => {
+  const { dir } = folder();
+  const claude = path.join(dir, CLAUDE_FILE);
+  try {
+    fs.writeFileSync(claude, "# Team rules\n");
+    writeClaudeSection(dir, SCOPE, COUNTS);
+    assert.equal(removeClaudeSection(dir), "section removed");
+    assert.equal(fs.readFileSync(claude, "utf8"), "# Team rules\n");
+    assert.equal(removeClaudeSection(dir), null);
+    fs.writeFileSync(claude, SECTION);
+    assert.equal(removeClaudeSection(dir), "section removed");
+    assert.ok(fs.existsSync(claude));
+    assert.equal(fs.readFileSync(claude, "utf8"), "");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -142,7 +142,9 @@ workspace keeps the hook entries and skill bodies of whichever version first ran
   `.claude/settings.json` and `.claude/settings.local.json` (Claude Code
   sessions only), and, in Claude Code and Codex alike, the task skills still
   ours under `.claude/skills` and `.agents/skills` and the Carrick rules section
-  between its markers in `AGENTS.md`. It prints one line for
+  between its markers in `AGENTS.md`, and in a `CLAUDE.md` the folder already
+  has (init writes it there too and never creates that file; `carrick remove`
+  takes it out and keeps the file). It prints one line for
   each ("Carrick brought its hook entries in <file> up to date for <version>.")
   and records the version, so the "run `carrick init`" line is not what an
   upgrade costs. It skips a file that holds no entry of ours, a settings file

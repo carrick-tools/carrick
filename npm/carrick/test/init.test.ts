@@ -1274,6 +1274,31 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
   }
 });
 
+test("init writes the check block into an existing CLAUDE.md, and creates none where there is none (carrick#3515)", posixNativeFixture, () => {
+  for (const existing of ["# Team rules\n", null]) {
+    const fixture = executableInitFixture("payments", "absent", "monorepo");
+    try {
+      const claude = path.join(fixture.repo, "CLAUDE.md");
+      if (existing !== null) fs.writeFileSync(claude, existing);
+      const result = spawnSync(
+        process.execPath,
+        [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--yes", fixture.repo],
+        { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      if (existing === null) {
+        assert.ok(!fs.existsSync(claude));
+      } else {
+        const body = fs.readFileSync(claude, "utf8");
+        assert.ok(body.startsWith("# Team rules\n\n<!-- carrick:check start -->"), body);
+        assert.equal(body.slice(existing.length + 1), fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8"));
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
 // carrick#991 / carrick#978. A machine signed in to two GitHub accounts writes
 // its remotes through a per-account ssh alias, and the repository behind that
 // alias is an ordinary GitHub repository. Reading the host literally dropped

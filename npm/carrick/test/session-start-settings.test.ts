@@ -326,6 +326,29 @@ test("self-update leaves the AGENTS.md section alone, and says why, without a re
   assert.ok(said.some((message) => /AGENTS\.md section left/.test(message)));
 });
 
+test("self-update adds the block to a CLAUDE.md created after init, refreshes a stale one, and never touches it without the AGENTS.md marker (carrick#3515)", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const current = renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 });
+  put(workspace.root, "AGENTS.md", current);
+  put(workspace.root, "CLAUDE.md", "# Team\n");
+  snapshot(workspace.root, TWO_REPOS);
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+  assert.equal(fs.readFileSync(path.join(workspace.root, "CLAUDE.md"), "utf8"), `# Team\n\n${current}`);
+  assert.ok(lines.some((line) => /rules section in CLAUDE\.md/.test(line)), lines.join("\n"));
+  put(workspace.root, "CLAUDE.md", SURROUND_BEFORE + OLD_SECTION + SURROUND_AFTER);
+  bringUpToDate(workspace.root, workspace.root, running);
+  assert.equal(fs.readFileSync(path.join(workspace.root, "CLAUDE.md"), "utf8"), SURROUND_BEFORE + current + SURROUND_AFTER);
+
+  const bare = makeWorkspace();
+  t.after(() => bare.cleanup());
+  put(bare.root, "AGENTS.md", "# No marker\n");
+  put(bare.root, "CLAUDE.md", "# Team\n");
+  snapshot(bare.root, TWO_REPOS);
+  bringUpToDate(bare.root, bare.root, running);
+  assert.equal(fs.readFileSync(path.join(bare.root, "CLAUDE.md"), "utf8"), "# Team\n");
+});
+
 // A workspace used only from Codex gets the same rules refresh (carrick#3435):
 // Codex reads AGENTS.md directly, and only `.codex/hooks.json` has a trust gate.
 test("a Codex session start rewrites the AGENTS.md section and skills, never .codex/hooks.json", async (t) => {
