@@ -884,13 +884,6 @@ export function renderSessionStart(
   return lines.join("\n");
 }
 
-/**
- * The one instruction a session start gives about finishing work. The
- * AGENTS.md section alone did not get the check run (proof run: 1 of 6).
- */
-export const CHECK_BEFORE_DONE =
-  "When your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done. Exit 1 is a contract problem; exit 2 means nothing could be checked.";
-
 /** Up to this many services, a session start states every one of them. */
 export const DETAILED_SERVICES = 3;
 

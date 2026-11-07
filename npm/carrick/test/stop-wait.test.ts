@@ -148,7 +148,7 @@ test("stop says the re-check is still running when it outlives the wait, once, a
   assert.ok(first.ms < 2500, `returned inside its wait (${first.ms} ms)`);
   assert.match(
     context(first.stdout),
-    /^Carrick: the re-check of user-service\/src\/routes\/users\.ts is still running after \d+ s\. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish\.$/,
+    /^Carrick: the re-check of user-service\/src\/routes\/users\.ts is still running after \d+ s\.$/,
   );
 
   const second = await stopWith(home, 20, { stop_hook_active: true });
@@ -247,48 +247,27 @@ function stopped(home: string, entry: QueueEntry): void {
   writeAtomic(path.join(sessionsDir(home), `${entry.session}.recheck.${entry.seq}.answer.json`), `${JSON.stringify(body)}\n`);
 }
 
-test("stop drops the check clause when a clean check --changed ran after the last edit", async (t) => {
+test("stop never carries the check clause: rule 5 and the post-edit line say it (carrick#3437)", async (t) => {
   const { workspace, home } = setup(t);
   const entry = queue(workspace.root, home, workspace.file);
   recordEdit(SESSION, workspace.root, 1_000_000, home);
-  marker(workspace.root, 2_000_000, 0);
+  // No check ran after the edit: the state in which the clause used to print.
   stopped(home, entry);
-  const text = (await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n");
-  assert.match(text, /was not re-checked: the re-check ran past its budget\./);
-  assert.doesNotMatch(text, CLAUSE);
-});
+  const stoppedText = (await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n");
+  assert.match(stoppedText, /was not re-checked: the re-check ran past its budget\.$/);
+  assert.doesNotMatch(stoppedText, CLAUSE);
 
-test("stop keeps the check clause when an edit came after the check", async (t) => {
-  const { workspace, home } = setup(t);
-  const entry = queue(workspace.root, home, workspace.file);
-  marker(workspace.root, 2_000_000, 0);
-  recordEdit(SESSION, workspace.root, 3_000_000, home);
-  stopped(home, entry);
-  assert.match((await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n"), CLAUSE);
-});
-
-test("stop keeps the check clause when no check --changed ran, or the one that ran failed", async (t) => {
-  const { workspace, home } = setup(t);
-  const entry = queue(workspace.root, home, workspace.file);
-  recordEdit(SESSION, workspace.root, 1_000_000, home);
-  stopped(home, entry);
-  assert.match((await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n"), CLAUSE, "no check");
-
-  const again = queue(workspace.root, home, workspace.file);
+  const nothing = queue(workspace.root, home, workspace.file);
   marker(workspace.root, 2_000_000, 2);
-  stopped(home, again);
-  assert.match((await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n"), CLAUSE, "exit 2 checked nothing");
-});
+  stopped(home, nothing);
+  assert.doesNotMatch((await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n"), CLAUSE, "exit 2 checked nothing");
 
-test("stop drops the clause from the still-running line when a clean check followed the last edit", async (t) => {
-  const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   queue(workspace.root, home, workspace.file);
-  recordEdit(SESSION, workspace.root, 1_000_000, home);
-  marker(workspace.root, 2_000_000, 0);
-  const text = (await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n");
-  assert.match(text, /is still running after \d+ s\.$/);
-  assert.doesNotMatch(text, CLAUSE);
+  recordEdit(SESSION, workspace.root, 3_000_000, home);
+  const running = (await stopAnswers(SESSION, { waitS: 0, home })).lines.join("\n");
+  assert.match(running, /is still running after \d+ s\.$/);
+  assert.doesNotMatch(running, CLAUSE);
 });
 
 // The Stop hook states the session's contract check from the per-file
