@@ -624,18 +624,6 @@ export function serviceBoundary(service: StatusService): string[] {
   return counts;
 }
 
-/** How many stale files one service line names before it says how many are left. */
-export const MAX_STALE_FILES = 5;
-
-function staleText(service: StatusService): string {
-  const total = service.stale_files_total ?? service.changed_since_index;
-  const shown = (service.stale_files ?? []).slice(0, MAX_STALE_FILES);
-  if (!shown.length) return "";
-  const rest = total - shown.length;
-  const listed = rest > 0 ? `${shown.join(", ")}, +${rest} more` : shown.join(", ");
-  return ` (${listed})`;
-}
-
 /**
  * Candidates only `carrick index` resolves, or 0 when the hosted index is the
  * index answering for this service: an index read in from the hosted rows
@@ -652,14 +640,15 @@ export function candidatesWaiting(service: StatusService): number {
  * the tree it reads has moved since, and what is waiting for a paid scan.
  *
  * Services of one repo share a commit and no longer share a changed-file
- * count: each is told about the files its own scan reads, and the repo's own
- * line carries what belongs to no service (carrick#997 item 4).
+ * count: each is told how many files its own scan reads have changed, and the
+ * repo's own line carries what belongs to no service (carrick#997 item 4).
+ * Never the files themselves: `carrick status` lists them (carrick#3477).
  */
 export function serviceLine(service: StatusService): string {
   const head = `- ${service.service} at ${shortHash(service.index_commit)}: ${service.routes} route(s), ${service.calls} call(s)`;
   const waiting = candidatesWaiting(service);
   const awaiting = waiting ? `, ${waiting} candidate(s) waiting for Carrick's cloud scan` : "";
-  return `${head}, changed since index: ${service.changed_since_index}${staleText(service)}${awaiting}`;
+  return `${head}, changed since index: ${service.changed_since_index}${awaiting}`;
 }
 
 /**
@@ -701,12 +690,7 @@ export function runningScanLine(scan: RunningScan): string {
  */
 export function repoLine(repo: StatusRepo): string | null {
   if (!repo.outside_every_service) return null;
-  const shown = (repo.stale_files ?? []).slice(0, MAX_STALE_FILES);
-  const rest = repo.outside_every_service - shown.length;
-  const listed = shown.length
-    ? ` (${rest > 0 ? `${shown.join(", ")}, +${rest} more` : shown.join(", ")})`
-    : "";
-  return `- ${repo.name}: ${repo.outside_every_service} file(s) changed outside every service${listed}`;
+  return `- ${repo.name}: ${repo.outside_every_service} file(s) changed outside every service`;
 }
 
 /** `2 h ago`, `8 days ago`: how long before `now` the time `iso` was. */
@@ -864,6 +848,15 @@ export function renderSessionStart(
   if (detailed) {
     for (const service of status.services) lines.push(serviceLine(service));
   } else {
+    // One count for the services that moved, never their files: an edit to a
+    // shared file moved every service that reads it, and the same paths on
+    // each line were not something to act on at session start (carrick#3477).
+    const moved = status.services.filter((service) => service.changed_since_index > 0).length;
+    if (moved > 0) {
+      lines.push(
+        `${moved} service${moved === 1 ? " has" : "s have"} local changes since the index; \`carrick status\` lists them.`,
+      );
+    }
     const actionable = status.services.filter(hasSomethingToDo);
     for (const service of actionable.slice(0, LISTED_SERVICES)) lines.push(serviceLine(service));
     if (actionable.length > LISTED_SERVICES) {
@@ -897,14 +890,13 @@ export const BOUNDARY_POINTER =
 /**
  * Whether a service is worth a line at the start of a session.
  *
- * Three things a reader can act on now: the tree has moved past the index for
- * this service's files, the service is holding candidates that only
- * `carrick index` resolves, or the hosted rows are not the ones being answered from. A
- * service that is none of those is in the total on the first line and nowhere
- * else.
+ * Two things a reader can act on now: the service is holding candidates that
+ * only `carrick index` resolves, or the hosted rows are not the ones being
+ * answered from. Local changes are a count at the session start, not a reason
+ * to name the service (carrick#3477). A service that is neither is in the
+ * total on the first line and nowhere else.
  */
 export function hasSomethingToDo(service: StatusService): boolean {
-  if (service.changed_since_index > 0) return true;
   if (candidatesWaiting(service) > 0) return true;
   return service.hosted_state !== undefined && service.hosted_state !== "enriched";
 }
