@@ -314,6 +314,12 @@ pub enum InstanceAt {
         /// The receiver id its instances are read through
         /// (`instance:()`, `instance:new`).
         receiver: String,
+        /// How the maker call is written and what it was handed: where a
+        /// client's base is read when the library-site reader holds no
+        /// instance at the site (carrick#3488). `None` where the walk did
+        /// not read the maker call. Never part of a record's state.
+        #[serde(skip)]
+        made: Option<MakerCall>,
     },
     /// A scope a labelled member opens (carrick#2474 R2b), at the member's
     /// call: the scoped instance is of the same export as the member's
@@ -353,6 +359,14 @@ pub enum InstanceAt {
         #[serde(skip_serializing_if = "Option::is_none")]
         boundary: Option<Boundary>,
     },
+}
+
+/// A labelled maker call a walk ended at: its form and its arguments, as a
+/// library claim's slot reads them (carrick#3488).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MakerCall {
+    pub form: MakerForm,
+    pub args: Vec<super::super::SiteArg>,
 }
 
 /// One instance end of a decided site: the call that hands the instance
@@ -1357,6 +1371,10 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                                 new,
                                 instance.member.as_deref(),
                             ),
+                            made: Some(MakerCall {
+                                form: instance.form,
+                                args: instance.args.clone(),
+                            }),
                         },
                     );
                 } else {
@@ -1952,6 +1970,7 @@ mod tests {
                 export: "Peer".to_string(),
                 member: None,
                 receiver: "instance:new".to_string(),
+                made: None,
             },
         }
     }

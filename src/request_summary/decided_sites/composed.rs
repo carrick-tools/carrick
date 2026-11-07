@@ -592,6 +592,7 @@ mod tests {
                 export: "default".to_string(),
                 member: None,
                 receiver: "instance:()".to_string(),
+                made: None,
             },
         }
     }

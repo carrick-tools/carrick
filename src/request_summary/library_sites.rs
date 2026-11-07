@@ -119,7 +119,7 @@ pub enum MakerForm {
 }
 
 /// One argument, as a library claim's slot reads it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SiteArg {
     /// The argument's text, when it is a literal ([`literal_text`]). On a
     /// site a caller fills ([`LibrarySite::origin`]), only the text this call
@@ -141,7 +141,7 @@ pub struct SiteArg {
 
 /// An object literal's keys, each with its literal text when the value is
 /// one ([`literal_text`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SiteObject {
     /// Key -> its literal text, or `None` when the value is not one (a method
     /// or a getter included). A key written before a spread or a computed key
@@ -3542,7 +3542,11 @@ pub(super) fn builder(builder: &super::Builder, module: &ModuleScope) -> Option<
     Some(NameValue::Builder(text_pieces(returned, &scope)?))
 }
 
-fn arg_literal<'a>(args: &'a [SiteArg], arg: usize, key: Option<&str>) -> Option<&'a str> {
+pub(super) fn arg_literal<'a>(
+    args: &'a [SiteArg],
+    arg: usize,
+    key: Option<&str>,
+) -> Option<&'a str> {
     let arg = args.get(arg)?;
     if arg.spread {
         return None;
@@ -3553,7 +3557,7 @@ fn arg_literal<'a>(args: &'a [SiteArg], arg: usize, key: Option<&str>) -> Option
     }
 }
 
-fn arg_supplied(args: &[SiteArg], arg: usize, key: Option<&str>) -> bool {
+pub(super) fn arg_supplied(args: &[SiteArg], arg: usize, key: Option<&str>) -> bool {
     let Some(arg) = args.get(arg) else {
         return false;
     };
