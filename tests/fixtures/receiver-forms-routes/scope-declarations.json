@@ -1,0 +1,12 @@
+[
+  {
+    "claim_id": "fixture-server@1:default:scope:route:name@0:mounts@1:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-server/index.d.ts",
+        "decl_line": 15
+      }
+    ]
+  }
+]

@@ -995,6 +995,10 @@ enum HeldInstance {
     /// (discovery numbering): a scope a labelled member returns, which the
     /// walk reads (carrick#2474 R2b).
     Returned(u32, u32),
+    /// A field of the class the member is written in (`this.app`), by the
+    /// class's span start and the field's name: a field a maker's instance
+    /// is written to is that instance (carrick#3489 W1).
+    Field { class: u32, field: String },
 }
 
 /// A call of a member (`app.basePath("/v2")`), as the scope it may return
@@ -4661,6 +4665,12 @@ impl Reader<'_> {
                 .written_instance(call, scope)
                 .map(|client| HeldInstance::Client(Box::new(client)))
                 .or_else(|| returned_call(call)),
+            Expr::Member(member) if matches!(unwrap_value(&member.obj), Expr::This(_)) => {
+                Some(HeldInstance::Field {
+                    class: scope.fields?.class,
+                    field: this_field(member)?,
+                })
+            }
             _ => None,
         }
     }

@@ -1856,7 +1856,9 @@ impl<'a> Walk<'a, '_> {
                     }
                     _ => return None,
                 },
-                super::HeldInstance::Imported(..) => return None,
+                super::HeldInstance::Imported(..) | super::HeldInstance::Field { .. } => {
+                    return None;
+                }
             },
             _ => return None,
         };

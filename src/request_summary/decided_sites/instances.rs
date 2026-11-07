@@ -1291,29 +1291,34 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         let Link::Field(link) = &**link else {
             return false;
         };
+        self.field_parameter(file, link.class, &link.field)
+    }
+
+    /// [`Self::field`] for the field `field` of the class `class`.
+    fn field_parameter(&mut self, file: &Path, class: u32, field: &str) -> bool {
         let Some(position) = self
             .inputs
             .files
             .get(file)
-            .and_then(|ir| ir.class_origins.get(&link.class))
-            .and_then(|origin| origin.fields.get(&link.field))
+            .and_then(|ir| ir.class_origins.get(&class))
+            .and_then(|origin| origin.fields.get(field))
             .and_then(|from| from.parameter)
         else {
             return false;
         };
         let index = self.index;
         let Some(built) = index
-            .constructions(file, link.class)
+            .constructions(file, class)
             .filter(|built| !built.is_empty())
         else {
             return false;
         };
-        let here = (file.to_path_buf(), link.class, link.field.clone());
+        let here = (file.to_path_buf(), class, field.to_string());
         if self.fielding.contains(&here) {
             return true;
         }
         self.fielding.push(here);
-        let own = [Piece::Param(position, link.field.clone())];
+        let own = [Piece::Param(position, field.to_string())];
         for construction in built {
             // The call graph's own entry for it: where a function it is
             // written in sits, which the construction index does not keep.
@@ -1337,6 +1342,28 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             HeldInstance::Client(client) => self.client(client, file, at),
             HeldInstance::Imported(lo, hi) => self.imported(file, (*lo, *hi), at),
             HeldInstance::Returned(lo, hi) => self.returned(file, (*lo, *hi), at),
+            HeldInstance::Field { class, field } => self.class_field(file, *class, field, at),
+        }
+    }
+
+    /// The instance a field of a class of `file` holds (carrick#3489 W1): the
+    /// maker every write in the class sets it to
+    /// ([`FileIr::field_receivers`], carrick#1665), else the constructor
+    /// parameter it is ([`Self::field_parameter`]), else no instance the
+    /// syntax names.
+    ///
+    /// [`FileIr::field_receivers`]: super::super::FileIr
+    fn class_field(&mut self, file: &Path, class: u32, field: &str, at: String) {
+        let made = self
+            .inputs
+            .files
+            .get(file)
+            .and_then(|ir| ir.field_receivers.get(&(class, field.to_string())))
+            .cloned();
+        if let Some(client) = made {
+            self.client(&client, file, at);
+        } else if !self.field_parameter(file, class, field) {
+            self.hole(at, InstanceHole::Unread, Some(format!("this.{field}")));
         }
     }
 
