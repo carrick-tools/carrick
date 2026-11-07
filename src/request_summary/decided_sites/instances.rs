@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use super::super::constructions::Constructed;
 use super::super::{
     CallIr, ClientRef, HeldInstance, KeyState, Link, MadeBy, MakerForm, Piece,
-    RequestSummaryInputs, Value, Way,
+    RequestSummaryInputs, Value, ValueAt, Way,
 };
 use super::boundaries::{Boundary, FnAt};
 use super::{Calls, Placed, filled, holds_parameter, relative, to_definition};
@@ -1362,9 +1362,69 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             .cloned();
         if let Some(client) = made {
             self.client(&client, file, at);
-        } else if !self.field_parameter(file, class, field) {
+        } else if !self.field_parameter(file, class, field) && !self.getter(file, class, field, &at)
+        {
             self.hole(at, InstanceHole::Unread, Some(format!("this.{field}")));
         }
+    }
+
+    /// The getter `field` names in the class (carrick#3489 W4): what it
+    /// returns is the instance. An own factory's makers are read as a call's
+    /// are; any other return is read where it is written (a name the
+    /// compiler declares, or a field of the class), and a return nothing
+    /// reads is a hole. `false` where the class has no such getter.
+    fn getter(&mut self, file: &Path, class: u32, field: &str, at: &str) -> bool {
+        let Some(key) = self
+            .inputs
+            .files
+            .get(file)
+            .and_then(|ir| ir.class_getters.get(&(class, field.to_string())))
+            .cloned()
+        else {
+            return false;
+        };
+        let here = (file.to_path_buf(), key.clone());
+        if !self.factories.insert(here.clone()) {
+            return true;
+        }
+        let function = self
+            .inputs
+            .files
+            .get(file)
+            .and_then(|ir| ir.functions.get(&key));
+        let (makers, values) = match function {
+            Some(function) => (
+                function
+                    .returned
+                    .as_ref()
+                    .map(|returned| returned.makers.clone()),
+                function.returned_values.clone(),
+            ),
+            None => (None, Vec::new()),
+        };
+        if let Some(makers) = makers {
+            for maker in makers {
+                self.client(&maker, file, at.to_string());
+            }
+        } else if values.is_empty() {
+            self.hole(
+                at.to_string(),
+                InstanceHole::Unread,
+                Some(format!("this.{field}")),
+            );
+        } else {
+            for value in values {
+                match value {
+                    ValueAt::Read { lo, hi, .. } => self.imported(file, (lo, hi), at.to_string()),
+                    ValueAt::Field { class, field, .. } => {
+                        self.class_field(file, class, &field, at.to_string())
+                    }
+                    _ => self.hole(at.to_string(), InstanceHole::Unread, None),
+                }
+            }
+        }
+        self.factories.remove(&here);
+        true
     }
 
     /// The maker of `client`, an instance read in `file`: a labelled maker

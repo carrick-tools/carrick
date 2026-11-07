@@ -392,7 +392,7 @@
  "ri-getter": {
   "feature": "getter returning an instance",
   "source": "ES5",
-  "status": "not_reached"
+  "status": "covered"
  },
  "ri-optional": {
   "feature": "optional-chaining on an instance",
