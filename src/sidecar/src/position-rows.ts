@@ -53,7 +53,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { ts, type Project } from 'ts-morph';
-import { WriteGuard, installedPackageDirectory, isDeclarationFileName, moduleExport } from './capture/index.js';
+import { WriteGuard, installedPackageDirectory, isDeclarationFileName, moduleExport, toPosix } from './capture/index.js';
 import { attributedDeclaration, installedPackageOf, typeDeclaration } from './declaration-attribution.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import type { ProjectLoader } from './project-loader.js';
@@ -364,7 +364,7 @@ export class PathNames {
   /** A request file's name: relative to the root, which every file the scanner sends is inside. */
   relative(file: string): string {
     const inside = this.inside(path.resolve(file));
-    return toSlashes(inside ? inside.rel : path.basename(file));
+    return toPosix(inside ? inside.rel : path.basename(file));
   }
 
   /** What a declaring file is written as, or `null` when nothing names it. */
@@ -379,10 +379,10 @@ export class PathNames {
 
   private nameDeclaringFile(fileName: string): string | null {
     const inside = this.inside(fileName);
-    if (inside) return toSlashes(inside.rel);
+    if (inside) return toPosix(inside.rel);
     const installed = installedPackageDirectory(this.roots[0], fileName) ?? this.packageDirectoryOf(fileName);
     if (installed && fs.existsSync(path.join(installed.directory, 'package.json'))) {
-      return `pkg:${installed.name}/${toSlashes(path.relative(installed.directory, fileName))}`;
+      return `pkg:${installed.name}/${toPosix(path.relative(installed.directory, fileName))}`;
     }
     return null;
   }
@@ -454,10 +454,6 @@ export class PathNames {
       return `import("${this.declaringFile(specifier) ?? '<outside the checkout>'}")`;
     });
   }
-}
-
-function toSlashes(p: string): string {
-  return p.split(path.sep).join('/');
 }
 
 /** What a name bound by `require()` refers to: the whole module, or one export. */

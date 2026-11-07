@@ -149,8 +149,3 @@ export function statusTableBody(
   }
   return { kind: 'body', entries: success, types };
 }
-
-/** The members of a union, or the type itself: what a set comparison reads. */
-export function constituents(type: ts.Type): ts.Type[] {
-  return type.isUnion() ? type.types : [type];
-}

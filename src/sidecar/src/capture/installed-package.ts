@@ -27,6 +27,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import { isPublishedSemver } from './lockfile.js';
+import { packageNameOf } from './specifiers.js';
 
 export interface InstalledPackageSpecifier {
   /** Bare specifier: public package name plus subpath, e.g. `pkg/sub`. */
@@ -79,7 +80,7 @@ export function typesPackageOf(name: string): string {
   return scoped ? `@types/${scoped[1]}__${scoped[2]}` : `@types/${name}`;
 }
 
-function toPosix(p: string): string {
+export function toPosix(p: string): string {
   return p.split(path.sep).join('/');
 }
 
@@ -252,7 +253,7 @@ export function withInstalledPackages(
         ? fallback([name], containingFile, reused?.slice(index, index + 1), redirected, compilerOptions, containingSourceFile)[0]
         : ts.resolveModuleName(name, containingFile, compilerOptions, base).resolvedModule;
       if (resolved || name.startsWith('.') || name.startsWith('/')) return resolved;
-      const packageName = packageNameOfSpecifier(name);
+      const packageName = packageNameOf(name);
       for (const owner of [packageName, typesPackageOf(packageName)]) {
         const root = installs[owner];
         if (root) {
@@ -263,11 +264,6 @@ export function withInstalledPackages(
       return undefined;
     });
   return base;
-}
-
-function packageNameOfSpecifier(spec: string): string {
-  const parts = spec.split('/');
-  return spec.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
 }
 
 /** Entry subpaths of a package that a consumer can import. */

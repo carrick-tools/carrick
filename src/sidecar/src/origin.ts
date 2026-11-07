@@ -18,6 +18,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { isInsideCheckout } from './capture/index.js';
 import type { Project, ResolutionHostFactory, ts } from 'ts-morph';
+import type { ExpandOrigin } from './type-structural-expander.js';
 
 /**
  * True when a declaration's source file is runtime/library origin rather than
@@ -156,5 +157,14 @@ export function registerExternalImports(project: Project, imports: ExternalImpor
  */
 export function externalImportsOf(project: Project): ExternalImports | undefined {
   return externalImportsByProject.get(project);
+}
+
+/** The program, service root and import record the printer decides library origin from. */
+export function expandOriginOf(project: Project, repoRoot: string): ExpandOrigin {
+  return {
+    program: project.getProgram().compilerObject,
+    repoRoot,
+    imports: externalImportsOf(project),
+  };
 }
 

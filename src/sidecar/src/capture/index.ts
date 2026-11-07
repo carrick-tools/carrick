@@ -74,6 +74,8 @@ export { findServiceTsconfig, fileConfigPath } from './service-config.js';
 export { WriteGuard } from './guarded-fs.js';
 export { installedPackageDirectory } from './installed-package-directory.js';
 export { isDeclarationFileName, packageNameOf } from './specifiers.js';
+export { toPosix } from './installed-package.js';
+export { constituentsOf } from './result-label.js';
 export { moduleExport } from './anchors.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
@@ -1580,7 +1582,6 @@ function resolveAnchors(
 // share with the capture's symbol anchor.
 export {
   classifyStatusCodes,
-  constituents,
   httpStatus,
   statesNoBody,
   statesNoShape,

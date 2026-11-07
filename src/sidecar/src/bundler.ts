@@ -23,7 +23,7 @@ import {
   expandTypeStructural,
   type ExpandOrigin,
 } from './type-structural-expander.js';
-import { externalImportsOf, isExternalOrigin } from './origin.js';
+import { expandOriginOf, isExternalOrigin } from './origin.js';
 import { statusTableBody } from './capture/index.js';
 
 /**
@@ -398,11 +398,7 @@ export class TypeBundler {
    * `ExpandOrigin`.
    */
   private expandOrigin(): ExpandOrigin {
-    return {
-      program: this.project.getProgram().compilerObject,
-      repoRoot: this.repoRoot,
-      imports: externalImportsOf(this.project),
-    };
+    return expandOriginOf(this.project, this.repoRoot);
   }
 
   private extractTypeDefinition(
