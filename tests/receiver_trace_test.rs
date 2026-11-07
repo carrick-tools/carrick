@@ -1817,6 +1817,32 @@ fn a_route_path_folded_by_the_name_fold_states_its_pieces() {
     );
 }
 
+/// carrick#3504 S2: a route path read off a constant object's entry
+/// (`ROUTES.things`) is `folded` from the file that declares the object,
+/// not `lit`: the resolver reads it through the declaration. The text and
+/// the row stay as they were.
+#[test]
+fn a_route_path_read_off_a_constant_objects_entry_is_folded_from_its_file() {
+    let on = scan_fixture("address-chain-folded");
+    let addresses = endpoint_addresses(&on);
+    let row = "src/server.ts:20 GET /things";
+    let address = addresses
+        .get(row)
+        .unwrap_or_else(|| panic!("{row}: {addresses:#?}"));
+    let own = address["parts"]
+        .as_array()
+        .and_then(|parts| parts.last())
+        .unwrap_or_else(|| panic!("{row}: {address}"));
+    assert_eq!(own["kind"], "own", "{row}: {address}");
+    assert_eq!(
+        own["value"]["values"],
+        serde_json::json!([[
+            { "piece": "folded", "text": "/things", "from": "src/server.ts" },
+        ]]),
+        "{addresses:#?}"
+    );
+}
+
 /// carrick#3496 slice 3: the type check pairs a call over the merged mount
 /// graph's routes and takes the producer's type from the manifest entry at
 /// the winning route's site. That join holds only if every producer entry's

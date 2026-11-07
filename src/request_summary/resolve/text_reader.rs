@@ -400,6 +400,47 @@ impl<'a> Resolver<'a> {
     }
 }
 
+impl Resolver<'_> {
+    /// The parts of the text `expr`, written in the repo file `file`
+    /// (relative to `root`), states: a template's or a `+` chain's pieces in
+    /// order, each with the file of the outermost declaration it was read
+    /// through (`None` for text written in place). `None` unless every part
+    /// is exactly one text.
+    pub(in crate::request_summary) fn text_parts(
+        &self,
+        root: &Path,
+        file: &str,
+        expr: &Expr,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        fn leaves<'v>(value: &'v ValueAt, out: &mut Vec<&'v ValueAt>) {
+            match value {
+                ValueAt::Concat(parts) => parts.iter().for_each(|part| leaves(part, out)),
+                other => out.push(other),
+            }
+        }
+        let absolute = root.join(file);
+        let (path, ir) = self.inputs_for(&absolute).files.get_key_value(&absolute)?;
+        let value = text_of(expr, &|lo| ir.discovery_start(lo));
+        let mut parts = Vec::new();
+        leaves(&value, &mut parts);
+        let mut out = Vec::new();
+        for part in parts {
+            match part {
+                // An empty quasi writes nothing.
+                ValueAt::Lit(text) if text.is_empty() => {}
+                ValueAt::Lit(text) => out.push((text.clone(), None)),
+                other => match self.text_values(path, other).as_slice() {
+                    [TextValue::Text { text, read_from }] => {
+                        out.push((text.clone(), read_from.first().cloned()));
+                    }
+                    _ => return None,
+                },
+            }
+        }
+        Some(out)
+    }
+}
+
 /// A declaration being read for its text; dropping it releases the mark.
 struct TextReading<'r> {
     reading: &'r RefCell<HashSet<(PathBuf, u32, String)>>,

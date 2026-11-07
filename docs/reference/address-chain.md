@@ -94,10 +94,13 @@ Derived from the parts and stored so readers need not re-derive it:
 - A mount or scope prefix that is an imported constant of the service is
   stored `folded` with its declaring file. A value read through a
   parameter's callers is stored `lit` without `from`.
-- The own part is stored `lit`, as the path the call writes. Where the
-  compiler folds it from constants (a template over a constant another
-  package exports), each such constant is stored `folded` with the file
-  that declares it.
+- The own part is stored `lit`, as the path the call writes. Where the path
+  is read off a declaration, each value read that way is stored `folded` with
+  the file that declares it: a constant, an entry of a constant object, an
+  enum member, or a `let` never assigned again, in this file or any other
+  (a template over a constant another package exports, or a bare
+  `app.get(ROUTES.things)`). The text written at the call itself stays
+  `lit`.
 - When two chains compose the same full path, the row stores the first.
 
 Not recorded yet (the field is absent): procedure (RPC router) rows, rows the

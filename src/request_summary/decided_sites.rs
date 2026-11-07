@@ -2504,7 +2504,21 @@ fn decide(
             let mut fold = super::site_record::NameFold::new(inputs, siblings, root);
             for site in &mut out.sites {
                 (site.composed, site.composed_trimmed) = match site.name_text() {
-                    Some(own) => composed::compose(&site.instances, Some(&own), &mounts),
+                    Some(own) => {
+                        let (mut composed, trimmed) =
+                            composed::compose(&site.instances, Some(&own), &mounts);
+                        // A path the code states as text, read off a
+                        // declaration (`app.get(ROUTES.things)`): its own
+                        // part states the file that declares it.
+                        if site.end.op.as_deref() == Some("receive")
+                            && let Some(pieces) = fold.declared_pieces(site, &own)
+                        {
+                            for composed in &mut composed {
+                                composed.own_pieces = pieces.clone();
+                            }
+                        }
+                        (composed, trimmed)
+                    }
                     None => {
                         // A route's own path written as a template over
                         // values the compiler types as one string each, from

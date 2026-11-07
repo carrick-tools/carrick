@@ -756,6 +756,61 @@ impl<'r> NameFold<'r> {
             .collect::<Option<Vec<_>>>()?;
         Some((text, pieces))
     }
+
+    /// The pieces of a route's own part when the code states its whole path
+    /// as text and reads some of it off a declaration (`app.get(ROUTES.things)`,
+    /// `app.get(P)` over `const P`, a template over such names): each value
+    /// read that way is `folded` from the file that declares it, the rest
+    /// `lit` (`docs/reference/address-chain.md`). `own` is the path the site
+    /// already states; `None` unless the pieces join to exactly that text.
+    /// A keyed slot (`{ path: ROUTES.things }`) and a path written wholly
+    /// in place are not read here.
+    pub(super) fn declared_pieces(
+        &mut self,
+        site: &DecidedSite,
+        own: &str,
+    ) -> Option<Vec<crate::address::Piece>> {
+        let [index] = site
+            .name_args
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .try_into()
+            .ok()?;
+        if site.key.is_some() {
+            return None;
+        }
+        let expr = {
+            let parsed = self.sources.get(&site.file)?;
+            let mut finder = CallFinder {
+                parsed,
+                target: (site.span_start, site.span_end),
+                handing: Vec::new(),
+                found: None,
+            };
+            parsed.module.visit_with(&mut finder);
+            finder.found?.arg_exprs.get(index)?.clone()
+        };
+        if matches!(super::unwrap_value(&expr), Expr::Lit(Lit::Str(_))) {
+            return None;
+        }
+        let parts = self
+            .resolver
+            .text_parts(self.sources.root, &site.file, &expr)?;
+        let text: String = parts.iter().map(|(text, _)| text.as_str()).collect();
+        if text != own || parts.iter().all(|(_, from)| from.is_none()) {
+            return None;
+        }
+        Some(
+            parts
+                .into_iter()
+                .map(|(text, from)| match from {
+                    Some(from) => crate::address::Piece::Folded { text, from },
+                    None => crate::address::Piece::Lit { text },
+                })
+                .collect(),
+        )
+    }
 }
 
 /// The file of a compiler row's declaration (`file:line`, or the file
