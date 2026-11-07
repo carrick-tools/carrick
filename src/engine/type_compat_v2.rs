@@ -1474,87 +1474,6 @@ fn join_identity(key: &OperationKey) -> Option<(String, String)> {
     }
 }
 
-/// Route-aware path normalization, ported from ts_check's `normalizePath`:
-/// lowercase, single slashes, no trailing slash, every param syntax
-/// (`:id`, `{id}`, `[id]`, `${expr}`) collapsed to `:param`.
-fn normalize_match_path(input: &str) -> String {
-    let mut normalized = input.to_lowercase();
-    while normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-    if !normalized.starts_with('/') {
-        normalized.insert(0, '/');
-    }
-    while normalized.contains("//") {
-        normalized = normalized.replace("//", "/");
-    }
-    normalized
-        .split('/')
-        .map(|seg| {
-            let is_param = seg.starts_with(':')
-                || (seg.starts_with('{') && seg.ends_with('}'))
-                || (seg.starts_with('[') && seg.ends_with(']'))
-                || seg.contains("${");
-            if is_param {
-                ":param".to_string()
-            } else {
-                seg.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Route-aware segment match, ported from ts_check's `pathsMatch`: equal
-/// normalized paths, or segment-wise with `:param` as a wildcard.
-fn paths_match(a: &str, b: &str) -> bool {
-    let na = normalize_match_path(a);
-    let nb = normalize_match_path(b);
-    if na == nb {
-        return true;
-    }
-    let sa: Vec<&str> = na.split('/').collect();
-    let sb: Vec<&str> = nb.split('/').collect();
-    if sa.len() != sb.len() {
-        return false;
-    }
-    sa.iter()
-        .zip(sb.iter())
-        .all(|(x, y)| x == y || x.starts_with(':') || y.starts_with(':'))
-}
-
-/// Whether the call has a placeholder at a position where the route states a
-/// literal segment (carrick#2004): `PATCH /things/${id}` against
-/// `PATCH /things/move`, or `POST /orgs/${id}/${target}` against every
-/// `POST /orgs/:orgId/<literal>`. The call's value there is unknown, so the
-/// pair is a guess that the call reaches this route and not another, and it
-/// is not compared. A route placeholder over a call literal is the ordinary
-/// case (`/users/:id` serves `/users/me`) and is not a guess.
-fn call_placeholder_over_route_literal(producer_path: &str, consumer_path: &str) -> bool {
-    let route = normalize_match_path(producer_path);
-    let call = normalize_match_path(consumer_path);
-    route
-        .split('/')
-        .zip(call.split('/'))
-        .any(|(route_seg, call_seg)| call_seg.starts_with(':') && !route_seg.starts_with(':'))
-}
-
-/// Producer-specificity score, ported from ts_check's `calculateMatchScore`:
-/// literal routes outrank parameterized ones for the same consumer.
-fn match_score(producer_path: &str, consumer_path: &str) -> u8 {
-    let np = normalize_match_path(producer_path);
-    let nc = normalize_match_path(consumer_path);
-    if np == nc {
-        if producer_path == consumer_path {
-            100
-        } else {
-            95
-        }
-    } else {
-        90
-    }
-}
-
 /// A verdict the pair is given before any probe runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreVerdict {
@@ -1727,12 +1646,6 @@ struct ServiceEntry<'a> {
     service_id: &'a str,
     has_surface: bool,
     entry: &'a TypeManifestEntry,
-    /// The dispatch case of every row this entry stands for (carrick#831):
-    /// on a producer, each case the route answers at this site (several cases
-    /// with no site of their own share the route's, and so its alias); on a
-    /// consumer, the case each call at this site sends. `[None]` is a plain
-    /// route, or a call that states no case, which is nearly every entry.
-    cases: Vec<Option<&'a crate::dispatch::Dispatch>>,
 }
 
 /// The sentence a call to a route that dispatches on a request field reads
@@ -1750,8 +1663,8 @@ fn case_unknown_reason(fields: &[&str]) -> String {
     )
 }
 
-/// Each HTTP row's dispatch case, by the site and operation a manifest entry
-/// names. Joined on `(file, line, method, path)`, the identity
+/// Each HTTP call row's dispatch case, by the site and operation a consumer
+/// manifest entry names. Joined on `(file, line, method, path)`, the identity
 /// [`build_type_manifest_entries`](crate::engine) builds the entry from.
 type CasesBySite<'a> =
     HashMap<(String, u32, String, String), Vec<Option<&'a crate::dispatch::Dispatch>>>;
@@ -1777,55 +1690,31 @@ fn cases_by_site(rows: &[crate::analyzer::ApiEndpointDetails]) -> CasesBySite<'_
     by_site
 }
 
-/// What one candidate producer entry answers a consumer entry about the
-/// dispatch case, folded over the cases on each side
-/// (`carrick_match::dispatch_verdict`): any pair of cases that matches, or a
-/// producer that does not dispatch, is a match; else any case the call leaves
-/// unknown is unknown; else the call states a value no case here answers.
-fn entry_dispatch_verdict(
-    producer: &ServiceEntry,
-    consumer: &ServiceEntry,
-) -> carrick_match::DispatchVerdict {
-    use carrick_match::DispatchVerdict;
-    let key = |case: &Option<&crate::dispatch::Dispatch>| crate::dispatch::Dispatch::key_of(*case);
-    let mut verdict = DispatchVerdict::ValueMismatch;
-    for producer_case in &producer.cases {
-        for consumer_case in &consumer.cases {
-            match carrick_match::dispatch_verdict(key(producer_case), key(consumer_case)) {
-                DispatchVerdict::Matched | DispatchVerdict::NotDispatching => {
-                    return DispatchVerdict::Matched;
-                }
-                DispatchVerdict::ValueUnknown => verdict = DispatchVerdict::ValueUnknown,
-                DispatchVerdict::ValueMismatch => {}
-            }
-        }
-    }
-    verdict
-}
-
 /// Build check pairs from every participating repo's manifest.
 ///
-/// Port of the ts_check manifest-matcher pairing semantics:
-/// - HTTP: method + route-aware path match + type_kind, keeping only the
-///   most specific producer(s) per consumer. A route that states a literal
-///   where the call has a placeholder is never a candidate: which route the
-///   call reaches is then unknown, and the call is not compared
-///   (carrick#2004). The consumer's own service is a
-///   candidate like any other (carrick#1945): a call to a route of its own
-///   service is a consumer of that route (carrick#1926), and the HTTP matcher
-///   keeps that edge (carrick#1944). Its routes are ranked with every
-///   sibling's by the one specificity score, so a sibling's literal route
-///   wins over the caller's own parameterized one, and the other way round.
-///   Among those, a route that dispatches on a request field is decided case
-///   by case as the analyzer's matcher decides it
-///   (`carrick_match::dispatch_outcome`, carrick#2059): a call is paired with
-///   the case it sends, a call that sends a value no case answers is not
-///   paired, and a call that states no case gets one half per kind, stored
-///   unverifiable without a probe.
-/// - socket/graphql/pubsub: exact operation-key match + type_kind, between
-///   two services only. The exact-key matcher drops a same-service edge for
-///   these protocols (#397/#410), so a pair here would be judged and stored
-///   against no edge.
+/// Which producers a consumer entry is paired with is the one pairing rule,
+/// [`carrick_match::PairingPool::pair`] (carrick#3496), over the same pool
+/// the analyzer draws its edges from, so the check judges exactly the pairs
+/// the index stores an edge for:
+/// - HTTP: the pool is every route of the merged mount graph
+///   ([`MountGraph::http_pairing_pool`](crate::mount_graph::MountGraph::http_pairing_pool)),
+///   typed or not (R10): a specific route the manifest holds no entry for
+///   still wins the call, and then nothing is compared, rather than a vaguer
+///   typed route the call never reaches. Each winning route is joined to the
+///   producer entries built at its site, `(service, file, line, method,
+///   full_path)`, the identity `build_type_manifest_entries` builds them
+///   from. The consumer's own service is ranked with every other
+///   (carrick#1945): a call to a route of its own service is a consumer of
+///   that route (carrick#1926). A winner where the call has a placeholder
+///   over the route's literal (carrick#2004) is not compared: which route
+///   the call reaches is a guess. A call that reaches a dispatching route
+///   without stating its case (`RouteCaseUnknown`, carrick#2059) gets one
+///   half per kind, stored unverifiable without a probe; a call stating a
+///   value no case answers gets none.
+/// - socket/graphql/pubsub: the pool is the producer entries, paired by
+///   exact key, between two services only. The exact-key matcher drops a
+///   same-service edge for these protocols (#397/#410), so a pair here would
+///   be judged and stored against no edge.
 ///
 /// A side without a v2 capture surface produces a pair with a pre-set
 /// unverifiable verdict instead of a probe ("peer scanned without a v2 surface
@@ -1838,7 +1727,10 @@ fn entry_dispatch_verdict(
 /// resolvable, compatible edges to "not compared".
 pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPair> {
     let mut producers: Vec<ServiceEntry> = Vec::new();
-    let mut consumers: Vec<ServiceEntry> = Vec::new();
+    // Each consumer entry, with the dispatch case each call at its site sends
+    // (carrick#831). `[None]` is a call that states no case, which is nearly
+    // every entry.
+    let mut consumers: Vec<(ServiceEntry, Vec<Option<&crate::dispatch::Dispatch>>)> = Vec::new();
 
     for repo in all_repo_data {
         let service_id = repo
@@ -1852,157 +1744,201 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         let Some(entries) = repo.type_manifest.as_ref() else {
             continue;
         };
-        let endpoint_cases = cases_by_site(&repo.endpoints);
         let call_cases = cases_by_site(&repo.calls);
         for entry in entries {
-            let (target, rows) = match entry.role {
-                ManifestRole::Producer => (&mut producers, &endpoint_cases),
-                ManifestRole::Consumer => (&mut consumers, &call_cases),
-            };
-            let cases = entry
-                .key
-                .as_http()
-                .and_then(|(method, path)| {
-                    rows.get(&(
-                        entry.file_path.clone(),
-                        entry.line_number,
-                        method.to_string(),
-                        path.to_string(),
-                    ))
-                })
-                .cloned()
-                .unwrap_or_else(|| vec![None]);
-            target.push(ServiceEntry {
+            let side = ServiceEntry {
                 service_id,
                 has_surface,
                 entry,
-                cases,
-            });
+            };
+            match entry.role {
+                ManifestRole::Producer => producers.push(side),
+                ManifestRole::Consumer => {
+                    let cases = entry
+                        .key
+                        .as_http()
+                        .and_then(|(method, path)| {
+                            call_cases.get(&(
+                                entry.file_path.clone(),
+                                entry.line_number,
+                                method.to_string(),
+                                path.to_string(),
+                            ))
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| vec![None]);
+                    consumers.push((side, cases));
+                }
+            }
         }
     }
 
+    // HTTP: the merged routes, and the producer entries built at each
+    // route's site.
+    let graph = crate::mount_graph::MountGraph::merge_from_repos(all_repo_data);
+    let routes = graph.get_resolved_endpoints();
+    let http_pool = graph.http_pairing_pool();
+    let mut entries_at: HashMap<(&str, String, u32, String, &str), Vec<&ServiceEntry>> =
+        HashMap::new();
+    // Exact-key protocols: one pool row per producer entry, in entry order.
+    let mut exact_entries: Vec<&ServiceEntry> = Vec::new();
+    let mut exact_rows: Vec<carrick_match::Producer> = Vec::new();
+    for producer in &producers {
+        match &producer.entry.key {
+            OperationKey::Http { method, path } => entries_at
+                .entry((
+                    producer.service_id,
+                    producer.entry.file_path.clone(),
+                    producer.entry.line_number,
+                    crate::type_manifest::normalize_manifest_method(method),
+                    path.as_str(),
+                ))
+                .or_default()
+                .push(producer),
+            key => {
+                let (protocol, name, direction) = crate::analyzer::exact_key_fields(key);
+                exact_rows.push(carrick_match::Producer {
+                    service: producer.service_id.to_string(),
+                    protocol,
+                    name,
+                    direction,
+                    ..Default::default()
+                });
+                exact_entries.push(producer);
+            }
+        }
+    }
+    let exact_pool = carrick_match::PairingPool::new(exact_rows);
+    let entries_for_route = |route: usize, kind: ManifestTypeKind| {
+        let route = &routes[route];
+        let (file, line) = crate::type_manifest::parse_file_location(&route.file_location);
+        let service = route
+            .service_name
+            .as_deref()
+            .or(route.repo_name.as_deref())
+            .unwrap_or_default();
+        entries_at
+            .get(&(
+                service,
+                file,
+                line,
+                crate::type_manifest::normalize_manifest_method(&route.method),
+                route.full_path.as_str(),
+            ))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |producer| producer.entry.type_kind == kind)
+    };
+
     let mut pairs: Vec<BuiltPair> = Vec::new();
-    for consumer in &consumers {
-        // Candidate producers, protocol-dispatched.
-        let mut candidates: Vec<(&ServiceEntry, u8)> = Vec::new();
+    for (consumer, cases) in &consumers {
+        let kind = consumer.entry.type_kind;
+        let OperationKey::Http { method, path } = &consumer.entry.key else {
+            let (protocol, name, direction) =
+                crate::analyzer::exact_key_fields(&consumer.entry.key);
+            let pairing = exact_pool.pair(&carrick_match::Call {
+                service: consumer.service_id.to_string(),
+                protocol,
+                name,
+                direction,
+                ..Default::default()
+            });
+            pairs.extend(
+                pairing
+                    .winners
+                    .iter()
+                    // One service on both ends is a pair for HTTP only.
+                    .filter(|winner| !winner.same_service)
+                    .map(|winner| exact_entries[winner.producer])
+                    .filter(|producer| producer.entry.type_kind == kind)
+                    .filter_map(|producer| build_pair(producer, consumer)),
+            );
+            continue;
+        };
+
+        // The routes the call reaches, once per case its site sends: a case
+        // that reaches a route's case is a match for the entry, as any
+        // case of a call at one site is.
+        let mut matched: Vec<usize> = Vec::new();
+        let mut case_unknown: Vec<usize> = Vec::new();
         // Routes the call could only be paired with by guessing its
         // placeholder's value (carrick#2004).
         let mut guessed: Vec<&str> = Vec::new();
-        for producer in &producers {
-            // One service on both ends is a pair for HTTP only (see above).
-            if producer.service_id == consumer.service_id && consumer.entry.key.as_http().is_none()
-            {
-                continue;
-            }
-            if producer.entry.type_kind != consumer.entry.type_kind {
-                continue;
-            }
-            match (&producer.entry.key, &consumer.entry.key) {
-                (
-                    OperationKey::Http {
-                        method: pm,
-                        path: pp,
-                    },
-                    OperationKey::Http {
-                        method: cm,
-                        path: cp,
-                    },
-                ) if pm.eq_ignore_ascii_case(cm) && paths_match(pp, cp) => {
-                    if call_placeholder_over_route_literal(pp, cp) {
-                        guessed.push(pp.as_str());
-                        continue;
-                    }
-                    candidates.push((producer, match_score(pp, cp)));
+        for case in cases {
+            let pairing = http_pool.pair(&carrick_match::Call {
+                service: consumer.service_id.to_string(),
+                protocol: "http".to_string(),
+                method: Some(method.clone()),
+                path: Some(path.clone()),
+                dispatch: crate::dispatch::Dispatch::key_of(*case),
+                ..Default::default()
+            });
+            let reached = match pairing.outcome {
+                carrick_match::PairOutcome::Matched => &mut matched,
+                carrick_match::PairOutcome::RouteCaseUnknown => &mut case_unknown,
+                // A value no case answers, a path with no literal, a route
+                // that corroborates nothing, or no route: no edge, so no pair.
+                _ => continue,
+            };
+            for winner in &pairing.winners {
+                if winner.call_param_over_route_literal == Some(true) {
+                    guessed.push(routes[winner.producer].full_path.as_str());
+                } else {
+                    reached.push(winner.producer);
                 }
-                // Exact-key protocols: socket / graphql / pubsub.
-                (
-                    p @ (OperationKey::Socket { .. }
-                    | OperationKey::Graphql { .. }
-                    | OperationKey::Pubsub { .. }),
-                    c,
-                ) if p == c => {
-                    candidates.push((producer, 100));
-                }
-                _ => {}
             }
         }
-        if candidates.is_empty() {
-            if !guessed.is_empty() {
-                guessed.sort_unstable();
-                guessed.dedup();
-                debug!(
-                    "v2 check: {} {} at {}:{} is not compared: its placeholder stands where {} route(s) state a literal segment ({})",
-                    consumer
-                        .entry
-                        .key
-                        .as_http()
-                        .map_or("", |(method, _)| method),
-                    consumer.entry.key.as_http().map_or("", |(_, path)| path),
-                    consumer.entry.file_path,
-                    consumer.entry.line_number,
-                    guessed.len(),
-                    guessed.join(", ")
-                );
-            }
-            continue;
-        }
-        // HTTP specificity: keep only the best-scoring producer(s), mirroring
-        // routing semantics (a literal route wins over :param).
-        let best = candidates.iter().map(|(_, s)| *s).max().unwrap_or(0);
-        // Then the dispatch case, as the analyzer's matcher decides it after
-        // the same specificity filter (carrick#2059): the check pairs a call
-        // with exactly the producers its edge reaches, so a half it judges is
-        // a half the index stores.
-        let mut matched: Vec<&ServiceEntry> = Vec::new();
-        let mut case_unknown: Vec<&ServiceEntry> = Vec::new();
-        let mut case_mismatched = 0u32;
-        for (producer, score) in candidates {
-            if score != best {
-                continue;
-            }
-            match entry_dispatch_verdict(producer, consumer) {
-                carrick_match::DispatchVerdict::ValueUnknown => case_unknown.push(producer),
-                carrick_match::DispatchVerdict::ValueMismatch => case_mismatched += 1,
-                _ => matched.push(producer),
-            }
-        }
-        match carrick_match::dispatch_outcome(
-            matched.len() as u32,
-            case_unknown.len() as u32,
-            case_mismatched,
-        ) {
-            carrick_match::DispatchOutcome::Matched => {
-                pairs.extend(
-                    matched
-                        .into_iter()
-                        .filter_map(|producer| build_pair(producer, consumer)),
-                );
-            }
+
+        let before = pairs.len();
+        if !matched.is_empty() {
+            pairs.extend(
+                matched
+                    .iter()
+                    .flat_map(|&route| entries_for_route(route, kind))
+                    .filter_map(|producer| build_pair(producer, consumer)),
+            );
+        } else if !case_unknown.is_empty() {
             // The call keeps one edge to the route with its case unknown, so
             // it gets one half per kind, stored unverifiable without a probe:
             // which case's type to compare against is the thing not known.
-            carrick_match::DispatchOutcome::RouteCaseUnknown => {
-                case_unknown.sort_by(|a, b| {
-                    (a.service_id, &a.entry.type_alias).cmp(&(b.service_id, &b.entry.type_alias))
+            let mut fields: Vec<&str> = case_unknown
+                .iter()
+                .filter_map(|&route| routes[route].dispatch.as_ref())
+                .map(|case| case.field.as_str())
+                .collect();
+            fields.sort_unstable();
+            fields.dedup();
+            let mut entries: Vec<&ServiceEntry> = case_unknown
+                .iter()
+                .flat_map(|&route| entries_for_route(route, kind))
+                .collect();
+            entries.sort_by(|a, b| {
+                (a.service_id, &a.entry.type_alias).cmp(&(b.service_id, &b.entry.type_alias))
+            });
+            if let Some(mut pair) = entries
+                .first()
+                .and_then(|producer| build_pair(producer, consumer))
+            {
+                pair.pre_verdict = Some(PreVerdict::NotCompared {
+                    reason: case_unknown_reason(&fields),
                 });
-                let mut fields: Vec<&str> = case_unknown
-                    .iter()
-                    .flat_map(|producer| producer.cases.iter().flatten())
-                    .map(|case| case.field.as_str())
-                    .collect();
-                fields.sort_unstable();
-                fields.dedup();
-                if let Some(mut pair) = build_pair(case_unknown[0], consumer) {
-                    pair.pre_verdict = Some(PreVerdict::NotCompared {
-                        reason: case_unknown_reason(&fields),
-                    });
-                    pair.pre_verdict_side = None;
-                    pairs.push(pair);
-                }
+                pair.pre_verdict_side = None;
+                pairs.push(pair);
             }
-            // A value no case answers, as the matcher: no edge, so no pair.
-            carrick_match::DispatchOutcome::NoCaseAnswers
-            | carrick_match::DispatchOutcome::NotMatched => {}
+        }
+        if pairs.len() == before && !guessed.is_empty() {
+            guessed.sort_unstable();
+            guessed.dedup();
+            debug!(
+                "v2 check: {} {} at {}:{} is not compared: its placeholder stands where {} route(s) state a literal segment ({})",
+                method,
+                path,
+                consumer.entry.file_path,
+                consumer.entry.line_number,
+                guessed.len(),
+                guessed.join(", ")
+            );
         }
     }
 
