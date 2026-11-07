@@ -1,0 +1,67 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/http",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture/http",
+          "export": "http",
+          "role": "http_client",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "post",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "method": "POST",
+              "picker": "fixture-picker",
+              "protocol": "http"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/http",
+          "export": "Client",
+          "role": "http_client",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "post",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "method": "POST",
+              "picker": "fixture-picker",
+              "of": "type",
+              "protocol": "http"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

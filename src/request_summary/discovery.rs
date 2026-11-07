@@ -1508,8 +1508,10 @@ impl<'a> Walker<'a> {
     /// whose claims they are, where each of those exports claims the member
     /// the same way (the store labels a package's factory under every name
     /// it is published as, `default` and a named export, and both name the
-    /// member's declaration). An op on what a scope member returns is one
-    /// only alone: its export also picks the scope label it is read under.
+    /// member's declaration), or where one claims it on the export and the
+    /// other on its type, which differ only in the receiver they name
+    /// (carrick#3044 S2). An op on what a scope member returns is one only
+    /// alone: its export also picks the scope label it is read under.
     /// `None` where they disagree.
     fn one_op<'d>(&self, ops: &'d [DeclaredOp]) -> Option<&'d DeclaredOp> {
         let (first, rest) = ops.split_first()?;
@@ -1525,7 +1527,7 @@ impl<'a> Walker<'a> {
                     .filter(|claim| {
                         matches!(claim, LibraryClaim::Op { member: Some(member), .. } if *member == op.member)
                     })
-                    .map(LibraryClaim::without_picker)
+                    .map(|claim| claim.without_picker().without_receiver())
                     .collect(),
             )
         };
@@ -5151,6 +5153,51 @@ export function listen(): void {
                 "src/catalog.ts:14 <- /api/v2/orders",
                 "src/index.ts:12 <- /internal/status",
                 "src/index.ts:7 <- /health",
+            ]),
+            "{got:#?}"
+        );
+    }
+
+    /// carrick#3044 S2: a package labels its client under the export that
+    /// holds an instance (`http`, `on: export`) and under the type of that
+    /// instance (`Client`, `of: type`); both ops stand on the one
+    /// declaration `Client.post`. They read the member the same way, so they
+    /// are one op: a call whose receiver is `a ?? http` or a function's
+    /// result is a site by the member's declaration, and none is ambiguous.
+    #[test]
+    fn an_export_label_and_a_type_label_on_one_declaration_are_one_op() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-typed-label")
+        else {
+            return;
+        };
+        let discovery = discover(
+            &on.inputs,
+            &Labels::traced(&exports, &declarations),
+            &on.repo,
+        );
+        assert_eq!(discovery.counts.get("declaration_ambiguous"), None);
+        let mut got: Vec<String> = discovery
+            .sites
+            .iter()
+            .filter(|site| site.end.is_some())
+            .map(|site| {
+                let reached = site.reached.map_or("-".to_string(), |by| {
+                    serde_json::to_value(by)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
+                format!("{} {reached}", site.file)
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            texts(&[
+                "src/t-call-result-receiver.ts declaration",
+                "src/t-coalesce-receiver.ts declaration",
+                "src/t-typed-const.ts name",
             ]),
             "{got:#?}"
         );
