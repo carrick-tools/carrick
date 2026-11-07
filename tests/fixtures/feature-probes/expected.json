@@ -27,7 +27,7 @@
  "n-computed": {
   "feature": "computed-property-names",
   "source": "test262",
-  "status": "lead"
+  "status": "covered"
  },
  "n-concat": {
   "feature": "string concatenation (+)",
@@ -47,7 +47,7 @@
  "n-const-enum": {
   "feature": "const enum (TS)",
   "source": "TS",
-  "status": "lead"
+  "status": "covered"
  },
  "n-ctor-field": {
   "feature": "constructor-assigned field (this.x = ...)",
@@ -72,7 +72,7 @@
  "n-enum": {
   "feature": "enum (TS)",
   "source": "TS",
-  "status": "lead"
+  "status": "covered"
  },
  "n-env": {
   "feature": "process.env base (host global)",
@@ -107,12 +107,12 @@
  "n-imported-object": {
   "feature": "imported const object member",
   "source": "test262 (modules)",
-  "status": "lead"
+  "status": "covered"
  },
  "n-join": {
   "feature": "Array.prototype.join (built-in)",
   "source": "test262 (built-in)",
-  "status": "lead"
+  "status": "covered"
  },
  "n-json-module": {
   "feature": "json-modules / import-attributes",
@@ -122,7 +122,7 @@
  "n-let": {
   "feature": "let",
   "source": "test262",
-  "status": "lead"
+  "status": "covered"
  },
  "n-literal": {
   "feature": "string literal (baseline)",
@@ -152,7 +152,7 @@
  "n-namespace": {
   "feature": "namespace (TS)",
   "source": "TS",
-  "status": "lead"
+  "status": "covered"
  },
  "n-non-null": {
   "feature": "non-null assertion on the name (!, TS)",
@@ -212,7 +212,7 @@
  "n-star-as": {
   "feature": "export-star-as-namespace-from-module",
   "source": "test262",
-  "status": "lead"
+  "status": "covered"
  },
  "n-static-block": {
   "feature": "class-static-block",
@@ -227,12 +227,12 @@
  "n-str-concat": {
   "feature": "String.prototype.concat (built-in)",
   "source": "test262 (built-in)",
-  "status": "lead"
+  "status": "covered"
  },
  "n-tagged": {
   "feature": "tagged template (String.raw)",
   "source": "test262 (template)",
-  "status": "lead"
+  "status": "covered"
  },
  "n-template": {
   "feature": "template",
@@ -342,7 +342,7 @@
  "r-enum": {
   "feature": "enum route name (TS)",
   "source": "TS",
-  "status": "lead"
+  "status": "covered"
  },
  "r-imported-app": {
   "feature": "app imported from another module",
