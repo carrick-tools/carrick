@@ -350,8 +350,8 @@ fn the_re_check_lists_each_descriptor_as_a_candidate_with_its_route() {
 }
 
 /// `check --changed` on a branch that adds the builders fails on none of
-/// them: the one that reaches no route is a candidate, counted on the
-/// summary line and listed with `--all` as not failing.
+/// them and exits 0: the one that reaches no route is counted on the summary
+/// line as a built request and listed with `--all` as not failing.
 #[test]
 fn check_changed_on_a_branch_adding_builders_fails_on_none() {
     let (dir, held) = workspace(Some(REQUESTS));
@@ -368,12 +368,13 @@ fn check_changed_on_a_branch_adding_builders_fails_on_none() {
     let plain = local(&repo, &["check", "--changed"]);
     let text = String::from_utf8_lossy(&plain.stdout).into_owned();
     assert!(
-        text.contains("0 incompatible, 0 reach no route, plus 1 model candidate"),
-        "the summary counts the unmatched candidate:\n{text}"
+        text.contains("0 incompatible, 0 reach no route, plus 1 built request not seen sent"),
+        "the summary counts the unmatched built request as its own kind:\n{text}"
     );
-    // Not 1: no problem fails. 2 (carrick#3012): the matched pairs hold no
-    // response type on the descriptor's side, so none was type-checked.
-    assert_eq!(plain.status.code(), Some(2), "{text}");
+    // Not 1: no problem fails. Not 2 (carrick#3012): the matched pairs hold
+    // no response type on the descriptor's side, but a matched method and
+    // path is the check a built request can have.
+    assert_eq!(plain.status.code(), Some(0), "{text}");
     let all = local(&repo, &["check", "--changed", "--all"]);
     let listed = String::from_utf8_lossy(&all.stdout).into_owned();
     assert!(

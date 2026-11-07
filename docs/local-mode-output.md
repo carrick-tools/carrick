@@ -658,7 +658,10 @@ on the summary line as `not type-checked`, listed with `--all` and in the JSON
 as `not_type_checked` (`file`, `line`, `role`, `method`, `path`, `reason`),
 and never counted as a pass. When the changed files hold such pairs, none was
 type-checked (`type_checked` is 0) and nothing fails, the run exits 2. A run
-that judged some pairs exits by those.
+that judged some pairs exits by those. A pair whose call is a built request
+(`request_descriptor`) is still counted and listed as not type-checked, but
+does not make the run exit 2: its matched method and path are the check it
+can have, so a branch that only adds request builders exits 0.
 
 A check that
 covered none of the files it was asked about exits 2, which no verdict uses:
@@ -689,7 +692,9 @@ are counted on the summary line by why they do not fail, `..., plus 2 already
 in the index and 1 unconfirmed, run with --all to list them`, and `--all`
 lists them, each marked with the same reason: `[already in the index, does
 not fail]`, `[unconfirmed: the base is set at run time, does not fail]`,
-`[model candidate, does not fail]` or `[source not stated, does not fail]`.
+`[model candidate, does not fail]`, `[built request not seen sent, does not
+fail]` (a `request_descriptor` call, counted as `1 built request not seen
+sent`) or `[source not stated, does not fail]`.
 A problem the index already held is counted as that, whatever else holds for
 it. `--json` always lists every problem, with its `source`,
 `already_indexed`, `unconfirmed` and `fails`.
