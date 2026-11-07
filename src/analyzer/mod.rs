@@ -677,7 +677,7 @@ fn read_undeclared_selections(calls: &[ApiEndpointDetails], outcomes: &mut [Pair
                 (
                     Protocol::Graphql,
                     service.to_string(),
-                    normalize_compat_path(&identity),
+                    carrick_match::route_identity(&identity),
                     file,
                     line,
                 ),
@@ -698,7 +698,7 @@ fn read_undeclared_selections(calls: &[ApiEndpointDetails], outcomes: &mut [Pair
         let key: ConsumerRowKey = (
             Protocol::Graphql,
             outcome.consumer_service.clone(),
-            normalize_compat_path(&outcome.identity),
+            carrick_match::route_identity(&outcome.identity),
             outcome.consumer_file.clone(),
             outcome.consumer_line.max(1),
         );
@@ -835,21 +835,20 @@ fn strip_ci_workspace_prefix(location: &str) -> &str {
         .unwrap_or(location)
 }
 
-/// Collapse any dynamic path segment (`:id`, `{id}`, `[id]`) to `:param` so the
-/// compat verdict join is param-NAME-agnostic. The cross-repo edge's
-/// `producer_key` keeps the source param name (`/orders/:id`), while the
-/// outcome's `identity` is built from the normalized manifest
-/// (`/orders/:param`). Without collapsing BOTH sides, the join misses on every
-/// parameterized route and the edge falls back to the optimistic `Some(true)`
-/// default — the historical cause of compat being pinned regardless of the
-/// actual verdicts.
-fn normalize_compat_path(path: &str) -> String {
-    path.split('/')
+/// The spelling a pairing key stores a path in: [`carrick_match::route_identity`]
+/// with every parameter token written `:param`, so keys already stored
+/// (`/orders/:param`) keep reading the same. Identity JOINS call
+/// `route_identity` directly (carrick#3496 R8); only a stored key goes through
+/// this.
+fn pairing_key_path(path: &str) -> String {
+    carrick_match::route_identity(path)
+        .split('/')
         .map(|seg| {
-            let is_param = seg.starts_with(':')
-                || (seg.starts_with('{') && seg.ends_with('}'))
-                || (seg.starts_with('[') && seg.ends_with(']'));
-            if is_param { ":param" } else { seg }
+            if seg == ":" || seg == ":?" {
+                ":param"
+            } else {
+                seg
+            }
         })
         .collect::<Vec<_>>()
         .join("/")
@@ -857,7 +856,7 @@ fn normalize_compat_path(path: &str) -> String {
 
 /// Map the structured v2 pair outcomes onto each cross-repo edge's
 /// `type_compatible`, keyed per consumer (#260) and param-name-agnostic on
-/// the path ([`normalize_compat_path`]). Pure over `(outcomes, matches)` so
+/// the path ([`carrick_match::route_identity`]). Pure over `(outcomes, matches)` so
 /// the verdict join is unit-testable without running the checker.
 ///
 /// Verdict precedence per edge key (multiple type_kinds collapse):
@@ -873,7 +872,7 @@ type VerdictKey = (String, String, (String, u32));
 fn verdict_key_of_outcome(outcome: &PairCheckOutcome) -> VerdictKey {
     (
         outcome.pseudo_method.clone(),
-        normalize_compat_path(&outcome.identity),
+        carrick_match::route_identity(&outcome.identity),
         (
             outcome.consumer_file.clone(),
             if outcome.consumer_line == 0 {
@@ -899,7 +898,7 @@ fn verdict_key_of_edge(edge: &CrossRepoMatch) -> Option<VerdictKey> {
     }
     let (method, path) = parse_producer_key(&edge.producer_key)?;
     let consumer = consumer_identity(edge.consumer_location.as_deref()?);
-    Some((method, normalize_compat_path(&path), consumer))
+    Some((method, carrick_match::route_identity(&path), consumer))
 }
 
 /// The `TypeVerdict` a check bucket states. One definition, so the per-edge
@@ -1970,7 +1969,7 @@ pub(crate) fn pairing_key_of(
         "{}|{}|{}~{}|{}",
         producer_service,
         pseudo_method,
-        normalize_compat_path(identity),
+        pairing_key_path(identity),
         consumer_service,
         consumer_file,
     )
@@ -3773,7 +3772,7 @@ impl Analyzer {
                     Some(protocol) => (
                         protocol,
                         outcome.consumer_service.clone(),
-                        normalize_compat_path(&outcome.identity),
+                        carrick_match::route_identity(&outcome.identity),
                         outcome.consumer_file.clone(),
                         outcome.consumer_line.max(1),
                     ),
@@ -3890,7 +3889,8 @@ impl Analyzer {
         producer_service: &'a str,
         consumer: carrick_match::ScopedRow<'a>,
     ) -> impl Iterator<Item = &'a ApiEndpointDetails> + 'a {
-        let want = exact_key_protocol(pseudo_method).map(|_| normalize_compat_path(identity));
+        let want =
+            exact_key_protocol(pseudo_method).map(|_| carrick_match::route_identity(identity));
         self.endpoints.iter().filter(move |endpoint| {
             let Some(want) = want.as_deref() else {
                 return false;
@@ -3898,7 +3898,7 @@ impl Analyzer {
             endpoint.key.protocol() != crate::operation::Protocol::Http
                 && endpoint.service_id() == Some(producer_service)
                 && parse_producer_key(&endpoint.key.canonical()).is_some_and(|(method, path)| {
-                    method == pseudo_method && normalize_compat_path(&path) == want
+                    method == pseudo_method && carrick_match::route_identity(&path) == want
                 })
                 && carrick_match::names_pair(consumer, endpoint.scoped())
         })
@@ -3928,13 +3928,13 @@ impl Analyzer {
         let Some(mount_graph) = self.mount_graph.as_ref() else {
             return Default::default();
         };
-        let want = normalize_compat_path(path);
+        let want = carrick_match::route_identity(path);
         mount_graph
             .get_resolved_endpoints()
             .iter()
             .filter(|endpoint| {
                 carrick_match::method_matches(&endpoint.method, method)
-                    && normalize_compat_path(&endpoint.full_path) == want
+                    && carrick_match::route_identity(&endpoint.full_path) == want
             })
             .map(|endpoint| endpoint.provenance)
             .min()
@@ -3969,7 +3969,7 @@ impl Analyzer {
         let Some(mount_graph) = self.mount_graph.as_ref() else {
             return Vec::new();
         };
-        let want = normalize_compat_path(path);
+        let want = carrick_match::route_identity(path);
         mount_graph
             .get_resolved_endpoints()
             .iter()
@@ -3980,7 +3980,7 @@ impl Analyzer {
                 // deterministic route that happens to share its key.
                 endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
                     && carrick_match::method_matches(&endpoint.method, method)
-                    && normalize_compat_path(&endpoint.full_path) == want
+                    && carrick_match::route_identity(&endpoint.full_path) == want
             })
             .map(|endpoint| endpoint.resolution_source)
             .collect()
@@ -4029,7 +4029,7 @@ impl Analyzer {
                 (
                     protocol,
                     service.to_string(),
-                    normalize_compat_path(&identity),
+                    carrick_match::route_identity(&identity),
                     file,
                     line,
                 ),
@@ -8586,12 +8586,39 @@ mod tests {
     }
 
     #[test]
-    fn normalize_compat_path_collapses_param_syntaxes() {
-        assert_eq!(normalize_compat_path("/orders/:id"), "/orders/:param");
-        assert_eq!(normalize_compat_path("/orders/{id}"), "/orders/:param");
-        assert_eq!(normalize_compat_path("/orders/[id]"), "/orders/:param");
-        assert_eq!(normalize_compat_path("/payments"), "/payments");
-        assert_eq!(normalize_compat_path("/"), "/");
+    fn verdict_join_reads_every_param_spelling_as_one_identity() {
+        for spelled in [
+            "/orders/:id",
+            "/orders/{id}",
+            "/orders/[id]",
+            "/orders/<id>",
+            "/orders/${id}",
+        ] {
+            assert_eq!(carrick_match::route_identity(spelled), "/orders/:");
+            assert_eq!(pairing_key_path(spelled), "/orders/:param");
+        }
+        assert_eq!(carrick_match::route_identity("/payments"), "/payments");
+        assert_eq!(carrick_match::route_identity("/"), "/");
+    }
+
+    /// carrick#3496 slice 2b: a producer key spelled `<id>` joins an outcome
+    /// whose identity is `:id` (the old reader kept `<id>` and missed).
+    #[test]
+    fn apply_pair_outcomes_joins_angle_bracket_producer_key() {
+        let outcomes = vec![outcome(
+            "GET",
+            "/orders/:id",
+            "web-frontend/lib/api.ts:36",
+            VerdictBucket::Incompatible,
+            Some("Order is not assignable to OrderView"),
+        )];
+        let mut matches = vec![edge_at(
+            "http|GET|/orders/<id>",
+            "web-frontend",
+            "web-frontend/lib/api.ts:36",
+        )];
+        apply_pair_outcomes(&outcomes, &mut matches);
+        assert_eq!(matches[0].type_compatible, Some(false));
     }
 
     /// carrick#3170: the services read back out of a type pairing are the
@@ -8976,7 +9003,7 @@ mod tests {
     /// Pub/sub canonical keys are 2-segment (`pubsub|<topic>`, broker excluded
     /// from identity), so the third `splitn(3, '|')` field is `None`.
     /// `parse_producer_key` must still recover `("PUBSUB", "<topic>")`. A
-    /// topic carries no path params, so `normalize_compat_path` leaves it
+    /// topic carries no path params, so `route_identity` leaves it
     /// unchanged — guarding a future param-collapse refactor from silently
     /// breaking the pub/sub join.
     #[test]
@@ -8989,7 +9016,10 @@ mod tests {
         assert_eq!(parse_producer_key("pubsub|"), None);
         // A topic with dots/no slashes is unaffected by the HTTP path-param
         // collapse, so the two sides of the join still agree.
-        assert_eq!(normalize_compat_path("order.placed"), "order.placed");
+        assert_eq!(
+            carrick_match::route_identity("order.placed"),
+            "order.placed"
+        );
     }
 
     /// The pub/sub cross-repo join. The outcome's `("PUBSUB", "<topic>")`

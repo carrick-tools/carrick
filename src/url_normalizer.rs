@@ -516,22 +516,9 @@ impl UrlNormalizer {
             .trim_end_matches(['`', '"', '\''])
             .to_string();
 
-        // Ensure path starts with /
-        if !result.starts_with('/') {
-            result = format!("/{}", result);
-        }
-
-        // Remove trailing slash (unless it's just "/")
-        if result.len() > 1 && result.ends_with('/') {
-            result.pop();
-        }
-
-        // Normalize multiple slashes
-        while result.contains("//") {
-            result = result.replace("//", "/");
-        }
-
-        result
+        // Leading slash, no trailing slash, no empty segment: the crate's
+        // one canonical form (carrick#3496).
+        carrick_match::canonical_path(&result)
     }
 
     /// Extract just the path from a URL, suitable for endpoint matching
