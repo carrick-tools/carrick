@@ -38,7 +38,7 @@ import { writeRepoCopy } from "./repo-copies.ts";
 import { claudeCodeFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
-import { AGENTS_FILE, writeAgentsSection } from "./agents-section.ts";
+import { AGENTS_FILE, CLAUDE_FILE, writeAgentsSection, writeClaudeSection } from "./agents-section.ts";
 import { ignoredSkillRoots, taskSkillWarnings, writeTaskSkills } from "./task-skills.ts";
 import { recordCliVersion } from "./outdated.ts";
 import { findCarrick, offerGlobalInstall } from "../global-install.ts";
@@ -191,7 +191,8 @@ function help(): string {
     "",
     "Sign in (here, or beforehand with carrick login), then set up a repository",
     "or a folder of repos for your agent: the agent hooks, the four task skills",
-    "your agent loads, a short \"Carrick check\" section in AGENTS.md, and the MCP",
+    "your agent loads, a short \"Carrick check\" section in AGENTS.md (and in",
+    "CLAUDE.md, where the folder already has one), and the MCP",
     "connection. It covers the repos here that your Carrick workspace holds, and",
     "reads the index Carrick has built for them into .carrick so this machine can",
     "answer from it. That read re-reads your source here first, which takes",
@@ -850,6 +851,13 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     writeAgentsSection(workspace, { slug: project }, plan.counts);
   } catch (error) {
     out.refuse(`Could not write the Carrick check section in ${AGENTS_FILE}: ${(error as Error).message}`);
+  }
+  // The same block inline in a CLAUDE.md the folder already has (carrick#3515):
+  // a session started in a subfolder does not follow an `@AGENTS.md` import.
+  try {
+    writeClaudeSection(workspace, { slug: project }, plan.counts);
+  } catch (error) {
+    out.refuse(`Could not write the Carrick check section in ${CLAUDE_FILE}: ${(error as Error).message}`);
   }
 
   // The same hooks and skills inside each repo of a folder, because an agent

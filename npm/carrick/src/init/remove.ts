@@ -57,7 +57,7 @@ import { disconnectMcpClients, inspectMcpClients, type McpRemoval } from "./mcp.
 import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
 import { CODEX_HOOKS_FILE, isEmptyHooksDocument, readHooksFile, uninstallCodexHooks } from "./codex.ts";
-import { AGENTS_FILE, hasAgentsSection, removeAgentsSection } from "./agents-section.ts";
+import { AGENTS_FILE, CLAUDE_FILE, hasAgentsSection, hasClaudeSection, removeAgentsSection, removeClaudeSection } from "./agents-section.ts";
 import { inspectTaskSkills, removeTaskSkills, SKILL_ROOTS, skillRootLink } from "./task-skills.ts";
 import { noticeFile, removeNotice } from "./outdated.ts";
 import { readWorkspaceFile, removeSelection, withoutOurExclusions, WORKSPACE_FILE } from "./workspace-file.ts";
@@ -310,6 +310,8 @@ export type FolderPlan = {
   skills: string[];
   /** Our "Carrick check" section in AGENTS.md is there (carrick#2828). */
   agents: boolean;
+  /** Our block is in the folder's CLAUDE.md too; the file is the team's and stays (carrick#3515). */
+  claude: boolean;
   /** The names init added to the exclude list; `file` where they are all it holds. */
   selection: { names: string[]; file: boolean } | null;
   carrick: boolean;
@@ -325,6 +327,7 @@ export function folderPlan(workspace: string): FolderPlan {
     codex: null,
     skills: [],
     agents: false,
+    claude: false,
     selection: null,
     carrick: false,
     leaves: [],
@@ -387,6 +390,7 @@ export function folderPlan(workspace: string): FolderPlan {
   }
 
   plan.agents = hasAgentsSection(workspace);
+  plan.claude = hasClaudeSection(workspace);
 
   // The repo selection, which is the one thing init writes into a file a user
   // can also write to (carrick#1344). Only the names init put in the exclude
@@ -416,6 +420,7 @@ export function folderLines(plan: FolderPlan): string[] {
   if (plan.codex === "entries") lines.push(`Carrick's hook entries in ${CODEX_HOOKS_FILE}`);
   if (plan.skills.length > 0) lines.push(`${plan.skills.length} task skill file(s) in ${SKILL_ROOTS.join(" and ")}`);
   if (plan.agents) lines.push(`The "Carrick check" section in ${AGENTS_FILE}`);
+  if (plan.claude) lines.push(`The "Carrick check" section in ${CLAUDE_FILE}`);
   if (plan.selection !== null) {
     lines.push(
       plan.selection.file
@@ -509,6 +514,16 @@ function removeFolder(plan: FolderPlan, out: InitOutput): void {
       }
     } catch (error) {
       out.refuse(`Could not edit ${AGENTS_FILE}: ${(error as Error).message}. Remove the "Carrick check" section there by hand.`);
+    }
+  }
+
+  if (plan.claude) {
+    try {
+      if (removeClaudeSection(workspace) !== null) {
+        out.done(`The "Carrick check" section removed from ${CLAUDE_FILE}; the file is yours and was left`);
+      }
+    } catch (error) {
+      out.refuse(`Could not edit ${CLAUDE_FILE}: ${(error as Error).message}. Remove the "Carrick check" section there by hand.`);
     }
   }
 

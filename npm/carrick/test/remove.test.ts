@@ -27,7 +27,7 @@ import {
   mcpRemovalLines,
   SCAFFOLD_FILES,
 } from "../src/init/remove.ts";
-import { writeAgentsSection } from "../src/init/agents-section.ts";
+import { writeAgentsSection, writeClaudeSection } from "../src/init/agents-section.ts";
 import { MCP_URL } from "../src/init/mcp.ts";
 import { INSTALL_ID_HEADER, installIdPath } from "../src/init/install-id.ts";
 import { sessionFile, sessionsDir } from "../src/hook/reuse.ts";
@@ -714,4 +714,21 @@ test("the folder plan lists our AGENTS.md check section, and a file without it l
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("the folder plan and the run name CLAUDE.md when it holds our block, and the file stays (carrick#3515)", posixFixture, (t) => {
+  const state = machine();
+  t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const dir = state.workspace;
+  const claude = path.join(dir, "CLAUDE.md");
+  fs.writeFileSync(claude, "# Team rules\n");
+  assert.equal(folderPlan(dir).claude, false);
+  writeAgentsSection(dir, { slug: "shop-system" }, { repos: 1, services: 1 });
+  writeClaudeSection(dir, { slug: "shop-system" }, { repos: 1, services: 1 });
+  const plan = folderPlan(dir);
+  assert.equal(plan.claude, true);
+  assert.ok(folderLines(plan).includes('The "Carrick check" section in CLAUDE.md'));
+  const result = carrick(state, "remove", "--workspace", dir, "--confirm", "repo");
+  assert.match(result.stdout, /"Carrick check" section removed from CLAUDE\.md/, result.stdout + result.stderr);
+  assert.equal(fs.readFileSync(claude, "utf8"), "# Team rules\n");
 });

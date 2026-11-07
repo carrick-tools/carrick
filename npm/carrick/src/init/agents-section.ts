@@ -8,6 +8,11 @@
 // the file is somebody's and is never read for meaning. The file is created
 // when it is missing, and deleted again on remove only when our section was
 // all it held.
+//
+// The same block goes into a CLAUDE.md the workspace already has (carrick#3515):
+// a Claude Code session started in a subfolder does not follow the `@AGENTS.md`
+// import, so the block is written inline there too. CLAUDE.md is never created,
+// and never deleted, because init did not create it.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -16,6 +21,7 @@ import { writeIfChanged } from "./files.ts";
 import { scopeArgument, type SkillScope } from "./task-skills.ts";
 
 export const AGENTS_FILE = "AGENTS.md";
+export const CLAUDE_FILE = "CLAUDE.md";
 
 const START = "<!-- carrick:check start -->";
 const END = "<!-- carrick:check end -->";
@@ -144,6 +150,36 @@ export function removeAgentsSection(workspace: string): "section removed" | "fil
     fs.rmSync(target);
     return "file removed";
   }
+  fs.writeFileSync(target, cleaned.body);
+  return "section removed";
+}
+
+/**
+ * Write our section into the workspace's CLAUDE.md, only where that file exists.
+ * Returns null where there is none: init never creates it (carrick#3515).
+ */
+export function writeClaudeSection(
+  workspace: string,
+  scope: SkillScope,
+  counts: WorkspaceCounts | null,
+): "written" | "unchanged" | null {
+  const target = path.join(workspace, CLAUDE_FILE);
+  if (!fs.existsSync(target)) return null;
+  return writeIfChanged(target, withCheckSection(fs.readFileSync(target, "utf8"), renderCheckSection(scope, counts)));
+}
+
+/** True where the workspace's CLAUDE.md holds our section. */
+export function hasClaudeSection(workspace: string): boolean {
+  const target = path.join(workspace, CLAUDE_FILE);
+  return fs.existsSync(target) && span(fs.readFileSync(target, "utf8")) !== null;
+}
+
+/** Take our section out of CLAUDE.md. The file stays, even where it is left empty. */
+export function removeClaudeSection(workspace: string): "section removed" | null {
+  const target = path.join(workspace, CLAUDE_FILE);
+  if (!fs.existsSync(target)) return null;
+  const cleaned = withoutCheckSection(fs.readFileSync(target, "utf8"));
+  if (!cleaned.changed) return null;
   fs.writeFileSync(target, cleaned.body);
   return "section removed";
 }
