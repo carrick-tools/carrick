@@ -65,6 +65,16 @@ takes the nearest `tsconfig.json`, else `jsconfig.json`, above it. A Deno
 service is not covered: its import maps decide, and its files take the
 nearest config. Code: `module_aliases::Governing` and `src/tsconfig_program.rs`.
 
+The same rule decides what a service's inputs are when a scan decides which
+services to analyse again (`src/change_scope.rs`): every config the rule can
+read one of its files under, each with its `extends` chain, and every path
+where a config appearing or leaving would change the rule's answer (the
+named config, the service-root names up to the first that exists, and
+otherwise the service's `jsconfig.json` and the `tsconfig.json` of each
+directory above it up to the nearest one). Derive reach reads the programs
+of the same configs, and the dependency-move check the packages their chains
+name.
+
 ## Why a config reader and not the compiler
 
 The type sidecar already runs `ts.resolveModuleName` and reads Deno's module

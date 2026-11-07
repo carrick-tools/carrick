@@ -171,6 +171,11 @@ impl ProgramRules {
         }
     }
 
+    /// Add the programs `other` read.
+    pub(crate) fn merge(&mut self, other: ProgramRules) {
+        self.programs.extend(other.programs);
+    }
+
     /// No config was read.
     pub(crate) fn is_empty(&self) -> bool {
         self.programs.is_empty()

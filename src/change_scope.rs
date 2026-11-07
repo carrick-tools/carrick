@@ -175,6 +175,10 @@ pub struct ServiceInputs {
     pub unresolved: Vec<UnresolvedImport>,
     /// `extends` values a config it reads could not follow.
     pub unfollowed_extends: Vec<String>,
+    /// The configs the one rule reads its files under
+    /// ([`crate::workspace_resolver::WorkspaceIndex::governing_configs`]),
+    /// relative to the scanned directory (carrick#3497).
+    pub configs: Vec<PathBuf>,
 }
 
 /// An import the resolver could not follow, and the files it could name.
@@ -1138,7 +1142,7 @@ impl<'r> Walks<'r> {
             };
             match moved {
                 Some(moved) => moved.reach(inputs, |moved| {
-                    loaded_packages(repo_path, top, service, inputs, reads, moved)
+                    loaded_packages(repo_path, top, inputs, reads, moved)
                 }),
                 None => DependencyReach::Unread,
             }
@@ -1777,10 +1781,21 @@ pub fn service_inputs(
     }
     let mut unfollowed_extends = index.unfollowed_extends();
 
-    // Its config chain, and what that config includes beyond the roots.
-    if let Some(tsconfig) = service_tsconfig_path(root, &service_root, service) {
-        let (chain, unfollowed) =
-            crate::module_aliases::tsconfig_chain(root, &tsconfig, &index.internal_package_dirs());
+    // Every config the one rule reads its files under (carrick#3497), each
+    // config's chain, and what each includes beyond the roots.
+    let configs = index.governing_configs();
+    // A config appearing or leaving where the rule looks for one moves which
+    // config governs the service.
+    if let Some(scope) = service.alias_scope(root) {
+        files.extend(
+            crate::module_aliases::service_config_candidates(root, &scope)
+                .iter()
+                .filter_map(|candidate| relative(&root.join(candidate))),
+        );
+    }
+    let internal = index.internal_package_dirs();
+    for tsconfig in &configs {
+        let (chain, unfollowed) = crate::module_aliases::tsconfig_chain(root, tsconfig, &internal);
         for spec in unfollowed {
             if !unfollowed_extends.contains(&spec) {
                 unfollowed_extends.push(spec);
@@ -1827,25 +1842,8 @@ pub fn service_inputs(
         lookup_dirs,
         unresolved,
         unfollowed_extends,
+        configs,
     }
-}
-
-/// The tsconfig that governs `service`: the one carrick.json names, else the
-/// nearest `tsconfig.json` at or above its directory. Repo-relative.
-pub(crate) fn service_tsconfig_path(
-    root: &Path,
-    service_root: &Path,
-    service: &Config,
-) -> Option<PathBuf> {
-    let found = match &service.tsconfig {
-        Some(named) => Some(service_root.join(named)).filter(|path| path.is_file()),
-        None => service_root
-            .ancestors()
-            .take_while(|dir| dir.starts_with(root))
-            .map(|dir| dir.join("tsconfig.json"))
-            .find(|path| path.is_file()),
-    }?;
-    found.strip_prefix(root).ok().map(Path::to_path_buf)
 }
 
 /// The part of a tsconfig `include` entry before its first wildcard.
@@ -1987,7 +1985,7 @@ impl<'a> CopyJudge<'a> {
             let reach = match self.moved(&copy.commit_hash, base, &changed, top) {
                 Some(moved) if moved.moves_nothing() => DependencyReach::Nothing,
                 Some(moved) if !pr_edits_what_it_loads() => moved.reach(&inputs, |moved| {
-                    loaded_packages(self.repo_path, top, service, &inputs, &self.reads, moved)
+                    loaded_packages(self.repo_path, top, &inputs, &self.reads, moved)
                 }),
                 _ => DependencyReach::Unread,
             };
@@ -4064,6 +4062,112 @@ mod tests {
                 .iter()
                 .all(Option::is_some),
             "git cannot compare with a commit it does not hold"
+        );
+    }
+
+    /// carrick#3497 S4: every config the one rule reads for a service is an
+    /// input of that service, and so is every place a config the rule would
+    /// read could appear. `moved(base)` lists api, web, worker.
+    fn config_moves(setup: &[(&str, Option<&str>)], change: &[(&str, Option<&str>)]) -> Vec<bool> {
+        let (repo, _, services) = workspace();
+        let path = repo.path().to_string_lossy().to_string();
+        let apply = |files: &[(&str, Option<&str>)]| {
+            for (file, contents) in files {
+                let file = repo.path().join(file);
+                match contents {
+                    Some(contents) => {
+                        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                        std::fs::write(file, contents).unwrap();
+                    }
+                    None => std::fs::remove_file(file).unwrap(),
+                }
+            }
+        };
+        apply(setup);
+        let base = commit_all(repo.path(), "configs");
+        apply(change);
+        commit_all(repo.path(), "change");
+        let changes = ChangedSince::new(&path, &services, &[]);
+        reading_moved_since(&path, &services, &changes, &base)
+    }
+
+    #[test]
+    fn editing_a_lone_member_jsconfig_moves_its_service() {
+        assert_eq!(
+            config_moves(
+                &[("apps/web/jsconfig.json", Some(r#"{"compilerOptions":{}}"#))],
+                &[(
+                    "apps/web/jsconfig.json",
+                    Some(r#"{"compilerOptions":{"baseUrl":"."}}"#)
+                )],
+            ),
+            [false, true, false]
+        );
+    }
+
+    #[test]
+    fn editing_or_adding_a_member_root_app_config_moves_its_service() {
+        let app = |base: &str| format!(r#"{{"compilerOptions":{{"baseUrl":"{base}"}}}}"#);
+        assert_eq!(
+            config_moves(
+                &[
+                    ("tsconfig.json", Some("{}")),
+                    ("apps/web/tsconfig.app.json", Some(&app("."))),
+                ],
+                &[("apps/web/tsconfig.app.json", Some(&app("src")))],
+            ),
+            [false, true, false],
+            "edited"
+        );
+        assert_eq!(
+            config_moves(&[], &[("apps/web/tsconfig.app.json", Some(&app(".")))]),
+            [false, true, false],
+            "added"
+        );
+    }
+
+    #[test]
+    fn editing_a_referenced_config_outside_the_service_moves_it() {
+        assert_eq!(
+            config_moves(
+                &[
+                    (
+                        "apps/web/tsconfig.json",
+                        Some(r#"{"files":[],"references":[{"path":"../../configs/web.json"}]}"#),
+                    ),
+                    (
+                        "configs/web.json",
+                        Some(r#"{"include":["../apps/web/src"]}"#)
+                    ),
+                ],
+                &[(
+                    "configs/web.json",
+                    Some(r#"{"include":["../apps/web/src"],"compilerOptions":{"strict":true}}"#),
+                )],
+            ),
+            [false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_config_appearing_or_leaving_above_the_services_moves_them() {
+        assert_eq!(
+            config_moves(
+                &[("apps/tsconfig.json", Some("{}"))],
+                &[("apps/tsconfig.json", None)]
+            ),
+            [true, true, true],
+            "removed"
+        );
+        assert_eq!(
+            config_moves(&[], &[("apps/tsconfig.json", Some("{}"))]),
+            [true, true, true],
+            "added"
+        );
+        assert_eq!(
+            config_moves(&[], &[("apps/notes.txt", Some("x"))]),
+            [false, false, false],
+            "any other file there moves nothing"
         );
     }
 

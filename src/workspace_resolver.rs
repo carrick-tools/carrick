@@ -357,6 +357,18 @@ impl WorkspaceIndex {
         self.aliases.as_ref()?.governing_config(file)
     }
 
+    /// Every config the service's rule can read one of its files under:
+    /// the service config and the configs its `references` reach, or, when it
+    /// has none, every per-file config under the service directory.
+    /// Repo-relative, sorted; empty for an index built without a service
+    /// (carrick#3497).
+    pub fn governing_configs(&self) -> Vec<PathBuf> {
+        self.aliases
+            .as_ref()
+            .map(ModuleAliases::governing_configs)
+            .unwrap_or_default()
+    }
+
     /// `extends` values an alias-reading index could not follow to a config
     /// on disk, sorted. Empty for an index built without aliases.
     pub fn unfollowed_extends(&self) -> Vec<String> {

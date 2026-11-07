@@ -99,6 +99,38 @@ pub(crate) fn service_config(
     None
 }
 
+/// Every path where a config appearing or leaving would change what
+/// [`service_config`] answers for `scope` on this tree, repo-relative
+/// (carrick#3497): the named config; the service-root names up to the first
+/// that exists; when none does, the service's `jsconfig.json` and
+/// `tsconfig.json` in each directory above it, up to the nearest that exists
+/// or the repo root.
+pub(crate) fn service_config_candidates(repo_root: &Path, scope: &ServiceScope) -> Vec<PathBuf> {
+    let exists = |path: &Path| repo_root.join(path).is_file();
+    let mut candidates: Vec<PathBuf> = scope.named.iter().cloned().collect();
+    if scope.named.as_deref().is_some_and(exists) {
+        return candidates;
+    }
+    for name in SERVICE_ROOT_NAMES {
+        let candidate = scope.dir.join(name);
+        let found = exists(&candidate);
+        candidates.push(candidate);
+        if found {
+            return candidates;
+        }
+    }
+    candidates.push(scope.dir.join("jsconfig.json"));
+    for dir in scope.dir.ancestors().skip(1) {
+        let candidate = dir.join("tsconfig.json");
+        let found = exists(&candidate);
+        candidates.push(candidate);
+        if found {
+            break;
+        }
+    }
+    candidates
+}
+
 /// The config each file of one service is read under (carrick#3497): the
 /// type sidecar's rule, steps 1-5 of `docs/reference/module-resolution.md`.
 /// Built once per service, so every question about a file is a lookup.
@@ -583,6 +615,15 @@ impl ModuleAliases {
             });
         }
         targets
+    }
+
+    /// Every config the service's rule can read a file under, repo-relative
+    /// and sorted; empty with no service (carrick#3497).
+    pub(crate) fn governing_configs(&self) -> Vec<PathBuf> {
+        self.governing
+            .as_ref()
+            .map(|governing| governing.configs().into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// The config the service's rule reads `from_file` (repo-relative) under,

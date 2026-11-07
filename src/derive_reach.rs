@@ -205,14 +205,21 @@ pub fn service_reach(repo: &Path, service: &Config, files: &[PathBuf]) -> Servic
         }
     }
 
-    if let Some(config) = governing_config(repo, &service_root, service) {
-        let rules = ProgramRules::new(repo, &config, &internal);
-        let config_dir = config.parent().unwrap_or(repo).to_path_buf();
+    let configs = governing_configs(repo, service, &modules, files);
+    if !configs.is_empty() {
+        let mut rules = ProgramRules::default();
+        for config in &configs {
+            rules.merge(ProgramRules::new(repo, config, &internal));
+        }
+        let config_dirs: Vec<&Path> = configs
+            .iter()
+            .map(|config| config.parent().unwrap_or(repo))
+            .collect();
         let matched: Vec<bool> = files.iter().map(|file| rules.lists(file)).collect();
         let narrows = files
             .iter()
             .zip(&matched)
-            .any(|(file, listed)| file.starts_with(&config_dir) && !listed);
+            .any(|(file, listed)| config_dirs.iter().any(|dir| file.starts_with(dir)) && !listed);
         if rules.is_empty() {
             reach.program = Program::None;
         } else if narrows {
@@ -508,27 +515,42 @@ fn dependency_names(json: &serde_json::Value) -> BTreeSet<String> {
     .collect()
 }
 
-/// The config that governs `service`: the one carrick.json names, else the
-/// nearest `tsconfig.json` at or above its directory, or a `jsconfig.json`
-/// at a level that holds no `tsconfig.json`.
-fn governing_config(repo: &Path, service_root: &Path, service: &Config) -> Option<PathBuf> {
-    if let Some(named) = &service.tsconfig {
-        // A member's config names one above it (`../../tsconfig.json`).
-        let path = canonical(&service_root.join(named));
-        let deno = path
-            .file_name()
-            .is_some_and(|name| name == "deno.json" || name == "deno.jsonc");
-        return (path.is_file() && !deno).then_some(path);
+/// The configs whose programs are `service`'s, canonical (carrick#3497):
+/// the one the one rule picks for the service ([`service_config`]), or, when
+/// it picks none, the config each walked file is read under. A Deno service
+/// that names its Deno config has none.
+///
+/// [`service_config`]: crate::module_aliases::service_config
+fn governing_configs(
+    repo: &Path,
+    service: &Config,
+    modules: &WorkspaceIndex,
+    files: &[PathBuf],
+) -> Vec<PathBuf> {
+    let scope = service.alias_scope(repo).or_else(|| {
+        service
+            .tsconfig
+            .is_none()
+            .then(|| crate::module_aliases::ServiceScope {
+                dir: normalize(Path::new(service.directory.as_deref().unwrap_or(""))),
+                named: None,
+            })
+    });
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    if let Some(config) =
+        crate::module_aliases::service_config(repo, &scope.dir, scope.named.as_deref())
+    {
+        return vec![canonical(&repo.join(config))];
     }
-    service_root
-        .ancestors()
-        .take_while(|dir| dir.starts_with(repo))
-        .find_map(|dir| {
-            ["tsconfig.json", "jsconfig.json"]
-                .into_iter()
-                .map(|name| dir.join(name))
-                .find(|path| path.is_file())
-        })
+    let per_file: BTreeSet<PathBuf> = files
+        .iter()
+        .filter_map(|file| file.strip_prefix(repo).ok())
+        .filter_map(|file| modules.governing_config(file))
+        .map(|config| canonical(&repo.join(config)))
+        .collect();
+    per_file.into_iter().collect()
 }
 
 /// One file's loads and whether it exports anything, from one parse.

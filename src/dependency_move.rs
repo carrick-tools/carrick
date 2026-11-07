@@ -29,7 +29,6 @@ use serde_json::{Map, Value};
 use crate::change_scope::{
     ClosureReads, ServiceInputs, is_gitignore, is_repo_input, parent_of, under,
 };
-use crate::config::Config;
 use crate::git_state::ChangedPath;
 use crate::request_summary::package_name;
 
@@ -575,14 +574,13 @@ fn holds(inputs: &ServiceInputs, dir: &str) -> bool {
         || inputs.files.iter().any(|file| under(file, dir))
 }
 
-/// Every package `service` loads, workspace packages left out: the package
-/// of each bare specifier its source files read (its tests included), every
-/// file of its closure and every source file under the directories it reads
-/// whole, and the packages its tsconfig chain names.
+/// Every package the service of `inputs` loads, workspace packages left out:
+/// the package of each bare specifier its source files read (its tests
+/// included), every file of its closure and every source file under the
+/// directories it reads whole, and the packages its configs' chains name.
 pub fn loaded_packages(
     repo_path: &str,
     top: &Path,
-    service: &Config,
     inputs: &ServiceInputs,
     reads: &ClosureReads,
     moved: &DependencyMove,
@@ -625,7 +623,11 @@ pub fn loaded_packages(
             }
         }
     }
-    packages.extend(tsconfig_packages(repo_path, service, &moved.workspace));
+    packages.extend(tsconfig_packages(
+        repo_path,
+        &inputs.configs,
+        &moved.workspace,
+    ));
     packages.retain(|package| !moved.workspace.contains_key(package));
     packages
 }
@@ -689,26 +691,24 @@ fn collect_package_targets(value: Option<&Value>, targets: &mut Vec<String>) {
     }
 }
 
-/// The packages the service's tsconfig chain names: a package it extends,
-/// `compilerOptions.types`, `jsxImportSource` (and `react` for a React
-/// `jsx` mode), and any `paths` target under `node_modules`.
+/// The packages the chains of the service's configs name (`configs`, the
+/// ones the one rule reads its files under, carrick#3497): a package one
+/// extends, `compilerOptions.types`, `jsxImportSource` (and `react` for a
+/// React `jsx` mode), and any `paths` target under `node_modules`.
 fn tsconfig_packages(
     repo_path: &str,
-    service: &Config,
+    configs: &[PathBuf],
     workspace: &BTreeMap<String, PathBuf>,
 ) -> BTreeSet<String> {
     let root = Path::new(repo_path);
-    let service_root = match &service.directory {
-        Some(dir) => root.join(dir),
-        None => root.to_path_buf(),
-    };
     let mut packages = BTreeSet::new();
-    let Some(tsconfig) = crate::change_scope::service_tsconfig_path(root, &service_root, service)
-    else {
-        return packages;
-    };
-    let (chain, unfollowed) = crate::module_aliases::tsconfig_chain(root, &tsconfig, workspace);
-    let mut extends: Vec<String> = unfollowed;
+    let mut extends: Vec<String> = Vec::new();
+    let mut chain = Vec::new();
+    for tsconfig in configs {
+        let (read, unfollowed) = crate::module_aliases::tsconfig_chain(root, tsconfig, workspace);
+        chain.extend(read);
+        extends.extend(unfollowed);
+    }
     for (_, json) in &chain {
         match json.get("extends") {
             Some(Value::String(one)) => extends.push(one.clone()),
