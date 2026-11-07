@@ -63,7 +63,7 @@ impl Composed {
             .iter()
             .map(|part| {
                 let value = match &part.value {
-                    address::Value::Unstated => "-".to_string(),
+                    address::Value::Unstated | address::Value::Neutral => "-".to_string(),
                     address::Value::Text { values } => {
                         let texts: Option<Vec<String>> =
                             values.iter().map(|pieces| read_text(pieces)).collect();

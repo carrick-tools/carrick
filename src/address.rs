@@ -57,6 +57,14 @@ pub enum PartKind {
     Scope,
     /// The row's own call: the path it writes.
     Own,
+    /// Declared by a later slice: an instance's own setting (a base path).
+    Instance,
+    /// Declared by a later slice: an inner level that overrides an outer
+    /// one's value for the same key.
+    Override,
+    /// Declared by a later slice: a directory or file name that is a
+    /// segment of a file-routed address.
+    FileSegment,
 }
 
 /// The axis of an operation's key a part extends.
@@ -64,6 +72,11 @@ pub enum PartKind {
 #[serde(rename_all = "snake_case")]
 pub enum Dimension {
     Path,
+    /// Declared by a later slice: a socket namespace.
+    Namespace,
+    /// Declared by a later slice: a name key (an RPC router key, a queue
+    /// or topic name prefix).
+    Name,
 }
 
 /// Where a part was read from.
@@ -72,6 +85,11 @@ pub enum Dimension {
 pub enum Via {
     /// A call the library store's verified label names.
     Label,
+    /// Declared by a later slice: read from code, no label.
+    Code,
+    /// Declared by a later slice: recorded from the frozen model path's
+    /// mount join.
+    Model,
 }
 
 /// What a part states.
@@ -82,6 +100,9 @@ pub enum Value {
     Text { values: Vec<Vec<Piece>> },
     /// The member writes nothing there: it adds nothing to the address.
     Unstated,
+    /// Declared by a later slice: states explicitly that it adds nothing
+    /// (a neutral sentinel).
+    Neutral,
 }
 
 /// One piece of a stated value.
@@ -119,6 +140,8 @@ impl Piece {
 pub enum UnknownReason {
     /// An environment read: set when the process starts.
     RuntimeEnv,
+    /// Declared by a later slice: the result of a call.
+    CallResult,
     /// A parameter whose callers the scan does not settle.
     Parameter,
     /// A conditional or a default whose ways the scan does not settle.
@@ -148,7 +171,7 @@ impl Reading {
         let pieces_of = |part: &Part| -> Vec<Piece> {
             match &part.value {
                 Value::Text { values } => values.iter().flatten().cloned().collect(),
-                Value::Unstated => Vec::new(),
+                Value::Unstated | Value::Neutral => Vec::new(),
             }
         };
         let own_unknown = parts.last().is_some_and(|own| {
@@ -297,5 +320,66 @@ mod tests {
         assert_eq!(json["reading"], "headless");
         let back: Address = serde_json::from_value(json).unwrap();
         assert_eq!(back, address);
+    }
+    /// Every enum value the design record names is declared now, so a blob
+    /// written by a later slice reads on this build (strict enums, #1740).
+    #[test]
+    fn a_blob_carrying_a_later_slice_value_reads_on_this_build() {
+        fn round<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(
+            value: T,
+            text: &str,
+        ) {
+            assert_eq!(
+                serde_json::to_value(&value).unwrap(),
+                serde_json::json!(text)
+            );
+            let back: T = serde_json::from_value(serde_json::json!(text)).unwrap();
+            assert_eq!(back, value);
+        }
+        round(PartKind::Mount, "mount");
+        round(PartKind::Scope, "scope");
+        round(PartKind::Own, "own");
+        round(PartKind::Instance, "instance");
+        round(PartKind::Override, "override");
+        round(PartKind::FileSegment, "file_segment");
+        round(Dimension::Path, "path");
+        round(Dimension::Namespace, "namespace");
+        round(Dimension::Name, "name");
+        round(Via::Label, "label");
+        round(Via::Code, "code");
+        round(Via::Model, "model");
+        round(UnknownReason::RuntimeEnv, "runtime_env");
+        round(UnknownReason::CallResult, "call_result");
+        round(UnknownReason::Parameter, "parameter");
+        round(UnknownReason::Conditional, "conditional");
+        round(UnknownReason::Unread, "unread");
+        for (reading, text) in [
+            (Reading::Whole, "whole"),
+            (Reading::Headless, "headless"),
+            (Reading::Gap, "gap"),
+            (Reading::Unread, "unread"),
+        ] {
+            round(reading, text);
+        }
+        let neutral: Value =
+            serde_json::from_value(serde_json::json!({"value": "neutral"})).unwrap();
+        assert_eq!(neutral, Value::Neutral);
+
+        let blob = serde_json::json!({
+            "parts": [{
+                "kind": "file_segment", "dimension": "namespace", "at": "a.ts:1",
+                "value": {"value": "neutral"}, "via": "model",
+            }, {
+                "kind": "override", "dimension": "name", "at": "a.ts:2",
+                "value": {"value": "text", "values": [[{
+                    "piece": "unknown", "written": "f()", "reason": "call_result",
+                }]]},
+                "via": "code",
+            }],
+            "reading": "unread",
+        });
+        let address: Address = serde_json::from_value(blob).unwrap();
+        assert_eq!(address.parts[0].kind, PartKind::FileSegment);
+        assert_eq!(address.parts[1].via, Via::Code);
     }
 }
