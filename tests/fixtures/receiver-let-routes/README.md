@@ -13,6 +13,8 @@ as every value written to it: its initialiser and each assignment.
 | `s-let-never.ts` | `let app = make()`, never written | root `s-let-never.ts:2` (line 3) |
 | `s-let-unplaced.ts` | `let app = make()`, `[app] = [make()]` | `unread` (line 4): a destructuring write is not placed |
 
-A route on `s-let.ts` keeps both ends (the walk's per-end rule): one root
-and one entry point, so its row is not placed at a path, and no row loses its
-path. `s-let-never.ts` is placed at `/p/s-let-never`.
+The route on `s-let.ts` keeps both ends (the walk's per-end rule): the root
+places it at `/p/s-let` (`library_claim`), and the entry point says another
+service may hand `set` a different app. `s-let-never.ts` is placed at
+`/p/s-let-never`. `s-let-unplaced.ts` is placed at no path (on main all
+three were the model's rows).

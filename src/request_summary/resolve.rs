@@ -108,6 +108,18 @@ impl Visit for PatternNames {
     }
 }
 
+/// The name a wrapped assignment target writes (`(s)`, `s!`, `s as T`),
+/// when the wrappers hold a bare name and no member.
+struct WrappedName(Option<BindingKey>);
+
+impl Visit for WrappedName {
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.0.get_or_insert_with(|| ident_key(ident));
+    }
+    fn visit_member_expr(&mut self, _: &MemberExpr) {}
+    fn visit_ts_type(&mut self, _: &TsType) {}
+}
+
 impl WriteCensus {
     fn mark(&mut self, pat: &impl VisitWith<PatternNames>) {
         let mut names = PatternNames::default();
@@ -128,6 +140,23 @@ impl Visit for WriteCensus {
                 }
             }
             AssignTarget::Pat(pat) => self.mark(pat),
+            // `(s) = …`, `s! = …`, `(s as T) = …`: the binding is written in
+            // a form no reader places. A member target writes a property,
+            // not the binding.
+            AssignTarget::Simple(
+                SimpleAssignTarget::Paren(_)
+                | SimpleAssignTarget::TsAs(_)
+                | SimpleAssignTarget::TsSatisfies(_)
+                | SimpleAssignTarget::TsNonNull(_)
+                | SimpleAssignTarget::TsTypeAssertion(_)
+                | SimpleAssignTarget::TsInstantiation(_),
+            ) => {
+                let mut names = WrappedName(None);
+                assign.left.visit_with(&mut names);
+                if let Some(key) = names.0 {
+                    self.unplaceable.insert(key);
+                }
+            }
             _ => {}
         }
         assign.visit_children_with(self);
@@ -784,6 +813,7 @@ impl Drop for Query<'_, '_> {
             census.max_query_steps = census.max_query_steps.max(census.steps - start);
             if self.0.capped.get() {
                 census.capped_queries += 1;
+                self.0.capped.set(false);
             }
             self.0.census.set(census);
         }
@@ -1613,6 +1643,73 @@ mod tests {
             [Got::End(End::Nothing), definition("sendGo")]
         );
         assert_eq!(read("spread.ts", 20), [definition("sendGo")]);
+    }
+
+    /// The census of the module binding `s` in `source`: how many plain
+    /// assignments it places, and whether another write makes it
+    /// unplaceable.
+    fn census_of(source: &str) -> (usize, bool) {
+        let cm: swc_common::sync::Lrc<swc_common::SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            false,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_source(
+            Path::new("a.ts"),
+            swc_common::FileName::Anon,
+            source.to_string(),
+            &cm,
+            &handler,
+            None,
+        )
+        .unwrap();
+        let mut census = WriteCensus::default();
+        module.visit_with(&mut census);
+        let key = census
+            .declared
+            .keys()
+            .find(|(name, _)| name == "s")
+            .cloned()
+            .expect("`s` is declared");
+        let placed = census.writes.get(&key).map_or(0, Vec::len);
+        let unplaceable = census.opaque
+            || census.unplaceable.contains(&key)
+            || census.declared.get(&key).copied().unwrap_or(0) > 1;
+        (placed, unplaceable)
+    }
+
+    /// carrick#3504 S1 (soundness rule 1): the census places each plain
+    /// assignment of a binding, anywhere in the module, and marks every
+    /// other form of write, so the binding is never read as its initialiser
+    /// alone. A write of a property, or of a name an inner scope declares
+    /// again, is no write of the binding.
+    #[test]
+    fn the_write_census_places_plain_writes_and_marks_every_other_write() {
+        assert_eq!(census_of("let s = a;"), (0, false));
+        assert_eq!(census_of("let s = a; s = b;"), (1, false));
+        assert_eq!(
+            census_of("let s = a; function f() { s = b; } const g = () => { s = c; };"),
+            (2, false)
+        );
+        assert_eq!(census_of("let s = a; s.x = b;"), (0, false));
+        assert_eq!(census_of("let s = a; function f(s) { s = b; }"), (0, false));
+        for source in [
+            "let s = a; s ??= b;",
+            "let s = a; s += b;",
+            "let s = a; s++;",
+            "let s = a; [s] = [b];",
+            "let s = a; ({ s } = o);",
+            "let s = a; for (s of list) {}",
+            "let s = a; (s) = b;",
+            "let s = a; s! = b;",
+            "let s = a; (s as any) = b;",
+            "var s = a; var s = b;",
+            "let s = a; eval('s = b');",
+        ] {
+            assert!(census_of(source).1, "{source}");
+        }
     }
 
     /// carrick#3504 S1: a query that reads more values than the step cap
