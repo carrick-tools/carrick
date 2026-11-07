@@ -620,10 +620,13 @@ pub fn finish(error: Option<&str>) {
     let now = timestamp();
     active.state.finished_at = Some(now.clone());
     active.state.updated_at = now;
-    write(&active.file, &active.state);
     // The last line of the log, so a reader tailing it sees the end rather
-    // than a progress count that simply stopped moving.
+    // than a progress count that simply stopped moving. Written before the
+    // record: a poll that reads "finished" from `carrick status` and then
+    // opens the log must find the outcome there already, and with the record
+    // first there was a moment when it did not (carrick#3456).
     log_line(&format!("carrick: {}", active.state.line()));
+    write(&active.file, &active.state);
     *guard = None;
 }
 
