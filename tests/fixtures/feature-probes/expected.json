@@ -377,7 +377,7 @@
  "ri-class-field": {
   "feature": "class field holding an instance",
   "source": "test262 (class-fields-public)",
-  "status": "not_reached"
+  "status": "covered"
  },
  "ri-const-alias": {
   "feature": "const alias of an instance",
