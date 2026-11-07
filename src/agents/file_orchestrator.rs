@@ -11804,29 +11804,13 @@ impl FileOrchestrator {
             .data_calls
             .iter()
             .map(|call| {
-                // Two guards on what counts as the service's own route,
-                // composed:
-                // - A zero-agreement routing match (#381), this service's own
-                //   catch-all fallback (`GET /*`) absorbing the call, is no
-                //   evidence: it would mark every one of the service's real
-                //   outgoing calls. Only a route that shares literal path
-                //   signal with the call counts.
-                // - Only route-definition evidence counts (#379): a call whose
-                //   only match is a call-site-evidence endpoint (its own
-                //   double-extracted twin) is a call to an EXTERNAL contract,
-                //   not the service calling its own surface.
-                graph
-                    .find_matching_endpoints(&call.canonical_path, &call.method)
-                    .iter()
-                    .any(|endpoint| {
-                        endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
-                            && carrick_match::match_agreement(
-                                &endpoint.full_path,
-                                &call.canonical_path,
-                            )
-                            .unwrap_or(0)
-                                > 0
-                    })
+                // The one rule for a row's `own_route`, whichever pass writes
+                // the row (carrick#1926): a route that shares literal path
+                // signal with the call (#381, so this service's own `GET /*`
+                // fallback absorbing a call is no evidence) and is backed by
+                // a route definition (#379, so the call's own double-extracted
+                // twin is not the service calling its own surface).
+                crate::call_through::serves_own_route(&graph, &call.method, &call.canonical_path)
             })
             .collect();
         for (call, own_route) in graph.data_calls.iter_mut().zip(own_route) {

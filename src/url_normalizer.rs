@@ -606,7 +606,7 @@ impl UrlNormalizer {
         // A literal host that is not this machine keeps its origin. The origin
         // IS the classification: stripped, the key is a bare `/user` that
         // reads exactly like an internal call, so every downstream consumer of
-        // the key (`find_matching_endpoints_with_normalizer`, the uploaded call
+        // the key (the analyzer's HTTP pairing, the uploaded call
         // in `mount_graph_to_api_details`) reports a working third-party call
         // as a missing endpoint.
         //
