@@ -436,8 +436,25 @@ impl<'n> Uses<'n> {
         matches!(expr, Expr::Ident(ident) if ident.sym == self.name)
     }
 
+    /// An entry read at any depth: a member chain whose root is the name
+    /// (`R.a`, `R.a.b`, `R.list[0]`).
     fn entry_of_name(&self, expr: &Expr) -> bool {
-        matches!(expr, Expr::Member(member) if self.is_name(&member.obj))
+        match expr {
+            Expr::Member(member) => self.is_name(&member.obj) || self.entry_of_name(&member.obj),
+            Expr::Paren(paren) => self.entry_of_name(&paren.expr),
+            Expr::TsNonNull(inner) => self.entry_of_name(&inner.expr),
+            _ => false,
+        }
+    }
+
+    /// A mutating call: an entry read that is the callee's object
+    /// (`R.list.push(x)`, `R.reverse()`) may change the object. An entry
+    /// passed as an argument is not counted: the fold reads only string
+    /// entries, which no callee can change (`f(R.a)`, `http.post(R[K])`).
+    fn callee_is_entry(&mut self, callee: &Expr) {
+        if self.entry_of_name(callee) {
+            self.only_read_entries = false;
+        }
     }
 }
 
@@ -461,7 +478,7 @@ impl Visit for Uses<'_> {
                 self.assigned |= binding.id.sym == self.name;
             }
             AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
-                if self.is_name(&member.obj) {
+                if self.is_name(&member.obj) || self.entry_of_name(&member.obj) {
                     self.only_read_entries = false;
                 }
             }
@@ -486,6 +503,17 @@ impl Visit for Uses<'_> {
             self.only_read_entries = false;
         }
         update.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        let callee = match &call.callee {
+            Callee::Expr(expr) => Some(&**expr),
+            _ => None,
+        };
+        if let Some(callee) = callee {
+            self.callee_is_entry(callee);
+        }
+        call.visit_children_with(self);
     }
 
     fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
@@ -562,9 +590,22 @@ mod tests {
         assert!(uses("let P = 'a'; ({ P } = { P: 'b' });", "P").0);
         assert!(uses("let P = 'a'; for (P of ['b']) {}", "P").0);
         assert_eq!(
-            uses("const R = { a: 'x' }; f(R.a, R['a']);", "R"),
+            uses("const R = { a: 'x' }; const u = R.a, v = R['a'];", "R"),
             (false, true)
         );
+        // Nested writes and mutating calls change an entry too.
+        for src in [
+            "const R = { a: { b: 'x' } }; R.a.b = 'y';",
+            "const R = { a: { b: 1 } }; R.a.b++;",
+            "const R = { a: { b: 'x' } }; delete R.a.b;",
+            "const R = { a: ['x'] }; R.a.push('y');",
+            "const R = ['x']; R.splice(0, 1);",
+            "const R = ['x']; R.reverse();",
+        ] {
+            assert!(!uses(src, "R").1, "{src}");
+        }
+        // An entry passed on is a string leaf to the fold: still read-only.
+        assert!(uses("const R = { a: 'x' }; f(R.a); g(R['a']);", "R").1);
         assert!(!uses("const R = { a: 'x' }; R.a = 'y';", "R").1);
         assert!(!uses("const R = { a: 'x' }; delete R.a;", "R").1);
         assert!(!uses("const R = { a: 'x' }; f(R);", "R").1);
