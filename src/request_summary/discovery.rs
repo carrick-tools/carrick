@@ -5510,6 +5510,119 @@ export function listen(): void {
         }
     }
 
+    /// carrick#3527 S5: the instance walk reads the service that holds each
+    /// file, so a send through a wrapper declared as a sibling service
+    /// (`new AlphaProducer().add(...)`, the queue made two files away in the
+    /// shared package) ends at the maker and is named by its construction.
+    /// No site or lead stands in the package's files, and the job name is
+    /// never the queue's name.
+    #[test]
+    fn a_maker_bound_name_made_in_a_sibling_package_is_read_at_the_send() {
+        let services = [
+            ("services/sender", "sender"),
+            ("packages/queue-kit", "queue-kit"),
+            ("packages/topics", "topics"),
+        ];
+        let Some(on) =
+            super::super::fixture_walk::walked_services("queue-enum-base-class", &services, true)
+        else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/queue-enum-base-class/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let exports = answer.exports;
+        let configs =
+            crate::config::Config::load_services(vec![on.repo.join("carrick.json")]).unwrap();
+        let config = configs
+            .iter()
+            .find(|config| config.service_name.as_deref() == Some("sender"))
+            .expect("carrick.json declares the sender");
+        let script = super::super::fixture_walk::sidecar().expect("the compiler engine is built");
+        let [own, kit, topics] = on.inputs.as_slice() else {
+            panic!("three services");
+        };
+        let declarations = super::super::fixture_walk::census_declarations(
+            &script, &on.repo, config, own, &exports,
+        );
+        let siblings = [kit, topics];
+        use super::super::decided_sites::{
+            MakerLabel, ProcedureLabels, ScopeLabel, SiteLabel, decided_sites_traced_with,
+        };
+        let discovery = discover_with(
+            own,
+            &siblings,
+            &Labels::traced(&exports, &declarations),
+            &on.repo,
+        );
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let labels = SiteLabel::from_exports(&exports);
+        let decided = decided_sites_traced_with(
+            own,
+            &siblings,
+            &on.repo,
+            &discovered,
+            &labels,
+            &MakerLabel::from_exports(&exports),
+            &ScopeLabel::from_exports(&exports, &declarations.verified_scopes),
+            &ProcedureLabels::from_exports(&exports, &declarations.verified_scopes),
+        );
+        let records =
+            super::super::site_record::site_records(own, &siblings, &on.repo, &decided, &labels);
+        let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for record in &records {
+            forced
+                .entry(record.state.point.at.clone())
+                .or_default()
+                .push(
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned(),
+                );
+        }
+        let leads: Vec<String> = decided
+            .leads
+            .iter()
+            .map(|lead| format!("{}:{} {:?}", lead.file, lead.line, lead.reason))
+            .collect();
+        for (point, name) in [
+            ("services/sender/src/send.ts:4", "alpha-jobs"),
+            ("services/sender/src/send.ts:8", "gamma-jobs"),
+        ] {
+            assert_eq!(
+                forced.get(point).cloned(),
+                Some(vec![Some(name.to_string())]),
+                "{point}: {forced:#?}\nleads: {leads:#?}"
+            );
+        }
+        assert!(
+            forced.keys().all(|point| !point.starts_with("packages/")),
+            "a site stands in a sibling's file: {forced:#?}"
+        );
+        assert!(
+            leads.iter().all(|lead| !lead.starts_with("packages/")),
+            "a lead stands in a sibling's file: {leads:#?}"
+        );
+        for names in forced.values() {
+            for name in names.iter().flatten() {
+                assert!(
+                    name != "job" && name != "direct-job",
+                    "a job name is forced as a queue name: {forced:#?}"
+                );
+            }
+        }
+    }
+
     /// carrick#3527: the walk up a maker-bound name's callers is capped
     /// (`MAX_COMPOSED` calls visited). Past the cap, here 128 paths through
     /// seven levels of parameter-passing helpers, the send stays one site

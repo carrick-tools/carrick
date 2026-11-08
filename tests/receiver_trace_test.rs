@@ -1627,6 +1627,21 @@ fn client_bases_follow_the_instance_walk() {
     }
 }
 
+/// carrick#3527 S5: a client made in a field of a class a sibling service
+/// declares is read where it is made, so the call that runs it in this
+/// service states the client's base. The site stands at this service's call.
+#[test]
+fn a_client_made_in_a_sibling_wrapper_field_states_its_base() {
+    let on = scan_fixture("receiver-forms-client-sibling");
+    let rows = call_rows(&on);
+    assert!(
+        rows.contains(
+            &"services/app/src/use.ts:2 https://m.test/p/sib-field request_summary".to_string()
+        ),
+        "{rows:#?}"
+    );
+}
+
 /// carrick#3044 S1: an HTTP client whose labels carry no `protocol` is
 /// judged under the #1564 rules, and a verified op there names the
 /// declaration of the member it judged, so every call of that member is a
