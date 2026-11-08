@@ -962,6 +962,10 @@ struct CallIr {
     /// rows' call target reads (carrick#2432): a parameter, a key of one, a
     /// local holding one, each side of a fallback. Read by discovery alone.
     callee_values: Vec<ValueAt>,
+    /// The member the callee reads, `object.key`, when the object is no
+    /// parameter alone ([`ValueAt::KeyOf`], carrick#2448). Read by
+    /// discovery where the rows name no definition for the call.
+    callee_key: Option<ValueAt>,
     /// What each argument may hold, by position (carrick#2432): the values a
     /// parameter of the callee is handed. A spread is an empty entry, and
     /// the last ([`values`]). Read by discovery alone.
@@ -1610,6 +1614,9 @@ pub struct FileIr {
     /// its initialiser and every write (the value resolver's binding table,
     /// carrick#3504 S1).
     module_bindings: HashMap<(u32, String), resolve::ModuleBinding>,
+    /// Each import (by its local name) this module only reads a member of
+    /// and never changes ([`resolve::module_bindings`], carrick#2448).
+    kept_imports: HashSet<String>,
     /// Where this file starts in the discovery source map
     /// ([`Self::swc_start`]).
     source_start: u32,
@@ -2392,7 +2399,7 @@ pub fn extract_file_ir(
             }
         }
         file.module_level = module_level;
-        file.module_bindings =
+        (file.module_bindings, file.kept_imports) =
             resolve::module_bindings(module, source_map, &reader, &scope, &file.functions);
     }
     // What a row stated in another module needs to say about a client's
@@ -7679,6 +7686,10 @@ impl Visit for CallWalker<'_, '_, '_> {
             Callee::Expr(callee) => self.reader.callee_values(callee, self.scope, bound),
             _ => Vec::new(),
         };
+        let callee_key = match &call.callee {
+            Callee::Expr(callee) => self.reader.callee_key(callee, self.scope, bound),
+            _ => None,
+        };
         let arg_values = self.reader.arg_values(&call.args, self.scope, bound);
         let language_call = match &call.callee {
             Callee::Expr(callee) => self
@@ -7703,6 +7714,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             callee_subject,
             callee_text,
             callee_values,
+            callee_key,
             arg_values,
             tested: self.guard.tested(call.span),
             handed,
@@ -7788,6 +7800,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 callee_subject: None,
                 callee_text: String::new(),
                 callee_values: Vec::new(),
+                callee_key: None,
                 arg_values: Vec::new(),
                 tested: None,
                 handed: Vec::new(),

@@ -99,6 +99,12 @@ pub(super) struct ModuleBinding {
     /// every other reader (`scope.held`), so [`Resolver::binding_values`]
     /// does not answer for it.
     pub(super) text_only: bool,
+    /// The module only ever reads the object the binding holds through a
+    /// member and never changes it ([`WriteCensus::object_kept`]), whether
+    /// or not it exports the binding. Only a member read of the object is
+    /// then the key its literal states (carrick#2448); the importers' uses
+    /// are [`Resolver::exported_object_kept`]'s.
+    pub(super) object_kept: bool,
 }
 
 impl ModuleBinding {
@@ -210,6 +216,15 @@ struct WriteCensus {
     class_edges: Vec<ClassEdge>,
     /// The name of the class declaration whose body is being visited.
     next_class_name: Option<BindingKey>,
+    /// How many of the references are the object of a member read, directly
+    /// or through a fallback, a condition or a wrapper (`client.get`,
+    /// `(a ?? client).get`): the binding's value is only read through a
+    /// member (carrick#2448).
+    member_bases: HashMap<BindingKey, usize>,
+    /// An entry of the binding, however nested, is assigned, updated or
+    /// deleted, through the binding or through a fallback of it
+    /// (`(a ?? client).get = f`).
+    written_through: HashSet<BindingKey>,
 }
 
 /// A class that extends a named class.
@@ -350,6 +365,66 @@ impl WriteCensus {
             || self.unplaceable.contains(key)
             || self.declared.get(key).copied().unwrap_or(0) > 1
     }
+
+    /// Whether the module only ever reads the object `key` holds through a
+    /// member, and never changes it (carrick#2448, soundness rule 2.3.3):
+    /// nothing assigns the name or an entry of it, deletes one, or hands the
+    /// object on, spreads it or exports it. Calling a member is a read.
+    /// `references` is the uses plus the one declaration (or import
+    /// specifier) that names it. A module that exports or imports the
+    /// binding is judged here for its own half; the importers' half is
+    /// [`Resolver`]'s.
+    fn object_kept(&self, key: &BindingKey) -> bool {
+        let count = |counts: &HashMap<BindingKey, usize>| counts.get(key).copied().unwrap_or(0);
+        !self.is_unplaceable(key)
+            && !self.writes.contains_key(key)
+            && !self.written_through.contains(key)
+            && count(&self.references) == count(&self.member_bases) + 1
+    }
+
+    /// Notes that an entry of each binding at the root of `expr` is
+    /// written.
+    fn write_through(&mut self, expr: &Expr) {
+        let mut roots = Vec::new();
+        member_leaves(expr, true, &mut roots);
+        self.written_through.extend(roots);
+    }
+}
+
+/// The bindings an expression may be, as the object of a member read: a name,
+/// either side of a fallback, either branch of a condition, through parens,
+/// non-null marks and type assertions. With `through_members` a member read
+/// is followed to its object too (`a.b.c` is rooted at `a`).
+fn member_leaves(expr: &Expr, through_members: bool, out: &mut Vec<BindingKey>) {
+    match expr {
+        Expr::Ident(ident) => out.push(ident_key(ident)),
+        Expr::Paren(inner) => member_leaves(&inner.expr, through_members, out),
+        Expr::TsAs(inner) => member_leaves(&inner.expr, through_members, out),
+        Expr::TsSatisfies(inner) => member_leaves(&inner.expr, through_members, out),
+        Expr::TsConstAssertion(inner) => member_leaves(&inner.expr, through_members, out),
+        Expr::TsTypeAssertion(inner) => member_leaves(&inner.expr, through_members, out),
+        Expr::TsNonNull(inner) => member_leaves(&inner.expr, through_members, out),
+        Expr::Bin(bin)
+            if matches!(
+                bin.op,
+                BinaryOp::NullishCoalescing | BinaryOp::LogicalOr | BinaryOp::LogicalAnd
+            ) =>
+        {
+            member_leaves(&bin.left, through_members, out);
+            member_leaves(&bin.right, through_members, out);
+        }
+        Expr::Cond(cond) => {
+            member_leaves(&cond.cons, through_members, out);
+            member_leaves(&cond.alt, through_members, out);
+        }
+        Expr::Member(member) if through_members => member_leaves(&member.obj, through_members, out),
+        Expr::OptChain(chain) if through_members => {
+            if let OptChainBase::Member(member) = &*chain.base {
+                member_leaves(&member.obj, through_members, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The binding at the root of an entry chain: `R` in `R.a`, `R.a.b`,
@@ -425,6 +500,7 @@ impl Visit for WriteCensus {
                     self.entry_escapes.insert(key);
                 }
                 self.write_member(&Expr::Member(member.clone()));
+                self.write_through(&member.obj);
             }
             // `(s) = …`, `s! = …`, `(s as T) = …`: the binding is written in
             // a form no reader places. A member target writes a property,
@@ -451,6 +527,10 @@ impl Visit for WriteCensus {
     fn visit_update_expr(&mut self, update: &UpdateExpr) {
         if let Expr::Ident(ident) = crate::graphql_document_sites::unwrap_expression(&update.arg) {
             self.unplaceable.insert(ident_key(ident));
+        }
+        if let Expr::Member(member) = crate::graphql_document_sites::unwrap_expression(&update.arg)
+        {
+            self.write_through(&member.obj);
         }
         self.escape(&update.arg);
         self.write_member(&update.arg);
@@ -494,6 +574,11 @@ impl Visit for WriteCensus {
         if unary.op == UnaryOp::Delete {
             self.escape(&unary.arg);
             self.write_member(&unary.arg);
+            if let Expr::Member(member) =
+                crate::graphql_document_sites::unwrap_expression(&unary.arg)
+            {
+                self.write_through(&member.obj);
+            }
         }
         unary.visit_children_with(self);
     }
@@ -501,6 +586,11 @@ impl Visit for WriteCensus {
     fn visit_member_expr(&mut self, member: &MemberExpr) {
         if let Expr::Ident(ident) = &*member.obj {
             *self.entry_reads.entry(ident_key(ident)).or_default() += 1;
+        }
+        let mut bases = Vec::new();
+        member_leaves(&member.obj, false, &mut bases);
+        for base in bases {
+            *self.member_bases.entry(base).or_default() += 1;
         }
         member.visit_children_with(self);
     }
@@ -579,9 +669,27 @@ pub(super) fn module_bindings(
     reader: &Reader<'_>,
     scope: &Scope<'_>,
     functions: &HashMap<String, FnIr>,
-) -> HashMap<(u32, String), ModuleBinding> {
+) -> (HashMap<(u32, String), ModuleBinding>, HashSet<String>) {
     let mut census = WriteCensus::default();
     module.visit_with(&mut census);
+    // Each import this module only reads a member of, and never changes: a
+    // module that imports a binding judges its half of whether the
+    // declaring module's object is kept (carrick#2448).
+    let mut kept_imports: HashSet<String> = HashSet::new();
+    for item in &module.body {
+        if let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item {
+            for specifier in &import.specifiers {
+                let local = match specifier {
+                    ImportSpecifier::Named(named) => &named.local,
+                    ImportSpecifier::Default(default) => &default.local,
+                    ImportSpecifier::Namespace(_) => continue,
+                };
+                if census.object_kept(&ident_key(local)) {
+                    kept_imports.insert(local.sym.to_string());
+                }
+            }
+        }
+    }
     // Discovery numbering is the extract's own: spans need no shift.
     let identity = |lo: u32| lo;
     let mut out: HashMap<(u32, String), ModuleBinding> = HashMap::new();
@@ -615,6 +723,7 @@ pub(super) fn module_bindings(
                         text: member.text(init, &identity),
                         entries_kept: false,
                         text_only: true,
+                        object_kept: false,
                     };
                     out.insert((line, member.bound.id.sym.to_string()), binding);
                 }
@@ -637,6 +746,7 @@ pub(super) fn module_bindings(
                 text: init.map(|init| text_of(init, &identity)),
                 entries_kept: census.entries_kept(&key, exported),
                 text_only: false,
+                object_kept: census.object_kept(&key),
             };
             out.insert((line, ident.id.sym.to_string()), binding);
         }
@@ -666,6 +776,7 @@ pub(super) fn module_bindings(
                 text: local.text.clone(),
                 entries_kept: census.entries_kept(&local.key, false),
                 text_only: !local.reassigned,
+                object_kept: false,
             };
             match out.entry((local.line, local.key.0.clone())) {
                 std::collections::hash_map::Entry::Occupied(mut taken) => {
@@ -677,7 +788,7 @@ pub(super) fn module_bindings(
             }
         }
     }
-    out
+    (out, kept_imports)
 }
 
 /// The class a module item declares, and whether it is exported inline.
@@ -913,6 +1024,19 @@ pub(super) enum ValueAt {
         hi: u32,
         made: Box<ClientRef>,
     },
+    /// The value at `key` of an object, read where a call's callee is
+    /// `object.key` and `object` is no parameter (carrick#2448): what
+    /// `object` may hold, each an object literal an in-repo factory returns
+    /// or a module binding holds. Only a call's callee carries it
+    /// ([`CallIr::callee_key`]); discovery reads it where the row names no
+    /// definition ([`Resolver::key_values`]). Not [`Self::Member`], which is
+    /// the text reader's.
+    KeyOf {
+        lo: u32,
+        hi: u32,
+        object: Vec<ValueAt>,
+        key: String,
+    },
     /// A function written here, by where its node starts.
     Function(u32),
     /// An object literal: each key's values, and whether a spread or a
@@ -1103,6 +1227,18 @@ pub(super) struct ParamValues {
     pub(super) defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
 }
 
+/// The key a member read states: `.name` or `['name']`.
+fn static_key(member: &MemberExpr) -> Option<String> {
+    match &member.prop {
+        MemberProp::Ident(prop) => Some(prop.sym.to_string()),
+        MemberProp::Computed(computed) => match &*computed.expr {
+            Expr::Lit(Lit::Str(text)) => Some(text.value.to_string_lossy().into_owned()),
+            _ => None,
+        },
+        MemberProp::PrivateName(_) => None,
+    }
+}
+
 impl Reader<'_> {
     /// What `expr` may hold, each side of a fallback (`a ?? b`, `a || b`)
     /// one value.
@@ -1172,16 +1308,7 @@ impl Reader<'_> {
                         field,
                     }];
                 }
-                let key = match &member.prop {
-                    MemberProp::Ident(prop) => Some(prop.sym.to_string()),
-                    MemberProp::Computed(computed) => match &*computed.expr {
-                        Expr::Lit(Lit::Str(text)) => {
-                            Some(text.value.to_string_lossy().into_owned())
-                        }
-                        _ => None,
-                    },
-                    MemberProp::PrivateName(_) => None,
-                };
+                let key = static_key(member);
                 if let Some(key) = key
                     && !matches!(
                         crate::graphql_document_sites::unwrap_expression(&member.obj),
@@ -1215,6 +1342,14 @@ impl Reader<'_> {
                 out.extend(self.values_in(&bin.right, scope, bound, depth + 1));
                 out
             }
+            // `options?.client`: the member read, as `options.client` is
+            // (carrick#2448).
+            Expr::OptChain(chain) => match &*chain.base {
+                OptChainBase::Member(member) => {
+                    self.values_in(&Expr::Member(member.clone()), scope, bound, depth + 1)
+                }
+                OptChainBase::Call(_) => vec![ValueAt::Unread],
+            },
             Expr::Arrow(arrow) => vec![ValueAt::Function(arrow.span.lo.0)],
             Expr::Fn(function) => vec![ValueAt::Function(function.function.span.lo.0)],
             Expr::Call(call) if matches!(call.callee, Callee::Expr(_)) => {
@@ -1398,6 +1533,44 @@ impl Reader<'_> {
             out.arg_values.push(self.value_of(expr, scope, bound));
         }
         out
+    }
+
+    /// The member a call's callee reads, `object.key`, when `object` holds
+    /// no parameter alone and the key is written: the key of whatever the
+    /// object may hold (carrick#2448). Read by discovery where the compiler's
+    /// row for the call names no definition.
+    pub(super) fn callee_key(
+        &self,
+        callee: &Expr,
+        scope: &Scope<'_>,
+        bound: &guards::Bound,
+    ) -> Option<ValueAt> {
+        let member = match crate::graphql_document_sites::unwrap_expression(callee) {
+            Expr::Member(member) => member,
+            _ => return None,
+        };
+        if matches!(
+            crate::graphql_document_sites::unwrap_expression(&member.obj),
+            Expr::This(_)
+        ) {
+            return None;
+        }
+        let key = static_key(member)?;
+        let object = self.values_in(&member.obj, scope, bound, 1);
+        // A parameter alone is the callee-value walk's: its callers decide.
+        if object.is_empty()
+            || object
+                .iter()
+                .all(|value| matches!(value, ValueAt::Param { .. }))
+        {
+            return None;
+        }
+        Some(ValueAt::KeyOf {
+            lo: member.span.lo.0,
+            hi: member.span.hi.0,
+            object,
+            key,
+        })
     }
 
     /// The functions written as a parameter's default (`doFetch = (url, init)
@@ -1616,6 +1789,14 @@ pub(super) struct Maker<'a> {
     pub(super) out: Option<u8>,
 }
 
+/// An object literal a value may hold, with the factory call that made it
+/// (carrick#2448).
+struct ObjectAt<'a> {
+    file: &'a Path,
+    fields: &'a BTreeMap<String, Vec<ValueAt>>,
+    maker: Option<Maker<'a>>,
+}
+
 /// A callee's parameters' defaults, with the file they are read in.
 pub(super) type Defaults<'a> = (&'a Path, &'a [(usize, Vec<String>, Vec<ValueAt>)]);
 
@@ -1673,6 +1854,10 @@ pub(super) struct Resolver<'a> {
     /// The declarations being read for their text (carrick#3504 S2): a
     /// value that reads itself holds no text.
     texts_reading: RefCell<HashSet<(PathBuf, u32, String)>>,
+    /// The exported module bindings some importer may change or hand on,
+    /// by declaring file and name; `None`: every one is contested
+    /// (carrick#2448). Built on first use.
+    contested: std::cell::OnceCell<Option<HashSet<(PathBuf, String)>>>,
 }
 
 /// What the resolver read (carrick#3504 S0): every value read, how many
@@ -1726,6 +1911,7 @@ impl<'a> Resolver<'a> {
             cap: MAX_QUERY_STEPS,
             bindings_reading: RefCell::new(HashSet::new()),
             texts_reading: RefCell::new(HashSet::new()),
+            contested: std::cell::OnceCell::new(),
         }
     }
 
@@ -1984,18 +2170,7 @@ impl<'a> Resolver<'a> {
                 }
                 // The factory call itself fills the parameters of the
                 // factory a function it returns reads (carrick#3504 S0b).
-                let maker = self.written_call(file, *lo).map(|call| Maker {
-                    call: Invoke {
-                        file,
-                        call,
-                        construction: false,
-                        bound: 0,
-                    },
-                    factory: (factory_file, factory),
-                    out: (self.bindings_reading.borrow().is_empty()
-                        && self.returns_depth.get() == 0)
-                        .then_some(*out),
-                });
+                let maker = self.maker_of(file, *lo, *out, (factory_file, factory));
                 self.returns_depth.set(self.returns_depth.get() + 1);
                 let mut held = Vec::new();
                 for returned in &factory.returned_values {
@@ -2037,9 +2212,11 @@ impl<'a> Resolver<'a> {
                 Some(function) => vec![Held::Reached(follow.written(file, function, invoke, None))],
                 None => nothing(),
             },
+            // Only `key_values` reads a key, at a call's callee.
+            ValueAt::KeyOf { .. }
             // The text variants are the names lowering's: this walk reads
             // none of them (carrick#3504 S2).
-            ValueAt::Object { .. }
+            | ValueAt::Object { .. }
             | ValueAt::Lit(_)
             | ValueAt::Concat(_)
             | ValueAt::Member { .. }
@@ -2050,6 +2227,240 @@ impl<'a> Resolver<'a> {
             // A maker's `new` is the receiver walk's alone.
             | ValueAt::New { .. }
             | ValueAt::Unread => nothing(),
+        }
+    }
+
+    /// The factory call starting at `lo` in `file`, as the maker of what
+    /// `factory` returns ([`Maker`]).
+    fn maker_of(
+        &self,
+        file: &'a Path,
+        lo: u32,
+        out: u8,
+        factory: (&'a Path, &'a FnIr),
+    ) -> Option<Maker<'a>> {
+        self.written_call(file, lo).map(|call| Maker {
+            call: Invoke {
+                file,
+                call,
+                construction: false,
+                bound: 0,
+            },
+            factory,
+            out: (self.bindings_reading.borrow().is_empty() && self.returns_depth.get() == 0)
+                .then_some(out),
+        })
+    }
+
+    /// What the key of a [`ValueAt::KeyOf`] callee holds when `invoke` runs
+    /// it (carrick#2448): the value at the key of each object literal the
+    /// object may hold, an in-repo factory's returned object or a module
+    /// binding's, and the key of a parameter's value for its callers to
+    /// fill. `None` when some value the object may hold is no object
+    /// literal this can read, or one something changes (soundness rule
+    /// 2.3.3): the member is then read as itself.
+    pub(super) fn key_values<F: Follow<'a>>(
+        &self,
+        follow: &mut F,
+        file: &'a Path,
+        value: &'a ValueAt,
+        invoke: Invoke<'a>,
+    ) -> Option<Vec<Held<F::Reached>>> {
+        let ValueAt::KeyOf { object, key, .. } = value else {
+            return None;
+        };
+        let _query = self.enter();
+        let nothing = || Held::Reached(F::Reached::default());
+        let mut out: Vec<Held<F::Reached>> = Vec::new();
+        let mut objects: Vec<ObjectAt<'a>> = Vec::new();
+        for held in object {
+            match held {
+                // `options.client.get`: what the callers write at the key.
+                ValueAt::Param { depth, index, keys } => {
+                    let mut keys = keys.clone();
+                    keys.push(key.clone());
+                    out.push(Held::Param(*depth, *index, keys));
+                }
+                other => {
+                    if !self.objects_of(file, other, None, &mut objects) {
+                        return None;
+                    }
+                }
+            }
+        }
+        if objects.is_empty() {
+            return None;
+        }
+        for object in objects {
+            let Some(values) = object.fields.get(key) else {
+                out.push(nothing());
+                continue;
+            };
+            for value in values {
+                match value {
+                    // A parameter of the factory: its own call fills it.
+                    ValueAt::Param { .. } => out.push(nothing()),
+                    ValueAt::Function(start) => match self.written_function(object.file, *start) {
+                        Some(function) => {
+                            let maker = object
+                                .maker
+                                .filter(|maker| written_in(maker.factory.1, function));
+                            out.push(Held::Reached(follow.written(
+                                object.file,
+                                function,
+                                invoke,
+                                maker,
+                            )));
+                        }
+                        None => out.push(nothing()),
+                    },
+                    other => out.extend(self.read_value(follow, object.file, other, invoke, false)),
+                }
+            }
+        }
+        Some(self.settle(out))
+    }
+
+    /// Each object literal `value`, read in `file`, may hold, pushed to
+    /// `out` with the factory call that made it. `false` when it may hold
+    /// anything else, or an object something may change.
+    fn objects_of(
+        &self,
+        file: &'a Path,
+        value: &'a ValueAt,
+        maker: Option<Maker<'a>>,
+        out: &mut Vec<ObjectAt<'a>>,
+    ) -> bool {
+        if self.step() {
+            return false;
+        }
+        match value {
+            ValueAt::Object { fields, .. } => {
+                out.push(ObjectAt {
+                    file,
+                    fields,
+                    maker,
+                });
+                true
+            }
+            // A module binding that holds the object, when every module
+            // reads only a member of it.
+            ValueAt::Read {
+                lo,
+                hi,
+                member: false,
+                ..
+            } => {
+                let Some((path, line, symbol)) = self
+                    .row_at(file, *lo, *hi, Kind::Ident)
+                    .and_then(|row| self.declared_binding(row))
+                else {
+                    return false;
+                };
+                let Some(declaring) = self.inputs.files.get(path) else {
+                    return false;
+                };
+                let Some(binding) = declaring
+                    .module_bindings
+                    .get(&(line, symbol.clone()))
+                    .filter(|binding| binding.values_read())
+                else {
+                    return false;
+                };
+                let table_name = declaring
+                    .declared_at
+                    .get(&symbol)
+                    .map_or(symbol.clone(), |(_, name)| name.clone());
+                if binding.unplaceable
+                    || !binding.writes.is_empty()
+                    || !binding.object_kept
+                    || binding.init.is_empty()
+                    || self.contested_exports(path, &table_name)
+                {
+                    return false;
+                }
+                let reading = (path.to_path_buf(), line, symbol);
+                if !self.bindings_reading.borrow_mut().insert(reading.clone()) {
+                    return false;
+                }
+                let held = binding
+                    .init
+                    .iter()
+                    .all(|init| self.objects_of(path, init, None, out));
+                self.bindings_reading.borrow_mut().remove(&reading);
+                held
+            }
+            // An in-repo factory's returned objects.
+            ValueAt::Returned {
+                lo, hi, out: depth, ..
+            } => {
+                let Reach::Function(target, key) = self.inputs_for(file).reach(file, *lo, *hi)
+                else {
+                    return false;
+                };
+                let Some((factory_file, factory)) = self.function(&target, &key) else {
+                    return false;
+                };
+                if self.returns_depth.get() >= MAX_VALUES || factory.returned_values.is_empty() {
+                    return false;
+                }
+                let maker = self.maker_of(file, *lo, *depth, (factory_file, factory));
+                self.returns_depth.set(self.returns_depth.get() + 1);
+                let held = factory
+                    .returned_values
+                    .iter()
+                    .all(|returned| self.objects_of(factory_file, returned, maker, out));
+                self.returns_depth.set(self.returns_depth.get() - 1);
+                held
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether some module may change, or hand on, the object the exported
+    /// binding `name` of `file` holds: an importer that does more than read
+    /// a member of it, a namespace import or a load of the module, or any
+    /// use no row follows. Without rows every export is contested.
+    fn contested_exports(&self, file: &Path, name: &str) -> bool {
+        let contested = self.contested.get_or_init(|| {
+            let links = self.inputs.links.as_ref()?;
+            if links.open() {
+                return None;
+            }
+            let mut out: HashSet<(PathBuf, String)> = HashSet::new();
+            for (importer, ir) in &self.inputs.files {
+                for local in ir.imported.keys() {
+                    match links.get(importer, local) {
+                        Some(super::row_links::RowLink::Declared(at, declared))
+                            if !ir.kept_imports.contains(local) =>
+                        {
+                            out.insert((at.clone(), declared.clone()));
+                        }
+                        Some(super::row_links::RowLink::Module(published)) => out.extend(
+                            published
+                                .iter()
+                                .map(|binding| (binding.file.clone(), binding.name.clone())),
+                        ),
+                        _ => {}
+                    }
+                }
+                for specifier in &ir.loads {
+                    if let Some(ImportedBinding::Module(published)) =
+                        self.inputs.bindings.load(importer, specifier)
+                    {
+                        out.extend(
+                            published
+                                .iter()
+                                .map(|binding| (binding.file.clone(), binding.name.clone())),
+                        );
+                    }
+                }
+            }
+            Some(out)
+        });
+        match contested {
+            Some(set) => set.contains(&(file.to_path_buf(), name.to_string())),
+            None => true,
         }
     }
 

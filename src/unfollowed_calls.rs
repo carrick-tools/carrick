@@ -92,12 +92,35 @@ pub fn place(rows: &[UnfollowedMemberCall], repo_path: &str) -> (Vec<UnfollowedM
     (placed, total)
 }
 
-/// Write `rows` on the blob. No rows leaves both keys as they are (absent).
-pub fn attach(cloud_data: &mut CloudRepoData, rows: &[UnfollowedMemberCall], repo_path: &str) {
+/// `rows` less the calls a fact site row stands at (`followed`, repo-relative
+/// file and line): the fact layer followed those to a labelled send
+/// (carrick#2448).
+fn not_followed(
+    rows: &[UnfollowedMemberCall],
+    repo_path: &str,
+    followed: &std::collections::HashSet<(String, u32)>,
+) -> Vec<UnfollowedMemberCall> {
+    rows.iter()
+        .filter(|row| {
+            !followed.contains(&(crate::engine::repo_relative(&row.file, repo_path), row.line))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Write `rows` on the blob, less the calls a fact site row stands at. No
+/// rows leaves both keys as they are (absent).
+pub fn attach(
+    cloud_data: &mut CloudRepoData,
+    rows: &[UnfollowedMemberCall],
+    repo_path: &str,
+    followed: &std::collections::HashSet<(String, u32)>,
+) {
+    let rows = not_followed(rows, repo_path, followed);
     if rows.is_empty() {
         return;
     }
-    let (placed, total) = place(rows, repo_path);
+    let (placed, total) = place(&rows, repo_path);
     cloud_data.unfollowed_member_calls = placed;
     cloud_data.unfollowed_member_calls_total = total;
 }
@@ -144,6 +167,19 @@ mod tests {
         assert_eq!(total as usize, MAX_PER_SERVICE + 8);
         assert_eq!(placed[0].file, "src/a.ts");
         assert_eq!(placed[1].line, 0);
+    }
+
+    #[test]
+    fn a_call_a_fact_site_row_stands_at_is_no_unfollowed_call() {
+        let rows = [
+            row("/repo/src/a.ts", 3, "get"),
+            row("/repo/src/a.ts", 4, "put"),
+        ];
+        let followed = std::collections::HashSet::from([("src/a.ts".to_string(), 3)]);
+        let kept = not_followed(&rows, "/repo", &followed);
+        let (placed, total) = place(&kept, "/repo");
+        assert_eq!(placed.iter().map(|r| r.line).collect::<Vec<_>>(), vec![4]);
+        assert_eq!(total, 1);
     }
 
     #[test]

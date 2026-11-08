@@ -1047,6 +1047,18 @@ pub struct SiteFold {
     pub socket_disagrees: usize,
 }
 
+impl SiteFold {
+    /// The calls a fact site row stands at, by repo-relative file and line:
+    /// the fact layer followed each to a labelled send (carrick#2448).
+    pub fn fact_call_lines(&self) -> std::collections::HashSet<(String, u32)> {
+        self.stated
+            .iter()
+            .filter(|row| row.side == RowSide::Call && row.fact())
+            .map(|row| (row.file.clone(), row.line))
+            .collect()
+    }
+}
+
 /// `file` relative to `root`, `/`-separated, whichever form it is held in
 /// ([`crate::utils::repo_relative_source_path`]).
 pub fn relative(root: &Path, file: &str) -> String {
@@ -1086,6 +1098,7 @@ pub fn fold(
         let is_model_row_of =
             |call: &DataFetchingCall, file: &str, line: u32, key: &OperationKey| {
                 (call.resolution_source == Some(ResolutionSource::Model)
+                    || call.resolution_source == Some(ResolutionSource::RequestSpec)
                     || call.resolution_source.is_some_and(is_old_path_source))
                     && call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
                         relative(root, f) == file && l.parse::<u32>().ok() == Some(line)
@@ -1248,8 +1261,16 @@ pub fn fold_rows(
         // provenance, the key unchanged (the frozen pass retires under
         // carrick#1670). On any disagreement the socket pass's row stays and
         // the fold counts it.
+        // A request spec (a verb-named call handed `{ url }`) that states
+        // the operation a fact states at the same call gives its site and
+        // its provenance to the fact, the key unchanged (carrick#2448): the
+        // fact reached a labelled send, and the spec is a reading of the
+        // call's spelling alone.
         let gives_way = |existing: &ApiEndpointDetails| {
             is_reader(existing)
+                || (row.fact()
+                    && existing.resolution_source == Some(ResolutionSource::RequestSpec)
+                    && existing.key == row.key)
                 || (row.fact() && is_old_path(existing) && existing.key != row.key)
                 || (row.fact()
                     && existing.resolution_source == Some(ResolutionSource::SocketCall)
