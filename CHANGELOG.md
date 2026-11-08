@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.148](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.147...carrick-v0.3.148) (2026-11-08)
+
+
+### Features
+
+* **resolve:** a function's own reassigned let reads through the binding table ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S1b) ([#3524](https://github.com/carrick-tools/carrick/issues/3524)) ([de32696](https://github.com/carrick-tools/carrick/commit/de3269668d0f8d4c7891cb9351b3034e846a0fdb))
+* **resolve:** one binding table and write census; module const and let read every write ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S1) ([#3521](https://github.com/carrick-tools/carrick/issues/3521)) ([dc6a134](https://github.com/carrick-tools/carrick/commit/dc6a134f649de74bd3984d82804ca3c878416a52))
+* **scanner:** a returned request in an uncalled builder is a candidate call row ([#3470](https://github.com/carrick-tools/carrick/issues/3470)) ([#3525](https://github.com/carrick-tools/carrick/issues/3525)) ([37daff0](https://github.com/carrick-tools/carrick/commit/37daff0b54c5b5509d815c3bd564bdbf79b223a9))
+
+
+### Bug Fixes
+
+* **check:** the type check carries each non-HTTP row's name scope into its pool ([#3520](https://github.com/carrick-tools/carrick/issues/3520)) ([#3526](https://github.com/carrick-tools/carrick/issues/3526)) ([461bcea](https://github.com/carrick-tools/carrick/commit/461bcead543bffd2837dc422bf9257e44fc7e457))
+* **local:** a route whose only callers are built requests is not "nothing type-checked" ([#3532](https://github.com/carrick-tools/carrick/issues/3532)) ([#3537](https://github.com/carrick-tools/carrick/issues/3537)) ([c3de04e](https://github.com/carrick-tools/carrick/commit/c3de04edad915b629fb47cc363c0fa0e0f8e6094))
+* **scanner:** store route paths in canonical form ([#3522](https://github.com/carrick-tools/carrick/issues/3522)) ([#3535](https://github.com/carrick-tools/carrick/issues/3535)) ([d464dff](https://github.com/carrick-tools/carrick/commit/d464dff5e4dcd27996baa43b5b45dd567c085db0))
+* **sidecar:** a repo failure helper's argument is not the success body ([#3523](https://github.com/carrick-tools/carrick/issues/3523)) ([#3528](https://github.com/carrick-tools/carrick/issues/3528)) ([fbb9fa1](https://github.com/carrick-tools/carrick/commit/fbb9fa113e3dd1c3eaac8a1d1df70f26d52cc584))
+
+
+### Refactoring
+
+* **check:** the type check pairs through PairingPool ([#3496](https://github.com/carrick-tools/carrick/issues/3496) slice 3) ([#3519](https://github.com/carrick-tools/carrick/issues/3519)) ([6e92553](https://github.com/carrick-tools/carrick/commit/6e925532b2d3650a553e6f32ba391f5fdc735dde))
+* **match:** identity readers use route_identity, clean_path uses canonical_path ([#3496](https://github.com/carrick-tools/carrick/issues/3496) slice 2b) ([#3517](https://github.com/carrick-tools/carrick/issues/3517)) ([27190d1](https://github.com/carrick-tools/carrick/commit/27190d13f36fd15409baa77a9b166e9a912ba021))
+* **scanner:** one message row-key function for both row writers ([#3498](https://github.com/carrick-tools/carrick/issues/3498)) ([#3531](https://github.com/carrick-tools/carrick/issues/3531)) ([65b9895](https://github.com/carrick-tools/carrick/commit/65b9895078ed0122d251e541a112d7f3769d4750))
+* **sidecar:** one helper for the function body a call runs ([#3500](https://github.com/carrick-tools/carrick/issues/3500) step 1) ([#3529](https://github.com/carrick-tools/carrick/issues/3529)) ([a0167f4](https://github.com/carrick-tools/carrick/commit/a0167f432f05f79e1269d9b32600c160d3807055))
+* **sidecar:** share toPosix, constituentsOf, packageNameOf and expandOriginOf instead of copies (reuse audit 13, 14, 15, 17) ([#3534](https://github.com/carrick-tools/carrick/issues/3534)) ([b7458c0](https://github.com/carrick-tools/carrick/commit/b7458c0c863e63496251e8993466fe17e07b4ead))
+
 ## [0.3.147](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.146...carrick-v0.3.147) (2026-11-07)
 
 
