@@ -1091,6 +1091,51 @@ pub enum BoundName {
     Export,
     /// The name a subscription handler is handed (amendment 7).
     Subscribed,
+    /// The name of the class member the decorator is applied to
+    /// (amendment 8): a decorate-form receive op.
+    Decorated,
+}
+
+/// One entry of a `first` name (amendment 8): a plain slot, or the
+/// decorated member's name. Both refuse any other field, as the compiler
+/// engine's request schema does: a check it refuses fails the whole request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NameEntry {
+    Decorated(DecoratedEntry),
+    Slot(NameEntrySlot),
+}
+
+/// `{"bound": "decorated"}`, and only that.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecoratedEntry {
+    pub bound: DecoratedBound,
+}
+
+/// The one bound name a `first` entry may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecoratedBound {
+    Decorated,
+}
+
+/// A `first` slot entry: argument `arg`, or its property `key`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NameEntrySlot {
+    pub arg: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// `{"first": [...]}` (amendment 8): the first entry the call fills names
+/// the op, read in order. How many entries and in what order is the
+/// verifier's verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NameFirst {
+    pub first: Vec<NameEntry>,
 }
 
 /// Where a router member takes its procedures (#2474 R6a, contract
@@ -1129,6 +1174,8 @@ pub enum OpName {
     Literal {
         literal: String,
     },
+    /// The first entry the call fills (amendment 8).
+    First(NameFirst),
     Slot(ClaimSlot),
 }
 

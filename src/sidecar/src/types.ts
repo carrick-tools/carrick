@@ -630,17 +630,30 @@ export interface NameLiteral {
   literal: string;
 }
 
+/** A `first` entry (amendment 8): a plain slot, or the decorated method's name. */
+export type NameEntry = { arg: number; key?: string } | { bound: 'decorated' };
+
+/**
+ * The first entry the call fills names the op, read in order (amendment 8):
+ * two to four entries, `{ bound: 'decorated' }` only last, on a decorate
+ * receive.
+ */
+export interface NameFirst {
+  first: NameEntry[];
+}
+
 /** Where an op's name comes from. */
-export type OpNameSource = BoundName | NameParts | NameLiteral | NameSlot;
+export type OpNameSource = BoundName | NameParts | NameLiteral | NameFirst | NameSlot;
 
 /**
  * A name the call does not carry: the one the maker's `name` slot bound to
  * the instance (`maker`), the one the scope member bound (`scope`), or the
  * key path the op's value sits under in a `collects` object (`key`, #2474
- * R6a).
+ * R6a), or the name of the class member a decorator is applied to
+ * (`decorated`, amendment 8).
  */
 export interface BoundName {
-  bound: 'maker' | 'scope' | 'key' | 'path' | 'export' | 'subscribed';
+  bound: 'maker' | 'scope' | 'key' | 'path' | 'export' | 'subscribed' | 'decorated';
   /** `path`: the property names walked on the receiver are joined by this (amendment 7). */
   join?: string;
   /** `subscribed`: the handler parameter that is handed the name. */

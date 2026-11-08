@@ -46,6 +46,7 @@ import { PathNames, declaringFileName, type PackageDirectoryOf } from './positio
 import type {
   ClaimSlot,
   KeyLabel,
+  NameEntry,
   LibraryCheck,
   LibraryClaim,
   LibraryRole,
@@ -1543,6 +1544,8 @@ function unbuiltPart(claim: LibraryClaim): string | undefined {
         if (joins !== undefined || name.param !== undefined || name.at !== undefined) return 'name.bound';
       } else if ('parts' in name) {
         return 'name.parts';
+      } else if ('first' in name) {
+        // Judged in `firstNameOutcome`: its entries are plain slots or the decorated name.
       } else if (!('literal' in name)) {
         // A literal is judged in `judgeOp`, a document or reference slot too; a make's or scope's still is not.
         slots.push({ ...name, document: undefined, ref: undefined });
@@ -2913,6 +2916,9 @@ class DeclarationReader {
       return unchecked('claim_invalid');
     }
     if (form === 'decorate' && claim.op !== 'receive') return unchecked('claim_invalid');
+    // A name the decorated method gives (amendment 8) is read on a decorate receive only.
+    const decorated = claim.name !== undefined && ('first' in claim.name || ('bound' in claim.name && claim.name.bound === 'decorated'));
+    if (decorated && form !== 'decorate') return unchecked('claim_invalid');
     // `returns` judges the handler a receive op registers.
     if (claim.returns !== undefined && (claim.op !== 'receive' || claim.handler === undefined)) {
       return unchecked('claim_invalid');
@@ -2934,6 +2940,10 @@ class DeclarationReader {
     // So is where the handler's request holds its path and method (#2474 R0).
     if (claim.request !== undefined && !requestAtValid(claim)) return unchecked('claim_invalid');
     const name = claim.name;
+    if (decorated && name !== undefined) {
+      if ('first' in name && (name.first.length < 2 || name.first.length > 4)) return unchecked('claim_invalid');
+      return this.decoratedNameOutcome(receiver, claim, 'first' in name ? name.first : [{ bound: 'decorated' }]);
+    }
     // A send carries a payload: a name alone on `send(data)` is the data. An
     // op that runs a function or client it is handed takes its name from
     // what it runs, and one that hands its handler a receiver (a server's
@@ -3043,6 +3053,11 @@ class DeclarationReader {
       const ran = this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
       return ran.verdict === 'verified' && requestDropped !== undefined ? { ...ran, requestDropped } : ran;
     }
+    return this.opVerified(callee, bodyMembers, requestDropped);
+  }
+
+  /** A verified op: the callee's declarations and members, for `labelledMembers`. */
+  private opVerified(callee: Exclude<Callable, { failure: Outcome }>, bodyMembers: ts.Declaration[] = [], requestDropped?: string): Outcome {
     const declarations = this.declarationsOf(callee);
     const members = callee.named
       ? (callee.named.property.declarations ?? [])
@@ -3054,6 +3069,103 @@ class DeclarationReader {
       ...(bodyMembers.length > 0 ? { bodyMembers } : {}),
       ...(requestDropped === undefined ? {} : { requestDropped }),
     };
+  }
+
+  /**
+   * A name read from the first entry the call fills, in order, or from the
+   * decorated method alone (amendment 8 of carrick#2434): a GraphQL root field
+   * written as a method decorator. The op is a decorate receive whose
+   * decorated method is the handler, so it holds no other part. `first` has
+   * two to four entries, none twice, `{ bound: 'decorated' }` only last.
+   *
+   * Strict D2 holds on EVERY overload that returns a method decorator, never
+   * on one: a reader that falls back to the method on `@Query()` would also
+   * write the method's name on `@Query('x')` unless every overload taking a
+   * string there is a `first` entry. Per overload, D2 runs once for each
+   * entry that takes a string there, that entry as the name and the others
+   * accounted for; with none, it runs with no name, and any string slot
+   * competes. Each slot entry takes a string on at least one such overload,
+   * else the reason a name slot that takes none answers.
+   */
+  private decoratedNameOutcome(receiver: MessageReceiver, claim: OpClaim, entries: readonly NameEntry[]): Outcome {
+    if (claim.form !== 'decorate' || claim.op !== 'receive') return unchecked('claim_invalid');
+    const parts = [
+      claim.payload, claim.handler, claim.ack, claim.runs, claim.yields, claim.request, claim.returns,
+      claim.method_key, claim.method_default, claim.options, claim.base,
+    ];
+    if (parts.some(part => part !== undefined)) return unchecked('claim_invalid');
+    const slots: ClaimSlot[] = [];
+    const seen = new Set<string>();
+    for (const [index, entry] of entries.entries()) {
+      if ('bound' in entry) {
+        if (index !== entries.length - 1) return unchecked('claim_invalid');
+        continue;
+      }
+      const slot: ClaimSlot = { arg: entry.arg, ...(entry.key === undefined ? {} : { key: entry.key }) };
+      const id = `${slot.arg}.${slot.key ?? ''}`;
+      if (seen.has(id)) return unchecked('claim_invalid');
+      seen.add(id);
+      slots.push(slot);
+    }
+    const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
+    if ('failure' in callee) return callee.failure;
+    const labels = claim.key_labels ?? {};
+    let best: RankedFailure | undefined;
+    let decorators = 0;
+    // Per slot entry, why it takes no string on an overload, until one where it does.
+    const unread = new Map<ClaimSlot, RankedFailure | undefined>(slots.map(slot => [slot, undefined]));
+    const takes = new Set<ClaimSlot>();
+    for (const signature of callee.signatures) {
+      const given = this.decoratorOutcome(signature, 'method');
+      if (given) {
+        best = furthest(best, 1, given);
+        continue;
+      }
+      decorators += 1;
+      const here: ClaimSlot[] = [];
+      for (const slot of slots) {
+        const failure = this.nameEntryFailure(signature, slot);
+        if (failure === undefined) {
+          here.push(slot);
+          takes.add(slot);
+        } else {
+          unread.set(slot, furthest(unread.get(slot), failure.rank, failure.outcome));
+        }
+      }
+      if (here.length === 0) {
+        const ambiguity = this.nameSiblings(signature, { positional: new Map(), keyed: new Map() }, new Map(), labels, []);
+        if (ambiguity) return ambiguity;
+        continue;
+      }
+      for (const slot of here) {
+        const layout = this.layout({ name: slot });
+        if ('failure' in layout) return layout.failure;
+        const others = here.filter(other => other !== slot);
+        const result = this.messageSignatureOutcome(signature, layout.value, labels, undefined, others);
+        if (result.rank !== Infinity) return result.outcome;
+      }
+    }
+    if (decorators === 0) return best!.outcome;
+    for (const [slot, failure] of unread) {
+      if (!takes.has(slot)) return failure!.outcome;
+    }
+    return this.opVerified(callee);
+  }
+
+  /**
+   * Why a `first` slot takes no name string on one overload, or undefined
+   * when it does: as a name slot is read (`messageSignatureOutcome`, steps 1
+   * and 3).
+   */
+  private nameEntryFailure(signature: ts.Signature, slot: ClaimSlot): RankedFailure | undefined {
+    const declared = this.keyParameterAt(signature, slot.arg);
+    if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
+    if (slot.key === undefined) {
+      const read = this.throughConditional(declared);
+      return this.acceptsString(read) ? undefined : { rank: 1, outcome: this.slotFailure(read, 'name_not_string') };
+    }
+    const view = this.viewFor(declared, new Map([[slot.key, 'name']]), given => this.runsFailure(given));
+    return 'rank' in view ? view : undefined;
   }
 
   /**
@@ -3291,6 +3403,10 @@ class DeclarationReader {
    * call's other parts.
    */
   private methodOutcome(claim: OpClaim, rules: RoleRules, receiver: MessageReceiver): Outcome | undefined {
+    // A GraphQL root field written as a decorator states its root word (amendment 8).
+    if (claim.protocol === 'graphql' && claim.form === 'decorate' && claim.method === undefined) {
+      return unchecked('claim_invalid');
+    }
     const words = methodWords(claim, rules);
     // A procedure named by its key (#2474 R6a): a receive op with a handler.
     // On http the label states its method, a route word, and the member names
@@ -3666,13 +3782,15 @@ class DeclarationReader {
    *    (design D2, `nameSiblings`).
    *
    * `runsAs` replaces the `runs` predicate (an adapter's collection, #2474
-   * R6a); absent, a `runs` slot is a declared function.
+   * R6a); absent, a `runs` slot is a declared function. `others` are a
+   * `first` name's other entries (amendment 8), see `nameSiblings`.
    */
   private messageSignatureOutcome(
     signature: ts.Signature,
     layout: ClaimLayout,
     labels: KeyLabels,
-    runsAs?: RunsPredicate
+    runsAs?: RunsPredicate,
+    others?: readonly ClaimSlot[]
   ): RankedFailure {
     const runsFailure = runsAs ?? ((declared: Slot | undefined) => this.runsFailure(declared));
     for (const [arg, part] of layout.positional) {
@@ -3722,7 +3840,7 @@ class DeclarationReader {
       if ('rank' in view) return view;
       views.set(arg, view.view);
     }
-    const ambiguity = this.nameSiblings(signature, layout, views, labels);
+    const ambiguity = this.nameSiblings(signature, layout, views, labels, others);
     if (ambiguity) return { rank: 4, outcome: ambiguity };
     return { rank: Infinity, outcome: VERIFIED };
   }
@@ -3813,7 +3931,10 @@ class DeclarationReader {
    * The labels must agree with the claim: at most one key is labelled `name`,
    * and only the claim's own name key; that key is never labelled `not_name`.
    * A `not_name` label for a key an overload does not declare is ignored
-   * (one label map serves every overload). No name, no rule.
+   * (one label map serves every overload). No name, no rule, except for a
+   * `first` name (amendment 8): `others` are its other entries that take a
+   * string on this overload, accounted for as the name is, and the rule holds
+   * with no name in the run at all.
    *
    * Rest parameters: a rest the claim puts a payload or handler in belongs
    * wholly to that part; one that holds the name holds other names too; from
@@ -3827,36 +3948,51 @@ class DeclarationReader {
     signature: ts.Signature,
     layout: ClaimLayout,
     views: ReadonlyMap<number, ts.Type>,
-    labels: KeyLabels
+    labels: KeyLabels,
+    others?: readonly ClaimSlot[]
   ): Outcome | undefined {
     const namedAt = [...layout.positional].find(([, part]) => part === 'name')?.[0];
     let nameKey: string | undefined;
     for (const keys of layout.keyed.values()) {
       for (const [key, part] of keys) if (part === 'name') nameKey = key;
     }
-    if (namedAt === undefined && nameKey === undefined) return undefined;
+    // A `first` name (amendment 8) is judged with no name of its own too: a
+    // string slot there is one a fallback name would be written over.
+    if (namedAt === undefined && nameKey === undefined && others === undefined) return undefined;
     const ambiguous = failed('name_ambiguous');
+    // The `first` entries beside this run's name, which name the op on another
+    // call: a position, or a key of the object at one.
+    const otherAt = new Set((others ?? []).filter(slot => slot.key === undefined).map(slot => slot.arg));
+    const otherKeys = new Map<number, Set<string>>();
+    for (const slot of others ?? []) {
+      if (slot.key !== undefined) otherKeys.set(slot.arg, (otherKeys.get(slot.arg) ?? new Set()).add(slot.key));
+    }
+    const nameKeys = new Set([...otherKeys.values()].flatMap(keys => [...keys]));
+    if (nameKey !== undefined) nameKeys.add(nameKey);
 
     const nameLabels = Object.keys(labels).filter(key => labels[key] === 'name');
     if (nameLabels.length > 1) return ambiguous;
-    if (nameLabels.length === 1 && nameLabels[0] !== nameKey) return ambiguous;
-    if (nameKey !== undefined && labels[nameKey] === 'not_name') return ambiguous;
+    if (nameLabels.length === 1 && !nameKeys.has(nameLabels[0])) return ambiguous;
+    if ([...nameKeys].some(key => labels[key] === 'not_name')) return ambiguous;
 
     // A string key at the call the claim neither assigns nor labels.
-    const unaccountedKey = (keys: readonly string[], assigned: ReadonlyMap<string, PartName>) =>
+    const unaccountedKey = (keys: readonly string[], assigned: ReadonlyMap<string, PartName> | ReadonlySet<string>) =>
       keys.some(key => !assigned.has(key) && labels[key] !== 'not_name');
     const none = new Map<string, PartName>();
     const takesString = (slot: Slot | undefined) => slot !== undefined && this.siblingTakesString(slot);
     // An argument the claim gives no part: a string, an object with a string
     // key nobody accounts for, or a rest the verifier cannot read, which could
     // hold either and no label can account for (fail closed, carrick#1687).
-    const competes = (slot: Slot | undefined) =>
-      slot === VARIADIC || takesString(slot) || unaccountedKey(this.stringKeys(slot), none);
+    const competes = (slot: Slot | undefined, i?: number) =>
+      slot === VARIADIC ||
+      takesString(slot) ||
+      unaccountedKey(this.stringKeys(slot), (i === undefined ? undefined : otherKeys.get(i)) ?? none);
 
     // Every object the claim reads keys of: its other string keys.
     for (const [arg, keys] of layout.keyed) {
       const view = views.get(arg);
-      if (view && unaccountedKey(this.stringKeys(view), keys)) return ambiguous;
+      const accounted = new Set([...keys.keys(), ...(otherKeys.get(arg) ?? [])]);
+      if (view && unaccountedKey(this.stringKeys(view), accounted)) return ambiguous;
     }
 
     const parameters = signature.getParameters();
@@ -3865,11 +4001,13 @@ class DeclarationReader {
     const restIndex =
       lastDeclaration && ts.isParameter(lastDeclaration) && lastDeclaration.dotDotDotToken ? parameters.length - 1 : -1;
     const fixed = restIndex === -1 ? parameters.length : restIndex;
-    const assigned = (i: number) => layout.positional.has(i) || layout.keyed.has(i);
+    const assigned = (i: number) => layout.positional.has(i) || layout.keyed.has(i) || otherAt.has(i);
+    // A rest never holds a `first` position: it would hold other names too.
+    if (restIndex !== -1 && [...otherAt].some(arg => arg >= restIndex)) return ambiguous;
 
     for (let i = 0; i < fixed; i++) {
       if (assigned(i)) continue;
-      if (competes(this.keyParameterAt(signature, i))) return ambiguous;
+      if (competes(this.keyParameterAt(signature, i), i)) return ambiguous;
     }
     if (restIndex === -1) return undefined;
     const rest = this.checker.getTypeOfSymbol(last);
@@ -3880,7 +4018,7 @@ class DeclarationReader {
       const fixedLength = variable === -1 ? elements.length : variable;
       for (let i = restIndex; i < restIndex + fixedLength; i++) {
         if (assigned(i)) continue;
-        if (competes(this.keyParameterAt(signature, i))) return ambiguous;
+        if (competes(this.keyParameterAt(signature, i), i)) return ambiguous;
       }
       if (variable !== -1) {
         const unfixed = [...layout.positional].filter(([arg]) => arg >= restIndex + variable).map(([, part]) => part);

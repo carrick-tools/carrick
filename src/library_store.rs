@@ -3361,6 +3361,31 @@ mod tests {
         );
     }
 
+    /// Amendment 8 of carrick#2434: a GraphQL root-field decorator's ops, named
+    /// by a `first` list or by the decorated member alone, parse whole.
+    #[test]
+    fn an_answer_with_decorated_names_parses_with_nothing_dropped() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"fixture-graph","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"fixture-graph","export":"Query","role":"server_framework","side":null,"ops":[
+                    {"op":"receive","member":null,"on":"export","form":"decorate","protocol":"graphql",
+                     "method":"QUERY","name":{"first":[{"arg":0},{"arg":1,"key":"name"},{"bound":"decorated"}]},
+                     "key_labels":{"description":"not_name"}}]},
+                {"specifier":"fixture-graph","export":"Mutation","role":"server_framework","side":null,"ops":[
+                    {"op":"receive","member":null,"on":"export","form":"decorate","protocol":"graphql",
+                     "method":"MUTATION","name":{"bound":"decorated"}}]}]}]}"#,
+        );
+        assert_eq!((answer.answered, answer.dropped), (1, 0));
+        assert_eq!(answer.exports.len(), 2);
+        let sent = serde_json::to_value(&answer.exports[0].claims).unwrap();
+        assert_eq!(
+            sent[0]["name"],
+            serde_json::json!({ "first": [{ "arg": 0 }, { "arg": 1, "key": "name" }, { "bound": "decorated" }] })
+        );
+        let sent = serde_json::to_value(&answer.exports[1].claims).unwrap();
+        assert_eq!(sent[0]["name"], serde_json::json!({ "bound": "decorated" }));
+    }
+
     #[test]
     fn the_store_s_label_v2_body_reads_its_label_side_rule_and_type_packages() {
         let answer = parse_answer(STORE_ANSWERED_V2);

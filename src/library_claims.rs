@@ -1110,7 +1110,11 @@ impl Reading<'_> {
                 // A name a scope member binds is carrick#1678's; one a
                 // router key binds is #2474 R6c's.
                 // The names amendment 7 adds are read from H3 on.
-                OpName::Bound { .. } | OpName::Parts { .. } | OpName::Literal { .. } => {
+                // A `first` name (amendment 8) is SB1's.
+                OpName::Bound { .. }
+                | OpName::Parts { .. }
+                | OpName::Literal { .. }
+                | OpName::First(_) => {
                     return None;
                 }
             };
@@ -1774,6 +1778,54 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Amendment 8 of carrick#2434: a decorated member's name and a `first`
+    /// list read from the wire and write back as they were read; a `first`
+    /// entry with any field the compiler engine's schema refuses is refused
+    /// here too, so it never reaches a request it would fail whole.
+    #[test]
+    fn amendment_eight_names_round_trip() {
+        let wire = [
+            json!({ "kind": "op", "op": "receive", "member": null, "on": "export",
+                    "form": "decorate", "protocol": "graphql", "method": "QUERY",
+                    "name": { "bound": "decorated" } }),
+            json!({ "kind": "op", "op": "receive", "member": null, "on": "export",
+                    "form": "decorate", "protocol": "graphql", "method": "QUERY",
+                    "name": { "first": [{ "arg": 0 }, { "arg": 1, "key": "name" },
+                                        { "bound": "decorated" }] },
+                    "key_labels": { "description": "not_name" } }),
+        ];
+        for value in wire {
+            let claim: LibraryClaim = serde_json::from_value(value.clone()).expect("a claim");
+            assert_eq!(serde_json::to_value(&claim).unwrap(), value);
+        }
+        let LibraryClaim::Op {
+            name: Some(name), ..
+        } = serde_json::from_value(json!({
+            "kind": "op", "op": "receive", "member": null, "form": "decorate",
+            "name": { "first": [{ "arg": 0 }, { "bound": "decorated" }] }
+        }))
+        .expect("a claim")
+        else {
+            panic!("an op with a name");
+        };
+        assert!(matches!(&*name, OpName::First(first) if first.first.len() == 2));
+        for refused in [
+            json!({ "first": [{ "arg": 0, "at": ["id"] }, { "bound": "decorated" }] }),
+            json!({ "first": [{ "arg": 0, "document": "graphql" }, { "bound": "decorated" }] }),
+            json!({ "first": [{ "arg": 0 }, { "bound": "maker" }] }),
+            json!({ "first": [{ "arg": 0 }, { "bound": "decorated", "join": "." }] }),
+            json!({ "first": [{ "arg": 0 }], "join": "." }),
+        ] {
+            assert!(
+                serde_json::from_value::<LibraryClaim>(json!({
+                    "kind": "op", "op": "receive", "member": null, "name": refused.clone()
+                }))
+                .is_err(),
+                "{refused}"
+            );
+        }
     }
 
     /// A claim written without the new fields writes back byte for byte as it
