@@ -22,7 +22,7 @@ one function out.
 | `s-closure-param-key.ts:7` | a key of the parameter, `make({ post: send })`, `o.post(…)` | Same |
 | `s-closure-param-local.ts:8` | a factory local holding that key | Same |
 | `s-two-level.ts:17` | the maker call `makeHttp(opts)` is in `makeClient`, passing its own parameter; the call is in `search`, one function further in | A site, end `send`, no stop: `opts` is read at `makeClient`'s callers |
-| `t-real.ts:26` | the same two-level shape, with a module-constant host and the method in the send's options | Same |
+| `t-real.ts:26` | the same two-level shape, with a module-constant host and the method in the send's options | Same. Its row waits on the path: it holds `one`'s own `id` (carrick#3372), so the scan leaves a `name_never_bound` lead there, not `injected_callee` |
 | `s-closure-local.ts:7` | a factory local holding `send` directly | A site, end `send` (already before the step) |
 | `s-two-level-direct.ts:11` | the returned function calls `send` directly | Same |
 | `z-literal-fn.ts:5` | a closed URL inside the returned function | A site at the inner call, end `send` (already before the step) |

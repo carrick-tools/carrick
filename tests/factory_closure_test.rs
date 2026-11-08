@@ -153,8 +153,8 @@ fn a_closure_over_a_factory_parameter_states_its_row_at_the_caller() {
     for (at, path) in [
         ("s-closure-coalesce.ts:8", "/p/s-closure-coalesce"),
         ("s-closure-param.ts:7", "/p/s-closure-param"),
+        ("s-closure-param-key.ts:7", "/p/s-closure-param-key"),
         ("s-two-level.ts:17", "/p/s-two-level"),
-        ("t-real.ts:26", "https://h.test/p/t-real/deals/"),
     ] {
         let found = rows
             .iter()
@@ -168,6 +168,22 @@ fn a_closure_over_a_factory_parameter_states_its_row_at_the_caller() {
         {
             wrong.push(format!("a lead at {at}: {lead}"));
         }
+    }
+    // The two-level shape with the path holding the nested function's own
+    // parameter: the callee decides, so what is left is the name
+    // (carrick#3372), not the callee.
+    if leads
+        .iter()
+        .any(|lead| lead.ends_with("src/t-real.ts:26 injected_callee"))
+    {
+        wrong.push("t-real.ts:26 is still an injected callee".to_string());
+    }
+    // The maker call fills `send` with a function that sends nothing.
+    if rows
+        .iter()
+        .any(|row| row.contains("/p/s-closure-coalesce-filled"))
+    {
+        wrong.push("s-closure-coalesce-filled.ts:9 states a row".to_string());
     }
     assert!(
         wrong.is_empty(),
