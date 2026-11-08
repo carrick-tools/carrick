@@ -45,7 +45,7 @@ import {
 } from './check-workspace.js';
 import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
 import { openProbeProgram, probeDeepFindings } from './check-deep.js';
-import { onlyDeclaredOpenAny } from './deep-walk.js';
+import { onlyDeclaredOpenMembers } from './deep-walk.js';
 import { pairFieldReports } from './check-fields.js';
 import { pairDispatchUnions } from './check-union.js';
 
@@ -846,9 +846,14 @@ function deepDecayOf(
     // pre-gate reads, exactly as when the walk stopped at the first hit.
     const findings = record?.any_provenance ?? [];
     // An `any` the source declares under a named member is an open member
-    // (carrick#2591): the pair is probed, and the compiler judges the closed
-    // members. Anything else on the record keeps the pair out of the probe.
-    if (onlyDeclaredOpenAny(findings)) continue;
+    // (carrick#2591), and so is an `unknown` on the side that receives the
+    // payload, or one the receiving side also declares at the same path: the pair is probed, and the compiler judges the closed members.
+    // Anything else on the record keeps the pair out of the probe.
+    const other = side === 'producer' ? 'consumer' : 'producer';
+    const otherEndpoint = plan.spec[other];
+    const counterpart =
+      aliasRecords.get(otherEndpoint.service_name)?.get(otherEndpoint.alias)?.any_provenance ?? [];
+    if (onlyDeclaredOpenMembers(findings, side === plan.direction.expected, counterpart)) continue;
     const finding = findings[0];
     if (finding) {
       return { side, kind: finding.kind, path: finding.path };
