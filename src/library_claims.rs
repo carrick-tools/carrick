@@ -770,7 +770,8 @@ pub struct LibraryRow {
     pub kind: LibraryRowKind,
     /// The topic or event, exactly as the source writes it.
     pub name: String,
-    pub name_scope: NameScope,
+    /// `None`: no scope, the name crosses services ([`scoped`]).
+    pub name_scope: Option<NameScope>,
     /// Every claim the row rests on, each maker of a set included, sorted.
     pub claim_ids: Vec<String>,
     /// A definition (`task({ id, run })`): where a model route at exactly
@@ -781,9 +782,9 @@ pub struct LibraryRow {
 impl LibraryRow {
     /// The row's `name_scope` as the index writes it (carrick#1663's
     /// [`carrick_match::NameScope`]): the claim's scope spelled `global` or
-    /// `service`, and its namespace.
-    pub fn wire_scope(&self) -> carrick_match::NameScope {
-        wire_scope_of(&self.name_scope)
+    /// `service`, and its namespace; `None` for a row that states no scope.
+    pub fn wire_scope(&self) -> Option<carrick_match::NameScope> {
+        self.name_scope.as_ref().map(wire_scope_of)
     }
 }
 
@@ -943,7 +944,7 @@ impl Reading<'_> {
         &self,
         kind: LibraryRowKind,
         name: String,
-        name_scope: NameScope,
+        name_scope: Option<NameScope>,
         claim_ids: BTreeSet<String>,
         definition: bool,
     ) -> LibraryRow {
@@ -1021,7 +1022,7 @@ impl Reading<'_> {
             }
             None => None,
         };
-        let mut read: Option<(LibraryRowKind, String, NameScope)> = None;
+        let mut read: Option<(LibraryRowKind, String, Option<NameScope>)> = None;
         for (id, claim) in self.claims {
             let LibraryClaim::Op {
                 op,
@@ -1139,7 +1140,7 @@ impl Reading<'_> {
 struct Through {
     kind: LibraryRowKind,
     name: String,
-    name_scope: NameScope,
+    name_scope: Option<NameScope>,
     claim_ids: Vec<String>,
 }
 
@@ -1183,20 +1184,21 @@ fn row_kind(role: LibraryRole, op: LibraryOp, side: Option<Side>) -> Option<Libr
 
 /// The scope a row is written with: an in-process bus's name never leaves
 /// its service (D4, carrick#1564 comment 5940360418), whatever the claim
-/// says; a claim that says nothing is read as `service` too, the direction
-/// that only ever loses an edge.
-pub(crate) fn scoped(role: LibraryRole, scope: Option<NameScope>) -> NameScope {
+/// says. Else the claim's scope. A claim that says nothing on a
+/// cross-process role (a broker, a socket) writes no scope: the name crosses
+/// services ([`crate::message_key::name_scope`], carrick#3531).
+pub(crate) fn scoped(role: LibraryRole, scope: Option<NameScope>) -> Option<NameScope> {
     let claimed = scope.map(|scope| wire_scope_of(&scope));
     let written =
-        crate::message_key::name_scope(role == LibraryRole::InProcessBus, claimed, None, None);
-    NameScope {
+        crate::message_key::name_scope(role == LibraryRole::InProcessBus, claimed, None, None)?;
+    Some(NameScope {
         scope: if written.scope == carrick_match::GLOBAL_SCOPE {
             NameScopeKind::Global
         } else {
             NameScopeKind::Service
         },
         namespace: written.namespace,
-    }
+    })
 }
 
 /// A claim's scope as the index writes it.
@@ -1888,10 +1890,10 @@ mod tests {
         );
         assert_eq!(
             rows[0].name_scope,
-            NameScope {
+            Some(NameScope {
                 scope: NameScopeKind::Global,
                 namespace: None
-            }
+            })
         );
         assert!(!rows[0].definition);
     }
@@ -2006,7 +2008,13 @@ mod tests {
                 "@fixture/queue@2:Queue:op:send:add:on:instance",
             ]
         );
-        assert_eq!(rows[0].name_scope.namespace.as_deref(), Some("queue"));
+        assert_eq!(
+            rows[0]
+                .name_scope
+                .as_ref()
+                .and_then(|scope| scope.namespace.as_deref()),
+            Some("queue")
+        );
         let unverified_maker =
             rows_of(&sites, &[queue], |check| !check.claim_id.contains(":make:"));
         assert!(unverified_maker.is_empty(), "the maker must verify");
@@ -2083,7 +2091,10 @@ mod tests {
         assert_eq!(rows[0].name, "send-email");
         assert!(rows[0].definition);
         assert_eq!(rows[0].kind, LibraryRowKind::Pubsub(PubsubRole::Subscriber));
-        assert_eq!(rows[0].name_scope.scope, NameScopeKind::Service);
+        assert_eq!(
+            rows[0].name_scope.as_ref().map(|scope| scope.scope),
+            Some(NameScopeKind::Service)
+        );
         let mut socket = jobs.clone();
         socket.role = LibraryRole::Socket;
         socket.side = Some(Side::Server);
@@ -2169,6 +2180,68 @@ mod tests {
         assert!(kinds(None).is_empty());
     }
 
+    /// A socket's event names are the contract between services: a claim
+    /// that states no scope writes none, so a server's emit in one service
+    /// pairs with a client's listener in another, and a client's emit with
+    /// the server's handler (carrick#3531).
+    #[test]
+    fn a_silent_socket_claim_writes_no_scope_and_crosses_services() {
+        let socket = |export_name: &str, side: &str| {
+            export(json!({
+                "package": "@fixture/socket", "version": "4.0.0", "specifier": "@fixture/socket",
+                "export": export_name, "role": "socket", "side": side,
+                "claims": [
+                    { "kind": "op", "op": "send", "member": "emit", "on": "export",
+                      "name": { "arg": 0 }, "payload": { "arg": 1 } },
+                    { "kind": "op", "op": "receive", "member": "on", "on": "export",
+                      "name": { "arg": 0 }, "handler": { "arg": 1 } }
+                ]
+            }))
+        };
+        let server = sites_of(&[(
+            "src/hub.ts",
+            "import { server } from \"@fixture/socket\";\n\
+             export function go() {\n\
+             \x20 server.emit(\"job:notify\", { id: 1 });\n\
+             \x20 server.on(\"job:subscribe\", (id) => {});\n\
+             }\n",
+        )]);
+        let client = sites_of(&[(
+            "src/watch.ts",
+            "import { client } from \"@fixture/socket\";\n\
+             export function go() {\n\
+             \x20 client.emit(\"job:subscribe\", 1);\n\
+             \x20 client.on(\"job:notify\", (job) => {});\n\
+             }\n",
+        )]);
+        let hub = rows_of(&server, &[socket("server", "server")], all);
+        let watch = rows_of(&client, &[socket("client", "client")], all);
+        assert_eq!(hub.len(), 2, "{hub:#?}");
+        assert_eq!(watch.len(), 2, "{watch:#?}");
+        let scope = |row: &LibraryRow| row.wire_scope();
+        for row in hub.iter().chain(&watch) {
+            assert_eq!(scope(row), None, "{row:#?}");
+        }
+        let pairs = |call: &LibraryRow, call_service, endpoint: &LibraryRow, endpoint_service| {
+            let (call_scope, endpoint_scope) = (scope(call), scope(endpoint));
+            call.name == endpoint.name
+                && carrick_match::names_pair(
+                    carrick_match::ScopedRow {
+                        service: call_service,
+                        name_scope: call_scope.as_ref(),
+                    },
+                    carrick_match::ScopedRow {
+                        service: endpoint_service,
+                        name_scope: endpoint_scope.as_ref(),
+                    },
+                )
+        };
+        // The server's emit reaches the client's listener; the client's
+        // emit reaches the server's handler.
+        assert!(pairs(&hub[0], "hub", &watch[1], "watch"));
+        assert!(pairs(&watch[0], "watch", &hub[1], "hub"));
+    }
+
     /// An export the store marks `by_origin` has no side of its own, so the
     /// side it states is never read as one (carrick#3011).
     #[test]
@@ -2229,8 +2302,13 @@ mod tests {
             .collect();
         assert_eq!(stated, vec![(3, "ready"), (4, "ready")], "{rows:#?}");
         for row in &rows {
-            assert_eq!(row.name_scope.scope, NameScopeKind::Service);
-            assert_eq!(row.name_scope.namespace.as_deref(), Some("event"));
+            assert_eq!(
+                row.name_scope,
+                Some(NameScope {
+                    scope: NameScopeKind::Service,
+                    namespace: Some("event".to_string()),
+                })
+            );
         }
     }
 
@@ -2332,25 +2410,30 @@ mod tests {
         let rows = rows_of(&sites, &[bus()], all);
         assert_eq!(
             rows[0].wire_scope(),
-            carrick_match::NameScope {
+            Some(carrick_match::NameScope {
                 scope: "global".to_string(),
                 namespace: None
-            }
+            })
         );
         let service = LibraryRow {
-            name_scope: NameScope {
+            name_scope: Some(NameScope {
                 scope: NameScopeKind::Service,
                 namespace: Some("task".to_string()),
-            },
+            }),
             ..rows[0].clone()
         };
         assert_eq!(
             service.wire_scope(),
-            carrick_match::NameScope {
+            Some(carrick_match::NameScope {
                 scope: "service".to_string(),
                 namespace: Some("task".to_string())
-            }
+            })
         );
+        let silent = LibraryRow {
+            name_scope: None,
+            ..rows[0].clone()
+        };
+        assert_eq!(silent.wire_scope(), None);
     }
 
     /// Only the message roles state rows here: an HTTP client's export, even
@@ -2454,17 +2537,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(names("instance:new"), vec!["welcome".to_string()]);
-        let scopes: Vec<NameScope> = rows_of(&sites, &[queue("instance:new")], all)
+        let scopes: Vec<Option<NameScope>> = rows_of(&sites, &[queue("instance:new")], all)
             .into_iter()
             .map(|row| row.name_scope)
             .collect();
         assert_eq!(
             scopes,
-            vec![NameScope {
-                scope: NameScopeKind::Service,
-                namespace: None
-            }],
-            "a claim that states no scope is read as `service`"
+            vec![None],
+            "a broker claim that states no scope writes none (carrick#3531)"
         );
         assert!(names("instance:new:Cluster").is_empty());
     }

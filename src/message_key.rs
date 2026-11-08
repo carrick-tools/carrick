@@ -5,14 +5,15 @@
 //! ([`crate::library_claims`]) and the site-row writer ([`crate::site_rows`]).
 //! Both ask this module for the three parts of a key that are not the name:
 //!
-//! - **Name scope** ([`name_scope`]). Whether a name crosses services.
-//!   `None` is no row's scope; every message row states one. An in-process
-//!   bus stays in its service (ruling D4, carrick#1564). Else a scope the
-//!   library's claim states wins. Else the kind the model named (`message`
-//!   is `global`, `event` is `service`). Else `service`, the direction that
-//!   only ever loses an edge. The namespace is the claim's, else the
-//!   caller's. Pairing reads it through `carrick_match::names_pair`
-//!   (`crates/carrick-match/src/name_scope.rs`).
+//! - **Name scope** ([`name_scope`]). Whether a name crosses services. An
+//!   in-process bus stays in its service (ruling D4, carrick#1564). Else a
+//!   scope the library's claim states wins. Else the kind the model named
+//!   (`message` is `global`, `event` is `service`). Else no scope: a broker's
+//!   topic or a socket's event that nothing scopes is the cross-service
+//!   contract Carrick exists to find, so it crosses services, as every row
+//!   written before scopes paired did (carrick#3531). The namespace is the
+//!   claim's, else the caller's. Pairing reads it through
+//!   `carrick_match::names_pair` (`crates/carrick-match/src/name_scope.rs`).
 //! - **Socket direction** ([`socket_direction`]). A send on a client's socket
 //!   goes client to server, a send on a server's the other way, and a
 //!   handler takes the opposite of a send. A library that serves both ends
@@ -27,15 +28,16 @@
 use crate::operation::SocketDirection;
 use crate::site_rows::RowSide;
 
-/// The scope a message row is written with. `claimed` is the scope the
-/// library's claim states, `kind_scope` the one the model's kind names
-/// (`global` or `service`), `namespace` the namespace the caller read.
+/// The scope a message row is written with, `None` for no scope (the name
+/// crosses services). `claimed` is the scope the library's claim states,
+/// `kind_scope` the one the model's kind names (`global` or `service`),
+/// `namespace` the namespace the caller read.
 pub fn name_scope(
     in_process: bool,
     claimed: Option<carrick_match::NameScope>,
     kind_scope: Option<&str>,
     namespace: Option<String>,
-) -> carrick_match::NameScope {
+) -> Option<carrick_match::NameScope> {
     let claimed_namespace = claimed.as_ref().and_then(|scope| scope.namespace.clone());
     let namespace = claimed_namespace.or(namespace);
     let scope = if in_process {
@@ -43,11 +45,9 @@ pub fn name_scope(
     } else if let Some(claimed) = claimed {
         claimed.scope
     } else {
-        kind_scope
-            .unwrap_or(carrick_match::SERVICE_SCOPE)
-            .to_string()
+        kind_scope?.to_string()
     };
-    carrick_match::NameScope { scope, namespace }
+    Some(carrick_match::NameScope { scope, namespace })
 }
 
 /// The direction of a socket call or handler on a `side` end (`client`,
@@ -96,25 +96,30 @@ mod tests {
             Some("service"),
             None,
         );
-        assert_eq!(got, scope("global", Some("q")));
+        assert_eq!(got, Some(scope("global", Some("q"))));
     }
 
     #[test]
     fn an_in_process_bus_is_service_whatever_is_stated() {
         let got = name_scope(true, Some(scope("global", Some("q"))), Some("global"), None);
-        assert_eq!(got, scope("service", Some("q")));
+        assert_eq!(got, Some(scope("service", Some("q"))));
+        assert_eq!(
+            name_scope(true, None, None, None),
+            Some(scope("service", None))
+        );
     }
 
     #[test]
-    fn a_silent_claim_reads_the_kind_then_service() {
+    fn a_silent_claim_reads_the_kind_then_no_scope() {
         assert_eq!(
             name_scope(false, None, Some("global"), None),
-            scope("global", None)
+            Some(scope("global", None))
         );
         assert_eq!(
-            name_scope(false, None, None, Some("ns".into())),
-            scope("service", Some("ns"))
+            name_scope(false, None, Some("service"), None),
+            Some(scope("service", None))
         );
+        assert_eq!(name_scope(false, None, None, Some("ns".into())), None);
     }
 
     #[test]

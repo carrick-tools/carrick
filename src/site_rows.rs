@@ -12,7 +12,8 @@
 //!   are [`crate::message_key`]'s, the same the library-claim writer asks
 //!   (carrick#3498): the scope the label's claim states wins, an
 //!   `in_process_bus` is `service` whatever the claim says, then the kind
-//!   (`message` `global`, `event` `service`), then `service`. A socket's
+//!   (`message` `global`, `event` `service`), else no scope (a `topic` or
+//!   `socket_event` nothing scopes crosses services, carrick#3531). A socket's
 //!   direction is read from the label's side: a send on a server's socket
 //!   goes server to client, a send on a client's client to server, and a
 //!   handler the other way; `both` is `Unknown`. A label the store marks
@@ -659,12 +660,7 @@ fn key_of(
     in_process: bool,
 ) -> Option<(OperationKey, Option<carrick_match::NameScope>)> {
     let scoped = |kind_scope: Option<&str>| {
-        Some(crate::message_key::name_scope(
-            in_process,
-            claimed.clone(),
-            kind_scope,
-            namespace.clone(),
-        ))
+        crate::message_key::name_scope(in_process, claimed.clone(), kind_scope, namespace.clone())
     };
     Some(match kind {
         "http" => (OperationKey::http(method.unwrap_or_default(), name), None),
