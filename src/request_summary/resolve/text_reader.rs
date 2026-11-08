@@ -205,7 +205,7 @@ impl<'a> Resolver<'a> {
             BindingKind::Let if !binding.writes.is_empty() || binding.unplaceable => {
                 return hole(Reassigned);
             }
-            BindingKind::Enum => return hole(UnreadExpression),
+            BindingKind::Enum | BindingKind::StaticField => return hole(UnreadExpression),
             _ => {}
         }
         let Some(text) = &binding.text else {
@@ -247,6 +247,32 @@ impl<'a> Resolver<'a> {
                 in_repo_declaration(row).into_iter().collect(),
             );
             return vec![TextValue::Text { text, read_from }];
+        }
+        // A `static` property of a class the module keeps (`C.P`): the row
+        // names the property, the binding table its initialiser.
+        if let Some(row) = self.row_at(file, lo, hi, Kind::Member)
+            && let Some((at, binding, declared)) = self.declared_entry(row)
+            && binding.kind == BindingKind::StaticField
+        {
+            let Some(text) = &binding.text else {
+                return hole(UnreadExpression);
+            };
+            let Some(_reading) = self.reading_text(&at) else {
+                return hole(Recursion);
+            };
+            note_all(&mut read_from, vec![declared]);
+            let mut out = self.text_values(at.0, text);
+            for entry in &mut out {
+                if let TextValue::Text {
+                    read_from: from, ..
+                } = entry
+                {
+                    let mut all = read_from.clone();
+                    note_all(&mut all, std::mem::take(from));
+                    *from = all;
+                }
+            }
+            return out;
         }
         // An object literal written in place (`const { a } = { a: '/x' }`)
         // cannot escape: its last entry with the key is the value.
@@ -292,6 +318,7 @@ impl<'a> Resolver<'a> {
         // the key, where the module only ever reads the object's entries.
         let last = match binding.kind {
             BindingKind::Enum => false,
+            BindingKind::StaticField => return hole(UnreadExpression),
             BindingKind::Var => return hole(Reassigned),
             BindingKind::Let if !binding.writes.is_empty() || binding.unplaceable => {
                 return hole(Reassigned);

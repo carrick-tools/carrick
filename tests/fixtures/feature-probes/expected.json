@@ -222,7 +222,7 @@
  "n-static-field": {
   "feature": "class-static-fields-public",
   "source": "test262",
-  "status": "lead"
+  "status": "covered"
  },
  "n-str-concat": {
   "feature": "String.prototype.concat (built-in)",

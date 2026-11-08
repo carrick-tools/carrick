@@ -196,6 +196,51 @@ fn a_destructured_name_states_its_keys_value_on_every_protocol() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A `static` property of a module-scope class names its initialiser's
+/// value (`C.P`), on every protocol; one the module writes elsewhere, or an
+/// exported class's, is no fact row and stays a possible call.
+#[test]
+fn a_static_field_names_its_value() {
+    let scan = scan();
+    let key = key();
+    let mut wrong = Vec::new();
+    let kind_asked: BTreeSet<&str> = key["kind_asked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file.as_str().unwrap())
+        .collect();
+    for (file, want) in key["names"].as_object().unwrap() {
+        if !file.contains("static-") {
+            continue;
+        }
+        let want = want.as_str().unwrap();
+        if kind_asked.contains(file.as_str()) {
+            if !scan.leads.contains(file) {
+                wrong.push(format!("{file}: want a possible call, got none"));
+            }
+            continue;
+        }
+        let got = scan.named.get(file).cloned().unwrap_or_default();
+        if got != BTreeSet::from([want.to_string()]) {
+            wrong.push(format!("{file}: want {want}, got {got:?}"));
+        }
+    }
+    for file in key["unnamed"].as_array().unwrap() {
+        let file = file.as_str().unwrap();
+        if !file.contains("static-") {
+            continue;
+        }
+        if let Some(got) = scan.named.get(file) {
+            wrong.push(format!("{file}: want no fact row, got {got:?}"));
+        }
+        if !scan.leads.contains(file) {
+            wrong.push(format!("{file}: want a possible call, got none"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A fallback name (`maybe ?? '/x'`, `maybe` a runtime value) states its
 /// stated side on every protocol; several stated values stay asked.
 #[test]

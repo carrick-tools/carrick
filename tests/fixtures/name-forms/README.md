@@ -18,6 +18,11 @@ Forms so far:
   error. `c-coalesce-const` (two constants) and `c-union` (a union of
   literals) are several values and stay asked.
 
+- `static-field` (S2b-6): `C.P` where `static P = '…'` is a property of a
+  module-scope class. `c-static-written` (`C.P = …` elsewhere) and
+  `c-static-exported` (an exported class) are unread on purpose: the value
+  may change, so the field's initialiser is not the name.
+
 `rows.expected.json` is the answer key, read by `tests/name_forms_test.rs`:
 `names` gives the one name each file's site forces and the scan writes as a
 fact row (a `kind_asked` pub/sub file waits on the broker's kind question
