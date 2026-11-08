@@ -72,6 +72,13 @@ target/
 !tests/fixtures/position-rows/repo/node_modules/@fixture/kit/
 !tests/fixtures/position-rows/repo/node_modules/@fixture/kit/package.json
 !tests/fixtures/position-rows/repo/node_modules/@fixture/kit/index.d.ts
+!tests/fixtures/graphql-document-arguments/apps/web/node_modules/
+!tests/fixtures/graphql-document-arguments/apps/web/node_modules/@fixture/
+!tests/fixtures/graphql-document-arguments/apps/web/node_modules/@fixture/documents/
+!tests/fixtures/graphql-document-arguments/apps/web/node_modules/@fixture/documents/package.json
+!tests/fixtures/graphql-document-arguments/apps/web/node_modules/@fixture/documents/src/
+!tests/fixtures/graphql-document-arguments/apps/web/node_modules/@fixture/documents/src/index.ts
+!tests/fixtures/graphql-document-arguments/apps/web/node_modules/@fixture/documents/src/ops.ts
 **/ts_check/output
 mcp-server/dist
 mcp-server/dist-lambda

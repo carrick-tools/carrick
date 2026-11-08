@@ -35,9 +35,11 @@ use super::*;
 use crate::position_rows::{Kind, Row};
 use std::cell::{Cell, RefCell};
 
+mod documents;
 mod text;
 mod text_reader;
 
+pub(crate) use documents::{DocumentEnd, DocumentLookup, document_calls};
 pub(super) use text::{pattern_members, text_of};
 pub(super) use text_reader::TextValue;
 

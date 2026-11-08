@@ -243,6 +243,7 @@ pub(crate) mod dispatch;
 // returns. Discovery's value walk reads callees through it (carrick#2432).
 // Design: carrick-cloud docs/internal/decisions/2026-11-07-one-value-resolver.md
 mod resolve;
+pub(crate) use resolve::{DocumentEnd, DocumentLookup, document_calls};
 use resolve::{Holds, ValueAt};
 
 // What each construction of a class passes, across the service, for the
