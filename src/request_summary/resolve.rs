@@ -1120,9 +1120,11 @@ pub(super) struct Maker<'a> {
     pub(super) factory: (&'a Path, &'a FnIr),
     /// How many functions the body that runs the made function is inside
     /// the one the factory call is written in: a parameter the call passes
-    /// is that many further out. `None` where the call is read through a
-    /// module binding, whose writer is no body around the one that runs it:
-    /// a parameter it passes is read as nothing, as before the step.
+    /// is that many further out. `None` where the call is not written in a
+    /// body around the one that runs the function: read through a module
+    /// binding (written in another function), or returned by another
+    /// factory (`return make(o)`, written in that factory). A parameter it
+    /// passes is then read as nothing, as before the step.
     pub(super) out: Option<u8>,
 }
 
@@ -1472,7 +1474,9 @@ impl<'a> Resolver<'a> {
                         construction: false,
                     },
                     factory: (factory_file, factory),
-                    out: self.bindings_reading.borrow().is_empty().then_some(*out),
+                    out: (self.bindings_reading.borrow().is_empty()
+                        && self.returns_depth.get() == 0)
+                        .then_some(*out),
                 });
                 self.returns_depth.set(self.returns_depth.get() + 1);
                 let mut held = Vec::new();

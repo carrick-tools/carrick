@@ -30,3 +30,4 @@ one function out.
 | `b-closure-coalesce.ts:8` | the call of what the factory returned | Not `injected_callee` |
 | `s-closure-coalesce-filled.ts:9` | the maker call fills `send` with `quiet`, which sends nothing | A site with stop `several_values`: the values disagree |
 | `c-binding-maker.ts:11` | the maker call `make(o)` writes a module `let` in `init`; `use` calls the binding | A site with stop `several_values`: `init`'s parameter is no parameter of `use`, so `use`'s caller passing `send` does not decide it |
+| `d-nested-factory.ts:10` | `outer` returns `make(o)`; `f` calls what `outer({ send: quiet })` returned | A site with stop `several_values`: the maker call `make(o)` is written in `outer`, not around `f`, so its parameter is not read at `f`'s callers |

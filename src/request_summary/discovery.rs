@@ -2998,6 +2998,14 @@ mod tests {
                 show("c-binding-maker.ts", 11)
             ));
         }
+        // The maker call is in another factory that returns its result: its
+        // parameter is `outer`'s, which `f`'s call fills with `quiet`.
+        if !several("d-nested-factory.ts", 10) {
+            wrong.push(format!(
+                "d-nested-factory.ts:10 not several: {}",
+                show("d-nested-factory.ts", 10)
+            ));
+        }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
