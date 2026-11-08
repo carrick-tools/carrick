@@ -62,7 +62,7 @@
  "n-destr-assign": {
   "feature": "destructuring-assignment",
   "source": "test262",
-  "status": "lead"
+  "status": "covered"
  },
  "n-destructure": {
   "feature": "destructuring-binding",

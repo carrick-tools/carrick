@@ -328,6 +328,56 @@ fn a_choice_states_its_values_only_when_every_side_is_stated_on_every_protocol()
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A destructuring assignment is a placed write of its key's value
+/// (carrick#3504 S2b-5): `({ a } = obj)` states `obj.a` on every protocol;
+/// a default or an array target stays asked.
+#[test]
+fn a_destructuring_assignment_writes_each_keys_value() {
+    let scan = scan();
+    let key = key();
+    let mut wrong = Vec::new();
+    let mut seen = 0;
+    for (file, want) in key["names"].as_object().unwrap() {
+        if !file.contains("destr-assign") {
+            continue;
+        }
+        seen += 1;
+        let want = want.as_str().unwrap();
+        // A broker's label does not say topic or job name: the kind is
+        // asked, so the row waits on the answer whatever the name.
+        if key["kind_asked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|asked| asked.as_str() == Some(file.as_str()))
+        {
+            if !scan.leads.contains(file) {
+                wrong.push(format!("{file}: want a possible call, got none"));
+            }
+            continue;
+        }
+        let got = scan.named.get(file).cloned().unwrap_or_default();
+        if got != BTreeSet::from([want.to_string()]) {
+            wrong.push(format!("{file}: want {want}, got {got:?}"));
+        }
+    }
+    for file in key["unnamed"].as_array().unwrap() {
+        let file = file.as_str().unwrap();
+        if !file.contains("destr-assign") {
+            continue;
+        }
+        seen += 1;
+        if let Some(got) = scan.named.get(file) {
+            wrong.push(format!("{file}: want no fact row, got {got:?}"));
+        }
+        if !scan.leads.contains(file) {
+            wrong.push(format!("{file}: want a possible call, got none"));
+        }
+    }
+    assert_eq!(seen, 5, "the destr-assign fixtures");
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// `??=` and `||=` are placed writes (carrick#3504 S2b-4): a `let` written
 /// once states that value on every protocol; one written with a second value
 /// (`c-let-written`) or by `&&=` stays asked.

@@ -23,6 +23,11 @@ Forms so far:
   `c-let-written` (a `let` written with a second value) is several values
   and stays asked; `c-and-assign` (`&&=`) computes a value no reader states.
 
+- `destr-assign` (S2b-5): `({ a } = obj)` writes the member `obj.a` to `a`,
+  a placed write beside the earlier value (an empty initialiser drops out).
+  `c-destr-assign-default` (a default) and `c-destr-assign-array` (`[a] = …`)
+  are written in a form no reader places and stay asked.
+
 - `static-field` (S2b-6): `C.P` where `static P = '…'` is a property of a
   module-scope class. `c-static-written` (`C.P = …` elsewhere) and
   `c-static-exported` (an exported class) are unread on purpose: the value

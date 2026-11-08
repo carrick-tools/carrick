@@ -7972,6 +7972,24 @@ impl Visit for CallWalker<'_, '_, '_> {
                 text: resolve::text_of(&assign.right, &|lo| lo),
             });
         }
+        // `({ a } = obj)`: each plain key writes the member `obj.a`, placed
+        // at the property (carrick#3504 S2b-5).
+        if let AssignTarget::Pat(target) = &assign.left
+            && let Some(object) = resolve::plain_object_target(target)
+        {
+            for member in resolve::pattern_members(object) {
+                let read = member.read(&assign.right);
+                if let Some(text) = member.text(&assign.right, &|lo| lo) {
+                    self.ir.binding_writes.push(resolve::BindingWrite {
+                        at: member.span.lo.0,
+                        values: self
+                            .reader
+                            .value_of(&read, self.scope, &guards::Bound::default()),
+                        text,
+                    });
+                }
+            }
+        }
         assign.visit_children_with(self);
     }
 

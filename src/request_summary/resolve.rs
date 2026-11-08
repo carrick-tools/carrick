@@ -382,6 +382,18 @@ pub(super) fn is_placed_assign(op: AssignOp) -> bool {
     )
 }
 
+/// The object pattern of a destructuring assignment target when every
+/// property is a plain key bound to a plain name with no default
+/// (carrick#3504 S2b-5).
+pub(super) fn plain_object_target(target: &AssignTargetPat) -> Option<&ObjectPat> {
+    let AssignTargetPat::Object(object) = target else {
+        return None;
+    };
+    let members = pattern_members(object);
+    (members.len() == object.props.len() && members.iter().all(|member| member.default.is_none()))
+        .then_some(object)
+}
+
 impl Visit for WriteCensus {
     fn visit_assign_expr(&mut self, assign: &AssignExpr) {
         match &assign.left {
@@ -393,7 +405,20 @@ impl Visit for WriteCensus {
                     self.unplaceable.insert(key);
                 }
             }
-            AssignTarget::Pat(pat) => self.mark(pat),
+            // `({ a, k: b } = obj)`: one placed write per plain key, at the
+            // property's start (carrick#3504 S2b-5). Any other target
+            // (array, nested, rest, computed key, default) is unplaceable.
+            AssignTarget::Pat(pat) => match plain_object_target(pat) {
+                Some(object) => {
+                    for member in pattern_members(object) {
+                        self.writes
+                            .entry(ident_key(&member.bound.id))
+                            .or_default()
+                            .push(member.span.lo.0);
+                    }
+                }
+                None => self.mark(pat),
+            },
             // `R.a = x`: an entry of `R` changes.
             AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
                 if let Some(key) = member_root(member) {
@@ -2736,6 +2761,9 @@ mod tests {
         assert_eq!(census_of("let s = a;"), (0, false));
         assert_eq!(census_of("let s = a; s = b;"), (1, false));
         assert_eq!(census_of("let s = a; s ??= b; s ||= c;"), (2, false));
+        // A plain key of a destructuring assignment is a placed write.
+        assert_eq!(census_of("let s = a; ({ s } = o);"), (1, false));
+        assert_eq!(census_of("let s = a; ({ k: s, j } = o);"), (1, false));
         assert_eq!(
             census_of("let s = a; function f() { s = b; } const g = () => { s = c; };"),
             (2, false)
@@ -2747,7 +2775,9 @@ mod tests {
             "let s = a; s += b;",
             "let s = a; s++;",
             "let s = a; [s] = [b];",
-            "let s = a; ({ s } = o);",
+            "let s = a; ({ s = 'x' } = o);",
+            "let s = a; ({ ...s } = o);",
+            "let s = a; ({ k: { s } } = o);",
             "let s = a; for (s of list) {}",
             "let s = a; (s) = b;",
             "let s = a; s! = b;",
