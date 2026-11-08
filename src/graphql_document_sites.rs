@@ -250,6 +250,9 @@ pub struct DocumentSiteConsumers {
     /// `(site file as the service lists it, executed document)`, in file
     /// order.
     sites: Vec<(PathBuf, ExecutedDocument)>,
+    /// Every operation (kind, name, root fields) a module of the service
+    /// declares as a compiled document, executed or not.
+    compiled: HashSet<(GraphqlOperationKind, String, Vec<String>)>,
 }
 
 /// What placing the call-site rows changed.
@@ -259,6 +262,10 @@ pub struct DocumentSiteSummary {
     pub site_rows: usize,
     /// Document-file rows removed because a call executes their operation.
     pub covered_rows: usize,
+    /// Document-file rows removed because the service also holds the
+    /// operation's compiled declaration: the calls that execute that
+    /// declaration are its consumers, and one nothing executes has none.
+    pub compiled_rows: usize,
     /// Calls whose document is already indexed where it is declared.
     pub declared_in_source: usize,
 }
@@ -323,7 +330,24 @@ pub fn read_document_sites(
         calls.len(),
         reader.documents.len()
     );
-    (sites, DocumentSiteConsumers { sites: consumers })
+    // The service's compiled declarations, whether or not a call executes them.
+    let mut compiled = HashSet::new();
+    for file in inputs.files.keys() {
+        for document in reader.module_documents(file).values() {
+            for operation in &document.operations {
+                if let Some(name) = &operation.name {
+                    compiled.insert((operation.kind, name.clone(), operation.fields.clone()));
+                }
+            }
+        }
+    }
+    (
+        sites,
+        DocumentSiteConsumers {
+            sites: consumers,
+            compiled,
+        },
+    )
 }
 
 impl DocumentSiteConsumers {
@@ -401,6 +425,16 @@ impl DocumentSiteConsumers {
             )) {
                 summary.covered_rows += 1;
                 false
+            } else if self.compiled.contains(&(
+                operation.kind,
+                name.clone(),
+                operation.fields.clone(),
+            )) {
+                // The service holds this operation's compiled declaration:
+                // its consumers are the calls that execute that, wherever
+                // they are, and one nothing executes has none.
+                summary.compiled_rows += 1;
+                false
             } else {
                 true
             }
@@ -412,6 +446,7 @@ impl DocumentSiteConsumers {
             debug!(
                 site_rows = summary.site_rows,
                 covered_rows = summary.covered_rows,
+                compiled_rows = summary.compiled_rows,
                 declared_in_source = summary.declared_in_source,
                 "GraphQL consumer rows placed at the calls that execute their documents"
             );
@@ -1862,7 +1897,6 @@ export function RetryButton() {
                     "src/pages/RetryButton.tsx",
                     4
                 ),
-                row("graphql|query|carriers", "src/graphql/orders.graphql", 11),
                 row("graphql|query|orders", "src/pages/CheckoutPage.tsx", 5),
                 row(
                     "graphql|query|shippingZones",
@@ -1870,13 +1904,14 @@ export function RetryButton() {
                     5
                 ),
             ],
-            "executed operations move to their calls; the one no call executes stays"
+            "executed operations move to their calls; the one no call executes is dropped with its compiled declaration held"
         );
         assert_eq!(
             summary,
             DocumentSiteSummary {
                 site_rows: 4,
                 covered_rows: 3,
+                compiled_rows: 1,
                 declared_in_source: 0,
             }
         );
@@ -1917,7 +1952,6 @@ export function RetryButton() {
         assert_eq!(
             kept,
             vec![
-                row("graphql|query|carriers", "src/graphql/orders.graphql", 12),
                 row("graphql|query|orders", "src/graphql/orders.graphql", 2),
                 row(
                     "graphql|query|shippingZones",

@@ -14,7 +14,7 @@
 //! | `currentUser` | `Profile.ts:6` | one row at the call |
 //! | `users` | `Profile.ts:11` | one row at the call |
 //! | `updateUser` | `Profile.ts:14` | one row at the call |
-//! | `adminStats` | nowhere | stays at `users.graphql:14` |
+//! | `adminStats` | nowhere | none: the service holds its compiled declaration, so a document nothing executes is no consumer |
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -97,7 +97,6 @@ fn a_bare_argument_naming_an_object_document_is_placed_at_its_call() {
             "mutation|updateUser",
             "apps/web/src/components/Profile.ts:14",
         ),
-        ("query|adminStats", "apps/web/src/graphql/users.graphql:14"),
     ]
     .iter()
     .map(|(key, file)| (key.to_string(), file.to_string()))

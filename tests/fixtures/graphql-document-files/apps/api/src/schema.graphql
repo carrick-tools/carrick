@@ -1,0 +1,8 @@
+type Query {
+  items: [String!]!
+  adminStats: Int
+}
+
+type Mutation {
+  renameItem(id: ID!): String
+}
