@@ -426,7 +426,7 @@ pub(super) struct WrittenIn {
     pub(super) path: Vec<String>,
     /// The call is a construction (`new X(…)`), kept in
     /// [`FnIr::constructions`].
-    constructed: bool,
+    pub(super) constructed: bool,
 }
 
 impl WrittenIn {

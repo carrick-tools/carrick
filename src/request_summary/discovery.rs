@@ -1107,6 +1107,25 @@ pub(super) fn reach_across(
     }
 }
 
+/// Whether `call`, written in `body`, hands its callee (code of the run,
+/// whose invoked parameters are `runs`) a function the callee does not run:
+/// a callback argument at a position it never invokes, or a function written
+/// inside an argument (`{ handler: async () => … }`), which the callee can
+/// only keep (carrick#3527).
+fn keeps_handed(body: &FnIr, call: &CallIr, construction: bool, runs: &BTreeSet<usize>) -> bool {
+    let kept_callback = call
+        .args
+        .iter()
+        .enumerate()
+        .any(|(index, arg)| matches!(arg, Value::Callback(_)) && !runs.contains(&index));
+    kept_callback
+        || body.detached.iter().any(|function| {
+            function.written_in.as_ref().is_some_and(|written| {
+                written.site == call.site && written.constructed == construction
+            })
+        })
+}
+
 /// The constructor body a `new C(…)` or `super(…)` in `file` runs, in the
 /// service of the run that holds C's declaration: the file and its key
 /// (carrick#3527). Joined on the class the call's row names, at the line it
@@ -1845,6 +1864,14 @@ impl<'a> Walker<'a> {
                 out.absorb(
                     self.handed(file, body, call, Some(&hop), |index| runs.contains(&index)),
                 );
+                // A function written at the call that the callee keeps and
+                // does not run (a callback it only stores, a `handler` in an
+                // object argument) runs later, from wherever the callee put
+                // it: the walk has not read everything the call does
+                // (carrick#3527).
+                if keeps_handed(body, call, construction, &runs) {
+                    out.missed = true;
+                }
                 if !out.ends.is_empty() {
                     out.stop = None;
                 }
