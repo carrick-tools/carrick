@@ -4893,6 +4893,26 @@ export function listen(): void {
         );
     }
 
+    /// A route written on a parameter a nested callback captures is read
+    /// where the parameter is declared: composed under the scope the
+    /// owner's host opens, as a route written in the owner itself.
+    #[test]
+    fn a_route_on_a_parameter_a_nested_callback_captures_is_composed_under_its_owners_scope() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-captured") else {
+            return;
+        };
+        use super::super::decided_sites::ScopeLabel;
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = composed_lines(&decided, false);
+        let want = texts(&[
+            "src/index.ts:12 <- /cap/each",
+            "src/index.ts:14 <- /cap/later",
+            "src/index.ts:21 <- /cap/direct",
+        ]);
+        assert_eq!(got, want, "{got:#?}");
+    }
+
     /// carrick#2474 R2b: with the receiver trace on, each route site names
     /// the full path it is served at, per instance end: the prefixes of the
     /// scopes a labelled member opens (a plugin it runs, handed by name,

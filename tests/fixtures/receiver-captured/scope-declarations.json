@@ -1,0 +1,32 @@
+[
+  {
+    "claim_id": "fixture-router@1:default:scope:route:name@0:mounts@1:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-router/index.d.ts",
+        "decl_line": 19
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-router@1:default:scope:register:name@1.prefix:runs@0>0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-router/index.d.ts",
+        "decl_line": 21
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-router@1:default:scope:basePath:name@0:returns:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-router/index.d.ts",
+        "decl_line": 23
+      }
+    ]
+  }
+]

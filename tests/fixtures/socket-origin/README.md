@@ -49,6 +49,22 @@ hands in.
 | `hub/src/conn.ts:53` | `Leaky`, `this` handed to a call | call `UNKNOWN` `run.flush` |
 | `hub/src/conn.ts:63` | `Orphan`, built with a peer nothing hands in | call `UNKNOWN` `run.lost` |
 
+K3d adds `hub/src/nested.ts`: a peer a callback owns, read in callbacks nested
+in it. Rows are keyed by event, in that file.
+
+| Event | Where the call is written | Row |
+|---|---|---|
+| `k.direct` | the `connection` callback itself | call `SERVER->CLIENT` |
+| `k.answered` | inside a `peer.listen` callback | call `SERVER->CLIENT` |
+| `k.local` | inside a callback handed to own code | call `SERVER->CLIENT` |
+| `k.later` | inside a `setTimeout` callback | call `SERVER->CLIENT` |
+| `k.deeper` | two callbacks deep (`peer.listen`, then `forEach`) | call `SERVER->CLIENT` |
+| `k.fn-answered` | the same, written as `function` expressions | call `SERVER->CLIENT` |
+| `k.inner-own` | owner handed to own code that keeps it, inside a `connection` callback | call `UNKNOWN` |
+| `k.own-host` | owner handed to own code that keeps it | call `UNKNOWN` |
+| `k.shadow` | an inner callback's own `peer` parameter | call `UNKNOWN` |
+| `k.named` | a named nested function: no host, the filed gap | call `UNKNOWN` |
+
 The two services pair on `order.placed` and `order.accepted`. Every row is a
 `library_claim`. With the switches off there are no site rows and the scan
 states no socket row.
