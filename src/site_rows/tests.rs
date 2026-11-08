@@ -1268,10 +1268,13 @@ fn a_candidate_leaves_the_graph_alone() {
     assert_eq!(serde_json::to_vec(&data.mount_graph).unwrap(), before);
 }
 
-/// The site rows of one file, kept as a candidate that stands.
+/// The site rows of one file, kept as a candidate that stands. The
+/// cassette's HTTP answer rests on a label-forced slot with a name the code
+/// does not state, so it needs a reader row; this copy states the name in
+/// the code, as a call the model reads off its own text does.
 fn standing_candidate(file: &str) -> SiteRows {
     let all = rows();
-    let site = SiteRows {
+    let mut site = SiteRows {
         enabled: true,
         rows: all
             .rows
@@ -1280,6 +1283,9 @@ fn standing_candidate(file: &str) -> SiteRows {
             .collect(),
         ..SiteRows::default()
     };
+    for row in &mut site.rows {
+        row.needs_reader = false;
+    }
     let row = row(&site, file).unwrap();
     assert!(row.inference.is_some(), "a candidate");
     assert!(row.stands(), "a standing candidate");
