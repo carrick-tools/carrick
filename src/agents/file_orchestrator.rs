@@ -9230,11 +9230,37 @@ impl FileOrchestrator {
             // Only against the rows THIS loop has pushed: a model row that
             // agrees with a deterministic row must fold onto it and keep its
             // source, which is the twin search below.
-            if Self::restates_a_kept_row(
-                &result.endpoints[deterministic_rows..],
-                &endpoint,
-                file_path,
-            ) {
+            //
+            // The one exception (carrick#3236): when the kept row's call does
+            // not write the path whole (a loop over `/docs/spec${tail}`) and
+            // this row's call does (`app.get('/docs/spec')`), the route is
+            // registered at this call, so its row stands here. The kept row
+            // was a reading of another site and carries nothing over.
+            if let Some(at) =
+                Self::kept_restatement(&result.endpoints[deterministic_rows..], &endpoint)
+            {
+                let kept = &result.endpoints[deterministic_rows + at];
+                if kept.resolution_source == Some(ResolutionSource::Model)
+                    && Self::site_writes_path_whole(&endpoint, candidate_map)
+                    && !Self::site_writes_path_whole(kept, candidate_map)
+                {
+                    debug!(
+                        "The row at line {} gives way to the registration at line {} that \
+                         writes the path whole: {} {} in {}",
+                        kept.line_number,
+                        endpoint.line_number,
+                        endpoint.method,
+                        endpoint.path,
+                        file_path
+                    );
+                    result.endpoints[deterministic_rows + at] = endpoint;
+                    continue;
+                }
+                Self::restates_a_kept_row(
+                    &result.endpoints[deterministic_rows..],
+                    &endpoint,
+                    file_path,
+                );
                 continue;
             }
             // A structural route the deterministic layer already stated. The
@@ -10206,8 +10232,7 @@ impl FileOrchestrator {
         endpoint: &EndpointResult,
         file_path: &str,
     ) -> bool {
-        let key = Self::model_row_key(endpoint);
-        let restates = kept.iter().any(|row| Self::model_row_key(row) == key);
+        let restates = Self::kept_restatement(kept, endpoint).is_some();
         if restates {
             warn!(
                 "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
@@ -10216,6 +10241,32 @@ impl FileOrchestrator {
             );
         }
         restates
+    }
+
+    /// The index in `kept` of the row `endpoint` restates, by
+    /// [`Self::model_row_key`].
+    fn kept_restatement(kept: &[EndpointResult], endpoint: &EndpointResult) -> Option<usize> {
+        let key = Self::model_row_key(endpoint);
+        kept.iter().position(|row| Self::model_row_key(row) == key)
+    }
+
+    /// Whether the call a row is anchored at writes its route path as one
+    /// plain string literal (the #332 reading), so the row's path is stated
+    /// at that call. A model copy of the mount prefix still counts; a path
+    /// that contradicts the literal does not (carrick#3236).
+    fn site_writes_path_whole(
+        row: &EndpointResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+    ) -> bool {
+        let Some(candidate) = candidate_map.get(&row.candidate_id) else {
+            return false;
+        };
+        Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+            .is_some_and(|literal| crate::swc_scanner::is_producer_route_path(&literal))
+            && !matches!(
+                Self::inline_literal_path(&row.path, candidate),
+                RegistrationLiteral::Contradicts(_)
+            )
     }
 
     /// A model row with no dispatch case, for a route the model also states
@@ -19515,6 +19566,90 @@ export { routes };
         // route's own payload, so it carries the type anchor.
         assert_eq!(result.endpoints[0].candidate_id, "happy");
         assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// Two registrations of one route in one file: the model states the loop's
+    /// template (`/docs/spec${tail}`, tail dropped) and the literal
+    /// (`/docs/spec`) with the same method and path. The row stands at the
+    /// registration that writes the path whole, in either order (carrick#3236).
+    fn registration_pair(
+        loop_snippet: &str,
+        literal_snippet: &str,
+    ) -> (HashMap<String, CandidateTarget>, Vec<EndpointResult>) {
+        let site = |id: &str, snippet: &str, span: u32, line: usize| {
+            let mut candidate = candidate_with_snippet(id, Some(snippet));
+            candidate.span_start = span;
+            candidate.span_end = span + 40;
+            candidate.line_number = line;
+            candidate.end_line = line;
+            candidate.callee_object = "app".to_string();
+            candidate.callee_property = Some("get".to_string());
+            candidate
+        };
+        let mut candidates = HashMap::new();
+        candidates.insert("loop".to_string(), site("loop", loop_snippet, 100, 17));
+        candidates.insert(
+            "literal".to_string(),
+            site("literal", literal_snippet, 200, 19),
+        );
+        let route = |candidate_id: &str, line: i32| EndpointResult {
+            handler_declaration_line: None,
+            registration_literal: None,
+            view_module: false,
+            candidate_id: candidate_id.to_string(),
+            line_number: line,
+            owner_node: "app".to_string(),
+            method: "GET".to_string(),
+            path: "/docs/spec".to_string(),
+            handler_name: "spec".to_string(),
+            pattern_matched: "app.get(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: None,
+        };
+        (candidates, vec![route("loop", 17), route("literal", 19)])
+    }
+
+    #[test]
+    fn a_literal_registration_keeps_its_row_over_a_loop_template_of_the_same_path() {
+        let (candidates, rows) = registration_pair("`/docs/spec${tail}`", "'/docs/spec'");
+        for order in [rows.clone(), rows.into_iter().rev().collect::<Vec<_>>()] {
+            let (result, _) = emit_and_join(
+                FileAnalysisResult {
+                    endpoints: order,
+                    ..Default::default()
+                },
+                &candidates,
+                "src/families.ts",
+            );
+            assert_eq!(result.endpoints.len(), 1, "{:#?}", result.endpoints);
+            assert_eq!(result.endpoints[0].candidate_id, "literal");
+            assert_eq!(result.endpoints[0].line_number, 19);
+        }
+    }
+
+    #[test]
+    fn two_literal_registrations_of_one_route_keep_the_first() {
+        let (candidates, rows) = registration_pair("'/docs/spec'", "'/docs/spec'");
+        let (result, _) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: rows,
+                ..Default::default()
+            },
+            &candidates,
+            "src/families.ts",
+        );
+        assert_eq!(result.endpoints.len(), 1, "{:#?}", result.endpoints);
+        assert_eq!(result.endpoints[0].candidate_id, "loop");
+        assert_eq!(result.endpoints[0].line_number, 17);
     }
 
     /// A GET carries no request body, so a `body` case on one is not a case

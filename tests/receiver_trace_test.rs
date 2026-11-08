@@ -980,7 +980,9 @@ fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
 /// a route path that writes its first segment before a value the code does
 /// not read (`/widgets/kinds/${kind}`, `/docs/spec${tail}`) keeps the
 /// reader's row, counted `unread_own_part`; the path that starts with its
-/// value (`${head}health`) is a guessed site and its row is withdrawn.
+/// value (`${head}health`) is a guessed site and its row is withdrawn. The
+/// loop's reader row gives way to the literal registration of the same route
+/// (carrick#3236), which the trace corrects instead of copying untyped.
 #[test]
 fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
     let (on, fallbacks) = scan_fixture_reading("receiver-route-stated-head");
@@ -995,23 +997,26 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
             .any(|row| row.contains("families.ts:14 POST /widgets/kinds/:kind"))
             && family
                 .iter()
-                .any(|row| row.contains("families.ts:17 GET /docs/spec")),
+                .any(|row| row.contains("families.ts:19 GET /api/v1/docs/spec library_claim")),
+        "{family:#?}"
+    );
+    assert!(
+        family.iter().all(|row| !row.contains("families.ts:17 ")),
         "{family:#?}"
     );
     assert!(
         family.iter().all(|row| !row.contains("health")),
         "{family:#?}"
     );
-    for row in family
-        .iter()
-        .filter(|row| row.contains("families.ts:14 ") || row.contains("families.ts:17 "))
-    {
+    for row in family.iter().filter(|row| row.contains("families.ts:14 ")) {
         assert!(row.contains(" model "), "{row}");
     }
     let counts = route_counts(&fallbacks);
     assert!(
         counts.contains(&"routes routes_untraced_unread_own_part=2".to_string())
-            && counts.contains(&"routes routes_guessed_withdrawn=1".to_string()),
+            && counts.contains(&"routes routes_guessed_withdrawn=1".to_string())
+            && counts.contains(&"routes routes_across_corrected=2".to_string())
+            && counts.contains(&"routes routes_across_added_untyped=1".to_string()),
         "{counts:#?}"
     );
     // An incremental re-scan gives the same rows.
