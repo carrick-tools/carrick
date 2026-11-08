@@ -11,6 +11,7 @@
 //! writes a fact row with that name, except a pub/sub file of `kind_asked`,
 //! whose broker label leaves the kind to the model, so it stays a possible
 //! call (its name is forced: the record-level test in discovery says so).
+//! Each file of `several` writes one fact row per name it lists.
 //! Each `unnamed` file, where a part does not fold, writes no fact row and
 //! stays a possible call.
 //!
@@ -190,6 +191,20 @@ fn a_name_stated_through_constants_is_a_fact_row() {
         let got = scan.named.get(file).cloned().unwrap_or_default();
         if got != BTreeSet::from([want.to_string()]) {
             wrong.push(format!("{file}: want {want}, got {got:?}"));
+        }
+    }
+    // A `let` written again holds its initialiser and every value written
+    // (carrick#3504 S2b-8): one fact row per value.
+    for (file, want) in key["several"].as_object().unwrap() {
+        let want: BTreeSet<String> = want
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect();
+        let got = scan.named.get(file).cloned().unwrap_or_default();
+        if got != want {
+            wrong.push(format!("{file}: want {want:?}, got {got:?}"));
         }
     }
     for file in key["unnamed"].as_array().unwrap() {

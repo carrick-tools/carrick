@@ -65,6 +65,7 @@ fn record(role: &str, handler: bool, payloads: PayloadSlots) -> SiteRecord {
         },
         payloads,
         basis: Default::default(),
+        names: Vec::new(),
         bucket: Bucket::Forced,
         lead: None,
         receiver: None,

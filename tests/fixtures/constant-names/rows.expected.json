@@ -27,8 +27,10 @@
     "src/q-enum.ts",
     "src/q-join.ts"
   ],
+  "several": {
+    "src/c-let-reassigned.ts": ["/c/let-reassigned/a", "/c/let-reassigned/b"]
+  },
   "unnamed": [
-    "src/c-let-reassigned.ts",
     "src/c-object-written.ts",
     "src/c-replace-runtime.ts"
   ]

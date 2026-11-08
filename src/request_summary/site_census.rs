@@ -49,6 +49,10 @@ struct RepoCensus {
     walked: usize,
     buckets: BTreeMap<String, usize>,
     lead_reasons: BTreeMap<String, usize>,
+    /// Records whose name the code states as several values, one row each
+    /// (carrick#3504 S2b-8), and the names they state.
+    several_names: usize,
+    several_names_rows: usize,
     state_bytes_p50: usize,
     state_bytes_p90: usize,
     state_bytes_max: usize,
@@ -340,6 +344,7 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
             census.method_unstated += 1;
         }
         let name = forced(Slot::Name)
+            .or_else(|| (!record.names.is_empty()).then(|| record.names.join("|")))
             .or_else(|| routed.written.clone())
             .unwrap_or_default();
         census
@@ -638,6 +643,10 @@ fn census_repo(
             *census.buckets.entry(bucket.to_string()).or_default() += 1;
             if let Some(reason) = record.lead {
                 *census.lead_reasons.entry(reason.to_string()).or_default() += 1;
+            }
+            if !record.names.is_empty() {
+                census.several_names += 1;
+                census.several_names_rows += record.names.len();
             }
             bytes.push(record.state_bytes());
             let state = serde_json::to_string(&record.state).unwrap_or_default();

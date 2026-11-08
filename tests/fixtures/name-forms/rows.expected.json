@@ -27,6 +27,13 @@
     "src/q-default.ts": "orders.defaulted",
     "src/s-default.ts": "room.defaulted"
   },
+  "several": {
+    "src/c-conditional.ts": ["/n/conditional-a", "/n/conditional-b"],
+    "src/q-conditional.ts": ["orders.conditional-a", "orders.conditional-b"],
+    "src/s-conditional.ts": ["room.conditional-a", "room.conditional-b"],
+    "src/c-coalesce-const.ts": ["/n/coalesce-a", "/n/coalesce-b"],
+    "src/c-let-written.ts": ["/c/let-written/a", "/c/let-written/b"]
+  },
   "kind_asked": [
     "src/q-destructure.ts",
     "src/q-fallback-stated.ts",
@@ -34,18 +41,18 @@
     "src/q-logical-assign.ts",
     "src/q-getter.ts",
     "src/q-destr-assign.ts",
-    "src/q-default.ts"
+    "src/q-default.ts",
+    "src/q-conditional.ts"
   ],
   "unnamed": [
     "src/c-destructure-written.ts",
     "src/c-coalesce.ts",
     "src/q-coalesce.ts",
     "src/s-coalesce.ts",
-    "src/c-coalesce-const.ts",
     "src/c-union.ts",
     "src/c-static-written.ts",
     "src/c-static-exported.ts",
-    "src/c-let-written.ts",
+    "src/c-union-name.ts",
     "src/c-and-assign.ts",
     "src/c-getter-overridden.ts",
     "src/c-getter-exported.ts",

@@ -365,6 +365,13 @@ pub struct SiteRecord {
     /// What each forced slot rests on (carrick#2520). Scanner-side only,
     /// like the anchors: off the wire, so no cache key moves.
     pub basis: BTreeMap<Slot, Basis>,
+    /// Every name the code states, where it states several whole values
+    /// (`flag ? '/a' : '/b'`, a `let` written again): the name is neither
+    /// forced nor asked, and each is a row (carrick#3504 S2b-8). Empty
+    /// otherwise. Off the wire, like the payloads: `forced` stays one text
+    /// per slot.
+    #[serde(skip)]
+    pub names: Vec<String>,
     pub bucket: Bucket,
     /// Why a lead is one.
     pub lead: Option<&'static str>,
@@ -466,22 +473,44 @@ fn one_line(text: &str) -> String {
 /// literals (`literals`). A choice (`?:`, `??`, `||`) is read by
 /// [`Choices`]. `None` when it is not stated whole (a concatenation with a
 /// value the code does not state, a call, a member read).
-fn whole_values(expr: &Expr, literals: &dyn Fn(&str) -> Vec<String>) -> Option<BTreeSet<String>> {
+fn whole_values(expr: &Expr, literals: &dyn Fn(&str) -> Vec<String>) -> Option<Whole> {
     match super::unwrap_value(expr) {
-        Expr::Lit(Lit::Str(lit)) => lit.value.as_str().map(|text| BTreeSet::from([text.into()])),
+        Expr::Lit(Lit::Str(lit)) => lit.value.as_str().map(|text| Whole::one(text.into())),
         Expr::Tpl(tpl) if tpl.exprs.is_empty() => match tpl.quasis.as_slice() {
             [quasi] => quasi
                 .cooked
                 .as_ref()
                 .and_then(|cooked| cooked.as_str())
-                .map(|text| BTreeSet::from([text.to_string()])),
+                .map(|text| Whole::one(text.to_string())),
             _ => None,
         },
         Expr::Ident(ident) => {
             let values: BTreeSet<String> = literals(ident.sym.as_ref()).into_iter().collect();
-            (!values.is_empty()).then_some(values)
+            // Several literals for one name are its type's union: the fold
+            // reads one text at most.
+            let from_type = values.len() > 1;
+            (!values.is_empty()).then_some(Whole { values, from_type })
         }
         _ => None,
+    }
+}
+
+/// Every whole value a slot may take, as the code states it, and whether
+/// the compiler's type, not the code, states the choice among them (a name
+/// typed as a union of literals, record rule 2.3.6): such a set stays
+/// asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Whole {
+    values: BTreeSet<String>,
+    from_type: bool,
+}
+
+impl Whole {
+    fn one(text: String) -> Self {
+        Whole {
+            values: BTreeSet::from([text]),
+            from_type: false,
+        }
     }
 }
 
@@ -511,18 +540,24 @@ impl Choices<'_, '_> {
     /// The texts the branches state. An empty text names nothing and drops
     /// out. `None` when no branch states one, or when any branch is unread:
     /// the choice stays asked.
-    fn values(&self, expr: &Expr) -> Option<BTreeSet<String>> {
+    fn values(&self, expr: &Expr) -> Option<Whole> {
         let mut values = BTreeSet::new();
+        let mut from_type = false;
         for value in self.resolver.text_set(self.root, self.file, expr) {
             match value {
-                TextValue::Text { text, .. } if !text.is_empty() => {
+                TextValue::Text {
+                    text,
+                    from_type: typed,
+                    ..
+                } if !text.is_empty() => {
                     values.insert(text);
+                    from_type |= typed;
                 }
                 TextValue::Text { .. } => {}
                 TextValue::Hole(_) => return None,
             }
         }
-        (!values.is_empty()).then_some(values)
+        (!values.is_empty()).then_some(Whole { values, from_type })
     }
 }
 
@@ -565,9 +600,9 @@ fn stated_whole(
     exprs: &[&Expr],
     literals: &dyn Fn(&str) -> Vec<String>,
     choices: &Choices<'_, '_>,
-) -> Option<BTreeSet<String>> {
+) -> Option<Whole> {
     if let Some(text) = literal_text(pieces).or_else(|| env_based_text(pieces)) {
-        return Some(BTreeSet::from([text]));
+        return Some(Whole::one(text));
     }
     // A name written as one choice: the summaries' pieces keep one side of
     // a `??`, so the choice is read from the expression itself.
@@ -583,7 +618,16 @@ fn stated_whole(
             if Choices::is_choice(&expr) {
                 return choices.values(&expr);
             }
-            whole_values(&expr, literals)
+            // A name the resolver reads as several texts (a `let` written
+            // again, carrick#3504 S2b-8, D6). One text is the fold's, read
+            // after this.
+            whole_values(&expr, literals).or_else(|| {
+                choices
+                    .in_place
+                    .then(|| choices.values(&expr))
+                    .flatten()
+                    .filter(|whole| whole.values.len() > 1)
+            })
         }
         _ => None,
     }
@@ -1887,10 +1931,10 @@ fn record(
         .iter()
         .filter_map(|index| parts.arg_exprs.get(*index))
         .collect();
-    let whole_names: Option<BTreeSet<String>> = match (&site.key, label.reads_name_of(site)) {
+    let whole_names: Option<Whole> = match (&site.key, label.reads_name_of(site)) {
         (Some(key), _) => {
             stated.value(key, place(PlaceFrom::ObjectKey, &at));
-            Some(BTreeSet::from([key.clone()]))
+            Some(Whole::one(key.clone()))
         }
         (None, true) => {
             if let Some(text) = literal_text(&site.name) {
@@ -1931,7 +1975,7 @@ fn record(
                     .or_else(|| folded_text(&site.name, &literals))
                     .map(|text| {
                         stated.value(&text, place(PlaceFrom::TemplateLiteral, &at));
-                        BTreeSet::from([text])
+                        Whole::one(text)
                     }),
             }
         }
@@ -2018,10 +2062,14 @@ fn record(
         true,
         Basis::Label,
     );
-    // The name: forced only when the code states one whole value; asked
-    // when it states several; a lead when it states none whole. A label
-    // that names no name slot forces neither the name nor the argument it
-    // is read from: both are asked.
+    // The name: forced when the code states one whole value; decided by
+    // the code, one row per value, when it states several (carrick#3504
+    // S2b-8, Q5): they ride on `names`, off the wire, and the name is
+    // neither forced nor asked. Asked when the compiler's type states the
+    // choice (a union of literals, record rule 2.3.6); a lead when the code
+    // states none whole. A label that names no name slot forces neither the
+    // name nor the argument it is read from: both are asked.
+    let mut several_names: Vec<String> = Vec::new();
     let name_unstated = match (label.reads_name_of(site), &whole_names) {
         (false, _) => {
             decide(Slot::Name, Vec::new(), true, Basis::Code);
@@ -2030,10 +2078,14 @@ fn record(
             }
             false
         }
-        (true, Some(values)) if !values.is_empty() => {
+        (true, Some(whole)) if whole.values.len() > 1 && !whole.from_type => {
+            several_names = whole.values.iter().cloned().collect();
+            false
+        }
+        (true, Some(whole)) if !whole.values.is_empty() => {
             decide(
                 Slot::Name,
-                values.iter().cloned().collect(),
+                whole.values.iter().cloned().collect(),
                 false,
                 Basis::Code,
             );
@@ -2087,6 +2139,7 @@ fn record(
                             in_place: false,
                         },
                     )
+                    .map(|whole| whole.values)
                 }
                 None => None,
             },
@@ -2112,6 +2165,9 @@ fn record(
             }
             _ => decide(Slot::Method, Vec::new(), true, method_basis),
         }
+    }
+    if !several_names.is_empty() {
+        basis.insert(Slot::Name, Basis::Code);
     }
     asked.sort();
     asked.dedup();
@@ -2305,6 +2361,7 @@ fn record(
         anchors,
         payloads,
         basis,
+        names: several_names,
         bucket,
         lead: (bucket == Bucket::Lead).then_some("name_unstated"),
         receiver: site.receiver.clone(),
@@ -2663,8 +2720,9 @@ mod tests {
     }
 
     /// Each bucket: a path constant from a sibling package is one stated
-    /// value (forced); a flag choosing between two constants is asked; an
-    /// event name from an import that cannot be read is a lead.
+    /// value (forced); a flag choosing between two constants states both,
+    /// each a row (carrick#3504 S2b-8: the name neither forced nor asked);
+    /// an event name from an import that cannot be read is a lead.
     #[test]
     fn each_site_falls_in_its_bucket() {
         let (records, _) = records_with_rows(&repo());
@@ -2685,8 +2743,11 @@ mod tests {
         assert!(users.state.asked.is_empty(), "{:?}", users.state.asked);
 
         let report = record(&records, "choices.ts:14");
-        assert_eq!(report.bucket, Bucket::Asked);
-        assert_eq!(report.state.asked, vec![Slot::Name]);
+        assert_eq!(report.bucket, Bucket::Forced, "{:?}", report.state);
+        assert!(report.state.asked.is_empty(), "{:?}", report.state.asked);
+        assert!(!report.state.forced.contains_key(&Slot::Name));
+        assert_eq!(report.names, ["/v1/report", "/v2/report"]);
+        assert_eq!(report.basis.get(&Slot::Name), Some(&Basis::Code));
         let offered: Vec<&str> = report
             .state
             .stated

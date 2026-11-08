@@ -15,19 +15,22 @@ Forms so far:
   when every side is stated (`*-fallback-stated`: a constant and a literal).
   A side the code does not state (`maybe ?? '/x'`, `maybe` a runtime value)
   keeps the name asked: stating the fallback alone is the initialiser-alone
-  error. `c-coalesce-const` (two constants) and `c-union` (a union of
-  literals) are several values and stay asked.
+  error. `c-union` (a branch typed as a union of literals) stays asked:
+  the type states that choice, not the code.
 - `logical-assign` (S2b-4): `??=` and `||=` are writes the binding holds
   beside its earlier value (`c-logical-assign`, `c-or-assign`, and the
   topic and socket forms; an empty initialiser or none adds no value).
-  `c-let-written` (a `let` written with a second value) is several values
-  and stays asked; `c-and-assign` (`&&=`) computes a value no reader states.
+  `c-and-assign` (`&&=`) computes a value no reader states.
 
 - `destr-assign` (S2b-5): `({ a } = obj)` writes the member `obj.a` to `a`,
   a placed write beside the earlier value (an empty initialiser drops out).
   `c-destr-assign-default` (a default) and `c-destr-assign-array` (`[a] = …`)
   are written in a form no reader places and stay asked.
-
+- `conditional` (S2b-8): a name the code states as several whole values
+  writes one fact row per value, on every protocol: `?:` over two literals
+  (`*-conditional`), over two constants (`c-coalesce-const`), and a `let`
+  written with a second value (`c-let-written`). A name typed as a union of
+  literals (`c-union-name`) stays asked.
 - `static-field` (S2b-6): `C.P` where `static P = '…'` is a property of a
   module-scope class. `c-static-written` (`C.P = …` elsewhere) and
   `c-static-exported` (an exported class) are unread on purpose: the value
@@ -49,5 +52,6 @@ Forms so far:
 `rows.expected.json` is the answer key, read by `tests/name_forms_test.rs`:
 `names` gives the one name each file's site forces and the scan writes as a
 fact row (a `kind_asked` pub/sub file waits on the broker's kind question
-instead); each `unnamed` file writes no fact row and stays a possible call.
+instead); `several` gives every name a file's site states, one fact row
+each; each `unnamed` file writes no fact row and stays a possible call.
 Never edited to make a test pass.
