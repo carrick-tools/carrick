@@ -1268,6 +1268,79 @@ fn a_candidate_leaves_the_graph_alone() {
     assert_eq!(serde_json::to_vec(&data.mount_graph).unwrap(), before);
 }
 
+/// The site rows of one file, kept as a candidate that stands. The
+/// cassette's HTTP answer rests on a label-forced slot with a name the code
+/// does not state, so it needs a reader row; this copy states the name in
+/// the code, as a call the model reads off its own text does.
+fn standing_candidate(file: &str) -> SiteRows {
+    let all = rows();
+    let mut site = SiteRows {
+        enabled: true,
+        rows: all
+            .rows
+            .into_iter()
+            .filter(|row| row.file == file)
+            .collect(),
+        ..SiteRows::default()
+    };
+    for row in &mut site.rows {
+        row.needs_reader = false;
+    }
+    let row = row(&site, file).unwrap();
+    assert!(row.inference.is_some(), "a candidate");
+    assert!(row.stands(), "a standing candidate");
+    site
+}
+
+/// A candidate that stands where the graph holds no row at its line joins
+/// the graph beside its `calls` row (carrick-cloud#3018): the cross-service
+/// pass and the cloud read the graph, and the call was on no list.
+#[test]
+fn a_standing_candidate_with_no_reader_row_joins_the_graph() {
+    let file = "src/http.ts";
+    let site = standing_candidate(file);
+    let candidate = row(&site, file).unwrap().clone();
+    let (method, path) = candidate.key.as_http().unwrap();
+    let (method, path) = (method.to_string(), path.to_string());
+    let mut data = blob_with_graph(vec![], vec![]);
+    fold_into(&mut data, &site);
+
+    let calls = data
+        .calls
+        .iter()
+        .filter(|call| call.file_path.to_string_lossy() == format!("{file}:{LINE}"))
+        .count();
+    assert_eq!(calls, 1, "{:?}", data.calls);
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 1, "{graph:?}");
+    assert_eq!(graph[0].file_location, format!("{file}:{LINE}"));
+    assert_eq!(graph[0].method, method);
+    assert_eq!(graph[0].canonical_path, path);
+    assert_eq!(graph[0].resolution_source, Some(ResolutionSource::Model));
+    assert_eq!(graph[0].base, candidate.base);
+    assert_eq!(graph[0].line, Some(LINE));
+}
+
+/// A line the graph already holds a row at gains nothing from a candidate:
+/// the reader's row there stands as it was.
+#[test]
+fn a_candidate_adds_nothing_where_the_graph_holds_a_row() {
+    let file = "src/http.ts";
+    let site = standing_candidate(file);
+    let mut data = blob_with_graph(
+        vec![],
+        vec![graph_call(
+            "GET",
+            "/v1/other",
+            file,
+            ResolutionSource::Model,
+        )],
+    );
+    let before = serde_json::to_vec(&data.mount_graph).unwrap();
+    fold_into(&mut data, &site);
+    assert_eq!(serde_json::to_vec(&data.mount_graph).unwrap(), before);
+}
+
 /// Off, the graph is byte for byte what it was.
 #[test]
 fn off_the_fold_leaves_the_graph_untouched() {

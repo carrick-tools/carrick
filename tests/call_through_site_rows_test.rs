@@ -290,6 +290,22 @@ fn the_graph_holds_the_fact_rows_the_site_fold_stated() {
     the_graph_holds_what_calls_states(&scanned().0, "a full scan");
 }
 
+/// No HTTP row of `calls` is on no list: each has a graph row at its
+/// `file:line` (carrick-cloud#3018). The cloud reads the graph.
+#[test]
+fn every_http_call_has_a_graph_row_at_its_line() {
+    for (service, blob) in &scanned().0 {
+        let graph_places: BTreeSet<String> =
+            graph_rows(blob).into_iter().map(|row| row.0).collect();
+        for (place, method, path) in http_calls(blob) {
+            assert!(
+                graph_places.contains(&place),
+                "{service}: {method} {path} at {place} has no graph row"
+            );
+        }
+    }
+}
+
 /// The model's four rows at the CLI's calls were replaced by facts, so the
 /// cross-service pass skips and counts them instead of reading them as calls
 /// that reach no request.

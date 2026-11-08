@@ -1078,6 +1078,9 @@ pub fn fold(
         // reader stated (carrick#2795): the cross-service pass and the cloud
         // read the graph's HTTP rows, and a fact held only in `calls` is
         // invisible to them while the reader's stale row there stands.
+        // A standing candidate joins only where the graph holds no row at
+        // its line (carrick-cloud#3018); a candidate over a reader's row
+        // leaves it.
         // An old-path row a fact replaced goes from the graph as the
         // reader's does (carrick#3283).
         let is_model_row_of =
@@ -1102,8 +1105,27 @@ pub fn fold(
                 });
         graph.data_calls = kept;
         let normalizer = crate::url_normalizer::UrlNormalizer::default();
+        // A candidate that stands where the graph holds no row at its line
+        // joins it too (carrick-cloud#3018): the reader stated nothing there,
+        // and a call in `calls` alone is on no list. Where a row stands the
+        // reader's row stays, as for any candidate. The places are taken
+        // before any push, so two candidates on one line add one row.
+        let held: std::collections::HashSet<(String, u32)> = graph
+            .data_calls
+            .iter()
+            .filter_map(|call| {
+                let (file, line) = call.file_location.rsplit_once(':')?;
+                Some((relative(root, file), line.parse().ok()?))
+            })
+            .collect();
+        let mut joined: std::collections::HashSet<(String, u32)> = Default::default();
         for row in fold.stated.iter().filter(|row| {
-            row.side == RowSide::Call && row.fact() && matches!(row.key, OperationKey::Http { .. })
+            row.side == RowSide::Call
+                && matches!(row.key, OperationKey::Http { .. })
+                && (row.fact()
+                    || (row.inference.is_some()
+                        && !held.contains(&(row.file.clone(), row.line))
+                        && joined.insert((row.file.clone(), row.line))))
         }) {
             let Some((method, path)) = row.key.as_http() else {
                 continue;
@@ -1124,6 +1146,9 @@ pub fn fold(
             let host = normalizer.absolute_host(path);
             let base = match host {
                 Some(_) => None,
+                // A candidate had no reader's row to read it from: the row's
+                // own reading of its base stands.
+                None if !row.fact() => row.base.clone(),
                 None => read.and_then(|call| call.base.clone()),
             };
             let host = host.or_else(|| read.and_then(|call| call.host.clone()));
