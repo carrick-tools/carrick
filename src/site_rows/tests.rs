@@ -159,6 +159,7 @@ fn labels() -> Vec<SiteLabel> {
         by_origin: false,
         yields: None,
         name_scope: None,
+        name_at_maker: false,
         package: "@fixture/wire".to_string(),
         export: export.to_string(),
         member: Some("emit".to_string()),

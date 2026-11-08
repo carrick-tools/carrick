@@ -197,6 +197,11 @@ pub struct SiteLabel {
     pub new: bool,
     #[serde(default)]
     pub name: Option<ArgSlot>,
+    /// The op's name is the name its receiver was made with (`name: {
+    /// bound: "maker" }`, carrick#3527): read at the maker call the
+    /// receiver's instance walk ends at, never at the op's own call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub name_at_maker: bool,
     #[serde(default)]
     pub payload: Option<ArgSlot>,
     #[serde(default)]
@@ -322,6 +327,7 @@ impl SiteLabel {
                         scope: None,
                         yields: op.yields,
                         name_scope: None,
+                        name_at_maker: false,
                     });
                 }
             }
@@ -382,6 +388,7 @@ impl SiteLabel {
                         scope: None,
                         yields: None,
                         name_scope: None,
+                        name_at_maker: false,
                     });
                     continue;
                 }
@@ -442,6 +449,13 @@ impl SiteLabel {
                         Some(OpName::Slot(name)) => Some(slot(name)),
                         _ => None,
                     },
+                    name_at_maker: matches!(
+                        name.as_deref(),
+                        Some(OpName::Bound {
+                            bound: BoundName::Maker,
+                            ..
+                        })
+                    ),
                     payload: payload.as_ref().map(slot),
                     handler: handler.as_ref().map(slot),
                     method,
@@ -499,8 +513,18 @@ impl SiteLabel {
 
     /// Whether the op has a name to read: a slot of its own call, or the
     /// argument of the scope call it is made on the result of (carrick#1678).
+    /// A name bound to the maker is read only where the walk read it
+    /// ([`Self::reads_name_of`]).
     pub fn reads_name(&self) -> bool {
         self.name.is_some() || self.scope.as_ref().is_some_and(|scope| scope.names)
+    }
+
+    /// Whether `site`'s name is read: [`Self::reads_name`], or a name its
+    /// receiver was made with that the walk read at the maker (carrick#3527).
+    /// A maker-bound site the walk named nothing for is read as a label with
+    /// no name slot is: the name is asked.
+    pub fn reads_name_of(&self, site: &DecidedSite) -> bool {
+        self.reads_name() || (self.name_at_maker && !site.name.is_empty())
     }
 
     /// The slot the call `end` names is handed a function in, when the store
@@ -688,7 +712,9 @@ pub struct DecidedSite {
     pub composed: Vec<Composed>,
     /// Whether `composed` stopped at its cap
     /// ([`composed::MAX_COMPOSED`] chains, and paths): some paths are
-    /// left out.
+    /// left out. Also set where the same cap stopped the walk up a
+    /// maker-bound name's callers (carrick#3527): the site is unnamed and
+    /// its name asked.
     pub composed_trimmed: bool,
     /// With the receiver trace on, for a procedure op's site (its label
     /// names it by its key, carrick#2474 R6c), the paths the adapters that
@@ -1340,6 +1366,36 @@ impl<'a> Calls<'a> {
             .get(&(file.to_path_buf(), key.to_string()))
             .map_or(&[], Vec::as_slice)
     }
+
+    /// What this service or the sibling that holds `file` read of it.
+    fn file_ir(&self, file: &Path) -> Option<&'a super::FileIr> {
+        super::discovery::inputs_holding(self.own, &self.siblings, file)
+            .files
+            .get(file)
+    }
+
+    /// Whether the definition `key` of `file` (this service's or a
+    /// sibling's) is a class's constructor body (carrick#3527).
+    fn is_constructor(&self, file: &Path, key: &str) -> bool {
+        self.file_ir(file)
+            .and_then(|ir| ir.functions.get(key))
+            .is_some_and(|function| function.constructor)
+    }
+
+    /// The constructor body `placed`'s receiver runs, where the receiver is
+    /// a construction written in place (`new AlphaProducer().add(…)`): its
+    /// file and key (carrick#3527).
+    fn receiver_constructed(&self, placed: &Placed<'a>) -> Option<(PathBuf, String)> {
+        // A `new` expression is read as no named form of object.
+        let (lo, hi, super::discovery::ObjectForm::Call | super::discovery::ObjectForm::Other) =
+            placed.call.receiver_object?
+        else {
+            return None;
+        };
+        let ir = self.file_ir(placed.file)?;
+        let made = self.at_span(placed.file, ir.swc_start(lo), ir.swc_start(hi))?;
+        super::discovery::constructed_across(self.own, &self.siblings, made.file, made.call)
+    }
 }
 
 /// Whether any piece is a parameter a caller fills.
@@ -1820,6 +1876,30 @@ struct Walk<'a, 'i> {
     /// Set only while the value-hop branch of `decide` walks: the last pair
     /// of `down` is a value hop ([`method_value`]).
     value_hop: bool,
+    /// Reads a name decided at one call as text, for a site stated at
+    /// another (a maker-bound name, carrick#3527).
+    fold: super::site_record::NameFold<'i>,
+    /// The functions some discovered site's chain enters: their callers are
+    /// listed by discovery as sites of their own.
+    entered: &'i HashSet<(PathBuf, String)>,
+}
+
+/// One value a maker call's name slot takes ([`Walk::made_with`]): the call
+/// that decides it, its pieces as that call's body reads them, the argument
+/// positions they are read from, and the constructor bodies the walk from
+/// the maker passed, by file and key (carrick#3527).
+struct MadeWith<'a> {
+    at: Placed<'a>,
+    pieces: Vec<Piece>,
+    args: BTreeSet<usize>,
+    passed: BTreeSet<(PathBuf, String)>,
+}
+
+/// One walk of the join ([`Walk::joins`]): the calls of the site, and the
+/// values in `made` (by index) that name it; `None` leaves it unnamed.
+struct Join<'a> {
+    down: Vec<Placed<'a>>,
+    fitting: Option<Vec<usize>>,
 }
 
 impl<'a> Walk<'a, '_> {
@@ -2202,6 +2282,336 @@ impl<'a> Walk<'a, '_> {
         path.pop();
     }
 
+    /// The site of the labelled call `chain` ends at (`chain` runs from
+    /// discovery's first call to it), an op whose name is the name its
+    /// receiver was made with (`name: { bound: "maker" }`, carrick#3527):
+    /// read at each labelled maker call the receiver's instance walk ends
+    /// at, in the slot the maker's own claim names, and composed up that
+    /// maker's callers ([`Self::made_with`]). Where every value reaches the
+    /// maker through a constructor body, the name is fixed when the instance
+    /// is constructed: the site is the lowest call of the op's chain whose
+    /// receiver is a construction, named by the values whose walk passed
+    /// that class's constructor ([`Self::joined`]). Else the values are
+    /// pooled at the labelled call. One name is the site's; several are a
+    /// `SeveralOperations` lead; an instance or a name no walk reads leaves
+    /// the site unnamed, as before ([`Self::unnamed`]). True where the site
+    /// is the labelled call.
+    fn maker_named(&mut self, chain: &[Placed<'a>], end: &LabelledEnd) -> bool {
+        let last = chain[chain.len() - 1];
+        let Some(makers) = self.makers else {
+            return false;
+        };
+        let roots = self.instances(&[last]);
+        let mut made: Vec<MadeWith<'a>> = Vec::new();
+        let mut unread = roots.is_empty();
+        // Each caller multiplies the paths up: the walks share one cap, and
+        // a walk the cap stops reads no name.
+        let mut budget = composed::Budget::full();
+        for root in &roots {
+            let InstanceAt::Root {
+                file,
+                package,
+                export,
+                member,
+                made: Some(call),
+                ..
+            } = &root.end
+            else {
+                unread = true;
+                continue;
+            };
+            let new = call.form == super::MakerForm::New;
+            let slot = makers
+                .iter()
+                .find(|maker| {
+                    maker.package == *package
+                        && maker.export == *export
+                        && maker.member == *member
+                        && maker.new == new
+                })
+                .and_then(|maker| maker.name.as_ref());
+            let maker = self
+                .calls
+                .at_span(&self.root.join(file), call.span.0, call.span.1);
+            let (Some(slot), Some(maker)) = (slot, maker) else {
+                unread = true;
+                continue;
+            };
+            let pieces = slot_value(maker.call, slot);
+            let args = BTreeSet::from([slot.arg]);
+            unread |= !self.made_with(
+                maker,
+                pieces,
+                args,
+                BTreeSet::new(),
+                &mut made,
+                &mut Vec::new(),
+                &mut budget,
+            );
+        }
+        if unread || made.is_empty() {
+            return self.unnamed_trimmed(chain, end, budget.trimmed);
+        }
+        if made.iter().all(|value| !value.passed.is_empty()) {
+            let mut joins = Vec::new();
+            self.joins(
+                chain.to_vec(),
+                &made,
+                &mut Vec::new(),
+                &mut budget,
+                &mut joins,
+            );
+            if budget.trimmed {
+                return self.unnamed_trimmed(chain, end, true);
+            }
+            for join in joins {
+                match join.fitting {
+                    None => {
+                        self.unnamed(&join.down, end);
+                    }
+                    Some(fitting) => {
+                        let fitting: Vec<&MadeWith<'a>> =
+                            fitting.iter().map(|&at| &made[at]).collect();
+                        self.named_by(&join.down, &fitting, end);
+                    }
+                }
+            }
+            return false;
+        }
+        let made: Vec<&MadeWith<'a>> = made.iter().collect();
+        if self.calls.is_own(last.file) {
+            self.named_by(&[last], &made, end)
+        } else {
+            self.named_by(chain, &made, end);
+            false
+        }
+    }
+
+    /// Every value the name slot of a maker call takes (carrick#3527): the
+    /// slot's `pieces` at `placed` (read from its arguments `args`) where they
+    /// hold no parameter, else what each caller of the function `placed` is
+    /// written in fills them with, up the callers. Each value keeps the
+    /// constructor bodies its walk passed (`passed`, the function `placed` is
+    /// written in included). False where a value is not read: a parameter
+    /// nothing hands in (an entry point), a callback's own, or a value this
+    /// pass does not read, or a walk `budget` stops (each call visited takes
+    /// one). `path` ends a cycle.
+    #[allow(clippy::too_many_arguments)]
+    fn made_with(
+        &self,
+        placed: Placed<'a>,
+        pieces: Vec<Piece>,
+        args: BTreeSet<usize>,
+        mut passed: BTreeSet<(PathBuf, String)>,
+        made: &mut Vec<MadeWith<'a>>,
+        path: &mut Vec<(PathBuf, String)>,
+        budget: &mut composed::Budget,
+    ) -> bool {
+        if !budget.take() {
+            return false;
+        }
+        if let Some(key) = placed.key
+            && self.calls.is_constructor(placed.file, key)
+        {
+            passed.insert((placed.file.to_path_buf(), key.to_string()));
+        }
+        if !holds_parameter(&pieces) {
+            if pieces.is_empty() || pieces.iter().any(|piece| matches!(piece, Piece::Unknown)) {
+                return false;
+            }
+            made.push(MadeWith {
+                at: placed,
+                pieces,
+                args,
+                passed,
+            });
+            return true;
+        }
+        let (Some(own), Some(key)) = (to_definition(&pieces, placed.depth), placed.key) else {
+            return false;
+        };
+        let callers = self.calls.callers_of(placed.file, key);
+        if callers.is_empty() {
+            return false;
+        }
+        let here = (placed.file.to_path_buf(), key.to_string());
+        if path.contains(&here) {
+            return true;
+        }
+        path.push(here);
+        let positions = parameter_positions(&own);
+        let mut read = true;
+        for caller in callers {
+            let value = filled(&own, caller.call);
+            read &= self.made_with(
+                *caller,
+                value,
+                positions.clone(),
+                passed.clone(),
+                made,
+                path,
+                budget,
+            );
+        }
+        path.pop();
+        read
+    }
+
+    /// The join (carrick#3527): the lowest call of `down` (calls from the
+    /// first to the labelled call), then of its callers up, whose receiver is
+    /// a construction written in place, named by the values `made` whose walk
+    /// passed that class's constructor body. A walk that meets no such call,
+    /// or a construction no value passed, names nothing ([`Self::unnamed`]).
+    /// Each walk's decision goes to `joins`, written only once the whole
+    /// walk is read: a walk `budget` stops (each call visited takes one)
+    /// leaves the site unnamed, never some paths named and the rest dropped.
+    /// `path` ends a cycle.
+    fn joins(
+        &self,
+        down: Vec<Placed<'a>>,
+        made: &[MadeWith<'a>],
+        path: &mut Vec<(PathBuf, String)>,
+        budget: &mut composed::Budget,
+        joins: &mut Vec<Join<'a>>,
+    ) {
+        if !budget.take() {
+            return;
+        }
+        for k in (0..down.len()).rev() {
+            let Some(constructor) = self.calls.receiver_constructed(&down[k]) else {
+                continue;
+            };
+            let fitting: Vec<usize> = (0..made.len())
+                .filter(|&at| made[at].passed.contains(&constructor))
+                .collect();
+            joins.push(if fitting.is_empty() {
+                Join {
+                    down,
+                    fitting: None,
+                }
+            } else {
+                Join {
+                    down: down[k..].to_vec(),
+                    fitting: Some(fitting),
+                }
+            });
+            return;
+        }
+        let top = down[0];
+        let Some(key) = top.key else {
+            joins.push(Join {
+                down,
+                fitting: None,
+            });
+            return;
+        };
+        let here = (top.file.to_path_buf(), key.to_string());
+        // Discovery lists the calls that enter this function as sites of
+        // their own, each with its whole chain: the join is read there.
+        if top.depth == 0 && self.entered.contains(&here) {
+            return;
+        }
+        let callers = self.calls.callers_of(top.file, key);
+        if callers.is_empty() {
+            joins.push(Join {
+                down,
+                fitting: None,
+            });
+            return;
+        }
+        if path.contains(&here) {
+            return;
+        }
+        path.push(here);
+        for caller in callers {
+            let mut longer = vec![*caller];
+            longer.extend_from_slice(&down);
+            self.joins(longer, made, path, budget, joins);
+        }
+        path.pop();
+    }
+
+    /// [`Self::unnamed`], and where a walk's cap stopped the name being read
+    /// (`trimmed`), the site says so in `composed_trimmed`, as a site whose
+    /// paths the cap stopped does.
+    fn unnamed_trimmed(&mut self, down: &[Placed<'a>], end: &LabelledEnd, trimmed: bool) -> bool {
+        let at_labelled = self.unnamed(down, end);
+        if trimmed {
+            let placed = if at_labelled {
+                down[down.len() - 1]
+            } else {
+                down[0]
+            };
+            let id = (
+                relative(self.root, placed.file),
+                placed.call.site.span_start,
+                None,
+                end.at(),
+            );
+            if let Some(&at) = self.kept.get(&id) {
+                self.out.sites[at].composed_trimmed = true;
+            }
+        }
+        at_labelled
+    }
+
+    /// A maker-bound op whose name no walk reads (an instance the walk does
+    /// not reach, as in a sibling's files, or a value it does not read): the
+    /// site the op's call is with no name read, as when the label names no
+    /// slot, so the name is asked as before (carrick#3527). For a sibling's
+    /// call, at the call of this service that enters it (`down[0]`). True
+    /// where the site is the labelled call.
+    fn unnamed(&mut self, down: &[Placed<'a>], end: &LabelledEnd) -> bool {
+        let last = down[down.len() - 1];
+        if self.calls.is_own(last.file) {
+            self.site(&[last], end, Vec::new(), BTreeSet::new());
+            true
+        } else {
+            self.site(down, end, Vec::new(), BTreeSet::new());
+            false
+        }
+    }
+
+    /// The site `down[0]` (calls down to the labelled call), named by the one
+    /// name the values `made` agree on, each read where it was decided
+    /// ([`Self::name_at`]); a `SeveralOperations` lead there where they name
+    /// several. True where the site is written at the labelled call.
+    fn named_by(&mut self, down: &[Placed<'a>], made: &[&MadeWith<'a>], end: &LabelledEnd) -> bool {
+        let mut names: Vec<Vec<Piece>> = Vec::new();
+        for value in made {
+            let name = self.name_at(value);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        let [name] = names.as_slice() else {
+            self.lead(&down[0], end, Undecided::SeveralOperations);
+            return false;
+        };
+        self.site(down, end, name.clone(), BTreeSet::new());
+        down.len() == 1
+    }
+
+    /// A maker-bound name as the call that decided it reads it
+    /// (carrick#3527): its text where one whole argument holds it and the
+    /// resolver reads that argument as one text, since the site states it
+    /// at another call, whose own arguments do not write it. Else its
+    /// pieces.
+    fn name_at(&mut self, value: &MadeWith<'a>) -> Vec<Piece> {
+        if literal_name(&value.pieces).is_some() {
+            return value.pieces.clone();
+        }
+        let [arg] = value.args.iter().copied().collect::<Vec<_>>()[..] else {
+            return value.pieces.clone();
+        };
+        let file = relative(self.root, value.at.file);
+        let span = (value.at.call.site.span_start, value.at.call.site.span_end);
+        match self.fold.arg_text(&file, span, arg) {
+            Some(text) => vec![Piece::Lit(text)],
+            None => value.pieces.clone(),
+        }
+    }
+
     /// One site per key of the handler table the labelled call is handed in
     /// a loop, at the line of the function under each key.
     fn table(&mut self, placed: &Placed<'a>, end: &LabelledEnd, keys: Vec<TableKey>) {
@@ -2448,6 +2858,8 @@ fn decide(
         reached: None,
         scope_call: None,
         value_hop: false,
+        fold: super::site_record::NameFold::new(inputs, siblings, root),
+        entered: &entered,
     };
     for site in discovered {
         let Some(end) = &site.end else {
@@ -2518,6 +2930,17 @@ fn decide(
         if let Some(scope) = label.scope.as_ref().filter(|scope| scope.names) {
             if last_is_own {
                 walk.scoped(&last, end, scope);
+            }
+            continue;
+        }
+        // An op whose name is the one its receiver was made with
+        // (carrick#3527): read at the maker the receiver's instance walk ends
+        // at, so only with the receiver trace on. With it off, the op names
+        // no slot of its own call, as below.
+        if label.name_at_maker && makers.is_some() {
+            let chain = place_chain(&calls, root, site, &last).unwrap_or_else(|| vec![last]);
+            if walk.maker_named(&chain, end) {
+                through_to_last(&mut walk);
             }
             continue;
         }
@@ -2643,7 +3066,7 @@ fn decide(
             let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
             let mut fold = super::site_record::NameFold::new(inputs, siblings, root);
             for site in &mut out.sites {
-                (site.composed, site.composed_trimmed) = match site.name_text() {
+                let (composed, trimmed) = match site.name_text() {
                     Some(own) => {
                         let (mut composed, trimmed) =
                             composed::compose(&site.instances, Some(&own), &mounts);
@@ -2689,6 +3112,9 @@ fn decide(
                         }
                     }
                 };
+                site.composed = composed;
+                // A maker-bound name's walk may have set it already.
+                site.composed_trimmed |= trimmed;
             }
             procedures::Pass {
                 calls: &calls,
@@ -3234,7 +3660,8 @@ pub(crate) mod tests {
 
     /// carrick#2439: the scan's settled claims give one label per op, with
     /// its slots, method fields, role and side, as the store's raw answer
-    /// does; a maker labels no op, and a bound name no name slot.
+    /// does; a maker labels no op, and a name bound to the maker no name
+    /// slot of the op's own call: it is read at the maker (carrick#3527).
     #[test]
     fn labels_read_from_the_settled_claims() {
         let exports: Vec<crate::library_claims::ExportClaims> =
@@ -3263,6 +3690,7 @@ pub(crate) mod tests {
                     by_origin: false,
                     yields: None,
                     name_scope: None,
+                    name_at_maker: false,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("post".into()),
@@ -3287,6 +3715,8 @@ pub(crate) mod tests {
                     by_origin: false,
                     yields: None,
                     name_scope: None,
+                    // A name bound to the maker is read there (carrick#3527).
+                    name_at_maker: true,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("send".into()),
@@ -4121,6 +4551,7 @@ pub(crate) mod tests {
             by_origin: false,
             yields: None,
             name_scope: None,
+            name_at_maker: false,
             package: "@fixture/wire".into(),
             export: "connect".into(),
             member: Some(member.into()),
@@ -4145,6 +4576,7 @@ pub(crate) mod tests {
             by_origin: false,
             yields: None,
             name_scope: None,
+            name_at_maker: false,
             package: "lib:lib.dom.d.ts".into(),
             export: "fetch".into(),
             member: None,
@@ -4177,6 +4609,7 @@ pub(crate) mod tests {
             by_origin: false,
             yields: None,
             name_scope: None,
+            name_at_maker: false,
             package: "node:child_process".into(),
             export: "ChildProcess".into(),
             member: Some("send".into()),
@@ -4793,6 +5226,7 @@ pub(crate) mod tests {
             by_origin: false,
             yields: None,
             name_scope: None,
+            name_at_maker: false,
             name: None,
             handler: Some(ArgSlot { arg: 0, key: None }),
             scope: Some(LabelScope {
@@ -4996,6 +5430,7 @@ pub(crate) mod tests {
             by_origin: false,
             yields: None,
             name_scope: None,
+            name_at_maker: false,
             package: "@fixture/http".into(),
             export: "default".into(),
             member: Some("get".into()),
@@ -5115,6 +5550,7 @@ pub(crate) mod tests {
                         }),
                         ..Default::default()
                     }],
+                    span: (0, 0),
                 }),
             },
         };

@@ -855,6 +855,28 @@ impl<'r> NameFold<'r> {
                 .collect(),
         )
     }
+
+    /// The one text the argument `arg` of the call at `span` in `file`
+    /// (repo-relative) always is, read by the resolver as a site's name is
+    /// ([`Resolver::text_read`]): where a name decided at one call is
+    /// stated at another (a maker-bound name, carrick#3527). `None` where it
+    /// reads no one text.
+    pub(super) fn arg_text(&mut self, file: &str, span: (u32, u32), arg: usize) -> Option<String> {
+        let expr = {
+            let parsed = self.sources.get(file)?;
+            let mut finder = CallFinder {
+                parsed,
+                target: span,
+                handing: Vec::new(),
+                found: None,
+            };
+            parsed.module.visit_with(&mut finder);
+            finder.found?.arg_exprs.get(arg)?.clone()
+        };
+        self.resolver
+            .text_read(self.sources.root, file, &expr)
+            .map(|(text, _)| text)
+    }
 }
 
 /// The file of a compiler row's declaration (`file:line`, or the file
@@ -1766,7 +1788,7 @@ fn record(
         .iter()
         .filter_map(|index| parts.arg_exprs.get(*index))
         .collect();
-    let whole_names: Option<BTreeSet<String>> = match (&site.key, label.reads_name()) {
+    let whole_names: Option<BTreeSet<String>> = match (&site.key, label.reads_name_of(site)) {
         (Some(key), _) => {
             stated.value(key, place(PlaceFrom::ObjectKey, &at));
             Some(BTreeSet::from([key.clone()]))
@@ -1901,7 +1923,7 @@ fn record(
     // when it states several; a lead when it states none whole. A label
     // that names no name slot forces neither the name nor the argument it
     // is read from: both are asked.
-    let name_unstated = match (label.reads_name(), &whole_names) {
+    let name_unstated = match (label.reads_name_of(site), &whole_names) {
         (false, _) => {
             decide(Slot::Name, Vec::new(), true, Basis::Code);
             if site.key.is_none() {

@@ -5378,6 +5378,114 @@ export function listen(): void {
         );
     }
 
+    /// carrick#3527 S4: an op whose name the store binds to its maker
+    /// (`new Queue(name).add(job, data)`, `name: { bound: maker }`) reads the
+    /// name at the maker call its instance was made by, composed up that
+    /// maker's callers. Where the maker runs inside a constructor chain
+    /// (`super(Topic.Alpha)`), each send is joined to the construction its
+    /// receiver is (`new AlphaProducer().add(...)`), so one wrapper serving
+    /// two queues names each send by its own. The job name (`'job'`,
+    /// `'direct-job'`) is never the queue's name.
+    #[test]
+    fn a_maker_bound_queue_name_is_read_at_its_construction() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("queue-enum-base-class-one", ".", "jobs")
+        else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for record in &records {
+            forced
+                .entry(record.state.point.at.clone())
+                .or_default()
+                .push(
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned(),
+                );
+        }
+        let leads: Vec<String> = decided
+            .leads
+            .iter()
+            .map(|lead| format!("{}:{} {:?}", lead.file, lead.line, lead.reason))
+            .collect();
+        for (point, name) in [
+            ("src/send.ts:5", "alpha-jobs"),
+            ("src/send.ts:9", "gamma-jobs"),
+            ("src/c1-direct.ts:7", "beta-jobs"),
+            ("src/c4-literal.ts:6", "literal-jobs"),
+        ] {
+            assert_eq!(
+                forced.get(point).cloned(),
+                Some(vec![Some(name.to_string())]),
+                "{point}: {forced:#?}\nleads: {leads:#?}"
+            );
+        }
+        // The wrapper's own send is not a site of its own beside the joined
+        // ones: the name is decided only where the receiver's construction is.
+        assert_eq!(forced.get("src/queue-client.ts:21"), None, "{forced:#?}");
+        for names in forced.values() {
+            for name in names.iter().flatten() {
+                assert!(
+                    name != "job" && name != "direct-job",
+                    "a job name is forced as a queue name: {forced:#?}"
+                );
+            }
+        }
+    }
+
+    /// carrick#3527: the walk up a maker-bound name's callers is capped
+    /// (`MAX_COMPOSED` calls visited). Past the cap, here 128 paths through
+    /// seven levels of parameter-passing helpers, the send stays one site
+    /// with its name asked, never dropped, and says the cap stopped it.
+    #[test]
+    fn a_maker_bound_name_past_the_walk_cap_stays_unnamed() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("queue-maker-fan-out", ".", "jobs")
+        else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for record in &records {
+            forced
+                .entry(record.state.point.at.clone())
+                .or_default()
+                .push(
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned(),
+                );
+        }
+        assert_eq!(
+            forced.get("src/open.ts:8").cloned(),
+            Some(vec![None]),
+            "{forced:#?}"
+        );
+        let sites: Vec<_> = decided
+            .sites
+            .iter()
+            .filter(|site| site.file == "src/open.ts" && site.line == 8)
+            .collect();
+        assert_eq!(sites.len(), 1, "{:#?}", decided.sites);
+        assert!(sites[0].composed_trimmed, "{:#?}", sites[0]);
+    }
+
     /// carrick#1678: a verb called on the object a scope member returns
     /// (`items.at("/items").get(list)`) is a route whose path is the scope
     /// call's argument and whose instance is the scope call's receiver: the
