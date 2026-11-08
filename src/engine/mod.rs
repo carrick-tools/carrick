@@ -8123,6 +8123,8 @@ fn append_deterministic_protocol_operations(
             withdrawn = site.withdrawn.len(),
             through = extractions.site.through.len(),
             through_folded = site.through_folded.len(),
+            kept_out = ?site.kept_out,
+            socket_disagrees = site.socket_disagrees,
             "site questions: fold"
         );
     }
@@ -26566,6 +26568,7 @@ unfollowed_member_calls_total: 0,
             lead_on_row_line: 0,
             through_folded: Vec::new(),
             replaced_by_fact: Vec::new(),
+            ..Default::default()
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
@@ -26688,6 +26691,7 @@ unfollowed_member_calls_total: 0,
             lead_on_row_line: 0,
             through_folded: Vec::new(),
             replaced_by_fact: Vec::new(),
+            ..Default::default()
         };
         // The anchor's file is the one discovery names, absolute here, and the
         // index is keyed by the repo-relative file.
