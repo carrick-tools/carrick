@@ -1708,10 +1708,6 @@ impl FunctionDefinitionExtractor {
         }
     }
 
-    /// Member names defined as BOTH a static and an instance member of the
-    /// class — the one shape where `Class.member` would collide on a single
-    /// map key. Private members are tracked with their `#` prefix, so they
-    /// can never collide with a same-named public member.
     /// Walk a class expression with `name` as its class: the class's own
     /// identifier, else the binding the language names it by.
     fn visit_class_expr_as(&mut self, name: Option<String>, class: &ClassExpr) {
@@ -1731,6 +1727,10 @@ impl FunctionDefinitionExtractor {
         self.current_class_collisions = prev_collisions;
     }
 
+    /// Member names defined as BOTH a static and an instance member of the
+    /// class — the one shape where `Class.member` would collide on a single
+    /// map key. Private members are tracked with their `#` prefix, so they
+    /// can never collide with a same-named public member.
     fn static_instance_collisions(class: &Class) -> HashSet<String> {
         let mut static_names = HashSet::new();
         let mut instance_names = HashSet::new();
@@ -3536,11 +3536,30 @@ second`): void {}
     }
 
     #[test]
-    fn anonymous_class_expression_members_are_skipped() {
+    fn const_bound_class_expression_members_key_by_the_binding() {
         let defs = extract("const Foo = class { run(): number { return 1; } };");
         assert!(
-            defs.is_empty(),
-            "anonymous class members have no stable name; got {:?}",
+            defs.contains_key("Foo.run"),
+            "the binding names the class; got {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unbound_anonymous_class_expression_members_are_skipped() {
+        let defs = extract(
+            "class Outer { go(): number { return 0; } }\n\
+             use(class { run(): number { return 1; } });\n\
+             new (class { walk(): number { return 2; } })();",
+        );
+        // The top-level calls record the module itself (`<module>`); no
+        // member of an unbound class expression is credited to any class.
+        assert!(
+            defs.contains_key("Outer.go")
+                && !defs
+                    .keys()
+                    .any(|key| key.ends_with(".run") || key.ends_with(".walk")),
+            "unbound anonymous members have no stable name; got {:?}",
             defs.keys().collect::<Vec<_>>()
         );
     }
