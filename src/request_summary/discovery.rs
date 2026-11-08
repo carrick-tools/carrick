@@ -5778,7 +5778,8 @@ export function listen(): void {
     /// carrick#3191: a route whose path is a binding with a literal default
     /// is served at the path the default gives, whichever way the default is
     /// written (a local's `||` or `??`, a destructuring default, a default on
-    /// a key of a destructured parameter), and so is a
+    /// a key of a destructured parameter; in a function or a module
+    /// constant), and so is a
     /// template or `+` built on one. A default read at runtime, and a local
     /// assigned again, state no path: each stays a guessed site.
     #[test]
@@ -5824,6 +5825,8 @@ export function listen(): void {
                 "src/index.ts:45 GET /bolts",
                 "src/index.ts:46 GET /bolts/:boltId",
                 "src/index.ts:53 GET /nuts",
+                "src/module.ts:13 GET /sprockets",
+                "src/module.ts:14 GET /springs/:springId",
             ]),
             "{served:#?}"
         );
