@@ -17,6 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { CheckResult } from "../contract.ts";
+import { linkedCheckoutTop } from "./worktree.ts";
 
 /** A session's accumulated record. */
 export type SessionRecord = {
@@ -40,7 +41,7 @@ export type SessionRecord = {
    * newest edit: the files the Stop hook states the session's check for
    * (`sessionCoverage` in `stop-wait.ts`, carrick#3466).
    */
-  files: Record<string, { root: string; at: number }>;
+  files: Record<string, { root: string; at: number; checkout?: string }>;
   /**
    * Workspace root -> the newest edit there the Stop hook has already spoken
    * about (checked, or queued `check --changed` for): it speaks once per change.
@@ -118,10 +119,11 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       edited: stamps(record.edited),
       files: Object.fromEntries(
         Object.entries(record.files ?? {}).filter(
-          (entry): entry is [string, { root: string; at: number }] =>
+          (entry): entry is [string, { root: string; at: number; checkout?: string }] =>
             typeof entry[1] === "object" &&
             entry[1] !== null &&
             typeof entry[1].root === "string" &&
+            (entry[1].checkout === undefined || typeof entry[1].checkout === "string") &&
             typeof entry[1].at === "number" &&
             Number.isFinite(entry[1].at),
         ),
@@ -279,7 +281,14 @@ export function recordEdit(sessionId: string, root: string, at: number, home?: s
   const current = readSession(sessionId, home);
   current.edited[root] = Math.max(at, current.edited[root] ?? 0);
   for (const file of files) {
-    current.files[file] = { root, at: Math.max(at, current.files[file]?.at ?? 0) };
+    // The linked worktree top is recorded now: once it is removed, nothing
+    // can recover it from the path (carrick#3595).
+    const checkout = linkedCheckoutTop(file) ?? current.files[file]?.checkout;
+    current.files[file] = {
+      root,
+      at: Math.max(at, current.files[file]?.at ?? 0),
+      ...(checkout === undefined ? {} : { checkout }),
+    };
   }
   current.updated = new Date().toISOString();
   write(sessionId, current, home);

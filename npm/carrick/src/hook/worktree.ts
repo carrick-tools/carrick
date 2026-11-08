@@ -22,6 +22,17 @@ function checkoutOf(start: string): { top: string; linked: boolean } | null {
   }
 }
 
+/** The top folder of the linked worktree `file` sits in, or null in the main checkout or none (carrick#3595). */
+export function linkedCheckoutTop(file: string): string | null {
+  const own = checkoutOf(path.dirname(file));
+  return own !== null && own.linked ? own.top : null;
+}
+
+/** Whether a linked worktree top recorded at edit time has been removed. */
+export function worktreeGone(top: string): boolean {
+  return !fs.existsSync(path.join(top, ".git"));
+}
+
 /**
  * Whether `file` sits in a linked git worktree other than the checkout the
  * session runs in (`cwd`). A file in the session's own checkout, in a plain
