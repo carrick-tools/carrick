@@ -36,6 +36,7 @@ import {
 import { checkedSinceLastEdit } from "./checked.ts";
 import { lateContext } from "./late.ts";
 import {
+  changedAnsweredAt,
   claimDelivery,
   enqueueChanged,
   ensureRunner,
@@ -151,9 +152,17 @@ export function sessionCoverage(session: string, root: string, home?: string, no
   const edits = Object.entries(record.files).filter(([, edit]) => edit.root === root);
   const newest = newestPerFile(session, home);
   const coverage: Coverage = { files: edits.length, upTo: record.edited[root] ?? 0, covered: [], gaps: [] };
+  // A whole-change check that answered after a file's last edit settled it:
+  // the gap was reported and the background check read the file, so it is not
+  // named again until the file changes (carrick#3543).
+  const changedAt = changedAnsweredAt(session, root, home);
   for (const [file, edit] of edits) {
     const relative = file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file;
-    const gap = (reason: string) => coverage.gaps.push({ file: relative, reason });
+    const retired = edit.at <= changedAt;
+    const gap = (reason: string) => {
+      if (retired) coverage.files -= 1;
+      else coverage.gaps.push({ file: relative, reason });
+    };
     const held = newest.get(file);
     if (held === undefined) {
       gap("no re-check answered it");

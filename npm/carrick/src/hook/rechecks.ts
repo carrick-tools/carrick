@@ -719,6 +719,23 @@ export function newestPerFile(session: string, home?: string): Map<string, { ent
   return out;
 }
 
+/**
+ * When the session's newest answered `check --changed` for `root` was queued,
+ * in epoch ms, or 0 when none answered. That check re-read every changed file
+ * of the workspace, so an edit made before it was queued is covered by it.
+ */
+export function changedAnsweredAt(session: string, root: string, home?: string): number {
+  let newest = 0;
+  for (const name of sessionNames(session, home).filter((n) => n.endsWith(".answer.json"))) {
+    const answer = readJson<Answer>(path.join(sessionsDir(home), name));
+    if (answer === null || !isChanged(answer) || answer.root !== root) continue;
+    if (answer.state !== "answered" || answer.changed === undefined) continue;
+    const at = Date.parse(answer.enqueued_at);
+    if (Number.isFinite(at) && at > newest) newest = at;
+  }
+  return newest;
+}
+
 /** Claim the right to print one answer: true for exactly one caller. */
 export function claimDelivery(session: string, seq: string, home?: string, now: number = Date.now()): boolean {
   const file = sessionPart(session, seq, "delivered", home);
