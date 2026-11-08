@@ -227,11 +227,12 @@ impl ExportClaims {
             if !scopes && matches!(claim, LibraryClaim::Scope { .. }) {
                 continue;
             }
-            // Written as a set, an override or a decorator, not called
-            // (amendment 7): the readers of call sites do not read it yet.
-            // An op written as a construction of its export is read at
-            // the `new` (carrick#3439).
-            if !claim.is_call_form() && !claim.is_new_form_op() {
+            // Written as a set or an override, or a scope written as a
+            // decorator (amendment 7): no call site is written that way. An
+            // op written as a construction of its export is read at the
+            // `new` (carrick#3439), and one written as a method decorator
+            // where the decorator is applied (carrick#3043).
+            if !claim.is_call_form() && claim.op_site_form().is_none() {
                 continue;
             }
             let Some(id) = claim_id(&prefix, claim) else {
@@ -270,6 +271,29 @@ impl ExportClaims {
     /// the wire; a listed `off_wire` call is off it; a `mutator` changes
     /// names; anything the lists do not name is unlisted, and contests.
     fn classify(&self, receiver: &str, used: &MemberUse) -> MemberWire {
+        if used.form == MakerForm::Decorate {
+            // A method decorator an op is written as (`@OnMessage("x")`,
+            // carrick#3043). A decorator no claim is written as is unlisted.
+            let claimed = self.claims.iter().any(|claim| match claim {
+                LibraryClaim::Op {
+                    member,
+                    path,
+                    on,
+                    of,
+                    ..
+                } if claim.is_decorate_form_op() => {
+                    applies(*on, of.as_deref(), receiver)
+                        && *path == used.path
+                        && *member == used.member
+                }
+                _ => false,
+            });
+            return if claimed {
+                MemberWire::OnWire
+            } else {
+                MemberWire::Unlisted
+            };
+        }
         if used.form == MakerForm::New {
             // A maker the export is built with, or an op written as the
             // construction itself (`new SendMessageCommand({ ... })`).
@@ -604,7 +628,7 @@ fn selector<'a>(
     of: Option<&'a str>,
     path: &'a [String],
     member: Option<&'a str>,
-    new: bool,
+    form: MakerForm,
 ) -> Selector<'a> {
     Selector {
         on: on.map(|on| match on {
@@ -615,7 +639,7 @@ fn selector<'a>(
         of,
         path,
         member,
-        new,
+        form,
     }
 }
 
@@ -1045,7 +1069,7 @@ impl Reading<'_> {
                 of.as_deref(),
                 path,
                 member.as_deref(),
-                claim.is_new_form_op(),
+                claim.op_site_form().unwrap_or(MakerForm::Call),
             );
             if !self.site.selected_by(through, &selected) || !self.verified(id, &receiver) {
                 continue;
@@ -1588,6 +1612,72 @@ mod tests {
         assert!(rows_of(&called, &[command_claims()], all).is_empty());
     }
 
+    fn gateway_claims() -> ExportClaims {
+        export(json!({
+            "package": "@fixture/socket", "version": "1.2.0", "specifier": "@fixture/socket",
+            "export": "OnMessage", "role": "socket", "side": "server",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": null, "on": "export",
+                  "form": "decorate", "name": { "arg": 0 } }
+            ]
+        }))
+    }
+
+    /// carrick#3043: an op claimed in the `decorate` form is read where the
+    /// decorator is applied to a method: a socket listener, client to server
+    /// (the export's side is the server's), at the method's name, checked on
+    /// the export receiver. A plain call of the same export is a use the
+    /// claims do not list: it contests the export, and no site states a row.
+    #[test]
+    fn a_decorate_form_op_states_a_listener_at_the_decorated_method() {
+        let source = "import { OnMessage } from \"@fixture/socket\";\n\
+            export class Lobby {\n\
+            \x20 @OnMessage(\"lobby.enter\")\n\
+            \x20 enter(body: unknown) { return body; }\n\
+            }\n";
+        let sites = sites_of(&[("src/lobby.ts", source)]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let rows = read(&sites, &[gateway_claims()], verifier(&asked, all)).rows;
+        let stated: Vec<(u32, LibraryRowKind, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.kind, row.name.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(
+                4,
+                LibraryRowKind::Socket {
+                    direction: SocketDirection::ClientToServer,
+                    listener: true
+                },
+                "lobby.enter"
+            )],
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows[0].claim_ids,
+            vec!["@fixture/socket@1:OnMessage:op:receive:():on:export:form:decorate"]
+        );
+        assert!(
+            asked
+                .borrow()
+                .iter()
+                .all(|check| check.receiver == "export"),
+            "{:?}",
+            asked.borrow()
+        );
+        let called = sites_of(&[(
+            "src/lobby.ts",
+            "import { OnMessage } from \"@fixture/socket\";\n\
+            export class Lobby {\n\
+            \x20 @OnMessage(\"lobby.enter\")\n\
+            \x20 enter(body: unknown) { return body; }\n\
+            }\n\
+            export const byHand = OnMessage(\"lobby.called\");\n",
+        )]);
+        assert!(rows_of(&called, &[gateway_claims()], all).is_empty());
+    }
+
     const BUS_SERVICE: &str = "import { bus } from \"@fixture/bus\";\n\
         export async function send(topic: string) {\n\
         \x20 await bus.publish(\"orders.created\", { id: 1 });\n\
@@ -1744,7 +1834,8 @@ mod tests {
     }
 
     /// The readers of call sites do not meet a claim written as a set, an
-    /// override, a decorator or a construction (amendment 7).
+    /// override or a scope decorator (amendment 7); an op written as a
+    /// construction or a method decorator is met where it is written.
     #[test]
     fn call_site_readers_skip_claims_written_in_another_form() {
         let server = export(json!({
@@ -1757,7 +1848,9 @@ mod tests {
                 { "kind": "scope", "member": "controller", "of": "instance:new",
                   "name": { "arg": 0 }, "form": "decorate" },
                 { "kind": "op", "op": "send", "member": null, "on": "export", "form": "new",
-                  "name": { "arg": 0, "key": "QueueUrl" } }
+                  "name": { "arg": 0, "key": "QueueUrl" } },
+                { "kind": "op", "op": "receive", "member": null, "on": "export",
+                  "form": "decorate", "name": { "arg": 0 } }
             ]
         }));
         let ids: Vec<String> = server
@@ -1766,12 +1859,15 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
         // An op written as a construction of its export is read at the `new`
-        // (carrick#3439); the other forms are still not read.
+        // (carrick#3439), and one written as a method decorator where it is
+        // applied (carrick#3043); a set and a scope decorator are still not
+        // read.
         assert_eq!(
             ids,
             vec![
                 "fixture-server@2:Server:op:receive:on:of:instance:new",
-                "fixture-server@2:Server:op:send:():on:export:form:new"
+                "fixture-server@2:Server:op:send:():on:export:form:new",
+                "fixture-server@2:Server:op:receive:():on:export:form:decorate"
             ]
         );
     }

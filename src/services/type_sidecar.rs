@@ -1467,6 +1467,36 @@ impl LibraryClaim {
         )
     }
 
+    /// Whether the claim is an op written as a method decorator
+    /// (`@OnMessage("x") handle() {}`, `form: decorate`, carrick#3043): read
+    /// where the decorator is applied, and the decorated method is its
+    /// handler.
+    pub fn is_decorate_form_op(&self) -> bool {
+        matches!(
+            self,
+            Self::Op {
+                form: Some(OpForm::Decorate),
+                ..
+            }
+        )
+    }
+
+    /// How a call site writes the op, for an op claim: `None` for a claim
+    /// that is no op, or an op written as a set or an override, which no
+    /// call site is.
+    pub fn op_site_form(&self) -> Option<crate::request_summary::MakerForm> {
+        use crate::request_summary::MakerForm;
+        match self {
+            Self::Op { form, .. } => match form {
+                None | Some(OpForm::Call) => Some(MakerForm::Call),
+                Some(OpForm::New) => Some(MakerForm::New),
+                Some(OpForm::Decorate) => Some(MakerForm::Decorate),
+                Some(OpForm::Set | OpForm::Override) => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The claim as an op or maker check sends it: without its `result`, so
     /// the verdict on the claim is the one it had before results existed
     /// (carrick#2819). Every other claim is returned as it is.

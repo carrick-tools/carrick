@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "lobby", "directory": "services/lobby" },
+    { "name": "player", "directory": "services/player" }
+  ]
+}
