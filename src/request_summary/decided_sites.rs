@@ -1642,7 +1642,12 @@ fn written_at(call: &CallIr, arg: usize, key: Option<&str>) -> MethodValue {
 /// The method `slot` reads at the labelled call (the last of `down`),
 /// composed up to the deciding call (the first) as the name is: each call
 /// fills the parameters of the function below it.
-fn method_value(down: &[Placed<'_>], slot: &ArgSlot) -> Option<MethodValue> {
+///
+/// With `value_hop`, the last pair of `down` is a value hop (carrick#2432):
+/// the first call runs, as a value, the function the labelled call is written
+/// in, so its arguments fill that function's own parameters at depth 0, as the
+/// name is filled, whatever depth the function is nested at.
+fn method_value(down: &[Placed<'_>], slot: &ArgSlot, value_hop: bool) -> Option<MethodValue> {
     let last = down.last()?;
     let mut value = written_at(last.call, slot.arg, slot.key.as_deref());
     for k in (0..down.len() - 1).rev() {
@@ -1652,7 +1657,12 @@ fn method_value(down: &[Placed<'_>], slot: &ArgSlot) -> Option<MethodValue> {
         if !holds_parameter(pieces) {
             break;
         }
-        let Some(own) = to_definition(pieces, down[k + 1].depth) else {
+        let depth = if value_hop && k + 2 == down.len() {
+            0
+        } else {
+            down[k + 1].depth
+        };
+        let Some(own) = to_definition(pieces, depth) else {
             return Some(MethodValue::Pieces(vec![Piece::Unknown]));
         };
         value = match own.as_slice() {
@@ -1807,6 +1817,9 @@ struct Walk<'a, 'i> {
     /// of, when its op's name is that call's argument (carrick#1678): its
     /// instances are the scope call's receiver's.
     scope_call: Option<Placed<'a>>,
+    /// Set only while the value-hop branch of `decide` walks: the last pair
+    /// of `down` is a value hop ([`method_value`]).
+    value_hop: bool,
 }
 
 impl<'a> Walk<'a, '_> {
@@ -1831,7 +1844,7 @@ impl<'a> Walk<'a, '_> {
             .label
             .and_then(|label| label.method.as_ref())
             .and_then(|method| method.from.as_ref())
-            .and_then(|slot| method_value(down, slot));
+            .and_then(|slot| method_value(down, slot, self.value_hop));
         if !self.seen.insert(id.clone()) {
             // Another walk reached this call and labelled end. The same
             // operation (a diamond) is one site; a different one means the
@@ -2434,6 +2447,7 @@ fn decide(
         receiver: None,
         reached: None,
         scope_call: None,
+        value_hop: false,
     };
     for site in discovered {
         let Some(end) = &site.end else {
@@ -2549,12 +2563,14 @@ fn decide(
         {
             let value = filled(&at_end, first.call);
             let down = [first, last];
+            walk.value_hop = true;
             if walk.settles(&first, &value, end) {
                 walk.site(&down, end, value, parameter_positions(&at_end));
             } else {
                 walked.push(format!("{}:{}", site.file, site.line));
                 walk.up(&down, &value, end, &mut Vec::new());
             }
+            walk.value_hop = false;
             continue;
         }
         let Some(chain) = place_chain(&calls, root, site, &last) else {

@@ -190,3 +190,47 @@ fn a_closure_over_a_factory_parameter_states_its_row_at_the_caller() {
         "{wrong:#?}\nrows: {rows:#?}\npossible calls: {leads:#?}"
     );
 }
+
+/// carrick FC1b: the method a value-hop call writes fills the returned
+/// function's own parameter. `fetch` (the `lib.dom` label) reads its method
+/// from the call's options; the answer key is the fixture's README.
+#[test]
+fn a_method_from_the_returned_functions_own_parameter_states_its_row() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    if !script.exists() {
+        assert!(
+            std::env::var("CI").is_err(),
+            "the built sidecar is missing in CI"
+        );
+        eprintln!("Skipping: the built sidecar is missing");
+        return;
+    }
+    let blobs = scan();
+    let rows = call_rows(&blobs);
+    let leads = possible_calls(&blobs);
+    let mut wrong = Vec::new();
+    for (at, method, path) in [
+        ("m-hop-method.ts:7", "POST", "/p/m-hop-post"),
+        ("m-hop-method.ts:8", "GET", "/p/m-hop-get"),
+        ("m-hop-maker.ts:18", "POST", "/p/m-hop-maker"),
+        ("m-hop-default.ts:7", "GET", "/p/m-hop-default"),
+        ("m-direct.ts:1", "GET", "/p/m-direct"),
+        ("m-flat-value.ts:4", "POST", "/p/m-flat-value"),
+        ("m-hop-literal.ts:7", "PUT", "/p/m-hop-literal"),
+    ] {
+        let want = format!("src/{at} {method} https://h.test{path} ");
+        if !rows.iter().any(|row| row.contains(&want)) {
+            wrong.push(format!("no row `{want}`"));
+        }
+        if let Some(lead) = leads
+            .iter()
+            .find(|lead| lead.contains(&format!("src/{at} ")))
+        {
+            wrong.push(format!("a lead at {at}: {lead}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{wrong:#?}\nrows: {rows:#?}\npossible calls: {leads:#?}"
+    );
+}

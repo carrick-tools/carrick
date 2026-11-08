@@ -31,3 +31,18 @@ one function out.
 | `s-closure-coalesce-filled.ts:9` | the maker call fills `send` with `quiet`, which sends nothing | A site with stop `several_values`: the values disagree |
 | `c-binding-maker.ts:11` | the maker call `make(o)` writes a module `let` in `init`; `use` calls the binding | A site with stop `several_values`: `init`'s parameter is no parameter of `use`, so `use`'s caller passing `send` does not decide it |
 | `d-nested-factory.ts:10` | `outer` returns `make(o)`; `f` calls what `outer({ send: quiet })` returned | A site with stop `several_values`: the maker call `make(o)` is written in `outer`, not around `f`, so its parameter is not read at `f`'s callers |
+
+## The method slot through the value hop (carrick FC1b)
+
+`fetch` is the `lib.dom` label: its method is read from the call's options
+(`method_key`, default `GET`). The returned function writes `{ method }` from
+its own parameter, so the call that holds what the factory returned fills it.
+
+| File:line | Shape | Record |
+|---|---|---|
+| `m-hop-method.ts:7` | `request(method, path)` nested in `make()`; `hs('POST', …)` | A row `POST https://h.test/p/m-hop-post` at the caller |
+| `m-hop-method.ts:8` | same, `hs('GET', …)` | A row `GET …/p/m-hop-get` |
+| `m-hop-maker.ts:18` | the maker form: `doFetch = o.send ?? fetch`, `make({ token })` held by an outer factory | A row `POST …/p/m-hop-maker` |
+| `m-hop-default.ts:7` | `hs('/p/m-hop-default')` writes no method argument | A row `GET …/p/m-hop-default` (the label's default) |
+| `m-flat-value.ts:4` | control: module-level `request` held as a value | A row `POST` (already before FC1b) |
+| `m-hop-literal.ts:7` | control: `{ method: 'PUT' }` written at the send | A row `PUT`, whatever the caller passes |
