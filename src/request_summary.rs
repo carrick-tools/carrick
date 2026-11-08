@@ -1138,6 +1138,10 @@ struct FnIr {
     /// what the value may hold read in its scope: a module binding's writes
     /// the value resolver reads (carrick#3504 S1).
     binding_writes: Vec<resolve::BindingWrite>,
+    /// Each `let` or `var` this body declares once and writes again, with
+    /// its initialiser read in its scope: the binding table takes it under
+    /// this function's key (carrick#3504 S1b).
+    local_bindings: Vec<resolve::LocalBinding>,
     /// Parameters the body calls (`produce()`), by position.
     invoked_params: BTreeSet<usize>,
     /// Function expressions passed as call arguments, referenced from a
@@ -2243,7 +2247,8 @@ pub fn extract_file_ir(
             }
         }
         file.module_level = module_level;
-        file.module_bindings = resolve::module_bindings(module, source_map, &reader, &scope);
+        file.module_bindings =
+            resolve::module_bindings(module, source_map, &reader, &scope, &file.functions);
     }
     // What a row stated in another module needs to say about a client's
     // base the way this module's own rows say it (carrick#1568). Any file
@@ -5677,6 +5682,25 @@ impl Reader<'_> {
                         if values.iter().any(|value| *value != ValueAt::Unread) {
                             scope.held.insert(ident_key(&ident.id), values);
                         }
+                    }
+                    // One the body writes again is every value written to
+                    // it: the value resolver's binding table reads it, with
+                    // the module's write census (carrick#3504 S1b). Read
+                    // only where the body declares the name once: the census
+                    // keys writes by binding, the table by line and name.
+                    if let Pat::Ident(ident) = &declarator.name
+                        && reassigned.names.contains(ident.id.sym.as_ref())
+                        && reassigned.declared_once(&declared, ident.id.sym.as_ref())
+                    {
+                        ir.local_bindings.push(resolve::LocalBinding {
+                            key: ident_key(&ident.id),
+                            line: self.source_map.lookup_char_pos(ident.id.span.lo).line as u32,
+                            init: declarator
+                                .init
+                                .as_deref()
+                                .map(|init| self.value_of(init, scope, &guards::Bound::default()))
+                                .unwrap_or_default(),
+                        });
                     }
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).

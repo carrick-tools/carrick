@@ -1597,7 +1597,14 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         let Some(ir) = inputs.files.get(file) else {
             return false;
         };
-        let Some(binding) = ir.module_bindings.get(&(line, symbol.to_string())) else {
+        // A function's own `let` (carrick#3504 S1b) is read for callees
+        // only: a receiver held in one is the walk's other readers' until
+        // the resolver owns receivers (S4).
+        let Some(binding) = ir
+            .module_bindings
+            .get(&(line, symbol.to_string()))
+            .filter(|binding| binding.declared_in.is_none())
+        else {
             return false;
         };
         let here = (file.to_path_buf(), format!("{line}:{symbol}"));
@@ -1618,19 +1625,20 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 None => {}
             }
             for start in &binding.writes {
-                match super::super::resolve::placed_write(ir, *start) {
-                    Some((Some(key), write))
-                        if matches!(
-                            write.values.as_slice(),
-                            [ValueAt::Param { depth: 0, keys, .. }] if keys.is_empty()
-                        ) =>
-                    {
-                        let [ValueAt::Param { index, .. }] = write.values.as_slice() else {
-                            continue;
-                        };
-                        let own = vec![Piece::Param(*index, symbol.to_string())];
-                        self.up_from(file, key, own, at.to_string());
-                    }
+                let placed = super::super::resolve::placed_write(ir, *start);
+                let own = placed.and_then(|(key, write)| {
+                    let key = key?;
+                    let function = ir.functions.get(key)?;
+                    let own = super::super::resolve::written_param(function, &write.values)?;
+                    Some((key, own))
+                });
+                // A write of the writing function's parameter: walk up its
+                // callers.
+                if let Some((key, own)) = own {
+                    self.up_from(file, key, own, at.to_string());
+                    continue;
+                }
+                match placed {
                     Some((_, write)) => match &write.held {
                         Some(held) => self.held(held, file, at.to_string()),
                         None => self.hole(at.to_string(), InstanceHole::Unread, unread.clone()),
