@@ -93,8 +93,10 @@ export function updateHooks(
   const stamp = readStamp(workspace);
   const changed: string[] = [];
   for (const relative of SETTINGS_FILES) {
-    if (stamp[relative] === running) continue;
     const target = path.join(projectDir, relative);
+    // Keyed by the file's path under the workspace, so a repo's copy is its own entry.
+    const key = path.relative(workspace, target);
+    if (stamp[key] === running) continue;
     try {
       const body = fs.readFileSync(target, "utf8");
       if (!entriesAreStale(body, expectedCarrickHooks)) continue;
@@ -102,7 +104,7 @@ export function updateHooks(
       const merged = merge(body, prefix);
       if (!merged.changed) continue;
       writeAtomic(target, merged.body);
-      stamp[relative] = running;
+      stamp[key] = running;
       changed.push(relative);
     } catch {
       // Unreadable or not JSON: a file to report (`carrick doctor` does), never to overwrite.
