@@ -512,10 +512,27 @@ const NameLiteralSchema = z.object({ literal: z.string().min(1) }).strict();
 
 const BoundNameSchema = z
   .object({
-    bound: z.enum(['maker', 'scope', 'key', 'path', 'export', 'subscribed']),
+    bound: z.enum(['maker', 'scope', 'key', 'path', 'export', 'subscribed', 'decorated']),
     join: z.string().min(1).optional(),
     param: z.number().int().nonnegative().optional(),
     at: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
+
+/**
+ * Amendment 8: the first entry the call fills names the op, read in order. An
+ * entry is a plain slot or the decorated method's name. How many entries,
+ * their order and duplicates are the verifier's verdict, since one element
+ * this schema refuses fails the whole request.
+ */
+const NameFirstSchema = z
+  .object({
+    first: z.array(
+      z.union([
+        z.object({ arg: z.number().int().nonnegative(), key: z.string().min(1).optional() }).strict(),
+        z.object({ bound: z.literal('decorated') }).strict(),
+      ])
+    ),
   })
   .strict();
 
@@ -632,7 +649,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
         .strict()
         .optional(),
       returns: z.object({ result: ResultShapeSchema.optional() }).strict().optional(),
-      name: z.union([BoundNameSchema, NamePartsSchema, NameLiteralSchema, NameSlotSchema]).optional(),
+      name: z.union([BoundNameSchema, NamePartsSchema, NameLiteralSchema, NameFirstSchema, NameSlotSchema]).optional(),
       payload: ClaimSlotSchema.optional(),
       handler: ClaimSlotSchema.optional(),
       ack: ClaimSlotSchema.optional(),

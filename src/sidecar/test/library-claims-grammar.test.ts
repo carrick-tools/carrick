@@ -83,6 +83,9 @@ const ELEMENTS: Record<string, LibraryCheck> = {
   'name literal': route({ name: { literal: 'connection' } }),
   'bound path': route({ name: { bound: 'path', join: '.' } }),
   'bound export': route({ name: { bound: 'export' } }),
+  // Amendment 8 (library-claims-decorated-name.test.ts): judged on a decorate receive, claim_invalid on this call-form route.
+  'bound decorated': route({ name: { bound: 'decorated' } }),
+  'name first': route({ name: { first: [{ arg: 0 }, { arg: 1, key: 'name' }, { bound: 'decorated' }] } }),
   'bound subscribed': route({ name: { bound: 'subscribed', param: 0, at: ['topic'] } }),
   'form new': route({ form: 'new' }),
   'form set': route({ form: 'set' }),
@@ -119,6 +122,8 @@ const BUILT = new Set([
   'name literal',
   'bound path',
   'bound export',
+  'bound decorated',
+  'name first',
   'protocol http',
   'protocol graphql',
   'protocol rpc',
