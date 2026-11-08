@@ -1,0 +1,142 @@
+{
+ "library_claims": [
+  {
+   "package": "@fixture/live-wire",
+   "version": "1.0.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "@fixture/live-wire",
+     "export": "Socket",
+     "role": "socket",
+     "label": "socket_client",
+     "side": "client",
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "key_labels": {},
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "member": "on",
+       "of": "instance:new",
+       "op": "receive",
+       "picker": "fixture-picker",
+       "name": {
+        "arg": 0
+       }
+      },
+      {
+       "member": "once",
+       "of": "instance:new",
+       "op": "receive",
+       "picker": "fixture-picker",
+       "name": {
+        "arg": 0
+       }
+      },
+      {
+       "member": "emit",
+       "of": "instance:new",
+       "op": "send",
+       "picker": "fixture-picker",
+       "name": {
+        "arg": 0
+       }
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "@fixture/live-wire",
+     "export": "io",
+     "role": "socket",
+     "label": "socket_client",
+     "side": "client",
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [
+      {
+       "member": "on",
+       "of": "instance:()",
+       "op": "receive",
+       "picker": "fixture-picker",
+       "name": {
+        "arg": 0
+       }
+      },
+      {
+       "member": "once",
+       "of": "instance:()",
+       "op": "receive",
+       "picker": "fixture-picker",
+       "name": {
+        "arg": 0
+       }
+      },
+      {
+       "member": "emit",
+       "of": "instance:()",
+       "op": "send",
+       "picker": "fixture-picker",
+       "name": {
+        "arg": 0
+       }
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  },
+  {
+   "package": "@fixture/live-server",
+   "version": "1.0.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "@fixture/live-server",
+     "export": "Server",
+     "role": "socket",
+     "label": "socket_server",
+     "side": "server",
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "key_labels": {},
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "member": "emit",
+       "of": "instance:new",
+       "op": "send",
+       "picker": "fixture-picker",
+       "name": {
+        "arg": 0
+       }
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  }
+ ]
+}

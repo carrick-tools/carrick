@@ -886,6 +886,15 @@ pub(super) fn in_repo(row: &Row) -> bool {
         })
 }
 
+/// Whether `claims` state `member` as a call-form op of the export.
+fn claims_member(claims: &ExportClaims, member: &str) -> bool {
+    claims.claims.iter().any(|claim| {
+        claim.is_call_form()
+            && matches!(claim, LibraryClaim::Op { member: Some(claimed), path, .. }
+                if claimed == member && path.is_empty())
+    })
+}
+
 /// The name a type's text starts with (`Broker`, `typeof Socket`).
 fn type_root(text: &str) -> Option<&str> {
     let text = text.strip_prefix("typeof ").unwrap_or(text);
@@ -1424,9 +1433,7 @@ impl<'a> Walker<'a> {
                 }
             }
         }
-        if !packages.is_empty()
-            && let Some(positions) = inputs.positions.as_ref()
-        {
+        if let Some(positions) = inputs.positions.as_ref() {
             for (lo, hi, member) in &call.receiver_spans {
                 let kind = if *member { Kind::Member } else { Kind::Ident };
                 let Ok(receiver) =
@@ -1434,10 +1441,8 @@ impl<'a> Walker<'a> {
                 else {
                     break;
                 };
-                for name in [receiver.symbol(), receiver.type_text().and_then(type_root)]
-                    .into_iter()
-                    .flatten()
-                {
+                let root = receiver.type_text().and_then(type_root);
+                for name in [receiver.symbol(), root].into_iter().flatten() {
                     for package in &packages {
                         if let Some(claims) = self.labels.get(package, name) {
                             return Some((
@@ -1445,6 +1450,44 @@ impl<'a> Walker<'a> {
                                 ReachedBy::Name,
                             ));
                         }
+                    }
+                }
+                // A member the class inherits is declared in its base's
+                // package, so `packages` is the base's. The class the
+                // receiver holds is declared elsewhere: in the package the
+                // receiver itself is declared in, or in the module the file
+                // imports the receiver's type from (carrick#3390). Read only
+                // where that export's claims state this member as an op.
+                let mut holders: Vec<(String, &str)> = Vec::new();
+                if !in_repo(receiver) {
+                    for package in store_keys(receiver, self.labels.exports) {
+                        holders.extend(
+                            [receiver.symbol(), root]
+                                .into_iter()
+                                .flatten()
+                                .map(|name| (package.clone(), name)),
+                        );
+                    }
+                }
+                if let Some(root) = root {
+                    let mut imported: Vec<_> = ir
+                        .bindings
+                        .values()
+                        .filter(|binding| !binding.namespace && binding.export == root)
+                        .map(|binding| binding.specifier.as_str())
+                        .collect();
+                    imported.sort_unstable();
+                    imported.dedup();
+                    for specifier in imported {
+                        holders
+                            .extend(specifier_keys(specifier).into_iter().map(|key| (key, root)));
+                    }
+                }
+                for (package, name) in holders {
+                    if let Some(claims) = self.labels.get(&package, name)
+                        && claims_member(claims, symbol)
+                    {
+                        return Some((end(&package, name, Some(symbol), claims), ReachedBy::Name));
                     }
                 }
             }
