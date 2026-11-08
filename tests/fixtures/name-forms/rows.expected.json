@@ -11,12 +11,17 @@
     "src/s-fallback-stated.ts": "room.fallback-stated",
     "src/c-static-field.ts": "/c/static-field",
     "src/q-static-field.ts": "orders.static-field",
-    "src/s-static-field.ts": "room.static-field"
+    "src/s-static-field.ts": "room.static-field",
+    "src/c-logical-assign.ts": "/c/logical-assign",
+    "src/c-or-assign.ts": "/c/or-assign",
+    "src/q-logical-assign.ts": "orders.logical-assign",
+    "src/s-logical-assign.ts": "room.logical-assign"
   },
   "kind_asked": [
     "src/q-destructure.ts",
     "src/q-fallback-stated.ts",
-    "src/q-static-field.ts"
+    "src/q-static-field.ts",
+    "src/q-logical-assign.ts"
   ],
   "unnamed": [
     "src/c-destructure-written.ts",
@@ -26,6 +31,8 @@
     "src/c-coalesce-const.ts",
     "src/c-union.ts",
     "src/c-static-written.ts",
-    "src/c-static-exported.ts"
+    "src/c-static-exported.ts",
+    "src/c-let-written.ts",
+    "src/c-and-assign.ts"
   ]
 }

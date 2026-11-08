@@ -137,7 +137,7 @@
  "n-logical-assign": {
   "feature": "logical-assignment-operators (||=, ??=)",
   "source": "test262",
-  "status": "lead"
+  "status": "covered"
  },
  "n-loop": {
   "feature": "for-of over a literal array",

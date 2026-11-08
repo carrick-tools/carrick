@@ -17,6 +17,11 @@ Forms so far:
   keeps the name asked: stating the fallback alone is the initialiser-alone
   error. `c-coalesce-const` (two constants) and `c-union` (a union of
   literals) are several values and stay asked.
+- `logical-assign` (S2b-4): `??=` and `||=` are writes the binding holds
+  beside its earlier value (`c-logical-assign`, `c-or-assign`, and the
+  topic and socket forms; an empty initialiser or none adds no value).
+  `c-let-written` (a `let` written with a second value) is several values
+  and stays asked; `c-and-assign` (`&&=`) computes a value no reader states.
 
 - `static-field` (S2b-6): `C.P` where `static P = '…'` is a property of a
   module-scope class. `c-static-written` (`C.P = …` elsewhere) and

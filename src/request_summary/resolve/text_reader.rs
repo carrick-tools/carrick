@@ -200,21 +200,51 @@ impl<'a> Resolver<'a> {
         let Some((at, binding, declared)) = self.declared_entry(row) else {
             return hole(OutsideService);
         };
-        match binding.kind {
+        // A `let` the module writes again (`=`, `??=`, `||=`) holds its
+        // initialiser and every value written (carrick#3504 S2b-4, D6): a
+        // set. The write census marks every other form of write.
+        let mut sources: Vec<&ValueAt> = Vec::new();
+        let written = match binding.kind {
             BindingKind::Var => return hole(Reassigned),
-            BindingKind::Let if !binding.writes.is_empty() || binding.unplaceable => {
-                return hole(Reassigned);
+            BindingKind::Let if binding.unplaceable => return hole(Reassigned),
+            BindingKind::Let if !binding.writes.is_empty() => {
+                let Some(ir) = self.inputs_for(at.0).files.get(at.0) else {
+                    return hole(OutsideService);
+                };
+                for start in &binding.writes {
+                    match placed_write(ir, *start) {
+                        Some((_, write)) => sources.push(&write.text),
+                        None => return hole(Reassigned),
+                    }
+                }
+                true
             }
             BindingKind::Enum | BindingKind::StaticField => return hole(UnreadExpression),
-            _ => {}
-        }
-        let Some(text) = &binding.text else {
-            return hole(UnreadExpression);
+            _ => false,
         };
+        // A declaration with no initialiser adds no value to a written set.
+        match &binding.text {
+            Some(text) => sources.insert(0, text),
+            None if written => {}
+            None => return hole(UnreadExpression),
+        }
         let Some(_reading) = self.reading_text(&at) else {
             return hole(Recursion);
         };
-        let mut out = self.text_values(at.0, text);
+        let mut out: Vec<TextValue> = Vec::new();
+        for source in sources {
+            for value in self.text_values(at.0, source) {
+                // An empty text names nothing; in a written set it drops out.
+                let empty = matches!(&value, TextValue::Text { text, .. } if text.is_empty());
+                if (written && empty) || out.contains(&value) {
+                    continue;
+                }
+                out.push(value);
+            }
+        }
+        if out.is_empty() {
+            return hole(UnreadExpression);
+        }
         for value in &mut out {
             if let TextValue::Text { read_from, .. } = value {
                 read_from.retain(|file| *file != declared);
@@ -710,7 +740,16 @@ mod tests {
             );
         };
         use guards::HoleReason::{Reassigned, UnreadExpression};
-        held("src/refuse.ts", "p_written", Reassigned);
+        // A `let` assigned again holds its initialiser and each write
+        // (carrick#3504 S2b-4, D6): two texts, never one.
+        let written: Vec<String> = probe(&resolver, &on, "src/refuse.ts", "p_written")
+            .into_iter()
+            .map(|value| match value {
+                TextValue::Text { text, .. } => text,
+                hole => panic!("p_written: {hole:?}"),
+            })
+            .collect();
+        assert_eq!(written, ["/before", "/after"]);
         held("src/refuse.ts", "p_written_entry", UnreadExpression);
         held("src/refuse.ts", "p_exported", UnreadExpression);
         held("src/refuse.ts", "p_var", Reassigned);

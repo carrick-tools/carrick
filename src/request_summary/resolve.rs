@@ -152,14 +152,17 @@ pub(super) struct LocalBinding {
     pub(super) reassigned: bool,
 }
 
-/// A plain assignment `name = value` written directly in a body (not in a
-/// function written inside it), with what the value may hold read in that
-/// body's scope.
+/// A placed assignment `name = value`, `name ??= value` or `name ||= value`
+/// written directly in a body (not in a function written inside it), with
+/// what the value may hold read in that body's scope.
 #[derive(Debug, Clone)]
 pub(super) struct BindingWrite {
     /// Where the assignment starts.
     pub(super) at: u32,
     pub(super) values: Vec<ValueAt>,
+    /// What the value states as text (carrick#3504 S2b-4): the text reader
+    /// reads a written `let` as its initialiser and each write.
+    pub(super) text: ValueAt,
 }
 
 /// Every write of every binding in a module, by binding (the one write
@@ -287,7 +290,7 @@ impl WriteCensus {
                     + 1
     }
 
-    /// A write the readers cannot place: a compound or logical assignment,
+    /// A write the readers cannot place: a compound or `&&=` assignment,
     /// an update, a destructuring target, a loop head, a second
     /// declaration, or `with` or `eval` in the module (soundness rule 1).
     fn is_unplaceable(&self, key: &BindingKey) -> bool {
@@ -316,12 +319,23 @@ fn member_root(member: &MemberExpr) -> Option<BindingKey> {
     }
 }
 
+/// The assignment operators whose right side is a value the binding holds:
+/// `=`, and `??=` and `||=`, which keep the earlier value or take the new
+/// one (carrick#3504 S2b-4). `&&=`, `+=` and the other compound forms
+/// compute a value no reader states.
+pub(super) fn is_placed_assign(op: AssignOp) -> bool {
+    matches!(
+        op,
+        AssignOp::Assign | AssignOp::NullishAssign | AssignOp::OrAssign
+    )
+}
+
 impl Visit for WriteCensus {
     fn visit_assign_expr(&mut self, assign: &AssignExpr) {
         match &assign.left {
             AssignTarget::Simple(SimpleAssignTarget::Ident(binding)) => {
                 let key = ident_key(&binding.id);
-                if assign.op == AssignOp::Assign {
+                if is_placed_assign(assign.op) {
                     self.writes.entry(key).or_default().push(assign.span.lo.0);
                 } else {
                     self.unplaceable.insert(key);
@@ -2492,6 +2506,7 @@ mod tests {
     fn the_write_census_places_plain_writes_and_marks_every_other_write() {
         assert_eq!(census_of("let s = a;"), (0, false));
         assert_eq!(census_of("let s = a; s = b;"), (1, false));
+        assert_eq!(census_of("let s = a; s ??= b; s ||= c;"), (2, false));
         assert_eq!(
             census_of("let s = a; function f() { s = b; } const g = () => { s = c; };"),
             (2, false)
@@ -2499,7 +2514,7 @@ mod tests {
         assert_eq!(census_of("let s = a; s.x = b;"), (0, false));
         assert_eq!(census_of("let s = a; function f(s) { s = b; }"), (0, false));
         for source in [
-            "let s = a; s ??= b;",
+            "let s = a; s &&= b;",
             "let s = a; s += b;",
             "let s = a; s++;",
             "let s = a; [s] = [b];",
