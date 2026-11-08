@@ -507,7 +507,7 @@
  "t-extract-method": {
   "feature": "method extracted to a const (bound)",
   "source": "builtins: Function.prototype.bind",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-factory-closure-param": {
   "feature": "parameter of a factory read in the function it returns (closure)",
