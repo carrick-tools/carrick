@@ -542,7 +542,8 @@ fn refused_roots(root: &Path) -> Vec<String> {
     let mut roots: Vec<String> = carrick::preflight::unprepared(root, &services)
         .into_iter()
         .filter_map(|row| match row {
-            carrick::preflight::Unprepared::Dependencies { install_root, .. } => {
+            carrick::preflight::Unprepared::Dependencies { install_root, .. }
+            | carrick::preflight::Unprepared::Workspace { install_root, .. } => {
                 Some(if install_root.is_empty() {
                     ".".to_string()
                 } else {
