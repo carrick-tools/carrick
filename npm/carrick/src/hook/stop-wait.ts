@@ -49,6 +49,7 @@ import {
   type Pending,
 } from "./rechecks.ts";
 import { markStated, readSession } from "./reuse.ts";
+import { worktreeGone } from "./worktree.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -149,7 +150,12 @@ export type Coverage = {
  */
 export function sessionCoverage(session: string, root: string, home?: string, now: number = Date.now()): Coverage {
   const record = readSession(session, home);
-  const edits = Object.entries(record.files).filter(([, edit]) => edit.root === root);
+  // An edit made in a linked worktree that has since been removed is not a
+  // change to name (carrick#3595). A missing file in the main checkout is a
+  // real deletion and stays: only the recorded worktree top decides.
+  const edits = Object.entries(record.files).filter(
+    ([, edit]) => edit.root === root && !(edit.checkout !== undefined && worktreeGone(edit.checkout)),
+  );
   const newest = newestPerFile(session, home);
   const coverage: Coverage = { files: edits.length, upTo: record.edited[root] ?? 0, covered: [], gaps: [] };
   // A whole-change check that answered after a file's last edit settled it:
