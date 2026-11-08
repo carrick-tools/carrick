@@ -8,11 +8,15 @@
     "src/s-destructure.ts": "room.destructured",
     "src/c-fallback-stated.ts": "/n/fallback-stated",
     "src/q-fallback-stated.ts": "orders.fallback-stated",
-    "src/s-fallback-stated.ts": "room.fallback-stated"
+    "src/s-fallback-stated.ts": "room.fallback-stated",
+    "src/c-static-field.ts": "/c/static-field",
+    "src/q-static-field.ts": "orders.static-field",
+    "src/s-static-field.ts": "room.static-field"
   },
   "kind_asked": [
     "src/q-destructure.ts",
-    "src/q-fallback-stated.ts"
+    "src/q-fallback-stated.ts",
+    "src/q-static-field.ts"
   ],
   "unnamed": [
     "src/c-destructure-written.ts",
@@ -20,6 +24,8 @@
     "src/q-coalesce.ts",
     "src/s-coalesce.ts",
     "src/c-coalesce-const.ts",
-    "src/c-union.ts"
+    "src/c-union.ts",
+    "src/c-static-written.ts",
+    "src/c-static-exported.ts"
   ]
 }

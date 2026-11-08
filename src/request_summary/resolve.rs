@@ -104,7 +104,7 @@ impl ModuleBinding {
     /// walk) read this entry: an enum holds no value, and a text-only local
     /// is held by its scope.
     pub(super) fn values_read(&self) -> bool {
-        self.kind != BindingKind::Enum && !self.text_only
+        !matches!(self.kind, BindingKind::Enum | BindingKind::StaticField) && !self.text_only
     }
 }
 
@@ -117,6 +117,11 @@ pub(super) enum BindingKind {
     Var,
     /// A TypeScript enum: `text` holds its members.
     Enum,
+    /// A `static` property of a class declared at module scope, keyed by the
+    /// property key's line and name (carrick#3504 S2b-6): `text` is its
+    /// initialiser as text, `None` where the class or property may change
+    /// after it is declared.
+    StaticField,
 }
 
 impl From<VarDeclKind> for BindingKind {
@@ -176,6 +181,16 @@ struct WriteCensus {
     /// method (`R.a = x`, `R.a++`, `delete R.a`, `R.list.push(x)`): the
     /// object it holds may change.
     entry_escapes: HashSet<BindingKey>,
+    /// How many of the references are `new C(…)` (carrick#3504 S2b-6).
+    constructions: HashMap<BindingKey, usize>,
+    /// How many of the references are `class D extends C`.
+    extensions: HashMap<BindingKey, usize>,
+    /// The key of every member something writes, updates or deletes
+    /// anywhere in the module (`X.P = v`, `this.P++`, `delete X.P`, a
+    /// pattern target): a static field with such a key may change.
+    written_keys: HashSet<String>,
+    /// A member with a computed key is written: any static field may change.
+    written_computed: bool,
 }
 
 /// Every binding a pattern writes.
@@ -229,6 +244,49 @@ impl WriteCensus {
             && count(&self.references) == count(&self.entry_reads) + 1
     }
 
+    /// Notes that the member `expr` names (if it is one) is written.
+    fn write_member(&mut self, expr: &Expr) {
+        let mut expr = expr;
+        loop {
+            match expr {
+                Expr::Paren(paren) => expr = &paren.expr,
+                Expr::TsNonNull(inner) => expr = &inner.expr,
+                Expr::TsAs(inner) => expr = &inner.expr,
+                _ => break,
+            }
+        }
+        if let Expr::Member(member) = expr {
+            match &member.prop {
+                MemberProp::Ident(prop) => {
+                    self.written_keys.insert(prop.sym.to_string());
+                }
+                MemberProp::PrivateName(_) => {}
+                MemberProp::Computed(_) => self.written_computed = true,
+            }
+        }
+    }
+
+    /// Whether nothing in the module changes the static field `key` of the
+    /// class `class` after its declaration (carrick#3504 S2b-6): the class
+    /// is not exported, nothing writes it or one of its entries, and every
+    /// reference to it is an entry read, a construction or an `extends`; and
+    /// no member with that key is written anywhere (`D.P = v` on a subclass,
+    /// `this.P = v` in a static method).
+    fn static_field_kept(&self, class: &BindingKey, key: &str, exported: bool) -> bool {
+        let count = |counts: &HashMap<BindingKey, usize>| counts.get(class).copied().unwrap_or(0);
+        !exported
+            && !self.is_unplaceable(class)
+            && !self.writes.contains_key(class)
+            && !self.entry_escapes.contains(class)
+            && !self.written_computed
+            && !self.written_keys.contains(key)
+            && count(&self.references)
+                == count(&self.entry_reads)
+                    + count(&self.constructions)
+                    + count(&self.extensions)
+                    + 1
+    }
+
     /// A write the readers cannot place: a compound or logical assignment,
     /// an update, a destructuring target, a loop head, a second
     /// declaration, or `with` or `eval` in the module (soundness rule 1).
@@ -275,6 +333,7 @@ impl Visit for WriteCensus {
                 if let Some(key) = member_root(member) {
                     self.entry_escapes.insert(key);
                 }
+                self.write_member(&Expr::Member(member.clone()));
             }
             // `(s) = …`, `s! = …`, `(s as T) = …`: the binding is written in
             // a form no reader places. A member target writes a property,
@@ -303,12 +362,36 @@ impl Visit for WriteCensus {
             self.unplaceable.insert(ident_key(ident));
         }
         self.escape(&update.arg);
+        self.write_member(&update.arg);
         update.visit_children_with(self);
+    }
+
+    fn visit_new_expr(&mut self, new: &NewExpr) {
+        if let Expr::Ident(ident) = &*new.callee {
+            *self.constructions.entry(ident_key(ident)).or_default() += 1;
+        }
+        new.visit_children_with(self);
+    }
+
+    fn visit_class(&mut self, class: &Class) {
+        if let Some(Expr::Ident(ident)) = class.super_class.as_deref() {
+            *self.extensions.entry(ident_key(ident)).or_default() += 1;
+        }
+        class.visit_children_with(self);
+    }
+
+    fn visit_pat(&mut self, pat: &Pat) {
+        // `[X.P] = …`, `({ a: X.P } = …)`, `for (X.P of …)`.
+        if let Pat::Expr(expr) = pat {
+            self.write_member(expr);
+        }
+        pat.visit_children_with(self);
     }
 
     fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
         if unary.op == UnaryOp::Delete {
             self.escape(&unary.arg);
+            self.write_member(&unary.arg);
         }
         unary.visit_children_with(self);
     }
@@ -390,6 +473,10 @@ pub(super) fn module_bindings(
     let identity = |lo: u32| lo;
     let mut out: HashMap<(u32, String), ModuleBinding> = HashMap::new();
     for item in &module.body {
+        if let Some((class, exported)) = module_class_decl(item) {
+            static_fields(class, exported, &census, source_map, &mut out);
+            continue;
+        }
         let Some(var) = module_var_decl(item) else {
             continue;
         };
@@ -478,6 +565,87 @@ pub(super) fn module_bindings(
         }
     }
     out
+}
+
+/// The class a module item declares, and whether it is exported inline.
+fn module_class_decl(item: &ModuleItem) -> Option<(&ClassDecl, bool)> {
+    match item {
+        ModuleItem::Stmt(Stmt::Decl(Decl::Class(class))) => Some((class, false)),
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+            Decl::Class(class) => Some((class, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A plain (identifier) key a class member names.
+fn plain_key(key: &PropName) -> Option<&str> {
+    match key {
+        PropName::Ident(ident) => Some(&ident.sym),
+        _ => None,
+    }
+}
+
+/// Each `static` property with a plain key and an initialiser the class
+/// declares, as a [`BindingKind::StaticField`] entry keyed by the key's line
+/// and name (carrick#3504 S2b-6). Its text is set only where nothing changes
+/// the field after the declaration ([`WriteCensus::static_field_kept`]), the
+/// property is the only static member with its key, and the class has no
+/// decorator, static block or accessor; else the entry has no text.
+fn static_fields(
+    class: &ClassDecl,
+    exported: bool,
+    census: &WriteCensus,
+    source_map: &Lrc<SourceMap>,
+    out: &mut HashMap<(u32, String), ModuleBinding>,
+) {
+    let class_key = ident_key(&class.ident);
+    let body = &class.class;
+    let plain = body.decorators.is_empty()
+        && !body.body.iter().any(|member| {
+            matches!(
+                member,
+                ClassMember::StaticBlock(_) | ClassMember::AutoAccessor(_)
+            )
+        });
+    let static_members_named = |name: &str| {
+        body.body
+            .iter()
+            .filter(|member| match member {
+                ClassMember::ClassProp(prop) => {
+                    prop.is_static && plain_key(&prop.key) == Some(name)
+                }
+                ClassMember::Method(method) => {
+                    method.is_static && plain_key(&method.key) == Some(name)
+                }
+                _ => false,
+            })
+            .count()
+    };
+    for member in &body.body {
+        let ClassMember::ClassProp(prop) = member else {
+            continue;
+        };
+        let (true, Some(name), Some(value)) = (prop.is_static, plain_key(&prop.key), &prop.value)
+        else {
+            continue;
+        };
+        let line = source_map.lookup_char_pos(prop.key.span().lo).line as u32;
+        let kept = plain
+            && !prop.declare
+            && prop.decorators.is_empty()
+            && static_members_named(name) == 1
+            && census.static_field_kept(&class_key, name, exported);
+        out.insert(
+            (line, name.to_string()),
+            ModuleBinding {
+                kind: BindingKind::StaticField,
+                text: kept.then(|| text_of(value, &|lo| lo)),
+                ..ModuleBinding::default()
+            },
+        );
+    }
 }
 
 /// Every enum a module declares, at any depth, by the line and name of its
