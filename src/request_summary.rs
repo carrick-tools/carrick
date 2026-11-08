@@ -1629,6 +1629,13 @@ impl FileIr {
         lo.saturating_sub(self.source_start) + SWC_SPAN_BASE
     }
 
+    /// A span start in SWC numbering (a fresh parse of this file's source,
+    /// as the records' reader makes) in discovery numbering: the inverse of
+    /// [`Self::swc_start`].
+    pub(crate) fn discovery_start(&self, lo: u32) -> u32 {
+        lo.saturating_sub(SWC_SPAN_BASE) + self.source_start
+    }
+
     /// The import bindings whose declaring module the summaries read, the
     /// modules the file loads, and, when `every_specifier`, every specifier
     /// it loads a module by ([`crate::call_graph::resolve_call_edges`]'s
@@ -5685,11 +5692,18 @@ impl Reader<'_> {
                     }
                     // One the body writes again is every value written to
                     // it: the value resolver's binding table reads it, with
-                    // the module's write census (carrick#3504 S1b). Read
-                    // only where the body declares the name once: the census
-                    // keys writes by binding, the table by line and name.
+                    // the module's write census (carrick#3504 S1b). Every
+                    // other local the body declares once is in the table for
+                    // the text reader (S2): the scope holds it for the value
+                    // readers (`values_in` returns `held` first, and a local
+                    // not held has an initialiser that is all `Unread`), so
+                    // they do not read this entry (`text_only`). A local
+                    // written inside a function written in this body, or in
+                    // a block at module scope, is not pushed. Read only
+                    // where the body declares the name once: the census keys
+                    // writes by binding, the table by line and name; never
+                    // `binding_count`, which counts assignment targets too.
                     if let Pat::Ident(ident) = &declarator.name
-                        && reassigned.names.contains(ident.id.sym.as_ref())
                         && reassigned.declared_once(&declared, ident.id.sym.as_ref())
                     {
                         ir.local_bindings.push(resolve::LocalBinding {
@@ -5700,6 +5714,12 @@ impl Reader<'_> {
                                 .as_deref()
                                 .map(|init| self.value_of(init, scope, &guards::Bound::default()))
                                 .unwrap_or_default(),
+                            kind: var.kind.into(),
+                            text: declarator
+                                .init
+                                .as_deref()
+                                .map(|init| resolve::text_of(init, &|lo| lo)),
+                            reassigned: reassigned.names.contains(ident.id.sym.as_ref()),
                         });
                     }
                     // A `let` set again on every path to one of a few makers'

@@ -1603,7 +1603,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         let Some(binding) = ir
             .module_bindings
             .get(&(line, symbol.to_string()))
-            .filter(|binding| binding.declared_in.is_none())
+            .filter(|binding| binding.declared_in.is_none() && binding.values_read())
         else {
             return false;
         };
