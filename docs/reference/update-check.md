@@ -2,7 +2,8 @@
 
 Governs `npm/carrick/src/update.ts`, `npm/carrick/src/update-check.ts`, the
 `noticeUpdate()` block in `npm/carrick/bin/carrick.mjs`, the version line in
-`npm/carrick/src/hook/session-start.ts`, and `checkVersion` /
+`npm/carrick/src/hook/session-start.ts`, `npm/carrick/src/hook/upgrade.ts`,
+`npm/carrick/src/upgrade.ts`, `npm/carrick/src/self-upgrade.ts`, and `checkVersion` /
 `pinnedActionRef` in `npm/carrick/src/init/doctor.ts`.
 
 ## The problem
@@ -43,36 +44,45 @@ from that moment the version on that machine never moves. The same is true of
 a `carrick` devDependency. This is what bit the customer and it is what this
 subsystem exists for.
 
-## Notify, do not self-update
+## An existing global install upgrades itself; everything else is told
 
-Two camps in the ecosystem. Notify-and-name-the-command: npm (update-notifier),
-`gh` (a cached check plus `GH_NO_UPDATE_NOTIFIER`), pnpm, deno, uv, rustup,
-bun, wrangler, vercel — all of them print, and all of them keep the upgrade as
-a separate explicit act. Self-mutating: Homebrew, Claude Code.
+David, 2026-11-08: "carrick should update itself". The earlier rule was to
+notify and name the command, because a self-update that guesses the install
+shape adds a second install beside the stale one, and PATH picks whichever it
+likes. This one does not guess: it resolves `carrick` on PATH, reads the shape
+off where that install sits, installs with the manager that owns it, and
+resolves `carrick` again to check (`syncGlobalInstall`, "Global sync" below).
 
-The dividing line is not taste, it is whether the tool owns its install
-location. Homebrew owns a prefix; Claude Code ships a native installer for
-exactly this reason. Carrick does not own anything: it can be under `npm -g`,
-`pnpm -g`, `bun -g`, a Volta shim, an npx cache, one global per nvm-managed
-Node, or a project's `node_modules`. A self-update that guesses the shape
-wrong does not fix a stale install — it adds a second one beside it, and PATH
-picks whichever it likes. That is precisely the "two versions on one machine
-in one morning" incident, not a fix for it.
+The rule:
 
-So: **detect the shape and print the exact command for it.** An agent that
-reads "Update with `pnpm add -D carrick@latest`" runs that command; the value
-is in getting the command right, which a self-updater needs to do anyway and
-which fails silently when it is wrong.
+- **A global install that already exists** (npm, pnpm, bun, volta) is upgraded
+  at session start, in a detached child, to the registry's `latest`
+  (`src/self-upgrade.ts`, `src/upgrade.ts`). Keeping an existing global current
+  is inside what the user agreed to when they installed it. The next session
+  says it is done.
+- **A project dependency and an npx run** are never upgraded by us. Editing
+  `package.json` or a lockfile is the repository's dependency tooling's job.
+  They get the notice with the exact command.
+- **Never a fresh install.** A machine with no global carrick on PATH is left
+  alone; the offer is `carrick init`'s, where somebody can be asked.
+- **Never across a major version, and never past the user's own npm policy**:
+  no flag of ours overrides a registry, a prefix or a release-age policy.
+- **Session start only.** Not from a hook that fires on edits and not in front
+  of a typed command: that would swap the binary under a running task and add
+  the package manager's time to a command somebody is waiting on.
+- **One attempt per release.** A claim keyed on the target version stops a
+  second child inside the check interval, and a release the machine refused or
+  could not make current is not tried again; the next release is.
+- **One off switch.** `CARRICK_NO_UPDATE_CHECK=1` also stops the upgrade, and CI
+  never upgrades.
+- **Fail open.** The child prints nothing and any error ends it with no record.
 
-An explicit `carrick upgrade` that runs the detected command is a small
-follow-up on top of `installShape`, not a prerequisite.
+What the reader sees: the session that starts the child says so, with the
+command; the next session says "Carrick updated itself from X to Y." once. A
+refused or stale result prints its warning once, naming the command to run.
 
-That argument still holds for the notice, and "Global sync" below is where it
-stops holding. It is not a self-update: a run through npx does not replace
-itself, it replaces the OTHER carrick it can prove is there — resolved off
-PATH, with its shape read from where it actually sits, and with the result
-verified by resolving it again. The failure the paragraph above describes is a
-guess about where an install is; that one does not guess.
+An explicit `carrick upgrade` command is not built: this removes the manual
+step it was for.
 
 ## Where the check runs, and what it costs
 
