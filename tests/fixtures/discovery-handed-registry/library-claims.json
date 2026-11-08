@@ -1,0 +1,34 @@
+{
+  "library_claims": [
+    {
+      "package": "fixture-wire",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-wire",
+          "export": "listen",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "key_labels": {}, "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "fixture-wire",
+          "export": "configure",
+          "role": "none",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

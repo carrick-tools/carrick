@@ -3151,6 +3151,85 @@ mod tests {
         );
     }
 
+    /// carrick#3527: a call into code of the run that hands its callee a
+    /// function the callee keeps and never runs (an object argument holding
+    /// `handler`, or a callback argument it only stores) has not been read
+    /// whole: the function runs later, from wherever the callee put it. Such
+    /// a call is `missed_inside`, in a constructor and in a method alike. A
+    /// callee that runs its callback, and a library callee, stay `finished`.
+    /// The answer key is `tests/fixtures/discovery-handed-registry/README.md`.
+    #[test]
+    fn a_call_that_hands_its_callee_a_function_it_keeps_is_not_finished() {
+        let Some(on) = walked(
+            "discovery-handed-registry",
+            "services/relay",
+            "relay",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-handed-registry");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let span = |file: &str, needle: &str| -> (String, u32, u32) {
+            let text = std::fs::read_to_string(fixture.join("repo/services/relay/src").join(file))
+                .unwrap();
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (
+                format!("services/relay/src/{file}"),
+                lo,
+                lo + needle.len() as u32,
+            )
+        };
+        for needle in [
+            // In the constructor.
+            "this.add(\"/gauges\", \"GET\", { handler: async ({ reply }) => reply.text(\"ok\") })",
+            // In a method.
+            "this.add(\"/pulse\", \"GET\", { handler: async ({ reply }) => reply.text(\"up\") })",
+            "this.addFn(\"/beat\", async ({ reply }) => reply.text(\"b\"))",
+        ] {
+            let at = span("relay-server.ts", needle);
+            assert!(
+                discovery.missed_inside.contains(&at) && !discovery.finished.contains(&at),
+                "{needle}: missed_inside {:?} finished {:?}",
+                discovery.missed_inside,
+                discovery.finished
+            );
+        }
+        // C1: the callee runs the callback it is handed. Its `fn()` stops
+        // the walk there, as before: never `missed_inside`.
+        let runs = span(
+            "relay-server.ts",
+            "this.runNow(() => {\n      this.count += 1;\n    })",
+        );
+        assert!(!discovery.missed_inside.contains(&runs));
+        assert!(
+            discovery.sites.iter().any(|site| site.file == runs.0
+                && site.span_start == runs.1
+                && site.stop.as_deref() == Some(INJECTED_CALLEE)),
+            "{:?}",
+            discovery.sites
+        );
+        // C2: a library callee handed an object holding a function.
+        let library = span("configure.ts", "configure({ onIdle: () => {} })");
+        // C3: a function written in the caller's body, not at the call.
+        let elsewhere = span("relay-server.ts", "this.record(\"/note\")");
+        for at in [library, elsewhere] {
+            assert!(
+                discovery.finished.contains(&at),
+                "{at:?}: finished {:?} missed_inside {:?} unfollowed {:?}",
+                discovery.finished,
+                discovery.missed_inside,
+                discovery.unfollowed
+            );
+        }
+    }
+
     /// Discovery over `tests/fixtures/callee-values` with its one label.
     fn callee_values_discovery() -> Option<Discovery> {
         let on = walked("callee-values", "services/web", "web", &[], true)?;
