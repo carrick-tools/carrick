@@ -1,0 +1,109 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:50",
+      "line_number": 50,
+      "target": "/ledger",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 50,
+      "payload_expression_text": "input",
+      "payload_expression_line": 50,
+      "primary_type_symbol": "CreditReply",
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "op",
+        "value": "credit"
+      }
+    },
+    {
+      "candidate_id": "@line:57",
+      "line_number": 57,
+      "target": "/notes",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 57,
+      "payload_expression_text": "input",
+      "payload_expression_line": 57,
+      "primary_type_symbol": "AddReply",
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "kind",
+        "value": "add"
+      }
+    },
+    {
+      "candidate_id": "@line:64",
+      "line_number": 64,
+      "target": "/notes",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 64,
+      "payload_expression_text": "input",
+      "payload_expression_line": 64,
+      "primary_type_symbol": "ListReply",
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "kind",
+        "value": "list"
+      }
+    },
+    {
+      "candidate_id": "@line:71",
+      "line_number": 71,
+      "target": "/notes",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 71,
+      "payload_expression_text": "input",
+      "payload_expression_line": 71,
+      "primary_type_symbol": "PurgeReply",
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "kind",
+        "value": "purge"
+      }
+    },
+    {
+      "candidate_id": "@line:78",
+      "line_number": 78,
+      "target": "/notes",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 78,
+      "payload_expression_text": "input",
+      "payload_expression_line": 78,
+      "primary_type_symbol": "ArchiveReply",
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "kind",
+        "value": "archive"
+      }
+    },
+    {
+      "candidate_id": "@line:84",
+      "line_number": 84,
+      "target": "/notes",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 84,
+      "payload_expression_text": "command",
+      "payload_expression_line": 84,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

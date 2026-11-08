@@ -5010,12 +5010,7 @@ impl FileOrchestrator {
         let mut endpoint_lookup: EndpointLookup = HashMap::new();
         let mut data_call_lookup: DataCallLookup = HashMap::new();
         let mut inline_aliases: Vec<(String, String)> = Vec::new();
-        let should_infer_request_body = |method: &str| {
-            matches!(
-                method,
-                "POST" | "PUT" | "PATCH" | "DELETE" | "ALL" | "UNKNOWN"
-            )
-        };
+        let should_infer_request_body = crate::type_manifest::producer_reads_request_body;
         // `consumer_response` marks a symbol named for what a consumer call
         // receives (carrick#1841): the sidecar reads a response table keyed
         // by status code as its 2xx body there.

@@ -31,6 +31,15 @@ pub fn is_producer_method(method: &str) -> bool {
             .eq_ignore_ascii_case(carrick_match::ANY_METHOD)
 }
 
+/// Whether a producer registered under `method` (already normalised by
+/// [`normalize_manifest_method`]) is asked for the request body it reads.
+pub fn producer_reads_request_body(method: &str) -> bool {
+    matches!(
+        method,
+        "POST" | "PUT" | "PATCH" | "DELETE" | "ALL" | "UNKNOWN"
+    )
+}
+
 pub fn build_display_name(key: &OperationKey, type_kind: &str) -> String {
     let kind = if type_kind.is_empty() {
         type_kind.to_string()
