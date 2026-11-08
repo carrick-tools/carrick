@@ -468,7 +468,7 @@ pub fn declared_infer_requests(
     let mut requests = Vec::new();
     let mut asked: std::collections::HashSet<(String, &'static str)> = Default::default();
     for endpoint in &graph.endpoints {
-        if endpoint.resolution_source == Some(ResolutionSource::DeclaredOperation) {
+        if endpoint.resolution_source != Some(ResolutionSource::DeclaredOperation) {
             continue;
         }
         // The raw line: `parse_file_location` reads line 0 as 1, and an
