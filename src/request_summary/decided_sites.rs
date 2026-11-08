@@ -511,13 +511,20 @@ impl SiteLabel {
             && self.scope.as_ref().map(|scope| &scope.step) == end.scope.as_ref()
     }
 
-    /// Whether the op has a name to read: a slot of its own call, the
-    /// argument of the scope call it is made on the result of (carrick#1678),
-    /// or the name its receiver was made with (carrick#3527).
+    /// Whether the op has a name to read: a slot of its own call, or the
+    /// argument of the scope call it is made on the result of (carrick#1678).
+    /// A name bound to the maker is read only where the walk read it
+    /// ([`Self::reads_name_of`]).
     pub fn reads_name(&self) -> bool {
-        self.name.is_some()
-            || self.name_at_maker
-            || self.scope.as_ref().is_some_and(|scope| scope.names)
+        self.name.is_some() || self.scope.as_ref().is_some_and(|scope| scope.names)
+    }
+
+    /// Whether `site`'s name is read: [`Self::reads_name`], or a name its
+    /// receiver was made with that the walk read at the maker (carrick#3527).
+    /// A maker-bound site the walk named nothing for is read as a label with
+    /// no name slot is: the name is asked.
+    pub fn reads_name_of(&self, site: &DecidedSite) -> bool {
+        self.reads_name() || (self.name_at_maker && !site.name.is_empty())
     }
 
     /// The slot the call `end` names is handed a function in, when the store
@@ -2277,8 +2284,9 @@ impl<'a> Walk<'a, '_> {
     /// receiver is a construction, named by the values whose walk passed
     /// that class's constructor ([`Self::joined`]). Else the values are
     /// pooled at the labelled call. One name is the site's; several are a
-    /// `SeveralOperations` lead; an instance or a name no walk reads is a
-    /// `NameNeverBound` lead. True where the site is the labelled call.
+    /// `SeveralOperations` lead; an instance or a name no walk reads leaves
+    /// the site unnamed, as before ([`Self::unnamed`]). True where the site
+    /// is the labelled call.
     fn maker_named(&mut self, chain: &[Placed<'a>], end: &LabelledEnd) -> bool {
         let last = chain[chain.len() - 1];
         let Some(makers) = self.makers else {
@@ -2329,8 +2337,7 @@ impl<'a> Walk<'a, '_> {
             );
         }
         if unread || made.is_empty() {
-            self.lead(&last, end, Undecided::NameNeverBound);
-            return false;
+            return self.unnamed(chain, end);
         }
         if made.iter().all(|value| !value.passed.is_empty()) {
             self.joined(chain.to_vec(), &made, end, &mut Vec::new());
@@ -2412,8 +2419,8 @@ impl<'a> Walk<'a, '_> {
     /// first to the labelled call), then of its callers up, whose receiver is
     /// a construction written in place, named by the values `made` whose walk
     /// passed that class's constructor body. A walk that meets no such call,
-    /// or a construction no value passed, is a `NameNeverBound` lead where it
-    /// ends. `path` ends a cycle.
+    /// or a construction no value passed, names nothing ([`Self::unnamed`]).
+    /// `path` ends a cycle.
     fn joined(
         &mut self,
         down: Vec<Placed<'a>>,
@@ -2430,7 +2437,7 @@ impl<'a> Walk<'a, '_> {
                 .filter(|value| value.passed.contains(&constructor))
                 .collect();
             if fitting.is_empty() {
-                self.lead(&down[k], end, Undecided::NameNeverBound);
+                self.unnamed(&down, end);
             } else {
                 self.named_by(&down[k..], &fitting, end);
             }
@@ -2438,7 +2445,7 @@ impl<'a> Walk<'a, '_> {
         }
         let top = down[0];
         let Some(key) = top.key else {
-            self.lead(&top, end, Undecided::NameNeverBound);
+            self.unnamed(&down, end);
             return;
         };
         let here = (top.file.to_path_buf(), key.to_string());
@@ -2449,7 +2456,7 @@ impl<'a> Walk<'a, '_> {
         }
         let callers = self.calls.callers_of(top.file, key);
         if callers.is_empty() {
-            self.lead(&top, end, Undecided::NameNeverBound);
+            self.unnamed(&down, end);
             return;
         }
         if path.contains(&here) {
@@ -2462,6 +2469,23 @@ impl<'a> Walk<'a, '_> {
             self.joined(longer, made, end, path);
         }
         path.pop();
+    }
+
+    /// A maker-bound op whose name no walk reads (an instance the walk does
+    /// not reach, as in a sibling's files, or a value it does not read): the
+    /// site the op's call is with no name read, as when the label names no
+    /// slot, so the name is asked as before (carrick#3527). For a sibling's
+    /// call, at the call of this service that enters it (`down[0]`). True
+    /// where the site is the labelled call.
+    fn unnamed(&mut self, down: &[Placed<'a>], end: &LabelledEnd) -> bool {
+        let last = down[down.len() - 1];
+        if self.calls.is_own(last.file) {
+            self.site(&[last], end, Vec::new(), BTreeSet::new());
+            true
+        } else {
+            self.site(down, end, Vec::new(), BTreeSet::new());
+            false
+        }
     }
 
     /// The site `down[0]` (calls down to the labelled call), named by the one
@@ -3549,7 +3573,8 @@ pub(crate) mod tests {
 
     /// carrick#2439: the scan's settled claims give one label per op, with
     /// its slots, method fields, role and side, as the store's raw answer
-    /// does; a maker labels no op, and a bound name no name slot.
+    /// does; a maker labels no op, and a name bound to the maker no name
+    /// slot of the op's own call: it is read at the maker (carrick#3527).
     #[test]
     fn labels_read_from_the_settled_claims() {
         let exports: Vec<crate::library_claims::ExportClaims> =
@@ -3603,7 +3628,8 @@ pub(crate) mod tests {
                     by_origin: false,
                     yields: None,
                     name_scope: None,
-                    name_at_maker: false,
+                    // A name bound to the maker is read there (carrick#3527).
+                    name_at_maker: true,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("send".into()),

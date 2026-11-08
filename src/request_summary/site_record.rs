@@ -1788,7 +1788,7 @@ fn record(
         .iter()
         .filter_map(|index| parts.arg_exprs.get(*index))
         .collect();
-    let whole_names: Option<BTreeSet<String>> = match (&site.key, label.reads_name()) {
+    let whole_names: Option<BTreeSet<String>> = match (&site.key, label.reads_name_of(site)) {
         (Some(key), _) => {
             stated.value(key, place(PlaceFrom::ObjectKey, &at));
             Some(BTreeSet::from([key.clone()]))
@@ -1923,7 +1923,7 @@ fn record(
     // when it states several; a lead when it states none whole. A label
     // that names no name slot forces neither the name nor the argument it
     // is read from: both are asked.
-    let name_unstated = match (label.reads_name(), &whole_names) {
+    let name_unstated = match (label.reads_name_of(site), &whole_names) {
         (false, _) => {
             decide(Slot::Name, Vec::new(), true, Basis::Code);
             if site.key.is_none() {
