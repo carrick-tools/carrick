@@ -164,6 +164,14 @@ pub struct Asked {
     /// the service imports it by (`events`, `node:events`): the store answers
     /// its exports under the `node:` form only.
     spellings: BTreeMap<String, BTreeSet<String>>,
+    /// Every npm alias the service imports (`socket.io-client-v4`, installed
+    /// as `npm:socket.io-client@4.x`), by the specifier the store is asked
+    /// under (`socket.io-client`, `socket.io-client/dist/x`): the spellings
+    /// the service imports it by. The store knows the real package only.
+    aliases: BTreeMap<String, BTreeSet<String>>,
+    /// The real packages asked on an alias's account: their exports are kept
+    /// only under a specifier in `aliases`.
+    aliased: BTreeSet<String>,
 }
 
 impl Asked {
@@ -191,6 +199,8 @@ impl Asked {
                     .collect(),
             },
             spellings: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            aliased: BTreeSet::new(),
         }
     }
 
@@ -210,6 +220,8 @@ impl Asked {
                 packages: Vec::new(),
             },
             spellings: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            aliased: BTreeSet::new(),
         });
         let room = MAX_PACKAGES.saturating_sub(asked.request.packages.len());
         asked
@@ -265,6 +277,14 @@ impl Asked {
             for (module, spellings) in other.spellings {
                 asked.spellings.entry(module).or_default().extend(spellings);
             }
+            for (specifier, spellings) in other.aliases {
+                asked
+                    .aliases
+                    .entry(specifier)
+                    .or_default()
+                    .extend(spellings);
+            }
+            asked.aliased.extend(other.aliased);
         }
         (merged, dropped)
     }
@@ -302,6 +322,18 @@ impl Asked {
                 package.package == export.package && package.version == export.version
             });
             if !asked {
+                continue;
+            }
+            if self.aliased.contains(&export.package) {
+                match self.aliases.get(&export.specifier) {
+                    Some(spellings) => {
+                        claims.extend(spellings.iter().map(|spelling| ExportClaims {
+                            specifier: spelling.clone(),
+                            ..export.clone()
+                        }))
+                    }
+                    None => claims.push(export),
+                }
                 continue;
             }
             match self.spellings.get(&export.package) {
@@ -350,6 +382,8 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
     let runtime = installed(RUNTIME_TYPES, install);
     let mut by_package: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
     let mut spellings: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut aliases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut aliased: BTreeSet<String> = BTreeSet::new();
     for specifier in specifiers {
         let Some(asked) = asked_as(specifier, &declared, runtime.as_ref(), install) else {
             continue;
@@ -360,9 +394,27 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
                 .or_default()
                 .insert(specifier.clone());
             asked.package.clone()
+        } else if let Some(imported) = &asked.imported_as {
+            // An npm alias: the store is asked under the real package, and
+            // the answer read back onto the spelling imported.
+            let wire = format!("{}{}", asked.package, &specifier[imported.len()..]);
+            aliases
+                .entry(wire.clone())
+                .or_default()
+                .insert(specifier.clone());
+            aliased.insert(asked.package.clone());
+            wire
         } else {
             specifier.clone()
         };
+        // One entry per package at one version: an alias installed at another
+        // version than the package itself is left unasked (fail closed).
+        if by_package
+            .get(&asked.package)
+            .is_some_and(|(version, _)| *version != asked.version)
+        {
+            continue;
+        }
         by_package
             .entry(asked.package)
             .or_insert_with(|| (asked.version, BTreeSet::new()))
@@ -385,6 +437,8 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
             packages,
         },
         spellings,
+        aliases,
+        aliased,
     })
 }
 
@@ -558,6 +612,9 @@ struct AskedAs {
     package: String,
     version: String,
     runtime: bool,
+    /// The package name the service imports it by, when that is an npm alias
+    /// for `package`.
+    imported_as: Option<String>,
 }
 
 /// The package and version `specifier` is asked about, if it is asked about
@@ -577,6 +634,7 @@ fn asked_as(
             package: format!("node:{module}"),
             version: runtime.version.clone(),
             runtime: true,
+            imported_as: None,
         })
     };
     // `node:events`: the runtime's module, at its types package's version.
@@ -593,7 +651,11 @@ fn asked_as(
     let name = crate::request_summary::package_name(specifier);
     let package = installed(name, install)?;
     from_public_registry(name, &package, install).then(|| AskedAs {
-        package: name.to_string(),
+        // An npm alias (`npm:<real>@<range>`) is asked under the real name its
+        // installed manifest states, never the alias (the store serves only
+        // names npm does).
+        imported_as: (package.name != name).then(|| name.to_string()),
+        package: package.name,
         version: package.version,
         runtime: false,
     })
@@ -604,6 +666,9 @@ fn asked_as(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Installed {
     dir: PathBuf,
+    /// The name its manifest states: differs from the directory's for an npm
+    /// alias.
+    name: String,
     version: String,
     /// The directory whose `node_modules` holds it: where its install ran.
     install_root: PathBuf,
@@ -620,8 +685,14 @@ fn installed(name: &str, install: &Install<'_>) -> Option<Installed> {
             let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
             let manifest: Value = serde_json::from_str(&text).ok()?;
             let version = manifest.get("version")?.as_str()?.to_string();
+            let real = manifest
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(name)
+                .to_string();
             Some(Installed {
                 dir,
+                name: real,
                 version,
                 install_root: root,
             })
@@ -692,7 +763,7 @@ fn from_public_registry(name: &str, package: &Installed, install: &Install<'_>) 
     let answers: Vec<bool> = [
         npm_lock(name, package, &lock_dir, NpmLock::Hidden),
         npm_lock(name, package, &lock_dir, NpmLock::Committed),
-        pnpm_lock(name, package, &lock_dir, install),
+        pnpm_lock(&package.name, package, &lock_dir, install),
         yarn_lock(name, package, &lock_dir, install),
         deno_lock(name, package, &lock_dir, install),
     ]
@@ -1020,12 +1091,16 @@ fn yarn_berry(
     let Ok(serde_yaml_ng::Value::Mapping(entries)) = serde_yaml_ng::from_str(text) else {
         return false;
     };
-    let wanted = format!("{name}@npm:{}", package.version);
+    // An npm alias resolves as `<alias>@npm:<real>@<version>`.
+    let wanted = [
+        format!("{name}@npm:{}", package.version),
+        format!("{name}@npm:{}@{}", package.name, package.version),
+    ];
     let resolved_by_npm = entries.iter().any(|(_, entry)| {
         entry
             .get("resolution")
             .and_then(serde_yaml_ng::Value::as_str)
-            == Some(wanted.as_str())
+            .is_some_and(|resolution| wanted.iter().any(|wanted| wanted == resolution))
     });
     if !resolved_by_npm {
         return false;
@@ -2687,6 +2762,59 @@ mod tests {
             asked(request),
             one("node:events", "22.5.0", &["node:events"])
         );
+    }
+
+    /// An npm alias installed as `npm:<real>@<range>`: `node_modules/<alias>`
+    /// holds the real package's manifest.
+    fn install_alias(root: &Path, alias: &str, real: &str, version: &str) {
+        write(
+            &root.join("node_modules").join(alias).join("package.json"),
+            &format!(r#"{{"name":"{real}","version":"{version}"}}"#),
+        );
+    }
+
+    #[test]
+    fn an_npm_alias_is_asked_under_its_real_name_and_read_back_on_the_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        install_alias(dir.path(), "lib-v4", "lib", "4.8.1");
+        npm_lockfile(dir.path(), &[("lib-v4", PUBLIC_TGZ)]);
+        let asked = request(
+            &specifiers(&["lib-v4", "lib-v4/dist/x"]),
+            &install_at(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            self::asked(Some(asked.clone())),
+            one("lib", "4.8.1", &["lib", "lib/dist/x"])
+        );
+        let answered = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"4.8.1","status":"answered","exports":[
+                {"specifier":"lib","export":"io","role":"socket","side":null,"ops":[]},
+                {"specifier":"lib/dist/x","export":"Manager","role":"socket","side":null,"ops":[]}]}]}"#,
+        );
+        let mut read: Vec<(String, String)> = asked
+            .claims(answered.exports)
+            .into_iter()
+            .map(|export| (export.specifier, export.export))
+            .collect();
+        read.sort();
+        assert_eq!(
+            read,
+            vec![
+                ("lib-v4".to_string(), "io".to_string()),
+                ("lib-v4/dist/x".to_string(), "Manager".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_alias_at_another_version_than_the_package_itself_is_left_unasked() {
+        let dir = tempfile::tempdir().unwrap();
+        install_package(dir.path(), "lib", "2.5.0");
+        install_alias(dir.path(), "lib-v4", "lib", "4.8.1");
+        npm_lockfile(dir.path(), &[("lib", PUBLIC_TGZ), ("lib-v4", PUBLIC_TGZ)]);
+        let request = request(&specifiers(&["lib", "lib-v4"]), &install_at(dir.path()));
+        assert_eq!(asked(request), one("lib", "2.5.0", &["lib"]));
     }
 
     #[test]
