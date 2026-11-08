@@ -1358,11 +1358,11 @@ impl<'a> Calls<'a> {
             .map_or(&[], Vec::as_slice)
     }
 
-    /// The inputs of this service or the sibling that holds `file`.
+    /// What this service or the sibling that holds `file` read of it.
     fn file_ir(&self, file: &Path) -> Option<&'a super::FileIr> {
-        std::iter::once(self.own)
-            .chain(self.siblings.iter().copied())
-            .find_map(|inputs| inputs.files.get(file))
+        super::discovery::inputs_holding(self.own, &self.siblings, file)
+            .files
+            .get(file)
     }
 
     /// Whether the definition `key` of `file` (this service's or a
