@@ -265,7 +265,7 @@ test("a tracked stale skill and settings file are left byte for byte and named i
   const skill = put(workspace.root, skillPath, stamped("an older body"));
   recordVersion(workspace.root, "0.0.1");
   git(workspace.root, "init", "-q");
-  git(workspace.root, "add", LOCAL, skillPath);
+  git(workspace.root, "add", "-f", LOCAL, skillPath);
   git(workspace.root, "commit", "-q", "-m", "tracked");
   const settingsBefore = fs.readFileSync(settings, "utf8");
   const skillBefore = fs.readFileSync(skill, "utf8");
@@ -285,7 +285,7 @@ test("when every outdated file is tracked, the held line replaces the version mi
   put(workspace.root, LOCAL, olderSettings());
   recordVersion(workspace.root, "0.0.1");
   git(workspace.root, "init", "-q");
-  git(workspace.root, "add", LOCAL);
+  git(workspace.root, "add", "-f", LOCAL);
   git(workspace.root, "commit", "-q", "-m", "tracked");
 
   const run = await session(workspace);
@@ -316,7 +316,7 @@ test("a repo below a folder keeps its tracked settings file byte for byte and na
   const repo = path.join(workspace.root, "api");
   const settings = put(repo, LOCAL, olderSettings());
   git(repo, "init", "-q");
-  git(repo, "add", LOCAL);
+  git(repo, "add", "-f", LOCAL);
   git(repo, "commit", "-q", "-m", "tracked");
   const before = fs.readFileSync(settings, "utf8");
 
