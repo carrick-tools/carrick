@@ -1856,6 +1856,15 @@ impl<'a> Walker<'a> {
         {
             return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
+        // A member of an object the compiler declares in the repository and
+        // no body implements: the function written at that key of each
+        // object the callee's object may hold (carrick#2448).
+        if reach == Reach::NoFunction
+            && !construction
+            && let Some(values) = self.key_callee(file, call, invoke)
+        {
+            return self.agree(values, invoke, Vec::new(), OF_VALUES);
+        }
         match reach {
             Reach::Function(target, key) => {
                 let hop = self.hop(&target, &key);
@@ -1922,6 +1931,23 @@ impl<'a> Walker<'a> {
             Reach::NoFunction => Outcome::default(),
             Reach::Unknown(reason) => Outcome::stopped(super::row_calls::hole_key(reason)),
         }
+    }
+
+    /// What the key `call`'s callee reads, `object.key`, holds in each
+    /// object its object may hold (carrick#2448): `None` where the rows give
+    /// the call no in-repo declaration, or the object is not one this reads.
+    fn key_callee(
+        &mut self,
+        file: &'a Path,
+        call: &'a CallIr,
+        invoke: Invoke<'a>,
+    ) -> Option<Vec<Held<'a>>> {
+        let key = call.callee_key.as_ref()?;
+        if !self.row(file, call).is_some_and(in_repo) {
+            return None;
+        }
+        let resolver = self.values;
+        resolver.key_values(self, file, key, invoke)
     }
 
     /// What the module binding `call`'s row names as its callee may hold
@@ -2939,6 +2965,105 @@ mod tests {
                 .iter()
                 .all(|site| site.stop.as_deref() != Some(UNANSWERED_PACKAGE))
         );
+    }
+
+    /// carrick#2448 T1: a member call on an object an in-repo factory returns
+    /// enters the function written at that key. `r1` sends through arrows in
+    /// the returned object; a write through the held object (`n1/escaped`)
+    /// and a client that sends nothing (`n1/cache`) enter nothing. The answer
+    /// key is `tests/fixtures/generated-client/README.md`.
+    #[test]
+    fn a_member_call_on_an_object_a_factory_returns_enters_the_function_at_that_key() {
+        let Some(on) = walked("generated-client", "", "", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        for (line, arrow) in [(5, 10), (8, 11), (10, 10)] {
+            let [site] = at("r1/sdk.ts", line)[..] else {
+                panic!(
+                    "a site at r1/sdk.ts:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("lib:lib.dom.d.ts", "fetch")
+            );
+            assert!(end.file.ends_with("r1/client.ts"), "{end:?}");
+            // `get` and `post` are written at lines 10 and 11 of the client.
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert!(
+                hops.contains(&(VALUE_HOP, arrow)),
+                "the chain goes through the arrow at the key: {hops:?}"
+            );
+        }
+        assert!(
+            at("n1/escaped.ts", 11)
+                .iter()
+                .all(|site| site.end.is_none()),
+            "an object written through is a hole: {:?}",
+            at("n1/escaped.ts", 11)
+        );
+        assert!(
+            at("n1/cache.ts", 19).iter().all(|site| site.end.is_none()),
+            "a client that sends nothing has no end"
+        );
+    }
+
+    /// carrick#2448 T1, soundness rule 2.3.3 across modules: the object a
+    /// module binding holds is read at a key only where no importer hands it
+    /// on. A module that passes `client` to a call may have it changed, so
+    /// the calls through it enter nothing.
+    #[test]
+    fn an_object_an_importer_hands_on_is_not_read_at_its_key() {
+        let Some(on) = walked(
+            "generated-client",
+            "",
+            "",
+            &[(
+                "src/r1/leak.ts",
+                "import { client } from './client';\nexport const leak = (use: (c: unknown) => void) => use(client);\n",
+            )],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let reached: Vec<u32> = discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with("r1/sdk.ts") && site.end.is_some())
+            .map(|site| site.line)
+            .collect();
+        // The calls through the module binding (`client.get`, line 10) are
+        // contested; the ones through `options.client ?? client` read
+        // `client` the same way.
+        assert!(reached.is_empty(), "{reached:?}");
     }
 
     /// carrick#2432 slice A2: a factory that returns a function it declares,

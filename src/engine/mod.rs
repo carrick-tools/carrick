@@ -5839,7 +5839,12 @@ async fn analyze_current_repo_incremental(
                 crate::parser::read_source(&Path::new(repo_path).join(file))
             });
             debug!("Handler spans placed on endpoint rows: {placed}");
-            crate::unfollowed_calls::attach(&mut cloud_data, &request_inputs.unfollowed, repo_path);
+            crate::unfollowed_calls::attach(
+                &mut cloud_data,
+                &request_inputs.unfollowed,
+                repo_path,
+                &site_fold.fact_call_lines(),
+            );
 
             // Same last step as the full branch: the boundary is read off the
             // finished payload once its paths are repo-relative (carrick#705).
@@ -13613,7 +13618,12 @@ async fn analyze_current_repo(
         crate::parser::read_source(&Path::new(repo_path).join(file))
     });
     debug!("Handler spans placed on endpoint rows: {placed}");
-    crate::unfollowed_calls::attach(&mut cloud_data, &request_inputs.unfollowed, repo_path);
+    crate::unfollowed_calls::attach(
+        &mut cloud_data,
+        &request_inputs.unfollowed,
+        repo_path,
+        &site_fold.fact_call_lines(),
+    );
 
     // 9. What this scan could not classify, stated beside what it did
     // (carrick#705). Collected last, off the finished payload and the stats of

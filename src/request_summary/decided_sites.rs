@@ -2892,6 +2892,15 @@ fn decide(
         .filter_map(|site| site.chain.first())
         .map(|hop| (root.join(&hop.file), hop.function.clone()))
         .collect();
+    // The functions written in place that some listed site's call runs as a
+    // value (carrick#2448), by file and the line they start on: a call in
+    // one whose value still holds a parameter is decided by that site's call.
+    let value_entered: HashSet<(PathBuf, u32)> = discovered
+        .iter()
+        .flat_map(|site| &site.chain)
+        .filter(|hop| hop.function == VALUE_HOP)
+        .map(|hop| (root.join(&hop.file), hop.line))
+        .collect();
     let mut tables: HashMap<(PathBuf, u32), Option<Vec<TableKey>>> = HashMap::new();
     let mut walked: Vec<String> = Vec::new();
     let mut unplaced: Vec<String> = Vec::new();
@@ -3058,6 +3067,20 @@ fn decide(
             walk.value_hop = false;
             continue;
         }
+        // A call into a function that runs a function written in place as a
+        // value: the call inside it that runs the value is a site of its
+        // own, and decides the name (carrick#2448).
+        if let [.., owner, hop] = site.chain.as_slice()
+            && hop.function == VALUE_HOP
+            && discovered.iter().any(|other| {
+                other.end == site.end
+                    && other.stop.is_none()
+                    && other.file == owner.file
+                    && matches!(other.chain.as_slice(), [only] if only == hop)
+            })
+        {
+            continue;
+        }
         let Some(chain) = place_chain(&calls, root, site, &last) else {
             walked.push(format!("{}:{}", site.file, site.line));
             walk.up(&[last], &at_end, end, &mut Vec::new());
@@ -3118,7 +3141,11 @@ fn decide(
         let covered = chain[0]
             .key
             .filter(|_| chain[0].depth == 0)
-            .is_some_and(|key| entered.contains(&(chain[0].file.to_path_buf(), key.to_string())));
+            .is_some_and(|key| entered.contains(&(chain[0].file.to_path_buf(), key.to_string())))
+            || (chain[0].depth > 0
+                && enclosing_function_line(inputs, chain[0].file, chain[0].call).is_some_and(
+                    |line| value_entered.contains(&(chain[0].file.to_path_buf(), line)),
+                ));
         if !covered {
             walked.push(format!("{}:{}", site.file, site.line));
             walk.up(&chain, &top, end, &mut Vec::new());
@@ -3535,6 +3562,40 @@ fn shift<'s>(placed: Placed<'s>, shifted: &'s [(Placed<'s>, CallIr)]) -> Placed<
 /// the labelled call last. `None` where a hop is a callback (no call of the
 /// service enters it), or a body calls the next function more than once or
 /// not at all.
+/// The line the innermost function written in `file` that holds `call`
+/// starts on (carrick#2448): the line a `<value>` hop names it by.
+fn enclosing_function_line(
+    inputs: &RequestSummaryInputs,
+    file: &Path,
+    call: &CallIr,
+) -> Option<u32> {
+    fn find(body: &FnIr, call: &CallIr, best: &mut Option<(u32, u32)>) {
+        for inner in body
+            .nested
+            .iter()
+            .chain(&body.detached)
+            .chain(&body.param_functions)
+        {
+            if let Some(site) = &inner.site
+                && site.lo <= call.site.lo
+                && call.site.hi <= site.hi
+            {
+                let width = site.hi - site.lo;
+                if best.is_none_or(|(least, _)| width < least) {
+                    *best = Some((width, site.line));
+                }
+            }
+            find(inner, call, best);
+        }
+    }
+    let ir = inputs.files.get(file)?;
+    let mut best = None;
+    for body in ir.functions.values().chain([&ir.module_level]) {
+        find(body, call, &mut best);
+    }
+    best.map(|(_, line)| line)
+}
+
 fn place_chain<'a>(
     calls: &Calls<'a>,
     root: &Path,
