@@ -1376,15 +1376,11 @@ fn to_definition(pieces: &[Piece], depth: u8) -> Option<Vec<Piece>> {
         .collect()
 }
 
-/// The argument `call` writes at `index`, unless a spread before it moves
-/// every position. With the receiver trace on, a spread leaves the
-/// arguments before it as written ([`CallIr::spread_from`]).
+/// The argument the function `call` runs receives at `index`
+/// ([`CallIr::passed_arg`]): the call's own, shifted past `this` for the
+/// language's `call` and `apply` (carrick#3504 S4d).
 fn argument(call: &CallIr, index: usize) -> Option<&Value> {
-    match (&call.site_args, call.spread_from) {
-        (Some(_), _) => call.args.get(index),
-        (None, Some(from)) if index < from => call.args.get(index),
-        _ => None,
-    }
+    call.passed_arg(index)
 }
 
 /// `pieces` (the callee's own, its parameters by position) with each

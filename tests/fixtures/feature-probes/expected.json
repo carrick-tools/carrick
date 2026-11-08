@@ -432,7 +432,7 @@
  "t-call-apply": {
   "feature": "Function.prototype.call (built-in)",
   "source": "test262 (built-in)",
-  "status": "lead"
+  "status": "covered"
  },
  "t-call-result-receiver": {
   "feature": "client returned by a function call",
