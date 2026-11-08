@@ -492,10 +492,11 @@ struct Choices<'a, 'r> {
     resolver: &'a Resolver<'r>,
     root: &'a Path,
     file: &'a str,
-    /// Whether a branch the code does not state refuses the whole choice
-    /// (a request method), or only drops out (a name: the stated side is
-    /// the name).
-    unread_refuses: bool,
+    /// Whether the argument is read as the choice itself (a name), not
+    /// through the summaries' pieces (a request method). Either way a branch
+    /// the code does not state refuses the whole choice: stating the other
+    /// side alone is the initialiser-alone error (carrick#3504 Q1).
+    in_place: bool,
 }
 
 impl Choices<'_, '_> {
@@ -508,8 +509,8 @@ impl Choices<'_, '_> {
     }
 
     /// The texts the branches state. An empty text names nothing and drops
-    /// out. `None` when no branch states one, or when an unread branch
-    /// refuses the choice.
+    /// out. `None` when no branch states one, or when any branch is unread:
+    /// the choice stays asked.
     fn values(&self, expr: &Expr) -> Option<BTreeSet<String>> {
         let mut values = BTreeSet::new();
         for value in self.resolver.text_set(self.root, self.file, expr) {
@@ -518,8 +519,7 @@ impl Choices<'_, '_> {
                     values.insert(text);
                 }
                 TextValue::Text { .. } => {}
-                TextValue::Hole(_) if self.unread_refuses => return None,
-                TextValue::Hole(_) => {}
+                TextValue::Hole(_) => return None,
             }
         }
         (!values.is_empty()).then_some(values)
@@ -571,7 +571,7 @@ fn stated_whole(
     }
     // A name written as one choice: the summaries' pieces keep one side of
     // a `??`, so the choice is read from the expression itself.
-    if !choices.unread_refuses
+    if choices.in_place
         && let [expr] = exprs
         && Choices::is_choice(expr)
     {
@@ -1799,7 +1799,7 @@ fn record(
                     resolver,
                     root,
                     file,
-                    unread_refuses: false,
+                    in_place: true,
                 },
             ) {
                 Some(values) => Some(values),
@@ -1963,7 +1963,7 @@ fn record(
                             resolver,
                             root,
                             file,
-                            unread_refuses: true,
+                            in_place: false,
                         },
                     )
                 }

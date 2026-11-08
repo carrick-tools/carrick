@@ -119,6 +119,7 @@ impl<'a> Resolver<'a> {
             lo,
             hi,
             member: false,
+            ..
         } = branch
             && let Some(row) = self.row_at(file, *lo, *hi, Kind::Ident)
         {

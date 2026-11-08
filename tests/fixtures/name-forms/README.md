@@ -11,9 +11,11 @@ Forms so far:
   `{ p: target, ...rest }`, from a kept `const` object, or as a function's
   own local). `c-destructure-written` is unread on purpose: the object is
   written elsewhere (`ROUTES.items = ...`), so the key's value is not stated.
-- `coalesce` (S2b-1): `??`, `||` and `?:`. A side the code does not state
-  (`maybe ?? '/x'`, `maybe` a runtime value) adds no value: the stated side
-  is the name. `c-coalesce-const` (two constants) and `c-union` (a union of
+- `coalesce` (S2b-1): `??`, `||` and `?:`. A choice states its values only
+  when every side is stated (`*-fallback-stated`: a constant and a literal).
+  A side the code does not state (`maybe ?? '/x'`, `maybe` a runtime value)
+  keeps the name asked: stating the fallback alone is the initialiser-alone
+  error. `c-coalesce-const` (two constants) and `c-union` (a union of
   literals) are several values and stay asked.
 
 `rows.expected.json` is the answer key, read by `tests/name_forms_test.rs`:

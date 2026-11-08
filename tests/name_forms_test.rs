@@ -199,7 +199,7 @@ fn a_destructured_name_states_its_keys_value_on_every_protocol() {
 /// A fallback name (`maybe ?? '/x'`, `maybe` a runtime value) states its
 /// stated side on every protocol; several stated values stay asked.
 #[test]
-fn a_fallback_name_states_its_stated_side_on_every_protocol() {
+fn a_choice_states_its_values_only_when_every_side_is_stated_on_every_protocol() {
     let scan = scan();
     let key = key();
     let mut wrong = Vec::new();

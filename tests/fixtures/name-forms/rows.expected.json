@@ -6,16 +6,19 @@
     "src/c-destructure-local.ts": "/c/destructure-local",
     "src/q-destructure.ts": "orders.destructured",
     "src/s-destructure.ts": "room.destructured",
-    "src/c-coalesce.ts": "/n/coalesce",
-    "src/q-coalesce.ts": "orders.coalesced",
-    "src/s-coalesce.ts": "room.coalesced"
+    "src/c-fallback-stated.ts": "/n/fallback-stated",
+    "src/q-fallback-stated.ts": "orders.fallback-stated",
+    "src/s-fallback-stated.ts": "room.fallback-stated"
   },
   "kind_asked": [
     "src/q-destructure.ts",
-    "src/q-coalesce.ts"
+    "src/q-fallback-stated.ts"
   ],
   "unnamed": [
     "src/c-destructure-written.ts",
+    "src/c-coalesce.ts",
+    "src/q-coalesce.ts",
+    "src/s-coalesce.ts",
     "src/c-coalesce-const.ts",
     "src/c-union.ts"
   ]
