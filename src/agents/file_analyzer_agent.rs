@@ -601,6 +601,17 @@ pub struct DataCallResult {
     /// the body, as on a request's own line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_body: Option<crate::forwarded_body::CallBody>,
+    /// The repo-relative file this call requests when the service serves it
+    /// from a static folder its routing convention names
+    /// ([`crate::file_based_router::StaticRoot`], carrick#1989): the call is
+    /// a request for a static asset of the service, not a call to a route.
+    ///
+    /// Never from the model: stamped by `stamp_static_assets` on every scan
+    /// over the folded rows (so it is rewritten, never carried), and absent
+    /// unless the file exists, so a blob without it is unchanged. The cloud
+    /// reads it as the unmatched reason `static_asset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_asset: Option<String>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -2154,6 +2165,7 @@ mod tests {
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -2219,6 +2231,7 @@ mod tests {
                 library_semantics: Vec::new(),
                 at_caller: false,
                 call_body: None,
+                static_asset: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -3566,5 +3579,40 @@ const data = await fetch('/api/users').then(resp => resp.json());
                 "   8| const line8 = 8;",
             ]
         );
+    }
+
+    fn bare_call_json() -> serde_json::Value {
+        serde_json::json!({
+            "candidate_id": "c1",
+            "line_number": 3,
+            "target": "/images/banner.svg",
+            "method": "GET",
+            "pattern_matched": "fetch",
+            "payload_expression_text": null,
+            "payload_expression_line": null,
+            "primary_type_symbol": null,
+            "type_import_source": null
+        })
+    }
+
+    /// The blob spelling of the static-asset mark (carrick#1989): the cloud
+    /// reads `static_asset` as written here.
+    #[test]
+    fn a_static_asset_row_serialises_its_file_under_static_asset() {
+        let mut json = bare_call_json();
+        json["static_asset"] = serde_json::json!("public/images/banner.svg");
+        let call: DataCallResult = serde_json::from_value(json).unwrap();
+        let out = serde_json::to_value(&call).unwrap();
+        assert_eq!(out["static_asset"], "public/images/banner.svg");
+    }
+
+    /// A row from before the field existed reads, and a row without a mark
+    /// writes nothing, so a blob without it is unchanged.
+    #[test]
+    fn a_row_without_a_static_asset_reads_and_writes_no_field() {
+        let call: DataCallResult = serde_json::from_value(bare_call_json()).unwrap();
+        assert_eq!(call.static_asset, None);
+        let out = serde_json::to_value(&call).unwrap();
+        assert!(out.get("static_asset").is_none(), "{out}");
     }
 }

@@ -17299,6 +17299,7 @@ unfollowed_member_calls_total: 0,
                     library_semantics: Vec::new(),
                     at_caller: false,
                     call_body: None,
+                    static_asset: None,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -17464,6 +17465,7 @@ unfollowed_member_calls_total: 0,
             library_semantics: Vec::new(),
             at_caller,
             call_body: None,
+            static_asset: None,
         };
         let declared =
             crate::forwarded_body::CallBody::Param(crate::forwarded_body::DeclaredParam {
@@ -19603,6 +19605,7 @@ unfollowed_member_calls_total: 0,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let multi_line = "register(\n  listOrders,\n  \"orders.save\",\n)";
         let chain = "register(listOrders, \"orders.then\").then(() => undefined)";
@@ -19705,6 +19708,7 @@ unfollowed_member_calls_total: 0,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let mut result = FileAnalysisResult {
             data_calls: vec![
@@ -24292,6 +24296,7 @@ unfollowed_member_calls_total: 0,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(

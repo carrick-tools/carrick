@@ -147,6 +147,46 @@ pub struct RoutingConvention {
     /// [`RoutingConvention::transform_segment`] drop the segment instead.
     #[serde(default)]
     pub private_file_prefixes: Vec<String>,
+    /// Folders the framework serves as static files, each at a URL prefix
+    /// (carrick#1989). A call whose path falls under one and names a file
+    /// that exists is a request for a static asset, not a call to a route
+    /// ([`static_asset_for`]). Plain data like every other field: detection or
+    /// `carrick.json` overrides the bootstrap. Empty: the convention states no
+    /// static folder.
+    #[serde(default)]
+    pub static_roots: Vec<StaticRoot>,
+}
+
+/// A folder served statically and the URL prefix it is served under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticRoot {
+    /// Service-relative directory, `/`-separated (e.g. `public`).
+    pub dir: String,
+    /// URL prefix the directory is served at (e.g. `/`).
+    pub url_prefix: String,
+}
+
+impl StaticRoot {
+    /// The `public/` folder served from the site root, which the bootstrap
+    /// conventions below state.
+    pub fn public_folder() -> Self {
+        Self {
+            dir: "public".to_string(),
+            url_prefix: "/".to_string(),
+        }
+    }
+}
+
+/// The repo-relative file a call path names under a static root of
+/// `conventions`, when the file exists. Stub: implemented in the next commit.
+pub fn static_asset_for(
+    _target: &str,
+    _service_root: &Path,
+    _repo_root: &Path,
+    _conventions: &[RoutingConvention],
+) -> Option<String> {
+    None
 }
 
 /// A route successfully derived from a file's location.
@@ -290,6 +330,7 @@ impl RoutingConvention {
             // `terminal_files` above; neither field below is consulted.
             terminal_stems: Vec::new(),
             private_file_prefixes: Vec::new(),
+            static_roots: vec![StaticRoot::public_folder()],
         }
     }
 
@@ -321,6 +362,7 @@ impl RoutingConvention {
             // `_app`, `_document`, `_middleware`: files the pages router
             // reserves for itself and never routes.
             private_file_prefixes: vec!["_".to_string()],
+            static_roots: vec![StaticRoot::public_folder()],
         }
     }
 
@@ -359,6 +401,7 @@ impl RoutingConvention {
             terminal_stems: vec!["index".to_string()],
             // Astro excludes `_`-prefixed files from routing outright.
             private_file_prefixes: vec!["_".to_string()],
+            static_roots: vec![StaticRoot::public_folder()],
         }
     }
 
@@ -425,6 +468,7 @@ impl RoutingConvention {
             // segment, not a private file. `transform_segment` drops the
             // segment and the module stays routed (carrick#702).
             private_file_prefixes: Vec::new(),
+            static_roots: vec![StaticRoot::public_folder()],
         }
     }
 
@@ -1366,5 +1410,114 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let back: RoutingConvention = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+
+    // --- static assets (carrick#1989) ---
+
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/static-assets-next")
+    }
+
+    fn asset(target: &str, conventions: &[RoutingConvention]) -> Option<String> {
+        let root = fixture();
+        static_asset_for(target, &root, &root, conventions)
+    }
+
+    #[test]
+    fn an_existing_file_under_the_public_folder_is_a_static_asset() {
+        let conventions = builtin_conventions(&["next".to_string()]);
+        assert_eq!(
+            asset("/images/banner.svg", &conventions).as_deref(),
+            Some("public/images/banner.svg")
+        );
+    }
+
+    #[test]
+    fn a_query_or_fragment_does_not_hide_the_file() {
+        let conventions = builtin_conventions(&["next".to_string()]);
+        for target in ["/images/banner.svg?v=2", "/images/banner.svg#top"] {
+            assert_eq!(
+                asset(target, &conventions).as_deref(),
+                Some("public/images/banner.svg"),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_stays_a_call() {
+        let conventions = builtin_conventions(&["next".to_string()]);
+        assert_eq!(asset("/images/missing.svg", &conventions), None);
+        // A directory is not a file.
+        assert_eq!(asset("/images", &conventions), None);
+    }
+
+    #[test]
+    fn a_route_path_is_not_a_static_asset() {
+        let conventions = builtin_conventions(&["next".to_string()]);
+        assert_eq!(asset("/api/items", &conventions), None);
+    }
+
+    #[test]
+    fn a_path_that_leaves_the_folder_is_not_a_static_asset() {
+        let conventions = builtin_conventions(&["next".to_string()]);
+        for target in [
+            "/../package.json",
+            "/images/../../package.json",
+            "//images/banner.svg",
+        ] {
+            assert_eq!(asset(target, &conventions), None, "{target}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_url_or_env_base_is_not_read() {
+        let conventions = builtin_conventions(&["next".to_string()]);
+        for target in [
+            "https://cdn.example.com/images/banner.svg",
+            "${process.env.CDN}/images/banner.svg",
+        ] {
+            assert_eq!(asset(target, &conventions), None, "{target}");
+        }
+    }
+
+    #[test]
+    fn no_convention_states_no_static_folder() {
+        assert_eq!(asset("/images/banner.svg", &[]), None);
+        let mut bare = builtin_conventions(&["next".to_string()]);
+        for c in &mut bare {
+            c.static_roots.clear();
+        }
+        assert_eq!(asset("/images/banner.svg", &bare), None);
+    }
+
+    #[test]
+    fn a_prefixed_static_root_serves_only_under_its_prefix() {
+        let mut conventions = builtin_conventions(&["next".to_string()]);
+        conventions[0].static_roots = vec![StaticRoot {
+            dir: "public/images".to_string(),
+            url_prefix: "/assets".to_string(),
+        }];
+        assert_eq!(
+            asset("/assets/banner.svg", &conventions).as_deref(),
+            Some("public/images/banner.svg")
+        );
+        assert_eq!(asset("/images/banner.svg", &conventions), None);
+        assert_eq!(asset("/assetsbanner.svg", &conventions), None);
+    }
+
+    #[test]
+    fn an_older_convention_without_static_roots_still_reads() {
+        let json = r#"{"name":"x","rootGlobs":["app"],"segmentSource":{"kind":"fileName","extensions":["ts"]},
+            "dynamicOpen":"[","dynamicClose":"]","catchAllMarker":"...","groupOpen":"(","groupClose":")",
+            "methodSource":"ExportName"}"#;
+        let c: RoutingConvention = serde_json::from_str(json).unwrap();
+        assert!(c.static_roots.is_empty());
+    }
+
+    #[test]
+    fn the_static_root_spelling_on_the_wire_is_camel_case() {
+        let json = serde_json::to_string(&StaticRoot::public_folder()).unwrap();
+        assert_eq!(json, r#"{"dir":"public","urlPrefix":"/"}"#);
     }
 }

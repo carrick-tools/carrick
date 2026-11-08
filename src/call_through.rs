@@ -3628,6 +3628,7 @@ mod tests {
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         }
     }
 
