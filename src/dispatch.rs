@@ -1055,7 +1055,10 @@ mod tests {
         }
     }
 
-    fn handlers(rows: &[(&str, &str, u32, &[(&str, Option<&str>)])]) -> DeclaredHandlers {
+    /// `(file, name, line, [(parameter, type text)])`.
+    type HandlerRow<'a> = (&'a str, &'a str, u32, &'a [(&'a str, Option<&'a str>)]);
+
+    fn handlers(rows: &[HandlerRow<'_>]) -> DeclaredHandlers {
         let mut handlers = DeclaredHandlers::default();
         for (file, name, line, params) in rows {
             handlers

@@ -176,13 +176,21 @@ fn producer_entries(service: &str, kind: &str) -> BTreeMap<u64, Vec<serde_json::
     by_line
 }
 
-/// The one producer entry of `service` of `kind` at `line`.
+/// The producer entry of `service` of `kind` at `line`. Each declared row
+/// has its entry, so two cases on one handler (`list`, `search`) have two,
+/// and they carry one alias and one type.
 fn producer_entry(service: &str, kind: &str, line: u64) -> serde_json::Value {
     let entries = producer_entries(service, kind);
     let at = entries
         .get(&line)
         .unwrap_or_else(|| panic!("no {kind} entry at {service}:{line}: {entries:#?}"));
-    assert_eq!(at.len(), 1, "one {kind} entry at {service}:{line}: {at:#?}");
+    for entry in at {
+        assert_eq!(
+            (&entry["type_alias"], published(entry)),
+            (&at[0]["type_alias"], published(&at[0])),
+            "the entries at {service}:{line} agree: {at:#?}"
+        );
+    }
     at[0].clone()
 }
 
