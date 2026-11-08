@@ -331,6 +331,7 @@ mod tests {
             stop: stop.map(str::to_string),
             receiver: None,
             reached: None,
+            bound: Vec::new(),
         }
     }
 

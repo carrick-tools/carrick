@@ -292,6 +292,7 @@ mod tests {
                     stop: None,
                     receiver: None,
                     reached: None,
+                    bound: Vec::new(),
                 })
                 .collect(),
             ..Discovery::default()

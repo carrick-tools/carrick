@@ -1001,6 +1001,11 @@ struct CallIr {
     /// member as the language library's ([`LanguageCall::decided`],
     /// carrick#3504 S4d). `None` for any other callee.
     language_call: Option<Box<LanguageCall>>,
+    /// The arguments a `bind` the call's callee was read through bound ahead
+    /// of the call's own (carrick#3504 S4d-b). Empty as written; set on the
+    /// copy the decided step reads a discovery site's chain through
+    /// ([`Self::with_bound`]).
+    bound: Vec<Value>,
 }
 
 /// A call written as a function's `call` or `apply` member: what the
@@ -1040,6 +1045,12 @@ impl CallIr {
     /// `call`, an element for a decided `apply`. `None` where no argument
     /// is written there or a spread before it moves it.
     fn passed_arg(&self, index: usize) -> Option<&Value> {
+        // Bound arguments fill the leading parameters, the call's own the
+        // rest (carrick#3504 S4d-b).
+        if let Some(bound) = self.bound.get(index) {
+            return Some(bound);
+        }
+        let index = index.saturating_sub(self.bound.len());
         match self.language_call.as_deref() {
             Some(LanguageCall {
                 decided: true,
@@ -1055,6 +1066,31 @@ impl CallIr {
                 ..
             }) => self.own_arg(index + 1),
             _ => self.own_arg(index),
+        }
+    }
+
+    /// Whether the arguments of this `f.bind(this, a, …)` call after `this`
+    /// are all written, as text no parameter of the function that writes the
+    /// call changes: no spread, no function, no object. Those are the
+    /// arguments the call bound ahead of the calls of its result
+    /// (carrick#3504 S4d-b); anything else is not read.
+    fn args_are_closed_text(&self) -> bool {
+        self.site_args.is_some()
+            && self.args.len() > 1
+            && self.args[1..].iter().all(|arg| match arg {
+                Value::Str(pieces) => pieces.iter().all(|piece| !piece.is_parameter()),
+                _ => false,
+            })
+    }
+
+    /// This call as one whose callee was read through `bind`: the `bind`
+    /// call's arguments after `this` fill the parameters ahead of its own
+    /// ([`Self::passed_arg`]). Only for a `bind` that
+    /// [`Self::args_are_closed_text`] holds for.
+    fn with_bound(&self, bind: &CallIr) -> CallIr {
+        CallIr {
+            bound: bind.args.iter().skip(1).cloned().collect(),
+            ..self.clone()
         }
     }
 
@@ -7690,6 +7726,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             ),
             constructs: matches!(call.callee, Callee::Super(_)),
             language_call,
+            bound: Vec::new(),
         });
     }
 
@@ -7761,6 +7798,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 instance: InstanceIr::default(),
                 constructs: false,
                 language_call: None,
+                bound: Vec::new(),
             });
         }
         element.visit_children_with(self);

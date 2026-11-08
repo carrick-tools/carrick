@@ -35,3 +35,19 @@ call's discovery record and the name its decided site states.
 | `m-own-apply.ts` | 8 | `send.apply(null, ["/p/m-own-apply"])` | site, `http` | `/p/m-own-apply` |
 | `m-publish-call.ts` | 8 | `pub.call(null, "m-publish-call")`, `pub` calls `bus.publish` | site, `bus` | `m-publish-call` |
 | `m-rpc-call.ts` | 12 | `rpc.call("/p/m-rpc-call")`, a class's own `call` method (control: no shift) | site, `http` | `/p/m-rpc-call` |
+
+## Bound arguments (carrick#3504 S4d-b)
+
+`f.bind(t, a)` binds `a` ahead of the arguments of the call that runs the
+result: the call's own arguments fill the parameters after the bound ones.
+Discovery's test `bound_arguments_fill_the_leading_parameters` reads the
+call's discovery record and the name its decided site states. A `bind` whose
+bound arguments are not all text outside any parameter, or a `bind` of a
+`bind`, is not read.
+
+| File | Line | Call | Recorded | Name |
+|---|---|---|---|---|
+| `m-bound-http.ts` | 9 | `send.bind(null, "/p/m-bound-http")`, then `g()` | site, `http` | `/p/m-bound-http` |
+| `m-bound-publish.ts` | 9 | `pub.bind(null, "m-bound-publish")`, then `g()` | site, `bus` | `m-bound-publish` |
+| `m-bound-split.ts` | 9 | `send.bind(null, "/p/m-bound-")`, then `g("split")` | site, `http` | `/p/m-bound-split` |
+| `m-own-bind-this.ts` | 9 | `send.bind(null)`, then `g("/p/m-own-bind-this")` (control: nothing bound) | site, `http` | `/p/m-own-bind-this` |

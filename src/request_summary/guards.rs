@@ -1451,6 +1451,7 @@ impl CallWalker<'_, '_, '_> {
             instance: self.reader.instance_ir(None, args, self.scope),
             constructs: true,
             language_call: None,
+            bound: Vec::new(),
         };
         self.ir.constructions.push(construction);
     }
@@ -1507,6 +1508,7 @@ impl CallWalker<'_, '_, '_> {
             instance: self.reader.instance_ir(Some(&call.callee), &[], self.scope),
             constructs: false,
             language_call: None,
+            bound: Vec::new(),
         });
     }
 
