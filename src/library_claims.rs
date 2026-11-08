@@ -2502,6 +2502,57 @@ mod tests {
         );
     }
 
+    /// carrick#3547 S2: a local queue's send keeps its publisher row when
+    /// another function's parameter of the same name is handed on (here to
+    /// a consumer, whose name a parameter states nothing). Before, the
+    /// parameter's use contested the local by name and the row was lost.
+    #[test]
+    fn a_local_send_keeps_its_row_beside_a_parameter_of_its_name() {
+        let queue = export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "Queue", "role": "broker",
+            "claims": [
+                { "kind": "make", "form": "new", "member": null, "name": { "arg": 0 },
+                  "name_scope": { "scope": "global", "namespace": "queue" } },
+                { "kind": "op", "op": "send", "member": "add", "on": "instance",
+                  "name": { "bound": "maker" }, "payload": { "arg": 1 } }
+            ]
+        }));
+        let consumer = export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "Consumer", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": null, "on": "export", "form": "new",
+                  "name": { "arg": 0, "key": "queueUrl" },
+                  "handler": { "arg": 0, "key": "handleMessage" },
+                  "key_labels": { "region": "not_name" },
+                  "name_scope": { "scope": "global", "namespace": "queue" } }
+            ]
+        }));
+        let sites = sites_of(&[(
+            "src/jobs.ts",
+            "import { Queue, Consumer } from \"@fixture/queue\";\n\
+             export async function run() {\n\
+             \x20 const queue = new Queue(\"orders\");\n\
+             \x20 await queue.add(\"job\", {});\n\
+             }\n\
+             export function held(queue: string) {\n\
+             \x20 return new Consumer({ queueUrl: queue, handleMessage: async () => {} });\n\
+             }\n",
+        )]);
+        let rows = rows_of(&sites, &[queue, consumer], all);
+        let stated: Vec<(u32, LibraryRowKind, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.kind, row.name.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(4, LibraryRowKind::Pubsub(PubsubRole::Publisher), "orders")],
+            "{rows:#?}"
+        );
+        assert!(rows[0].name_scope.is_some(), "{rows:#?}");
+    }
+
     /// Carrick#3049: a queue export written on a `type:` receiver, with
     /// `receiver_types` naming the instance id that holds it, reads the same
     /// rows as today's form written on the instance id, once lowered. Without

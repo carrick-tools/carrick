@@ -759,13 +759,21 @@ struct ClientRef {
 
 impl ClientRef {
     /// This client, held by a binding the file uses as `used`.
-    fn used_as(mut self, used: &BindingUse) -> Self {
-        self.contested |= used.contests_client();
-        self.called = used.called.keys().cloned().collect();
-        self.called_computed = used.called_computed;
-        self.contested_message |= used.contests_message();
-        self.member_uses = used.member_uses().collect();
-        self.returned.extend(used.returned_at.iter().copied());
+    fn used_as(self, used: &BindingUse) -> Self {
+        self.used_apart(used, used)
+    }
+
+    /// This client, held by a binding the file uses as `own`, among the
+    /// uses of every binding of its name, `by_name` (carrick#3547 S2). The
+    /// HTTP reading's fields read `by_name`, as the old path always has
+    /// (R4); the message roles' fields read `own`.
+    fn used_apart(mut self, by_name: &BindingUse, own: &BindingUse) -> Self {
+        self.contested |= by_name.contests_client();
+        self.called = by_name.called.keys().cloned().collect();
+        self.called_computed = by_name.called_computed;
+        self.contested_message |= own.contests_message();
+        self.member_uses = own.member_uses().collect();
+        self.returned.extend(own.returned_at.iter().copied());
         self
     }
 
@@ -1831,6 +1839,8 @@ pub fn extract_file_ir(
             .collect(),
         imports: HashSet::new(),
         uses: uses.uses,
+        binding_uses: uses.bindings,
+        unbound_uses: uses.unbound,
         object_consts: object_consts(module),
         object_lits: HashMap::new(),
         subclass_fields: subclass_members(&classes, |class| &class.fields),
@@ -1852,7 +1862,7 @@ pub fn extract_file_ir(
     module_scope.receivers = import_receivers(&imports)
         .into_iter()
         .map(|(name, client)| {
-            let client = module_scope.with_uses(client, &name);
+            let client = module_scope.with_uses(client, &name, None);
             (name, client)
         })
         .collect();
@@ -1955,7 +1965,7 @@ pub fn extract_file_ir(
                         module_scope.destructured.insert(name.clone());
                         match (client, target) {
                             (Some(client), _) => {
-                                let client = module_scope.with_uses(client, &name);
+                                let client = module_scope.with_uses(client, &name, None);
                                 if redeclared.declares_name(&name) {
                                     module_scope.shadowed_clients.insert(name.clone());
                                     file.shadowed_clients.insert(name, client);
@@ -2042,7 +2052,7 @@ pub fn extract_file_ir(
                             .insert(name.clone(), target.sym.to_string());
                     }
                     if let Some(client) = client {
-                        let client = module_scope.with_uses(client, &name);
+                        let client = module_scope.with_uses(client, &name, None);
                         if redeclared.declares_name(&name) {
                             module_scope.shadowed_clients.insert(name.clone());
                             file.shadowed_clients.insert(name, client);
@@ -2624,8 +2634,14 @@ struct ModuleScope {
     /// imports: each may hold an instance the module it names declares
     /// (carrick#1568).
     imports: HashSet<String>,
-    /// [`BindingUses`] over the whole file.
+    /// [`BindingUses`] over the whole file, by name.
     uses: HashMap<String, BindingUse>,
+    /// The same uses by the binding each identifier names
+    /// ([`BindingUses::bindings`], carrick#3547 S2).
+    binding_uses: HashMap<BindingKey, BindingUse>,
+    /// The uses recorded with no binding of their own, by name
+    /// ([`BindingUses::unbound`]).
+    unbound_uses: HashMap<String, BindingUse>,
     /// Names declared once in the file, by `const <name> = { … }`.
     object_consts: HashSet<String>,
     /// The literal of each module-scope `const` object the file never writes
@@ -2662,13 +2678,30 @@ struct ModuleScope {
 }
 
 impl ModuleScope {
-    /// `client`, contested when the file uses `binding` other than to call
-    /// through it or export it (carrick#1564 re-review, R6).
-    fn with_uses(&self, client: ClientRef, binding: &str) -> ClientRef {
-        match self.uses.get(binding) {
-            Some(used) => client.used_as(used),
-            None => client,
+    /// `client`, contested when the file uses `name` other than to call
+    /// through it or export it (carrick#1564 re-review, R6). Given the
+    /// `binding` that holds it, a message role reads that binding's own
+    /// uses, and an HTTP reading still every use of the name
+    /// ([`ClientRef::used_apart`], carrick#3547 S2).
+    fn with_uses(&self, client: ClientRef, name: &str, binding: Option<&BindingKey>) -> ClientRef {
+        let Some(by_name) = self.uses.get(name) else {
+            return client;
+        };
+        match binding {
+            Some(key) => client.used_apart(by_name, &self.uses_of(key)),
+            None => client.used_as(by_name),
         }
+    }
+
+    /// The uses of the binding `key`, with every use of its name recorded
+    /// with no binding of its own (an alias root), so that one fails closed
+    /// (carrick#3547 S2).
+    fn uses_of(&self, key: &BindingKey) -> BindingUse {
+        let mut used = self.binding_uses.get(key).cloned().unwrap_or_default();
+        if let Some(unbound) = self.unbound_uses.get(&key.0) {
+            used.merge(unbound);
+        }
+        used
     }
 
     /// Whether the file writes through `name` (`name.key = …`, `delete
@@ -3233,11 +3266,49 @@ impl BindingUse {
 /// Every binding's uses over a subtree ([`BindingUse`]). Calls through a
 /// binding (`api.get(…)`, `api(…)`) and `export default api` record nothing;
 /// a bare reassignment is left to the declaration rules.
+///
+/// Every use is recorded by name in [`Self::uses`], and beside it by the
+/// binding its identifier names in [`Self::bindings`], or in
+/// [`Self::unbound`] when it names none (carrick#3547 S2), as
+/// [`crate::binding_scope::Declarations`] keeps names and bindings.
 #[derive(Default)]
 struct BindingUses {
     uses: HashMap<String, BindingUse>,
+    /// The same uses by the binding each identifier names. A file parsed
+    /// without the resolver gives every binding of a name one key, which
+    /// is the name's uses.
+    bindings: HashMap<BindingKey, BindingUse>,
+    /// The uses with no binding of their own: a field of `this` and the
+    /// root of an `import alias = root.a.b`. Every binding of the name
+    /// reads them ([`ModuleScope::uses_of`]).
+    unbound: HashMap<String, BindingUse>,
     /// `import alias = root.a.b` declarations, settled after the walk.
     aliases: Vec<EntityAlias>,
+}
+
+/// The key a use is recorded under ([`binding_key`]): the name, and the
+/// binding an identifier names. A field of `this` names none.
+struct UseKey {
+    name: String,
+    binding: Option<BindingKey>,
+}
+
+impl UseKey {
+    /// The binding `ident` names.
+    fn of(ident: &Ident) -> Self {
+        Self {
+            name: ident.sym.to_string(),
+            binding: Some(ident_key(ident)),
+        }
+    }
+
+    /// `name`, with no binding of its own.
+    fn unbound(name: String) -> Self {
+        Self {
+            name,
+            binding: None,
+        }
+    }
 }
 
 /// `import alias = root.a.b` (`export import` when `exported`).
@@ -3250,12 +3321,24 @@ struct EntityAlias {
 }
 
 impl BindingUses {
-    fn mark(&mut self, key: String, record: impl FnOnce(&mut BindingUse)) {
-        record(self.uses.entry(key).or_default());
+    /// Records one use under `key`'s name and under its binding, or with
+    /// no binding. [`BindingUse::merge`] adds every field `record` sets.
+    fn mark(&mut self, key: UseKey, record: impl FnOnce(&mut BindingUse)) {
+        let mut used = BindingUse::default();
+        record(&mut used);
+        match key.binding {
+            Some(binding) => self.bindings.entry(binding).or_default().merge(&used),
+            None => self
+                .unbound
+                .entry(key.name.clone())
+                .or_default()
+                .merge(&used),
+        }
+        self.uses.entry(key.name).or_default().merge(&used);
     }
 
     /// `key` is used as a value, at `at`.
-    fn mark_other(&mut self, key: String, at: u32) {
+    fn mark_other(&mut self, key: UseKey, at: u32) {
         self.mark(key, |used| {
             used.other = true;
             used.other_at.insert(at);
@@ -3416,7 +3499,7 @@ impl BindingUses {
 
 /// The binding a member chain is read off, through any hops, plain,
 /// computed or optional.
-fn chain_root(expr: &Expr) -> Option<String> {
+fn chain_root(expr: &Expr) -> Option<UseKey> {
     let mut at = crate::graphql_document_sites::unwrap_expression(expr);
     loop {
         if let Some(key) = binding_key(at) {
@@ -3428,7 +3511,7 @@ fn chain_root(expr: &Expr) -> Option<String> {
 
 /// `root.a.b`, with every hop a plain name and `root` a binding
 /// ([`binding_key`]): the root's key and the hops in order.
-fn member_path(expr: &Expr) -> Option<(String, Vec<String>)> {
+fn member_path(expr: &Expr) -> Option<(UseKey, Vec<String>)> {
     let mut path: Vec<String> = Vec::new();
     let mut at = crate::graphql_document_sites::unwrap_expression(expr);
     loop {
@@ -3653,7 +3736,7 @@ impl Visit for BindingUses {
                 && !named.is_type_only
                 && let ModuleExportName::Ident(ident) = &named.orig
             {
-                self.mark(ident.sym.to_string(), |used| used.exported = true);
+                self.mark(UseKey::of(ident), |used| used.exported = true);
             }
         }
     }
@@ -3689,7 +3772,7 @@ impl Visit for BindingUses {
 
     fn visit_prop(&mut self, prop: &Prop) {
         if let Prop::Shorthand(ident) = prop {
-            self.mark_other(ident.sym.to_string(), ident.span.lo.0);
+            self.mark_other(UseKey::of(ident), ident.span.lo.0);
             return;
         }
         prop.visit_children_with(self);
@@ -3765,7 +3848,9 @@ impl BindingUses {
                 settled.insert(index);
                 let root = self.aliases[index].root.clone();
                 let at = self.aliases[index].at;
-                self.mark_other(root, at);
+                // The root is a name the declaration's entity names, with
+                // no binding read here: every binding of it is contested.
+                self.mark_other(UseKey::unbound(root), at);
             }
         }
     }
@@ -3840,13 +3925,16 @@ impl BindingUses {
     }
 }
 
-/// The key a binding is tracked by: an identifier's name, or `this.<field>`.
-fn binding_key(expr: &Expr) -> Option<String> {
+/// The key a binding is tracked by: an identifier's name and binding, or
+/// `this.<field>`, which names no binding.
+fn binding_key(expr: &Expr) -> Option<UseKey> {
     match expr {
-        Expr::Ident(ident) => Some(ident.sym.to_string()),
+        Expr::Ident(ident) => Some(UseKey::of(ident)),
         Expr::Member(member) if matches!(&*member.obj, Expr::This(_)) => match &member.prop {
-            MemberProp::Ident(ident) => Some(format!("this.{}", ident.sym)),
-            MemberProp::PrivateName(private) => Some(format!("this.#{}", private.name)),
+            MemberProp::Ident(ident) => Some(UseKey::unbound(format!("this.{}", ident.sym))),
+            MemberProp::PrivateName(private) => {
+                Some(UseKey::unbound(format!("this.#{}", private.name)))
+            }
             MemberProp::Computed(_) => None,
         },
         _ => None,
@@ -5585,7 +5673,7 @@ impl Reader<'_> {
         let receivers = receivers
             .into_iter()
             .map(|(name, client)| {
-                let client = module.with_uses(client, &format!("this.{name}"));
+                let client = module.with_uses(client, &format!("this.{name}"), None);
                 (name, client)
             })
             .collect();
@@ -5887,8 +5975,9 @@ impl Reader<'_> {
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).
                     // One never set again is a local receiver, below. Its
-                    // uses are kept by name, so it is read only where the
-                    // body declares the name once; a `var` declared twice
+                    // reassignments are kept by name, so it is read only
+                    // where the body declares the name once; its uses are
+                    // its own binding's (carrick#3547 S2). A `var` declared twice
                     // is set by each declaration too, and a destructuring or
                     // a `for (x of …)` head declares it again.
                     if let Pat::Ident(ident) = &declarator.name
@@ -5903,11 +5992,12 @@ impl Reader<'_> {
                         )
                     {
                         let name = ident.id.sym.as_ref();
+                        let key = ident_key(&ident.id);
                         let makers = makers
                             .into_iter()
-                            .map(|client| scope.module.with_uses(client, name))
+                            .map(|client| scope.module.with_uses(client, name, Some(&key)))
                             .collect();
-                        scope.let_makers.insert(ident_key(&ident.id), makers);
+                        scope.let_makers.insert(key, makers);
                     }
                     // `const { url } = options`: each name holds one key of
                     // the parameter it is unpacked from (carrick#1950), where
@@ -5993,7 +6083,7 @@ impl Reader<'_> {
                         if let Some(client) = client
                             && declared.name_count(&name) == 1
                         {
-                            let client = scope.module.with_uses(client, &name);
+                            let client = scope.module.with_uses(client, &name, Some(&key));
                             scope.local_receivers.insert(key, client);
                         }
                     }
@@ -11995,6 +12085,66 @@ function build() { return {}; }
         let mut merged = BindingUse::default();
         merged.merge(&uses.uses["api"]);
         assert_eq!(merged.returned_at, uses.uses["api"].returned_at);
+    }
+
+    /// carrick#3547 S2: the uses by name are every binding's uses of the
+    /// name and the uses with no binding, together, so keeping the by-binding
+    /// view beside them leaves the by-name view as it was. Two functions'
+    /// bindings of one name stay apart.
+    #[test]
+    fn the_uses_by_name_are_every_binding_of_the_name_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(
+            &path,
+            "import { Queue } from \"@fixture/queue\";\n\
+             export function ship() {\n\
+             \x20 const parcels = new Queue(\"p\");\n\
+             \x20 parcels.add(\"j\", {});\n\
+             \x20 return parcels;\n\
+             }\n\
+             export function label(parcels: Queue) {\n\
+             \x20 keep({ parcels });\n\
+             \x20 parcels.tasks.obliterate();\n\
+             \x20 if (parcels.paused) { (parcels as any).name = \"x\"; }\n\
+             }\n\
+             export class Holder {\n\
+             \x20 parcels = 1;\n\
+             \x20 hand() { return keep(this.parcels); }\n\
+             }\n\
+             export import inner = parcels.inner;\n\
+             export { label };\n\
+             declare function keep(value: unknown): void;\n",
+        )
+        .expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let mut uses = BindingUses::default();
+        module.visit_with(&mut uses);
+        uses.settle_aliases(&HashSet::new());
+        for (name, used) in &uses.uses {
+            let mut together = uses.unbound.get(name).cloned().unwrap_or_default();
+            for ((bound, _), each) in &uses.bindings {
+                if bound == name {
+                    together.merge(each);
+                }
+            }
+            assert_eq!(format!("{together:?}"), format!("{used:?}"), "{name}");
+        }
+        let parcels = uses
+            .bindings
+            .keys()
+            .filter(|(name, _)| name == "parcels")
+            .count();
+        assert_eq!(parcels, 2, "{:#?}", uses.bindings.keys());
+        assert!(uses.unbound.contains_key("parcels"), "the alias root");
+        assert!(uses.unbound.contains_key("this.parcels"));
     }
 
     /// The URL the first request `function` makes in `source` reads as,

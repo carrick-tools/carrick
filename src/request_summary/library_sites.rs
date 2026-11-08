@@ -2315,7 +2315,7 @@ impl Reader<'_> {
                 if !made.iter().all(|client| same_maker(client, first)) {
                     continue;
                 }
-                let mut client = module_scope.with_uses(first.clone(), name);
+                let mut client = module_scope.with_uses(first.clone(), name, None);
                 client.shared = Some(name.to_string());
                 out.insert(key, client);
             }
@@ -4313,6 +4313,144 @@ mod tests {
         assert_eq!(maker(field).line, 7);
         assert_eq!(maker(field).args[0].text.as_deref(), Some("emails"));
         assert_eq!(field.contest(on_wire), None);
+    }
+
+    /// carrick#3547 S2: a function's own instance is read through its own
+    /// binding's uses only. A parameter of the same name in another
+    /// function, handed on there, is another binding and contests nothing
+    /// here, in a function body or a constructor's.
+    #[test]
+    fn a_local_receiver_is_not_contested_by_another_binding_of_its_name() {
+        let sites = sites_of(&[(
+            "src/ship.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export async function ship() {\n\
+             \x20 const parcels = new Queue(\"parcels\");\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             }\n\
+             export function label(parcels: string) {\n\
+             \x20 return { url: parcels };\n\
+             }\n\
+             export class Shipper {\n\
+             \x20 constructor() {\n\
+             \x20   const parcels = new Queue(\"crates\");\n\
+             \x20   parcels.add(\"job\", {});\n\
+             \x20 }\n\
+             }\n",
+        )]);
+        let local = site(&sites, "src/ship.ts", 4, Some("add"));
+        assert_eq!(maker(local).holder, Holder::Local);
+        assert_eq!(maker(local).args[0].text.as_deref(), Some("parcels"));
+        assert_eq!(local.contest(on_wire), None, "{local:#?}");
+        let constructed = site(&sites, "src/ship.ts", 12, Some("add"));
+        assert_eq!(maker(constructed).args[0].text.as_deref(), Some("crates"));
+        assert_eq!(constructed.contest(on_wire), None, "{constructed:#?}");
+    }
+
+    /// carrick#3547 S2 control: a parameter of the same name that is never
+    /// read contests nothing, before and after the uses were kept by
+    /// binding. Were this red, the local would be lost to a declaration
+    /// clash, not to its uses.
+    #[test]
+    fn a_local_receiver_beside_an_unread_parameter_of_its_name_is_read() {
+        let sites = sites_of(&[(
+            "src/ship.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export async function ship() {\n\
+             \x20 const parcels = new Queue(\"parcels\");\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             }\n\
+             export function label(parcels: string) {\n\
+             \x20 return { url: \"/labels\" };\n\
+             }\n",
+        )]);
+        let local = site(&sites, "src/ship.ts", 4, Some("add"));
+        assert_eq!(local.contest(on_wire), None, "{local:#?}");
+    }
+
+    /// carrick#3547 S2: a closure that captures the local and hands it on
+    /// uses the local's own binding, so it still contests.
+    #[test]
+    fn a_local_receiver_a_closure_hands_on_is_contested() {
+        let sites = sites_of(&[(
+            "src/ship.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export async function ship() {\n\
+             \x20 const parcels = new Queue(\"parcels\");\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             \x20 later(() => keep(parcels));\n\
+             }\n\
+             export function label(parcels: string) {\n\
+             \x20 return { url: \"/labels\" };\n\
+             }\n\
+             declare function later(run: () => void): void;\n\
+             declare function keep(value: unknown): void;\n",
+        )]);
+        let local = site(&sites, "src/ship.ts", 4, Some("add"));
+        assert_eq!(local.contest(on_wire), Some(Contest::Used), "{local:#?}");
+    }
+
+    /// carrick#3547 S2: a member another binding of the same name calls is
+    /// none of the local's uses.
+    #[test]
+    fn another_binding_of_its_name_lends_the_local_no_member_use() {
+        let sites = sites_of(&[(
+            "src/ship.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export async function ship() {\n\
+             \x20 const parcels = new Queue(\"parcels\");\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             }\n\
+             export async function clear(parcels: Queue) {\n\
+             \x20 await parcels.obliterate();\n\
+             }\n",
+        )]);
+        let local = site(&sites, "src/ship.ts", 4, Some("add"));
+        assert!(
+            !local
+                .uses
+                .iter()
+                .any(|used| used.member.as_deref() == Some("obliterate")),
+            "{local:#?}"
+        );
+    }
+
+    /// carrick#3547 S2 fails closed: a use recorded with no binding of its
+    /// own reaches every binding of its name. A field of `this` handed on
+    /// is never a local's binding; the root of an exported `import x =
+    /// root.y` alias is recorded by name, and contests the local.
+    #[test]
+    fn a_use_with_no_binding_of_its_own_contests_by_name() {
+        let field = sites_of(&[(
+            "src/ship.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export async function ship() {\n\
+             \x20 const parcels = new Queue(\"parcels\");\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             }\n\
+             export class Holder {\n\
+             \x20 parcels = 1;\n\
+             \x20 hand() { return keep(this.parcels); }\n\
+             }\n\
+             declare function keep(value: unknown): void;\n",
+        )]);
+        assert_eq!(
+            site(&field, "src/ship.ts", 4, Some("add")).contest(on_wire),
+            None
+        );
+        let aliased = sites_of(&[(
+            "src/ship.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export async function ship() {\n\
+             \x20 const parcels = new Queue(\"parcels\");\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             }\n\
+             export import inner = parcels.inner;\n",
+        )]);
+        assert_eq!(
+            site(&aliased, "src/ship.ts", 4, Some("add")).contest(on_wire),
+            Some(Contest::Used)
+        );
     }
 
     /// carrick#3043: a method decorator call on an import is a site of the
