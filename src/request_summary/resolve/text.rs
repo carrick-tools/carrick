@@ -47,6 +47,14 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
                 .and_then(|cooked| cooked.as_str())
                 .map(str::to_string)
         }),
+        Expr::Cond(cond) => ValueAt::Alt {
+            branches: vec![next(&cond.cons), next(&cond.alt)],
+        },
+        Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
+            ValueAt::Alt {
+                branches: vec![next(&bin.left), next(&bin.right)],
+            }
+        }
         Expr::Bin(bin) if bin.op == BinaryOp::Add => {
             ValueAt::Concat(vec![next(&bin.left), next(&bin.right)])
         }

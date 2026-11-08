@@ -39,6 +39,7 @@ mod text;
 mod text_reader;
 
 pub(super) use text::{pattern_members, text_of};
+pub(super) use text_reader::TextValue;
 
 /// How many object literals deep an argument's keys are read (the decision
 /// record's object-depth cap, D7).
@@ -590,6 +591,9 @@ pub(super) enum ValueAt {
         object: Box<ValueAt>,
         args: Vec<ValueAt>,
     },
+    /// A choice the code writes in place (`c ? a : b`, `a ?? b`, `a || b`):
+    /// every branch is a value the name may take, never collapsed.
+    Alt { branches: Vec<ValueAt> },
     /// An object literal's entries in source order; a key may be computed.
     Entries(Vec<(ValueAt, ValueAt)>),
     /// An array literal's elements, the object of a `join`.
@@ -1558,6 +1562,7 @@ impl<'a> Resolver<'a> {
             | ValueAt::Concat(_)
             | ValueAt::Member { .. }
             | ValueAt::BuiltIn { .. }
+            | ValueAt::Alt { .. }
             | ValueAt::Entries(_)
             | ValueAt::Elements(_)
             // A maker's `new` is the receiver walk's alone.
