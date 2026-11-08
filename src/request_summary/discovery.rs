@@ -6464,6 +6464,7 @@ export function listen(): void {
                         home: None,
                         yarn_registry_env: None,
                         npm_registry_env: None,
+                        bun_registry_env: None,
                         xdg_config_home: None,
                     },
                 );

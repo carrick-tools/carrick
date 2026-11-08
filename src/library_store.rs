@@ -102,12 +102,15 @@ const PUBLIC_REGISTRIES: [&str; 2] = ["registry.npmjs.org", "registry.yarnpkg.co
 pub(crate) const RUNTIME_TYPES: &str = "@types/node";
 
 /// The lockfiles an install writes.
-const LOCKFILES: [&str; 5] = [
+const LOCKFILES: [&str; 7] = [
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
     "yarn.lock",
     "deno.lock",
+    "bun.lock",
+    // Binary and never read: its presence alone makes the ask blind.
+    "bun.lockb",
 ];
 
 /// A request to the store (contract section 2). `workspace_packages` is
@@ -151,6 +154,9 @@ pub struct Install<'a> {
     /// `NPM_CONFIG_REGISTRY`, the default registry Deno installs from when
     /// it is set.
     pub npm_registry_env: Option<&'a str>,
+    /// `BUN_CONFIG_REGISTRY`, the default registry Bun installs from when it
+    /// is set.
+    pub bun_registry_env: Option<&'a str>,
     /// `XDG_CONFIG_HOME`, which pnpm 11 and later reads its global config
     /// from (`$XDG_CONFIG_HOME/pnpm/rc`) before the home directory's.
     pub xdg_config_home: Option<&'a Path>,
@@ -540,6 +546,18 @@ fn unreadable_in(lock_dir: &Path) -> Vec<PathBuf> {
             out.push(path);
         }
     }
+    let bun = lock_dir.join("bun.lock");
+    if bun.is_file() {
+        if crate::packages::read_jsonc_config(&bun).is_err() {
+            out.push(bun);
+        }
+    } else {
+        // Bun's binary lockfile is not read; name it rather than stay silent.
+        let binary = lock_dir.join("bun.lockb");
+        if binary.is_file() {
+            out.push(binary);
+        }
+    }
     let pnpm = lock_dir.join("pnpm-lock.yaml");
     if pnpm.is_file() {
         if read_yaml_documents(&pnpm).is_none() {
@@ -695,6 +713,7 @@ fn from_public_registry(name: &str, package: &Installed, install: &Install<'_>) 
         pnpm_lock(name, package, &lock_dir, install),
         yarn_lock(name, package, &lock_dir, install),
         deno_lock(name, package, &lock_dir, install),
+        bun_lock(name, package, &lock_dir, install),
     ]
     .into_iter()
     .flatten()
@@ -1057,6 +1076,152 @@ fn yarn_berry(
         .filter_map(|rc| server(Some(rc)))
         .chain(install.yarn_registry_env.map(str::to_string))
         .all(|registry| is_public_url(&registry))
+}
+
+/// Bun's answer from the text `bun.lock` (JSONC), or `None` when it is
+/// absent. Every `packages` entry whose identity is exactly
+/// `name@<installed version>` and whose key is `name` or ends `/name` (a
+/// nested copy; any other key is an alias) must carry a sha integrity and a
+/// public registry: a URL in the second element is held to
+/// [`is_public_url`], and `""` (Bun's mark for whatever default registry is
+/// configured, public or not) to [`bun_configured_registry_is_public`]. A
+/// workspace, git, file, link or URL identity never equals an installed
+/// version, so it finds no entry. At least one entry must exist.
+fn bun_lock(
+    name: &str,
+    package: &Installed,
+    lock_dir: &Path,
+    install: &Install<'_>,
+) -> Option<bool> {
+    let path = lock_dir.join("bun.lock");
+    if !path.is_file() {
+        return None;
+    }
+    let Ok(lock) = crate::packages::read_jsonc_config(&path) else {
+        return Some(false);
+    };
+    let Some(Value::Object(packages)) = lock.get("packages") else {
+        return Some(false);
+    };
+    let suffix = format!("/{name}");
+    let mut found = false;
+    for (key, entry) in packages {
+        let Some(ident) = entry.get(0).and_then(Value::as_str) else {
+            continue;
+        };
+        // `name@1.2.3`, split at the last `@` after the first character.
+        let Some(at) = ident
+            .char_indices()
+            .rev()
+            .find(|(i, c)| *i > 0 && *c == '@')
+            .map(|(i, _)| i)
+        else {
+            continue;
+        };
+        if &ident[..at] != name || ident[at + 1..] != package.version {
+            continue;
+        }
+        if key != name && !key.ends_with(&suffix) {
+            return Some(false);
+        }
+        found = true;
+        let registry_public = match entry.get(1).and_then(Value::as_str) {
+            Some("") => bun_configured_registry_is_public(name, lock_dir, install),
+            Some(url) => is_public_url(url),
+            None => false,
+        };
+        let integrity = entry
+            .get(3)
+            .and_then(Value::as_str)
+            .is_some_and(|integrity| integrity.starts_with("sha"));
+        if !registry_public || !integrity {
+            return Some(false);
+        }
+    }
+    Some(found)
+}
+
+/// Whether the registry Bun is configured to install `name` from is the
+/// public one. Bun records `""` for the default registry whatever it is, so
+/// it is read where Bun reads it: every `bunfig.toml` from the lockfile's
+/// directory up to the repo root, `$XDG_CONFIG_HOME/.bunfig.toml`,
+/// `~/.bunfig.toml`, `BUN_CONFIG_REGISTRY` and `NPM_CONFIG_REGISTRY`. A
+/// scope mapped in `[install.scopes]` is held to that mapping; otherwise
+/// every default registry named must be public, and none named is the public
+/// default. Any line under those tables that cannot be read is not public.
+fn bun_configured_registry_is_public(name: &str, lock_dir: &Path, install: &Install<'_>) -> bool {
+    let scope = scope_of(name).map(|scope| scope.trim_start_matches('@'));
+    let mut files: Vec<PathBuf> = roots(lock_dir, install.repo_root)
+        .into_iter()
+        .map(|dir| dir.join("bunfig.toml"))
+        .collect();
+    files.extend(install.xdg_config_home.map(|xdg| xdg.join(".bunfig.toml")));
+    files.extend(install.home.map(|home| home.join(".bunfig.toml")));
+    let mut scoped: Vec<String> = Vec::new();
+    let mut default: Vec<String> = install
+        .bun_registry_env
+        .into_iter()
+        .chain(install.npm_registry_env)
+        .map(str::to_string)
+        .collect();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let mut section = "";
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') {
+                section = line.trim_matches(['[', ']', ' ']);
+                // A per-scope table is a form this reader does not take.
+                if section.starts_with("install.scopes.") {
+                    return false;
+                }
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().trim_matches('"');
+            match section {
+                "install" if key == "registry" => match bunfig_url(value) {
+                    Some(url) => default.push(url),
+                    None => return false,
+                },
+                "install.scopes" => match bunfig_url(value) {
+                    Some(url) => {
+                        if Some(key.trim_start_matches('@')) == scope {
+                            scoped.push(url);
+                        }
+                    }
+                    None => return false,
+                },
+                _ => {}
+            }
+        }
+    }
+    default.iter().all(|registry| is_public_url(registry))
+        && scoped.iter().all(|registry| is_public_url(registry))
+}
+
+/// The registry URL a bunfig value names: a string, or an inline table with
+/// a `url`. `None` for any other form.
+fn bunfig_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    let quoted = |text: &str| -> Option<String> {
+        let rest = text.trim_start().strip_prefix('"')?;
+        Some(rest[..rest.find('"')?].to_string())
+    };
+    if let Some(table) = value.strip_prefix('{') {
+        let url = table
+            .split(',')
+            .find_map(|part| part.trim().strip_prefix("url"))?;
+        return quoted(url.trim_start().strip_prefix('=')?);
+    }
+    quoted(value)
 }
 
 /// Deno's answer from `deno.lock`, or `None` when it is absent
@@ -1755,6 +1920,7 @@ mod tests {
             home: None,
             yarn_registry_env: None,
             npm_registry_env: None,
+            bun_registry_env: None,
             xdg_config_home: None,
         }
     }
@@ -2034,6 +2200,7 @@ mod tests {
             home: None,
             yarn_registry_env: None,
             npm_registry_env: None,
+            bun_registry_env: None,
             xdg_config_home: None,
         };
         assert_eq!(
@@ -2434,6 +2601,177 @@ mod tests {
             .unwrap()
             .insert(key.to_string(), entry);
         lock.to_string()
+    }
+
+    /// `lib@1.0.0` installed in `root` with a `bun.lock` of `packages` (the
+    /// text between the braces) and, when given, a `bunfig.toml`.
+    fn bun_install(root: &Path, packages: &str, bunfig: Option<&str>) {
+        install_package(root, "lib", "1.0.0");
+        write(
+            &root.join("bun.lock"),
+            &format!("{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n{packages}\n  }},\n}}\n"),
+        );
+        if let Some(bunfig) = bunfig {
+            write(&root.join("bunfig.toml"), bunfig);
+        }
+    }
+
+    const BUN_LIB: &str = r#"    "lib": ["lib@1.0.0", "", {}, "sha512-abc"],"#;
+
+    #[test]
+    fn a_bun_package_from_the_default_public_registry_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        bun_install(dir.path(), BUN_LIB, None);
+        assert_eq!(
+            asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
+            one("lib", "1.0.0", &["lib"])
+        );
+        // A public registry named in bunfig is the same as none.
+        let named = tempfile::tempdir().unwrap();
+        bun_install(
+            named.path(),
+            BUN_LIB,
+            Some("[install]\nregistry = \"https://registry.npmjs.org/\"\n"),
+        );
+        assert_eq!(
+            asked(request(&specifiers(&["lib"]), &install_at(named.path()))),
+            one("lib", "1.0.0", &["lib"])
+        );
+    }
+
+    #[test]
+    fn a_bun_package_under_a_private_default_registry_in_bunfig_is_not_sent() {
+        for bunfig in [
+            "[install]\nregistry = \"https://npm.acme.dev/\"\n",
+            "[install]\nregistry = { url = \"https://npm.acme.dev/\", token = \"t\" }\n",
+            // A form this reader does not take fails closed.
+            "[install]\nregistry = {\n  url = \"https://registry.npmjs.org/\"\n}\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            bun_install(dir.path(), BUN_LIB, Some(bunfig));
+            assert_eq!(
+                asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
+                vec![],
+                "{bunfig}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bun_scope_mapped_off_the_public_registry_is_not_sent() {
+        // The URL in the second element.
+        let dir = tempfile::tempdir().unwrap();
+        bun_install(
+            dir.path(),
+            r#"    "lib": ["lib@1.0.0", "https://npm.acme.dev/lib/-/lib-1.0.0.tgz", {}, "sha512-abc"],"#,
+            None,
+        );
+        assert_eq!(
+            asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
+            vec![]
+        );
+        // A public URL there is sent.
+        let public = tempfile::tempdir().unwrap();
+        bun_install(
+            public.path(),
+            r#"    "lib": ["lib@1.0.0", "https://registry.npmjs.org/lib/-/lib-1.0.0.tgz", {}, "sha512-abc"],"#,
+            None,
+        );
+        assert_eq!(
+            asked(request(&specifiers(&["lib"]), &install_at(public.path()))),
+            one("lib", "1.0.0", &["lib"])
+        );
+        // The scope's mapping in bunfig, for a scoped `""` entry.
+        let scoped = tempfile::tempdir().unwrap();
+        install_package(scoped.path(), "@acme/lib", "1.0.0");
+        write(
+            &scoped.path().join("bun.lock"),
+            r#"{"lockfileVersion":1,"packages":{"@acme/lib":["@acme/lib@1.0.0","",{},"sha512-abc"]}}"#,
+        );
+        write(
+            &scoped.path().join("bunfig.toml"),
+            "[install.scopes]\n\"@acme\" = { url = \"https://npm.acme.dev/\" }\n",
+        );
+        assert_eq!(
+            asked(request(
+                &specifiers(&["@acme/lib"]),
+                &install_at(scoped.path())
+            )),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_bun_workspace_git_tarball_or_alias_entry_is_not_sent() {
+        for entry in [
+            r#"    "lib": ["lib@workspace:packages/lib"],"#,
+            r#"    "lib": ["lib@github:acme/lib#abc123", {}, "acme-lib-abc123"],"#,
+            r#"    "lib": ["lib@https://example.com/lib-1.0.0.tgz", {}, "sha512-abc"],"#,
+            // The key is another name: an alias.
+            r#"    "other": ["lib@1.0.0", "", {}, "sha512-abc"],"#,
+            // No integrity.
+            r#"    "lib": ["lib@1.0.0", "", {}],"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            bun_install(dir.path(), entry, None);
+            assert_eq!(
+                asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
+                vec![],
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bun_lock_with_trailing_commas_and_a_nested_copy_reads_by_name_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        // The root copy is another version; the installed one is the nested
+        // copy, keyed `parent/lib`. Comments and trailing commas are JSONC.
+        bun_install(
+            dir.path(),
+            r#"    // the root copy
+    "lib": ["lib@2.0.0", "", {}, "sha512-root",],
+    "parent/lib": ["lib@1.0.0", "", {}, "sha512-nested",],"#,
+            None,
+        );
+        assert_eq!(
+            asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
+            one("lib", "1.0.0", &["lib"])
+        );
+    }
+
+    #[test]
+    fn an_unreadable_bun_lock_or_a_lone_bun_lockb_makes_the_ask_blind() {
+        let broken = tempfile::tempdir().unwrap();
+        install_package(broken.path(), "lib", "1.0.0");
+        write(
+            &broken.path().join("bun.lock"),
+            "{ \"packages\": [unclosed\n",
+        );
+        let health = ask_health(&specifiers(&["lib"]), &install_at(broken.path()));
+        assert_eq!((health.installed, health.sent), (1, 0));
+        assert_eq!(
+            health.unreadable_lockfiles,
+            BTreeSet::from([broken.path().join("bun.lock")])
+        );
+        assert!(health.is_blind());
+
+        let binary = tempfile::tempdir().unwrap();
+        install_package(binary.path(), "lib", "1.0.0");
+        write(&binary.path().join("bun.lockb"), "binary");
+        let health = ask_health(&specifiers(&["lib"]), &install_at(binary.path()));
+        assert_eq!(
+            health.unreadable_lockfiles,
+            BTreeSet::from([binary.path().join("bun.lockb")])
+        );
+        assert!(health.is_blind());
+
+        // A text lockfile beside it is read, and the binary one is not named.
+        let both = tempfile::tempdir().unwrap();
+        bun_install(both.path(), BUN_LIB, None);
+        write(&both.path().join("bun.lockb"), "binary");
+        let health = ask_health(&specifiers(&["lib"]), &install_at(both.path()));
+        assert!(!health.is_blind(), "{health:?}");
     }
 
     #[test]
