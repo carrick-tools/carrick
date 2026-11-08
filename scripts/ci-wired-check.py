@@ -26,7 +26,16 @@ entry = re.compile(r"^ +- shard: (\S+)\n((?: {12,}\S.*\n?)*)", re.M)
 for m in entry.finditer(text):
     shard, body = m.group(1), m.group(2)
     targets = re.search(r"^ +targets: >-\n((?: {14,}\S.*\n?)*)", body, re.M)
-    for name in re.findall(r"--test (\w+)", targets.group(1) if targets else ""):
+    words = (targets.group(1) if targets else "").split()
+    # The list is `--test <name>` pairs, word by word: a name glued to the
+    # next flag (`a_test--test b_test`) passes a substring search but not
+    # cargo, which then fails the shard's build (S9, FS-G3 on 2026-11-08).
+    pairs = list(zip(words[0::2], words[1::2]))
+    if len(words) % 2 or any(flag != "--test" or not re.fullmatch(r"\w+", name) for flag, name in pairs):
+        bad = [f"{flag} {name}" for flag, name in pairs if flag != "--test" or not re.fullmatch(r"\w+", name)]
+        print(f"::error::shard {shard}: targets must be '--test <name>' pairs; first bad pair: {(bad or words[-1:])[0]!r}")
+        sys.exit(1)
+    for _, name in pairs:
         plain[name].append(shard)
     part = re.search(r"^ +partitioned: (.+)$", body, re.M)
     if part:
