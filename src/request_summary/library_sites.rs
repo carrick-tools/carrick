@@ -2298,7 +2298,7 @@ impl Reader<'_> {
                 if !made.iter().all(|client| same_maker(client, first)) {
                     continue;
                 }
-                let mut client = module_scope.with_uses(first.clone(), name);
+                let mut client = module_scope.with_uses(first.clone(), name, None);
                 client.shared = Some(name.to_string());
                 out.insert(key, client);
             }
