@@ -127,7 +127,7 @@ const OF_IMPLEMENTATIONS: Plural = Plural {
 };
 
 /// The hop a walk records where it enters a function through a value.
-use super::decided_sites::VALUE_HOP;
+use super::decided_sites::{BoundCall, VALUE_HOP};
 
 /// One discovered site, or one walk that entered code and stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +154,10 @@ pub struct DiscoverySite {
     /// receiver trace on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reached: Option<ReachedBy>,
+    /// The calls on the way whose callee was a `bind` with bound arguments
+    /// (carrick#3504 S4d-b).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bound: Vec<BoundCall>,
 }
 
 /// The labelled call a site reaches.
@@ -920,6 +924,9 @@ struct Found {
     /// Reached through a callee whose values reach different labelled
     /// exports (carrick#2432): one of several, so no site.
     several: Option<&'static str>,
+    /// The calls the walk read through a `bind` with bound arguments
+    /// (carrick#3504 S4d-b).
+    bound: Vec<BoundCall>,
 }
 
 /// What a call or a body reaches.
@@ -1395,6 +1402,7 @@ impl<'a> Walker<'a> {
             file,
             call,
             construction,
+            bound: 0,
         };
         let end = |package: &str, export: &str, member: Option<&str>, claims: &ExportClaims| {
             self.end_at(invoke, package, export, member, claims)
@@ -1788,6 +1796,7 @@ impl<'a> Walker<'a> {
             file,
             call,
             construction,
+            bound: 0,
         };
         // `f.call(t, a)` or `f.apply(t, [a])`, the row naming the language's
         // member (carrick#3504 S4d): the call runs `f`, followed through
@@ -1812,6 +1821,7 @@ impl<'a> Walker<'a> {
                     receiver: traced.then(|| self.receiver_of(file, call)).flatten(),
                     reached: traced.then_some(reached),
                     several: None,
+                    bound: Vec::new(),
                 }],
                 ..Outcome::default()
             };
@@ -2097,6 +2107,7 @@ impl<'a> Walker<'a> {
                     stop,
                     receiver: None,
                     reached: None,
+                    bound: Vec::new(),
                 };
             if outcome.ends.is_empty() {
                 if !outcome.unanswered.is_empty() {
@@ -2192,6 +2203,7 @@ impl<'a> Walker<'a> {
                 discovery.sites.push(DiscoverySite {
                     receiver: found.receiver,
                     reached: found.reached,
+                    bound: found.bound,
                     ..record(Some(found.end), found.chain, stop)
                 });
             }
@@ -2500,9 +2512,31 @@ impl<'a> Follow<'a> for Walker<'a> {
                 receiver: None,
                 reached: None,
                 several: None,
+                bound: Vec::new(),
             }],
             ..Outcome::default()
         })
+    }
+
+    fn bound(
+        &mut self,
+        mut reached: Outcome<'a>,
+        invoke: Invoke<'a>,
+        bind: (&'a Path, &CallIr),
+    ) -> Outcome<'a> {
+        let (bind_file, bind) = bind;
+        let at = BoundCall {
+            file: self.rel(invoke.file),
+            span_start: invoke.call.site.span_start,
+            span_end: invoke.call.site.span_end,
+            bind_file: self.rel(bind_file),
+            bind_start: bind.site.span_start,
+            bind_end: bind.site.span_end,
+        };
+        for found in &mut reached.ends {
+            found.bound.push(at.clone());
+        }
+        reached
     }
 
     fn definition(&mut self, target: PathBuf, key: String, invoke: Invoke<'a>) -> Outcome<'a> {
@@ -3495,6 +3529,58 @@ mod tests {
             ("m-own-apply.ts", 8, "site http", "/p/m-own-apply"),
             ("m-publish-call.ts", 8, "site bus", "m-publish-call"),
             ("m-rpc-call.ts", 12, "site http", "/p/m-rpc-call"),
+        ]
+        .into_iter()
+        .filter_map(|(file, line, want, name)| {
+            let got = recorded_at(&discovery, file, line);
+            let named = name_at(file, line);
+            (got != [want.to_string()] || named != [name.to_string()])
+                .then(|| format!("{file}:{line} want {want} {name}, got {got:?} {named:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// carrick#3504 S4d-b: `f.bind(t, a)` binds `a` ahead of the arguments
+    /// of the call that runs the result: an HTTP request and a broker
+    /// publish name what the bind states, a call's own argument follows the
+    /// bound ones, and `f.bind(t)` binds nothing. The answer key is
+    /// `tests/fixtures/callee-members/README.md`.
+    #[test]
+    fn bound_arguments_fill_the_leading_parameters() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("callee-members", "services/web", "web")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let name_at = |file: &str, line: u32| -> Vec<String> {
+            let mut out: Vec<String> = decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .map(|site| {
+                    site.name
+                        .iter()
+                        .map(|piece| match piece {
+                            Piece::Lit(text) => text.clone(),
+                            _ => "?".to_string(),
+                        })
+                        .collect()
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let wrong: Vec<String> = [
+            ("m-bound-http.ts", 9, "site http", "/p/m-bound-http"),
+            ("m-bound-publish.ts", 9, "site bus", "m-bound-publish"),
+            ("m-bound-split.ts", 9, "site http", "/p/m-bound-split"),
+            ("m-own-bind-this.ts", 9, "site http", "/p/m-own-bind-this"),
         ]
         .into_iter()
         .filter_map(|(file, line, want, name)| {

@@ -142,6 +142,27 @@ pub struct DiscoverySite {
     /// How discovery matched the labelled call, with the receiver trace on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reached: Option<super::discovery::ReachedBy>,
+    /// The calls on the way whose callee was a `bind` with bound arguments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bound: Vec<BoundCall>,
+}
+
+/// A call whose callee discovery read through a `bind` that bound
+/// arguments (carrick#3504 S4d-b): the bound arguments fill the leading
+/// parameters of the function ahead of the call's own. Both calls by their
+/// SWC span in the file parsed on its own, files repo-relative; the bound
+/// arguments are the `bind` call's after `this`, read from that call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundCall {
+    /// The call that runs the bound function (`g()` in `const g =
+    /// send.bind(null, '/p')`).
+    pub file: String,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// The `bind` call (`send.bind(null, '/p')`), in `bind_file`.
+    pub bind_file: String,
+    pub bind_start: u32,
+    pub bind_end: u32,
 }
 
 /// Discovery's census file: `{ "sites": [...] }`.
@@ -2836,6 +2857,12 @@ fn decide(
     let mut tables: HashMap<(PathBuf, u32), Option<Vec<TableKey>>> = HashMap::new();
     let mut walked: Vec<String> = Vec::new();
     let mut unplaced: Vec<String> = Vec::new();
+    // The calls each site's chain runs a `bind` through, read with the bound
+    // arguments ahead of their own (carrick#3504 S4d-b).
+    let shifted: Vec<Vec<(Placed<'_>, CallIr)>> = discovered
+        .iter()
+        .map(|site| bound_calls(&calls, root, site))
+        .collect();
     let mut walk = Walk {
         calls: &calls,
         inputs,
@@ -2855,7 +2882,8 @@ fn decide(
         fold: super::site_record::NameFold::new(inputs, siblings, root),
         entered: &entered,
     };
-    for site in discovered {
+    for (at, site) in discovered.iter().enumerate() {
+        let shifted = shifted[at].as_slice();
         let Some(end) = &site.end else {
             continue;
         };
@@ -2978,6 +3006,7 @@ fn decide(
             && let Some(first) =
                 calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
         {
+            let first = shift(first, shifted);
             let value = filled(&at_end, first.call);
             let down = [first, last];
             walk.value_hop = true;
@@ -2995,6 +3024,10 @@ fn decide(
             walk.up(&[last], &at_end, end, &mut Vec::new());
             continue;
         };
+        let chain: Vec<Placed<'_>> = chain
+            .into_iter()
+            .map(|placed| shift(placed, shifted))
+            .collect();
         // Compose up the chain: values[k] is the slot at chain[k], as the
         // body that writes chain[k] reads it.
         let n = chain.len();
@@ -3418,6 +3451,43 @@ impl Decided {
             }
         });
         before - self.sites.len()
+    }
+}
+
+/// The calls of `site` that run a function through a `bind` with bound
+/// arguments, each with its copy that reads those arguments ahead of its own
+/// (carrick#3504 S4d-b). A call or a `bind` the calls do not place is left
+/// as written.
+fn bound_calls<'a>(
+    calls: &Calls<'a>,
+    root: &Path,
+    site: &DiscoverySite,
+) -> Vec<(Placed<'a>, CallIr)> {
+    site.bound
+        .iter()
+        .filter_map(|bound| {
+            let run = calls.at_span(&root.join(&bound.file), bound.span_start, bound.span_end)?;
+            let bind = calls.at_span(
+                &root.join(&bound.bind_file),
+                bound.bind_start,
+                bound.bind_end,
+            )?;
+            bind.call
+                .args_are_closed_text()
+                .then(|| (run, run.call.with_bound(bind.call)))
+        })
+        .collect()
+}
+
+/// `placed`, read through its bound arguments where `shifted` holds a copy
+/// of its call.
+fn shift<'s>(placed: Placed<'s>, shifted: &'s [(Placed<'s>, CallIr)]) -> Placed<'s> {
+    match shifted
+        .iter()
+        .find(|(run, _)| run.file == placed.file && run.call.site == placed.call.site)
+    {
+        Some((_, call)) => Placed { call, ..placed },
+        None => placed,
     }
 }
 
@@ -4426,6 +4496,7 @@ pub(crate) mod tests {
             stop: None,
             receiver: None,
             reached: None,
+            bound: Vec::new(),
         };
         let answer: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
@@ -4652,6 +4723,7 @@ pub(crate) mod tests {
             stop: None,
             receiver: None,
             reached: None,
+            bound: Vec::new(),
         }
     }
 
@@ -4786,6 +4858,7 @@ pub(crate) mod tests {
             stop: None,
             receiver: None,
             reached: None,
+            bound: Vec::new(),
         };
         let decided = decided_sites(&inputs, &root, &[site], &[send]);
         assert_eq!(

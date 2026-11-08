@@ -432,7 +432,7 @@
  "t-bound-args": {
   "feature": "Function.prototype.bind with bound arguments (built-in)",
   "source": "test262 (built-in)",
-  "status": "lead"
+  "status": "covered"
  },
  "t-call-apply": {
   "feature": "Function.prototype.call (built-in)",

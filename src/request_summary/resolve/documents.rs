@@ -235,6 +235,7 @@ pub(crate) fn document_calls(
                 file: wait.at.0,
                 call: wait.call,
                 construction: false,
+                bound: 0,
             };
             let mut held = Vec::new();
             for (depth, index, keys) in &wait.params {
@@ -328,6 +329,7 @@ fn read_call<'a>(
         file,
         call,
         construction: false,
+        bound: 0,
     };
     let mut leaves = Vec::new();
     for values in &call.arg_values {

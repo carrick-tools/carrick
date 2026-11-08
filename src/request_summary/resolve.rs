@@ -1356,6 +1356,12 @@ pub(super) struct Invoke<'a> {
     pub(super) file: &'a Path,
     pub(super) call: &'a CallIr,
     pub(super) construction: bool,
+    /// How many leading arguments a `bind` the value was read through has
+    /// bound ahead of this call's own (carrick#3504 S4d-b): the call's
+    /// argument `i` fills the function's parameter `bound + i`, and the
+    /// parameters before `bound` hold the bound arguments, which the
+    /// decided step reads (`DiscoverySite::bound`).
+    pub(super) bound: usize,
 }
 
 /// One value a position may hold, read (carrick#2432). `R` is what the
@@ -1403,6 +1409,18 @@ pub(super) trait Follow<'a> {
         invoke: Invoke<'a>,
         maker: Option<Maker<'a>>,
     ) -> Self::Reached;
+
+    /// `reached` was read through a `bind` that bound arguments ahead of
+    /// the call `invoke` (carrick#3504 S4d-b): `bind` is the `bind` call.
+    /// The default keeps `reached` as it is.
+    fn bound(
+        &mut self,
+        reached: Self::Reached,
+        _invoke: Invoke<'a>,
+        _bind: (&'a Path, &CallIr),
+    ) -> Self::Reached {
+        reached
+    }
 }
 
 /// The call of an own factory that made the function a value holds
@@ -1739,16 +1757,45 @@ impl<'a> Resolver<'a> {
             } => {
                 // `f.bind(this)` is `f`: the member the compiler's row names
                 // as the language library's `bind` returns its object.
+                // With arguments bound (`f.bind(this, a)`), they fill the
+                // leading parameters ahead of the call's own (carrick#3504
+                // S4d-b): read when every one is text no parameter of the
+                // function that writes the bind moves, and the bind is the
+                // first one the value is read through.
                 if let Some(call) = member
-                    && call.args == 1
                     && self.is_library_bind(file, call.lo, call.hi)
                 {
-                    let mut out = Vec::new();
-                    for object in &call.object {
-                        out.extend(self.read_value(follow, file, object, invoke, at_caller));
-                    }
-                    if !out.is_empty() {
-                        return out;
+                    let bind = if call.args == 1 {
+                        None
+                    } else {
+                        self.written_call(file, *lo)
+                            .filter(|bind| bind.args_are_closed_text())
+                            .filter(|_| invoke.bound == 0)
+                            .map(|bind| (bind, call.args - 1))
+                    };
+                    if call.args == 1 || bind.is_some() {
+                        let inner = Invoke {
+                            bound: bind.map_or(0, |(_, count)| count),
+                            ..invoke
+                        };
+                        let mut out = Vec::new();
+                        for object in &call.object {
+                            out.extend(self.read_value(follow, file, object, inner, at_caller));
+                        }
+                        if let Some((bind, _)) = bind {
+                            out = out
+                                .into_iter()
+                                .map(|held| match held {
+                                    Held::Reached(reached) => {
+                                        Held::Reached(follow.bound(reached, invoke, (file, bind)))
+                                    }
+                                    other => other,
+                                })
+                                .collect();
+                        }
+                        if !out.is_empty() {
+                            return out;
+                        }
                     }
                 }
                 let Reach::Function(target, key) = self.inputs_for(file).reach(file, *lo, *hi)
@@ -1768,6 +1815,7 @@ impl<'a> Resolver<'a> {
                         file,
                         call,
                         construction: false,
+                        bound: 0,
                     },
                     factory: (factory_file, factory),
                     out: (self.bindings_reading.borrow().is_empty()
@@ -1917,6 +1965,7 @@ impl<'a> Resolver<'a> {
                             file: placed.file,
                             call: placed.call,
                             construction: true,
+                            bound: 0,
                         };
                         for held in
                             self.passed(follow, Some(at), *index, keys, Some(defaults), invoke)
@@ -1977,10 +2026,14 @@ impl<'a> Resolver<'a> {
             // Shifted past `this` for the language's `call` and `apply`
             // (carrick#3504 S4d).
             let args = at.call.passed_values();
+            // Bound arguments fill the leading parameters (carrick#3504
+            // S4d-b): their text is the decided step's, this walk reads
+            // nothing there, and the call's own arguments follow them.
+            let own = index.checked_sub(at.bound);
             // A spread (an empty entry) at or before the position moves it.
-            let spread = args.iter().take(index + 1).any(Vec::is_empty);
-            match args.get(index) {
-                _ if spread => written.push(ValueAt::Unread),
+            let spread = own.is_some_and(|own| args.iter().take(own + 1).any(Vec::is_empty));
+            match own.and_then(|own| args.get(own)) {
+                _ if spread || own.is_none() => written.push(ValueAt::Unread),
                 Some(values) => {
                     for value in values {
                         match value.at(keys) {
@@ -2062,6 +2115,7 @@ impl<'a> Resolver<'a> {
                 file: caller.file,
                 call: caller.call,
                 construction: false,
+                bound: 0,
             };
             for value in self.passed(follow, Some(at), index, keys, callee, invoke) {
                 match value {
@@ -2343,6 +2397,7 @@ mod tests {
             file: path,
             call,
             construction: false,
+            bound: 0,
         };
         let mut out = Vec::new();
         for value in &call.callee_values {
