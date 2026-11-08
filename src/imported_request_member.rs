@@ -172,6 +172,12 @@ pub struct RequestMember {
     /// file carries for this request is found again (carrick#656), and it is
     /// deliberately outside `PartialEq` below.
     pub request_line: u32,
+    /// Where the member's request call starts, file-local and counted from
+    /// [`crate::swc_scanner::SWC_SPAN_BASE`]: the numbering a library site's
+    /// `span_start` uses. A scan shares one source map across files, so the
+    /// raw span is not file-local. Provenance, outside `PartialEq`; it tells
+    /// a server-framework call from a request that shares its line.
+    pub request_start: u32,
     /// What a call through the member sends as its body (carrick#1782): no
     /// body the call's arguments state ([`CallBody::Built`]), or the declared
     /// parameter the member sends unchanged. `None` where the member sends a
@@ -645,6 +651,8 @@ impl MemberCollector<'_> {
             base_unread,
             request_line: u32::try_from(self.source_map.lookup_char_pos(call.span().lo).line)
                 .unwrap_or(0),
+            request_start: self.source_map.lookup_byte_offset(call.span().lo).pos.0
+                + crate::swc_scanner::SWC_SPAN_BASE,
             body: sent_body(call, options, verb_call, target_at, params),
         })
     }
@@ -1105,7 +1113,19 @@ mod tests {
     use swc_ecma_visit::VisitMutWith;
 
     fn index(content: &str) -> RequestMemberIndex {
+        index_after(None, content)
+    }
+
+    /// `content` as the second file of a source map that already holds
+    /// `earlier`, the way a scan shares one map across its files.
+    fn index_after(earlier: Option<&str>, content: &str) -> RequestMemberIndex {
         let source_map: Lrc<SourceMap> = Default::default();
+        if let Some(earlier) = earlier {
+            source_map.new_source_file(
+                Lrc::new(FileName::Real(PathBuf::from("earlier.ts"))),
+                earlier.to_string(),
+            );
+        }
         let source_file = source_map.new_source_file(
             Lrc::new(FileName::Real(PathBuf::from("client.ts"))),
             content.to_string(),
@@ -1138,6 +1158,7 @@ mod tests {
             method: method.to_string(),
             target: target.to_string(),
             request_line: 0,
+            request_start: 0,
             body: None,
             base_unread: false,
         }
@@ -1244,6 +1265,20 @@ mod tests {
             members.get("listThings").map(|member| member.request_line),
             Some(3),
             "the request's own line, not the member's or the file's"
+        );
+    }
+
+    /// SPAN-1: the start is file-local plus `SWC_SPAN_BASE`, the numbering a
+    /// library site's `span_start` uses, though a scan shares one source map
+    /// across files. The first file of a map cannot tell the two apart.
+    #[test]
+    fn records_the_file_local_start_of_its_request() {
+        let content = "class C {\n  go() {\n    return fetch(`${this.base}/api/x`, { method: \"GET\" });\n  }\n}\n";
+        let members = index_after(Some("// an earlier file\nexport const a = 1;\n"), content);
+        let offset = content.find("fetch(").unwrap() as u32;
+        assert_eq!(
+            members.get("go").map(|member| member.request_start),
+            Some(offset + crate::swc_scanner::SWC_SPAN_BASE)
         );
     }
 
