@@ -1712,6 +1712,25 @@ impl FunctionDefinitionExtractor {
     /// class — the one shape where `Class.member` would collide on a single
     /// map key. Private members are tracked with their `#` prefix, so they
     /// can never collide with a same-named public member.
+    /// Walk a class expression with `name` as its class: the class's own
+    /// identifier, else the binding the language names it by.
+    fn visit_class_expr_as(&mut self, name: Option<String>, class: &ClassExpr) {
+        let prev = match name {
+            Some(name) => {
+                self.record_field_types(&name, &class.class);
+                self.current_class.replace(name)
+            }
+            None => self.current_class.take(),
+        };
+        let prev_collisions = std::mem::replace(
+            &mut self.current_class_collisions,
+            Self::static_instance_collisions(&class.class),
+        );
+        class.visit_children_with(self);
+        self.current_class = prev;
+        self.current_class_collisions = prev_collisions;
+    }
+
     fn static_instance_collisions(class: &Class) -> HashSet<String> {
         let mut static_names = HashSet::new();
         let mut instance_names = HashSet::new();
@@ -2257,6 +2276,12 @@ impl Visit for FunctionDefinitionExtractor {
                             },
                         );
                     }
+                    // `const Api = class {}`: the language names the class by
+                    // its binding, so its methods key as `Api.method`.
+                    Expr::Class(class) if class.ident.is_none() => {
+                        self.visit_class_expr_as(Some(name), class);
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -2292,24 +2317,14 @@ impl Visit for FunctionDefinitionExtractor {
         self.current_class_collisions = prev_collisions;
     }
 
-    /// Class expressions (`const Foo = class { ... }`, `export default class Foo`).
-    /// An anonymous class expression clears the tracked name: its members have
+    /// Class expressions (`export default class Foo`, `class Named {}`). An
+    /// anonymous class expression clears the tracked name: its members have
     /// no stable qualified name and must not be attributed to an outer class.
+    /// A `const` declarator names its anonymous class expression itself (see
+    /// `visit_var_declarator`).
     fn visit_class_expr(&mut self, class: &ClassExpr) {
-        let prev = match &class.ident {
-            Some(ident) => {
-                self.record_field_types(ident.sym.as_ref(), &class.class);
-                self.current_class.replace(ident.sym.to_string())
-            }
-            None => self.current_class.take(),
-        };
-        let prev_collisions = std::mem::replace(
-            &mut self.current_class_collisions,
-            Self::static_instance_collisions(&class.class),
-        );
-        class.visit_children_with(self);
-        self.current_class = prev;
-        self.current_class_collisions = prev_collisions;
+        let name = class.ident.as_ref().map(|ident| ident.sym.to_string());
+        self.visit_class_expr_as(name, class);
     }
 
     /// Index class methods (static and instance) as `Class.method` (see

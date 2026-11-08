@@ -447,7 +447,12 @@
  "t-class-expr": {
   "feature": "class expression",
   "source": "test262 (class)",
-  "status": "not_reached"
+  "status": "covered"
+ },
+ "t-class-expr-named": {
+  "feature": "named class expression",
+  "source": "test262 (class)",
+  "status": "covered"
  },
  "t-class-field-client": {
   "feature": "class field holding the client",
