@@ -34,9 +34,10 @@ fn sidecar_available() -> bool {
     node && built
 }
 
-/// One edge of a blob: (service, caller, callee, callee file, call line,
-/// call count).
-type Edge = (String, String, String, String, u64, u64);
+/// One edge of a blob: (service, caller, callee, callee file, call line).
+/// Edges to one callee fold to the first call's line, so a second call that
+/// took an edge it should not have moves the line, never adds a row.
+type Edge = (String, String, String, String, u64);
 
 /// Every edge of every service's blob.
 fn scan_edges() -> BTreeSet<Edge> {
@@ -96,7 +97,6 @@ fn scan_edges() -> BTreeSet<Edge> {
                     call["name"].as_str().unwrap_or_default().to_string(),
                     call["file_path"].as_str().unwrap_or_default().to_string(),
                     call["call_site_line"].as_u64().unwrap_or_default(),
-                    call["call_count"].as_u64().unwrap_or_default(),
                 ));
             }
         }
@@ -110,14 +110,14 @@ fn scan_edges() -> BTreeSet<Edge> {
 }
 
 /// The edge `caller` -> `callee` in `common/money.ts`, if the scan stated it:
-/// (call line, call count).
-fn into_money(edges: &BTreeSet<Edge>, caller: &str, callee: &str) -> Option<(u64, u64)> {
+/// its call line.
+fn into_money(edges: &BTreeSet<Edge>, caller: &str, callee: &str) -> Option<u64> {
     edges
         .iter()
-        .find(|(_, from, to, file, ..)| {
+        .find(|(_, from, to, file, _)| {
             from == caller && to == callee && file.ends_with("common/money.ts")
         })
-        .map(|(.., line, count)| (*line, *count))
+        .map(|(.., line)| *line)
 }
 
 #[test]
@@ -131,28 +131,28 @@ fn a_bare_call_the_resolver_cannot_place_takes_its_edge_from_the_call_row() {
     // Known positive: an ESM import the resolver places.
     assert_eq!(
         into_money(&edges, "invoice", "formatTotal"),
-        Some((4, 1)),
+        Some(4),
         "the scan stated {edges:#?}"
     );
     // A destructured require of a path that names no file, read through its
     // `typeof import` cast.
     assert_eq!(
         into_money(&edges, "checkout", "formatTotal"),
-        Some((6, 1)),
+        Some(6),
         "the scan stated {edges:#?}"
     );
     // A require that resolves wins over a cast naming another file.
     assert_eq!(
         into_money(&edges, "viaLocal", "formatTotal"),
-        Some((3, 1)),
+        Some(3),
         "the scan stated {edges:#?}"
     );
     // The member call through the cast whole-module binding (line 8) is the
     // only `roundCents` edge: the uncast require of a missing path (line 7)
-    // names nothing, so it adds neither a line nor a count.
+    // names nothing, so the edge keeps line 8.
     assert_eq!(
         into_money(&edges, "checkout", "roundCents"),
-        Some((8, 1)),
+        Some(8),
         "the scan stated {edges:#?}"
     );
     // A parameter typed `typeof formatTotal` is no caller of it.
