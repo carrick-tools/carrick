@@ -5775,6 +5775,69 @@ export function listen(): void {
         assert_eq!(served(&again), (got, untraced, guessed));
     }
 
+    /// carrick#3191: a route whose path is a binding with a literal default
+    /// is served at the path the default gives, whichever way the default is
+    /// written (a local's `||` or `??`, a destructuring default, a parameter
+    /// default, a default on a key of a destructured parameter), and so is a
+    /// template or `+` built on one. A default read at runtime, and a local
+    /// assigned again, state no path: each stays a guessed site.
+    #[test]
+    fn a_route_path_held_in_a_binding_with_a_literal_default_is_served_there() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-route-default")
+        else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let routes = crate::site_rows::traced(&decided, &records);
+        let mut served: Vec<String> = routes
+            .routes
+            .iter()
+            .map(|route| {
+                format!(
+                    "{}:{} {} {}",
+                    route.file,
+                    route.line,
+                    route.method,
+                    route.full_paths.join(" ")
+                )
+            })
+            .collect();
+        served.sort();
+        assert_eq!(
+            served,
+            texts(&[
+                "src/index.ts:15 GET /widgets",
+                "src/index.ts:16 GET /widgets/:widgetId",
+                "src/index.ts:23 GET /gadgets",
+                "src/index.ts:24 GET /gadgets/:gadgetId",
+                "src/index.ts:31 GET /parts",
+                "src/index.ts:32 GET /parts/:partId",
+                "src/index.ts:38 GET /tools",
+                "src/index.ts:39 GET /tools/:toolId",
+                "src/index.ts:45 GET /bolts",
+                "src/index.ts:46 GET /bolts/:boltId",
+                "src/index.ts:53 GET /nuts",
+            ]),
+            "{served:#?}"
+        );
+        let mut guessed: Vec<String> = routes
+            .guessed
+            .iter()
+            .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
+            .collect();
+        guessed.sort();
+        assert_eq!(
+            guessed,
+            texts(&["src/index.ts:60 GET", "src/index.ts:64 GET"]),
+            "{guessed:#?}"
+        );
+    }
+
     /// Ruling on PR #3182 (2026-11-02): a route whose own path the code
     /// writes in no whole way (a base joined with text, a base rewritten by
     /// a call, a local holding a value read at runtime, a loop over values
@@ -5809,7 +5872,7 @@ export function listen(): void {
             .collect();
         assert_eq!(
             served,
-            texts(&["src/index.ts:21 GET /ready"]),
+            texts(&["src/index.ts:19 GET /", "src/index.ts:21 GET /ready"]),
             "{served:#?}"
         );
         let mut guessed: Vec<String> = routes
@@ -5823,7 +5886,6 @@ export function listen(): void {
             texts(&[
                 "src/index.ts:14 GET",
                 "src/index.ts:16 POST",
-                "src/index.ts:19 GET",
                 "src/table.ts:17 GET",
             ]),
             "{guessed:#?}"

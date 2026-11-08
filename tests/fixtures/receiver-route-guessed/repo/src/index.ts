@@ -14,7 +14,7 @@ export function serve(): void {
   app.get(`${basePath}health`, ok);
   // The base rewritten by a call: no way is written whole.
   app.post(String(basePath).replace(/\/$/, "") + "/jobs", ok);
-  // A default held in a local: not read yet (carrick#3191).
+  // A default held in a local: served at the default (carrick#3191).
   const root = basePath ?? "/";
   app.get(root, ok);
   // A literal route beside them.
