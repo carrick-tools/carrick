@@ -884,6 +884,23 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// (carrick#2474 R2b); one written under a key of an object literal is
     /// a callback option.
     fn callback(&mut self, placed: &Placed<'a>, pieces: &[Piece]) {
+        // Every parameter the receiver holds belongs to a callback that
+        // encloses this one: read it where it was declared, from that
+        // callback's own host, one callback out at a time. `up` refuses
+        // again at the next callback in when the pieces are still captured.
+        if !pieces
+            .iter()
+            .any(|piece| matches!(piece, Piece::Param(..) | Piece::ParamKey(..)))
+            && pieces.iter().any(|piece| matches!(piece, Piece::Outer(..)))
+            && let Some(host) = placed.host
+            && let Some(outer) =
+                self.calls
+                    .at_span(placed.file, host.site.span_start, host.site.span_end)
+        {
+            let lifted = pieces.iter().map(Piece::lifted).collect();
+            self.up(outer, lifted);
+            return;
+        }
         let at = self.at(placed);
         let written = placed.written_in;
         if let Some(written) = written.filter(|written| !written.path.is_empty()) {

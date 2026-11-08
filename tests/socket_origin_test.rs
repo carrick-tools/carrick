@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 const SERVER: &str = "services/hub/src/server.ts";
 const CLIENT: &str = "services/peer/src/client.ts";
 const CONN: &str = "services/hub/src/conn.ts";
+const NESTED: &str = "services/hub/src/nested.ts";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/socket-origin")
@@ -304,6 +305,46 @@ fn the_two_services_pair_on_both_events() {
         assert!(
             keys(endpoint_in, "endpoints").contains(&event.to_string()),
             "{endpoint_in} serves {event}: {services:#?}"
+        );
+    }
+}
+
+/// A peer is the parameter of the callback a hub runs; callbacks written
+/// inside it capture it. Each is read where the peer was declared, from the
+/// callback that owns it, so a call in a callback nested in it, at any depth,
+/// has the side that owner's peer has.
+#[test]
+fn a_peer_captured_by_a_nested_callback_keeps_the_side_it_was_handed_in_on() {
+    let rows = &scanned()["hub"];
+    for event in [
+        "k.direct",
+        "k.answered",
+        "k.local",
+        "k.later",
+        "k.deeper",
+        "k.fn-answered",
+    ] {
+        let key = format!("socket|server_to_client|{event}");
+        assert!(
+            rows.iter()
+                .any(|row| row.key == key && row.file_path.starts_with(NESTED)),
+            "{key} in {rows:#?}"
+        );
+    }
+}
+
+/// A captured peer whose owner nothing hands a peer in stays without a side,
+/// as does an inner callback's own parameter and a parameter of a named
+/// nested function (no host to step out through).
+#[test]
+fn a_captured_peer_whose_owner_nothing_hands_in_stays_unknown() {
+    let rows = &scanned()["hub"];
+    for event in ["k.inner-own", "k.own-host", "k.shadow", "k.named"] {
+        let key = format!("socket|unknown|{event}");
+        assert!(
+            rows.iter()
+                .any(|row| row.key == key && row.file_path.starts_with(NESTED)),
+            "{key} in {rows:#?}"
         );
     }
 }
