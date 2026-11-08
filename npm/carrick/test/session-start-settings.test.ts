@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import { fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
 import { currentVersion } from "../src/update.ts";
@@ -243,6 +244,87 @@ test("skills still ours are brought up to date under both roots, with their own 
 
   const second = await session(workspace);
   assert.doesNotMatch(second.stdout, /brought its|carrick init/);
+});
+
+function git(repo: string, ...args: string[]): void {
+  execFileSync("git", ["-C", repo, "-c", "user.email=t@example.com", "-c", "user.name=t", ...args], { stdio: "ignore" });
+}
+
+function heldLine(files: string[]): RegExp {
+  const named = files.map((file) => file.replaceAll(".", "\\.")).join(" and ");
+  return new RegExp(
+    `Carrick did not update ${named} because git tracks them here\\. Run \`carrick init\`, then commit the change in its own pull request\\.`,
+  );
+}
+
+test("a tracked stale skill and settings file are left byte for byte and named in one line", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const settings = put(workspace.root, LOCAL, olderSettings());
+  const skillPath = skillFile(SKILL_ROOTS[0]!, "carrick-impact");
+  const skill = put(workspace.root, skillPath, stamped("an older body"));
+  recordVersion(workspace.root, "0.0.1");
+  git(workspace.root, "init", "-q");
+  git(workspace.root, "add", LOCAL, skillPath);
+  git(workspace.root, "commit", "-q", "-m", "tracked");
+  const settingsBefore = fs.readFileSync(settings, "utf8");
+  const skillBefore = fs.readFileSync(skill, "utf8");
+
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+
+  assert.equal(fs.readFileSync(settings, "utf8"), settingsBefore);
+  assert.equal(fs.readFileSync(skill, "utf8"), skillBefore);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, heldLine([LOCAL, skillPath]));
+  assert.equal(fs.readFileSync(path.join(workspace.root, ".carrick", "cli-version"), "utf8").trim(), "0.0.1");
+});
+
+test("when every outdated file is tracked, the held line replaces the version mismatch line", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  put(workspace.root, LOCAL, olderSettings());
+  recordVersion(workspace.root, "0.0.1");
+  git(workspace.root, "init", "-q");
+  git(workspace.root, "add", LOCAL);
+  git(workspace.root, "commit", "-q", "-m", "tracked");
+
+  const run = await session(workspace);
+
+  assert.match(run.stdout, heldLine([LOCAL]));
+  assert.doesNotMatch(run.stdout, /set this workspace up/);
+});
+
+test("the same files untracked are rewritten, as before", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const settings = put(workspace.root, LOCAL, olderSettings());
+  const skillPath = skillFile(SKILL_ROOTS[0]!, "carrick-impact");
+  const skill = put(workspace.root, skillPath, stamped("an older body"));
+  git(workspace.root, "init", "-q");
+
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+
+  assert.notEqual(fs.readFileSync(settings, "utf8"), olderSettings());
+  assert.notEqual(fs.readFileSync(skill, "utf8"), stamped("an older body"));
+  assert.ok(lines.some((line) => /brought its hook entries/.test(line)));
+  assert.ok(lines.every((line) => !/did not update/.test(line)));
+});
+
+test("a repo below a folder keeps its tracked settings file byte for byte and names it", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const repo = path.join(workspace.root, "api");
+  const settings = put(repo, LOCAL, olderSettings());
+  git(repo, "init", "-q");
+  git(repo, "add", LOCAL);
+  git(repo, "commit", "-q", "-m", "tracked");
+  const before = fs.readFileSync(settings, "utf8");
+
+  const lines = bringUpToDate(workspace.root, repo, running);
+
+  assert.equal(fs.readFileSync(settings, "utf8"), before);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, heldLine([path.join("api", LOCAL)]));
 });
 
 test("an edited skill is left alone, and a missing one is not created", async (t) => {
