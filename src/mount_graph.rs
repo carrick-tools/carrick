@@ -367,6 +367,13 @@ pub struct DataFetchingCall {
     /// and `host`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub own_route: bool,
+    /// The repo-relative file this call requests when the service serves it
+    /// from a static folder its routing convention names (carrick#1989),
+    /// carried from the per-file row so it reaches
+    /// `mount_graph.data_calls[]`. Absent on every other row, so a blob with
+    /// no static call is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_asset: Option<String>,
 }
 
 /// The complete mount and endpoint graph
@@ -840,6 +847,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -939,6 +947,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route,
+            static_asset: None,
         };
         let mut graph = MountGraph::new();
         graph.data_calls = vec![
@@ -1745,6 +1754,7 @@ mod tests {
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);

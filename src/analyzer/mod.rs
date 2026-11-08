@@ -5421,6 +5421,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         };
         (call, row)
     }
@@ -5891,6 +5892,7 @@ mod tests {
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             });
 
             let (findings, _verified, _edges) =
@@ -5965,6 +5967,7 @@ mod tests {
                     reaches_request: None,
                     library_semantics: Vec::new(),
                     own_route: false,
+                    static_asset: None,
                 });
             }
 
@@ -6182,6 +6185,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
         analyzer.mount_graph = Some(mount_graph);
 
@@ -6268,6 +6272,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
         analyzer.mount_graph = Some(mount_graph);
 
@@ -6659,6 +6664,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
 
         let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -6900,6 +6906,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
 
         analyzer.analyze_matches_with_mount_graph(&mount_graph)
@@ -7185,6 +7192,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -7303,6 +7311,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
         analyzer
             .calls
@@ -7390,6 +7399,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
         analyzer
             .calls
@@ -7460,6 +7470,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -9141,6 +9152,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }
     }
 

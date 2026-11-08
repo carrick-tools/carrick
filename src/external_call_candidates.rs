@@ -3889,6 +3889,7 @@ mod tests {
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             }
         }
 

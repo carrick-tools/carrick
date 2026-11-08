@@ -16613,6 +16613,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             reaches_request: Some(abs("src/lib/search-client.ts:88")),
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
 
         let mut function_definitions = HashMap::new();
@@ -17350,6 +17351,7 @@ unfollowed_member_calls_total: 0,
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -17426,6 +17428,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.data_calls = vec![
@@ -17574,6 +17577,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route,
+            static_asset: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.data_calls = vec![
@@ -17734,6 +17738,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -18663,6 +18668,7 @@ unfollowed_member_calls_total: 0,
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -18690,6 +18696,7 @@ unfollowed_member_calls_total: 0,
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             },
         ];
 
@@ -25206,6 +25213,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }
     }
 
@@ -25268,6 +25276,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],

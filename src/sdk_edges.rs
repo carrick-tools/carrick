@@ -813,6 +813,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }];
         data.mount_graph = Some(graph);
         data
@@ -958,6 +959,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }];
         sdk.mount_graph = Some(graph);
 
@@ -1021,6 +1023,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }];
         data.mount_graph = Some(graph);
         data

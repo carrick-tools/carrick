@@ -11753,6 +11753,9 @@ impl FileOrchestrator {
                         // Decided by the seventh pass below, once every
                         // endpoint path is final (carrick#1926).
                         own_route: false,
+                        // Stamped over the folded rows by
+                        // `stamp_static_assets` (carrick#1989).
+                        static_asset: data_call.static_asset.clone(),
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));
