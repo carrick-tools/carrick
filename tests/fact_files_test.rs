@@ -128,6 +128,14 @@ const MIXED_LOAD: &str = "import { useQuery } from \"@fixture/gql\";\nimport sen
 
 const MIXED_PAGE: &str = "import { loadBoth } from \"./mixed_load\";\n\nexport async function mixedPage(path: string): Promise<unknown> {\n  return loadBoth(path);\n}\n";
 
+const PROXY: &str = "import { Route } from \"@fixture/routes\";\n\nexport class Proxy {\n  constructor(private readonly base: string) {}\n\n  @Route(\"/proxy\")\n  forward(item: string): Promise<Response> { return fetch(`${this.base}/api/v2/forward/${item}`, { method: \"PUT\" }); }\n}\n";
+
+const PROXY_CALLER: &str = "import { Proxy } from \"./proxy\";\n\ninterface Forwarder {\n  forward(item: string): Promise<Response>;\n}\n\nconst client: Forwarder = new Proxy(\"http://items.internal\");\n\nexport async function run(): Promise<void> {\n  await client.forward(\"a\");\n}\n";
+
+const CHAINED: &str = "import server from \"@fixture/server\";\n\nexport function createChained() {\n  const srv = server();\n  srv\n    .get(\"/health/chained\", () => \"ok\");\n  return srv;\n}\n";
+
+const CHAINED_CALLER: &str = "import { createChained } from \"./chained\";\n\nexport function startChained() {\n  return createChained();\n}\n";
+
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
     let dir = repo.join("__llm__/analyze-file");
@@ -240,6 +248,16 @@ fn repo(tmp: &Path) -> PathBuf {
         REGISTERS_NAMED_CALLER,
     )
     .unwrap();
+    add_package(
+        &repo,
+        "@fixture/routes",
+        "1.0.0",
+        "export declare function Route(path: string): MethodDecorator;\n",
+    );
+    fs::write(repo.join("src/proxy.ts"), PROXY).unwrap();
+    fs::write(repo.join("src/proxy_caller.ts"), PROXY_CALLER).unwrap();
+    fs::write(repo.join("src/chained.ts"), CHAINED).unwrap();
+    fs::write(repo.join("src/chained_caller.ts"), CHAINED_CALLER).unwrap();
     fs::write(repo.join("src/status.ts"), STATUS).unwrap();
     fs::write(repo.join("src/poll.ts"), POLL).unwrap();
     fs::write(repo.join("src/helper.ts"), HELPER).unwrap();
@@ -290,6 +308,15 @@ fn repo(tmp: &Path) -> PathBuf {
         "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "exports": [{
             "specifier": "@fixture/serve", "export": "answer", "role": "server_framework",
+            "side": "server", "classifier": "fixture-classifier", "makes": [], "scopes": [],
+            "ops": [], "reserved": [], "calls": [], "patterns": []
+        }]
+    }));
+    claims.push(serde_json::json!({
+        "package": "@fixture/routes", "version": "1.0.0", "status": "answered",
+        "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "exports": [{
+            "specifier": "@fixture/routes", "export": "Route", "role": "server_framework",
             "side": "server", "classifier": "fixture-classifier", "makes": [], "scopes": [],
             "ops": [], "reserved": [], "calls": [], "patterns": []
         }]
@@ -671,6 +698,53 @@ fn a_callee_that_registers_a_route_states_no_call_at_its_caller() {
         on.log_has(&["is a server-framework call", "registers.ts:9"]),
         "the drop is logged: {}",
         on.log
+    );
+}
+
+/// SPAN-1: a decorator site sits on the method's name line, and the request
+/// of a one-line method starts on that same line. Only the call's span start
+/// says they are different calls.
+#[test]
+fn a_request_on_a_decorated_methods_name_line_reaches_the_member_join() {
+    let scan = choosing();
+    let rows: Vec<_> = scan
+        .calls
+        .iter()
+        .filter(|call| {
+            call["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("proxy_caller.ts"))
+                && call["line"].as_i64() == Some(10)
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "{:#?}", scan.calls);
+    assert_eq!(rows[0]["method"], "PUT", "{}", rows[0]);
+    assert_eq!(rows[0]["path"], "/api/v2/forward/:item", "{}", rows[0]);
+}
+
+/// SPAN-1: a registration whose member name is on a later line than its call
+/// start is still a registration at its caller.
+#[test]
+fn a_registration_broken_across_lines_states_no_call_at_its_caller() {
+    let scan = choosing();
+    let rows: Vec<_> = scan
+        .calls
+        .iter()
+        .filter(|call| {
+            call["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("chained_caller.ts"))
+                && call["line"].as_i64() == Some(4)
+        })
+        .collect();
+    assert!(
+        rows.is_empty(),
+        "a route registration is not a request: {rows:#?}"
+    );
+    assert!(
+        scan.log_has(&["is a server-framework call", "chained.ts:5"]),
+        "the drop is logged: {}",
+        scan.log
     );
 }
 
