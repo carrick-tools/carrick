@@ -5316,9 +5316,18 @@ async fn analyze_current_repo_incremental(
                 }
                 _ => None,
             };
+            // The calls that execute a GraphQL document, read through the
+            // value resolver (carrick#3504 S9), as on the full path.
+            let (document_sites, document_consumers) =
+                crate::graphql_document_sites::read_document_sites(
+                    &request_inputs,
+                    &sibling_inputs,
+                    Some(&service_modules),
+                );
             let (early_answer, first_answer) = tokio::sync::oneshot::channel();
             let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
             let file_orchestrator = file_orchestrator
+                .with_document_sites(document_sites)
                 .with_fact_files(crate::agents::file_orchestrator::FactFileSource::later(
                     fact_files,
                 ))
@@ -5413,7 +5422,7 @@ async fn analyze_current_repo_incremental(
             // the GraphQL consumer file set folds transport data calls out of
             // the graph (#307) so every downstream surface (cloud projection,
             // type manifest, type requests) sees the same call set.
-            let (mut protocol_extractions, document_sites) = scan_protocol_extractions(
+            let mut protocol_extractions = scan_protocol_extractions(
                 repo_path,
                 service,
                 &files,
@@ -5423,7 +5432,7 @@ async fn analyze_current_repo_incremental(
             );
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
-                document_sites,
+                document_consumers,
                 &merged_results,
                 repo_path,
                 &service_modules,
@@ -6268,8 +6277,9 @@ fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<PathBuf> {
 /// the mount graph is projected into cloud data — the GraphQL consumer file
 /// set drives `fold_graphql_transport_calls` on the graph first (#307).
 ///
-/// The calls that execute a GraphQL document are read here too, and placed
-/// in the extraction by [`settle_graphql_documents`] once the transport fold
+/// The calls that execute a GraphQL document are read before the analysis
+/// ([`crate::graphql_document_sites::read_document_sites`]), and placed in
+/// the extraction by [`settle_graphql_documents`] once the transport fold
 /// has run (carrick#1157). The located consumer types join there, after the
 /// placement, because they are keyed by the file that executes the document.
 fn scan_protocol_extractions(
@@ -6279,10 +6289,7 @@ fn scan_protocol_extractions(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     detection: &DetectionResult,
     service_modules: &crate::workspace_resolver::WorkspaceIndex,
-) -> (
-    ProtocolExtractions,
-    crate::graphql_document_sites::DocumentSiteConsumers,
-) {
+) -> ProtocolExtractions {
     let scan_roots = service_graphql_roots(repo_path, service);
     // The printed schemas the service declares it serves (carrick#1099). What
     // they failed to declare is reported once the run's rows are built
@@ -6297,14 +6304,6 @@ fn scan_protocol_extractions(
         declared.files.contains(&op.file_path) || !exclusion.excludes(&op.file_path, false)
     });
     merge_graphql_resolver_locations(&mut graphql, file_results);
-    // Aliases resolve here as they do for the HTTP-twin drop: a page imports
-    // its generated documents through the repo's path aliases as often as
-    // through a relative specifier.
-    // Under the service's own tsconfig, as its other passes (carrick#3497).
-    let document_sites = crate::graphql_document_sites::collect_document_site_consumers(
-        files,
-        Some(service_modules),
-    );
     // The detected socket clients gate the pass's unknown-direction half; its
     // Socket.IO rules are independent of them (carrick#1281).
     let sockets = crate::socket_io::scan_files(files, &detection.socket_clients);
@@ -6318,17 +6317,14 @@ fn scan_protocol_extractions(
         .cloned()
         .collect();
     let event_bus = crate::event_emitter::scan_files(files, &sockets, service_modules, &transports);
-    (
-        ProtocolExtractions {
-            graphql,
-            sockets,
-            event_bus,
-            library: crate::library_claims::LibraryRows::default(),
-            site: crate::site_rows::SiteRows::default(),
-            socket_sites: socket_sites::SocketSites::default(),
-        },
-        document_sites,
-    )
+    ProtocolExtractions {
+        graphql,
+        sockets,
+        event_bus,
+        library: crate::library_claims::LibraryRows::default(),
+        site: crate::site_rows::SiteRows::default(),
+        socket_sites: socket_sites::SocketSites::default(),
+    }
 }
 
 /// A service's library sites and what the library store is asked about
@@ -13165,6 +13161,14 @@ async fn analyze_current_repo(
         Path::new(repo_path),
         ask_turns.clone(),
     );
+    // The calls that execute a GraphQL document, read through the value
+    // resolver (carrick#3504 S9): the analysis drops their HTTP twins, and
+    // their consumer rows are placed once the transport fold has run.
+    let (document_sites, document_consumers) = crate::graphql_document_sites::read_document_sites(
+        &request_inputs,
+        &sibling_inputs,
+        Some(&service_modules),
+    );
     let (early_answer, first_answer) = tokio::sync::oneshot::channel();
     let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
     let (analysis_result, (settled, placements, fallbacks), library_answer, ()) = tokio::join!(
@@ -13180,6 +13184,7 @@ async fn analyze_current_repo(
             &normalizer,
             crate::agents::file_orchestrator::SummarySource::later(summaries),
             crate::agents::file_orchestrator::FactFileSource::later(fact_files),
+            document_sites,
         ),
         compose_summaries(
             &request_inputs,
@@ -13230,7 +13235,7 @@ async fn analyze_current_repo(
     // GraphQL consumer file set folds transport data calls out of the mount
     // graph (#307) so every downstream surface (cloud projection, type
     // manifest, type requests) sees the same call set.
-    let (mut protocol_extractions, document_sites) = scan_protocol_extractions(
+    let mut protocol_extractions = scan_protocol_extractions(
         repo_path,
         service,
         &files,
@@ -13241,7 +13246,7 @@ async fn analyze_current_repo(
     let mut analysis_result = analysis_result;
     settle_graphql_documents(
         &mut protocol_extractions.graphql,
-        document_sites,
+        document_consumers,
         &analysis_result.file_results,
         repo_path,
         &service_modules,

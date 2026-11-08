@@ -1338,6 +1338,10 @@ pub struct FileOrchestrator {
     /// the labelled call (carrick#2819). Empty unless the engine hands one
     /// over.
     result_index: crate::result_shapes::ResultIndex,
+    /// The calls that execute a GraphQL document, read through the value
+    /// resolver before the analysis (carrick#3504 S9): their HTTP twins are
+    /// dropped (phase 5c). Empty unless the engine hands them over.
+    document_sites: crate::graphql_document_sites::DocumentSites,
     /// Whether this service's answers were asked ahead of its analysis, and
     /// which side of that this orchestrator is (carrick#3131).
     ahead: crate::agents::asked_ahead::AheadRole,
@@ -1695,6 +1699,7 @@ impl FileOrchestrator {
             request_summaries: RequestSummaryIndex::default().into(),
             fact_files: FactFileSource::None,
             result_index: crate::result_shapes::ResultIndex::default(),
+            document_sites: crate::graphql_document_sites::DocumentSites::default(),
             ahead: crate::agents::asked_ahead::AheadRole::None,
             ahead_analyzer: None,
         }
@@ -1731,6 +1736,17 @@ impl FileOrchestrator {
     /// the consumer response requests built for them (carrick#2819).
     pub fn with_result_index(mut self, result_index: crate::result_shapes::ResultIndex) -> Self {
         self.result_index = result_index;
+        self
+    }
+
+    /// The calls of this service that execute a GraphQL document
+    /// ([`crate::graphql_document_sites::read_document_sites`]), whose HTTP
+    /// twins the analysis drops.
+    pub fn with_document_sites(
+        mut self,
+        document_sites: crate::graphql_document_sites::DocumentSites,
+    ) -> Self {
+        self.document_sites = document_sites;
         self
     }
 
@@ -4795,12 +4811,12 @@ impl FileOrchestrator {
         // request this site makes. Cross-file for two reasons: the document is
         // usually declared in another module, and when that module is not on
         // disk the callee's other sites are what show it executes documents.
-        // Resolved through the repo's aliases as well: this runs after the
-        // model, so following more specifiers changes nothing it was asked.
+        // The sites are read before the analysis, through the value resolver
+        // over the compiler's rows (carrick#3504 S9).
         stats.graphql_document_site_drops =
             crate::graphql_document_sites::suppress_document_site_http_rows(
                 &mut file_results,
-                Some(service_modules),
+                &self.document_sites,
             );
         if stats.graphql_document_site_drops.total() > 0 {
             debug!(

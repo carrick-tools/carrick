@@ -105,6 +105,9 @@ impl MultiAgentOrchestrator {
         // The files the fact layer would send the reader, logged beside the
         // ones the signals select (carrick#2613).
         fact_files: crate::agents::file_orchestrator::FactFileSource,
+        // The calls that execute a GraphQL document, read through the value
+        // resolver before the analysis (carrick#3504 S9).
+        document_sites: crate::graphql_document_sites::DocumentSites,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 
@@ -135,7 +138,8 @@ impl MultiAgentOrchestrator {
         let file_orchestrator = FileOrchestrator::new(self.agent_service.clone())
             .deferring_model(setup.deferred.is_some())
             .with_request_summaries(request_summaries)
-            .with_fact_files(fact_files);
+            .with_fact_files(fact_files)
+            .with_document_sites(document_sites);
         let file_centric_result = file_orchestrator
             .analyze_files(
                 &files,

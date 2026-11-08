@@ -1,0 +1,1 @@
+{ "name": "graphql-document-arguments", "private": true, "workspaces": ["apps/*", "packages/*"] }
