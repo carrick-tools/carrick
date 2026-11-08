@@ -585,6 +585,9 @@ pub enum ReachedBy {
     /// The declaration the call's member resolves to, which a verified op
     /// claim resolves to on a receiver the claim applies to.
     Declaration,
+    /// The export the compiler types the callee as (`send: typeof fetch`),
+    /// where the callee's values are all holes (carrick#2448 T3b).
+    Type,
 }
 
 /// One op a member declaration stands for.
@@ -955,6 +958,10 @@ struct Outcome<'a> {
     unanswered: BTreeSet<String>,
     /// Each callee whose value a caller of the body decides (carrick#2432).
     open: Vec<Open<'a>>,
+    /// The outcome of a value the resolver read to a labelled export or a
+    /// function (carrick#2448 T3b), not a hole: a hole is the default
+    /// outcome, which a function that reaches nothing also is.
+    known: bool,
 }
 
 /// A callee that is a value some of whose values are parameters of the body
@@ -1170,6 +1177,16 @@ pub(super) fn constructed_across(
 /// The compiler's `call` row for `call` in `file`, from `inputs` (which
 /// holds `file`).
 fn row_at<'a>(inputs: &'a RequestSummaryInputs, file: &Path, call: &CallIr) -> Option<&'a Row> {
+    row_of_kind(inputs, file, call, Kind::Call)
+}
+
+/// The row of `kind` at the call's span.
+fn row_of_kind<'a>(
+    inputs: &'a RequestSummaryInputs,
+    file: &Path,
+    call: &CallIr,
+    kind: Kind,
+) -> Option<&'a Row> {
     let positions = inputs.positions.as_ref()?;
     let ir = inputs.files.get(file)?;
     positions
@@ -1177,7 +1194,7 @@ fn row_at<'a>(inputs: &'a RequestSummaryInputs, file: &Path, call: &CallIr) -> O
             file,
             ir.swc_start(call.site.lo),
             ir.swc_start(call.site.hi),
-            Kind::Call,
+            kind,
         )
         .ok()
 }
@@ -1372,6 +1389,60 @@ impl<'a> Walker<'a> {
     /// The call row at `call`, when there are rows to read.
     fn row(&self, file: &Path, call: &CallIr) -> Option<&Row> {
         row_at(self.inputs_for(file), file, call)
+    }
+
+    /// The labelled export the compiler types `call`'s callee as
+    /// (carrick#2448 T3b): the `typed_decl` row beside the call row names the
+    /// function the callee's type is (`send: typeof fetch`), published under
+    /// the store's key or a global of the language's library. Only where
+    /// every value the resolver gave the callee is a hole: a value it read
+    /// to a function or an export decides, whatever the callee is typed as.
+    fn through_type(&self, invoke: Invoke<'_>, values: &[Held<'_>]) -> Option<Outcome<'a>> {
+        let holes = !values.is_empty()
+            && values
+                .iter()
+                .all(|value| matches!(value, Held::Reached(outcome) if !outcome.known));
+        if !holes || invoke.construction {
+            return None;
+        }
+        let row = row_of_kind(
+            self.inputs_for(invoke.file),
+            invoke.file,
+            invoke.call,
+            Kind::TypedDecl,
+        )?;
+        let symbol = row.symbol()?;
+        if in_repo(row) {
+            return None;
+        }
+        let from_store = store_keys(row, self.labels.exports)
+            .into_iter()
+            .find_map(|package| {
+                published_names(row).into_iter().find_map(|export| {
+                    self.labels
+                        .get(&package, export)
+                        .map(|claims| self.end_at(invoke, &package, export, None, claims))
+                })
+            });
+        let end = from_store.or_else(|| {
+            let global = row
+                .decl_file()
+                .is_some_and(|declared| declared.starts_with("lib:"))
+                .then(|| self.labels.global(symbol))
+                .flatten()?;
+            Some(self.end_at(invoke, &global.package, symbol, None, global))
+        })?;
+        Some(Outcome {
+            ends: vec![Found {
+                chain: Vec::new(),
+                end,
+                receiver: None,
+                reached: Some(ReachedBy::Type),
+                several: None,
+                bound: Vec::new(),
+            }],
+            ..Outcome::default()
+        })
     }
 
     /// The binding `call` is made on ([`receiver_at`]).
@@ -1875,6 +1946,9 @@ impl<'a> Walker<'a> {
             for value in &call.callee_values {
                 values.extend(resolver.read_value(self, file, value, invoke, false));
             }
+            if let Some(typed) = self.through_type(invoke, &values) {
+                return typed;
+            }
             return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
         if call.invokes_param.is_some() {
@@ -1893,6 +1967,9 @@ impl<'a> Walker<'a> {
         ) && !construction
             && let Some(values) = self.key_callee(file, call, invoke)
         {
+            if let Some(typed) = self.through_type(invoke, &values) {
+                return typed;
+            }
             return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
         // A callee the compiler declares as a module binding (`const s =
@@ -1902,6 +1979,9 @@ impl<'a> Walker<'a> {
             && !construction
             && let Some(values) = self.binding_callee(file, call, invoke)
         {
+            if let Some(typed) = self.through_type(invoke, &values) {
+                return typed;
+            }
             return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
         match reach {
@@ -1967,7 +2047,10 @@ impl<'a> Walker<'a> {
                 }
                 out
             }
-            Reach::NoFunction => Outcome::default(),
+            // No value read: the callee is a hole, typed as what it may be.
+            Reach::NoFunction => self
+                .through_type(invoke, &[Held::Reached(Outcome::default())])
+                .unwrap_or_default(),
             Reach::Unknown(reason) => Outcome::stopped(super::row_calls::hole_key(reason)),
         }
     }
@@ -2580,6 +2663,7 @@ impl<'a> Follow<'a> for Walker<'a> {
                 several: None,
                 bound: Vec::new(),
             }],
+            known: true,
             ..Outcome::default()
         })
     }
@@ -2606,7 +2690,10 @@ impl<'a> Follow<'a> for Walker<'a> {
     }
 
     fn definition(&mut self, target: PathBuf, key: String, invoke: Invoke<'a>) -> Outcome<'a> {
-        self.enter_value(target, key, invoke)
+        Outcome {
+            known: true,
+            ..self.enter_value(target, key, invoke)
+        }
     }
 
     fn written(
@@ -2628,8 +2715,12 @@ impl<'a> Follow<'a> for Walker<'a> {
             }),
         };
         let inner = self.body(file, function);
-        self.bind(inner, invoke, Some((file, function)), maker)
-            .under(hop)
+        Outcome {
+            known: true,
+            ..self
+                .bind(inner, invoke, Some((file, function)), maker)
+                .under(hop)
+        }
     }
 }
 
@@ -3137,6 +3228,48 @@ mod tests {
                 "r2/sdk.ts:{line}"
             );
         }
+    }
+
+    /// carrick#2448 T3b: the faithful generated shape sends through
+    /// `const _fetch = opts.fetch!`, where `opts` is handed to hooks, so every
+    /// value the resolver gives `_fetch` is a hole. The compiler types the
+    /// call's callee as a labelled export (`fetch?: typeof fetch`), and the
+    /// call row says so: that export is the end, reached through its type.
+    /// The answer key is `tests/fixtures/generated-client/README.md`.
+    #[test]
+    fn a_send_through_a_value_typed_as_fetch_reaches_fetch() {
+        let Some(on) = walked("generated-client", "", "", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let sites: Vec<&DiscoverySite> = discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with("r3/client/client.ts") && site.line == 38)
+            .collect();
+        let [site] = sites[..] else {
+            panic!(
+                "a site at r3/client/client.ts:38: {:?} {:?}",
+                discovery.sites, discovery.unfollowed
+            );
+        };
+        let end = site
+            .end
+            .as_ref()
+            .expect("the call reaches fetch by its type");
+        assert_eq!(
+            (end.package.as_str(), end.export.as_str()),
+            ("lib:lib.dom.d.ts", "fetch")
+        );
+        assert!(end.file.ends_with("r3/client/client.ts"), "{end:?}");
+        assert_eq!(end.line, 38, "{end:?}");
     }
 
     /// carrick#2448 T1, soundness rule 2.3.3 across modules: the object a
