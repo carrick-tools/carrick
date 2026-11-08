@@ -1004,7 +1004,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// The value of the call at `span` in `file`: the scope a member a
     /// `returns` label names opens (`app.basePath("/v2")`), or a hole.
     fn returned(&mut self, file: &Path, span: (u32, u32), at: String) {
-        let host = self.inputs.files.get(file).and_then(|ir| {
+        let host = self.calls.inputs_for(file).files.get(file).and_then(|ir| {
             self.calls
                 .at_span(file, ir.swc_start(span.0), ir.swc_start(span.1))
         });
@@ -1138,8 +1138,9 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// argument (with that argument); for a call of the repository's own
     /// code, the callee (carrick#2474 R5a).
     fn runs_of(&self, file: &Path, host: &CallIr) -> Option<(FnAt, Option<u32>)> {
-        let positions = self.inputs.positions.as_ref()?;
-        let ir = self.inputs.files.get(file)?;
+        let holder = self.calls.inputs_for(file);
+        let positions = holder.positions.as_ref()?;
+        let ir = holder.files.get(file)?;
         let named = |row: &crate::position_rows::Row| {
             if !super::super::discovery::in_repo(row) {
                 return None;
@@ -1238,8 +1239,9 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// The member declaration (`decl_file`, `decl_line`) `host`'s call
     /// resolves to, as the compiler's call row names it.
     fn declaration_of(&self, host: &Placed<'_>) -> Option<(String, u32)> {
-        let positions = self.inputs.positions.as_ref()?;
-        let ir = self.inputs.files.get(host.file)?;
+        let holder = self.calls.inputs_for(host.file);
+        let positions = holder.positions.as_ref()?;
+        let ir = holder.files.get(host.file)?;
         let row = positions
             .lookup(
                 host.file,
@@ -1316,7 +1318,8 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// [`Self::field`] for the field `field` of the class `class`.
     fn field_parameter(&mut self, file: &Path, class: u32, field: &str) -> bool {
         let Some(position) = self
-            .inputs
+            .calls
+            .inputs_for(file)
             .files
             .get(file)
             .and_then(|ir| ir.class_origins.get(&class))
@@ -1401,7 +1404,8 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// [`FileIr::field_receivers`]: super::super::FileIr
     fn class_field(&mut self, file: &Path, class: u32, field: &str, at: String) {
         let made = self
-            .inputs
+            .calls
+            .inputs_for(file)
             .files
             .get(file)
             .and_then(|ir| ir.field_receivers.get(&(class, field.to_string())))
@@ -1421,7 +1425,8 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// reads is a hole. `false` where the class has no such getter.
     fn getter(&mut self, file: &Path, class: u32, field: &str, at: &str) -> bool {
         let Some(key) = self
-            .inputs
+            .calls
+            .inputs_for(file)
             .files
             .get(file)
             .and_then(|ir| ir.class_getters.get(&(class, field.to_string())))
@@ -1445,7 +1450,8 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             return;
         }
         let function = self
-            .inputs
+            .calls
+            .inputs_for(file)
             .files
             .get(file)
             .and_then(|ir| ir.functions.get(&key));
@@ -1546,11 +1552,12 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// The name an import binds at `span` in `file`: the module-scope
     /// instance the declaration the compiler names holds.
     fn imported(&mut self, file: &Path, span: (u32, u32), at: String) {
-        let Some(positions) = self.inputs.positions.as_ref() else {
+        let holder = self.calls.inputs_for(file);
+        let Some(positions) = holder.positions.as_ref() else {
             self.hole(at, InstanceHole::Unread, None);
             return;
         };
-        let Some(ir) = self.inputs.files.get(file) else {
+        let Some(ir) = holder.files.get(file) else {
             self.hole(at, InstanceHole::Unread, None);
             return;
         };
@@ -1586,7 +1593,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             return;
         };
         let declaring = positions.path_of(decl_file);
-        let Some(declared) = self.inputs.files.get(&declaring) else {
+        let Some(declared) = self.calls.inputs_for(&declaring).files.get(&declaring) else {
             self.hole(
                 at,
                 InstanceHole::OutsideService,
@@ -1615,7 +1622,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// value names no instance, is a hole. `false` where the file declares
     /// no such binding.
     fn module_binding(&mut self, file: &Path, line: u32, symbol: &str, at: &str) -> bool {
-        let inputs = self.inputs;
+        let inputs = self.calls.inputs_for(file);
         let Some(ir) = inputs.files.get(file) else {
             return false;
         };
@@ -1670,7 +1677,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// Whether `call`, written in `file`, is a library call
     /// ([`library_call`]).
     pub(super) fn library_call(&self, file: &Path, call: &CallIr) -> bool {
-        library_call(self.inputs, file, call)
+        library_call(self.calls.inputs_for(file), file, call)
     }
 
     /// The library calls that may run the function `key` of `file`, each

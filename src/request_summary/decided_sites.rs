@@ -1347,18 +1347,11 @@ impl<'a> Calls<'a> {
         if let Some(crossed) = self.cross.get(&at) {
             return Some(crossed);
         }
-        let holder = if self.is_own(placed.file) {
-            self.own
-        } else {
-            self.siblings
-                .iter()
-                .copied()
-                .find(|sibling| sibling.files.contains_key(placed.file))
-                .unwrap_or(self.own)
-        };
-        holder
-            .sites
-            .target_at(placed.file, placed.call.site.lo, placed.call.site.hi)
+        self.inputs_for(placed.file).sites.target_at(
+            placed.file,
+            placed.call.site.lo,
+            placed.call.site.hi,
+        )
     }
 
     pub(super) fn callers_of(&self, file: &Path, key: &str) -> &[Placed<'a>] {
@@ -1369,9 +1362,14 @@ impl<'a> Calls<'a> {
 
     /// What this service or the sibling that holds `file` read of it.
     fn file_ir(&self, file: &Path) -> Option<&'a super::FileIr> {
+        self.inputs_for(file).files.get(file)
+    }
+
+    /// The service of the run that holds `file`: this one or an entered
+    /// sibling, own where none does. The one holder rule the instance walk
+    /// reads every file through (carrick#3527 S5); see `Resolver::inputs_for`.
+    pub(super) fn inputs_for(&self, file: &Path) -> &'a super::RequestSummaryInputs {
         super::discovery::inputs_holding(self.own, &self.siblings, file)
-            .files
-            .get(file)
     }
 
     /// Whether the definition `key` of `file` (this service's or a
