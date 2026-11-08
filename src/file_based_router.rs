@@ -1536,10 +1536,12 @@ mod tests {
     #[test]
     fn a_prefixed_static_root_serves_only_under_its_prefix() {
         let mut conventions = builtin_conventions(&["next".to_string()]);
-        conventions[0].static_roots = vec![StaticRoot {
-            dir: "public/images".to_string(),
-            url_prefix: "/assets".to_string(),
-        }];
+        for convention in &mut conventions {
+            convention.static_roots = vec![StaticRoot {
+                dir: "public/images".to_string(),
+                url_prefix: "/assets".to_string(),
+            }];
+        }
         assert_eq!(
             asset("/assets/banner.svg", &conventions).as_deref(),
             Some("public/images/banner.svg")
