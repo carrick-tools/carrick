@@ -1439,16 +1439,20 @@ fn plan_in<'a>(
     rechecking: Option<&BTreeSet<String>>,
 ) -> Vec<Scope> {
     let mut walks = Walks::new(repo_path, changes);
-    let repo_label = Path::new(repo_path)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| repo_path.to_string());
+    // The name an unnamed service's id carries, as its blob's `repo_name`
+    // does: a re-scan of a linked worktree is named as its repo, not by the
+    // worktree's folder (carrick#3595). Read only under a re-check.
+    let repo_label = rechecking.map(|_| crate::utils::get_repository_name(repo_path));
     let scopes: Vec<Scope> = services
         .iter()
         .map(|service| {
             let scope = match rechecking {
                 Some(listed) => {
-                    let id = service.service_name.as_deref().unwrap_or(&repo_label);
+                    let id = service
+                        .service_name
+                        .as_deref()
+                        .or(repo_label.as_deref())
+                        .unwrap_or(repo_path);
                     recheck_scope(listed.contains(id), stored(service))
                 }
                 None => walks.scope(service, Against::Stored(stored(service), this_run)),
