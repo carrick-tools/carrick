@@ -2116,6 +2116,81 @@ mod tests {
         assert!(unverified_maker.is_empty(), "the maker must verify");
     }
 
+    /// carrick-cloud#3139: a consumer export that subscribes when
+    /// constructed (`new Consumer({ queueUrl, handleMessage })`) is a receive
+    /// in the `new` form: a subscriber row at the construction, beside the
+    /// queue's publisher row on the same name and scope. A name held in a
+    /// parameter states nothing. A verifier that refuses the receive (a
+    /// scanner before it reads one) leaves the publisher row only.
+    #[test]
+    fn a_new_form_receive_states_a_subscriber_row() {
+        let queue = export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "Queue", "role": "broker",
+            "claims": [
+                { "kind": "make", "form": "new", "member": null, "name": { "arg": 0 },
+                  "name_scope": { "scope": "global", "namespace": "queue" } },
+                { "kind": "op", "op": "send", "member": "add", "on": "instance",
+                  "name": { "bound": "maker" }, "payload": { "arg": 1 } }
+            ]
+        }));
+        let consumer = export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "Consumer", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": null, "on": "export", "form": "new",
+                  "name": { "arg": 0, "key": "queueUrl" },
+                  "handler": { "arg": 0, "key": "handleMessage" },
+                  "key_labels": { "region": "not_name" },
+                  "name_scope": { "scope": "global", "namespace": "queue" } }
+            ]
+        }));
+        let sites = sites_of(&[(
+            "src/jobs.ts",
+            "import { Queue, Consumer } from \"@fixture/queue\";\n\
+             export async function run() {\n\
+             \x20 const orders = new Queue(\"orders\");\n\
+             \x20 await orders.add(\"job\", {});\n\
+             \x20 const c = new Consumer({ queueUrl: \"orders\", handleMessage: async () => {} });\n\
+             \x20 c.start();\n\
+             }\n\
+             export function held(queue: string) {\n\
+             \x20 return new Consumer({ queueUrl: queue, handleMessage: async () => {} });\n\
+             }\n",
+        )]);
+        let exports = [queue, consumer];
+        let rows = rows_of(&sites, &exports, all);
+        let stated: Vec<(u32, LibraryRowKind, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.kind, row.name.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                (4, LibraryRowKind::Pubsub(PubsubRole::Publisher), "orders"),
+                (5, LibraryRowKind::Pubsub(PubsubRole::Subscriber), "orders"),
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(rows[0].name_scope, rows[1].name_scope);
+        assert!(rows[0].name_scope.is_some(), "{rows:#?}");
+        assert!(
+            rows[1].claim_ids[0].starts_with("@fixture/queue@2:Consumer:op:receive:"),
+            "{rows:#?}"
+        );
+        assert!(rows[1].claim_ids[0].ends_with(":form:new"), "{rows:#?}");
+
+        let refused = rows_of(&sites, &exports, |check| {
+            !check.claim_id.contains(":op:receive:")
+        });
+        let kinds: Vec<LibraryRowKind> = refused.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![LibraryRowKind::Pubsub(PubsubRole::Publisher)],
+            "{refused:#?}"
+        );
+    }
+
     /// Carrick#3049: a queue export written on a `type:` receiver, with
     /// `receiver_types` naming the instance id that holds it, reads the same
     /// rows as today's form written on the instance id, once lowered. Without

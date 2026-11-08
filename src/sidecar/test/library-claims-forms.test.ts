@@ -1,7 +1,8 @@
 /**
  * carrick#3047 (H3 of the HTTP slice), label restructure amendment 7
  * (carrick#2434), part 3: the verifier judges `form: set` (a send), `new`
- * (a send or a request), `decorate` (a receive, and a scope) and the
+ * (a send, a request or a receive: carrick-cloud#3139), `decorate` (a
+ * receive, and a scope) and the
  * `returns` field of a receive op. `override`, and `set` on a receive, stay
  * `part_unbuilt`. Absorbs carrick#3022's verifier half (`set`).
  *
@@ -74,6 +75,21 @@ export interface Routes {
 }
 export declare const routes: Routes;
 `;
+// A queue consumer that subscribes when constructed: by name and a processor
+// that may be a file path (Worker), or by an options object (Consumer).
+const JOBS = `export interface Job { id: string }
+export interface Message { body: string }
+export declare class Worker {
+  constructor(name: string, processor?: string | URL | null | ((job: Job) => Promise<void>), opts?: { concurrency?: number });
+  on(event: string, listener: (...args: unknown[]) => void): this;
+  close(): Promise<void>;
+}
+export interface ConsumerOptions { queueUrl: string; region?: string; handleMessage?: (m: Message) => Promise<void> }
+export declare class Consumer {
+  constructor(options: ConsumerOptions);
+  static create(options: ConsumerOptions): Consumer;
+}
+`;
 const DECORATORS = `export declare function Get(path?: string): MethodDecorator;
 export declare function Controller(prefix?: string): ClassDecorator;
 export declare function Body(): ParameterDecorator;
@@ -93,6 +109,8 @@ const setSend = (member: string | null, extra: Record<string, unknown> = {}, exp
   check(pkg, exported, 'type', { kind: 'op', op: 'send', member, of: 'type', form: 'set', payload: { arg: 0 }, ...extra });
 const newSend = (pkg: string, exported: string, extra: Record<string, unknown> = {}) =>
   check(pkg, exported, 'export', { kind: 'op', op: 'send', member: null, on: 'export', form: 'new', payload: { arg: 0 }, ...extra });
+const newReceive = (exported: string, extra: Record<string, unknown>) =>
+  check('fixture-jobs', exported, 'export', { kind: 'op', op: 'receive', member: null, on: 'export', form: 'new', ...extra }, 'broker');
 const returning = (member: string, returns: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
   check('fixture-routes', 'routes', 'export', {
     kind: 'op',
@@ -132,6 +150,7 @@ describe('verify_library_claims: forms and returns (carrick#3047)', () => {
       ['fixture-reply', REPLY],
       ['fixture-routes', ROUTES],
       ['fixture-decorators', DECORATORS],
+      ['fixture-jobs', JOBS],
     ]) {
       files[`node_modules/${name}/package.json`] = JSON.stringify({ name, version: '1.0.0', types: 'index.d.ts' });
       files[`node_modules/${name}/index.d.ts`] = text;
@@ -255,17 +274,41 @@ describe('verify_library_claims: forms and returns (carrick#3047)', () => {
       assert.strictEqual(verdict(request), 'verified');
     });
 
-    it('is not a receive', () => {
-      const receive = check('fixture-reply', 'Reply', 'export', {
-        kind: 'op',
-        op: 'receive',
-        member: null,
-        on: 'export',
-        form: 'new',
-        name: { arg: 0 },
-        handler: { arg: 1 },
-      });
-      assert.strictEqual(verdict(receive), 'unchecked claim_invalid');
+    it('reads a receive on the construct signatures (carrick-cloud#3139)', () => {
+      const parts = { name: { arg: 0, key: 'queueUrl' }, handler: { arg: 0, key: 'handleMessage' } };
+      assert.strictEqual(verdict(newReceive('Consumer', { ...parts, key_labels: { region: 'not_name' } })), 'verified');
+      // Strict D2: the other string key competes with the name until labelled.
+      assert.strictEqual(verdict(newReceive('Consumer', parts)), 'failed name_ambiguous');
+    });
+
+    it('known gap: a name-only receive whose processor accepts a string stays ambiguous', () => {
+      // The unassigned processor (`string | URL | null | fn`) competes with the
+      // name and a positional cannot be labelled. Admitting it needs a
+      // name-rule exception in the judge (nameSiblings), parked with its own
+      // ruling (carrick-cloud#3139). Flip this when that change lands.
+      assert.strictEqual(verdict(newReceive('Worker', { name: { arg: 0 } })), 'failed name_ambiguous');
+    });
+
+    it('judges a stated handler as on a call receive', () => {
+      // The processor may be a file path: no function the judge can read.
+      assert.strictEqual(verdict(newReceive('Worker', { name: { arg: 0 }, handler: { arg: 1 } })), 'failed handler_not_function');
+    });
+
+    it('still wants a name on a receive; a define and an execute stay unread', () => {
+      assert.strictEqual(verdict(newReceive('Worker', {})), 'unchecked claim_invalid');
+      // No message role reads an execute, in any form, before or after.
+      assert.strictEqual(verdict(newReceive('Worker', { op: 'execute', name: { arg: 0 } })), 'unchecked role_unsupported');
+      // A definition is a maker called with a name and a handler; constructed, it is no definition (characterisation).
+      const define = check('fixture-jobs', 'Worker', 'export', { kind: 'make', form: 'new', member: null, name: { arg: 0 }, handler: { arg: 1 } }, 'broker');
+      assert.strictEqual(verdict(define), 'failed handler_not_function');
+    });
+
+    it('lists the processor as no function and with no keys (the lister is unchanged)', () => {
+      const listed = verifier.listSurface(root, ['fixture-jobs'], 1_000_000);
+      const worker = listed.surfaces[0].exports.find(e => e.export === 'Worker')!;
+      const construct = worker.receivers.find(r => r.receiver === 'export')!.construct![0];
+      assert.strictEqual(construct.params[1].function, false);
+      assert.strictEqual(construct.params[1].keys, undefined);
     });
   });
 

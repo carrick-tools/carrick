@@ -2906,9 +2906,12 @@ class DeclarationReader {
    */
   private judgeOp(receiver: MessageReceiver, claim: OpClaim, rules: RoleRules): Outcome {
     // Amendment 7, part 3 (carrick#3047): the form says how the service
-    // writes the op, and the op kinds a form belongs to.
+    // writes the op, and the op kinds a form belongs to. A `new` receive
+    // subscribes when the export is constructed (carrick-cloud#3139).
     const form = claim.form ?? 'call';
-    if (form === 'new' && claim.op !== 'send' && claim.op !== 'request') return unchecked('claim_invalid');
+    if (form === 'new' && claim.op !== 'send' && claim.op !== 'request' && claim.op !== 'receive') {
+      return unchecked('claim_invalid');
+    }
     if (form === 'decorate' && claim.op !== 'receive') return unchecked('claim_invalid');
     // `returns` judges the handler a receive op registers.
     if (claim.returns !== undefined && (claim.op !== 'receive' || claim.handler === undefined)) {
