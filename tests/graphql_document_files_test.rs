@@ -23,8 +23,11 @@ use std::sync::OnceLock;
 
 /// `(service, kind|field, file:line)` of every GraphQL consumer row, and the
 /// `kind|field` of every GraphQL producer row, from one scan of the fixture.
-fn scan() -> &'static (BTreeSet<(String, String, String)>, BTreeSet<String>) {
-    static SCAN: OnceLock<(BTreeSet<(String, String, String)>, BTreeSet<String>)> = OnceLock::new();
+/// Consumer rows `(service, kind|field, file:line)` and producer `kind|field`s.
+type Scan = (BTreeSet<(String, String, String)>, BTreeSet<String>);
+
+fn scan() -> &'static Scan {
+    static SCAN: OnceLock<Scan> = OnceLock::new();
     SCAN.get_or_init(|| {
         let repo =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/graphql-document-files");
