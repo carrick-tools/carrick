@@ -90,6 +90,10 @@ impl<'a> Resolver<'a> {
                 member: false,
                 ..
             } => self.text_of_name(file, *lo, *hi),
+            ValueAt::Alt { branches } => branches
+                .iter()
+                .flat_map(|branch| self.text_of_branch(file, branch))
+                .collect(),
             ValueAt::Member {
                 lo,
                 hi,
@@ -105,6 +109,35 @@ impl<'a> Resolver<'a> {
             } => self.text_of_built_in(file, (*lo, *hi), method, object, args),
             _ => hole(UnreadExpression),
         }
+    }
+
+    /// One branch of a choice. A name the compiler types as a union of
+    /// literals is each literal (the choice is the code's, not the type's:
+    /// the record keeps asking it); anything else reads as it does alone.
+    fn text_of_branch(&self, file: &Path, branch: &ValueAt) -> Vec<TextValue> {
+        if let ValueAt::Read {
+            lo,
+            hi,
+            member: false,
+        } = branch
+            && let Some(row) = self.row_at(file, *lo, *hi, Kind::Ident)
+        {
+            let literals = row
+                .type_text()
+                .map(super::super::site_record::literals_of_type)
+                .unwrap_or_default();
+            if literals.len() > 1 {
+                let read_from: Vec<String> = in_repo_declaration(row).into_iter().collect();
+                return literals
+                    .into_iter()
+                    .map(|text| TextValue::Text {
+                        text,
+                        read_from: read_from.clone(),
+                    })
+                    .collect();
+            }
+        }
+        self.text_values(file, branch)
     }
 
     /// `part` read as exactly one text, else why not.
@@ -435,6 +468,24 @@ impl<'a> Resolver<'a> {
 }
 
 impl Resolver<'_> {
+    /// Every text `expr`, written in the repo file `file` (relative to
+    /// `root`), may be, never collapsed: a choice (`?:`, `??`, `||`) is each
+    /// of its branches, and a branch the code does not state is a
+    /// [`TextValue::Hole`]. Empty when the file is not one of the run's.
+    pub(in crate::request_summary) fn text_set(
+        &self,
+        root: &Path,
+        file: &str,
+        expr: &Expr,
+    ) -> Vec<TextValue> {
+        let absolute = root.join(file);
+        let Some((path, ir)) = self.inputs_for(&absolute).files.get_key_value(&absolute) else {
+            return Vec::new();
+        };
+        let value = text_of(expr, &|lo| ir.discovery_start(lo));
+        self.text_values(path, &value)
+    }
+
     /// The parts of the text `expr`, written in the repo file `file`
     /// (relative to `root`), states: a template's or a `+` chain's pieces in
     /// order, each with the file of the outermost declaration it was read
@@ -527,6 +578,51 @@ mod tests {
             .and_then(|(_, binding)| binding.text.clone())
             .unwrap_or_else(|| panic!("{name} is declared with an initialiser in {file}"));
         resolver.text_values(&path, &text)
+    }
+
+    /// A choice reads every branch, never collapsed: a branch the code does
+    /// not state is a hole beside the others, a name typed as a union of
+    /// literals is each literal, and a nested choice flattens.
+    #[test]
+    fn an_alt_reads_every_branch() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let alt = "src/alt.ts";
+        let texts = |name: &str| -> (Vec<String>, usize) {
+            let got = probe(&resolver, &on, alt, name);
+            let holes = got
+                .iter()
+                .filter(|value| matches!(value, TextValue::Hole(_)))
+                .count();
+            let mut texts: Vec<String> = got
+                .into_iter()
+                .filter_map(|value| match value {
+                    TextValue::Text { text, .. } => Some(text),
+                    TextValue::Hole(_) => None,
+                })
+                .collect();
+            texts.sort();
+            (texts, holes)
+        };
+        assert_eq!(texts("p_coalesce"), (vec!["/fallback".to_string()], 1));
+        assert_eq!(texts("p_or"), (vec!["/or".to_string()], 1));
+        assert_eq!(
+            texts("p_cond"),
+            (vec!["/api".to_string(), "/other".to_string()], 0)
+        );
+        assert_eq!(
+            texts("p_chain"),
+            (vec!["/api".to_string(), "/last".to_string()], 1)
+        );
+        assert_eq!(
+            texts("p_union"),
+            (
+                vec!["/u/a".to_string(), "/u/b".to_string(), "/u/c".to_string()],
+                0
+            )
+        );
     }
 
     /// Every form the name fold read: a `const`, a `let` never assigned

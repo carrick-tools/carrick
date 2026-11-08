@@ -54,7 +54,7 @@ use super::RequestSummaryInputs;
 use super::decided_sites::{
     Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel, SlotBinding,
 };
-use super::resolve::Resolver;
+use super::resolve::{Resolver, TextValue};
 use crate::position_rows::{Kind, PositionIndex};
 use crate::site_questions::{
     Place, PlaceFrom, Point, SiteCall, SiteState, Slot, Stated, StatedValue,
@@ -462,10 +462,10 @@ fn one_line(text: &str) -> String {
 }
 
 /// Every whole value `expr` may take, as the code states it: a string or a
-/// plain template literal, a name whose type is a literal or a union of
-/// literals (`literals`), or a choice between such values. `None` when any
-/// value it may take is not stated whole (a concatenation with a value the
-/// code does not state, a call, a member read).
+/// plain template literal, or a name whose type is a literal or a union of
+/// literals (`literals`). A choice (`?:`, `??`, `||`) is read by
+/// [`Choices`]. `None` when it is not stated whole (a concatenation with a
+/// value the code does not state, a call, a member read).
 fn whole_values(expr: &Expr, literals: &dyn Fn(&str) -> Vec<String>) -> Option<BTreeSet<String>> {
     match super::unwrap_value(expr) {
         Expr::Lit(Lit::Str(lit)) => lit.value.as_str().map(|text| BTreeSet::from([text.into()])),
@@ -477,21 +477,52 @@ fn whole_values(expr: &Expr, literals: &dyn Fn(&str) -> Vec<String>) -> Option<B
                 .map(|text| BTreeSet::from([text.to_string()])),
             _ => None,
         },
-        Expr::Cond(cond) => {
-            let mut values = whole_values(&cond.cons, literals)?;
-            values.extend(whole_values(&cond.alt, literals)?);
-            Some(values)
-        }
-        Expr::Bin(bin) if matches!(bin.op, BinaryOp::LogicalOr | BinaryOp::NullishCoalescing) => {
-            let mut values = whole_values(&bin.left, literals)?;
-            values.extend(whole_values(&bin.right, literals)?);
-            Some(values)
-        }
         Expr::Ident(ident) => {
             let values: BTreeSet<String> = literals(ident.sym.as_ref()).into_iter().collect();
             (!values.is_empty()).then_some(values)
         }
         _ => None,
+    }
+}
+
+/// Reads a choice written in place (`c ? a : b`, `a ?? b`, `a || b`)
+/// through the value resolver (carrick#3504 S2b-1): each branch it states
+/// is a value.
+struct Choices<'a, 'r> {
+    resolver: &'a Resolver<'r>,
+    root: &'a Path,
+    file: &'a str,
+    /// Whether a branch the code does not state refuses the whole choice
+    /// (a request method), or only drops out (a name: the stated side is
+    /// the name).
+    unread_refuses: bool,
+}
+
+impl Choices<'_, '_> {
+    fn is_choice(expr: &Expr) -> bool {
+        match super::unwrap_value(expr) {
+            Expr::Cond(_) => true,
+            Expr::Bin(bin) => matches!(bin.op, BinaryOp::LogicalOr | BinaryOp::NullishCoalescing),
+            _ => false,
+        }
+    }
+
+    /// The texts the branches state. An empty text names nothing and drops
+    /// out. `None` when no branch states one, or when an unread branch
+    /// refuses the choice.
+    fn values(&self, expr: &Expr) -> Option<BTreeSet<String>> {
+        let mut values = BTreeSet::new();
+        for value in self.resolver.text_set(self.root, self.file, expr) {
+            match value {
+                TextValue::Text { text, .. } if !text.is_empty() => {
+                    values.insert(text);
+                }
+                TextValue::Text { .. } => {}
+                TextValue::Hole(_) if self.unread_refuses => return None,
+                TextValue::Hole(_) => {}
+            }
+        }
+        (!values.is_empty()).then_some(values)
     }
 }
 
@@ -533,13 +564,26 @@ fn stated_whole(
     pieces: &[super::Piece],
     exprs: &[&Expr],
     literals: &dyn Fn(&str) -> Vec<String>,
+    choices: &Choices<'_, '_>,
 ) -> Option<BTreeSet<String>> {
     if let Some(text) = literal_text(pieces).or_else(|| env_based_text(pieces)) {
         return Some(BTreeSet::from([text]));
     }
+    // A name written as one choice: the summaries' pieces keep one side of
+    // a `??`, so the choice is read from the expression itself.
+    if !choices.unread_refuses
+        && let [expr] = exprs
+        && Choices::is_choice(expr)
+    {
+        return choices.values(expr);
+    }
     match pieces {
         [super::Piece::Opaque { text, .. }] => {
-            whole_values(&expr_written_as(parsed?, exprs, text)?, literals)
+            let expr = expr_written_as(parsed?, exprs, text)?;
+            if Choices::is_choice(&expr) {
+                return choices.values(&expr);
+            }
+            whole_values(&expr, literals)
         }
         _ => None,
     }
@@ -1746,7 +1790,18 @@ fn record(
                 matches!(piece, super::Piece::Opaque { text, .. }
                     if folded.contains_key(text) && name_literals(&names, text).is_empty())
             });
-            match stated_whole(sources.get(file), &site.name, &name_exprs, &literals) {
+            match stated_whole(
+                sources.get(file),
+                &site.name,
+                &name_exprs,
+                &literals,
+                &Choices {
+                    resolver,
+                    root,
+                    file,
+                    unread_refuses: false,
+                },
+            ) {
                 Some(values) => Some(values),
                 None => read_through
                     .then(|| folded_text(&site.name, &literals))
@@ -1899,7 +1954,18 @@ fn record(
                     .map(|default| BTreeSet::from([default])),
                 Some(MethodValue::Pieces(pieces)) => {
                     let exprs: Vec<&Expr> = parts.arg_exprs.iter().collect();
-                    stated_whole(sources.get(file), pieces, &exprs, &literals)
+                    stated_whole(
+                        sources.get(file),
+                        pieces,
+                        &exprs,
+                        &literals,
+                        &Choices {
+                            resolver,
+                            root,
+                            file,
+                            unread_refuses: true,
+                        },
+                    )
                 }
                 None => None,
             },

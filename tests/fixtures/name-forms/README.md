@@ -7,10 +7,14 @@ protocol: `c-<form>.ts` is an HTTP call, `q-<form>.ts` a pub/sub topic,
 
 Forms so far:
 
-- `destructure`: a name bound by an object pattern (`const { path } = {...}`,
+- `destructure` (S2b-3): a name bound by an object pattern (`const { path } = {...}`,
   `{ p: target, ...rest }`, from a kept `const` object, or as a function's
   own local). `c-destructure-written` is unread on purpose: the object is
   written elsewhere (`ROUTES.items = ...`), so the key's value is not stated.
+- `coalesce` (S2b-1): `??`, `||` and `?:`. A side the code does not state
+  (`maybe ?? '/x'`, `maybe` a runtime value) adds no value: the stated side
+  is the name. `c-coalesce-const` (two constants) and `c-union` (a union of
+  literals) are several values and stay asked.
 
 `rows.expected.json` is the answer key, read by `tests/name_forms_test.rs`:
 `names` gives the one name each file's site forces and the scan writes as a

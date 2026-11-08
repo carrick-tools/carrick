@@ -5,12 +5,18 @@
     "src/c-destructure-const.ts": "/c/destructure-const/items",
     "src/c-destructure-local.ts": "/c/destructure-local",
     "src/q-destructure.ts": "orders.destructured",
-    "src/s-destructure.ts": "room.destructured"
+    "src/s-destructure.ts": "room.destructured",
+    "src/c-coalesce.ts": "/n/coalesce",
+    "src/q-coalesce.ts": "orders.coalesced",
+    "src/s-coalesce.ts": "room.coalesced"
   },
   "kind_asked": [
-    "src/q-destructure.ts"
+    "src/q-destructure.ts",
+    "src/q-coalesce.ts"
   ],
   "unnamed": [
-    "src/c-destructure-written.ts"
+    "src/c-destructure-written.ts",
+    "src/c-coalesce-const.ts",
+    "src/c-union.ts"
   ]
 }

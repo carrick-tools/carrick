@@ -22,7 +22,7 @@
  "n-coalesce": {
   "feature": "coalesce-expression (??)",
   "source": "test262",
-  "status": "lead"
+  "status": "covered"
  },
  "n-computed": {
   "feature": "computed-property-names",

@@ -1,6 +1,7 @@
 //! Operation names written in a form the names lowering learns one step at
 //! a time (carrick#3504 S2b): so far an object-pattern declaration
-//! (`const { path } = ...`). Layout and key as in `constant_names_test.rs`.
+//! (`const { path } = ...`) and `??`, `||`, `?:` choices. Layout and key as
+//! in `constant_names_test.rs`.
 //!
 //! Drives the real scanner binary on `.`, as the Action runs it, over a
 //! committed copy of `tests/fixtures/name-forms/repo` (one root
@@ -169,6 +170,47 @@ fn a_destructured_name_states_its_keys_value_on_every_protocol() {
         .map(|file| file.as_str().unwrap())
         .collect();
     for (file, want) in key["names"].as_object().unwrap() {
+        let want = want.as_str().unwrap();
+        // A broker's label does not say topic or job name: the kind is
+        // asked, so the row waits on the answer whatever the name.
+        if kind_asked.contains(file.as_str()) {
+            if !scan.leads.contains(file) {
+                wrong.push(format!("{file}: want a possible call, got none"));
+            }
+            continue;
+        }
+        let got = scan.named.get(file).cloned().unwrap_or_default();
+        if got != BTreeSet::from([want.to_string()]) {
+            wrong.push(format!("{file}: want {want}, got {got:?}"));
+        }
+    }
+    for file in key["unnamed"].as_array().unwrap() {
+        let file = file.as_str().unwrap();
+        if let Some(got) = scan.named.get(file) {
+            wrong.push(format!("{file}: want no fact row, got {got:?}"));
+        }
+        if !scan.leads.contains(file) {
+            wrong.push(format!("{file}: want a possible call, got none"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A fallback name (`maybe ?? '/x'`, `maybe` a runtime value) states its
+/// stated side on every protocol; several stated values stay asked.
+#[test]
+fn a_fallback_name_states_its_stated_side_on_every_protocol() {
+    let scan = scan();
+    let key = key();
+    let mut wrong = Vec::new();
+    let kind_asked: BTreeSet<&str> = key["kind_asked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file.as_str().unwrap())
+        .collect();
+    let names = key["names"].as_object().unwrap().iter();
+    for (file, want) in names {
         let want = want.as_str().unwrap();
         // A broker's label does not say topic or job name: the kind is
         // asked, so the row waits on the answer whatever the name.
