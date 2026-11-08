@@ -1195,6 +1195,55 @@ impl Way {
     }
 }
 
+/// The most ways text joined with defaults is read as ([`joined_ways`]).
+const MAX_JOINED_WAYS: usize = 16;
+
+/// Whether `ident` names a parameter or a local that falls back to a default
+/// ([`Scope::defaults`], [`Scope::local_ways`]).
+fn holds_a_default(ident: &Ident, scope: &Scope<'_>) -> bool {
+    let key = ident_key(ident);
+    scope.defaults.contains_key(&key) || scope.local_ways.contains_key(&key)
+}
+
+/// Whether `expr` is text joined (a template, or `+`) with a name that falls
+/// back to a default, or with a `??`/`||` default written in place
+/// (carrick#3191).
+fn joins_a_default(expr: &Expr, scope: &Scope<'_>) -> bool {
+    match unwrap_value(expr) {
+        Expr::Ident(ident) => holds_a_default(ident, scope),
+        Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
+            true
+        }
+        Expr::Bin(bin) if bin.op == BinaryOp::Add => {
+            joins_a_default(&bin.left, scope) || joins_a_default(&bin.right, scope)
+        }
+        Expr::Tpl(tpl) => tpl.exprs.iter().any(|part| joins_a_default(part, scope)),
+        _ => false,
+    }
+}
+
+/// Every way `parts`, joined in order, reads: one per choice of a way of
+/// each part. A way is a default's where any part's is. `None` past
+/// [`MAX_JOINED_WAYS`].
+fn joined_ways(parts: Vec<Vec<Way>>) -> Option<Vec<Way>> {
+    let mut out = vec![Way::stated(Vec::new())];
+    for part in parts {
+        if out.len() * part.len().max(1) > MAX_JOINED_WAYS {
+            return None;
+        }
+        out = out
+            .iter()
+            .flat_map(|head| {
+                part.iter().map(move |tail| Way {
+                    pieces: concat([head.pieces.clone(), tail.pieces.clone()]),
+                    fallback: head.fallback || tail.fallback,
+                })
+            })
+            .collect();
+    }
+    Some(out)
+}
+
 /// What the receiver trace reads at one call (carrick#2474 R2a): the
 /// receiver object's value as the body reads it (a parameter, a key of
 /// one, an enclosing function's), what the receiver holds as the value
@@ -4911,6 +4960,12 @@ struct Scope<'a> {
     /// of the conditionals it holds (carrick#2050): only a local whose
     /// initialiser holds one is here.
     alts: HashMap<BindingKey, Alternatives>,
+    /// Each local the body declares once and never assigns again whose value
+    /// falls back to a default (`const at = opts.at ?? "/x"`, `const { at =
+    /// "/x" } = opts`): the way it is written, then the default
+    /// (carrick#3191). Read by the receiver trace alone, as
+    /// [`Self::defaults`] is.
+    local_ways: HashMap<BindingKey, Vec<Way>>,
     /// The names the function assigns again, anywhere in it: a test that
     /// reads one is not the same test twice (carrick#2051).
     reassigned: HashSet<String>,
@@ -4952,6 +5007,7 @@ impl<'a> Scope<'a> {
             fetches: HashSet::new(),
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
+            local_ways: HashMap::new(),
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: HashMap::new(),
@@ -5150,20 +5206,20 @@ impl Reader<'_> {
         let branching = match unwrap_value(expr) {
             Expr::Bin(bin) => matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr),
             Expr::Cond(_) => true,
-            Expr::Ident(ident) => scope.defaults.contains_key(&ident_key(ident)),
+            Expr::Ident(ident) => holds_a_default(ident, scope),
             _ => false,
         };
         if !branching {
             // A conditional reached through a local or joined with text
             // (`apiPrefix + "/x"`, `apiPrefix = base ? … : "/api"`): each
             // reading the send side reads it as (carrick#2386).
-            return self
-                .alternatives(expr, scope)
-                .map(|alts| alts.chosen_texts())
-                .unwrap_or_default()
-                .into_iter()
-                .map(Way::stated)
-                .collect();
+            if let Some(alts) = self.alternatives(expr, scope) {
+                return alts.chosen_texts().into_iter().map(Way::stated).collect();
+            }
+            // A default joined with text (`${at}/:id`, carrick#3191).
+            if !joins_a_default(expr, scope) {
+                return Vec::new();
+            }
         }
         let ways = self.ways(expr, scope);
         if ways.len() > 1 { ways } else { Vec::new() }
@@ -5171,6 +5227,36 @@ impl Reader<'_> {
 
     fn ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Way> {
         match unwrap_value(expr) {
+            // A local holding a default (carrick#3191): its ways, read where
+            // it is declared.
+            Expr::Ident(ident) if scope.local_ways.contains_key(&ident_key(ident)) => {
+                scope.local_ways[&ident_key(ident)].clone()
+            }
+            // Text joined with a default (`${at}/:id`, `at + "/:id"`): each
+            // way of each part, in turn (carrick#3191).
+            Expr::Tpl(tpl) if joins_a_default(expr, scope) => {
+                let mut parts = Vec::new();
+                for (index, quasi) in tpl.quasis.iter().enumerate() {
+                    let text = quasi
+                        .cooked
+                        .as_ref()
+                        .map(|cooked| cooked.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| quasi.raw.to_string());
+                    parts.push(vec![Way::stated(vec![Piece::Lit(text)])]);
+                    if let Some(part) = tpl.exprs.get(index) {
+                        parts.push(self.ways(part, scope));
+                    }
+                }
+                joined_ways(parts)
+                    .unwrap_or_else(|| vec![Way::stated(self.eval(expr, scope).pieces())])
+            }
+            Expr::Bin(bin) if bin.op == BinaryOp::Add && joins_a_default(expr, scope) => {
+                joined_ways(vec![
+                    self.ways(&bin.left, scope),
+                    self.ways(&bin.right, scope),
+                ])
+                .unwrap_or_else(|| vec![Way::stated(self.eval(expr, scope).pieces())])
+            }
             // `opts.prefix ?? '/api'`: the left side, then the default.
             Expr::Bin(bin) if bin.op == BinaryOp::NullishCoalescing => {
                 let mut ways = self.ways(&bin.left, scope);
@@ -5985,6 +6071,7 @@ impl Reader<'_> {
             fetches,
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
+            local_ways: HashMap::new(),
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
@@ -6054,6 +6141,7 @@ impl Reader<'_> {
             fetches,
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
+            local_ways: HashMap::new(),
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
@@ -6285,6 +6373,42 @@ impl Reader<'_> {
                             }
                         }
                     }
+                    // `const { at = "/x" } = opts`: the key as the source
+                    // holds it (a parameter's key, else a value not read),
+                    // then the default (carrick#3191).
+                    if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
+                    {
+                        let source = match crate::graphql_document_sites::unwrap_expression(init) {
+                            Expr::Ident(source)
+                                if scope.key_objects.contains(&ident_key(source)) =>
+                            {
+                                scope.param_index(source)
+                            }
+                            _ => None,
+                        };
+                        for prop in &object.props {
+                            let ObjectPatProp::Assign(assign) = prop else {
+                                continue;
+                            };
+                            let Some(default) = &assign.value else {
+                                continue;
+                            };
+                            let binding = ident_key(&assign.key.id);
+                            if reassigned.names.contains(&binding.0)
+                                || declared.binding_count(&binding) != 1
+                            {
+                                continue;
+                            }
+                            let name = assign.key.id.sym.to_string();
+                            let own = match source {
+                                Some(index) => Piece::ParamKey(index, name.clone(), name),
+                                None => Piece::Unknown,
+                            };
+                            let mut ways = vec![Way::stated(vec![own])];
+                            ways.extend(Way::defaulted(self.ways(default, scope)));
+                            scope.local_ways.insert(binding, ways);
+                        }
+                    }
                     if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
                         let name = ident.id.sym.to_string();
                         let key = ident_key(&ident.id);
@@ -6319,6 +6443,26 @@ impl Reader<'_> {
                         } else {
                             self.alternatives(init, scope)
                         };
+                        // A default it falls back to (`opts.at ?? "/x"`),
+                        // read by the receiver trace (carrick#3191).
+                        let defaulted = !unsettled
+                            && matches!(
+                                unwrap_value(init),
+                                Expr::Bin(bin) if matches!(
+                                    bin.op,
+                                    BinaryOp::NullishCoalescing | BinaryOp::LogicalOr
+                                )
+                            );
+                        let ways = if defaulted {
+                            self.ways(init, scope)
+                        } else {
+                            Vec::new()
+                        };
+                        if ways.len() > 1 {
+                            scope.local_ways.insert(key.clone(), ways);
+                        } else {
+                            scope.local_ways.remove(&key);
+                        }
                         scope.locals.insert(key.clone(), value);
                         match alts {
                             Some(alts) => {
