@@ -31,11 +31,12 @@ literals and read no declaration):
 | `p_plus` | `/api//health` |
 | `p_local_join` (a `const` in a top-level function's body) | `/api/local` |
 
+A `let` assigned again (`p_written`) is each value it holds, `/before` and `/after` (S2b-4).
+
 Not read (`refuse.ts`, `evalfile.ts`): each is a hole.
 
 | Probe | Why |
 |---|---|
-| `p_written` | a `let` assigned again |
 | `p_written_entry` | an entry of the object is assigned |
 | `p_exported` | an importer may write the object's entries |
 | `p_var` | a `var` |

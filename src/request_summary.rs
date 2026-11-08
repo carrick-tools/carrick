@@ -7755,9 +7755,9 @@ impl Visit for CallWalker<'_, '_, '_> {
         if let Some(write) = self.reader.field_write(assign, self.scope) {
             self.ir.field_writes.push(write);
         }
-        // `name = value`: a write the value resolver reads for a module
-        // binding (carrick#3504 S1).
-        if assign.op == AssignOp::Assign
+        // `name = value`, `name ??= value`, `name ||= value`: a write the
+        // value resolver reads for a module binding (carrick#3504 S1, S2b-4).
+        if resolve::is_placed_assign(assign.op)
             && matches!(
                 assign.left,
                 AssignTarget::Simple(SimpleAssignTarget::Ident(_))
@@ -7768,6 +7768,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 values: self
                     .reader
                     .value_of(&assign.right, self.scope, &guards::Bound::default()),
+                text: resolve::text_of(&assign.right, &|lo| lo),
             });
         }
         assign.visit_children_with(self);
