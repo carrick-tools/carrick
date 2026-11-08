@@ -1371,6 +1371,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 hi,
                 member: Some(_),
                 made: None,
+                ..
             }) => self.returned(file, (*lo, *hi), at),
             Some(ValueAt::Field { class, field, .. }) => self.class_field(file, *class, field, at),
             _ => return false,

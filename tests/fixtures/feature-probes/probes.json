@@ -713,6 +713,13 @@
   "kind": "call",
   "source": "builtins: Function.prototype.bind"
  },
+ "t-factory-closure-param": {
+  "carries": "target",
+  "expect": "/p/t-factory-closure-param",
+  "feature": "parameter of a factory read in the function it returns (closure)",
+  "kind": "call",
+  "source": "ES5"
+ },
  "t-generator": {
   "carries": "target",
   "expect": "/p/t-generator",

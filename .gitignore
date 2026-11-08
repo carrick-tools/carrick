@@ -132,3 +132,14 @@ tests/fixtures/**/.carrick/
 !tests/fixtures/feature-probes/repo/node_modules/@fixture/queue/
 !tests/fixtures/feature-probes/repo/node_modules/@fixture/queue/package.json
 !tests/fixtures/feature-probes/repo/node_modules/@fixture/queue/index.d.ts
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/send/
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/send/package.json
+!tests/fixtures/feature-probes/repo/node_modules/@fixture/send/index.d.ts
+!tests/fixtures/factory-closure/repo/services/web/node_modules/
+!tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/
+!tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/send/
+!tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/send/package.json
+!tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/send/index.d.ts
+!tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/pub/
+!tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/pub/package.json
+!tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/pub/index.d.ts

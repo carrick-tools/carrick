@@ -499,7 +499,10 @@ pub(super) enum ValueAt {
     /// What the call spanning `lo..hi` returns. A call of a member
     /// (`f.bind(x)`) carries the member read's span and what its object may
     /// hold, for a member the language's own library declares to return its
-    /// object (carrick#2432 slice A2).
+    /// object (carrick#2432 slice A2). `out`: how many functions the body
+    /// that reads the value is inside the one the call is written in
+    /// (carrick#3504 S0b): a parameter that body's maker call passes is
+    /// that many functions further out.
     ///
     /// `made` is the instance the call builds where a maker or an own
     /// factory makes it ([`Reader::written_instance`]): the receiver walk
@@ -507,6 +510,7 @@ pub(super) enum ValueAt {
     Returned {
         lo: u32,
         hi: u32,
+        out: u8,
         member: Option<Box<MemberCall>>,
         made: Option<Box<ClientRef>>,
     },
@@ -612,11 +616,13 @@ impl ValueAt {
             Self::Returned {
                 lo,
                 hi,
+                out,
                 member,
                 made,
             } => Self::Returned {
                 lo: *lo,
                 hi: *hi,
+                out: out.saturating_add(1),
                 member: member.as_ref().map(|call| {
                     Box::new(MemberCall {
                         object: call.object.iter().map(Self::enclosed).collect(),
@@ -837,6 +843,7 @@ impl Reader<'_> {
                 vec![ValueAt::Returned {
                     lo: call.span.lo.0,
                     hi: call.span.hi.0,
+                    out: 0,
                     member,
                     made: self.written_instance(expr, scope).map(Box::new),
                 }]
@@ -1090,12 +1097,49 @@ pub(super) trait Follow<'a> {
     /// The value is the in-repo definition `key` of `target`.
     fn definition(&mut self, target: PathBuf, key: String, invoke: Invoke<'a>) -> Self::Reached;
 
-    /// The value is `function`, written in place in `file`.
-    fn written(&mut self, file: &'a Path, function: &'a FnIr, invoke: Invoke<'a>) -> Self::Reached;
+    /// The value is `function`, written in place in `file`. `maker`: the
+    /// call of the factory that returned it, when the function is written
+    /// directly in that factory's body (carrick#3504 S0b).
+    fn written(
+        &mut self,
+        file: &'a Path,
+        function: &'a FnIr,
+        invoke: Invoke<'a>,
+        maker: Option<Maker<'a>>,
+    ) -> Self::Reached;
+}
+
+/// The call of an own factory that made the function a value holds
+/// (carrick#3504 S0b, rule 2.7's per-caller fan-out through a closure):
+/// what fills a parameter of the factory the function reads.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Maker<'a> {
+    /// The factory call, where it is written.
+    pub(super) call: Invoke<'a>,
+    /// The factory, with the file it is written in.
+    pub(super) factory: (&'a Path, &'a FnIr),
+    /// How many functions the body that runs the made function is inside
+    /// the one the factory call is written in: a parameter the call passes
+    /// is that many further out. `None` where the call is not written in a
+    /// body around the one that runs the function: read through a module
+    /// binding (written in another function), or returned by another
+    /// factory (`return make(o)`, written in that factory). A parameter it
+    /// passes is then read as nothing, as before the step.
+    pub(super) out: Option<u8>,
 }
 
 /// A callee's parameters' defaults, with the file they are read in.
 pub(super) type Defaults<'a> = (&'a Path, &'a [(usize, Vec<String>, Vec<ValueAt>)]);
+
+/// Whether `function` is written directly in `factory`'s body, one function
+/// in: a parameter it reads one function out is the factory's.
+pub(super) fn written_in(factory: &FnIr, function: &FnIr) -> bool {
+    factory
+        .nested
+        .iter()
+        .chain(&factory.detached)
+        .any(|inner| std::ptr::eq(inner, function))
+}
 
 pub(super) fn defaults_of<'a>(callee: Option<(&'a Path, &'a FnIr)>) -> Option<Defaults<'a>> {
     callee.map(|(file, callee)| (file, callee.param_defaults.as_slice()))
@@ -1295,6 +1339,32 @@ impl<'a> Resolver<'a> {
             .find_map(|body| find(body, start))
     }
 
+    /// The call written in `file` whose node starts at `start` (discovery
+    /// numbering, as [`ValueAt::Returned`] holds it), at any depth of any
+    /// body.
+    pub(super) fn written_call(&self, file: &Path, start: u32) -> Option<&'a CallIr> {
+        fn find(ir: &FnIr, start: u32) -> Option<&CallIr> {
+            ir.read_calls()
+                .map(|(call, _)| call)
+                .find(|call| call.site.lo == start)
+                .or_else(|| {
+                    ir.nested
+                        .iter()
+                        .chain(&ir.detached)
+                        .chain(&ir.param_functions)
+                        .find_map(|inner| find(inner, start))
+                })
+        }
+        let ir = self.inputs_for(file).files.get(file)?;
+        let mut keys: Vec<&String> = ir.functions.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| &ir.functions[key])
+            .chain(std::iter::once(&ir.module_level))
+            .chain(&ir.constructor_defaults)
+            .find_map(|body| find(body, start))
+    }
+
     /// What `value`, read in a body of `file`, holds when `invoke` runs it
     /// (carrick#2432): a parameter of that body is left for its callers; a
     /// name or member is what `follow` says its row is, else the in-repo
@@ -1368,7 +1438,9 @@ impl<'a> Resolver<'a> {
                         .unwrap_or_else(nothing),
                 }
             }
-            ValueAt::Returned { lo, hi, member, .. } => {
+            ValueAt::Returned {
+                lo, hi, out, member, ..
+            } => {
                 // `f.bind(this)` is `f`: the member the compiler's row names
                 // as the language library's `bind` returns its object.
                 if let Some(call) = member
@@ -1393,23 +1465,58 @@ impl<'a> Resolver<'a> {
                 if self.returns_depth.get() >= MAX_VALUES {
                     return nothing();
                 }
+                // The factory call itself fills the parameters of the
+                // factory a function it returns reads (carrick#3504 S0b).
+                let maker = self.written_call(file, *lo).map(|call| Maker {
+                    call: Invoke {
+                        file,
+                        call,
+                        construction: false,
+                    },
+                    factory: (factory_file, factory),
+                    out: (self.bindings_reading.borrow().is_empty()
+                        && self.returns_depth.get() == 0)
+                        .then_some(*out),
+                });
                 self.returns_depth.set(self.returns_depth.get() + 1);
-                let mut out = Vec::new();
+                let mut held = Vec::new();
                 for returned in &factory.returned_values {
                     match returned {
                         // A parameter of the factory: its own call fills it.
-                        ValueAt::Param { .. } => out.extend(nothing()),
+                        ValueAt::Param { .. } => held.extend(nothing()),
+                        // A function the factory's own body writes: one
+                        // function in, so its parameters are the factory's.
+                        ValueAt::Function(start) => {
+                            match self
+                                .written_function(factory_file, *start)
+                                .filter(|function| written_in(factory, function))
+                            {
+                                Some(function) => held.push(Held::Reached(follow.written(
+                                    factory_file,
+                                    function,
+                                    invoke,
+                                    maker,
+                                ))),
+                                None => held.extend(self.read_value(
+                                    follow,
+                                    factory_file,
+                                    returned,
+                                    invoke,
+                                    false,
+                                )),
+                            }
+                        }
                         other => {
-                            out.extend(self.read_value(follow, factory_file, other, invoke, false))
+                            held.extend(self.read_value(follow, factory_file, other, invoke, false))
                         }
                     }
                 }
                 self.returns_depth.set(self.returns_depth.get() - 1);
-                if out.is_empty() { nothing() } else { out }
+                if held.is_empty() { nothing() } else { held }
             }
             ValueAt::Function(_) if at_caller => vec![Held::Callback],
             ValueAt::Function(start) => match self.written_function(file, *start) {
-                Some(function) => vec![Held::Reached(follow.written(file, function, invoke))],
+                Some(function) => vec![Held::Reached(follow.written(file, function, invoke, None))],
                 None => nothing(),
             },
             // The text variants are the names lowering's: this walk reads
@@ -1856,7 +1963,13 @@ mod tests {
             End::Definition(key)
         }
 
-        fn written(&mut self, _: &'a Path, function: &'a FnIr, _: Invoke<'a>) -> End {
+        fn written(
+            &mut self,
+            _: &'a Path,
+            function: &'a FnIr,
+            _: Invoke<'a>,
+            _: Option<Maker<'a>>,
+        ) -> End {
             End::Written(function.site.as_ref().map_or(0, |site| site.line))
         }
     }
