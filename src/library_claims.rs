@@ -2020,6 +2020,79 @@ mod tests {
         assert!(unverified_maker.is_empty(), "the maker must verify");
     }
 
+    /// carrick-cloud#3139: a consumer export that subscribes when
+    /// constructed (`new Worker(name, processor)`) is a receive in the `new`
+    /// form: a subscriber row at the construction, beside the queue's
+    /// publisher row on the same name and scope. A name held in a parameter
+    /// states nothing. A verifier that refuses the receive (a scanner before
+    /// it reads one) leaves the publisher row only.
+    #[test]
+    fn a_new_form_receive_states_a_subscriber_row() {
+        let queue = export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "Queue", "role": "broker",
+            "claims": [
+                { "kind": "make", "form": "new", "member": null, "name": { "arg": 0 },
+                  "name_scope": { "scope": "global", "namespace": "queue" } },
+                { "kind": "op", "op": "send", "member": "add", "on": "instance",
+                  "name": { "bound": "maker" }, "payload": { "arg": 1 } }
+            ]
+        }));
+        let worker = export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "Worker", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": null, "on": "export", "form": "new",
+                  "name": { "arg": 0 },
+                  "name_scope": { "scope": "global", "namespace": "queue" } }
+            ]
+        }));
+        let sites = sites_of(&[(
+            "src/jobs.ts",
+            "import { Queue, Worker } from \"@fixture/queue\";\n\
+             export async function run() {\n\
+             \x20 await new Queue(\"orders\").add(\"job\", {});\n\
+             \x20 const w = new Worker(\"orders\", async () => {});\n\
+             \x20 w.on(\"completed\", () => {});\n\
+             \x20 await w.close();\n\
+             }\n\
+             export function held(queue: string) {\n\
+             \x20 return new Worker(queue, async () => {});\n\
+             }\n",
+        )]);
+        let exports = [queue, worker];
+        let rows = rows_of(&sites, &exports, all);
+        let stated: Vec<(u32, LibraryRowKind, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.kind, row.name.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                (3, LibraryRowKind::Pubsub(PubsubRole::Publisher), "orders"),
+                (4, LibraryRowKind::Pubsub(PubsubRole::Subscriber), "orders"),
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(rows[0].name_scope, rows[1].name_scope);
+        assert!(rows[0].name_scope.is_some(), "{rows:#?}");
+        assert_eq!(
+            rows[1].claim_ids,
+            vec!["@fixture/queue@2:Worker:op:receive:():on:export:form:new"]
+        );
+        assert!(rows[1].claim_ids[0].ends_with(":form:new"));
+
+        let refused = rows_of(&sites, &exports, |check| {
+            !check.claim_id.contains(":op:receive:")
+        });
+        let kinds: Vec<LibraryRowKind> = refused.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![LibraryRowKind::Pubsub(PubsubRole::Publisher)],
+            "{refused:#?}"
+        );
+    }
+
     /// Carrick#3049: a queue export written on a `type:` receiver, with
     /// `receiver_types` naming the instance id that holds it, reads the same
     /// rows as today's form written on the instance id, once lowered. Without
