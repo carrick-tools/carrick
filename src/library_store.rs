@@ -708,13 +708,38 @@ fn installed(name: &str, install: &Install<'_>) -> Option<Installed> {
                 .and_then(Value::as_str)
                 .unwrap_or(name)
                 .to_string();
+            let install_root = linked_install_root(&dir, &root, install.repo_root).unwrap_or(root);
             Some(Installed {
                 dir,
                 name: real,
                 version,
-                install_root: root,
+                install_root,
             })
         })
+}
+
+/// The directory whose install a linked copy belongs to. A workspace member
+/// installed by the root's install holds `node_modules/<name>` as a link into
+/// the root's store (`<R>/node_modules/.pnpm/<key>/node_modules/<name>`, or a
+/// `.bun` store): the install record is `<R>`'s, not the member directory's
+/// (which may hold a stale lockfile of its own). `<R>` is named by the
+/// outermost `node_modules` segment of the copy's real path, inside the repo
+/// root. `None` when the copy is not a link, or its real path holds no
+/// `node_modules` segment inside the repo (an npm workspace link to
+/// `packages/<name>`), so the install stays where the copy was found.
+fn linked_install_root(dir: &Path, found_in: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let real = dir.canonicalize().ok()?;
+    let real_found_in = found_in.canonicalize().ok()?;
+    if real == real_found_in.join(dir.strip_prefix(found_in).ok()?) {
+        return None;
+    }
+    let real_repo = repo_root.canonicalize().ok()?;
+    let inside = real.strip_prefix(&real_repo).ok()?;
+    let at = inside
+        .components()
+        .position(|part| part.as_os_str() == "node_modules")?;
+    let relative: PathBuf = inside.components().take(at).collect();
+    Some(repo_root.join(relative))
 }
 
 /// The directories from `from` up to `repo_root`, both included; only `from`
@@ -2220,6 +2245,105 @@ mod tests {
         );
         assert_eq!(
             asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
+            vec![]
+        );
+    }
+
+    /// A pnpm install at `root` whose store holds `x@1.0.0`, with the
+    /// install record (`.modules.yaml`, `pnpm-lock.yaml`) beside it.
+    fn pnpm_root_store(root: &Path) -> PathBuf {
+        let store = root
+            .join("node_modules")
+            .join(".pnpm")
+            .join("x@1.0.0")
+            .join("node_modules")
+            .join("x");
+        write(
+            &store.join("package.json"),
+            r#"{"name":"x","version":"1.0.0"}"#,
+        );
+        write(
+            &root.join("node_modules").join(".modules.yaml"),
+            "layoutVersion: 5\nregistries:\n  default: https://registry.npmjs.org/\n",
+        );
+        write(
+            &root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\npackages:\n  x@1.0.0:\n    resolution: {integrity: sha512-abc}\n",
+        );
+        store
+    }
+
+    fn install_in<'a>(service: &'a Path, repo: &'a Path) -> Install<'a> {
+        Install {
+            service_root: service,
+            repo_root: repo,
+            ..install_at(repo)
+        }
+    }
+
+    #[test]
+    fn a_package_linked_from_the_workspace_root_store_reads_the_root_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = pnpm_root_store(root);
+        let member = root.join("packages").join("a");
+        // A stale lockfile of the member's own, and no install record there.
+        write(
+            &member.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\npackages: {}\n",
+        );
+        fs::create_dir_all(member.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(&store, member.join("node_modules").join("x")).unwrap();
+        let install = install_in(&member, root);
+        assert_eq!(
+            asked(request(&specifiers(&["x"]), &install)),
+            one("x", "1.0.0", &["x"])
+        );
+        let health = ask_health(&specifiers(&["x"]), &install);
+        assert!(health.unreadable_lockfiles.is_empty(), "{health:?}");
+        assert!(!health.is_blind(), "{health:?}");
+    }
+
+    #[test]
+    fn a_package_installed_by_the_nested_dirs_own_install_reads_that_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        pnpm_root_store(root);
+        let member = root.join("packages").join("a");
+        // The member ran its own install: its copy is a link into its own
+        // store, and its own lockfile does not list the package.
+        let own = pnpm_root_store(&member);
+        write(
+            &member.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\npackages: {}\n",
+        );
+        std::os::unix::fs::symlink(&own, member.join("node_modules").join("x")).unwrap();
+        // The root install lists it; the member's own record is the one read.
+        assert_eq!(
+            asked(request(&specifiers(&["x"]), &install_in(&member, root))),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_linked_npm_workspace_member_is_still_read_where_it_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let member = root.join("packages").join("x");
+        write(
+            &member.join("package.json"),
+            r#"{"name":"x","version":"1.0.0"}"#,
+        );
+        write(
+            &root.join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{"node_modules/x":{"resolved":"packages/x","link":true}}}"#,
+        );
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(&member, root.join("node_modules").join("x")).unwrap();
+        let found = installed("x", &install_in(root, root)).unwrap();
+        assert_eq!(found.install_root, root);
+        assert_eq!(
+            asked(request(&specifiers(&["x"]), &install_in(root, root))),
             vec![]
         );
     }
