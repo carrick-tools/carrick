@@ -21593,6 +21593,53 @@ export { routes };
         );
     }
 
+    /// carrick#1989 on the wire: the stamped row reaches the serialised
+    /// `mount_graph.data_calls[]` the cloud reads, carrying `static_asset`,
+    /// and a call that is not a request for a served file carries no key.
+    #[test]
+    fn mount_graph_data_calls_serialise_static_asset_only_where_stamped() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/static-assets-next");
+        let conventions = builtin_conventions(&["next".to_string()]);
+        let mut results = HashMap::new();
+        results.insert(
+            "app/page.tsx".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    static_call("/images/banner.svg", Some("GET")),
+                    static_call("/api/items", Some("GET")),
+                ],
+                ..Default::default()
+            },
+        );
+        FileOrchestrator::stamp_static_assets(&mut results, &conventions, &root, &root);
+
+        let graph = FileOrchestrator::new(AgentService::new()).build_mount_graph(
+            &results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let wire = serde_json::to_value(&graph).unwrap();
+        let rows = wire["data_calls"].as_array().unwrap();
+        let row = |path: &str| {
+            rows.iter()
+                .find(|r| r["canonical_path"] == path)
+                .unwrap_or_else(|| panic!("no data_calls row for {path}: {rows:?}"))
+        };
+        assert_eq!(
+            row("/images/banner.svg")["static_asset"],
+            "public/images/banner.svg"
+        );
+        assert!(
+            row("/api/items")
+                .as_object()
+                .unwrap()
+                .get("static_asset")
+                .is_none()
+        );
+    }
+
     /// A member nothing was lost for writes nothing: an absent field says the
     /// scan counted nothing, and a zero would read as a completeness claim the
     /// count cannot make.
