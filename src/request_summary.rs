@@ -5685,6 +5685,34 @@ impl Reader<'_> {
                             reassigned: reassigned.names.contains(ident.id.sym.as_ref()),
                         });
                     }
+                    // `const { a, b: name } = init`: each plain key is a local
+                    // of its own for the text reader (carrick#3504 S2b-3),
+                    // under the same once-declared rule.
+                    if let (Pat::Object(pattern), Some(init)) =
+                        (&declarator.name, declarator.init.as_deref())
+                    {
+                        for member in resolve::pattern_members(pattern) {
+                            let name = member.bound.id.sym.as_ref();
+                            if !reassigned.declared_once(&declared, name) {
+                                continue;
+                            }
+                            ir.local_bindings.push(resolve::LocalBinding {
+                                key: ident_key(&member.bound.id),
+                                line: self
+                                    .source_map
+                                    .lookup_char_pos(member.bound.id.span.lo)
+                                    .line as u32,
+                                init: self.value_of(
+                                    &member.read(init),
+                                    scope,
+                                    &guards::Bound::default(),
+                                ),
+                                kind: var.kind.into(),
+                                text: member.text(init, &|lo| lo),
+                                reassigned: reassigned.names.contains(name),
+                            });
+                        }
+                    }
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).
                     // One never set again is a local receiver, below. Its

@@ -38,7 +38,7 @@ use std::cell::{Cell, RefCell};
 mod text;
 mod text_reader;
 
-pub(super) use text::text_of;
+pub(super) use text::{pattern_members, text_of};
 
 /// How many object literals deep an argument's keys are read (the decision
 /// record's object-depth cap, D7).
@@ -336,6 +336,13 @@ impl Visit for WriteCensus {
         for name in names.0 {
             *self.declared.entry(name).or_default() += 1;
         }
+        // `const { a } = OBJ` reads keys of `OBJ`, as `OBJ.a` does
+        // (carrick#3504 S2b-3).
+        if let (Pat::Object(_), Some(init)) = (&declarator.name, &declarator.init)
+            && let Expr::Ident(source) = crate::graphql_document_sites::unwrap_expression(init)
+        {
+            *self.entry_reads.entry(ident_key(source)).or_default() += 1;
+        }
         declarator.visit_children_with(self);
     }
 
@@ -387,6 +394,31 @@ pub(super) fn module_bindings(
         };
         let exported = matches!(item, ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(_)));
         for declarator in &var.decls {
+            // `const { a, b: name } = init`: each plain key is a binding of
+            // its own (carrick#3504 S2b-3). The text reader reads its text;
+            // the value entry is the member read, held for the value
+            // readers that take destructured bindings later (S4).
+            if let (Pat::Object(pattern), Some(init)) =
+                (&declarator.name, declarator.init.as_deref())
+            {
+                for member in pattern_members(pattern) {
+                    let key = ident_key(&member.bound.id);
+                    let line = source_map.lookup_char_pos(member.bound.id.span.lo).line as u32;
+                    let read = member.read(init);
+                    let binding = ModuleBinding {
+                        declared_in: None,
+                        init: reader.value_of(&read, scope, &guards::Bound::default()),
+                        writes: census.writes.get(&key).cloned().unwrap_or_default(),
+                        unplaceable: census.is_unplaceable(&key),
+                        kind: var.kind.into(),
+                        text: member.text(init, &identity),
+                        entries_kept: false,
+                        text_only: true,
+                    };
+                    out.insert((line, member.bound.id.sym.to_string()), binding);
+                }
+                continue;
+            }
             let Pat::Ident(ident) = &declarator.name else {
                 continue;
             };

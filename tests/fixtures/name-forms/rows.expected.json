@@ -1,0 +1,16 @@
+{
+  "names": {
+    "src/c-destructure.ts": "/c/destructure",
+    "src/c-destructure-renamed.ts": "/c/destructure-renamed",
+    "src/c-destructure-const.ts": "/c/destructure-const/items",
+    "src/c-destructure-local.ts": "/c/destructure-local",
+    "src/q-destructure.ts": "orders.destructured",
+    "src/s-destructure.ts": "room.destructured"
+  },
+  "kind_asked": [
+    "src/q-destructure.ts"
+  ],
+  "unnamed": [
+    "src/c-destructure-written.ts"
+  ]
+}

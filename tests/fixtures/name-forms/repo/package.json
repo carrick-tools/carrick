@@ -1,0 +1,11 @@
+{
+  "name": "name-forms",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/http": "^1.0.0",
+    "@fixture/live-wire": "^3.1.0",
+    "@fixture/queue": "^2.4.0",
+    "fixture-server": "^1.0.0"
+  }
+}
