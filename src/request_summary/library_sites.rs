@@ -4308,7 +4308,15 @@ mod tests {
              \x20 #leave(body: unknown) { return body; }\n\
              }\n";
         let sites = sites_of(&[("src/chat.ts", source)]);
-        let stated: Vec<(u32, MakerForm, &str, Option<&str>, Option<&str>, bool)> = sites
+        type StatedSite<'a> = (
+            u32,
+            MakerForm,
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            bool,
+        );
+        let stated: Vec<StatedSite> = sites
             .iter()
             .map(|site| {
                 (
