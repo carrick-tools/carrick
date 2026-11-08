@@ -1,0 +1,40 @@
+name: Install Deno (CI)
+description: >
+  Installs a pinned Deno for linux x64 from Deno's own download site, with
+  GitHub releases as the fallback, and checks the zip against a pinned sha256.
+  setup-deno reads GitHub releases only, so a GitHub release-download outage
+  failed every Rust test job at setup (2026-11-08: 504 on every try for hours).
+inputs:
+  version:
+    description: Deno version, without the leading v.
+    required: true
+  sha256:
+    description: sha256 of deno-x86_64-unknown-linux-gnu.zip for that version.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Download, check and put Deno on PATH
+      shell: bash
+      env:
+        DENO_VERSION: ${{ inputs.version }}
+        DENO_SHA256: ${{ inputs.sha256 }}
+      run: |
+        set -euo pipefail
+        zip=deno-x86_64-unknown-linux-gnu.zip
+        dest="$RUNNER_TEMP/deno-$DENO_VERSION"
+        mkdir -p "$dest"
+        ok=
+        for url in "https://dl.deno.land/release/v$DENO_VERSION/$zip" \
+                   "https://github.com/denoland/deno/releases/download/v$DENO_VERSION/$zip"; do
+          for try in 1 2 3; do
+            if curl -fsSL --max-time 120 -o "$dest/$zip" "$url"; then ok=1; break 2; fi
+            echo "install-deno: $url failed (try $try of 3)"
+            sleep 5
+          done
+        done
+        if [ -z "$ok" ]; then echo "::error::install-deno: no source served Deno $DENO_VERSION"; exit 1; fi
+        echo "$DENO_SHA256  $dest/$zip" | sha256sum -c -
+        unzip -q -o "$dest/$zip" -d "$dest"
+        echo "$dest" >> "$GITHUB_PATH"
+        "$dest/deno" --version

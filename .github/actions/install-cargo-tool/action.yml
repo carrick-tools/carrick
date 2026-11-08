@@ -1,0 +1,54 @@
+name: Install a cargo tool (CI)
+description: >
+  Puts a pinned cargo tool on PATH from the Actions cache. On a miss it
+  compiles the tool from crates.io and saves it to the cache, so later runs
+  are a restore. It never reads GitHub release downloads: on 2026-11-08 those
+  returned 504 for hours, and taiki-e/install-action (which reads them) hung
+  test shards for 20+ minutes at "Install cargo-nextest".
+inputs:
+  crate:
+    description: crates.io package name, e.g. cargo-nextest.
+    required: true
+  version:
+    description: Exact version to install.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Restore ${{ inputs.crate }} ${{ inputs.version }}
+      id: cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ~/.cache/ci-tools/${{ inputs.crate }}-${{ inputs.version }}
+        key: ci-tool-${{ runner.os }}-${{ runner.arch }}-${{ inputs.crate }}-${{ inputs.version }}
+
+    - name: Compile ${{ inputs.crate }} ${{ inputs.version }} from crates.io (cache miss)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CRATE: ${{ inputs.crate }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        root="$HOME/.cache/ci-tools/$CRATE-$VERSION"
+        cargo install --locked "$CRATE" --version "$VERSION" --root "$root.build"
+        mkdir -p "$root"
+        cp "$root.build/bin/"* "$root/"
+
+    - name: Save ${{ inputs.crate }} ${{ inputs.version }}
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ~/.cache/ci-tools/${{ inputs.crate }}-${{ inputs.version }}
+        key: ci-tool-${{ runner.os }}-${{ runner.arch }}-${{ inputs.crate }}-${{ inputs.version }}
+
+    - name: Put ${{ inputs.crate }} on PATH
+      shell: bash
+      env:
+        CRATE: ${{ inputs.crate }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        root="$HOME/.cache/ci-tools/$CRATE-$VERSION"
+        ls "$root"
+        echo "$root" >> "$GITHUB_PATH"

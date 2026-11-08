@@ -50,9 +50,10 @@ runs:
           src/sidecar/package-lock.json
 
     - name: Install Deno for type and dependency preparation tests
-      uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+      uses: ./.github/actions/install-deno
       with:
-        deno-version: "2.9.4"
+        version: "2.9.4"
+        sha256: c24f955d9fbfe0ea5ae2b501c8e71ae76e31e4c9782390a54a284b3364fda725
 
     # Fixture dependencies. `express-single` and `fastify-api` have no
     # lockfile, so on a miss `npm install` resolves whatever is newest and
