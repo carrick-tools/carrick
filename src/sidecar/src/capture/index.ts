@@ -42,7 +42,7 @@ import type {
   SelfCheckOutcome,
   SerializationTier,
 } from './api.js';
-import { entryRelativeSpecifier, resolveAnchor, type ResolvedAnchor } from './anchors.js';
+import { entryRelativeSpecifier, resolveAnchor, resolveSourceFile, type ResolvedAnchor } from './anchors.js';
 import { findAugmentationFiles } from './augmentations.js';
 import { installedVersions, lockfileVersions } from './lockfile.js';
 import { installedResolutionEdges, RESOLUTION_FILE } from './resolution-edges.js';
@@ -1475,7 +1475,7 @@ function resolveAnchors(
     const anchorSources = [
       ...new Set(
         opts.anchors
-          .flatMap((a) => (a.source_file ? [path.join(ctx.repoRoot, a.source_file)] : []))
+          .flatMap((a) => (a.source_file ? [resolveSourceFile(ctx.repoRoot, a.source_file)] : []))
       ),
     ].filter((f) => fs.existsSync(f));
     const options = sidecarCompilerOptions({
