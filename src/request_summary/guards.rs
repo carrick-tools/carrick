@@ -1449,6 +1449,7 @@ impl CallWalker<'_, '_, '_> {
             // The instance each argument holds, for a constructor parameter a
             // field is set from (carrick#1670 T3).
             instance: self.reader.instance_ir(None, args, self.scope),
+            constructs: true,
         };
         self.ir.constructions.push(construction);
     }
@@ -1503,6 +1504,7 @@ impl CallWalker<'_, '_, '_> {
             receiver_spans: super::discovery::receiver_spans(&call.callee),
             receiver_object: super::discovery::receiver_object(&call.callee),
             instance: self.reader.instance_ir(Some(&call.callee), &[], self.scope),
+            constructs: false,
         });
     }
 

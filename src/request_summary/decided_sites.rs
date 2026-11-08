@@ -1116,12 +1116,35 @@ impl<'a> Calls<'a> {
             file: &'a Path,
             by_start: &'s HashMap<u32, &'a str>,
         }
+        /// The definition `call`, written in `file`, reaches, as `at` reads
+        /// it; where it names none, the constructor body a `new` or a
+        /// `super(…)` runs, and for a call written in a constructor body
+        /// what the rows say it reaches (carrick#3527): the frozen call
+        /// graph keys no constructor and may read none of its calls.
+        fn target_of(
+            at: &Source<'_, '_>,
+            file: &Path,
+            call: &CallIr,
+            in_constructor: bool,
+        ) -> Target {
+            (at.target)(at.source, file, call)
+                .or_else(|| super::discovery::constructed_across(at.source, &[], file, call))
+                .or_else(|| {
+                    in_constructor
+                        .then(|| match at.source.reach(file, call.site.lo, call.site.hi) {
+                            super::row_calls::Reach::Function(target, key) => Some((target, key)),
+                            _ => None,
+                        })
+                        .flatten()
+                })
+        }
         fn walk<'a>(
             in_file: &InFile<'_, 'a>,
             key: Option<&'a str>,
             depth: u8,
             ir: &'a FnIr,
             host: Option<&'a CallIr>,
+            in_constructor: bool,
             out: &mut Calls<'a>,
         ) {
             let (at, file) = (in_file.source, in_file.file);
@@ -1158,7 +1181,7 @@ impl<'a> Calls<'a> {
                 if let Some(key) = key {
                     out.by_owner.entry((file, key)).or_default().push(placed);
                 }
-                if !is_optional && let Some(target) = (at.target)(at.source, file, call) {
+                if !is_optional && let Some(target) = target_of(at, file, call, in_constructor) {
                     out.callers.entry(target).or_default().push(placed);
                 }
             }
@@ -1168,7 +1191,15 @@ impl<'a> Calls<'a> {
                         .iter()
                         .any(|arg| matches!(arg, Value::Callback(at) if *at == index))
                 });
-                walk(in_file, key, depth.saturating_add(1), inner, host, out);
+                walk(
+                    in_file,
+                    key,
+                    depth.saturating_add(1),
+                    inner,
+                    host,
+                    in_constructor,
+                    out,
+                );
             }
             for inner in &ir.detached {
                 // A function module-level code writes outside any call that
@@ -1184,8 +1215,16 @@ impl<'a> Calls<'a> {
                     .flatten()
                     .and_then(|site| in_file.by_start.get(&site.lo).copied());
                 match own {
-                    Some(own) => walk(in_file, Some(own), 0, inner, None, out),
-                    None => walk(in_file, key, depth.saturating_add(1), inner, None, out),
+                    Some(own) => walk(in_file, Some(own), 0, inner, None, false, out),
+                    None => walk(
+                        in_file,
+                        key,
+                        depth.saturating_add(1),
+                        inner,
+                        None,
+                        in_constructor,
+                        out,
+                    ),
                 }
             }
         }
@@ -1230,10 +1269,19 @@ impl<'a> Calls<'a> {
                         0,
                         &file.functions[key],
                         None,
+                        file.functions[key].constructor,
                         &mut calls,
                     );
                 }
-                walk(&in_file, None, 0, &file.module_level, None, &mut calls);
+                walk(
+                    &in_file,
+                    None,
+                    0,
+                    &file.module_level,
+                    None,
+                    false,
+                    &mut calls,
+                );
             }
         }
         calls
