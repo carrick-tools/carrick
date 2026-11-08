@@ -1881,6 +1881,7 @@ impl<'a> Walk<'a, '_> {
                 hi,
                 member: Some(_),
                 made: None,
+                ..
             } => Some((ir.swc_start(*lo), ir.swc_start(*hi))),
             _ => None,
         }
@@ -1926,6 +1927,7 @@ impl<'a> Walk<'a, '_> {
                         hi,
                         member: Some(_),
                         made: None,
+                        ..
                     } => (ir.swc_start(*lo), ir.swc_start(*hi)),
                     // A module `const` the call initialises, as the binding
                     // table holds it: the compiler names the declaration.

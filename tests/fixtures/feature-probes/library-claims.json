@@ -142,6 +142,41 @@
      "patterns": []
     }
    ]
+  },
+  {
+   "package": "@fixture/send",
+   "version": "1.0.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "@fixture/send",
+     "export": "send",
+     "role": "http_client",
+     "side": "client",
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [
+      {
+       "op": "request",
+       "member": null,
+       "on": "export",
+       "name": {
+        "arg": 0
+       },
+       "payload": {
+        "arg": 1
+       },
+       "method": "POST",
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
   }
  ]
 }

@@ -70,7 +70,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::implementations::{Followed, Implementations};
-use super::resolve::{Follow, Invoke, MAX_VALUES, Resolver, defaults_of};
+use super::resolve::{Follow, Invoke, MAX_VALUES, Maker, Resolver, defaults_of};
 use super::row_calls::Reach;
 use super::*;
 use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_step};
@@ -1775,7 +1775,7 @@ impl<'a> Walker<'a> {
                     },
                     None => {
                         let inner = self.definition(&id);
-                        self.bind(inner, invoke, callee).under(hop.clone())
+                        self.bind(inner, invoke, callee, None).under(hop.clone())
                     }
                 };
                 // A sibling's code is read without the instances its makers
@@ -2188,22 +2188,50 @@ impl<'a> Walker<'a> {
         }
         let inner = self.definition(&id);
         let callee = self.function(&id.0, &id.1);
-        self.bind(inner, invoke, callee).under(hop)
+        self.bind(inner, invoke, callee, None).under(hop)
     }
 
     /// `inner`, what a function `invoke` calls reaches, with each value its
     /// own parameters hold filled from what `invoke` passes there, or the
-    /// default `callee` gives. What is left open is a parameter of the body
-    /// that holds `invoke`.
+    /// default `callee` gives. A parameter one function out is the
+    /// factory's that `maker` called to make the function (carrick#3504
+    /// S0b), filled from what that call passes. What is left open is a
+    /// parameter of the body that holds `invoke`.
     fn bind(
         &mut self,
         mut inner: Outcome<'a>,
         invoke: Invoke<'a>,
         callee: Option<(&'a Path, &'a FnIr)>,
+        maker: Option<Maker<'a>>,
     ) -> Outcome<'a> {
         for open in std::mem::take(&mut inner.open) {
             let mut values = open.known;
             for (depth, index, keys) in open.refs {
+                if depth == 1
+                    && let Some(maker) = maker
+                {
+                    let resolver = self.values;
+                    let filled = resolver.passed(
+                        self,
+                        Some(maker.call),
+                        index,
+                        &keys,
+                        defaults_of(Some(maker.factory)),
+                        open.invoke,
+                    );
+                    for value in filled {
+                        values.push(match (value, maker.out) {
+                            // A parameter of the body the maker call is
+                            // written in, `out` functions out of this one.
+                            (Held::Param(depth, index, keys), Some(out)) => {
+                                Held::Param(depth.saturating_add(out), index, keys)
+                            }
+                            (Held::Param(..), None) => Held::Reached(Outcome::default()),
+                            (other, _) => other,
+                        });
+                    }
+                    continue;
+                }
                 if depth != 0 {
                     // A parameter of the function the callee is written in:
                     // the callee's own caller does not fill it.
@@ -2386,7 +2414,13 @@ impl<'a> Follow<'a> for Walker<'a> {
         self.enter_value(target, key, invoke)
     }
 
-    fn written(&mut self, file: &'a Path, function: &'a FnIr, invoke: Invoke<'a>) -> Outcome<'a> {
+    fn written(
+        &mut self,
+        file: &'a Path,
+        function: &'a FnIr,
+        invoke: Invoke<'a>,
+        maker: Option<Maker<'a>>,
+    ) -> Outcome<'a> {
         let line = function.site.as_ref().map_or(0, |site| site.line);
         let hop = ChainHop {
             function: VALUE_HOP.to_string(),
@@ -2394,7 +2428,8 @@ impl<'a> Follow<'a> for Walker<'a> {
             line,
         };
         let inner = self.body(file, function);
-        self.bind(inner, invoke, Some((file, function))).under(hop)
+        self.bind(inner, invoke, Some((file, function)), maker)
+            .under(hop)
     }
 }
 
@@ -2939,11 +2974,28 @@ mod tests {
                 show("b-closure-coalesce.ts", 8)
             ));
         }
-        // The maker call fills `send` with a function that sends nothing.
-        if decided("s-closure-coalesce-filled.ts", 9, "@fixture/send", "send") {
+        // The maker call fills `send` with a function that sends nothing:
+        // the values disagree.
+        let several = |file: &str, line: u32| -> bool {
+            let sites = at(file, line);
+            !sites.is_empty()
+                && sites
+                    .iter()
+                    .all(|site| site.stop.as_deref() == Some(SEVERAL_VALUES))
+        };
+        if !several("s-closure-coalesce-filled.ts", 9) {
             wrong.push(format!(
-                "s-closure-coalesce-filled.ts:9 decided: {}",
+                "s-closure-coalesce-filled.ts:9 not several: {}",
                 show("s-closure-coalesce-filled.ts", 9)
+            ));
+        }
+        // The maker call writes a module binding in another function: its
+        // parameter is no parameter of the body that calls the binding, so
+        // what that body's caller passes does not decide it.
+        if !several("c-binding-maker.ts", 11) {
+            wrong.push(format!(
+                "c-binding-maker.ts:11 not several: {}",
+                show("c-binding-maker.ts", 11)
             ));
         }
         assert!(wrong.is_empty(), "{wrong:#?}");

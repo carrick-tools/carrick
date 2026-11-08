@@ -509,6 +509,11 @@
   "source": "builtins: Function.prototype.bind",
   "status": "not_reached"
  },
+ "t-factory-closure-param": {
+  "feature": "parameter of a factory read in the function it returns (closure)",
+  "source": "ES5",
+  "status": "covered"
+ },
  "t-generator": {
   "feature": "generators wrapper",
   "source": "test262",

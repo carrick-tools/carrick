@@ -106,7 +106,7 @@ jobs:
             partitioned: --test call_through_rows_test
             partition: slice:1/3
             targets: >-
-              --test conditional_request_url_test --test registration_veto_test --test in_process_publish_test --test listener_receivers_test --test graphql_located_operation_types_test --test wrapper_dispatch_test --test workspace_member_callers_test --test factory_receiver_test --test named_dispatch_test --test jsx_component_callers_test --test module_resolution_parity_test --test mock_storage_test --test graphql_extraction_test
+              --test conditional_request_url_test --test registration_veto_test --test in_process_publish_test --test listener_receivers_test --test graphql_located_operation_types_test --test wrapper_dispatch_test --test workspace_member_callers_test --test factory_receiver_test --test factory_closure_test--test named_dispatch_test --test jsx_component_callers_test --test module_resolution_parity_test --test mock_storage_test --test graphql_extraction_test
           - shard: n7
             runner: nextest
             targets: >-

@@ -17,7 +17,7 @@
 
 | File:line | Call | Record |
 |---|---|---|
-| `items.ts:5` | `send("POST", …)` | A site. End: `fetch` in `http.ts`. Chain: one `<value>` hop at `request` (`http.ts:9`). Stop `several_values`: `options.fetch` is a key no caller fills, so the other value decides |
+| `items.ts:5` | `send("POST", …)` | A site. End: `fetch` in `http.ts`. Chain: one `<value>` hop at `request` (`http.ts:9`). No stop: `options.fetch` is a key the maker call `makeClient({ token })` does not write, so the other value decides (carrick#3504 S0b) |
 | `items.ts:10` | `send("GET", …)` | A site. Same end and chain |
 | `plain.ts:10` | `label("hello")` | Not a site (`unfollowed`, `value_callee`) |
-| `bound_items.ts:9` | `send({ … })` | Not a site with an end. `options` is the factory's parameter, one function out of `request`; reading it as `request`'s own first parameter takes the argument's global `fetch` |
+| `bound_items.ts:9` | `send({ … })` | Not a site with an end. `options` is the factory's parameter, one function out of `request`, filled by the maker call with `stub`, which sends nothing; reading it as `request`'s own first parameter takes the argument's global `fetch` |
