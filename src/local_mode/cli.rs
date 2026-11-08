@@ -637,6 +637,11 @@ fn not_installed(repo: &Path, services: &[crate::config::Config]) -> Vec<serde_j
                 install_root,
                 command,
                 ..
+            }
+            | crate::preflight::Unprepared::Workspace {
+                service,
+                install_root,
+                command,
             } => Some(serde_json::json!({
                 "service": service,
                 "directory": if install_root.is_empty() { ".".to_string() } else { install_root },
