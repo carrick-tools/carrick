@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.150](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.149...carrick-v0.3.150) (2026-11-08)
+
+
+### Features
+
+* **compiler-engine:** decorated and first names for GraphQL decorator ops (SB0-S) ([#3575](https://github.com/carrick-tools/carrick/issues/3575)) ([6af7173](https://github.com/carrick-tools/carrick/commit/6af717357e015d73696354eff53efb2d2a8f11a4))
+* **resolve:** GraphQL document sites read through the value resolver ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S9) ([#3569](https://github.com/carrick-tools/carrick/issues/3569)) ([123e34e](https://github.com/carrick-tools/carrick/commit/123e34e9de5467520eea1234916f615a401899f1))
+* **resolver:** a static class field names its value ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S2b-6) ([#3578](https://github.com/carrick-tools/carrick/issues/3578)) ([4562381](https://github.com/carrick-tools/carrick/commit/4562381e66e873be4a4806c082d9d996dace48e2))
+* **scanner:** read a maker-bound name at the maker and join it to each send ([#3527](https://github.com/carrick-tools/carrick/issues/3527) S4) ([#3566](https://github.com/carrick-tools/carrick/issues/3566)) ([f042b39](https://github.com/carrick-tools/carrick/commit/f042b3977ffa26a7b9408e7377bf5927dd2e2161))
+
+
+### Bug Fixes
+
+* **discovery:** S2 relanded; a call that hands its callee a function it keeps is not finished ([#3527](https://github.com/carrick-tools/carrick/issues/3527)) ([#3570](https://github.com/carrick-tools/carrick/issues/3570)) ([d20661a](https://github.com/carrick-tools/carrick/commit/d20661a151240a34fb89d95cee6fc63fa19538c7))
+* **library-store:** ask an npm alias under its real package and version ([#3571](https://github.com/carrick-tools/carrick/issues/3571)) ([5f66e2f](https://github.com/carrick-tools/carrick/commit/5f66e2f160bdc5c8a3cffbbbda74787f3827a806))
+* **library-store:** read bun.lock for the provenance rule; name bun.lockb as unreadable ([#3573](https://github.com/carrick-tools/carrick/issues/3573)) ([3f1264d](https://github.com/carrick-tools/carrick/commit/3f1264db4d6eed5795e603a18453ff5d18f117e4))
+* **npm:** Stop hook ignores other worktrees and stops repeating answered gaps ([#3577](https://github.com/carrick-tools/carrick/issues/3577)) ([abda8d9](https://github.com/carrick-tools/carrick/commit/abda8d923ce9a5d716a68829ed7f2b063ce883d1)), closes [#3543](https://github.com/carrick-tools/carrick/issues/3543)
+* the method a value-hop call writes fills the returned function's own parameter ([#3572](https://github.com/carrick-tools/carrick/issues/3572)) ([4def2bd](https://github.com/carrick-tools/carrick/commit/4def2bd87ec81f885418471e58de0bf2ce1662ad))
+
 ## [0.3.149](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.148...carrick-v0.3.149) (2026-11-08)
 
 
