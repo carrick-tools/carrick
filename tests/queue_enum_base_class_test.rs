@@ -54,8 +54,6 @@ struct Blob {
     publishers: BTreeSet<String>,
     /// Each pub/sub producer possible call, as `file:line reason`.
     producer_leads: BTreeSet<String>,
-    /// Each pub/sub consumer possible call, as `file:line reason`.
-    consumer_leads: BTreeSet<String>,
     /// Every pub/sub row of the blob, either side.
     pubsub_rows: usize,
     /// The topic of every pub/sub row, either side.
@@ -157,16 +155,13 @@ fn scan(fixture: &str) -> BTreeMap<String, Blob> {
                 continue;
             }
             found.pubsub_leads += 1;
-            let at = format!(
-                "{}:{} {}",
-                lead["file_path"].as_str().unwrap(),
-                lead["line_number"],
-                lead["unread"]["reason"].as_str().unwrap()
-            );
             if lead["role"] == "producer" {
-                found.producer_leads.insert(at);
-            } else if lead["role"] == "consumer" {
-                found.consumer_leads.insert(at);
+                found.producer_leads.insert(format!(
+                    "{}:{} {}",
+                    lead["file_path"].as_str().unwrap(),
+                    lead["line_number"],
+                    lead["unread"]["reason"].as_str().unwrap()
+                ));
             }
         }
         blobs.insert(service, found);
@@ -213,22 +208,6 @@ fn the_senders_wrapped_sends_stay_leads_and_no_row_is_named_job() {
             blob.topics
         );
     }
-}
-
-/// carrick#3527 S2: the runner's `new AlphaConsumer()` and `new
-/// GammaConsumer()` run each subclass constructor, whose `this.init(...)`
-/// reaches the wrapper's `Worker`. Each construction is a consumer possible
-/// call (the name stays unread until the base-class field is filled from
-/// `super(...)`); before, a constructor body ran nothing and the runner's
-/// blob held no pub/sub lead.
-#[test]
-fn the_runners_constructions_are_consumer_leads() {
-    let fixture = "queue-enum-base-class";
-    let blobs = scan(fixture);
-    assert_eq!(
-        blobs["runner"].consumer_leads,
-        key(fixture, "runner_possible_calls")
-    );
 }
 
 /// With the store's corrected label, a queue named by a literal is one

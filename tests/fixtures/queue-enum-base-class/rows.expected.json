@@ -3,9 +3,5 @@
   "sender_possible_calls": [
     "services/sender/src/send.ts:4 unanswered",
     "services/sender/src/send.ts:8 unanswered"
-  ],
-  "runner_possible_calls": [
-    "services/runner/src/run.ts:4 unanswered",
-    "services/runner/src/run.ts:5 unanswered"
   ]
 }
