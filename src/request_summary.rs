@@ -243,7 +243,7 @@ pub(crate) mod dispatch;
 // returns. Discovery's value walk reads callees through it (carrick#2432).
 // Design: carrick-cloud docs/internal/decisions/2026-11-07-one-value-resolver.md
 mod resolve;
-use resolve::ValueAt;
+use resolve::{Holds, ValueAt};
 
 // What each construction of a class passes, across the service, for the
 // fields its constructor sets from a parameter (carrick#2452 slice 2).
@@ -986,48 +986,14 @@ struct CallIr {
     instance: InstanceIr,
 }
 
-/// The instance an expression holds where it is written, as the syntax
-/// names one (carrick#2474 R2a): where the receiver trace's walk ends.
-#[derive(Debug, Clone)]
-enum HeldInstance {
-    /// What the library-site reader reads a holder as: a maker's instance,
-    /// or what an own factory call returns ([`Reader::written_instance`]).
-    Client(Box<ClientRef>),
-    /// A name an import binds, or a module-scope instance's name a scope
-    /// below declares again (carrick#2474 R2b), at its span (discovery
-    /// numbering): which declaration it reaches is the compiler's to say.
-    Imported(u32, u32),
-    /// A call of a member that is no maker's and no own factory's, or a
-    /// module-scope binding such a call initialises, at the call's span
-    /// (discovery numbering): a scope a labelled member returns, which the
-    /// walk reads (carrick#2474 R2b).
-    Returned(u32, u32),
-    /// A field of the class the member is written in (`this.app`), by the
-    /// class's span start and the field's name: a field a maker's instance
-    /// is written to is that instance (carrick#3489 W1).
-    Field { class: u32, field: String },
-}
-
-/// A call of a member (`app.basePath("/v2")`), as the scope it may return
-/// ([`HeldInstance::Returned`]).
-fn returned_call(expr: &Expr) -> Option<HeldInstance> {
-    match unwrap_value(expr) {
-        Expr::Call(call) => match &call.callee {
-            Callee::Expr(callee) if matches!(unwrap_value(callee), Expr::Member(_)) => {
-                Some(HeldInstance::Returned(call.span.lo.0, call.span.hi.0))
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// What one argument holds, whole, and what each plain key of an object
-/// literal written there holds (`{ app }`).
+/// literal written there holds (`{ app }`), as the value resolver lowers
+/// them ([`Reader::value_of`], carrick#3504 S3): the receiver trace's walk
+/// ends where a value names an instance.
 #[derive(Debug, Clone, Default)]
 struct ArgHeld {
-    whole: Option<HeldInstance>,
-    keys: BTreeMap<String, HeldInstance>,
+    whole: Vec<ValueAt>,
+    keys: BTreeMap<String, Vec<ValueAt>>,
     /// The argument's span (discovery numbering), where no spread comes
     /// before it: where a compiler row names what a name there declares
     /// (carrick#2474 R2b).
@@ -1076,12 +1042,12 @@ impl Way {
 
 /// What the receiver trace reads at one call (carrick#2474 R2a): the
 /// receiver object's value as the body reads it (a parameter, a key of
-/// one, an enclosing function's), the instance the receiver holds where
-/// the syntax names one, and each argument's.
+/// one, an enclosing function's), what the receiver holds as the value
+/// resolver lowers it (carrick#3504 S3), and each argument's.
 #[derive(Debug, Clone, Default)]
 struct InstanceIr {
     receiver_value: Option<Value>,
-    receiver_held: Option<HeldInstance>,
+    receiver: Vec<ValueAt>,
     args: Vec<ArgHeld>,
     /// The argument slots whose text [`RequestSummaryInputs::linked`] read
     /// through a module-scope constant, piece by piece as they read before
@@ -1731,7 +1697,6 @@ pub fn extract_file_ir(
         receivers: HashMap::new(),
         lazy_clients: HashMap::new(),
         shadowed_clients: HashSet::new(),
-        returned_consts: HashMap::new(),
         destructured: HashSet::new(),
         lets: module
             .body
@@ -1949,12 +1914,6 @@ pub fn extract_file_ir(
                     // ([`ClientInstance::http_factory`]), and a service that
                     // held none before held no HTTP instance a specifier
                     // could take away.
-                    if client.is_none()
-                        && !redeclared.declares_name(&name)
-                        && let Some(HeldInstance::Returned(lo, hi)) = returned_call(init)
-                    {
-                        module_scope.returned_consts.insert(name.clone(), (lo, hi));
-                    }
                     if client.is_none()
                         && let Expr::Ident(target) =
                             crate::graphql_document_sites::unwrap_expression(init)
@@ -2520,10 +2479,6 @@ struct ModuleScope {
     /// The module-scope bindings that hold an instance a scope below
     /// declares the name of again ([`FileIr::shadowed_clients`]).
     shadowed_clients: HashSet<String>,
-    /// Each module-scope `const` a member call that is no maker's
-    /// initialises, by name, at the call's span (discovery numbering):
-    /// [`HeldInstance::Returned`] (carrick#2474 R2b).
-    returned_consts: HashMap<String, (u32, u32)>,
     /// Each module-scope `const` a destructuring of a module object literal
     /// binds ([`destructured_keys`], carrick#3489 W2): a module name whose
     /// instance [`FileIr::module_instance`] follows.
@@ -4760,57 +4715,6 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
-    /// The instance `expr` holds where it is written (carrick#2474 R2a): a
-    /// name the scope holds an instance in, a maker or own factory call
-    /// ([`Reader::written_instance`]), or a name an import binds, whose
-    /// declaration the compiler names. A parameter is the walk's to fill,
-    /// and anything else holds nothing the syntax names.
-    fn held(&self, expr: &Expr, scope: &Scope<'_>) -> Option<HeldInstance> {
-        match unwrap_value(expr) {
-            Expr::Ident(ident) => {
-                if scope.param_index(ident).is_some() {
-                    return None;
-                }
-                if let Some(client) = scope.receiver(ident)
-                    && client.instance.is_some()
-                {
-                    return Some(HeldInstance::Client(Box::new(client.clone())));
-                }
-                let key = ident_key(ident);
-                let name = ident.sym.as_ref();
-                if scope.locals.contains_key(&key) || scope.local_receivers.contains_key(&key) {
-                    return None;
-                }
-                if let Some((lo, hi)) = scope.module.returned_consts.get(name) {
-                    return Some(HeldInstance::Returned(*lo, *hi));
-                }
-                // An import, or a module-scope `const` (an alias of another
-                // module binding, carrick#3489 W2): the declaration the
-                // compiler names is read for the instance it holds.
-                (scope.module.imports.contains(name)
-                    || scope.module.shadowed_clients.contains(name)
-                    || scope.module.destructured.contains(name)
-                    || scope.module.consts.contains_key(&key)
-                    // A module `let` (carrick#3489 W5) other than a lazy
-                    // client a getter builds (carrick#1790).
-                    || (scope.module.lets.contains(&key)
-                        && !scope.module.lazy_clients.contains_key(&key)))
-                .then_some(HeldInstance::Imported(ident.span.lo.0, ident.span.hi.0))
-            }
-            call @ (Expr::Call(_) | Expr::New(_)) => self
-                .written_instance(call, scope)
-                .map(|client| HeldInstance::Client(Box::new(client)))
-                .or_else(|| returned_call(call)),
-            Expr::Member(member) if matches!(unwrap_value(&member.obj), Expr::This(_)) => {
-                Some(HeldInstance::Field {
-                    class: scope.fields?.class,
-                    field: this_field(member)?,
-                })
-            }
-            _ => None,
-        }
-    }
-
     /// Every way `expr` reads, one list of pieces each, where it holds a
     /// default or a conditional (carrick#2635); empty where it reads one
     /// way. `eval` reads the same expressions as one opaque value, which
@@ -4897,7 +4801,12 @@ impl Reader<'_> {
         let receiver_value = object
             .filter(|object| matches!(unwrap_value(object), Expr::Ident(_) | Expr::Member(_)))
             .map(|object| self.eval(unwrap_value(object), scope));
-        let receiver_held = object.and_then(|object| self.held(object, scope));
+        let bound = guards::Bound::default();
+        let receiver = object
+            .map(|object| self.value_of(object, scope, &bound))
+            .unwrap_or_default();
+        // Each argument is lowered on its own: one after a spread is still
+        // the one written there (`app.use(...middleware, router)`).
         let args = args
             .iter()
             .map(|arg| {
@@ -4905,31 +4814,11 @@ impl Reader<'_> {
                     return ArgHeld::default();
                 }
                 let span = unwrap_value(&arg.expr).span();
-                let keys = match unwrap_value(&arg.expr) {
-                    Expr::Object(object) => object
-                        .props
-                        .iter()
-                        .filter_map(|prop| match prop {
-                            PropOrSpread::Prop(prop) => match &**prop {
-                                Prop::Shorthand(ident) => {
-                                    let held = self.held(&Expr::Ident(ident.clone()), scope)?;
-                                    Some((ident.sym.to_string(), held))
-                                }
-                                Prop::KeyValue(entry) => {
-                                    let name = match &entry.key {
-                                        PropName::Ident(name) => name.sym.to_string(),
-                                        PropName::Str(text) => {
-                                            text.value.to_string_lossy().into_owned()
-                                        }
-                                        _ => return None,
-                                    };
-                                    Some((name, self.held(&entry.value, scope)?))
-                                }
-                                _ => None,
-                            },
-                            PropOrSpread::Spread(_) => None,
-                        })
-                        .collect(),
+                let whole = self.value_of(&arg.expr, scope, &bound);
+                // An object literal's plain keys (`{ app }`), as its
+                // lowering states them.
+                let keys = match whole.as_slice() {
+                    [ValueAt::Object { fields, .. }] => fields.clone(),
                     _ => BTreeMap::new(),
                 };
                 let alts = match unwrap_value(&arg.expr) {
@@ -4969,7 +4858,7 @@ impl Reader<'_> {
                     },
                 };
                 ArgHeld {
-                    whole: self.held(&arg.expr, scope),
+                    whole,
                     keys,
                     span: Some((span.lo.0, span.hi.0)),
                     alts,
@@ -4978,7 +4867,7 @@ impl Reader<'_> {
             .collect();
         InstanceIr {
             receiver_value,
-            receiver_held,
+            receiver,
             args,
             folds: Vec::new(),
         }
@@ -7707,7 +7596,6 @@ impl Visit for CallWalker<'_, '_, '_> {
                 values: self
                     .reader
                     .value_of(&assign.right, self.scope, &guards::Bound::default()),
-                held: self.reader.held(&assign.right, self.scope),
             });
         }
         assign.visit_children_with(self);

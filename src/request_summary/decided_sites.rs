@@ -1845,6 +1845,47 @@ impl<'a> Walk<'a, '_> {
         });
     }
 
+    /// The member call (swc numbering) a module `const` of `file` named at
+    /// `span` (discovery numbering) is bound to, once for the whole module:
+    /// the compiler's row there names the declaration, and the binding
+    /// table's entry for it is never written again and holds one call of a
+    /// member that builds no instance.
+    fn const_call(&self, file: &Path, span: (u32, u32)) -> Option<(u32, u32)> {
+        use super::resolve::{BindingKind, ValueAt};
+        let ir = self.inputs.files.get(file)?;
+        let positions = self.inputs.positions.as_ref()?;
+        let row = positions
+            .lookup(
+                file,
+                ir.swc_start(span.0),
+                ir.swc_start(span.1),
+                crate::position_rows::Kind::Ident,
+            )
+            .ok()?;
+        if !super::discovery::in_repo(row) || positions.path_of(row.decl_file()?) != file {
+            return None;
+        }
+        let binding = ir
+            .module_bindings
+            .get(&(row.decl_line()?, row.symbol()?.to_string()))?;
+        if binding.declared_in.is_some()
+            || binding.kind != BindingKind::Const
+            || binding.unplaceable
+            || !binding.writes.is_empty()
+        {
+            return None;
+        }
+        match instances::one_reading(&binding.init)? {
+            ValueAt::Returned {
+                lo,
+                hi,
+                member: Some(_),
+                made: None,
+            } => Some((ir.swc_start(*lo), ir.swc_start(*hi))),
+            _ => None,
+        }
+    }
+
     /// The scope call the labelled call `last` is made on the result of, and
     /// the slot of it that holds the name: the call of the member `scope`
     /// names, which a label verified on the scope's base receiver says
@@ -1864,18 +1905,39 @@ impl<'a> Walk<'a, '_> {
         let instance = &last.call.instance;
         let at = match last.call.receiver_object? {
             (lo, hi, ObjectForm::Call) => (ir.swc_start(lo), ir.swc_start(hi)),
-            (_, _, ObjectForm::Name) => match instance.receiver_held.as_ref()? {
-                super::HeldInstance::Returned(lo, hi) => (ir.swc_start(*lo), ir.swc_start(*hi)),
-                super::HeldInstance::Client(client) => match &client.instance {
-                    Some(made) if matches!(made.made_by, super::MadeBy::Call(_)) => {
-                        (made.site.span_start, made.site.span_end)
+            (_, _, ObjectForm::Name) => {
+                use super::resolve::ValueAt;
+                match instances::one_reading(&instance.receiver)? {
+                    ValueAt::Read {
+                        holds: super::Holds::Made(client),
+                        ..
                     }
+                    | ValueAt::Returned {
+                        made: Some(client), ..
+                    }
+                    | ValueAt::New { made: client, .. } => match &client.instance {
+                        Some(made) if matches!(made.made_by, super::MadeBy::Call(_)) => {
+                            (made.site.span_start, made.site.span_end)
+                        }
+                        _ => return None,
+                    },
+                    ValueAt::Returned {
+                        lo,
+                        hi,
+                        member: Some(_),
+                        made: None,
+                    } => (ir.swc_start(*lo), ir.swc_start(*hi)),
+                    // A module `const` the call initialises, as the binding
+                    // table holds it: the compiler names the declaration.
+                    ValueAt::Read {
+                        lo,
+                        hi,
+                        member: false,
+                        holds: super::Holds::Declared,
+                    } => self.const_call(last.file, (*lo, *hi))?,
                     _ => return None,
-                },
-                super::HeldInstance::Imported(..) | super::HeldInstance::Field { .. } => {
-                    return None;
                 }
-            },
+            }
             _ => return None,
         };
         let call = self.calls.at_span(last.file, at.0, at.1)?;

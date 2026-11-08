@@ -70,8 +70,6 @@ pub(super) struct ModuleBinding {
     /// What the initialiser may hold, read in module scope. Empty when the
     /// declaration has none.
     pub(super) init: Vec<ValueAt>,
-    /// The instance the initialiser holds, as the receiver trace reads one.
-    pub(super) init_held: Option<HeldInstance>,
     /// Where each plain assignment to the binding starts (`name = value`),
     /// anywhere in the module: its value is in the [`BindingWrite`] of the
     /// body it is written in.
@@ -156,8 +154,6 @@ pub(super) struct BindingWrite {
     /// Where the assignment starts.
     pub(super) at: u32,
     pub(super) values: Vec<ValueAt>,
-    /// The instance the value holds, as the receiver trace reads one.
-    pub(super) held: Option<HeldInstance>,
 }
 
 /// Every write of every binding in a module, by binding (the one write
@@ -402,7 +398,6 @@ pub(super) fn module_bindings(
                 init: init
                     .map(|init| reader.value_of(init, scope, &guards::Bound::default()))
                     .unwrap_or_default(),
-                init_held: init.and_then(|init| reader.held(init, scope)),
                 writes: census.writes.get(&key).cloned().unwrap_or_default(),
                 unplaceable: census.is_unplaceable(&key),
                 kind: var.kind.into(),
@@ -432,7 +427,6 @@ pub(super) fn module_bindings(
             let binding = ModuleBinding {
                 declared_in: Some(function.clone()),
                 init: local.init.clone(),
-                init_held: None,
                 writes: census.writes.get(&local.key).cloned().unwrap_or_default(),
                 unplaceable: census.is_unplaceable(&local.key),
                 kind: local.kind,
@@ -483,8 +477,14 @@ pub(super) enum ValueAt {
         keys: Vec<String>,
     },
     /// A name or a member read here, by its span (discovery numbering): the
-    /// compiler's row there says what it holds.
-    Read { lo: u32, hi: u32, member: bool },
+    /// compiler's row there says what it holds. `holds` is what the receiver
+    /// walk reads a name as ([`Holds`]); every other reader ignores it.
+    Read {
+        lo: u32,
+        hi: u32,
+        member: bool,
+        holds: Holds,
+    },
     /// `this.<field>` (spanning `lo..hi`) in a member of the class whose
     /// span starts at `class`, a field its constructor sets from a parameter
     /// (carrick#2452): what each construction of the class passes there.
@@ -500,10 +500,23 @@ pub(super) enum ValueAt {
     /// (`f.bind(x)`) carries the member read's span and what its object may
     /// hold, for a member the language's own library declares to return its
     /// object (carrick#2432 slice A2).
+    ///
+    /// `made` is the instance the call builds where a maker or an own
+    /// factory makes it ([`Reader::written_instance`]): the receiver walk
+    /// ends there. Every other reader ignores it.
     Returned {
         lo: u32,
         hi: u32,
         member: Option<Box<MemberCall>>,
+        made: Option<Box<ClientRef>>,
+    },
+    /// A `new` of a maker ([`Reader::written_instance`]) spanning `lo..hi`:
+    /// the instance it builds, which only the receiver walk reads. Every
+    /// other reader reads it as [`Self::Unread`]; any other `new` is one.
+    New {
+        lo: u32,
+        hi: u32,
+        made: Box<ClientRef>,
     },
     /// A function written here, by where its node starts.
     Function(u32),
@@ -549,6 +562,24 @@ pub(super) enum ValueAt {
     Unread,
 }
 
+/// What the receiver walk reads a name as, decided where the name is read
+/// (carrick#3504 S3a). Only the walk reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum Holds {
+    /// A member read, a parameter, a name a function declares, or a name no
+    /// declaration the module states binds: no instance the walk names.
+    #[default]
+    Nothing,
+    /// An import, or a binding the module declares (a `const`, a `let` other
+    /// than a lazy client a getter builds, a destructured key, a module
+    /// instance a scope below declares again): the declaration the
+    /// compiler's row names is read for the instance it holds.
+    Declared,
+    /// The library instance the scope holds in the name ([`Scope::receiver`]):
+    /// a maker's or an own factory's.
+    Made(Box<ClientRef>),
+}
+
 /// A call of a member, `object.method(…)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MemberCall {
@@ -578,7 +609,12 @@ impl ValueAt {
                     .collect(),
                 open: *open,
             },
-            Self::Returned { lo, hi, member } => Self::Returned {
+            Self::Returned {
+                lo,
+                hi,
+                member,
+                made,
+            } => Self::Returned {
                 lo: *lo,
                 hi: *hi,
                 member: member.as_ref().map(|call| {
@@ -587,6 +623,7 @@ impl ValueAt {
                         ..(**call).clone()
                     })
                 }),
+                made: made.clone(),
             },
             other => other.clone(),
         }
@@ -620,6 +657,39 @@ impl ValueAt {
             // a row at.
             _ => Some(vec![Self::Unread]),
         }
+    }
+}
+
+/// What the receiver walk reads the name `ident` as, where the scope holds
+/// no value for it ([`Holds`]): the instance the scope holds in it, else a
+/// binding the module declares or imports, else nothing (a parameter, or a
+/// name a function declares).
+fn name_holds(ident: &Ident, scope: &Scope<'_>) -> Holds {
+    if scope.param_index(ident).is_some() {
+        return Holds::Nothing;
+    }
+    if let Some(client) = scope.receiver(ident)
+        && client.instance.is_some()
+    {
+        return Holds::Made(Box::new(client.clone()));
+    }
+    let key = ident_key(ident);
+    let name = ident.sym.as_ref();
+    if scope.locals.contains_key(&key) || scope.local_receivers.contains_key(&key) {
+        return Holds::Nothing;
+    }
+    let module = &scope.module;
+    let declared = module.imports.contains(name)
+        || module.shadowed_clients.contains(name)
+        || module.destructured.contains(name)
+        || module.consts.contains_key(&key)
+        // A module `let` (carrick#3489 W5) other than a lazy client a getter
+        // builds (carrick#1790): no call is read through that one.
+        || (module.lets.contains(&key) && !module.lazy_clients.contains_key(&key));
+    if declared {
+        Holds::Declared
+    } else {
+        Holds::Nothing
     }
 }
 
@@ -667,17 +737,33 @@ impl Reader<'_> {
                         lo: ident.span.lo.0,
                         hi: ident.span.hi.0,
                         member: false,
+                        holds: name_holds(ident, scope),
                     }],
                 }
             }
+            // `await createApp()`: what the awaited expression holds.
+            Expr::Await(awaited) => self.values_in(&awaited.arg, scope, bound, depth + 1),
+            // `new Queue(…)`: the instance a maker builds; any other `new`
+            // holds nothing a reader states.
+            Expr::New(_) => match self.written_instance(expr, scope) {
+                Some(made) => vec![ValueAt::New {
+                    lo: expr.span().lo.0,
+                    hi: expr.span().hi.0,
+                    made: Box::new(made),
+                }],
+                None => vec![ValueAt::Unread],
+            },
             Expr::Member(member) => {
-                // A field the class's constructor sets from a parameter.
+                // A field of the class the member is written in. One its
+                // constructor sets from a parameter is what each
+                // construction passes there; any other is read as the member
+                // it is ([`Resolver::field_values`] answers `None`), and the
+                // receiver walk reads what the class writes to it.
                 if matches!(
                     crate::graphql_document_sites::unwrap_expression(&member.obj),
                     Expr::This(_)
                 ) && let Some(fields) = scope.fields
                     && let Some(field) = this_field(member)
-                    && fields.origins.contains_key(&field)
                 {
                     return vec![ValueAt::Field {
                         lo: member.span.lo.0,
@@ -719,6 +805,7 @@ impl Reader<'_> {
                     lo: member.span.lo.0,
                     hi: member.span.hi.0,
                     member: true,
+                    holds: Holds::Nothing,
                 }]
             }
             Expr::Bin(bin)
@@ -751,6 +838,7 @@ impl Reader<'_> {
                     lo: call.span.lo.0,
                     hi: call.span.hi.0,
                     member,
+                    made: self.written_instance(expr, scope).map(Box::new),
                 }]
             }
             Expr::Object(object) => {
@@ -1254,11 +1342,12 @@ impl<'a> Resolver<'a> {
                         lo: *lo,
                         hi: *hi,
                         member: true,
+                        holds: Holds::Nothing,
                     };
                     self.read_value(follow, file, &read, invoke, at_caller)
                 }
             },
-            ValueAt::Read { lo, hi, member } => {
+            ValueAt::Read { lo, hi, member, .. } => {
                 let kind = if *member { Kind::Member } else { Kind::Ident };
                 if let Some(reached) = follow.export(file, *lo, *hi, kind, invoke) {
                     return vec![Held::Reached(reached)];
@@ -1279,7 +1368,7 @@ impl<'a> Resolver<'a> {
                         .unwrap_or_else(nothing),
                 }
             }
-            ValueAt::Returned { lo, hi, member } => {
+            ValueAt::Returned { lo, hi, member, .. } => {
                 // `f.bind(this)` is `f`: the member the compiler's row names
                 // as the language library's `bind` returns its object.
                 if let Some(call) = member
@@ -1332,6 +1421,8 @@ impl<'a> Resolver<'a> {
             | ValueAt::BuiltIn { .. }
             | ValueAt::Entries(_)
             | ValueAt::Elements(_)
+            // A maker's `new` is the receiver walk's alone.
+            | ValueAt::New { .. }
             | ValueAt::Unread => nothing(),
         }
     }
@@ -2126,6 +2217,160 @@ mod tests {
         assert_eq!(
             written_param(&ir.functions[key], &write.values),
             Some(vec![Piece::Param(0, "next".to_string())])
+        );
+    }
+
+    /// Every call written in `ir`, at any depth.
+    fn calls_of(ir: &FileIr) -> Vec<&CallIr> {
+        fn walk<'f>(body: &'f FnIr, out: &mut Vec<&'f CallIr>) {
+            out.extend(body.read_calls().map(|(call, _)| call));
+            for inner in body.nested.iter().chain(&body.detached) {
+                walk(inner, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&ir.module_level, &mut out);
+        for body in ir.functions.values() {
+            walk(body, &mut out);
+        }
+        out
+    }
+
+    /// carrick#3504 S3a: the receiver trace reads the value resolver's one
+    /// lowering. A maker call and a maker's `new` carry the instance they
+    /// build (`made`), as does a name the scope holds one in; a field of the
+    /// class is a `Field` even where no constructor parameter sets it (and
+    /// discovery still reads it as the member it is); a call of a member
+    /// that builds nothing is `Returned` with its member; `await` is read
+    /// through; and a local declared once reads as its initialiser.
+    #[test]
+    fn the_receiver_lowering_reads_what_held_read() {
+        let source = "\
+import { make, Make } from 'pkg';
+declare function getApp(): any;
+async function createApp() { return make(); }
+const a = make();
+const b = new Make();
+class C { f = make(); m() { this.f.get('/f'); } n() { this.f(); } }
+const r = getApp().basePath('/v2');
+a.get('/a');
+b.get('/b');
+r.get('/r');
+async function main() { (await createApp()).get('/w'); const l = a; l.get('/l'); }
+function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
+";
+        let path = PathBuf::from("src/lowering.ts");
+        let inputs = RequestSummaryInputs {
+            files: HashMap::from([(
+                path.clone(),
+                super::super::file_ir_of(&path, source).expect("the source parses"),
+            )]),
+            ..RequestSummaryInputs::default()
+        };
+        let ir = &inputs.files[&path];
+        let calls = calls_of(ir);
+        let receiver = |callee: &str| -> Vec<ValueAt> {
+            calls
+                .iter()
+                .find(|call| call.callee_text == callee)
+                .unwrap_or_else(|| panic!("a call of `{callee}`: {calls:#?}"))
+                .instance
+                .receiver
+                .clone()
+        };
+        let made = |value: &ValueAt| match value {
+            ValueAt::Read { holds, .. } => matches!(holds, Holds::Made(_)),
+            ValueAt::Returned { made, .. } => made.is_some(),
+            ValueAt::New { .. } => true,
+            _ => false,
+        };
+        let init =
+            |line: u32, name: &str| ir.module_bindings[&(line, name.to_string())].init.clone();
+
+        // The maker call and the maker's `new` carry what they build.
+        let [a_init] = init(4, "a").try_into().expect("one value");
+        assert!(
+            matches!(a_init, ValueAt::Returned { member: None, .. }) && made(&a_init),
+            "{a_init:?}"
+        );
+        let [b_init] = init(5, "b").try_into().expect("one value");
+        assert!(matches!(b_init, ValueAt::New { .. }), "{b_init:?}");
+        // A name the module holds an instance in carries it.
+        for callee in ["a.get", "b.get"] {
+            let [value] = receiver(callee).try_into().expect("one value");
+            assert!(
+                matches!(value, ValueAt::Read { member: false, .. }) && made(&value),
+                "{callee}: {value:?}"
+            );
+        }
+        // A call of a member that builds nothing: the scope it may return.
+        let [r_init] = init(7, "r").try_into().expect("one value");
+        assert!(
+            matches!(
+                r_init,
+                ValueAt::Returned {
+                    member: Some(_),
+                    ..
+                }
+            ) && !made(&r_init),
+            "{r_init:?}"
+        );
+        let [r_value] = receiver("r.get").try_into().expect("one value");
+        assert!(
+            matches!(
+                r_value,
+                ValueAt::Read {
+                    member: false,
+                    holds: Holds::Declared,
+                    ..
+                }
+            ),
+            "{r_value:?}"
+        );
+        // A name a function declares and its scope does not hold names no
+        // instance (a local written twice).
+        let [twice] = receiver("w.get").try_into().expect("one value");
+        assert!(
+            matches!(
+                twice,
+                ValueAt::Read {
+                    holds: Holds::Nothing,
+                    ..
+                }
+            ),
+            "{twice:?}"
+        );
+        // A field of the class no constructor parameter sets.
+        assert!(
+            ir.class_origins
+                .values()
+                .all(|origin| !origin.fields.contains_key("f")),
+            "no origin entry for `f`"
+        );
+        assert!(
+            matches!(receiver("this.f.get").as_slice(), [ValueAt::Field { field, .. }] if field == "f"),
+            "{:?}",
+            receiver("this.f.get")
+        );
+        // Discovery reads that field's call as the member it is.
+        let field_call = calls
+            .iter()
+            .find(|call| call.callee_text == "this.f")
+            .expect("a call of `this.f`");
+        assert!(Resolver::new(&inputs, &[]).unbound_fields(&path, field_call));
+        // `await` is read through to the own factory's call.
+        let [awaited] = receiver("(await createApp()).get")
+            .try_into()
+            .expect("one value");
+        assert!(
+            matches!(awaited, ValueAt::Returned { member: None, .. }) && made(&awaited),
+            "{awaited:?}"
+        );
+        // A local declared once reads as its initialiser: the module's `a`.
+        let [local] = receiver("l.get").try_into().expect("one value");
+        assert!(
+            matches!(local, ValueAt::Read { member: false, .. }) && made(&local),
+            "{local:?}"
         );
     }
 
