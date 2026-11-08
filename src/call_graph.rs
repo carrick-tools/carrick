@@ -508,24 +508,29 @@ pub fn resolve_call_edges(
 }
 
 /// The edges the compiler's `call` rows state where resolution by name
-/// stated none: every member-shaped call site (`obj.m()`, `this.m()`,
-/// `this.f.m()`, `make().m()`, `a.b.m()`) whatever declares the receiver's
-/// type: a `const` a call initialised, a destructured or union-typed binding,
-/// a property chain (carrick#2615, carrick#813). The row's declaration names
-/// the member the compiler resolved, joined to the definition that opens at
-/// its file and line ([`crate::request_summary`]'s `RowCalls`). A bare call
-/// (`foo()`) is not asked: the resolver owns it.
+/// stated none: every call site the resolver left without a target. A
+/// member-shaped call (`obj.m()`, `this.m()`, `this.f.m()`, `make().m()`,
+/// `a.b.m()`) whatever declares the receiver's type: a `const` a call
+/// initialised, a destructured or union-typed binding, a property chain
+/// (carrick#2615, carrick#813). A bare call (`foo()`) whose binding only the
+/// compiler can follow, such as a require of a path that names no file, cast
+/// to `typeof import(...)` of the module that holds the function
+/// (carrick#3446). The row's declaration names the function the compiler
+/// resolved, joined to the definition that opens at its file and line
+/// ([`crate::request_summary`]'s `RowCalls`).
 ///
 /// `row_target` is what the rows say the call spanning `lo..hi` in a file
 /// reaches; it is only consulted where [`CallSiteTargets`] holds nothing for
 /// the site, so every edge resolution stated is unchanged. A target the
 /// merged definitions do not hold (a file outside the service) adds nothing,
 /// and neither does a call at module scope whose row the resolver dropped for
-/// want of an edge. Returns how many edges were added, and the member calls
-/// that took none: where the rows name no target, `row_unfollowed` says why
-/// the call is left unfollowed, if it is ([`crate::unfollowed_calls`]). A
-/// call the rows do name a target for, whose edge the filters above drop (a
-/// recursive call, a definition outside the service), is not one of them.
+/// want of an edge. Returns how many edges were added (and how many of them
+/// at bare calls), and the member calls that took none: where the rows name
+/// no target, `row_unfollowed` says why the call is left unfollowed, if it is
+/// ([`crate::unfollowed_calls`]). A bare call is never one of them; that list
+/// is member calls only. A call the rows do name a target for, whose edge the
+/// filters above drop (a recursive call, a definition outside the service),
+/// is not one of them either.
 pub fn add_row_edges(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     per_file: &HashMap<PathBuf, FileCallIndex>,
@@ -535,6 +540,7 @@ pub fn add_row_edges(
     row_unfollowed: impl Fn(&Path, u32, u32) -> Option<crate::request_summary::Unfollowed>,
 ) -> RowEdges {
     let mut added = 0;
+    let mut added_bare = 0;
     let mut unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall> = Vec::new();
     let mut files: Vec<&PathBuf> = per_file.keys().collect();
     files.sort();
@@ -544,20 +550,23 @@ pub fn add_row_edges(
         callers.sort();
         for caller_key in callers {
             let mut edges: Vec<FunctionCallRef> = Vec::new();
+            let mut bare_edges = 0;
             for callee in &index.callees[caller_key] {
-                // Every member-shaped call the resolver left without a target
-                // asks the compiler; a bare call stays with the resolver.
-                let compiler_asked = !matches!(callee.shape, CalleeShape::Bare);
-                if !compiler_asked
-                    || callee.span.is_dummy()
+                // Every call the resolver left without a target asks the
+                // compiler, bare or member-shaped.
+                if callee.span.is_dummy()
                     || sites
                         .target_at(&index.path, callee.span.lo.0, callee.span.hi.0)
                         .is_some()
                 {
                     continue;
                 }
+                let bare = matches!(callee.shape, CalleeShape::Bare);
                 let Some((file, key)) = row_target(&index.path, callee.span.lo.0, callee.span.hi.0)
                 else {
+                    if bare {
+                        continue;
+                    }
                     if let Some(why) =
                         row_unfollowed(&index.path, callee.span.lo.0, callee.span.hi.0)
                     {
@@ -591,6 +600,9 @@ pub fn add_row_edges(
                     call_site_line: callee.line,
                     call_count: 1,
                 });
+                if bare {
+                    bare_edges += 1;
+                }
             }
             if edges.is_empty() {
                 continue;
@@ -603,11 +615,16 @@ pub fn add_row_edges(
                 continue;
             };
             added += edges.len();
+            added_bare += bare_edges;
             def.calls.append(&mut edges);
             dedupe_edges(&mut def.calls);
         }
     }
-    RowEdges { added, unfollowed }
+    RowEdges {
+        added,
+        added_bare,
+        unfollowed,
+    }
 }
 
 /// What [`add_row_edges`] produced.
@@ -615,6 +632,8 @@ pub fn add_row_edges(
 pub struct RowEdges {
     /// Edges written into the definitions.
     pub added: usize,
+    /// Of those, the edges at bare calls (`foo()`) (carrick#3446).
+    pub added_bare: usize,
     /// Member calls that took no edge and say why, paths as walked.
     pub unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall>,
 }

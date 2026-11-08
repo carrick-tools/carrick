@@ -11279,10 +11279,15 @@ fn discover_with_positions(
             service.service_name.as_deref().unwrap_or("(root)"),
             row_calls.describe()
         );
-        // Member calls on a receiver a call initialised take their target
-        // from the `call` row where resolution by name stated none
-        // (carrick#2615).
-        let crate::call_graph::RowEdges { added, unfollowed } = crate::call_graph::add_row_edges(
+        // Every call resolution by name left without a target takes it from
+        // the `call` row: member calls on a receiver a call initialised
+        // (carrick#2615), and bare calls through a binding only the compiler
+        // follows (carrick#3446).
+        let crate::call_graph::RowEdges {
+            added,
+            added_bare,
+            unfollowed,
+        } = crate::call_graph::add_row_edges(
             &mut all_function_definitions,
             &per_file_calls,
             &keys,
@@ -11291,7 +11296,7 @@ fn discover_with_positions(
             |file, lo, hi| request_inputs.unfollowed_at(file, lo, hi),
         );
         debug!(
-            "Call edges the position rows added for service {}: {added}; member calls left unfollowed: {}",
+            "Call edges the position rows added for service {}: {added} ({added_bare} at bare calls); member calls left unfollowed: {}",
             service.service_name.as_deref().unwrap_or("(root)"),
             unfollowed.len()
         );
