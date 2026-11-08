@@ -984,6 +984,9 @@ struct CallIr {
     /// What the receiver trace walks an instance from (carrick#2474 R2a).
     /// Read by the trace alone.
     instance: InstanceIr,
+    /// A `new C(…)` or a `super(…)`: the call runs the constructor of the
+    /// class its row names (carrick#3527, [`FileIr::constructor_at`]).
+    constructs: bool,
 }
 
 /// What one argument holds, whole, and what each plain key of an object
@@ -1189,6 +1192,12 @@ struct FnIr {
     /// Each request this body builds and returns for a caller to send
     /// (carrick#3470, [`descriptors`]). Read by that pass alone.
     built_requests: Vec<descriptors::BuiltRequest>,
+    /// A class constructor's body, keyed `<Class>.constructor` in
+    /// [`FileIr::functions`] (carrick#3527): read by discovery and the
+    /// decided sites, which reach it from a `new` or a `super(...)` through
+    /// [`FileIr::constructor_keys`]. The old path's summaries and the
+    /// construction reader skip it.
+    constructor: bool,
 }
 
 impl FnIr {
@@ -1503,6 +1512,13 @@ pub struct FileIr {
     /// Every `new` the file writes, wherever it is, and every class it
     /// extends ([`constructions::NewsAndBases`], carrick#2452).
     news: constructions::NewsAndBases,
+    /// Each line a class with a constructor body is declared on (its
+    /// decorators, the class and its name) and the constructor's own line,
+    /// with the class's name and the key of its constructor in
+    /// [`Self::functions`]: where a compiler `call` row for `new C(…)` or
+    /// `super(…)`, which names the class, joins the constructor it runs
+    /// (carrick#3527, [`Self::constructor_at`]).
+    constructor_keys: HashMap<u32, Vec<(String, String)>>,
 }
 
 /// Text a link resolves to, and what a binding hands an importer where it
@@ -5058,6 +5074,51 @@ impl Reader<'_> {
                         module,
                         &none,
                     ));
+                    // The body, read as a member's is, under its own key
+                    // (carrick#3527): what a `new` or a `super(…)` runs. Its
+                    // field writes are already counted from the constructor
+                    // above.
+                    if let Some(body) = &ctor.body {
+                        let function = Function {
+                            params: pats
+                                .into_iter()
+                                .map(|pat| Param {
+                                    span: pat.span(),
+                                    decorators: Vec::new(),
+                                    pat,
+                                })
+                                .collect(),
+                            decorators: Vec::new(),
+                            span: ctor.span,
+                            ctxt: ctor.ctxt,
+                            body: Some(body.clone()),
+                            is_generator: false,
+                            is_async: false,
+                            type_params: None,
+                            return_type: None,
+                            this_param: None,
+                        };
+                        let mut ir = self.function(&function, table(false), module, &none);
+                        library_sites::take_field_writes(&mut ir, &mut Vec::new());
+                        ir.constructor = true;
+                        let constructor = format!("{name}.constructor");
+                        let mut lines: Vec<u32> = class
+                            .decorators
+                            .iter()
+                            .map(|decorator| decorator.span)
+                            .chain([class.span, ident.span, ctor.span])
+                            .map(|span| self.site(span).line)
+                            .collect();
+                        lines.sort_unstable();
+                        lines.dedup();
+                        for line in lines {
+                            file.constructor_keys
+                                .entry(line)
+                                .or_default()
+                                .push((name.to_string(), constructor.clone()));
+                        }
+                        file.functions.insert(constructor, in_class(ir));
+                    }
                 }
                 ClassMember::ClassProp(prop) => {
                     let (Some(member_name), Some(init)) = (prop_name(&prop.key), &prop.value)
@@ -7421,6 +7482,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 &call.args,
                 self.scope,
             ),
+            constructs: matches!(call.callee, Callee::Super(_)),
         });
     }
 
@@ -7490,6 +7552,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 receiver_spans: Vec::new(),
                 receiver_object: None,
                 instance: InstanceIr::default(),
+                constructs: false,
             });
         }
         element.visit_children_with(self);
@@ -9730,6 +9793,11 @@ pub fn summarize(
         keys.sort();
         for key in keys {
             let ir = &files[*path].functions[key];
+            // A constructor body is read by the fact layer alone
+            // (carrick#3527): the frozen summaries stay as they were.
+            if ir.constructor {
+                continue;
+            }
             emit(&mut composer, path, ir, &mut index, true);
         }
     }
@@ -9759,10 +9827,11 @@ pub fn summarize(
     // (carrick#1801), whether or not the call graph resolved that call.
     for path in &paths {
         let mut canonical = None;
-        for key in files[*path].functions.keys() {
-            if composer
-                .summary(path, key)
-                .is_some_and(|summary| summary.passes_body)
+        for (key, ir) in &files[*path].functions {
+            if !ir.constructor
+                && composer
+                    .summary(path, key)
+                    .is_some_and(|summary| summary.passes_body)
             {
                 let file = canonical
                     .get_or_insert_with(|| {

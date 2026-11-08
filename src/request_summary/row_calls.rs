@@ -760,6 +760,24 @@ impl RequestSummaryInputs {
     }
 }
 
+impl FileIr {
+    /// The key of the constructor body the class `symbol`, declared at
+    /// `line`, runs ([`FileIr::constructor_keys`], carrick#3527). Read only
+    /// for a `new` or a `super(…)`, whose `call` row names the class: never
+    /// through [`join`], so no other call of a class's name (a JSX tag)
+    /// reaches a constructor.
+    pub(super) fn constructor_at(&self, line: u32, symbol: &str) -> Option<String> {
+        let mut keys = self
+            .constructor_keys
+            .get(&line)?
+            .iter()
+            .filter(|(class, _)| class == symbol)
+            .map(|(_, key)| key);
+        let key = keys.next()?;
+        keys.next().is_none().then(|| key.clone())
+    }
+}
+
 /// What a declaration in `declaring` that [`join`] read is.
 fn reach_of_join(declaring: PathBuf, joined: Join) -> Reach {
     match joined {
