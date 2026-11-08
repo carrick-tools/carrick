@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-const LEDGER: &str = "ledger-fn/src/index.ts";
-const NOTES: &str = "notes-fn/src/index.ts";
 const WEB: &str = "notes-web/src/api.ts";
 
 fn fixture_dir() -> PathBuf {

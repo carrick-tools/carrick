@@ -206,6 +206,7 @@ pub fn collect_dispatch_tables(
 pub fn apply_declared_operations(
     graph: &mut crate::mount_graph::MountGraph,
     config: &crate::config::Config,
+    handlers: &DeclaredHandlers,
 ) -> usize {
     use crate::agents::file_analyzer_agent::ResolutionSource;
 
@@ -258,7 +259,8 @@ pub fn apply_declared_operations(
             let carried = (replaced.len() == 1).then(|| replaced[0].clone());
 
             for operation in &block.operations {
-                let (file_location, handler) = declared_location(operation, carried.as_ref());
+                let (file_location, handler) =
+                    declared_location(operation, carried.as_ref(), handlers);
                 graph.endpoints.push(crate::mount_graph::ResolvedEndpoint {
                     method: method.clone(),
                     path: path.clone(),
@@ -301,24 +303,298 @@ pub fn apply_declared_operations(
 /// the row it replaced, or nothing.
 ///
 /// The declared handler is written as `file:symbol` and a row's location is
-/// `file:line`, so the symbol travels as the handler NAME and the location
-/// keeps the file with line 0 — a location a reader can open, and one that
-/// `parse_file_location` still reads as a location rather than as a path with
-/// a symbol glued to it.
+/// `file:line`, so the symbol travels as the handler NAME and the location is
+/// the line the handler is declared on (carrick#2076). That line is the
+/// case's own site: its alias, its handler span and its type requests are all
+/// read there, so two cases on two handlers never share a contract. A symbol
+/// discovery does not find in that file exactly once keeps line 0, a location
+/// a reader can still open and one no site is read at.
 fn declared_location(
     operation: &crate::config::DeclaredOperation,
     carried: Option<&crate::mount_graph::ResolvedEndpoint>,
+    handlers: &DeclaredHandlers,
 ) -> (String, Option<String>) {
-    if let Some(handler) = operation.handler.as_deref()
-        && let Some((file, symbol)) = handler.rsplit_once(':')
-        && !file.trim().is_empty()
-    {
-        return (format!("{file}:0"), Some(symbol.to_string()));
+    if let Some((file, symbol)) = declared_handler(operation) {
+        let line = match handlers.the_one(file, symbol) {
+            Some(definition) => definition.line,
+            None => {
+                tracing::debug!(
+                    "carrick.json names handler '{symbol}' in '{file}', which this scan does \
+                     not find defined there exactly once; its operation keeps line 0"
+                );
+                0
+            }
+        };
+        return (format!("{file}:{line}"), Some(symbol.to_string()));
     }
     match carried {
         Some(row) => (row.file_location.clone(), row.handler.clone()),
         None => (String::new(), operation.handler.clone()),
     }
+}
+
+/// The `(file, symbol)` a declared operation names as its handler.
+fn declared_handler(operation: &crate::config::DeclaredOperation) -> Option<(&str, &str)> {
+    let (file, symbol) = operation.handler.as_deref()?.rsplit_once(':')?;
+    (!file.trim().is_empty()).then_some((file, symbol.trim()))
+}
+
+/// A function a declared operation can name as its handler: where it is
+/// declared, and the parameters it states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredHandler {
+    pub line: u32,
+    /// `(name, annotated type text)`, in order. `None` where the source
+    /// writes no annotation.
+    pub params: Vec<(String, Option<String>)>,
+}
+
+/// The functions discovery found, by repo-relative file and name, so a
+/// declared `file:symbol` handler can be placed (carrick#2076). Built from
+/// discovery's definitions before anything fills an unannotated parameter
+/// with an inferred type, so a parameter's type text here is what the source
+/// wrote.
+#[derive(Debug, Default)]
+pub struct DeclaredHandlers {
+    by_name: std::collections::HashMap<(String, String), Vec<DeclaredHandler>>,
+}
+
+impl DeclaredHandlers {
+    pub fn from_definitions<'a>(
+        definitions: impl IntoIterator<Item = &'a crate::visitor::FunctionDefinition>,
+        repo_path: &str,
+    ) -> Self {
+        let mut by_name: std::collections::HashMap<(String, String), Vec<DeclaredHandler>> =
+            Default::default();
+        for definition in definitions {
+            if definition.line_number == 0 {
+                continue;
+            }
+            let path = definition.file_path.to_string_lossy();
+            let file = crate::handler_span::normalize(crate::utils::repo_relative_source_path(
+                &path, repo_path,
+            ));
+            by_name
+                .entry((file, definition.name.clone()))
+                .or_default()
+                .push(DeclaredHandler {
+                    line: definition.line_number,
+                    params: definition
+                        .arguments
+                        .iter()
+                        .map(|argument| (argument.name.clone(), argument.type_string.clone()))
+                        .collect(),
+                });
+        }
+        Self { by_name }
+    }
+
+    /// The definition named `symbol` in `file`, when there is exactly one.
+    fn the_one(&self, file: &str, symbol: &str) -> Option<&DeclaredHandler> {
+        let found = self.by_name.get(&(
+            crate::handler_span::normalize(file.trim()),
+            symbol.to_string(),
+        ))?;
+        match found.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+}
+
+/// The type requests for every declared operation placed at its handler
+/// (carrick#2076). A declared row has no file-analysis row, so the producer
+/// loop of `collect_type_requests` never asks for it; this asks what that
+/// loop asks of a routed handler, at the handler's declaration line.
+///
+/// - Response: the handler's return (`function_return`). A status-and-body
+///   envelope the handler serialised is read through to its body by the
+///   inferrer (carrick#2200).
+/// - Request (body methods only): the handler's own body parameter
+///   (`function_param`), chosen by [`case_parameters`]. Where none
+///   qualifies, nothing is asked and the side stays unknown.
+///
+/// The alias is built from exactly the inputs `build_type_manifest_entries`
+/// uses for the row, so the answer joins its manifest entry. Two operations
+/// on one handler share the site, so they share one request per kind.
+pub fn declared_infer_requests(
+    graph: &crate::mount_graph::MountGraph,
+    config: &crate::config::Config,
+    handlers: &DeclaredHandlers,
+    repo_path: &str,
+) -> Vec<crate::services::type_sidecar::InferRequestItem> {
+    use crate::agents::file_analyzer_agent::ResolutionSource;
+    use crate::cloud_storage::{ManifestRole, ManifestTypeKind};
+    use crate::services::type_sidecar::{InferKind, InferRequestItem};
+    use crate::type_manifest::{
+        build_manifest_type_alias_with_site_id, build_site_id, is_producer_method,
+        normalize_manifest_method, parse_file_location, producer_reads_request_body,
+    };
+
+    // `(file, line)` of each placed handler -> the parameter its request is
+    // read from, if any.
+    let mut placed: std::collections::HashMap<(String, u32), Option<String>> = Default::default();
+    for block in &config.declared_operations {
+        let mut block_handlers: Vec<(&str, &DeclaredHandler)> = Vec::new();
+        for operation in &block.operations {
+            let Some((file, symbol)) = declared_handler(operation) else {
+                continue;
+            };
+            let Some(definition) = handlers.the_one(file, symbol) else {
+                continue;
+            };
+            if !block_handlers
+                .iter()
+                .any(|(seen, held)| *seen == file && *held == definition)
+            {
+                block_handlers.push((file, definition));
+            }
+        }
+        let parameters = case_parameters(
+            &block_handlers
+                .iter()
+                .map(|(_, definition)| *definition)
+                .collect::<Vec<_>>(),
+        );
+        for ((file, definition), parameter) in block_handlers.into_iter().zip(parameters) {
+            placed.insert(
+                (crate::handler_span::normalize(file.trim()), definition.line),
+                parameter,
+            );
+        }
+    }
+
+    let root = std::path::Path::new(repo_path);
+    let mut requests = Vec::new();
+    let mut asked: std::collections::HashSet<(String, &'static str)> = Default::default();
+    for endpoint in &graph.endpoints {
+        if endpoint.resolution_source != Some(ResolutionSource::DeclaredOperation) {
+            continue;
+        }
+        // The raw line: `parse_file_location` reads line 0 as 1, and an
+        // unplaced row has no site to ask at.
+        let Some((file, line)) = crate::handler_span::split_location(&endpoint.file_location)
+        else {
+            continue;
+        };
+        let Some(parameter) = placed.get(&(file, line)) else {
+            continue;
+        };
+        let method = normalize_manifest_method(&endpoint.method);
+        if !is_producer_method(&method) || !endpoint.full_path.starts_with('/') {
+            continue;
+        }
+        let (manifest_file, manifest_line) = parse_file_location(&endpoint.file_location);
+        let key = crate::operation::OperationKey::http(&method, endpoint.full_path.clone());
+        let site_id = build_site_id(&manifest_file, manifest_line, &key, repo_path);
+        let alias = |kind| {
+            build_manifest_type_alias_with_site_id(
+                &key,
+                ManifestRole::Producer,
+                kind,
+                Some(&site_id),
+            )
+        };
+        let file_path = root.join(&manifest_file).to_string_lossy().into_owned();
+        let ask = |infer_kind, alias, param_name| InferRequestItem {
+            member: None,
+            result: None,
+            file_path: file_path.clone(),
+            line_number: manifest_line,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind,
+            alias: Some(alias),
+            param_name,
+            route_path: None,
+        };
+        let response = alias(ManifestTypeKind::Response);
+        if asked.insert((response.clone(), "response")) {
+            requests.push(ask(InferKind::FunctionReturn, response, None));
+        }
+        if producer_reads_request_body(&method)
+            && let Some(parameter) = parameter
+        {
+            let request = alias(ManifestTypeKind::Request);
+            if asked.insert((request.clone(), "request")) {
+                requests.push(ask(
+                    InferKind::FunctionParam,
+                    request,
+                    Some(parameter.clone()),
+                ));
+            }
+        }
+    }
+    requests
+}
+
+/// For each of a block's distinct handlers, the parameter that holds that
+/// case's own request, if one does (carrick#2076).
+///
+/// A handler's parameter is its case's request only when it is the handler's
+/// one annotated, non-primitive parameter whose type no other handler in the
+/// block also takes. A type every case's handler takes is the dispatcher's
+/// type, not the case's: anchoring each case on it would read every consumer
+/// against the same (often all-optional) shape. A context argument shared by
+/// every handler drops out the same way. A block with one handler has nothing
+/// to tell its own type from the dispatcher's, so it states no request.
+fn case_parameters(handlers: &[&DeclaredHandler]) -> Vec<Option<String>> {
+    let typed = |handler: &DeclaredHandler| -> Vec<(String, String)> {
+        handler
+            .params
+            .iter()
+            .filter_map(|(name, text)| {
+                let text = text.as_deref()?.split_whitespace().collect::<String>();
+                (!states_only_primitives(&text)).then(|| (name.clone(), text))
+            })
+            .collect()
+    };
+    let all: Vec<Vec<(String, String)>> = handlers.iter().map(|handler| typed(handler)).collect();
+    all.iter()
+        .enumerate()
+        .map(|(index, own)| {
+            if handlers.len() < 2 {
+                return None;
+            }
+            let distinct: Vec<&(String, String)> = own
+                .iter()
+                .filter(|(_, text)| {
+                    !all.iter().enumerate().any(|(other, theirs)| {
+                        other != index && theirs.iter().any(|(_, t)| t == text)
+                    })
+                })
+                .collect();
+            match distinct.as_slice() {
+                [(name, _)] => Some(name.clone()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// True when a type text (whitespace removed) is made only of primitive
+/// keywords and literals joined by `|`: no shape a request body could have.
+fn states_only_primitives(text: &str) -> bool {
+    text.split('|').filter(|part| !part.is_empty()).all(|part| {
+        matches!(
+            part,
+            "string"
+                | "number"
+                | "boolean"
+                | "bigint"
+                | "null"
+                | "undefined"
+                | "any"
+                | "unknown"
+                | "void"
+                | "never"
+                | "true"
+                | "false"
+        ) || part.starts_with(['"', '\'', '`'])
+            || part.parse::<f64>().is_ok()
+    })
 }
 
 /// The advisory for every handler that switches on a request field and has no
@@ -749,6 +1025,7 @@ mod tests {
                 Some("POST /types/check-or-upload"),
                 &["search-by-intent", "upload-logs"],
             )]),
+            &DeclaredHandlers::default(),
         );
 
         assert_eq!(written, 2);
@@ -776,6 +1053,147 @@ mod tests {
                 carrick_match::MatchEvidence::RouteDefinition
             );
         }
+    }
+
+    fn handlers(rows: &[(&str, &str, u32, &[(&str, Option<&str>)])]) -> DeclaredHandlers {
+        let mut handlers = DeclaredHandlers::default();
+        for (file, name, line, params) in rows {
+            handlers
+                .by_name
+                .entry((file.to_string(), name.to_string()))
+                .or_default()
+                .push(DeclaredHandler {
+                    line: *line,
+                    params: params
+                        .iter()
+                        .map(|(name, text)| (name.to_string(), text.map(str::to_string)))
+                        .collect(),
+                });
+        }
+        handlers
+    }
+
+    const FILE: &str = "lambdas/check-or-upload/index.ts";
+
+    /// carrick#2076: a handler discovery finds once in its file places its
+    /// operation at its declaration line; one it does not find keeps line 0.
+    #[test]
+    fn a_declared_handler_found_once_places_its_operation_at_its_declaration_line() {
+        let mut graph = crate::mount_graph::MountGraph::new();
+        apply_declared_operations(
+            &mut graph,
+            &config_with(vec![block(
+                Some("POST /types/check-or-upload"),
+                &["search-by-intent", "upload-logs"],
+            )]),
+            &handlers(&[(FILE, "handle-search-by-intent", 40, &[])]),
+        );
+
+        let at: Vec<(&str, &str)> = graph
+            .endpoints
+            .iter()
+            .map(|e| {
+                (
+                    e.dispatch.as_ref().unwrap().value.as_str(),
+                    e.file_location.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            at,
+            vec![
+                ("search-by-intent", "lambdas/check-or-upload/index.ts:40"),
+                ("upload-logs", "lambdas/check-or-upload/index.ts:0"),
+            ]
+        );
+    }
+
+    /// The request of a case is its handler's own parameter type: a type
+    /// every handler takes is the dispatcher's, a shared context drops out,
+    /// a primitive is no body, and one handler alone states nothing.
+    #[test]
+    fn a_case_request_is_the_handler_parameter_no_other_handler_takes() {
+        let handler = |params: &[(&str, Option<&str>)]| DeclaredHandler {
+            line: 1,
+            params: params
+                .iter()
+                .map(|(name, text)| (name.to_string(), text.map(str::to_string)))
+                .collect(),
+        };
+        let credit = handler(&[("cmd", Some("CreditCommand")), ("ctx", Some("Ctx"))]);
+        let debit = handler(&[
+            ("cmd", Some("DebitCommand")),
+            ("ctx", Some("Ctx")),
+            ("id", Some("string | undefined")),
+        ]);
+        let purge = handler(&[("input", Some("NotesInput")), ("ctx", Some("Ctx"))]);
+        let archive = handler(&[("input", Some("NotesInput")), ("ctx", Some("Ctx"))]);
+        let untyped = handler(&[("input", None)]);
+
+        assert_eq!(
+            case_parameters(&[&credit, &debit, &purge, &archive, &untyped]),
+            vec![
+                Some("cmd".to_string()),
+                Some("cmd".to_string()),
+                None,
+                None,
+                None
+            ]
+        );
+        assert_eq!(case_parameters(&[&credit]), vec![None]);
+        assert!(states_only_primitives("\"a\"|'b'|42|null"));
+        assert!(!states_only_primitives("string[]"));
+    }
+
+    /// One response request per placed handler, a request-side request only
+    /// where a parameter qualifies, and nothing for an unplaced operation.
+    #[test]
+    fn declared_cases_are_asked_at_their_handler() {
+        use crate::services::type_sidecar::InferKind;
+
+        let mut config = config_with(vec![block(
+            Some("POST /types/check-or-upload"),
+            &["search-by-intent", "find-similar", "upload-logs"],
+        )]);
+        config.declared_operations[0].operations[2].handler =
+            Some(format!("{FILE}:handle-find-similar"));
+        let handlers = handlers(&[
+            (
+                FILE,
+                "handle-search-by-intent",
+                40,
+                &[("payload", Some("SearchInput"))],
+            ),
+            (
+                FILE,
+                "handle-find-similar",
+                90,
+                &[("payload", Some("FindInput"))],
+            ),
+        ]);
+        let mut graph = crate::mount_graph::MountGraph::new();
+        apply_declared_operations(&mut graph, &config, &handlers);
+        let requests = declared_infer_requests(&graph, &config, &handlers, "/repo");
+
+        let asked: Vec<(u32, InferKind, Option<&str>)> = requests
+            .iter()
+            .map(|r| (r.line_number, r.infer_kind.clone(), r.param_name.as_deref()))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (40, InferKind::FunctionReturn, None),
+                (40, InferKind::FunctionParam, Some("payload")),
+                (90, InferKind::FunctionReturn, None),
+                (90, InferKind::FunctionParam, Some("payload")),
+            ],
+            "two operations on one handler are asked once"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.file_path == format!("/repo/{FILE}"))
+        );
     }
 
     /// A declaration REPLACES what inference produced for the same route,
@@ -809,6 +1227,7 @@ mod tests {
                 Some("POST /types/check-or-upload"),
                 &["search-by-intent"],
             )]),
+            &DeclaredHandlers::default(),
         );
 
         assert_eq!(
@@ -861,6 +1280,7 @@ mod tests {
                 None,
                 &["search-by-intent", "upload-logs", "download-file"],
             )]),
+            &DeclaredHandlers::default(),
         );
 
         assert_eq!(written, 3);

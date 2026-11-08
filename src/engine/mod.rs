@@ -5077,6 +5077,14 @@ async fn analyze_current_repo_incremental(
             // still refreshed when one of its callees changed (the caller's
             // hash includes its callee intents). Incremental scans populate
             // FunctionDefinition.intent exactly as full ones do (issue #110).
+            //
+            // The definitions move into the intents below, so the handlers a
+            // `carrick.json` operation can name are indexed first
+            // (carrick#2076).
+            let declared_handlers = crate::dispatch::DeclaredHandlers::from_definitions(
+                function_definitions.values(),
+                repo_path,
+            );
             let intents = IntentsInFlight::start(
                 AgentService::new(),
                 function_definitions,
@@ -5413,7 +5421,11 @@ async fn analyze_current_repo_incremental(
             // path exactly as on the full one. The blocks live in the config,
             // not in the analysis cache, so an edited `carrick.json` takes
             // effect on the next scan without a cache bump.
-            let declared = crate::dispatch::apply_declared_operations(&mut mount_graph, service);
+            let declared = crate::dispatch::apply_declared_operations(
+                &mut mount_graph,
+                service,
+                &declared_handlers,
+            );
             if declared > 0 {
                 debug!("Declared operations materialised from carrick.json: {declared}");
             }
@@ -5705,6 +5717,13 @@ async fn analyze_current_repo_incremental(
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
             protocol_infer.extend(site_infer_requests(&site_fold, repo_path, &results));
+            // A declared operation's case is read at its handler (carrick#2076).
+            protocol_infer.extend(crate::dispatch::declared_infer_requests(
+                &mount_graph,
+                config,
+                &declared_handlers,
+                repo_path,
+            ));
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -13085,6 +13104,13 @@ async fn analyze_current_repo(
     // matches the previous scan are reused: the intent cache is
     // content-addressed and independent of the analysis cache's validity (see
     // the caller).
+    //
+    // The definitions move into the intents, so the handlers a `carrick.json`
+    // operation can name are indexed first (carrick#2076).
+    let declared_handlers = crate::dispatch::DeclaredHandlers::from_definitions(
+        function_definitions.values(),
+        repo_path,
+    );
     let intents = IntentsInFlight::start(
         AgentService::new(),
         function_definitions,
@@ -13335,8 +13361,11 @@ async fn analyze_current_repo(
     // (carrick#831), applied after every pass that reads the source: a
     // declaration replaces what inference produced for the same handler, so
     // it has to run once inference is finished with the graph.
-    let declared =
-        crate::dispatch::apply_declared_operations(&mut analysis_result.mount_graph, service);
+    let declared = crate::dispatch::apply_declared_operations(
+        &mut analysis_result.mount_graph,
+        service,
+        &declared_handlers,
+    );
     if declared > 0 {
         debug!("Declared operations materialised from carrick.json: {declared}");
     }
@@ -13480,6 +13509,13 @@ async fn analyze_current_repo(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
     protocol_infer.extend(site_infer_requests(&site_fold, repo_path, &results));
+    // A declared operation's case is read at its handler (carrick#2076).
+    protocol_infer.extend(crate::dispatch::declared_infer_requests(
+        &analysis_result.mount_graph,
+        config,
+        &declared_handlers,
+        repo_path,
+    ));
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -31773,5 +31809,86 @@ io.on("bare:in", (event) => {});
                 "/orders/:order/lines".to_string()
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod declared_alias_tests {
+    use super::*;
+    use crate::config::{DeclaredDispatch, DeclaredOperation, DeclaredOperations};
+
+    fn definition(name: &str, line: u32, param_type: &str) -> FunctionDefinition {
+        FunctionDefinition {
+            name: name.to_string(),
+            file_path: std::path::PathBuf::from("/repo/notes/src/index.ts"),
+            node_type: Default::default(),
+            arguments: vec![crate::visitor::FunctionArgument {
+                name: "input".to_string(),
+                type_ann: None,
+                type_string: Some(param_type.to_string()),
+                is_explicit: true,
+                is_optional: false,
+                has_default: false,
+                default_value: None,
+                is_rest: false,
+            }],
+            body_source: None,
+            is_exported: true,
+            line_number: line,
+            end_line: line + 4,
+            intent: None,
+            calls: vec![],
+            tokens: vec![],
+            return_type: None,
+            return_is_explicit: false,
+            signature: None,
+            intent_input_hash: None,
+            dispatch_table: None,
+        }
+    }
+
+    /// carrick#2076: the alias a declared case is asked under is the alias
+    /// its producer manifest entry carries, or the answer never joins.
+    #[test]
+    fn a_declared_case_is_asked_under_the_alias_its_manifest_entry_carries() {
+        let config = Config {
+            service_name: Some("notes".to_string()),
+            declared_operations: vec![DeclaredOperations {
+                service: "notes".to_string(),
+                route: Some("POST /notes".to_string()),
+                dispatch: DeclaredDispatch {
+                    location: crate::dispatch::DispatchLocation::Body,
+                    field: "kind".to_string(),
+                },
+                operations: ["add", "list"]
+                    .iter()
+                    .map(|value| DeclaredOperation {
+                        value: value.to_string(),
+                        handler: Some(format!("notes/src/index.ts:{value}Note")),
+                    })
+                    .collect(),
+            }],
+            ..Default::default()
+        };
+        let definitions = [
+            definition("addNote", 12, "AddInput"),
+            definition("listNote", 30, "ListInput"),
+        ];
+        let handlers = crate::dispatch::DeclaredHandlers::from_definitions(&definitions, "/repo");
+        let mut graph = MountGraph::new();
+        crate::dispatch::apply_declared_operations(&mut graph, &config, &handlers);
+
+        let manifest: BTreeSet<String> = build_type_manifest_entries(&graph, &config, "/repo")
+            .into_iter()
+            .filter(|entry| entry.role == ManifestRole::Producer)
+            .map(|entry| entry.type_alias)
+            .collect();
+        let asked: BTreeSet<String> =
+            crate::dispatch::declared_infer_requests(&graph, &config, &handlers, "/repo")
+                .into_iter()
+                .filter_map(|request| request.alias)
+                .collect();
+        assert_eq!(asked.len(), 4, "two sites, two kinds: {asked:?}");
+        assert_eq!(asked, manifest);
     }
 }
