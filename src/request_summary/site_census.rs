@@ -597,7 +597,7 @@ fn census_repo(
                 .unwrap_or_default();
             *census.leads.entry(reason).or_default() += 1;
         }
-        let records = site_records(&inputs, &root, &decided, &labels);
+        let records = site_records(&inputs, &[], &root, &decided, &labels);
         // How discovery reached each record's labelled call, and the
         // instance it is made on, as the decided site at the record's call
         // says.

@@ -50,12 +50,11 @@ use swc_common::{BytePos, SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-mod fold;
-
 use super::RequestSummaryInputs;
 use super::decided_sites::{
     Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel, SlotBinding,
 };
+use super::resolve::Resolver;
 use crate::position_rows::{Kind, PositionIndex};
 use crate::site_questions::{
     Place, PlaceFrom, Point, SiteCall, SiteState, Slot, Stated, StatedValue,
@@ -585,13 +584,14 @@ fn name_literals(names: &[CompilerName], ident: &str) -> Vec<String> {
 }
 
 /// The one text each value `pieces` names always is, by the value's text
-/// ([`fold::Fold`], carrick#3479): a `let` never assigned again, an enum
-/// member, an entry of a constant object, a built-in over such parts. The
-/// value is read at the expression the call writes for it among `exprs`
-/// (the site's name arguments, in `file`). A value that does not fold is
-/// left out.
+/// ([`Resolver::text_read`], carrick#3479, carrick#3504 S2): a `let` never
+/// assigned again, an enum member, an entry of a constant object, a built-in
+/// over such parts. The value is read at the expression the call writes for
+/// it among `exprs` (the site's name arguments, in `file`). A value that
+/// does not fold is left out.
 fn folded_values(
     sources: &mut Sources<'_>,
+    resolver: &Resolver<'_>,
     positions: Option<&PositionIndex>,
     root: &Path,
     file: &str,
@@ -599,9 +599,9 @@ fn folded_values(
     exprs: &[&Expr],
 ) -> HashMap<String, (String, Option<String>)> {
     let mut values = HashMap::new();
-    let Some(positions) = positions else {
+    if positions.is_none() {
         return values;
-    };
+    }
     for piece in pieces {
         let super::Piece::Opaque { text, .. } = piece else {
             continue;
@@ -615,9 +615,14 @@ fn folded_values(
         else {
             continue;
         };
-        let mut fold = fold::Fold::new(sources, positions, root);
-        if let Some(value) = fold.text(file, &expr) {
-            values.insert(text.clone(), (value, fold.origin()));
+        if let Some((value, read_from)) = resolver.text_read(root, file, &expr) {
+            // The one file every declaration the value read lives in: where
+            // it came from. `None` where it read none, or several.
+            let origin = match read_from.as_slice() {
+                [one] => Some(one.clone()),
+                _ => None,
+            };
+            values.insert(text.clone(), (value, origin));
         }
     }
     values
@@ -648,16 +653,22 @@ fn piece_literals(
 pub(super) struct NameFold<'r> {
     sources: Sources<'r>,
     positions: Option<&'r PositionIndex>,
+    resolver: Resolver<'r>,
 }
 
 impl<'r> NameFold<'r> {
-    pub(super) fn new(inputs: &'r RequestSummaryInputs, root: &'r Path) -> Self {
+    pub(super) fn new(
+        inputs: &'r RequestSummaryInputs,
+        siblings: &'r [&'r RequestSummaryInputs],
+        root: &'r Path,
+    ) -> Self {
         NameFold {
             sources: Sources {
                 root,
                 files: HashMap::new(),
             },
             positions: inputs.positions.as_ref(),
+            resolver: Resolver::new(inputs, siblings),
         }
     }
 
@@ -709,6 +720,7 @@ impl<'r> NameFold<'r> {
             .collect();
         let folded = folded_values(
             &mut self.sources,
+            &self.resolver,
             Some(positions),
             root,
             &site.file,
@@ -743,6 +755,61 @@ impl<'r> NameFold<'r> {
             })
             .collect::<Option<Vec<_>>>()?;
         Some((text, pieces))
+    }
+
+    /// The pieces of a route's own part when the code states its whole path
+    /// as text and reads some of it off a declaration (`app.get(ROUTES.things)`,
+    /// `app.get(P)` over `const P`, a template over such names): each value
+    /// read that way is `folded` from the file that declares it, the rest
+    /// `lit` (`docs/reference/address-chain.md`). `own` is the path the site
+    /// already states; `None` unless the pieces join to exactly that text.
+    /// A keyed slot (`{ path: ROUTES.things }`) and a path written wholly
+    /// in place are not read here.
+    pub(super) fn declared_pieces(
+        &mut self,
+        site: &DecidedSite,
+        own: &str,
+    ) -> Option<Vec<crate::address::Piece>> {
+        let [index] = site
+            .name_args
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .try_into()
+            .ok()?;
+        if site.key.is_some() {
+            return None;
+        }
+        let expr = {
+            let parsed = self.sources.get(&site.file)?;
+            let mut finder = CallFinder {
+                parsed,
+                target: (site.span_start, site.span_end),
+                handing: Vec::new(),
+                found: None,
+            };
+            parsed.module.visit_with(&mut finder);
+            finder.found?.arg_exprs.get(index)?.clone()
+        };
+        if matches!(super::unwrap_value(&expr), Expr::Lit(Lit::Str(_))) {
+            return None;
+        }
+        let parts = self
+            .resolver
+            .text_parts(self.sources.root, &site.file, &expr)?;
+        let text: String = parts.iter().map(|(text, _)| text.as_str()).collect();
+        if text != own || parts.iter().all(|(_, from)| from.is_none()) {
+            return None;
+        }
+        Some(
+            parts
+                .into_iter()
+                .map(|(text, from)| match from {
+                    Some(from) => crate::address::Piece::Folded { text, from },
+                    None => crate::address::Piece::Lit { text },
+                })
+                .collect(),
+        )
     }
 }
 
@@ -793,7 +860,7 @@ fn env_based_text(pieces: &[super::Piece]) -> Option<String> {
 /// A declaration file as the record names it: an installed package outside
 /// the repo (`pkg:<name>/<path>` in the rows) under `node_modules/`, as an
 /// installed package inside it is.
-fn declaration_path(decl_file: &str) -> String {
+pub(super) fn declaration_path(decl_file: &str) -> String {
     match decl_file.strip_prefix("pkg:") {
         Some(rest) => format!("node_modules/{rest}"),
         None => decl_file.to_string(),
@@ -1308,7 +1375,7 @@ fn literal_of_type(type_text: &str) -> Option<String> {
 /// Every text a string literal type or a union of string literal types
 /// stands for (`"a" | "b"` gives `a` and `b`); none when any member is not
 /// a string literal.
-fn literals_of_type(type_text: &str) -> Vec<String> {
+pub(super) fn literals_of_type(type_text: &str) -> Vec<String> {
     let mut values = Vec::new();
     let mut rest = type_text.trim();
     while !rest.is_empty() {
@@ -1345,7 +1412,7 @@ fn literals_of_type(type_text: &str) -> Vec<String> {
 
 /// Whether a row's declaration file is a file of the repo, whose text the
 /// scanner may slice (not the default library, not a package).
-fn in_repo(decl_file: &str) -> bool {
+pub(super) fn in_repo(decl_file: &str) -> bool {
     !(decl_file.starts_with("lib:")
         || decl_file.starts_with("pkg:")
         || decl_file.split('/').any(|part| part == "node_modules"))
@@ -1516,6 +1583,7 @@ fn roles_by_file(decided: &Decided) -> BTreeMap<String, BTreeSet<String>> {
 /// rows are `inputs.positions`, when the run walked them.
 pub fn site_records(
     inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
     root: &Path,
     decided: &Decided,
     labels: &[SiteLabel],
@@ -1525,6 +1593,7 @@ pub fn site_records(
         files: HashMap::new(),
     };
     let roles = roles_by_file(decided);
+    let resolver = Resolver::new(inputs, siblings);
     decided
         .sites
         .iter()
@@ -1532,6 +1601,7 @@ pub fn site_records(
             let label = SiteLabel::find(labels, &site.end)?;
             record(
                 &mut sources,
+                &resolver,
                 inputs.positions.as_ref(),
                 root,
                 site,
@@ -1544,6 +1614,7 @@ pub fn site_records(
 
 fn record(
     sources: &mut Sources<'_>,
+    resolver: &Resolver<'_>,
     positions: Option<&PositionIndex>,
     root: &Path,
     site: &DecidedSite,
@@ -1594,7 +1665,7 @@ fn record(
             .iter()
             .filter_map(|index| parts.arg_exprs.get(*index))
             .collect();
-        folded_values(sources, positions, root, file, &site.name, &exprs)
+        folded_values(sources, resolver, positions, root, file, &site.name, &exprs)
     };
     let literals = |text: &str| -> Vec<String> { piece_literals(&names, &folded, text) };
 
@@ -2295,7 +2366,7 @@ mod tests {
         index.bind(&repo.join(choices), &text);
         inputs.positions = Some(index);
         let decided = decided_sites(&inputs, repo, &sites, &labels);
-        let records = site_records(&inputs, repo, &decided, &labels);
+        let records = site_records(&inputs, &[], repo, &decided, &labels);
         (records, decided)
     }
 
@@ -2773,7 +2844,7 @@ mod tests {
         }
         let (sites, labels) = rooms_sites(&text);
         let decided = decided_sites(&inputs, &root, &sites, &labels);
-        (site_records(&inputs, &root, &decided, &labels), text)
+        (site_records(&inputs, &[], &root, &decided, &labels), text)
     }
 
     fn rooms_record<'r>(records: &'r [SiteRecord], text: &str, needle: &str) -> &'r SiteRecord {
@@ -2797,7 +2868,7 @@ mod tests {
             .collect();
         let labels = vec![label];
         let decided = decided_sites(&inputs, &root, &sites, &labels);
-        (site_records(&inputs, &root, &decided, &labels), text)
+        (site_records(&inputs, &[], &root, &decided, &labels), text)
     }
 
     /// carrick#2674 P3-1a: a request's slot is the value its body key holds
@@ -2890,7 +2961,7 @@ mod tests {
         .collect();
         let labels = vec![label];
         let decided = decided_sites(&inputs, &root, &sites, &labels);
-        (site_records(&inputs, &root, &decided, &labels), text)
+        (site_records(&inputs, &[], &root, &decided, &labels), text)
     }
 
     fn env_record<'r>(records: &'r [SiteRecord], text: &str, needle: &str) -> &'r SiteRecord {
@@ -3294,7 +3365,7 @@ mod tests {
         let root = decided_fixture();
         let inputs = crate::engine::discover_request_inputs(&root);
         let (decided, text) = paths_decided();
-        let records = site_records(&inputs, &root, &decided, &[fetch_label()]);
+        let records = site_records(&inputs, &[], &root, &decided, &[fetch_label()]);
         let at = format!("{PATHS}:{}", line_of(&text, "send(`/tasks/"));
         let record = records
             .iter()
@@ -3351,7 +3422,7 @@ mod tests {
             .collect();
         let labels = vec![send.clone(), on.clone()];
         let decided = decided_sites(&inputs, &root, &sites, &labels);
-        let records = site_records(&inputs, &root, &decided, &labels);
+        let records = site_records(&inputs, &[], &root, &decided, &labels);
         let at = |needle: &str| {
             let at = format!("{file}:{}", line_of(&text, needle));
             records

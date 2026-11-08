@@ -35,6 +35,11 @@ use super::*;
 use crate::position_rows::{Kind, Row};
 use std::cell::{Cell, RefCell};
 
+mod text;
+mod text_reader;
+
+pub(super) use text::text_of;
+
 /// How many object literals deep an argument's keys are read (the decision
 /// record's object-depth cap, D7).
 const MAX_VALUE_DEPTH: usize = 4;
@@ -77,11 +82,57 @@ pub(super) struct ModuleBinding {
     /// (soundness rule 1). An importer cannot assign a module's binding
     /// (rule 2), so the module's own census is complete.
     pub(super) unplaceable: bool,
+    /// How it is declared.
+    pub(super) kind: BindingKind,
+    /// What the initialiser states as text ([`text::text_of`], carrick#3504
+    /// S2), or an enum's members. `None` for a declaration with no
+    /// initialiser.
+    pub(super) text: Option<ValueAt>,
+    /// The module only ever reads the object the binding holds through its
+    /// entries: nothing writes the binding, an entry of it, or exports it,
+    /// and every reference to it is an entry read. Only then is an entry's
+    /// value the one its literal states.
+    pub(super) entries_kept: bool,
+    /// The binding is in the table for the text reader alone: a function's
+    /// own local its body never writes again. The scope already holds it for
+    /// every other reader (`scope.held`), so [`Resolver::binding_values`]
+    /// does not answer for it.
+    pub(super) text_only: bool,
 }
 
-/// A function's own `let` or `var` that its body writes again
-/// (carrick#3504 S1b), with its initialiser read in the body's scope: the
-/// binding table takes it under the function's key, with the census's
+impl ModuleBinding {
+    /// Whether the value readers (discovery's callee walk, the receiver
+    /// walk) read this entry: an enum holds no value, and a text-only local
+    /// is held by its scope.
+    pub(super) fn values_read(&self) -> bool {
+        self.kind != BindingKind::Enum && !self.text_only
+    }
+}
+
+/// How a binding is declared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum BindingKind {
+    #[default]
+    Const,
+    Let,
+    Var,
+    /// A TypeScript enum: `text` holds its members.
+    Enum,
+}
+
+impl From<VarDeclKind> for BindingKind {
+    fn from(kind: VarDeclKind) -> Self {
+        match kind {
+            VarDeclKind::Const => Self::Const,
+            VarDeclKind::Let => Self::Let,
+            VarDeclKind::Var => Self::Var,
+        }
+    }
+}
+
+/// A function's own `let`, `var` or `const` declared once in its body
+/// (carrick#3504 S1b, S2), with its initialiser read in the body's scope:
+/// the binding table takes it under the function's key, with the census's
 /// writes.
 #[derive(Debug, Clone)]
 pub(super) struct LocalBinding {
@@ -89,6 +140,12 @@ pub(super) struct LocalBinding {
     /// The 1-based line its name is declared on.
     pub(super) line: u32,
     pub(super) init: Vec<ValueAt>,
+    pub(super) kind: BindingKind,
+    /// What the initialiser states as text (carrick#3504 S2).
+    pub(super) text: Option<ValueAt>,
+    /// The body writes the name again: the value readers read it (S1b).
+    /// Otherwise the scope holds it and only the text reader needs it here.
+    pub(super) reassigned: bool,
 }
 
 /// A plain assignment `name = value` written directly in a body (not in a
@@ -113,6 +170,15 @@ struct WriteCensus {
     declared: HashMap<BindingKey, usize>,
     /// `with` or a direct `eval` may write any binding.
     opaque: bool,
+    /// How many times a binding is named, its declaration's own name
+    /// included (carrick#3504 S2, the escape census).
+    references: HashMap<BindingKey, usize>,
+    /// How many of those are the object of an entry read (`R.a`, `R[k]`).
+    entry_reads: HashMap<BindingKey, usize>,
+    /// An entry of the binding is written, updated, deleted or called as a
+    /// method (`R.a = x`, `R.a++`, `delete R.a`, `R.list.push(x)`): the
+    /// object it holds may change.
+    entry_escapes: HashSet<BindingKey>,
 }
 
 /// Every binding a pattern writes.
@@ -143,6 +209,56 @@ impl WriteCensus {
         pat.visit_with(&mut names);
         self.unplaceable.extend(names.0);
     }
+
+    /// Notes that an entry of the binding at the root of `expr` may change.
+    fn escape(&mut self, expr: &Expr) {
+        if let Some(key) = entry_root(expr) {
+            self.entry_escapes.insert(key);
+        }
+    }
+
+    /// Whether the module only ever reads the object `key` holds through
+    /// its entries, and no importer or other holder can change it
+    /// (carrick#3504 S2): the binding is not exported, nothing writes it or
+    /// one of its entries, and every reference but its declaration is an
+    /// entry read. An entry passed on (`f(R.a)`) is a string leaf to the
+    /// text reader: no callee can change it.
+    fn entries_kept(&self, key: &BindingKey, exported: bool) -> bool {
+        let count = |counts: &HashMap<BindingKey, usize>| counts.get(key).copied().unwrap_or(0);
+        !exported
+            && !self.is_unplaceable(key)
+            && !self.writes.contains_key(key)
+            && !self.entry_escapes.contains(key)
+            && count(&self.references) == count(&self.entry_reads) + 1
+    }
+
+    /// A write the readers cannot place: a compound or logical assignment,
+    /// an update, a destructuring target, a loop head, a second
+    /// declaration, or `with` or `eval` in the module (soundness rule 1).
+    fn is_unplaceable(&self, key: &BindingKey) -> bool {
+        self.opaque
+            || self.unplaceable.contains(key)
+            || self.declared.get(key).copied().unwrap_or(0) > 1
+    }
+}
+
+/// The binding at the root of an entry chain: `R` in `R.a`, `R.a.b`,
+/// `R.list[0]`, `(R.a)!`.
+fn entry_root(expr: &Expr) -> Option<BindingKey> {
+    match expr {
+        Expr::Member(member) => member_root(member),
+        Expr::Paren(paren) => entry_root(&paren.expr),
+        Expr::TsNonNull(inner) => entry_root(&inner.expr),
+        _ => None,
+    }
+}
+
+/// [`entry_root`] of a member read.
+fn member_root(member: &MemberExpr) -> Option<BindingKey> {
+    match &*member.obj {
+        Expr::Ident(ident) => Some(ident_key(ident)),
+        other => entry_root(other),
+    }
 }
 
 impl Visit for WriteCensus {
@@ -157,6 +273,12 @@ impl Visit for WriteCensus {
                 }
             }
             AssignTarget::Pat(pat) => self.mark(pat),
+            // `R.a = x`: an entry of `R` changes.
+            AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
+                if let Some(key) = member_root(member) {
+                    self.entry_escapes.insert(key);
+                }
+            }
             // `(s) = …`, `s! = …`, `(s as T) = …`: the binding is written in
             // a form no reader places. A member target writes a property,
             // not the binding.
@@ -183,7 +305,26 @@ impl Visit for WriteCensus {
         if let Expr::Ident(ident) = crate::graphql_document_sites::unwrap_expression(&update.arg) {
             self.unplaceable.insert(ident_key(ident));
         }
+        self.escape(&update.arg);
         update.visit_children_with(self);
+    }
+
+    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+        if unary.op == UnaryOp::Delete {
+            self.escape(&unary.arg);
+        }
+        unary.visit_children_with(self);
+    }
+
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        if let Expr::Ident(ident) = &*member.obj {
+            *self.entry_reads.entry(ident_key(ident)).or_default() += 1;
+        }
+        member.visit_children_with(self);
+    }
+
+    fn visit_ident(&mut self, ident: &Ident) {
+        *self.references.entry(ident_key(ident)).or_default() += 1;
     }
 
     fn visit_for_head(&mut self, head: &ForHead) {
@@ -208,10 +349,15 @@ impl Visit for WriteCensus {
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Callee::Expr(callee) = &call.callee
-            && matches!(&**callee, Expr::Ident(ident) if ident.sym == "eval")
-        {
-            self.opaque = true;
+        if let Callee::Expr(callee) = &call.callee {
+            if matches!(&**callee, Expr::Ident(ident) if ident.sym == "eval") {
+                self.opaque = true;
+            }
+            // `R.list.push(x)`, `R.reverse()`: a method called on an entry
+            // may change the object. An entry passed as an argument is not
+            // counted: the text reader reads only string entries, which no
+            // callee can change.
+            self.escape(callee);
         }
         call.visit_children_with(self);
     }
@@ -221,9 +367,12 @@ impl Visit for WriteCensus {
 
 /// Each module-scope binding a plain name declares, with its initialiser
 /// read in module scope and every write the census finds (carrick#3504 S1),
-/// and each function's own `let` its body writes again, under the
-/// function's key (S1b). Two bindings declared on one line with one name
-/// are each unplaceable: no row says which one a use means.
+/// each function's own `let` its body writes again, under the function's key
+/// (S1b), and what each states as text (S2): every plain-name local a top
+/// level definition's own body declares once, and every enum at any depth.
+/// A local in a function written inside that body, and a declaration in a
+/// block at module scope, are unread. Two bindings declared on one line with
+/// one name are each unplaceable: no row says which one a use means.
 pub(super) fn module_bindings(
     module: &Module,
     source_map: &Lrc<SourceMap>,
@@ -233,16 +382,14 @@ pub(super) fn module_bindings(
 ) -> HashMap<(u32, String), ModuleBinding> {
     let mut census = WriteCensus::default();
     module.visit_with(&mut census);
-    let unplaceable = |key: &BindingKey| {
-        census.opaque
-            || census.unplaceable.contains(key)
-            || census.declared.get(key).copied().unwrap_or(0) > 1
-    };
+    // Discovery numbering is the extract's own: spans need no shift.
+    let identity = |lo: u32| lo;
     let mut out: HashMap<(u32, String), ModuleBinding> = HashMap::new();
     for item in &module.body {
         let Some(var) = module_var_decl(item) else {
             continue;
         };
+        let exported = matches!(item, ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(_)));
         for declarator in &var.decls {
             let Pat::Ident(ident) = &declarator.name else {
                 continue;
@@ -257,10 +404,26 @@ pub(super) fn module_bindings(
                     .unwrap_or_default(),
                 init_held: init.and_then(|init| reader.held(init, scope)),
                 writes: census.writes.get(&key).cloned().unwrap_or_default(),
-                unplaceable: unplaceable(&key),
+                unplaceable: census.is_unplaceable(&key),
+                kind: var.kind.into(),
+                text: init.map(|init| text_of(init, &identity)),
+                entries_kept: census.entries_kept(&key, exported),
+                text_only: false,
             };
             out.insert((line, ident.id.sym.to_string()), binding);
         }
+    }
+    let mut enums = Enums {
+        source_map,
+        found: Vec::new(),
+    };
+    module.visit_with(&mut enums);
+    for (at, text) in enums.found {
+        out.entry(at).or_insert_with(|| ModuleBinding {
+            kind: BindingKind::Enum,
+            text: Some(text),
+            ..ModuleBinding::default()
+        });
     }
     let mut keys: Vec<&String> = functions.keys().collect();
     keys.sort();
@@ -271,7 +434,11 @@ pub(super) fn module_bindings(
                 init: local.init.clone(),
                 init_held: None,
                 writes: census.writes.get(&local.key).cloned().unwrap_or_default(),
-                unplaceable: unplaceable(&local.key),
+                unplaceable: census.is_unplaceable(&local.key),
+                kind: local.kind,
+                text: local.text.clone(),
+                entries_kept: census.entries_kept(&local.key, false),
+                text_only: !local.reassigned,
             };
             match out.entry((local.line, local.key.0.clone())) {
                 std::collections::hash_map::Entry::Occupied(mut taken) => {
@@ -284,6 +451,24 @@ pub(super) fn module_bindings(
         }
     }
     out
+}
+
+/// Every enum a module declares, at any depth, by the line and name of its
+/// id, with its members as text.
+struct Enums<'m> {
+    source_map: &'m Lrc<SourceMap>,
+    found: Vec<((u32, String), ValueAt)>,
+}
+
+impl Visit for Enums<'_> {
+    fn visit_ts_enum_decl(&mut self, decl: &TsEnumDecl) {
+        let line = self.source_map.lookup_char_pos(decl.id.span.lo).line as u32;
+        self.found.push((
+            (line, decl.id.sym.to_string()),
+            text::enum_text(decl, &|lo| lo),
+        ));
+        decl.visit_children_with(self);
+    }
 }
 
 /// One value a callee, an argument, a parameter's default or a `return` may
@@ -328,6 +513,38 @@ pub(super) enum ValueAt {
         fields: BTreeMap<String, Vec<ValueAt>>,
         open: bool,
     },
+    /// Text a name states (carrick#3504 S2, [`text::text_of`]): only the
+    /// text reader ([`Resolver::text_values`]) reads the variants below.
+    /// Discovery's lowering never produces them, and every other reader
+    /// treats them as [`Self::Unread`].
+    ///
+    /// A string literal's text.
+    Lit(String),
+    /// Parts joined: a template's quasis and expressions, or `a + b`.
+    Concat(Vec<ValueAt>),
+    /// A member read, `object.key`, spanning `lo..hi` (the key is a
+    /// [`Self::Lit`] for `.name`, else what the computed key states).
+    Member {
+        lo: u32,
+        hi: u32,
+        object: Box<ValueAt>,
+        key: Box<ValueAt>,
+    },
+    /// `object.method(args)` spanning `lo..hi`, for `join`, `concat`,
+    /// `replace` and `replaceAll` (and `raw` for ``String.raw`…` ``, whose
+    /// object is the template's raw text): the text reader applies it only
+    /// where the compiler's row says it is the language library's.
+    BuiltIn {
+        lo: u32,
+        hi: u32,
+        method: String,
+        object: Box<ValueAt>,
+        args: Vec<ValueAt>,
+    },
+    /// An object literal's entries in source order; a key may be computed.
+    Entries(Vec<(ValueAt, ValueAt)>),
+    /// An array literal's elements, the object of a `join`.
+    Elements(Vec<ValueAt>),
     /// Anything else.
     Unread,
 }
@@ -805,11 +1022,13 @@ pub(super) struct Resolver<'a> {
     siblings: &'a [&'a RequestSummaryInputs],
     /// Each function's callers, through what the rows say each call reaches:
     /// what fills a parameter a value is read from (carrick#2432).
-    callers: super::decided_sites::Calls<'a>,
+    /// Built on first use: the text reader never asks.
+    callers: std::cell::OnceCell<super::decided_sites::Calls<'a>>,
     /// Each class of the service read through its constructions, with them
     /// (carrick#2452): what fills a field its constructor sets from a
     /// parameter.
-    constructed: super::constructions::Constructed<'a>,
+    /// Built on first use: the text reader never asks.
+    constructed: std::cell::OnceCell<super::constructions::Constructed<'a>>,
     /// How many own factories' returns the value being read is inside.
     returns_depth: Cell<usize>,
     /// The fields being read through their constructions (carrick#2452): a
@@ -831,6 +1050,9 @@ pub(super) struct Resolver<'a> {
     /// The module bindings being read (carrick#3504 S1): a binding written
     /// with its own value adds nothing (soundness rule 7).
     bindings_reading: RefCell<HashSet<(PathBuf, u32, String)>>,
+    /// The declarations being read for their text (carrick#3504 S2): a
+    /// value that reads itself holds no text.
+    texts_reading: RefCell<HashSet<(PathBuf, u32, String)>>,
 }
 
 /// What the resolver read (carrick#3504 S0): every value read, how many
@@ -874,8 +1096,8 @@ impl<'a> Resolver<'a> {
         Resolver {
             inputs,
             siblings,
-            callers: super::decided_sites::Calls::through_reach(inputs),
-            constructed: super::constructions::constructed(inputs),
+            callers: std::cell::OnceCell::new(),
+            constructed: std::cell::OnceCell::new(),
             returns_depth: Cell::new(0),
             fields_reading: RefCell::new(HashSet::new()),
             census: Cell::new(Census::default()),
@@ -883,7 +1105,20 @@ impl<'a> Resolver<'a> {
             capped: Cell::new(false),
             cap: MAX_QUERY_STEPS,
             bindings_reading: RefCell::new(HashSet::new()),
+            texts_reading: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Each function's callers ([`Self::callers`]'s index).
+    fn callers(&self) -> &super::decided_sites::Calls<'a> {
+        self.callers
+            .get_or_init(|| super::decided_sites::Calls::through_reach(self.inputs))
+    }
+
+    /// Each class read through its constructions.
+    fn constructed(&self) -> &super::constructions::Constructed<'a> {
+        self.constructed
+            .get_or_init(|| super::constructions::constructed(self.inputs))
     }
 
     /// The same resolver with a lower step cap.
@@ -1088,7 +1323,16 @@ impl<'a> Resolver<'a> {
                 Some(function) => vec![Held::Reached(follow.written(file, function, invoke))],
                 None => nothing(),
             },
-            ValueAt::Object { .. } | ValueAt::Unread => nothing(),
+            // The text variants are the names lowering's: this walk reads
+            // none of them (carrick#3504 S2).
+            ValueAt::Object { .. }
+            | ValueAt::Lit(_)
+            | ValueAt::Concat(_)
+            | ValueAt::Member { .. }
+            | ValueAt::BuiltIn { .. }
+            | ValueAt::Entries(_)
+            | ValueAt::Elements(_)
+            | ValueAt::Unread => nothing(),
         }
     }
 
@@ -1127,9 +1371,10 @@ impl<'a> Resolver<'a> {
         &'a super::constructions::FieldOrigin,
         Vec<super::decided_sites::Placed<'a>>,
     )> {
-        let built = match self.constructed.built.get(&(file, class)) {
+        let constructed = self.constructed();
+        let built = match constructed.built.get(&(file, class)) {
             Some(built) => built.clone(),
-            None if self.constructed.refused.contains(&(file, class)) => return None,
+            None if constructed.refused.contains(&(file, class)) => return None,
             None => Vec::new(),
         };
         let origin = self.inputs.files.get(file)?.class_origins.get(&class)?;
@@ -1309,7 +1554,7 @@ impl<'a> Resolver<'a> {
         }
         passing.push(id);
         let callee = defaults_of(self.function(file, key));
-        let callers: Vec<_> = self.callers.callers_of(file, key).to_vec();
+        let callers: Vec<_> = self.callers().callers_of(file, key).to_vec();
         let mut values = Vec::new();
         if callers.is_empty() {
             // Nothing calls it: what it holds is its default, if any.
@@ -1385,7 +1630,10 @@ impl<'a> Resolver<'a> {
     ) -> Option<Vec<Held<F::Reached>>> {
         let _query = self.enter();
         let ir = self.inputs_for(file).files.get(file)?;
-        let binding = ir.module_bindings.get(&(line, symbol.to_string()))?;
+        let binding = ir
+            .module_bindings
+            .get(&(line, symbol.to_string()))
+            .filter(|binding| binding.values_read())?;
         let nothing = || Held::Reached(F::Reached::default());
         let reading = (file.to_path_buf(), line, symbol.to_string());
         if !self.bindings_reading.borrow_mut().insert(reading.clone()) {
@@ -1723,6 +1971,14 @@ mod tests {
     /// assignments it places, and whether another write makes it
     /// unplaceable.
     fn census_of(source: &str) -> (usize, bool) {
+        let (census, key) = census_over(source, "s");
+        let placed = census.writes.get(&key).map_or(0, Vec::len);
+        (placed, census.is_unplaceable(&key))
+    }
+
+    /// The write census over `source`, with the key of the first binding
+    /// named `name` (outermost declared first, as the parser resolves it).
+    fn census_over(source: &str, name: &str) -> (WriteCensus, BindingKey) {
         let cm: swc_common::sync::Lrc<swc_common::SourceMap> = Default::default();
         let handler = swc_common::errors::Handler::with_tty_emitter(
             swc_common::errors::ColorConfig::Never,
@@ -1741,17 +1997,81 @@ mod tests {
         .unwrap();
         let mut census = WriteCensus::default();
         module.visit_with(&mut census);
+        // The binding the module's own (first) declaration of `name` makes
+        // is the one with the lowest syntax context among those declared.
         let key = census
             .declared
             .keys()
-            .find(|(name, _)| name == "s")
+            .filter(|(declared, _)| declared == name)
+            .min_by_key(|(_, ctxt)| ctxt.as_u32())
             .cloned()
-            .expect("`s` is declared");
-        let placed = census.writes.get(&key).map_or(0, Vec::len);
-        let unplaceable = census.opaque
-            || census.unplaceable.contains(&key)
-            || census.declared.get(&key).copied().unwrap_or(0) > 1;
-        (placed, unplaceable)
+            .unwrap_or_else(|| panic!("`{name}` is declared"));
+        (census, key)
+    }
+
+    /// Whether the module keeps the object `name` holds through its entries
+    /// (the census's escape rule, carrick#3504 S2), and whether anything
+    /// assigns the name again.
+    fn kept_of(source: &str, name: &str) -> (bool, bool) {
+        let (census, key) = census_over(source, name);
+        let assigned = census.writes.contains_key(&key) || census.is_unplaceable(&key);
+        (assigned, census.entries_kept(&key, false))
+    }
+
+    /// carrick#3504 S2, the name fold's escape census moved onto the write
+    /// census (carrick#3479's cases): a `let` is read only where nothing
+    /// assigns it again, in any form; an object's entries only where every
+    /// use reads one. The census is keyed by binding: an inner scope that
+    /// declares the name again blocks nothing.
+    #[test]
+    fn a_binding_keeps_its_entries_only_where_nothing_changes_them() {
+        assert_eq!(kept_of("let P = 'a'; f(P);", "P"), (false, false));
+        for source in [
+            "let P = 'a'; P = 'b';",
+            "let P = 'a'; P += 'b';",
+            "let P = 'a'; P++;",
+            "let P = 'a'; [P] = ['b'];",
+            "let P = 'a'; ({ P } = { P: 'b' });",
+            "let P = 'a'; for (P of ['b']) {}",
+        ] {
+            assert!(kept_of(source, "P").0, "{source}");
+        }
+        assert_eq!(
+            kept_of("const R = { a: 'x' }; const u = R.a, v = R['a'];", "R"),
+            (false, true)
+        );
+        // Nested writes and mutating calls change an entry too.
+        for source in [
+            "const R = { a: { b: 'x' } }; R.a.b = 'y';",
+            "const R = { a: { b: 1 } }; R.a.b++;",
+            "const R = { a: { b: 'x' } }; delete R.a.b;",
+            "const R = { a: ['x'] }; R.a.push('y');",
+            "const R = ['x']; R.splice(0, 1);",
+            "const R = ['x']; R.reverse();",
+            "const R = { a: 'x' }; R.a = 'y';",
+            "const R = { a: 'x' }; delete R.a;",
+            "const R = { a: 'x' }; f(R);",
+            "const R = { a: 'x' }; export { R };",
+            "const R = { a: 'x' }; g({ R });",
+            "const R = { a: 'x' }; eval('1');",
+        ] {
+            assert!(!kept_of(source, "R").1, "{source}");
+        }
+        // An entry passed on is a string leaf to the text reader: still
+        // read-only.
+        assert!(kept_of("const R = { a: 'x' }; f(R.a); g(R['a']);", "R").1);
+        // An inner `R` that is written or escapes is another binding.
+        assert!(
+            kept_of(
+                "const R = { a: 'x' }; const u = R.a; \
+                 function f() { const R = { a: 'y' }; R.a = 'z'; g(R); }",
+                "R"
+            )
+            .1
+        );
+        // An exported declaration is never kept.
+        let (census, key) = census_over("export const R = { a: 'x' };", "R");
+        assert!(!census.entries_kept(&key, true));
     }
 
     /// carrick#3504 S1 (soundness rule 1): the census places each plain
