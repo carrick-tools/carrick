@@ -1072,6 +1072,14 @@ pub(super) fn reach_across(
 ) -> Reach {
     let holder = inputs_holding(inputs, siblings, file);
     let reach = holder.reach(file, call.site.lo, call.site.hi);
+    // A `new C(…)` or a `super(…)` runs C's constructor body, which no
+    // definition the call graph keys holds (carrick#3527).
+    if call.constructs
+        && !matches!(reach, Reach::Function(..))
+        && let Some(constructor) = constructed_across(inputs, siblings, file, call)
+    {
+        return Reach::Function(constructor.0, constructor.1);
+    }
     let Reach::OutsideService(declaring, name) = &reach else {
         return reach;
     };
@@ -1097,6 +1105,33 @@ pub(super) fn reach_across(
         }
         Some(read) => read,
     }
+}
+
+/// The constructor body a `new C(…)` or `super(…)` in `file` runs, in the
+/// service of the run that holds C's declaration: the file and its key
+/// (carrick#3527). Joined on the class the call's row names, at the line it
+/// declares it on ([`FileIr::constructor_at`]). `None` for a class with no
+/// constructor body, one declared outside the run, and anything else.
+pub(super) fn constructed_across(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    file: &Path,
+    call: &CallIr,
+) -> Option<(PathBuf, String)> {
+    if !call.constructs {
+        return None;
+    }
+    let holder = inputs_holding(inputs, siblings, file);
+    let row = row_at(holder, file, call)?;
+    if !in_repo(row) {
+        return None;
+    }
+    let declaring = holder.positions.as_ref()?.path_of(row.decl_file()?);
+    let key = inputs_holding(inputs, siblings, &declaring)
+        .files
+        .get(&declaring)?
+        .constructor_at(row.decl_line()?, row.symbol()?)?;
+    Some((declaring, key))
 }
 
 /// The compiler's `call` row for `call` in `file`, from `inputs` (which
@@ -1222,6 +1257,14 @@ impl<'a> Walker<'a> {
                     .filter(|(_, keys)| keys.iter().any(|known| known == key))
                     .map(|(line, _)| *line)
                     .min()
+                    // A constructor body, at its class (carrick#3527).
+                    .or_else(|| {
+                        ir.constructor_keys
+                            .iter()
+                            .filter(|(_, keys)| keys.iter().any(|(_, known)| known == key))
+                            .map(|(line, _)| *line)
+                            .min()
+                    })
             })
             .unwrap_or_default();
         ChainHop {
@@ -5190,6 +5233,43 @@ export function listen(): void {
                 );
             }
         }
+    }
+
+    /// carrick#3527 S2: a constructor body is read as a function. A queue
+    /// opened by a literal inside a constructor (`new Worker('ctor-literal-jobs')`)
+    /// is a site forcing that name, reached from `new CtorWorker()`; before,
+    /// nothing in a constructor body was a call of any function.
+    #[test]
+    fn a_queue_opened_in_a_constructor_chain_is_a_site() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("queue-enum-base-class-one", ".", "jobs")
+        else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for record in &records {
+            forced
+                .entry(record.state.point.at.clone())
+                .or_default()
+                .push(
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned(),
+                );
+        }
+        assert_eq!(
+            forced.get("src/c2-ctor-literal.ts:5").cloned(),
+            Some(vec![Some("ctor-literal-jobs".to_string())]),
+            "{forced:#?}"
+        );
     }
 
     /// carrick#1678: a verb called on the object a scope member returns
