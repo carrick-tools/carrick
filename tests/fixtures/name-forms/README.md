@@ -28,6 +28,12 @@ Forms so far:
   `c-static-exported` (an exported class) are unread on purpose: the value
   may change, so the field's initialiser is not the name.
 
+- `getter` (S2b-7): `this.url` where `get url() { return '...'; }` is a getter
+  of a module-scope class. `c-getter-overridden` (a subclass redeclares it),
+  `c-getter-exported` (an exported class) and `c-getter-body` (the body is
+  not the one `return`) are unread on purpose: what the getter returns is
+  not stated by the class alone.
+
 `rows.expected.json` is the answer key, read by `tests/name_forms_test.rs`:
 `names` gives the one name each file's site forces and the scan writes as a
 fact row (a `kind_asked` pub/sub file waits on the broker's kind question

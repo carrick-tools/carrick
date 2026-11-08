@@ -219,7 +219,9 @@ impl<'a> Resolver<'a> {
                 }
                 true
             }
-            BindingKind::Enum | BindingKind::StaticField => return hole(UnreadExpression),
+            BindingKind::Enum | BindingKind::StaticField | BindingKind::Getter => {
+                return hole(UnreadExpression);
+            }
             _ => false,
         };
         // A declaration with no initialiser adds no value to a written set.
@@ -282,7 +284,7 @@ impl<'a> Resolver<'a> {
         // names the property, the binding table its initialiser.
         if let Some(row) = self.row_at(file, lo, hi, Kind::Member)
             && let Some((at, binding, declared)) = self.declared_entry(row)
-            && binding.kind == BindingKind::StaticField
+            && matches!(binding.kind, BindingKind::StaticField | BindingKind::Getter)
         {
             let Some(text) = &binding.text else {
                 return hole(UnreadExpression);
@@ -348,7 +350,7 @@ impl<'a> Resolver<'a> {
         // the key, where the module only ever reads the object's entries.
         let last = match binding.kind {
             BindingKind::Enum => false,
-            BindingKind::StaticField => return hole(UnreadExpression),
+            BindingKind::StaticField | BindingKind::Getter => return hole(UnreadExpression),
             BindingKind::Var => return hole(Reassigned),
             BindingKind::Let if !binding.writes.is_empty() || binding.unplaceable => {
                 return hole(Reassigned);

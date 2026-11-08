@@ -106,7 +106,10 @@ impl ModuleBinding {
     /// walk) read this entry: an enum holds no value, and a text-only local
     /// is held by its scope.
     pub(super) fn values_read(&self) -> bool {
-        !matches!(self.kind, BindingKind::Enum | BindingKind::StaticField) && !self.text_only
+        !matches!(
+            self.kind,
+            BindingKind::Enum | BindingKind::StaticField | BindingKind::Getter
+        ) && !self.text_only
     }
 }
 
@@ -124,6 +127,11 @@ pub(super) enum BindingKind {
     /// initialiser as text, `None` where the class or property may change
     /// after it is declared.
     StaticField,
+    /// A getter of a class declared at module scope, keyed by the key's line
+    /// and name (carrick#3504 S2b-7): `text` is the one value its body
+    /// returns, `None` where the body is anything else or a subclass, a
+    /// write or an escape may change what the member reads.
+    Getter,
 }
 
 impl From<VarDeclKind> for BindingKind {
@@ -196,6 +204,19 @@ struct WriteCensus {
     written_keys: HashSet<String>,
     /// A member with a computed key is written: any static field may change.
     written_computed: bool,
+    /// Every class that extends a named class (carrick#3504 S2b-7): its own
+    /// name (`None` for a class expression), what it extends and the plain
+    /// keys of its members. A subclass may redeclare a getter.
+    class_edges: Vec<ClassEdge>,
+    /// The name of the class declaration whose body is being visited.
+    next_class_name: Option<BindingKey>,
+}
+
+/// A class that extends a named class.
+struct ClassEdge {
+    name: Option<BindingKey>,
+    extends: BindingKey,
+    keys: HashSet<String>,
 }
 
 /// Every binding a pattern writes.
@@ -290,6 +311,35 @@ impl WriteCensus {
                     + count(&self.constructions)
                     + count(&self.extensions)
                     + 1
+    }
+
+    /// Whether the getter `key` of the class `class` returns the same value
+    /// wherever it is read (carrick#3504 S2b-7): the class is kept exactly as
+    /// a static field's is, and no class extending it, however far down,
+    /// declares a member with that key. A class expression extending it has
+    /// no name to follow, so its subclasses are unknown.
+    fn getter_kept(&self, class: &BindingKey, key: &str, exported: bool) -> bool {
+        if !self.static_field_kept(class, key, exported) {
+            return false;
+        }
+        let mut frontier = vec![class.clone()];
+        let mut seen = HashSet::new();
+        while let Some(parent) = frontier.pop() {
+            if !seen.insert(parent.clone()) {
+                continue;
+            }
+            for edge in self
+                .class_edges
+                .iter()
+                .filter(|edge| edge.extends == parent)
+            {
+                match &edge.name {
+                    Some(name) if !edge.keys.contains(key) => frontier.push(name.clone()),
+                    _ => return false,
+                }
+            }
+        }
+        true
     }
 
     /// A write the readers cannot place: a compound or `&&=` assignment,
@@ -389,9 +439,20 @@ impl Visit for WriteCensus {
         new.visit_children_with(self);
     }
 
+    fn visit_class_decl(&mut self, decl: &ClassDecl) {
+        self.next_class_name = Some(ident_key(&decl.ident));
+        decl.visit_children_with(self);
+    }
+
     fn visit_class(&mut self, class: &Class) {
+        let name = self.next_class_name.take();
         if let Some(Expr::Ident(ident)) = class.super_class.as_deref() {
             *self.extensions.entry(ident_key(ident)).or_default() += 1;
+            self.class_edges.push(ClassEdge {
+                name,
+                extends: ident_key(ident),
+                keys: class.body.iter().filter_map(member_key).collect(),
+            });
         }
         class.visit_children_with(self);
     }
@@ -461,6 +522,17 @@ impl Visit for WriteCensus {
             // counted: the text reader reads only string entries, which no
             // callee can change.
             self.escape(callee);
+            // `Object.defineProperty(o, 'k', …)` writes a member in a form
+            // no reader places (carrick#3504 S2b-7).
+            if let Expr::Member(member) = &**callee
+                && let MemberProp::Ident(prop) = &member.prop
+                && matches!(
+                    &*prop.sym,
+                    "defineProperty" | "defineProperties" | "setPrototypeOf"
+                )
+            {
+                self.written_computed = true;
+            }
         }
         call.visit_children_with(self);
     }
@@ -595,6 +667,16 @@ fn module_class_decl(item: &ModuleItem) -> Option<(&ClassDecl, bool)> {
     }
 }
 
+/// The plain key a class member declares, whatever its kind.
+fn member_key(member: &ClassMember) -> Option<String> {
+    match member {
+        ClassMember::ClassProp(prop) => plain_key(&prop.key),
+        ClassMember::Method(method) => plain_key(&method.key),
+        _ => None,
+    }
+    .map(str::to_string)
+}
+
 /// A plain (identifier) key a class member names.
 fn plain_key(key: &PropName) -> Option<&str> {
     match key {
@@ -640,6 +722,12 @@ fn static_fields(
             .count()
     };
     for member in &body.body {
+        if let ClassMember::Method(method) = member {
+            getter(
+                method, body, plain, &class_key, exported, census, source_map, out,
+            );
+            continue;
+        }
         let ClassMember::ClassProp(prop) = member else {
             continue;
         };
@@ -662,6 +750,67 @@ fn static_fields(
             },
         );
     }
+}
+
+/// How many members of one side of the class (`static` or instance) have the
+/// plain key `name`, of any kind.
+fn same_side_members_named(class: &Class, is_static: bool, name: &str) -> usize {
+    class
+        .body
+        .iter()
+        .filter(|member| match member {
+            ClassMember::ClassProp(prop) => {
+                prop.is_static == is_static && plain_key(&prop.key) == Some(name)
+            }
+            ClassMember::Method(method) => {
+                method.is_static == is_static && plain_key(&method.key) == Some(name)
+            }
+            _ => false,
+        })
+        .count()
+}
+
+/// A getter with a plain key as a [`BindingKind::Getter`] entry keyed by the
+/// key's line and name (carrick#3504 S2b-7). Its text is set only where the
+/// body is the one statement `return <value>`, the getter is the only member
+/// of its kind with its key, and the class is kept
+/// ([`WriteCensus::getter_kept`]); else the entry has no text.
+#[allow(clippy::too_many_arguments)]
+fn getter(
+    method: &ClassMethod,
+    class: &Class,
+    plain: bool,
+    class_key: &BindingKey,
+    exported: bool,
+    census: &WriteCensus,
+    source_map: &Lrc<SourceMap>,
+    out: &mut HashMap<(u32, String), ModuleBinding>,
+) {
+    let (MethodKind::Getter, Some(name)) = (method.kind, plain_key(&method.key)) else {
+        return;
+    };
+    let line = source_map.lookup_char_pos(method.key.span().lo).line as u32;
+    let returned = method
+        .function
+        .body
+        .as_ref()
+        .and_then(|body| match body.stmts.as_slice() {
+            [Stmt::Return(ReturnStmt { arg: Some(arg), .. })] => Some(arg),
+            _ => None,
+        });
+    let kept = plain
+        && method.function.decorators.is_empty()
+        && !method.is_override
+        && same_side_members_named(class, method.is_static, name) == 1
+        && census.getter_kept(class_key, name, exported);
+    out.insert(
+        (line, name.to_string()),
+        ModuleBinding {
+            kind: BindingKind::Getter,
+            text: returned.filter(|_| kept).map(|arg| text_of(arg, &|lo| lo)),
+            ..ModuleBinding::default()
+        },
+    );
 }
 
 /// Every enum a module declares, at any depth, by the line and name of its

@@ -15,13 +15,17 @@
     "src/c-logical-assign.ts": "/c/logical-assign",
     "src/c-or-assign.ts": "/c/or-assign",
     "src/q-logical-assign.ts": "orders.logical-assign",
-    "src/s-logical-assign.ts": "room.logical-assign"
+    "src/s-logical-assign.ts": "room.logical-assign",
+    "src/c-getter.ts": "/c/getter",
+    "src/q-getter.ts": "orders.getter",
+    "src/s-getter.ts": "room.getter"
   },
   "kind_asked": [
     "src/q-destructure.ts",
     "src/q-fallback-stated.ts",
     "src/q-static-field.ts",
-    "src/q-logical-assign.ts"
+    "src/q-logical-assign.ts",
+    "src/q-getter.ts"
   ],
   "unnamed": [
     "src/c-destructure-written.ts",
@@ -33,6 +37,9 @@
     "src/c-static-written.ts",
     "src/c-static-exported.ts",
     "src/c-let-written.ts",
-    "src/c-and-assign.ts"
+    "src/c-and-assign.ts",
+    "src/c-getter-overridden.ts",
+    "src/c-getter-exported.ts",
+    "src/c-getter-body.ts"
   ]
 }

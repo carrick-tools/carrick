@@ -241,6 +241,52 @@ fn a_static_field_names_its_value() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A getter of a module-scope class names the one value it returns
+/// (`this.url`), on every protocol; one a subclass redeclares, an exported
+/// class's, or one whose body is more than `return <value>`, is no fact row
+/// and stays a possible call.
+#[test]
+fn a_getter_names_what_it_returns() {
+    let scan = scan();
+    let key = key();
+    let mut wrong = Vec::new();
+    let kind_asked: BTreeSet<&str> = key["kind_asked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file.as_str().unwrap())
+        .collect();
+    for (file, want) in key["names"].as_object().unwrap() {
+        if !file.contains("-getter") {
+            continue;
+        }
+        let want = want.as_str().unwrap();
+        if kind_asked.contains(file.as_str()) {
+            if !scan.leads.contains(file) {
+                wrong.push(format!("{file}: want a possible call, got none"));
+            }
+            continue;
+        }
+        let got = scan.named.get(file).cloned().unwrap_or_default();
+        if got != BTreeSet::from([want.to_string()]) {
+            wrong.push(format!("{file}: want {want}, got {got:?}"));
+        }
+    }
+    for file in key["unnamed"].as_array().unwrap() {
+        let file = file.as_str().unwrap();
+        if !file.contains("-getter") {
+            continue;
+        }
+        if let Some(got) = scan.named.get(file) {
+            wrong.push(format!("{file}: want no fact row, got {got:?}"));
+        }
+        if !scan.leads.contains(file) {
+            wrong.push(format!("{file}: want a possible call, got none"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A fallback name (`maybe ?? '/x'`, `maybe` a runtime value) states its
 /// stated side on every protocol; several stated values stay asked.
 #[test]
