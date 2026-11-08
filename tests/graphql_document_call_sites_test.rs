@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | `Orders` (`orders`, aliased `shippingZones`) | `CheckoutPage.tsx:6` | two rows at the hook |
 //! | `PlaceOrder` (`placeOrder`) | `CheckoutPage.tsx:7`, `RetryButton.tsx:5` | one row at each hook |
-//! | `Carriers` (`carriers`) | nowhere | stays at `orders.graphql:17` |
+//! | `Carriers` (`carriers`) | nowhere | none: the service holds its compiled declaration |
 //!
 //! The REST call in the checkout page is still a call: the page is not a
 //! document file, so the transport fold does not read it as a GraphQL POST.
@@ -209,10 +209,9 @@ fn assert_answer_key(repo: &Path) {
                 "mutation|placeOrder",
                 "apps/web/src/components/RetryButton.tsx:5"
             ),
-            ("query|carriers", "apps/web/src/graphql/orders.graphql:17"),
         ]),
         "an executed operation is indexed at each call that executes it; one no call \
-         executes stays in its document file"
+         executes is no consumer, its compiled declaration being held by the service"
     );
     // A row at a call is attributed like the document it came from.
     let bindings: BTreeSet<String> = scan.blob("shop-web")["calls"]

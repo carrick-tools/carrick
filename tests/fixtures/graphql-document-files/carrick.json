@@ -1,0 +1,17 @@
+{
+  "services": [
+    {
+      "serviceName": "catalog-api",
+      "directory": "apps/api",
+      "graphqlSchemas": ["apps/api/src/schema.graphql"]
+    },
+    {
+      "serviceName": "documents",
+      "directory": "packages/documents"
+    },
+    {
+      "serviceName": "catalog-web",
+      "directory": "apps/web"
+    }
+  ]
+}
