@@ -502,12 +502,6 @@ pub(super) fn constructed(inputs: &RequestSummaryInputs) -> Constructed<'_> {
         let mut keys: Vec<&String> = file.functions.keys().collect();
         keys.sort();
         for key in keys {
-            // A construction written in a constructor body stays unplaced,
-            // so its class stays refused (carrick#3527): reading `super(…)`
-            // and a constructor's own `new` is the value resolver's.
-            if file.functions[key].constructor {
-                continue;
-            }
             walk(
                 path,
                 Some(key.as_str()),
