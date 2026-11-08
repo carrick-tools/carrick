@@ -430,6 +430,45 @@ for (const [name, arrange, reason] of [
   });
 }
 
+/** The background check --changed answers, as the runner writes it. */
+function answerChanged(home: string, entry: QueueEntry): void {
+  const changed = parseChangedResult(fs.readFileSync(fixturePath("check-changed-clean.json"), "utf8"), 0)!;
+  writeAtomic(
+    path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.answer.json`),
+    `${JSON.stringify({ ...entry, state: "answered", started_at: entry.enqueued_at, finished_at: new Date().toISOString(), changed })}\n`,
+  );
+}
+
+test("a reported gap is not repeated once the whole-change check answered it, until the file changes again (carrick#3543)", async (t) => {
+  const { workspace, home } = setup(t);
+  edit(workspace.root, home, workspace.file, Date.now() - 5000);
+  answer(home, queue(workspace.root, home, workspace.file), fixture("check-deferred.json"));
+
+  const first = (await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false })).lines.join("\n");
+  assert.match(first, NOT_CHECKED);
+  const [queued] = changedQueued(workspace.root);
+  assert.ok(queued);
+  answerChanged(home, queued!);
+
+  // The agent keeps editing another file: the answered gap is not named again.
+  const other = path.join(workspace.service, "src", "routes", "orders.ts");
+  fs.writeFileSync(other, "export {};\n");
+  edit(workspace.root, home, other, Date.now() + 1000);
+  answerInHand(workspace.root, SESSION, other, reread(clean()), Date.now() + 2000, { home });
+  const second = (await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false })).lines.join("\n");
+  assert.doesNotMatch(second, NOT_CHECKED);
+  assert.doesNotMatch(second, /users\.ts/);
+
+  // Nothing new: nothing said.
+  const third = await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false });
+  assert.doesNotMatch(third.lines.join("\n"), NOT_CHECKED);
+
+  // The file changes again: it is named again.
+  edit(workspace.root, home, workspace.file, Date.now() + 60_000);
+  const fourth = (await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false })).lines.join("\n");
+  assert.match(fourth, /^Carrick did not check the whole change: user-service\/src\/routes\/users\.ts: /m);
+});
+
 test("stop delivers a finished check --changed answer: its verdict, never a clause", async (t) => {
   const { workspace, home } = setup(t);
   const entry = enqueueChanged(workspace.root, SESSION, Date.now(), { home })!;

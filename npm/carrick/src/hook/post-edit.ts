@@ -32,6 +32,7 @@ import { markTold, recordEdit, toldKey, wasTold } from "./reuse.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
+import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
 
 const log = createLogger("carrick-hook");
@@ -195,6 +196,8 @@ async function main(): Promise<void> {
     for (const [index, file] of edited.entries()) {
       const result = answers.results[index] ?? null;
       if (result?.error) continue;
+      // A subagent's own worktree is not this session's change (carrick#3543).
+      if (inOtherWorktree(file, cwd ?? process.cwd())) continue;
       if (result !== null && !queued.has(file)) answerInHand(choice.root, session, file, result, editedAt);
       if (result !== null || queued.has(file)) recorded.push(file);
     }
