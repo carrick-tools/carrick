@@ -3536,7 +3536,7 @@ export function listen(): void {
     #[test]
     fn a_row_without_the_publication_bits_reads_and_names_nothing() {
         let text = concat!(
-            r#"{"v":4,"typescript":"5.9.3","service":"api","files":1}"#,
+            r#"{"v":5,"typescript":"5.9.3","service":"api","files":1}"#,
             "\n",
             r#"{"f":"src/a.ts","h":"00","r":[["call",0,7,"greet","node_modules/p/index.d.ts",1,"p","string",0],["call",9,16,"make","node_modules/p/index.d.ts",3,"p","App",96]]}"#,
             "\n"

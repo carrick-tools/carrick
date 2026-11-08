@@ -1211,13 +1211,13 @@ mod tests {
         }
     }
 
-    /// carrick#2448, #2561: the reader reads version 4 only; a file of any
+    /// carrick#2448, #2561: the reader reads version 5 only; a file of any
     /// other version is an error, so `load_index` over a version-3 file (with
     /// its `impl` rows) left by an earlier build gives every lookup
     /// [`HoleReason::RowsMissing`] and the scan goes on.
     #[test]
     fn a_rows_file_of_another_version_is_not_read() {
-        for v in [3, 5] {
+        for v in [3, 4] {
             let text = format!(
                 "{{\"v\":{v},\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}}\n\
                  {{\"f\":\"a.ts\",\"h\":\"00\",\"r\":[]}}\n"
@@ -1365,21 +1365,21 @@ mod tests {
 
     #[test]
     fn a_line_with_a_key_the_format_does_not_name_is_refused() {
-        let text = "{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[],\"extra\":1}\n";
         assert!(read_rows(text.as_bytes()).is_err());
     }
 
     #[test]
     fn a_row_is_a_nine_element_array() {
-        let text = "{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"call\",0,3,\"f\",\"a.ts\",1,null,\"void\",0]]}\n";
         let file = read_rows(text.as_bytes()).expect("a valid file");
         let row = &file.files[0].r[0];
         assert_eq!(row.kind(), Kind::Call);
         assert_eq!((row.start(), row.end()), (0, 3));
         assert_eq!(row.symbol(), Some("f"));
-        let short = "{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let short = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                      {\"f\":\"a.ts\",\"r\":[[\"call\",0,3]]}\n";
         assert!(read_rows(short.as_bytes()).is_err());
     }
@@ -1389,7 +1389,7 @@ mod tests {
     /// compiler version; a member row, and a declaration in a package, give none.
     #[test]
     fn the_index_names_the_default_library_globals_the_code_uses() {
-        let text = "{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[\
                     [\"ident\",0,5,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
                     [\"ident\",6,9,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
@@ -1425,7 +1425,7 @@ mod tests {
     ) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
         let mut lines = vec![format!(
-            "{{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
+            "{{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
             files.len()
         )];
         let mut paths = Vec::new();
