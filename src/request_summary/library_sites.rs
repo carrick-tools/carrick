@@ -131,6 +131,11 @@ pub struct SiteArg {
     pub object: Option<SiteObject>,
     /// The argument is a function expression written at the call.
     pub function: bool,
+    /// The argument is a value the source states and that is no string: a
+    /// number, a boolean, `null`, an array or a class expression. With
+    /// `function` and an object literal, the arguments a name slot passes
+    /// over as another overload's.
+    pub non_string: bool,
     /// Text with a parameter of the enclosing function in it
     /// ([`text_pieces`]): a hole each caller fills with its own argument
     /// (carrick#1562). `text` is `None` while a hole is open.
@@ -231,6 +236,7 @@ impl SiteArg {
                 text,
                 object,
                 function: self.function,
+                non_string: self.non_string,
                 holes,
                 spread: self.spread,
             },
@@ -518,6 +524,10 @@ pub struct LibrarySite {
     /// The member called (`None`: the receiver itself).
     pub member: Option<String>,
     pub args: Vec<SiteArg>,
+    /// For a site in the decorate form: the name of the class member the
+    /// decorator is applied to, when it is an identifier or a string literal
+    /// (a computed key names nothing). `None` for any other site.
+    pub decorated: Option<String>,
     /// The receiver is used, in a module that reaches it, in a way that may
     /// change it ([`Contest::Used`]).
     pub contested: bool,
@@ -1210,6 +1220,7 @@ impl SiteReader<'_> {
                     path: site.path.clone(),
                     member: site.member.clone(),
                     args,
+                    decorated: site.decorated.clone(),
                     contested,
                     uses: client.member_uses.clone(),
                     export_uses: client.export_uses.clone(),
@@ -1273,6 +1284,7 @@ impl SiteReader<'_> {
                         path: site.path.clone(),
                         member: site.member.clone(),
                         args,
+                        decorated: site.decorated.clone(),
                         contested: contested || made_contested,
                         uses,
                         export_uses,
@@ -1907,6 +1919,7 @@ impl<'a> LinkedNames<'a> {
             text,
             object,
             function: arg.function,
+            non_string: arg.non_string,
             holes,
             spread: arg.spread,
         }
@@ -1996,6 +2009,9 @@ pub(super) struct LibrarySiteIr {
     pub(super) path: Vec<String>,
     pub(super) member: Option<String>,
     pub(super) args: Vec<SiteArg>,
+    /// The decorated member's name, set by the decorator reader
+    /// ([`super::Reader::decorator_sites`]); `None` for any other site.
+    pub(super) decorated: Option<String>,
 }
 
 /// What a library site's receiver is read through.
@@ -2043,6 +2059,7 @@ impl Reader<'_> {
             path,
             member,
             args: site_args(args, scope),
+            decorated: None,
         })
     }
 
@@ -3188,6 +3205,12 @@ pub(super) fn site_arg(expr: &Expr, scope: &Scope<'_>) -> SiteArg {
             _ => None,
         },
         function: matches!(expr, Expr::Arrow(_) | Expr::Fn(_)),
+        non_string: matches!(
+            expr,
+            Expr::Lit(Lit::Num(_) | Lit::Bool(_) | Lit::Null(_) | Lit::BigInt(_))
+                | Expr::Array(_)
+                | Expr::Class(_)
+        ),
         holes,
         spread: false,
     }

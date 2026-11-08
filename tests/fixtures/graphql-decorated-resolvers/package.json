@@ -1,0 +1,11 @@
+{
+  "name": "graphql-decorated-resolvers-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": ["services/*"],
+  "dependencies": {
+    "@fixture/gql-decorators": "^2.0.0",
+    "@fixture/gql-options": "^1.0.0",
+    "@fixture/http-params": "^1.0.0"
+  }
+}

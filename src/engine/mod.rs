@@ -8196,6 +8196,9 @@ impl LibrarySiteIndex {
                         .socket
                         .insert((file, row.line, row.name.clone(), direction, listener));
                 }
+                // No pass states a GraphQL field at a decorated method for a
+                // library row to fold.
+                LibraryRowKind::Graphql(_) => {}
             }
         }
         index.global_pubsub.sort_by(|a, b| {
@@ -8352,6 +8355,17 @@ fn append_library_operations(
                 &row.file,
                 row.line,
             ))),
+            // A field the service's printed schema also states is the
+            // schema's row: the contract is stated once (contract
+            // amendment 8, Q5).
+            LibraryRowKind::Graphql(kind) => {
+                let key = OperationKey::graphql(kind, row.name.clone());
+                if !cloud_data.endpoints.iter().any(|held| held.key == key) {
+                    cloud_data
+                        .endpoints
+                        .push(claimed(to_producer(key, &row.file, row.line)));
+                }
+            }
         }
     }
     if !stated.rows.is_empty() {

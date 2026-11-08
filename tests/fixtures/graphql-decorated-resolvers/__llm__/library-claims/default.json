@@ -1,0 +1,175 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/gql-decorators",
+      "version": "2.0.0",
+      "status": "answered",
+      "surface_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "exports": [
+        {
+          "specifier": "@fixture/gql-decorators",
+          "export": "Query",
+          "role": "server_framework",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": null,
+              "on": "export",
+              "form": "decorate",
+              "protocol": "graphql",
+              "method": "QUERY",
+              "name": { "first": [{ "arg": 0 }, { "arg": 1, "key": "name" }, { "bound": "decorated" }] },
+              "key_labels": {
+                "description": "not_name",
+                "deprecationReason": "not_name",
+                "nullable": "not_name",
+                "defaultValue": "not_name"
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/gql-decorators",
+          "export": "Mutation",
+          "role": "server_framework",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": null,
+              "on": "export",
+              "form": "decorate",
+              "protocol": "graphql",
+              "method": "MUTATION",
+              "name": { "first": [{ "arg": 0 }, { "arg": 1, "key": "name" }, { "bound": "decorated" }] },
+              "key_labels": {
+                "description": "not_name",
+                "deprecationReason": "not_name",
+                "nullable": "not_name",
+                "defaultValue": "not_name"
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/gql-decorators",
+          "export": "Subscription",
+          "role": "server_framework",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": null,
+              "on": "export",
+              "form": "decorate",
+              "protocol": "graphql",
+              "method": "SUBSCRIPTION",
+              "name": { "first": [{ "arg": 0 }, { "arg": 1, "key": "name" }, { "bound": "decorated" }] },
+              "key_labels": {
+                "description": "not_name",
+                "deprecationReason": "not_name",
+                "nullable": "not_name",
+                "defaultValue": "not_name"
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/gql-decorators",
+          "export": "ResolveField",
+          "role": "none",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/gql-decorators",
+          "export": "Resolver",
+          "role": "none",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture/gql-options",
+      "version": "1.0.0",
+      "status": "answered",
+      "surface_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "exports": [
+        {
+          "specifier": "@fixture/gql-options",
+          "export": "Query",
+          "role": "server_framework",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": null,
+              "on": "export",
+              "form": "decorate",
+              "protocol": "graphql",
+              "method": "QUERY",
+              "name": { "first": [{ "arg": 0, "key": "name" }, { "bound": "decorated" }] },
+              "key_labels": { "description": "not_name" },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture/http-params",
+      "version": "1.0.0",
+      "status": "answered",
+      "surface_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "exports": [
+        {
+          "specifier": "@fixture/http-params",
+          "export": "Query",
+          "role": "none",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

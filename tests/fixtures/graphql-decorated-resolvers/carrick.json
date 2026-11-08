@@ -1,0 +1,15 @@
+{
+  "services": [
+    { "name": "backend", "directory": "services/backend" },
+    {
+      "name": "consumer",
+      "directory": "services/consumer",
+      "internalEnvVars": ["BACKEND_URL"]
+    },
+    {
+      "name": "printed",
+      "directory": "services/printed",
+      "graphqlSchemas": ["services/printed/schema.graphql"]
+    }
+  ]
+}

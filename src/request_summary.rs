@@ -4944,11 +4944,14 @@ impl Reader<'_> {
     /// the decorate form, read in the module's scope, where a decorator is
     /// evaluated, and placed at the method's name, `name`, as a route
     /// decorator's row is. The method is the decorated handler, so the
-    /// site is the method's own.
+    /// site is the method's own. `decorated` is the method's name when its
+    /// key is an identifier or a string literal: what a decorator that names
+    /// nothing leaves the method to name (SB1).
     fn decorator_sites(
         &self,
         decorators: &[Decorator],
         name: Span,
+        decorated: Option<&str>,
         module: &ModuleScope,
         ir: &mut FnIr,
     ) {
@@ -4966,6 +4969,7 @@ impl Reader<'_> {
                 self.library_site(call.span, MakerForm::Decorate, callee, &call.args, &scope)
             {
                 site.op_line = self.line(name);
+                site.decorated = decorated.map(str::to_string);
                 ir.library.push(site);
             }
         }
@@ -5022,6 +5026,7 @@ impl Reader<'_> {
                     self.decorator_sites(
                         &method.function.decorators,
                         method.key.span(),
+                        Some(&member_name),
                         module,
                         &mut ir,
                     );
@@ -5044,6 +5049,7 @@ impl Reader<'_> {
                     self.decorator_sites(
                         &method.function.decorators,
                         method.key.span,
+                        None,
                         module,
                         &mut ir,
                     );

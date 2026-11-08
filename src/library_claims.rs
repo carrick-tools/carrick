@@ -18,7 +18,10 @@
 //!   with a name and a handler, is a subscriber row;
 //! - `socket`: the export's `side` and the op give the direction, and a
 //!   `receive` is the listener;
-//! - every other role, HTTP included, states nothing here.
+//! - `server_framework`: only a `receive` op in the `decorate` form that
+//!   speaks GraphQL (contract amendment 8): the decorated method is the
+//!   producer of the root field its decorator names, else its own name;
+//! - every other role, and a server framework's HTTP ops, state nothing here.
 //!
 //! A site states a row only when nothing contests its receiver (calls are
 //! classified by the claims' own lists, amendment 2 B1), every receiver it
@@ -35,15 +38,15 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::operation::{PubsubRole, SocketDirection};
+use crate::operation::{GraphqlOperationKind, PubsubRole, SocketDirection};
 use crate::request_summary::{
     LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, On, Selector, SiteMaker,
     SiteReceiver,
 };
 use crate::services::type_sidecar::{
-    BoundName, ClaimOn, ClaimSlot, Collects, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole,
-    MakeForm, NameScope, NameScopeKind, OpForm, OpName, ScopeForm, SemanticsResult,
-    SemanticsVerdict,
+    BoundName, ClaimOn, ClaimProtocol, ClaimSlot, Collects, LibraryCheck, LibraryClaim, LibraryOp,
+    LibraryRole, MakeForm, NameEntry, NameScope, NameScopeKind, OpForm, OpName, ScopeForm,
+    SemanticsResult, SemanticsVerdict,
 };
 use crate::site_rows::RowSide;
 
@@ -187,6 +190,35 @@ fn is_message_role(role: LibraryRole) -> bool {
         role,
         LibraryRole::Broker | LibraryRole::Socket | LibraryRole::InProcessBus
     )
+}
+
+/// A GraphQL root field written as a method decorator (contract amendment 8
+/// on carrick#2434): a `receive` op in the `decorate` form that speaks
+/// GraphQL.
+fn is_graphql_decorator(claim: &LibraryClaim) -> bool {
+    matches!(
+        claim,
+        LibraryClaim::Op {
+            op: LibraryOp::Receive,
+            protocol: Some(ClaimProtocol::Graphql),
+            ..
+        }
+    ) && claim.is_decorate_form_op()
+}
+
+/// Whether this module reads the export's sites: a message role's, or a
+/// server framework's GraphQL root-field decorators. The rest of a server
+/// framework's claims (its HTTP routes) are read elsewhere.
+fn is_read_export(export: &ExportClaims) -> bool {
+    is_message_role(export.role)
+        || (export.role == LibraryRole::ServerFramework
+            && export.claims.iter().any(is_graphql_decorator))
+}
+
+/// Whether the claim is one this module reads on `export`: every claim of a
+/// message role, and only the GraphQL decorators of a server framework.
+fn is_read_claim(export: &ExportClaims, claim: &LibraryClaim) -> bool {
+    is_message_role(export.role) || is_graphql_decorator(claim)
 }
 
 impl ExportClaims {
@@ -651,7 +683,7 @@ fn selector<'a>(
 /// asks nothing.
 pub fn checks(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryCheck> {
     let mut checks = Vec::new();
-    for export in exports.iter().filter(|export| is_message_role(export.role)) {
+    for export in exports.iter().filter(|export| is_read_export(export)) {
         let receivers: BTreeSet<String> = sites
             .sites
             .iter()
@@ -662,6 +694,9 @@ pub fn checks(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryChec
             continue;
         }
         for (id, claim) in export.claims_by_id() {
+            if !is_read_claim(export, claim) {
+                continue;
+            }
             let on: Vec<&str> = match claim {
                 LibraryClaim::Make { .. } => vec!["export"],
                 LibraryClaim::Op { on, of, .. } | LibraryClaim::Reserved { on, of, .. } => {
@@ -780,6 +815,9 @@ pub enum LibraryRowKind {
         direction: SocketDirection,
         listener: bool,
     },
+    /// A GraphQL root field written as a method decorator: the decorated
+    /// method resolves it, so the row is a producer.
+    Graphql(GraphqlOperationKind),
 }
 
 /// One row a verified library claim states at a call site.
@@ -851,7 +889,7 @@ pub fn read(
         .map(|(check, _)| (check.claim_id.clone(), check.receiver.clone()))
         .collect();
     let mut stated: Vec<(LibraryRow, ReceiverKey)> = Vec::new();
-    for export in exports.iter().filter(|export| is_message_role(export.role)) {
+    for export in exports.iter().filter(|export| is_read_export(export)) {
         let claims = export.claims_by_id();
         for site in sites
             .sites
@@ -1059,6 +1097,8 @@ impl Reading<'_> {
                 handler,
                 ack,
                 name_scope,
+                protocol,
+                method,
                 ..
             } = claim
             else {
@@ -1084,6 +1124,7 @@ impl Reading<'_> {
             if !supplied {
                 return None;
             }
+            let first_read: String;
             let (text, scope) = match name.as_deref()? {
                 OpName::Slot(slot) => (
                     self.site.literal(slot_arg(slot), slot_key(slot))?,
@@ -1107,14 +1148,21 @@ impl Reading<'_> {
                         name_scope.clone(),
                     )
                 }
+                // The name of the member a decorator is applied to
+                // (amendment 8).
+                OpName::Bound {
+                    bound: BoundName::Decorated,
+                    ..
+                } => (self.site.decorated.as_deref()?, None),
+                // The first entry the call fills (amendment 8).
+                OpName::First(first) => {
+                    first_read = first_name(self.site, &first.first)?;
+                    (first_read.as_str(), None)
+                }
                 // A name a scope member binds is carrick#1678's; one a
                 // router key binds is #2474 R6c's.
                 // The names amendment 7 adds are read from H3 on.
-                // A `first` name (amendment 8) is SB1's.
-                OpName::Bound { .. }
-                | OpName::Parts { .. }
-                | OpName::Literal { .. }
-                | OpName::First(_) => {
+                OpName::Bound { .. } | OpName::Parts { .. } | OpName::Literal { .. } => {
                     return None;
                 }
             };
@@ -1123,8 +1171,14 @@ impl Reading<'_> {
             }
             // A `by_origin` export has no side of its own (see `row_kind`).
             let side = self.export.side.filter(|_| self.export.side_rule.is_none());
-            let kind = row_kind(self.export.role, *op, side)?;
-            let this = (kind, text.to_string(), scoped(self.export.role, scope));
+            let kind = row_kind(self.export.role, *op, side, *protocol, method.as_deref())?;
+            // A GraphQL field pairs by its root type and name under a served
+            // schema: it carries no scope.
+            let scope = match kind {
+                LibraryRowKind::Graphql(_) => None,
+                _ => scoped(self.export.role, scope),
+            };
+            let this = (kind, text.to_string(), scope);
             match &read {
                 Some(seen) if *seen != this => return None,
                 _ => read = Some(this),
@@ -1172,6 +1226,71 @@ struct Through {
     claim_ids: Vec<String>,
 }
 
+/// What one `first` slot reads at a call (contract amendment 8).
+enum SlotRead {
+    /// A string literal: the name.
+    Named(String),
+    /// The call does not fill the slot, or fills it with a value that is no
+    /// string: the next entry.
+    Next,
+    /// A value the source does not state as a string (an identifier, a call,
+    /// a spread): nothing is read, as a name that might be overridden by it
+    /// would be wrong.
+    Stop,
+}
+
+/// The name a `first` list reads at a call: each entry in order, the first
+/// the call fills. `None` when an entry stops the reading, or none fills.
+///
+/// The `name_unread` lead the ruling asks for a stop is not recorded: this
+/// reader has no lead channel yet. The plain slot reader
+/// ([`LibrarySite::literal`]) is unchanged, so socket and broker rows do not
+/// move.
+fn first_name(site: &LibrarySite, first: &[NameEntry]) -> Option<String> {
+    for entry in first {
+        match entry {
+            NameEntry::Decorated(_) => return site.decorated.clone(),
+            NameEntry::Slot(slot) => {
+                match read_slot(site, slot.arg as usize, slot.key.as_deref()) {
+                    SlotRead::Named(name) => return Some(name),
+                    SlotRead::Next => {}
+                    SlotRead::Stop => return None,
+                }
+            }
+        }
+    }
+    None
+}
+
+fn read_slot(site: &LibrarySite, arg: usize, key: Option<&str>) -> SlotRead {
+    let Some(arg) = site.args.get(arg) else {
+        return SlotRead::Next;
+    };
+    // A spread moves every position after it, and may hold the key.
+    if arg.spread {
+        return SlotRead::Stop;
+    }
+    // A value the source states and that cannot be the name.
+    let other = arg.function || arg.non_string;
+    match key {
+        None => match &arg.text {
+            Some(text) => SlotRead::Named(text.clone()),
+            None if other || arg.object.is_some() => SlotRead::Next,
+            None => SlotRead::Stop,
+        },
+        Some(key) => match &arg.object {
+            Some(object) => match object.fields.get(key) {
+                Some(Some(text)) => SlotRead::Named(text.clone()),
+                Some(None) => SlotRead::Stop,
+                None if object.open => SlotRead::Stop,
+                None => SlotRead::Next,
+            },
+            None if other || arg.text.is_some() => SlotRead::Next,
+            None => SlotRead::Stop,
+        },
+    }
+}
+
 fn slot_arg(slot: &ClaimSlot) -> usize {
     slot.arg as usize
 }
@@ -1186,9 +1305,27 @@ fn slot_key(slot: &ClaimSlot) -> Option<&str> {
 /// export the store marks `by_origin` is passed no side: its side is decided
 /// per receiver at a decided site (docs/reference/client-semantics.md,
 /// "Message roles"). A `request` or an `execute` is no message row.
-fn row_kind(role: LibraryRole, op: LibraryOp, side: Option<Side>) -> Option<LibraryRowKind> {
-    use LibraryRowKind::{Pubsub, Socket};
+fn row_kind(
+    role: LibraryRole,
+    op: LibraryOp,
+    side: Option<Side>,
+    protocol: Option<ClaimProtocol>,
+    method: Option<&str>,
+) -> Option<LibraryRowKind> {
+    use LibraryRowKind::{Graphql, Pubsub, Socket};
     Some(match (role, op, side) {
+        // A GraphQL root field: the op's `method` is its root type, and any
+        // other word states nothing (contract amendment 8).
+        (LibraryRole::ServerFramework, LibraryOp::Receive, _)
+            if protocol == Some(ClaimProtocol::Graphql) =>
+        {
+            Graphql(match method? {
+                "QUERY" => GraphqlOperationKind::Query,
+                "MUTATION" => GraphqlOperationKind::Mutation,
+                "SUBSCRIPTION" => GraphqlOperationKind::Subscription,
+                _ => return None,
+            })
+        }
         (LibraryRole::Broker | LibraryRole::InProcessBus, LibraryOp::Send, _) => {
             Pubsub(PubsubRole::Publisher)
         }
@@ -1249,7 +1386,7 @@ mod tests {
     use crate::request_summary::library_sites;
 
     /// A manifest declaring every package the tests import.
-    const MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/jobs\": \"^1.0.0\", \"@fixture/queue\": \"^2.0.0\", \"@fixture/bus\": \"^1.0.0\", \"@fixture/socket\": \"^1.0.0\", \"@fixture/http\": \"^1.0.0\" } }\n";
+    const MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/jobs\": \"^1.0.0\", \"@fixture/queue\": \"^2.0.0\", \"@fixture/bus\": \"^1.0.0\", \"@fixture/socket\": \"^1.0.0\", \"@fixture/http\": \"^1.0.0\", \"@fixture/gql\": \"^1.0.0\" } }\n";
 
     fn sites_of(files: &[(&str, &str)]) -> LibrarySites {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1680,6 +1817,128 @@ mod tests {
             export const byHand = OnMessage(\"lobby.called\");\n",
         )]);
         assert!(rows_of(&called, &[gateway_claims()], all).is_empty());
+    }
+
+    /// One root-field decorator export, labelled the way the store labels a
+    /// code-first GraphQL library: the name is the first of argument 0, the
+    /// options `name`, then the decorated method.
+    fn root_field_claims(exported: &str, method: &str) -> ExportClaims {
+        export(json!({
+            "package": "@fixture/gql", "version": "1.0.0", "specifier": "@fixture/gql",
+            "export": exported, "role": "server_framework",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": null, "on": "export",
+                  "form": "decorate", "protocol": "graphql", "method": method,
+                  "name": { "first": [{ "arg": 0 }, { "arg": 1, "key": "name" },
+                                      { "bound": "decorated" }] },
+                  "key_labels": { "description": "not_name" } }
+            ]
+        }))
+    }
+
+    fn root_fields() -> Vec<ExportClaims> {
+        vec![
+            root_field_claims("Query", "QUERY"),
+            root_field_claims("Mutation", "MUTATION"),
+        ]
+    }
+
+    /// The rows a service of one file states through the root-field
+    /// decorators, as (line, kind, name).
+    fn root_field_rows(source: &str) -> Vec<(u32, LibraryRowKind, String)> {
+        let sites = sites_of(&[("src/resolvers.ts", source)]);
+        let mut rows = rows_of(&sites, &root_fields(), all);
+        assert!(rows.iter().all(|row| row.name_scope.is_none()), "{rows:#?}");
+        rows.sort_by_key(|row| row.line);
+        rows.into_iter()
+            .map(|row| (row.line, row.kind, row.name))
+            .collect()
+    }
+
+    const QUERY: LibraryRowKind = LibraryRowKind::Graphql(GraphqlOperationKind::Query);
+    const MUTATION: LibraryRowKind = LibraryRowKind::Graphql(GraphqlOperationKind::Mutation);
+
+    /// Amendment 8: a `receive` op in the `decorate` form that speaks GraphQL
+    /// is a producer of the root field the decorator names (argument 0), or
+    /// else the decorated method's own name, of the root type the op's
+    /// `method` says, at the method's name.
+    #[test]
+    fn a_decorate_form_graphql_op_states_a_producer_at_the_decorated_method() {
+        let source = "import { Query, Mutation } from \"@fixture/gql\";\n\
+            export class Resolver {\n\
+            \x20 @Query(\"byString\")\n\
+            \x20 lookup() { return 1; }\n\
+            \x20 @Query()\n\
+            \x20 everything() { return 2; }\n\
+            \x20 @Mutation(() => Object)\n\
+            \x20 rename() { return 3; }\n\
+            \x20 @Query(5)\n\
+            \x20 numbered() { return 4; }\n\
+            }\n";
+        assert_eq!(
+            root_field_rows(source),
+            vec![
+                (4, QUERY, "byString".to_string()),
+                (6, QUERY, "everything".to_string()),
+                (8, MUTATION, "rename".to_string()),
+                (10, QUERY, "numbered".to_string()),
+            ]
+        );
+    }
+
+    /// A `name` option the call writes outranks the decorated member's name,
+    /// and so does argument 0; an options object at argument 0 holds no
+    /// name there (this label reads it at argument 1).
+    #[test]
+    fn a_name_option_outranks_the_decorated_members_name() {
+        let source = "import { Query, Mutation } from \"@fixture/gql\";\n\
+            export class Resolver {\n\
+            \x20 @Mutation(() => Object, { name: \"renameThing\", description: \"d\" })\n\
+            \x20 rename() { return 1; }\n\
+            \x20 @Query(\"first\", { name: \"second\" })\n\
+            \x20 both() { return 2; }\n\
+            \x20 @Query({ name: \"ignored\" } as any)\n\
+            \x20 byMethod() { return 3; }\n\
+            }\n";
+        assert_eq!(
+            root_field_rows(source),
+            vec![
+                (4, MUTATION, "renameThing".to_string()),
+                (6, QUERY, "first".to_string()),
+                (8, QUERY, "byMethod".to_string()),
+            ]
+        );
+    }
+
+    /// A name the source does not write out as a string states no row, and
+    /// the method's name never fills in for it: a variable, a call, a
+    /// spread, a computed method key, and an options object that might hold
+    /// the key.
+    #[test]
+    fn a_name_option_that_is_not_a_literal_states_no_row() {
+        let source = "import { Query, Mutation } from \"@fixture/gql\";\n\
+            declare const dynamic: string;\n\
+            declare const args: any[];\n\
+            declare const options: any;\n\
+            declare function named(): string;\n\
+            const computed = \"c\";\n\
+            export class Resolver {\n\
+            \x20 @Mutation(() => Object, { name: dynamic })\n\
+            \x20 a() { return 1; }\n\
+            \x20 @Query(named())\n\
+            \x20 b() { return 2; }\n\
+            \x20 @Query(...args)\n\
+            \x20 c() { return 3; }\n\
+            \x20 @Query(() => Object, options)\n\
+            \x20 d() { return 4; }\n\
+            \x20 @Query(() => Object, { ...options })\n\
+            \x20 e() { return 5; }\n\
+            \x20 @Query()\n\
+            \x20 [computed]() { return 6; }\n\
+            \x20 @Query(dynamic)\n\
+            \x20 f() { return 7; }\n\
+            }\n";
+        assert_eq!(root_field_rows(source), vec![]);
     }
 
     const BUS_SERVICE: &str = "import { bus } from \"@fixture/bus\";\n\
