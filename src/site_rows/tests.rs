@@ -2008,6 +2008,7 @@ fn a_silent_cross_process_site_writes_no_scope_and_crosses_services() {
 fn socket_fact(key: OperationKey) -> SiteRow {
     let mut row = a_socket_fact_row();
     row.inference = None;
+    row.source = ResolutionSource::LibraryClaim;
     row.in_band = false;
     row.needs_reader = false;
     row.key = key;
@@ -2071,6 +2072,23 @@ fn a_socket_pass_row_of_another_operation_keeps_its_site_and_is_counted() {
         vec![(old, Some(ResolutionSource::SocketCall), None)]
     );
     assert_eq!(fold.socket_disagrees, 1);
+}
+
+/// A fact stating the socket pass's own operation takes the site: the key is
+/// unchanged and the source is the fact's.
+#[test]
+fn a_socket_fact_takes_its_site_from_the_socket_pass_row_of_the_same_operation() {
+    let key = chat(SocketDirection::ServerToClient);
+    let (calls, fold) = fold_socket(socket_fact(key.clone()), key.clone());
+    assert_eq!(
+        at_site(&calls, SOCKET_FILE),
+        vec![(key.clone(), Some(ResolutionSource::LibraryClaim), None)]
+    );
+    assert_eq!(
+        fold.withdrawn,
+        vec![(SOCKET_FILE.to_string(), LINE, key, RowSide::Call)]
+    );
+    assert!(fold.kept_out.is_empty() && fold.socket_disagrees == 0);
 }
 
 /// A fact of unknown direction states less than the socket pass: it never

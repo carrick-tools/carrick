@@ -1218,8 +1218,22 @@ pub fn fold_rows(
         // replaces it as it replaces the reader's row (carrick#3283). One
         // that states the same operation keeps the site, which then changes
         // nothing.
+        // A socket-pass row gives way only to a fact stating the same
+        // operation with a direction: the fact takes the site and its
+        // provenance, the key unchanged (the frozen pass retires under
+        // carrick#1670). On any disagreement the socket pass's row stays and
+        // the fold counts it.
         let gives_way = |existing: &ApiEndpointDetails| {
-            is_reader(existing) || (row.fact() && is_old_path(existing) && existing.key != row.key)
+            is_reader(existing)
+                || (row.fact() && is_old_path(existing) && existing.key != row.key)
+                || (row.fact()
+                    && existing.resolution_source == Some(ResolutionSource::SocketCall)
+                    && existing.key == row.key
+                    && matches!(
+                        &row.key,
+                        OperationKey::Socket { direction, .. }
+                            if *direction != SocketDirection::Unknown
+                    ))
         };
         if let Some(&kept) = here.iter().find(|&&index| !gives_way(&rows[index])) {
             if row.fact() {
