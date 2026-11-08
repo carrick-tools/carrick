@@ -30,6 +30,11 @@
 // for a Claude Code session; the skills and the AGENTS.md section, which Codex
 // reads with no trust gate, move the same way under either.
 //
+// A file git tracks here is the team's, not ours: it is left as it is and named in
+// one line (carrick self-update R5), because a rewrite on whatever branch the
+// session is on leaves a diff, and two teammates on different versions would flip
+// it back and forth.
+//
 // `.codex/hooks.json` is never written: a changed project hook is untrusted until
 // Codex records its hash (`codex.ts`), so only `carrick init` plus the user's
 // approval can move it.
@@ -51,7 +56,8 @@ import {
   recordedCliVersion,
 } from "./outdated.ts";
 import { expectedCarrickHooks, installedCarrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
-import { inspectTaskSkills, renderTaskSkill, scopeOf, TASK_SKILLS, type TaskSkill } from "./task-skills.ts";
+import { trackedPaths } from "./repo-copies.ts";
+import { inspectTaskSkills, renderTaskSkill, scopeOf, SKILL_ROOTS, TASK_SKILLS, type TaskSkill } from "./task-skills.ts";
 
 /** Which settings files were rewritten for which version, so one removed on purpose stays removed. */
 export function updatedStampFile(workspace: string): string {
@@ -89,6 +95,8 @@ export function updateHooks(
   projectDir: string,
   running: string,
   merge: typeof mergeCarrickHooks = mergeCarrickHooks,
+  tracked: Set<string> = new Set(),
+  held: string[] = [],
 ): string[] {
   const stamp = readStamp(workspace);
   const changed: string[] = [];
@@ -103,6 +111,10 @@ export function updateHooks(
       const prefix = installedCarrickHooks(body)[0]!.command.split(/\s+hook\s+/)[0]!;
       const merged = merge(body, prefix);
       if (!merged.changed) continue;
+      if (tracked.has(relative)) {
+        held.push(relative);
+        continue;
+      }
       writeAtomic(target, merged.body);
       stamp[key] = running;
       changed.push(relative);
@@ -121,12 +133,16 @@ export function updateHooks(
 }
 
 /** Task skills still ours and an older body, rewritten with the scope each was written with. */
-function updateSkills(workspace: string): string[] {
+function updateSkills(workspace: string, tracked: Set<string>, held: string[]): string[] {
   const changed: string[] = [];
   for (const skill of inspectTaskSkills(workspace)) {
     if (skill.state !== "ours" || skill.current) continue;
     const name = path.basename(path.dirname(skill.path)) as TaskSkill;
     if (!TASK_SKILLS.includes(name)) continue;
+    if (tracked.has(skill.path)) {
+      held.push(skill.path);
+      continue;
+    }
     try {
       const target = path.join(workspace, skill.path);
       writeAtomic(target, renderTaskSkill(name, scopeOf(fs.readFileSync(target, "utf8"))));
@@ -155,7 +171,12 @@ function snapshotCounts(workspace: string): WorkspaceCounts | null {
  * the snapshot. Returns the file written, or null. `log` says why a section was
  * left alone.
  */
-function updateAgentsSection(workspace: string, log: (message: string) => void): string | null {
+function updateAgentsSection(
+  workspace: string,
+  log: (message: string) => void,
+  tracked: Set<string>,
+  held: string[],
+): string | null {
   const target = path.join(workspace, AGENTS_FILE);
   try {
     const existing = fs.readFileSync(target, "utf8");
@@ -168,6 +189,10 @@ function updateAgentsSection(workspace: string, log: (message: string) => void):
     }
     const body = withCheckSection(existing, renderCheckSection({ slug }, counts));
     if (body === existing) return null;
+    if (tracked.has(AGENTS_FILE)) {
+      held.push(AGENTS_FILE);
+      return null;
+    }
     writeAtomic(target, body);
     return AGENTS_FILE;
   } catch {
@@ -181,7 +206,7 @@ function updateAgentsSection(workspace: string, log: (message: string) => void):
  * holds our marker, so a folder init never wrote to is left alone. Returns the
  * file written, or null.
  */
-function updateClaudeSection(workspace: string): string | null {
+function updateClaudeSection(workspace: string, tracked: Set<string>, held: string[]): string | null {
   const target = path.join(workspace, CLAUDE_FILE);
   try {
     const agents = fs.readFileSync(path.join(workspace, AGENTS_FILE), "utf8");
@@ -192,6 +217,10 @@ function updateClaudeSection(workspace: string): string | null {
     if (slug === "" || counts === null) return null;
     const body = withCheckSection(existing, renderCheckSection({ slug }, counts));
     if (body === existing) return null;
+    if (tracked.has(CLAUDE_FILE)) {
+      held.push(CLAUDE_FILE);
+      return null;
+    }
     writeAtomic(target, body);
     return CLAUDE_FILE;
   } catch {
@@ -212,25 +241,54 @@ export function bringUpToDate(
   projectDir: string | null,
   running: string | null,
   log: (message: string) => void = () => {},
+  held: string[] = [],
 ): string[] {
   if (!running || !/^\d+\.\d+\.\d+$/.test(running)) return [];
   const recorded = recordedCliVersion(workspace);
   if (recorded !== null && isNewer(recorded, running)) return [];
   const lines: string[] = [];
-  const hooks = projectDir === null ? [] : updateHooks(workspace, projectDir, running);
+  // Files git tracks here are the team's: left as they are and named below. Asked
+  // once per directory; a folder that is no repository, or a git that cannot
+  // answer, tracks nothing, which is what this did before it asked.
+  const settingsHeld: string[] = [];
+  const hooks =
+    projectDir === null
+      ? []
+      : updateHooks(
+          workspace,
+          projectDir,
+          running,
+          mergeCarrickHooks,
+          trackedPaths(projectDir, SETTINGS_FILES) ?? new Set(),
+          settingsHeld,
+        );
   if (hooks.length > 0) {
     lines.push(`Carrick brought its hook entries in ${hooks.join(", ")} up to date for ${running}.`);
   }
-  const skills = updateSkills(workspace);
+  const rootTracked = trackedPaths(workspace, [...SKILL_ROOTS, AGENTS_FILE, CLAUDE_FILE]) ?? new Set();
+  const rootHeld: string[] = [];
+  const skills = updateSkills(workspace, rootTracked, rootHeld);
   if (skills.length > 0) {
     const roots = [...new Set(skills.map((file) => path.dirname(path.dirname(file))))];
     lines.push(`Carrick brought its task skills in ${roots.join(", ")} up to date for ${running}.`);
   }
-  const written = [updateAgentsSection(workspace, log), updateClaudeSection(workspace)].filter(
-    (file): file is string => file !== null,
-  );
+  const written = [
+    updateAgentsSection(workspace, log, rootTracked, rootHeld),
+    updateClaudeSection(workspace, rootTracked, rootHeld),
+  ].filter((file): file is string => file !== null);
   if (written.length > 0) {
     lines.push(`Carrick brought its rules section in ${written.join(" and ")} up to date for ${running}.`);
+  }
+  const skipped = [
+    ...settingsHeld.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))),
+    ...rootHeld,
+  ];
+  held.push(...skipped);
+  if (skipped.length > 0) {
+    const named = skipped.length === 1 ? skipped[0]! : `${skipped.slice(0, -1).join(", ")} and ${skipped.at(-1)}`;
+    lines.push(
+      `Carrick did not update ${named} because git tracks them here. Run \`carrick init\`, then commit the change in its own pull request.`,
+    );
   }
   // The recorded version is what the mismatch line compares. Move it only when
   // nothing of ours is still old: a Codex hook file we may not touch keeps the

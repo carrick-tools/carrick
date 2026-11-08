@@ -136,7 +136,7 @@ export function excludeFile(repo: string): string | null {
 }
 
 /** The paths among these that git tracks here: the team's copies. */
-function trackedPaths(repo: string, relatives: string[]): Set<string> | null {
+export function trackedPaths(repo: string, relatives: string[]): Set<string> | null {
   const answer = git(repo, ["ls-files", "-z", "--", ...relatives.map((relative) => relative.split(path.sep).join("/"))]);
   if (answer === null) return null;
   return new Set(answer.split("\0").filter((entry) => entry !== "").map((entry) => entry.split("/").join(path.sep)));

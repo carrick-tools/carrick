@@ -33,7 +33,7 @@ import {
   markerPath,
   refreshInBackground,
 } from "./refresh.ts";
-import { versionMismatch } from "../init/outdated.ts";
+import { outdatedFiles, outdatedInstall, versionMismatch } from "../init/outdated.ts";
 import { bringUpToDate } from "../init/self-update.ts";
 import { markInvoker } from "./invoker.ts";
 
@@ -116,15 +116,19 @@ async function main(): Promise<void> {
     // `.codex/hooks.json` is never written (`init/self-update.ts`).
     // A by-hand run (neither harness) writes nothing.
     const projectDir = codex ? null : process.env["CLAUDE_PROJECT_DIR"] || null;
+    const held: string[] = [];
     if (codex || projectDir) {
       try {
-        lines.push(...bringUpToDate(choice.root, projectDir, currentVersion(), (message) => log(message)));
+        lines.push(...bringUpToDate(choice.root, projectDir, currentVersion(), (message) => log(message), held));
       } catch (error) {
         log("self-update failed", String(error));
       }
     }
+    // When every outdated file is one git tracks, the held line has said it.
+    const outdated = outdatedFiles(outdatedInstall(choice.root));
+    const allHeld = held.length > 0 && outdated.every((file) => held.includes(file));
     const mismatch = versionMismatch(choice.root, currentVersion());
-    if (mismatch) lines.push(mismatch);
+    if (mismatch && !allHeld) lines.push(mismatch);
   }
 
   const outcome = await status({ cwd: choice.root, workspace: choice.markerFound ? choice.root : null });
