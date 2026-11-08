@@ -233,14 +233,30 @@ fn removed_operations(
     main_self: &[CloudRepoData],
     current: &[CloudRepoData],
 ) -> Vec<Removed<RemovedOperation>> {
-    let current_keys: HashSet<ServiceEndpointKey> = current
-        .iter()
-        .flat_map(|data| {
-            data.endpoints
-                .iter()
-                .map(|row| (data.service_name.clone(), delta_identity(&row.key)))
-        })
-        .collect();
+    let is_documentation = |row: &crate::analyzer::ApiEndpointDetails| {
+        crate::agents::FileOrchestrator::is_documentation_route(
+            row.resolution_source,
+            row.handler_name.as_deref(),
+        )
+    };
+    let keys_of = |handlers_only: bool| -> HashSet<ServiceEndpointKey> {
+        current
+            .iter()
+            .flat_map(|data| {
+                data.endpoints
+                    .iter()
+                    .filter(move |row| !(handlers_only && is_documentation(row)))
+                    .map(|row| (data.service_name.clone(), delta_identity(&row.key)))
+            })
+            .collect()
+    };
+    let current_keys = keys_of(false);
+    // A documentation row keeps the operation it states alive only for a row
+    // that documentation alone ever stated: a main row with a real handler
+    // is removed when no current row with a real handler shares its key, so
+    // a renamed path its documentation still states is seen to go (carrick#3252;
+    // `check --changed` reads the same rule).
+    let current_handler_keys = keys_of(true);
     // Main's spelling of each key, as the delta keeps it, beside each row.
     let mut spelled: HashMap<ServiceEndpointKey, DeltaRow> = HashMap::new();
     let mut rows: HashMap<ServiceEndpointKey, Vec<(String, String, Option<ResolutionSource>)>> =
@@ -248,7 +264,12 @@ fn removed_operations(
     for repo in main_self {
         for row in &repo.endpoints {
             let id = (repo.service_name.clone(), delta_identity(&row.key));
-            if current_keys.contains(&id) {
+            let still_there = if is_documentation(row) {
+                &current_keys
+            } else {
+                &current_handler_keys
+            };
+            if still_there.contains(&id) {
                 continue;
             }
             keep_first_spelling(&mut spelled, &repo.service_name, row, &repo.commit_hash);
