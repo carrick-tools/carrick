@@ -14,8 +14,10 @@ Two shapes are pinned at today's reading, for later tickets to move:
 `use-whole.ts` (the key is a whole path segment, `/${version}/items`) keeps
 the callee's `/:version/items` placeholder (carrick#3608 T2), and a direct
 call that fills two name parameters at once with no options bag the summary
-reads is asked rather than stated (carrick#3608 T3), so the HTTP clients
-here send an options bag (`{ body }`).
+reads is asked rather than stated (carrick#3608 T3), so most HTTP clients
+here send an options bag (`{ body }`), which the summaries read.
+`use-based.ts` (HTTP) and `use-event.ts` (socket) are read by the caller
+walk alone.
 
 `rows.expected.json` is the answer key, read by
 `tests/version_segments_test.rs`: `rows` maps a call line to the one row the
