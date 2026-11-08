@@ -508,6 +508,19 @@ impl<'a> Resolver<'a> {
             })
     }
 
+    /// The one text `value`, written in `file` (as `inputs` keys it), always
+    /// is. `None` unless it is exactly one text.
+    pub(in crate::request_summary) fn text_of_value(
+        &self,
+        file: &Path,
+        value: &ValueAt,
+    ) -> Option<String> {
+        match self.text_values(file, value).as_slice() {
+            [TextValue::Text { text, .. }] => Some(text.clone()),
+            _ => None,
+        }
+    }
+
     /// The one text `expr`, written in the repo file `file` (relative to
     /// `root`), always is, with the files whose declarations it read.
     /// `None` unless it is exactly one text.

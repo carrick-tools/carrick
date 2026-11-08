@@ -21,7 +21,11 @@
     "src/s-getter.ts": "room.getter",
     "src/c-destr-assign.ts": "/c/destr-assign",
     "src/q-destr-assign.ts": "orders.destr-assign",
-    "src/s-destr-assign.ts": "room.destr-assign"
+    "src/s-destr-assign.ts": "room.destr-assign",
+    "src/c-default.ts": "/c/default",
+    "src/c-default-given.ts": "/c/default-given",
+    "src/q-default.ts": "orders.defaulted",
+    "src/s-default.ts": "room.defaulted"
   },
   "kind_asked": [
     "src/q-destructure.ts",
@@ -29,7 +33,8 @@
     "src/q-static-field.ts",
     "src/q-logical-assign.ts",
     "src/q-getter.ts",
-    "src/q-destr-assign.ts"
+    "src/q-destr-assign.ts",
+    "src/q-default.ts"
   ],
   "unnamed": [
     "src/c-destructure-written.ts",
@@ -46,6 +51,7 @@
     "src/c-getter-exported.ts",
     "src/c-getter-body.ts",
     "src/c-destr-assign-default.ts",
-    "src/c-destr-assign-array.ts"
+    "src/c-destr-assign-array.ts",
+    "src/c-default-spread.ts"
   ]
 }

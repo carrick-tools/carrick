@@ -39,6 +39,13 @@ Forms so far:
   not the one `return`) are unread on purpose: what the getter returns is
   not stated by the class alone.
 
+- `default`: a parameter the caller does not write is its default
+  (`function send(p = '/x')`, `send()`). A destructured key's default
+  (`send({ path = '/x' })`) is a gap: the key is not read as a key of the
+  parameter. `c-default-given` passes the argument and
+  names its own value; `c-default-spread` spreads before the position and
+  stays unknown.
+
 `rows.expected.json` is the answer key, read by `tests/name_forms_test.rs`:
 `names` gives the one name each file's site forces and the scan writes as a
 fact row (a `kind_asked` pub/sub file waits on the broker's kind question

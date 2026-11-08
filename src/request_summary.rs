@@ -1328,6 +1328,9 @@ struct FnIr {
     /// its position, the keys down to it and what it may hold, read in the
     /// function's own scope (carrick#2432). Read by discovery alone.
     param_defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
+    /// The same defaults as the text they state, for the caller walk to fill
+    /// an omitted argument with (carrick#3504 S2b-2).
+    param_default_texts: Vec<(usize, ValueAt)>,
     /// Each function written as a parameter's default, read with this
     /// function's own captures (carrick#2813). A value that is one reaches it
     /// here, by where it starts. Discovery's value walk enters it; no site
@@ -5805,6 +5808,7 @@ impl Reader<'_> {
             type_params: type_param_names(function.type_params.as_deref()),
             site: Some(self.site(function.span)),
             param_defaults: values.defaults,
+            param_default_texts: values.default_texts,
             param_functions,
             ..FnIr::default()
         };
@@ -5864,6 +5868,7 @@ impl Reader<'_> {
             type_params: type_param_names(arrow.type_params.as_deref()),
             site: Some(self.site(arrow.span)),
             param_defaults: values.defaults,
+            param_default_texts: values.default_texts,
             param_functions,
             ..FnIr::default()
         };
