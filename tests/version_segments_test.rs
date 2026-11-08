@@ -246,8 +246,10 @@ fn a_runtime_version_stays_a_placeholder() {
 }
 
 /// A library that reads the verb from the `method` key sends the client's
-/// default where the caller omits it, not the library's own default.
+/// default where the caller omits it, not the library's own default; so
+/// does an options bag the call sends, read by the summaries
+/// (`use-bag-method`), not the `GET` a bag without a method reads as.
 #[test]
 fn a_defaulted_method_key_is_the_method_a_caller_omits() {
-    check(&["src/use-method.ts"]);
+    check(&["src/use-method.ts", "src/use-bag-method.ts"]);
 }
