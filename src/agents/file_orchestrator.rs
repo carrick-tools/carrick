@@ -9230,11 +9230,37 @@ impl FileOrchestrator {
             // Only against the rows THIS loop has pushed: a model row that
             // agrees with a deterministic row must fold onto it and keep its
             // source, which is the twin search below.
-            if Self::restates_a_kept_row(
-                &result.endpoints[deterministic_rows..],
-                &endpoint,
-                file_path,
-            ) {
+            //
+            // The one exception (carrick#3236): when the kept row's call does
+            // not write the path whole (a loop over `/docs/spec${tail}`) and
+            // this row's call does (`app.get('/docs/spec')`), the route is
+            // registered at this call, so its row stands here. The kept row
+            // was a reading of another site and carries nothing over.
+            if let Some(at) =
+                Self::kept_restatement(&result.endpoints[deterministic_rows..], &endpoint)
+            {
+                let kept = &result.endpoints[deterministic_rows + at];
+                if kept.resolution_source == Some(ResolutionSource::Model)
+                    && Self::site_writes_path_whole(&endpoint, candidate_map)
+                    && !Self::site_writes_path_whole(kept, candidate_map)
+                {
+                    debug!(
+                        "The row at line {} gives way to the registration at line {} that \
+                         writes the path whole: {} {} in {}",
+                        kept.line_number,
+                        endpoint.line_number,
+                        endpoint.method,
+                        endpoint.path,
+                        file_path
+                    );
+                    result.endpoints[deterministic_rows + at] = endpoint;
+                    continue;
+                }
+                Self::restates_a_kept_row(
+                    &result.endpoints[deterministic_rows..],
+                    &endpoint,
+                    file_path,
+                );
                 continue;
             }
             // A structural route the deterministic layer already stated. The
@@ -10206,8 +10232,7 @@ impl FileOrchestrator {
         endpoint: &EndpointResult,
         file_path: &str,
     ) -> bool {
-        let key = Self::model_row_key(endpoint);
-        let restates = kept.iter().any(|row| Self::model_row_key(row) == key);
+        let restates = Self::kept_restatement(kept, endpoint).is_some();
         if restates {
             warn!(
                 "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
@@ -10216,6 +10241,32 @@ impl FileOrchestrator {
             );
         }
         restates
+    }
+
+    /// The index in `kept` of the row `endpoint` restates, by
+    /// [`Self::model_row_key`].
+    fn kept_restatement(kept: &[EndpointResult], endpoint: &EndpointResult) -> Option<usize> {
+        let key = Self::model_row_key(endpoint);
+        kept.iter().position(|row| Self::model_row_key(row) == key)
+    }
+
+    /// Whether the call a row is anchored at writes its route path as one
+    /// plain string literal (the #332 reading), so the row's path is stated
+    /// at that call. A model copy of the mount prefix still counts; a path
+    /// that contradicts the literal does not (carrick#3236).
+    fn site_writes_path_whole(
+        row: &EndpointResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+    ) -> bool {
+        let Some(candidate) = candidate_map.get(&row.candidate_id) else {
+            return false;
+        };
+        Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+            .is_some_and(|literal| crate::swc_scanner::is_producer_route_path(&literal))
+            && !matches!(
+                Self::inline_literal_path(&row.path, candidate),
+                RegistrationLiteral::Contradicts(_)
+            )
     }
 
     /// A model row with no dispatch case, for a route the model also states
