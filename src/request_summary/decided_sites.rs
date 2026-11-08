@@ -1520,52 +1520,94 @@ fn argument(call: &CallIr, index: usize) -> Option<&Value> {
 /// parameter filled from the arguments `call` writes. A position the call
 /// does not write, or one after a spread, is not known.
 fn filled(pieces: &[Piece], call: &CallIr) -> Vec<Piece> {
-    filled_with(pieces, call, &|_| None)
+    filled_with(pieces, call, &|_, _| None)
 }
 
+/// The text the callee gives a parameter (`key` None) or a key of one, by
+/// position: [`FnIr::param_default_texts`](super::FnIr), read as one text.
+type Defaults<'d> = dyn Fn(usize, Option<&str>) -> Option<String> + 'd;
+
 /// [`filled`], where a position the call omits (no argument, no spread)
-/// takes `default(position)`, the text the callee gives it, when it states
-/// one (carrick#3504 S2b-2). A destructured key's default is a gap: its
-/// name is not read as a key of the parameter (`keyed_names`).
-fn filled_with(
-    pieces: &[Piece],
-    call: &CallIr,
-    default: &dyn Fn(usize) -> Option<String>,
-) -> Vec<Piece> {
-    let omitted = |index: usize| call.args.len() <= index && call.spread_from.is_none();
+/// takes `default(position, None)`, the text the callee gives it, when it
+/// states one (carrick#3504 S2b-2), and a key the caller's object leaves
+/// out takes `default(position, Some(key))` ([`key_filled`], carrick#3608).
+fn filled_with(pieces: &[Piece], call: &CallIr, default: &Defaults<'_>) -> Vec<Piece> {
+    let omitted = |index: usize| call.omits(index);
     let lit = |text: Option<String>| vec![text.map_or(Piece::Unknown, Piece::Lit)];
-    concat(pieces.iter().map(|piece| {
-        match piece {
-            Piece::Param(index, _) => match argument(call, *index) {
-                Some(value) => value.pieces(),
-                None if omitted(*index) => lit(default(*index)),
-                None => vec![Piece::Unknown],
-            },
-            Piece::ParamKey(index, key, name) => match argument(call, *index) {
-                Some(Value::Obj(object)) => match (object.fields.get(key), &object.under_param) {
-                    (Some(value), _) => value.pieces(),
-                    // A spread of the caller's own parameter with no such key
-                    // written after it: the key waits on the caller's caller
-                    // (carrick#2448 T2). A key written before the spread may
-                    // be overwritten by it: not read.
-                    (None, Some((passed, before))) if !before.contains_key(key) => {
-                        vec![Piece::ParamKey(*passed, key.clone(), name.clone())]
-                    }
-                    _ => vec![Piece::Unknown],
-                },
-                // The caller passes its own parameter on whole: its key waits on
-                // the caller's caller.
-                Some(Value::Str(pieces)) => match pieces.as_slice() {
-                    [Piece::Param(passed, _)] => {
-                        vec![Piece::ParamKey(*passed, key.clone(), name.clone())]
-                    }
-                    _ => vec![Piece::Unknown],
-                },
-                _ => vec![Piece::Unknown],
-            },
-            other => vec![other.clone()],
+    concat(pieces.iter().map(|piece| match piece {
+        Piece::Param(index, _) => match argument(call, *index) {
+            Some(value) => value.pieces(),
+            None if omitted(*index) => lit(default(*index, None)),
+            None => vec![Piece::Unknown],
+        },
+        Piece::ParamKey(index, key, name) => {
+            let or = default(*index, Some(key.as_str())).map(|text| vec![Piece::Lit(text)]);
+            key_filled(call, *index, key, name, or, omitted(*index))
         }
+        Piece::ParamKeyOr(index, key, name, or) => {
+            key_filled(call, *index, key, name, Some(or.clone()), omitted(*index))
+        }
+        other => vec![other.clone()],
     }))
+}
+
+/// The key `key` (read by `name`) of the argument `call` writes at
+/// `index`, where `or` is what the key holds when the caller's object
+/// leaves it out (carrick#3608): the key the object writes; else, for an
+/// argument the call omits (`omitted`) or a closed object without the key,
+/// `or`; for an object spreading the caller's own options with the key not
+/// written after the spread, that parameter's key, falling back to the key
+/// written before the spread or to `or` ([`Piece::ParamKeyOr`]); for the
+/// caller's own parameter passed on whole, its key, with the same `or`. Any
+/// other argument, and a fallback no text states, is not known.
+fn key_filled(
+    call: &CallIr,
+    index: usize,
+    key: &str,
+    name: &str,
+    or: Option<Vec<Piece>>,
+    omitted: bool,
+) -> Vec<Piece> {
+    let unknown = || vec![Piece::Unknown];
+    // The caller's own parameter, read at the call above.
+    let passed = |position: usize, or: Option<Vec<Piece>>| {
+        vec![match or {
+            Some(or) => Piece::ParamKeyOr(position, key.to_string(), name.to_string(), or),
+            None => Piece::ParamKey(position, key.to_string(), name.to_string()),
+        }]
+    };
+    match argument(call, index) {
+        None if omitted => or.unwrap_or_else(unknown),
+        Some(Value::Obj(object)) => {
+            if let Some(value) = object.fields.get(key) {
+                return value.pieces();
+            }
+            let settled = !object.unsettled.contains(key) && !object.functions.contains(key);
+            match &object.under_param {
+                // `{ version: 'v2', ...options }`: the caller's key, else the
+                // one written before the spread, else the default.
+                Some((position, before)) if settled && or.is_some() => {
+                    let or = before.get(key).map(Value::pieces).or(or);
+                    passed(*position, or)
+                }
+                Some((position, before)) if settled => match before.get(key) {
+                    Some(value) => passed(*position, Some(value.pieces())),
+                    None => unknown(),
+                },
+                None if settled && !object.open && object.under_rest.is_none() => {
+                    or.unwrap_or_else(unknown)
+                }
+                _ => unknown(),
+            }
+        }
+        // The caller passes its own parameter on whole: its key waits on the
+        // caller's caller.
+        Some(Value::Str(pieces)) => match pieces.as_slice() {
+            [Piece::Param(position, _)] => passed(*position, or),
+            _ => unknown(),
+        },
+        _ => unknown(),
+    }
 }
 
 /// One key of a value that is a whole parameter: of the function the call
@@ -1587,7 +1629,9 @@ fn parameter_positions(pieces: &[Piece]) -> BTreeSet<usize> {
     pieces
         .iter()
         .filter_map(|piece| match piece {
-            Piece::Param(index, _) | Piece::ParamKey(index, ..) => Some(*index),
+            Piece::Param(index, _) | Piece::ParamKey(index, ..) | Piece::ParamKeyOr(index, ..) => {
+                Some(*index)
+            }
             _ => None,
         })
         .collect()
@@ -1962,10 +2006,16 @@ fn made_by(pieces: Vec<Piece>, maker: &CallIr) -> Vec<Piece> {
 /// 0, as the name is filled, whatever depth the function is nested at. A hop
 /// that carries the maker call its function was made by (carrick#2448 T2)
 /// fills the parameter the function reads one function out from that call.
+///
+/// `default(placed, index, key)` is the text the function `placed` is
+/// written in gives that key of its parameter: where a caller's object
+/// leaves the key out, the method is that default (`const { method = 'POST' }
+/// = options || {}`, carrick#3608), not the label's.
 fn method_value(
     down: &[Placed<'_>],
     slot: &ArgSlot,
     hops: &[Option<Placed<'_>>],
+    default: &dyn Fn(&Placed<'_>, usize, &str) -> Option<String>,
 ) -> Option<MethodValue> {
     let last = down.last()?;
     let mut value = written_at(last.call, slot.arg, slot.key.as_deref());
@@ -1986,10 +2036,32 @@ fn method_value(
         if let Some(Some(maker)) = hop {
             own = made_by(own, maker.call);
         }
+        let call = down[k].call;
+        let omitted = |index: usize| call.omits(index);
         value = match own.as_slice() {
-            [Piece::Param(index, _)] => written_at(down[k].call, *index, None),
-            [Piece::ParamKey(index, key, _)] => written_at(down[k].call, *index, Some(key)),
-            _ => MethodValue::Pieces(filled(&own, down[k].call)),
+            [Piece::Param(index, _)] => written_at(call, *index, None),
+            [Piece::ParamKey(index, key, name)] => {
+                match default(&down[k + 1], *index, key).map(|text| vec![Piece::Lit(text)]) {
+                    Some(or) => MethodValue::Pieces(key_filled(
+                        call,
+                        *index,
+                        key,
+                        name,
+                        Some(or),
+                        omitted(*index),
+                    )),
+                    None => written_at(call, *index, Some(key)),
+                }
+            }
+            [Piece::ParamKeyOr(index, key, name, or)] => MethodValue::Pieces(key_filled(
+                call,
+                *index,
+                key,
+                name,
+                Some(or.clone()),
+                omitted(*index),
+            )),
+            _ => MethodValue::Pieces(filled(&own, call)),
         };
     }
     Some(value)
@@ -2175,19 +2247,29 @@ impl<'a> Walk<'a, '_> {
     /// `key` of `file`) gives its parameters, each read as exactly one text
     /// (carrick#3504 S2b-2).
     fn fill(&self, pieces: &[Piece], call: &CallIr, callee: (&Path, Option<&str>)) -> Vec<Piece> {
-        let function = callee
-            .1
-            .and_then(|key| self.resolver.function(callee.0, key));
-        let Some((at, function)) = function else {
-            return filled(pieces, call);
-        };
-        filled_with(pieces, call, &|index| {
-            let (_, _, text) = function
-                .param_default_texts
-                .iter()
-                .find(|(position, keys, _)| *position == index && keys.is_empty())?;
-            self.resolver.text_of_value(at, text).ok()
+        filled_with(pieces, call, &|index, key| {
+            self.default_text(callee, index, key)
         })
+    }
+
+    /// The one text the function `callee` (definition `key` of `file`) gives
+    /// its parameter at `index` (`key` None) or that parameter's key, as
+    /// [`Self::fill`] reads it (carrick#3504 S2b-2, carrick#3608).
+    fn default_text(
+        &self,
+        callee: (&Path, Option<&str>),
+        index: usize,
+        key: Option<&str>,
+    ) -> Option<String> {
+        let key: Vec<&str> = key.into_iter().collect();
+        let (at, function) = self.resolver.function(callee.0, callee.1?)?;
+        let (_, _, text) = function
+            .param_default_texts
+            .iter()
+            .find(|(position, written, _)| {
+                *position == index && written.iter().map(String::as_str).eq(key.iter().copied())
+            })?;
+        self.resolver.text_of_value(at, text).ok()
     }
 
     /// `down` is the calls from the site (first) to the labelled call
@@ -2211,7 +2293,11 @@ impl<'a> Walk<'a, '_> {
             .label
             .and_then(|label| label.method.as_ref())
             .and_then(|method| method.from.as_ref())
-            .and_then(|slot| method_value(down, slot, &self.value_hops));
+            .and_then(|slot| {
+                method_value(down, slot, &self.value_hops, &|callee, index, key| {
+                    self.default_text((callee.file, callee.key), index, Some(key))
+                })
+            });
         if !self.seen.insert(id.clone()) {
             // Another walk reached this call and labelled end. The same
             // operation (a diamond) is one site; a different one means the
@@ -4384,6 +4470,73 @@ fn loop_key(stmt: &ForOfStmt) -> Option<(String, String)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// carrick#3608: a key the caller's object leaves out (or no object at
+    /// all) is the callee's default; a key it writes is its own; with a
+    /// spread of the caller's own options and no key after it, the key waits
+    /// on that caller, falling back to the key written before the spread,
+    /// else the default. A key with no default the object leaves out stays
+    /// unknown.
+    #[test]
+    fn filled_takes_a_keys_default_when_the_object_omits_it() {
+        let file = super::super::tests::file_ir_of(
+            "declare function request(e: string, o?: object): void;\n\
+             export function a() { request('/a'); }\n\
+             export function b() { request('/b', {}); }\n\
+             export function c() { request('/c', { version: 'v2' }); }\n\
+             export function d(o: object) { request('/d', { version: 'v2', ...o }); }\n\
+             export function e(o: object) { request('/e', { ...o }); }\n\
+             export function f(o: object) { request('/f', o); }\n\
+             export function g(o: object) { request('/g', { ...o, version: 'v3' }); }\n",
+        );
+        let own = [
+            Piece::Param(0, "endpoint".into()),
+            Piece::Lit("/".into()),
+            Piece::ParamKey(1, "version".into(), "version".into()),
+        ];
+        let default = |index: usize, key: Option<&str>| {
+            (index == 1 && key == Some("version")).then(|| "v1".to_string())
+        };
+        let fill = |function: &str, default: &Defaults<'_>| {
+            filled_with(&own, &file.functions[function].calls[0], default)
+        };
+        let lit = |text: &str| Piece::Lit(text.to_string());
+        let or =
+            |text: &str| Piece::ParamKeyOr(0, "version".into(), "version".into(), vec![lit(text)]);
+        assert_eq!(fill("a", &default), [lit("/a/v1")]);
+        assert_eq!(fill("b", &default), [lit("/b/v1")]);
+        assert_eq!(fill("c", &default), [lit("/c/v2")]);
+        assert_eq!(fill("d", &default), [lit("/d/"), or("v2")]);
+        assert_eq!(fill("e", &default), [lit("/e/"), or("v1")]);
+        assert_eq!(fill("f", &default), [lit("/f/"), or("v1")]);
+        assert_eq!(fill("g", &default), [lit("/g/v3")]);
+        // No default: the key the object leaves out is not known.
+        let none = |_: usize, _: Option<&str>| None;
+        assert_eq!(fill("a", &none), [lit("/a/"), Piece::Unknown]);
+        assert_eq!(fill("b", &none), [lit("/b/"), Piece::Unknown]);
+        assert_eq!(fill("d", &none), [lit("/d/"), or("v2")]);
+        assert_eq!(fill("e", &none), [lit("/e/"), Piece::Unknown]);
+        // The fallback rides up: the next caller's closed object without
+        // the key takes it.
+        let up = [Piece::ParamKeyOr(
+            1,
+            "version".into(),
+            "version".into(),
+            vec![lit("v2")],
+        )];
+        assert_eq!(
+            filled_with(&up, &file.functions["b"].calls[0], &none),
+            [lit("v2")]
+        );
+        assert_eq!(
+            filled_with(&up, &file.functions["c"].calls[0], &none),
+            [lit("v2")]
+        );
+        assert_eq!(
+            filled_with(&up, &file.functions["a"].calls[0], &none),
+            [lit("v2")]
+        );
+    }
 
     /// carrick#2439: the scan's settled claims give one label per op, with
     /// its slots, method fields, role and side, as the store's raw answer

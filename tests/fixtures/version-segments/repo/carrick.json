@@ -1,0 +1,3 @@
+{
+  "services": [{ "name": "version-segments", "directory": ".", "tsconfig": "tsconfig.json" }]
+}

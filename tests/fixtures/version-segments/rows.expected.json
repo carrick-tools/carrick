@@ -1,0 +1,29 @@
+{
+  "rows": {
+    "src/use-options.ts:2": "GET /v1/a",
+    "src/use-options.ts:3": "GET /v2/b",
+    "src/use-options.ts:4": "POST /v1/c",
+    "src/use-options.ts:5": "POST /v2/d",
+    "src/use-param-key.ts:2": "POST /v1/k/omitted",
+    "src/use-param-key.ts:3": "POST /v1/k/empty",
+    "src/use-param-key.ts:4": "POST /v2/k/given",
+    "src/use-based.ts:2": "POST /v1/e",
+    "src/use-based.ts:3": "POST /v2/f",
+    "src/use-override.ts:2": "POST /v1/g",
+    "src/use-override.ts:3": "POST /v2/h",
+    "src/use-whole.ts:2": "POST /:version/items",
+    "src/use-whole.ts:3": "POST /:version/items",
+    "src/use-runtime.ts:3": "POST /:version/r/one",
+    "src/use-runtime.ts:4": "POST /v1/r/two",
+    "src/use-runtime.ts:5": "POST /v2/r/three",
+    "src/use-method.ts:2": "POST /m/omitted",
+    "src/use-method.ts:3": "GET /m/get",
+    "src/use-method.ts:4": "POST /m/body",
+    "src/use-event.ts:2": "room.versioned",
+    "src/use-event.ts:3": "room.given"
+  },
+  "kind_asked": [
+    "src/use-topic.ts:2",
+    "src/use-topic.ts:3"
+  ]
+}

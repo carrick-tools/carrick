@@ -2259,11 +2259,13 @@ fn address_piece(piece: &Piece, conditional: bool) -> address::Piece {
             };
             unknown(written, UnknownReason::Conditional, Vec::new())
         }
-        Piece::Param(_, name) | Piece::ParamKey(_, _, name) => {
+        Piece::Param(_, name) | Piece::ParamKey(_, _, name) | Piece::ParamKeyOr(_, _, name, _) => {
             unknown(name, UnknownReason::Parameter, Vec::new())
         }
         Piece::Outer(_, inner) => match &**inner {
-            Piece::Param(_, name) | Piece::ParamKey(_, _, name) => {
+            Piece::Param(_, name)
+            | Piece::ParamKey(_, _, name)
+            | Piece::ParamKeyOr(_, _, name, _) => {
                 unknown(name, UnknownReason::Parameter, Vec::new())
             }
             _ => unknown("", UnknownReason::Parameter, Vec::new()),
