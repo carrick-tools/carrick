@@ -40,48 +40,10 @@ extension added, then `.js` swapped for `.ts`, then an `index` file.
 
 ## Which config governs a file
 
-One rule, the one the TypeScript language service applies, so call edges
-and types read a file under the same config the editor does (carrick#3497).
-The scanner and the type sidecar both implement it. For a file under the
-service directory:
-
-1. **Nearest config that lists the file.** In each directory from the
-   file's up to the service directory, inclusive, take its `tsconfig.json`,
-   else its `jsconfig.json`, and ask whether it lists the file. If it does
-   not, keep climbing. The climb stops after a `node_modules` directory.
-2. **References.** A config "lists" a file when it, or a project it
-   references, does. The file goes to the first project in search order
-   (the config, then its references depth-first in declared order) that
-   lists it while none of its own references does. A solution config
-   (`"files": []` plus `references`) therefore hands each file to the
-   referenced project that lists it.
-3. **Fallback: the service config.** When no config inside the service lists
-   the file, the service config governs it (and step 2 applies to it), found
-   in this order:
-   - the `tsconfig` the service's `carrick.json` names, when the file exists
-     and is not a `deno.json(c)`;
-   - `tsconfig.json`, `tsconfig.build.json`, `tsconfig.app.json` in the
-     service directory, first found;
-   - when a directory above the service (up to the scan root) holds a
-     `tsconfig.json`, the service directory's own `jsconfig.json` if it has
-     one, otherwise that nearest `tsconfig.json`.
-
-   None of these: no config.
-
-A project lists its `files`, and the files under its `include` minus
-`exclude` that it takes: TypeScript sources always, JavaScript only under
-`allowJs` (on by default in a `jsconfig.json`). The compiler's default
-`exclude` (`node_modules`, `outDir`) is not applied.
-
-A named config is part of the fallback, not an override: a nearer config
-that lists the file still governs it, as it does in the editor.
-
-A file outside the service directory (a sibling package the call graph reads)
-takes the nearest `tsconfig.json`, else `jsconfig.json`, above it. A Deno
-service is not covered: its import maps decide, and its files take the
-nearest config. Code: `module_aliases::Governing` and `src/tsconfig_program.rs`
-in the scanner; `GoverningConfigs` in the sidecar's
-`src/sidecar/src/capture/service-config.ts`.
+Carrick reads each file under the config your editor uses for it: the
+nearest `tsconfig.json` (or `jsconfig.json`) that includes the file,
+following project references. The `tsconfig` named in `carrick.json` is the
+fallback for files no closer config includes.
 
 ## Why a config reader and not the compiler
 
