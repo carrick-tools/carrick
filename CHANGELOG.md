@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.3.149](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.148...carrick-v0.3.149) (2026-11-08)
+
+
+### Features
+
+* a method decorator written as an op is a listener ([#3043](https://github.com/carrick-tools/carrick/issues/3043), socket) ([#3557](https://github.com/carrick-tools/carrick/issues/3557)) ([bf84b66](https://github.com/carrick-tools/carrick/commit/bf84b666065bbb934f786432055c979e270760cb))
+* **resolve:** ?: ?? || names read through the resolver ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S2b-1) ([#3563](https://github.com/carrick-tools/carrick/issues/3563)) ([75ded76](https://github.com/carrick-tools/carrick/commit/75ded762d5945d64295e782ce5183936e65af147))
+* **resolve:** a destructured declaration names its key's value ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S2b-3) ([#3561](https://github.com/carrick-tools/carrick/issues/3561)) ([405fd66](https://github.com/carrick-tools/carrick/commit/405fd6617faf392abdfa3effbb4b2a8fe56ad544))
+* **resolve:** a library member held as a value reaches its op ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S4a) ([#3564](https://github.com/carrick-tools/carrick/issues/3564)) ([43a610f](https://github.com/carrick-tools/carrick/commit/43a610f1e2eeeddec660ef327bcbe9ea5da70ee4))
+* **resolve:** a receiver an own function returns is what the function returns ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S3c) ([#3546](https://github.com/carrick-tools/carrick/issues/3546)) ([6736ee7](https://github.com/carrick-tools/carrick/commit/6736ee7c8e2c7410f95e6a0f8f9c02783bd4faef))
+* **resolve:** names onto the value resolver; the name fold deleted ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S2) ([#3542](https://github.com/carrick-tools/carrick/issues/3542)) ([f0f6496](https://github.com/carrick-tools/carrick/commit/f0f6496d50f63f394aeeab4fdcbfc5a7e224cc8d))
+* **resolver:** a closure reads its factory's parameters from the call that made it ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S0b) ([#3556](https://github.com/carrick-tools/carrick/issues/3556)) ([9fe7bd0](https://github.com/carrick-tools/carrick/commit/9fe7bd0c5bf26988d2f7fc0874bf2128c4ed0421))
+* **scanner:** read constructor bodies and reach them from new and super ([#3527](https://github.com/carrick-tools/carrick/issues/3527) S2) ([#3544](https://github.com/carrick-tools/carrick/issues/3544)) ([6ff44af](https://github.com/carrick-tools/carrick/commit/6ff44af63a6da8a123e290b3e7334ebed4fca68d))
+* **sidecar:** typed_decl row for a call through a value typed as a function ([#2448](https://github.com/carrick-tools/carrick/issues/2448) T3a) ([#3549](https://github.com/carrick-tools/carrick/issues/3549)) ([63aa26a](https://github.com/carrick-tools/carrick/commit/63aa26a3cceac1e7c29dbab5264f896d74b592bc))
+
+
+### Bug Fixes
+
+* **discovery:** read an inherited listener under the class its receiver holds ([#3554](https://github.com/carrick-tools/carrick/issues/3554)) ([416a71f](https://github.com/carrick-tools/carrick/commit/416a71f1633cdfb5c9b4d05e2c396c06de6ec230)), closes [#3390](https://github.com/carrick-tools/carrick/issues/3390)
+* **graphql:** a declaration holding document text in a property is a document ([#3555](https://github.com/carrick-tools/carrick/issues/3555)) ([caf523f](https://github.com/carrick-tools/carrick/commit/caf523fec86b81c61fcd0dddb6d33dfefd1bd9e8))
+* **resolve:** the nearest config that lists a file governs it, in the scanner and the sidecar ([#3497](https://github.com/carrick-tools/carrick/issues/3497) S2) ([#3533](https://github.com/carrick-tools/carrick/issues/3533)) ([347e64e](https://github.com/carrick-tools/carrick/commit/347e64e3ccfebe1201d31a8f2540ebe20a515787))
+* **scanner:** a const-bound class expression is read as that class ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S4e) ([#3562](https://github.com/carrick-tools/carrick/issues/3562)) ([6222332](https://github.com/carrick-tools/carrick/commit/62223320b921d153a7ca2547643eb548b60daef6))
+* **sidecar:** read a receive in the new form (S-3139b) ([#3548](https://github.com/carrick-tools/carrick/issues/3548)) ([6482960](https://github.com/carrick-tools/carrick/commit/6482960f00eb8be185dee6c0ebf458cb2a3b5715))
+* **site-rows:** a fact socket row takes its site only from a socket-pass row of the same operation ([#3567](https://github.com/carrick-tools/carrick/issues/3567)) ([08102d0](https://github.com/carrick-tools/carrick/commit/08102d076284aaebe11ea3c5e0764bfc4107db8c))
+
+
+### Refactoring
+
+* **resolver:** the receiver walk reads the value lowering ([#3504](https://github.com/carrick-tools/carrick/issues/3504) S3a) ([#3552](https://github.com/carrick-tools/carrick/issues/3552)) ([1023a94](https://github.com/carrick-tools/carrick/commit/1023a9452c554ec44ed6ca82c8f9a4915a2b54df))
+
+
+### CI/CD
+
+* Deno and cargo tools without GitHub release downloads ([#3545](https://github.com/carrick-tools/carrick/issues/3545)) ([f500b8a](https://github.com/carrick-tools/carrick/commit/f500b8a8083e28eedb1c1c21db7d00587c5ff48b))
+
 ## [0.3.148](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.147...carrick-v0.3.148) (2026-11-08)
 
 
