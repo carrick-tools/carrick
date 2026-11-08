@@ -1135,16 +1135,22 @@ fn yarn_berry(
     let Ok(serde_yaml_ng::Value::Mapping(entries)) = serde_yaml_ng::from_str(text) else {
         return false;
     };
-    // An npm alias resolves as `<alias>@npm:<real>@<version>`.
-    let wanted = [
-        format!("{name}@npm:{}", package.version),
-        format!("{name}@npm:{}@{}", package.name, package.version),
-    ];
-    let resolved_by_npm = entries.iter().any(|(_, entry)| {
+    // The resolution names the real package (`<real>@npm:<version>`). An npm
+    // alias is told apart by its entry's key (`<alias>@npm:<real>@<range>`,
+    // several joined by `, `): without it a plain package of the real name
+    // could be mistaken for the alias.
+    let wanted = format!("{}@npm:{}", package.name, package.version);
+    let alias_key = format!("{name}@npm:{}@", package.name);
+    let resolved_by_npm = entries.iter().any(|(key, entry)| {
         entry
             .get("resolution")
             .and_then(serde_yaml_ng::Value::as_str)
-            .is_some_and(|resolution| wanted.iter().any(|wanted| wanted == resolution))
+            .is_some_and(|resolution| resolution == wanted)
+            && (package.name == name
+                || key.as_str().is_some_and(|key| {
+                    key.split(',')
+                        .any(|spec| spec.trim().trim_matches('"').starts_with(&alias_key))
+                }))
     });
     if !resolved_by_npm {
         return false;
@@ -2766,6 +2772,110 @@ mod tests {
             asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
             vec![]
         );
+    }
+
+    /// A pnpm 9.15 install of `"lib-v4": "npm:lib@4.8.1"`, as pnpm wrote it
+    /// (`.modules.yaml` and `pnpm-lock.yaml` generated locally with pnpm
+    /// 9.15.4 over a public package, the name changed): the importer maps the
+    /// alias to `lib@4.8.1`, and `packages` is keyed by the real name.
+    fn pnpm_alias_install(root: &Path, packages_key: &str) {
+        install_alias(root, "lib-v4", "lib", "4.8.1");
+        write(
+            &root.join("node_modules").join(".modules.yaml"),
+            "hoistPattern:\n  - '*'\nlayoutVersion: 5\nnodeLinker: isolated\nregistries:\n  default: https://registry.npmjs.org/\n",
+        );
+        write(
+            &root.join("pnpm-lock.yaml"),
+            &format!(
+                "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .:\n    dependencies:\n      lib-v4:\n        specifier: npm:lib@4.8.1\n        version: lib@4.8.1\n\npackages:\n\n  {packages_key}:\n    resolution: {{integrity: sha512-abc}}\n\nsnapshots:\n\n  {packages_key}: {{}}\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn a_pnpm_alias_is_asked_under_its_real_name() {
+        let dir = tempfile::tempdir().unwrap();
+        pnpm_alias_install(dir.path(), "lib@4.8.1");
+        assert_eq!(
+            asked(request(&specifiers(&["lib-v4"]), &install_at(dir.path()))),
+            one("lib", "4.8.1", &["lib"])
+        );
+    }
+
+    #[test]
+    fn a_pnpm_alias_whose_packages_entry_is_not_the_real_name_at_the_version_is_left_unasked() {
+        // The alias's own name as the key (a form pnpm does not write for an
+        // alias), and a different version than the installed one.
+        for key in ["lib-v4@4.8.1", "lib@4.8.0"] {
+            let dir = tempfile::tempdir().unwrap();
+            pnpm_alias_install(dir.path(), key);
+            assert_eq!(
+                asked(request(&specifiers(&["lib-v4"]), &install_at(dir.path()))),
+                vec![],
+                "{key}"
+            );
+        }
+    }
+
+    /// A Yarn Berry 4.18 install of `"lib-v4": "npm:lib@4.8.1"`, as Yarn
+    /// wrote it (`yarn.lock` generated locally with Yarn 4.18.1 over a public
+    /// package, the name changed): the key is `<alias>@npm:<real>@<range>` and
+    /// the resolution names the real package.
+    fn berry_alias_install(root: &Path, key: &str, resolution: &str) {
+        install_alias(root, "lib-v4", "lib", "4.8.1");
+        write(
+            &root.join("yarn.lock"),
+            &format!(
+                "__metadata:\n  version: 10\n  cacheKey: 10c0\n\n\"{key}\":\n  version: 4.8.1\n  resolution: \"{resolution}\"\n  checksum: 10c0/abc\n  languageName: node\n  linkType: hard\n\n\"t@workspace:.\":\n  version: 0.0.0-use.local\n  resolution: \"t@workspace:.\"\n  dependencies:\n    lib-v4: \"npm:lib@4.8.1\"\n  languageName: unknown\n  linkType: soft\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn a_yarn_berry_alias_is_asked_under_its_real_name() {
+        let dir = tempfile::tempdir().unwrap();
+        berry_alias_install(dir.path(), "lib-v4@npm:lib@4.8.1", "lib@npm:4.8.1");
+        assert_eq!(
+            asked(request(&specifiers(&["lib-v4"]), &install_at(dir.path()))),
+            one("lib", "4.8.1", &["lib"])
+        );
+        // Several ranges resolving to the one entry join in its key.
+        let joined = tempfile::tempdir().unwrap();
+        berry_alias_install(
+            joined.path(),
+            "lib-v4@npm:lib@4.8.1, lib-v4@npm:lib@4.x",
+            "lib@npm:4.8.1",
+        );
+        assert_eq!(
+            asked(request(
+                &specifiers(&["lib-v4"]),
+                &install_at(joined.path())
+            )),
+            one("lib", "4.8.1", &["lib"])
+        );
+    }
+
+    #[test]
+    fn a_yarn_berry_alias_in_a_form_this_scanner_cannot_read_is_left_unasked() {
+        // Resolved by another protocol; keyed as a plain package of the real
+        // name (no alias entry); an alias of another package than the one
+        // installed.
+        for (key, resolution) in [
+            (
+                "lib-v4@npm:lib@4.8.1",
+                "lib@patch:lib@npm%3A4.8.1#./p.patch::version=4.8.1",
+            ),
+            ("lib@npm:4.8.1", "lib@npm:4.8.1"),
+            ("lib-v4@npm:other@4.8.1", "lib@npm:4.8.1"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            berry_alias_install(dir.path(), key, resolution);
+            assert_eq!(
+                asked(request(&specifiers(&["lib-v4"]), &install_at(dir.path()))),
+                vec![],
+                "{key} {resolution}"
+            );
+        }
     }
 
     /// The Deno lockfiles of `tests/fixtures/deno-lock` (carrick#1720): each
