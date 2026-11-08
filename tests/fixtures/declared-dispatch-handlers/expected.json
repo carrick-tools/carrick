@@ -1,0 +1,17 @@
+{
+  "_doc": "Answer key for tests/declared_dispatch_handlers_test.rs (carrick#2076). `placed`: each declared operation's row location and handler span, by service and dispatch value. A handler the block names that is not defined in its file keeps line 0 and no span.",
+  "placed": {
+    "ledger-fn": {
+      "credit": { "at": "ledger-fn/src/index.ts:36", "span": [36, 39] },
+      "debit": { "at": "ledger-fn/src/index.ts:41", "span": [41, 44] }
+    },
+    "notes-fn": {
+      "add": { "at": "notes-fn/src/index.ts:48", "span": [48, 53] },
+      "list": { "at": "notes-fn/src/index.ts:55", "span": [55, 59] },
+      "search": { "at": "notes-fn/src/index.ts:55", "span": [55, 59] },
+      "purge": { "at": "notes-fn/src/index.ts:61", "span": [61, 65] },
+      "archive": { "at": "notes-fn/src/index.ts:67", "span": [67, 71] },
+      "export": { "at": "notes-fn/src/index.ts:0", "span": null }
+    }
+  }
+}

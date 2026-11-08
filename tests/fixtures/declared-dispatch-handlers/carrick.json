@@ -1,0 +1,31 @@
+{
+  "services": [
+    { "name": "ledger-fn", "directory": "ledger-fn" },
+    { "name": "notes-fn", "directory": "notes-fn" },
+    { "name": "notes-web", "directory": "notes-web" }
+  ],
+  "operations": [
+    {
+      "service": "ledger-fn",
+      "route": "POST /ledger",
+      "dispatch": { "location": "body", "field": "op" },
+      "operations": [
+        { "value": "credit", "handler": "ledger-fn/src/index.ts:credit" },
+        { "value": "debit", "handler": "ledger-fn/src/index.ts:debit" }
+      ]
+    },
+    {
+      "service": "notes-fn",
+      "route": "POST /notes",
+      "dispatch": { "location": "body", "field": "kind" },
+      "operations": [
+        { "value": "add", "handler": "notes-fn/src/index.ts:addNote" },
+        { "value": "list", "handler": "notes-fn/src/index.ts:listNotes" },
+        { "value": "search", "handler": "notes-fn/src/index.ts:listNotes" },
+        { "value": "purge", "handler": "notes-fn/src/index.ts:purgeNotes" },
+        { "value": "archive", "handler": "notes-fn/src/index.ts:archiveNotes" },
+        { "value": "export", "handler": "notes-fn/src/index.ts:exportNotes" }
+      ]
+    }
+  ]
+}
