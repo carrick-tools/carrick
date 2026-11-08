@@ -83,7 +83,7 @@ function machineWith(options: {
 test("an older global is upgraded to the running version, and the run says so", () => {
   const said: string[] = [];
   const { machine, installs } = machineWith({ versions: ["0.3.81", "0.3.84"] });
-  const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
+  const outcome = syncGlobalInstall({ target: "0.3.84", machine, say: (line) => said.push(line) });
   assert.deepEqual(outcome, { kind: "upgraded", from: "0.3.81", to: "0.3.84", warning: null });
   assert.deepEqual(installs, [["npm", "install", "-g", "carrick@0.3.84"]]);
   assert.equal(said.length, 2, said.join(" | "));
@@ -120,7 +120,7 @@ test("a refused install prints the reason and one command, and does not retry", 
     ok: false,
     reason: "npm error notarget No matching version found for carrick@0.3.84 with a date before …",
   });
-  const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
+  const outcome = syncGlobalInstall({ target: "0.3.84", machine, say: (line) => said.push(line) });
   assert.equal(outcome.kind, "refused");
   assert.equal(installs.length, 1, "a refusal is not retried with more force");
   assert.equal(said.length, 1, "the refusal is the run's closing line, not a progress one");
@@ -133,7 +133,7 @@ test("an install that reported success but left an older carrick first on PATH i
   // The second `find` is the verification: a second install earlier on PATH,
   // or a version manager's shim, answers first and was never touched.
   const { machine } = machineWith({ versions: ["0.3.81", "0.3.81"], binary: "/opt/shim/carrick" });
-  const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
+  const outcome = syncGlobalInstall({ target: "0.3.84", machine, say: (line) => said.push(line) });
   assert.equal(outcome.kind, "stale");
   assert.match(outcome.warning!, /still runs 0\.3\.81 from \/opt\/shim\/carrick/);
   assert.match(outcome.warning!, /npm install -g carrick@0\.3\.84/);
@@ -142,7 +142,7 @@ test("an install that reported success but left an older carrick first on PATH i
 test("an install that put nothing on PATH says which directory is missing from it", () => {
   const said: string[] = [];
   const { machine } = machineWith({ versions: ["0.3.81"] });
-  const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
+  const outcome = syncGlobalInstall({ target: "0.3.84", machine, say: (line) => said.push(line) });
   assert.equal(outcome.kind, "stale");
   assert.match(outcome.warning!, /nothing answers to `carrick` on PATH/);
 });
@@ -151,7 +151,7 @@ test("a current, newer or unreadable global is left alone and says nothing", () 
   for (const version of ["0.3.84", "0.4.0", null]) {
     const said: string[] = [];
     const { machine, installs } = machineWith({ versions: [version] });
-    const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
+    const outcome = syncGlobalInstall({ target: "0.3.84", machine, say: (line) => said.push(line) });
     assert.notEqual(outcome.kind, "upgraded");
     assert.deepEqual(installs, [], `${version} was installed over`);
     assert.deepEqual(said, [], `${version} printed ${said.join(" | ")}`);
@@ -166,7 +166,7 @@ test("a global that is a project dependency is reported, never installed over", 
     kind: "project",
     manifest: "/repo/package.json",
   });
-  const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
+  const outcome = syncGlobalInstall({ target: "0.3.84", machine, say: (line) => said.push(line) });
   assert.equal(outcome.kind, "stale");
   assert.deepEqual(installs, []);
   assert.deepEqual(said, [], "nothing was upgraded, so there is no progress to report");
@@ -176,7 +176,7 @@ test("a global that is a project dependency is reported, never installed over", 
 test("nothing on PATH is not a reason to install anything", () => {
   const said: string[] = [];
   const { machine, installs } = machineWith({ versions: [] });
-  const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
+  const outcome = syncGlobalInstall({ target: "0.3.84", machine, say: (line) => said.push(line) });
   assert.deepEqual(outcome, { kind: "skipped", why: "no carrick on PATH", warning: null });
   assert.deepEqual(installs, []);
   assert.deepEqual(said, []);
