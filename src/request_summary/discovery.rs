@@ -5121,8 +5121,11 @@ export function listen(): void {
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = without_files(
-            without_files(instance_ends(&decided), MODULE_ALIAS_FILES),
-            GETTER_FILES,
+            without_files(
+                without_files(instance_ends(&decided), MODULE_ALIAS_FILES),
+                GETTER_FILES,
+            ),
+            CALL_RESULT_FILES,
         );
         assert_eq!(
             got,
@@ -5148,6 +5151,9 @@ export function listen(): void {
 
     /// The `receiver-forms-routes` files carrick#3489 W4 reads.
     const GETTER_FILES: &[&str] = &["src/ri-getter.ts:", "src/s-getter-builds.ts:"];
+
+    /// The `receiver-forms-routes` files carrick#3504 S3c reads.
+    const CALL_RESULT_FILES: &[&str] = &["src/s-call-result.ts:"];
 
     /// `ends` without the lines of the files named by `prefixes`.
     fn without_files(ends: Vec<String>, prefixes: &[&str]) -> Vec<String> {
@@ -5239,6 +5245,30 @@ export function listen(): void {
             texts(&[
                 "src/ri-getter.ts:3 <- src/ri-getter.ts:3 root src/ri-getter.ts:2",
                 "src/s-getter-builds.ts:2 <- src/s-getter-builds.ts:2 root src/s-getter-builds.ts:2",
+            ]),
+            "{got:#?}"
+        );
+    }
+
+    /// carrick#3504 S3c: a receiver that is the call of an own function
+    /// holds what the function returns: `getApp().get(..)` where `getApp`
+    /// returns a module-scope instance ends at that instance's maker.
+    #[test]
+    fn a_function_result_receiver_holds_what_the_function_returns() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-routes")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = only_files(instance_ends(&decided), CALL_RESULT_FILES);
+        assert_eq!(
+            got,
+            texts(&[
+                "src/s-call-result.ts:4 <- src/s-call-result.ts:4 root src/s-call-result.ts:2",
             ]),
             "{got:#?}"
         );

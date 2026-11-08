@@ -374,6 +374,11 @@
   "source": "ES5",
   "status": "lead"
  },
+ "ri-call-result": {
+  "feature": "call result of an own function as the receiver",
+  "source": "ES5",
+  "status": "covered"
+ },
  "ri-class-field": {
   "feature": "class field holding an instance",
   "source": "test262 (class-fields-public)",

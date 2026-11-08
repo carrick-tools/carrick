@@ -524,6 +524,13 @@
   "kind": "endpoint",
   "source": "ES5"
  },
+ "ri-call-result": {
+  "carries": "target",
+  "expect": "/p/ri-call-result",
+  "feature": "call result of an own function as the receiver",
+  "kind": "endpoint",
+  "source": "ES5"
+ },
  "ri-class-field": {
   "carries": "target",
   "expect": "/p/ri-class-field",

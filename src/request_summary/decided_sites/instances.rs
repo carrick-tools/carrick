@@ -1397,9 +1397,20 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         else {
             return false;
         };
+        self.returns(file, key, at, Some(format!("this.{field}")));
+        true
+    }
+
+    /// What the function `key` of `file` returns is the instance at `at`
+    /// (carrick#3504 S3c): an own factory's makers are read as a call's are;
+    /// any other return is read where it is written (a name the compiler
+    /// declares, or a field of the class), and a return nothing reads is a
+    /// hole carrying `unread`. A function already being followed ends
+    /// nothing again.
+    fn returns(&mut self, file: &Path, key: String, at: &str, unread: Option<String>) {
         let here = (file.to_path_buf(), key.clone());
         if !self.factories.insert(here.clone()) {
-            return true;
+            return;
         }
         let function = self
             .inputs
@@ -1421,11 +1432,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 self.client(&maker, file, at.to_string());
             }
         } else if values.is_empty() {
-            self.hole(
-                at.to_string(),
-                InstanceHole::Unread,
-                Some(format!("this.{field}")),
-            );
+            self.hole(at.to_string(), InstanceHole::Unread, unread);
         } else {
             for value in values {
                 match value {
@@ -1438,7 +1445,6 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             }
         }
         self.factories.remove(&here);
-        true
     }
 
     /// The maker of `client`, an instance read in `file`: a labelled maker
@@ -1496,27 +1502,10 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     self.returned_at(placed, at);
                     return;
                 }
-                let returned = target.as_ref().and_then(|(target_file, key)| {
-                    self.inputs
-                        .files
-                        .get(target_file)?
-                        .functions
-                        .get(key)?
-                        .returned
-                        .as_ref()
-                });
-                let (Some((target_file, key)), Some(returned)) = (target.clone(), returned) else {
-                    self.hole(at, InstanceHole::Unread, None);
-                    return;
-                };
-                let here = (target_file.clone(), key);
-                if !self.factories.insert(here.clone()) {
-                    return;
+                match target {
+                    Some((target_file, key)) => self.returns(&target_file, key, &at, None),
+                    None => self.hole(at, InstanceHole::Unread, None),
                 }
-                for maker in returned.makers.clone() {
-                    self.client(&maker, &target_file, at.clone());
-                }
-                self.factories.remove(&here);
             }
         }
     }
