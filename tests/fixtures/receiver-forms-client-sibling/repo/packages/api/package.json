@@ -1,0 +1,7 @@
+{
+  "name": "@fixture/api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@fixture/mk": "^3.0.0" },
+  "main": "src/index.ts"
+}

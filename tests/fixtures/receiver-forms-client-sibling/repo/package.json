@@ -1,0 +1,9 @@
+{
+  "name": "receiver-forms-client-sibling",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*", "services/*"],
+  "dependencies": {
+    "@fixture/mk": "^3.0.0"
+  }
+}
