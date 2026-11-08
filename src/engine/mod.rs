@@ -20767,6 +20767,45 @@ unfollowed_member_calls_total: 0,
         assert!(rows.is_empty(), "{rows:#?}");
     }
 
+    /// carrick#3547 S2, R4: the HTTP reading still contests a local client
+    /// by name. A parameter of the same name handed on in another function
+    /// leaves nothing read through the local client, as before the message
+    /// roles kept their uses by binding; without that parameter the base is
+    /// read.
+    #[test]
+    fn a_local_client_beside_a_handed_on_parameter_of_its_name_reads_as_before() {
+        let source = |extra: &str| {
+            format!(
+                "import http from \"@fixture/http\";\n\
+                 export function local() {{\n\
+                 \x20 const api = http.create({{ baseURL: \"/local\" }});\n\
+                 \x20 return api.get(\"/users\");\n\
+                 }}\n\
+                 declare function keep(value: unknown): unknown;\n\
+                 {extra}"
+            )
+        };
+        let targets = |source: &str| -> Vec<(u32, String)> {
+            let (dir, discovery) = discover_sources(&[("src/local.ts", source)]);
+            library_rows_of(&dir, &discovery, "src/local.ts", &verified_sample())
+                .iter()
+                .map(|row| (row.line, row.target.clone()))
+                .collect()
+        };
+        assert_eq!(
+            targets(&source("")),
+            vec![(4, "/local/users".to_string())],
+            "the control reads the base through the client"
+        );
+        let held = targets(&source(
+            "export function held(api: unknown) { return keep(api); }\n",
+        ));
+        assert!(
+            held.iter().all(|(_, target)| target != "/local/users"),
+            "{held:#?}"
+        );
+    }
+
     /// carrick#1564, third review: a call through an instance to a member
     /// outside its verified surface may change its base, so the instance
     /// holds no client; one that only calls verified verbs still does.
