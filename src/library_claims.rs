@@ -2051,7 +2051,8 @@ mod tests {
             "src/jobs.ts",
             "import { Queue, Worker } from \"@fixture/queue\";\n\
              export async function run() {\n\
-             \x20 await new Queue(\"orders\").add(\"job\", {});\n\
+             \x20 const orders = new Queue(\"orders\");\n\
+             \x20 await orders.add(\"job\", {});\n\
              \x20 const w = new Worker(\"orders\", async () => {});\n\
              \x20 w.on(\"completed\", () => {});\n\
              \x20 await w.close();\n\
@@ -2069,8 +2070,8 @@ mod tests {
         assert_eq!(
             stated,
             vec![
-                (3, LibraryRowKind::Pubsub(PubsubRole::Publisher), "orders"),
-                (4, LibraryRowKind::Pubsub(PubsubRole::Subscriber), "orders"),
+                (4, LibraryRowKind::Pubsub(PubsubRole::Publisher), "orders"),
+                (5, LibraryRowKind::Pubsub(PubsubRole::Subscriber), "orders"),
             ],
             "{rows:#?}"
         );
