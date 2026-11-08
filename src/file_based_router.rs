@@ -179,13 +179,55 @@ impl StaticRoot {
 }
 
 /// The repo-relative file a call path names under a static root of
-/// `conventions`, when the file exists. Stub: implemented in the next commit.
+/// `conventions`, when the file exists.
+///
+/// Reads only a target that is a path on the service's own origin (leading
+/// `/`): an absolute URL or an environment-supplied base names a host this
+/// scan cannot tie to the service. The query and fragment are not part of the
+/// file. A path with an empty, `.` or `..` segment is never read, so a target
+/// cannot leave the folder, and a symlink out of the service is refused.
+/// A path under a static prefix whose file is not there is `None`: it stays a
+/// call that matches no route.
 pub fn static_asset_for(
-    _target: &str,
-    _service_root: &Path,
-    _repo_root: &Path,
-    _conventions: &[RoutingConvention],
+    target: &str,
+    service_root: &Path,
+    repo_root: &Path,
+    conventions: &[RoutingConvention],
 ) -> Option<String> {
+    let path = target.split(['?', '#']).next()?;
+    let rest_of_path = path.strip_prefix('/')?;
+    if rest_of_path
+        .split('/')
+        .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return None;
+    }
+    let service_canonical = service_root.canonicalize().ok()?;
+    for root in conventions.iter().flat_map(|c| &c.static_roots) {
+        let prefix = root.url_prefix.trim_end_matches('/');
+        let Some(under) = path.strip_prefix(prefix).and_then(|p| p.strip_prefix('/')) else {
+            continue;
+        };
+        if root.dir.split('/').any(|segment| segment == "..") {
+            continue;
+        }
+        let Ok(file) = service_root.join(&root.dir).join(under).canonicalize() else {
+            continue;
+        };
+        if !file.is_file() || !file.starts_with(&service_canonical) {
+            continue;
+        }
+        let relative = repo_root
+            .canonicalize()
+            .ok()
+            .and_then(|repo| file.strip_prefix(repo).ok().map(Path::to_path_buf))
+            .or_else(|| {
+                file.strip_prefix(&service_canonical)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })?;
+        return Some(relative.to_string_lossy().replace('\\', "/"));
+    }
     None
 }
 
