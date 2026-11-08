@@ -1368,8 +1368,8 @@ impl<'a> Calls<'a> {
     /// The service of the run that holds `file`: this one or an entered
     /// sibling, own where none does. The one holder rule the instance walk
     /// reads every file through (carrick#3527 S5); see `Resolver::inputs_for`.
-    pub(super) fn inputs_for(&self, file: &Path) -> &'a super::RequestSummaryInputs {
-        super::discovery::inputs_holding(self.own, &self.siblings, file)
+    pub(super) fn inputs_for(&self, _file: &Path) -> &'a super::RequestSummaryInputs {
+        self.own
     }
 
     /// Whether the definition `key` of `file` (this service's or a
