@@ -10,7 +10,7 @@
 //! every reader of the binding table treats them as unread. S3 merges the
 //! two into one `lower`.
 
-use swc_common::Span;
+use swc_common::{DUMMY_SP, Span, Spanned};
 use swc_ecma_ast::*;
 
 use super::ValueAt;
@@ -208,4 +208,87 @@ pub(in crate::request_summary) fn enum_text(
         entries.push((key, value));
     }
     ValueAt::Entries(entries)
+}
+
+/// One plain-key property of an object pattern declarator
+/// (`const { a, b: name, c = '/x' } = init`, carrick#3504 S2b-3): the name
+/// it binds, the key it reads, its span, and its default. A rest element, a
+/// nested pattern and a computed key are not plain keys.
+pub(in crate::request_summary) struct PatternMember<'p> {
+    pub(in crate::request_summary) bound: &'p BindingIdent,
+    pub(in crate::request_summary) key: String,
+    pub(in crate::request_summary) span: Span,
+    pub(in crate::request_summary) default: Option<&'p Expr>,
+}
+
+/// The plain-key properties of `pattern`, in source order.
+pub(in crate::request_summary) fn pattern_members(pattern: &ObjectPat) -> Vec<PatternMember<'_>> {
+    let mut out = Vec::new();
+    for prop in &pattern.props {
+        match prop {
+            ObjectPatProp::Assign(assign) => out.push(PatternMember {
+                bound: &assign.key,
+                key: assign.key.id.sym.to_string(),
+                span: assign.span,
+                default: assign.value.as_deref(),
+            }),
+            ObjectPatProp::KeyValue(entry) => {
+                let key = match &entry.key {
+                    PropName::Ident(name) => name.sym.to_string(),
+                    PropName::Str(text) => match text.value.as_str() {
+                        Some(text) => text.to_string(),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                let (bound, default) = match &*entry.value {
+                    Pat::Ident(bound) => (bound, None),
+                    Pat::Assign(assign) => match &*assign.left {
+                        Pat::Ident(bound) => (bound, Some(&*assign.right)),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                out.push(PatternMember {
+                    bound,
+                    key,
+                    span: entry.key.span().with_hi(entry.value.span().hi),
+                    default,
+                });
+            }
+            ObjectPatProp::Rest(_) => {}
+        }
+    }
+    out
+}
+
+impl PatternMember<'_> {
+    /// What the bound name states as text: the member of `init` the key
+    /// names, read where the property is written. A property with a default
+    /// is unread (`None`) until the names lowering reads `??`.
+    pub(in crate::request_summary) fn text(
+        &self,
+        init: &Expr,
+        shift: &dyn Fn(u32) -> u32,
+    ) -> Option<ValueAt> {
+        if self.default.is_some() {
+            return None;
+        }
+        Some(ValueAt::Member {
+            lo: shift(self.span.lo.0),
+            hi: shift(self.span.hi.0),
+            object: Box::new(text_of(init, shift)),
+            key: Box::new(ValueAt::Lit(self.key.clone())),
+        })
+    }
+
+    /// The member read `init.key` the property stands for, spanning the
+    /// property, for the value readers to lower as they do any member read.
+    pub(in crate::request_summary) fn read(&self, init: &Expr) -> Expr {
+        Expr::Member(MemberExpr {
+            span: self.span,
+            obj: Box::new(init.clone()),
+            prop: MemberProp::Ident(IdentName::new(self.key.as_str().into(), DUMMY_SP)),
+        })
+    }
 }

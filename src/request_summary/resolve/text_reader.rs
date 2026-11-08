@@ -214,6 +214,27 @@ impl<'a> Resolver<'a> {
             );
             return vec![TextValue::Text { text, read_from }];
         }
+        // An object literal written in place (`const { a } = { a: '/x' }`)
+        // cannot escape: its last entry with the key is the value.
+        if let ValueAt::Entries(entries) = object {
+            let value = match self.entry_of(file, entries, &key, true) {
+                Ok(Some(value)) => value,
+                Ok(None) => return hole(UnreadExpression),
+                Err(reason) => return hole(reason),
+            };
+            let mut out = self.text_values(file, value);
+            for entry in &mut out {
+                if let TextValue::Text {
+                    read_from: from, ..
+                } = entry
+                {
+                    let mut all = read_from.clone();
+                    note_all(&mut all, std::mem::take(from));
+                    *from = all;
+                }
+            }
+            return out;
+        }
         let ValueAt::Read {
             lo,
             hi,
@@ -248,24 +269,10 @@ impl<'a> Resolver<'a> {
                 true
             }
         };
-        let mut found = None;
-        for (name, value) in entries {
-            let name = match name {
-                ValueAt::Lit(name) => name.clone(),
-                other => match self.one_text(at.0, other) {
-                    Ok((name, _)) => name,
-                    Err(reason) => return hole(reason),
-                },
-            };
-            if name == key {
-                found = Some(value);
-                if !last {
-                    break;
-                }
-            }
-        }
-        let Some(value) = found else {
-            return hole(UnreadExpression);
+        let value = match self.entry_of(at.0, entries, &key, last) {
+            Ok(Some(value)) => value,
+            Ok(None) => return hole(UnreadExpression),
+            Err(reason) => return hole(reason),
         };
         let Some(_reading) = self.reading_text(&at) else {
             return hole(Recursion);
@@ -283,6 +290,31 @@ impl<'a> Resolver<'a> {
             }
         }
         out
+    }
+
+    /// The value of the entry named `key` in `entries` (keys read in
+    /// `file`): the last one with the key where `last`, else the first.
+    fn entry_of<'v>(
+        &self,
+        file: &Path,
+        entries: &'v [(ValueAt, ValueAt)],
+        key: &str,
+        last: bool,
+    ) -> Result<Option<&'v ValueAt>, guards::HoleReason> {
+        let mut found = None;
+        for (name, value) in entries {
+            let name = match name {
+                ValueAt::Lit(name) => name.clone(),
+                other => self.one_text(file, other).map(|(name, _)| name)?,
+            };
+            if name == key {
+                found = Some(value);
+                if !last {
+                    break;
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// `join`, `concat`, `replace`, `replaceAll` and `String.raw` of the
