@@ -290,7 +290,7 @@ export class SidecarClient {
 /**
  * The kinds each rows version holds: version 1 (carrick#2405); version 2 adds
  * `impl` and `jsx` (carrick#2430); version 3 adds `decl` (carrick#2448);
- * version 4 drops `impl` (carrick#2561).
+ * version 4 drops `impl` (carrick#2561); version 5 adds `typed_decl` (carrick#2448).
  */
 const VERSION_1_KINDS = new Set(['call', 'member', 'compare', 'ident']);
 const VERSION_2_KINDS = new Set([...VERSION_1_KINDS, 'impl', 'jsx']);

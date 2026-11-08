@@ -42,7 +42,7 @@
 //! (carrick#2448) added [`Kind::Decl`]; version 4 (carrick#2561) dropped
 //! `impl` rows, whose go-to-implementation search was most of the walk and
 //! which nothing read (carrick#2432 asks for implementations where discovery
-//! stops). A file of any other version is not
+//! stops); version 5 (carrick#2448) added [`Kind::TypedDecl`]. A file of any other version is not
 //! read: its service reads as [`HoleReason::RowsMissing`]. A walk removes any
 //! earlier rows file before it writes. The rows of a service a later laptop
 //! pass carries are used again instead of walked, only when [`kept_rows`]
@@ -73,7 +73,7 @@ use crate::services::type_sidecar::{PositionRowsCounts, SidecarRecipe};
 pub const POSITIONS_DIR: &str = "positions";
 
 /// The format version the header carries.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The type is `any`, declared or inferred. Never set with [`FLAG_ERROR_TYPE`].
 pub const FLAG_ANY: u8 = 1;
@@ -161,6 +161,14 @@ pub enum Kind {
     /// the tag names (for an intrinsic, the `JSX.IntrinsicElements` member)
     /// and the tag's type (an intrinsic's attributes).
     Jsx,
+    /// A `call` row's callee TYPE (carrick#2448): written beside a `call`
+    /// row, at its span, when the callee symbol is a value (a parameter, a
+    /// property, a local) and its type is a named function's own
+    /// (`send: typeof fetch`). The row names that function's declaration as
+    /// the compiler records it: symbol, file, line, package, and the
+    /// [`FLAG_PUBLISHED`] / [`FLAG_MODULE_DEFAULT`] bits; no type. None where
+    /// the callee symbol is that declaration, or the type is anonymous.
+    TypedDecl,
 }
 
 /// `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]`.
@@ -1298,6 +1306,61 @@ mod tests {
             Ok(Some("get"))
         );
         assert_eq!(index.union_declarations(&file, base, base + 3), Ok(&[][..]));
+    }
+
+    /// carrick#2448: a `typed_decl` row shares its call row's span and is
+    /// looked up by its own kind; it reads as `typed_decl` in the file.
+    #[test]
+    fn a_typed_decl_row_is_looked_up_beside_its_call_row() {
+        let root = Path::new("/repo");
+        let text = "send('/a');\n";
+        let typed = Row(
+            Kind::TypedDecl,
+            0,
+            10,
+            Some("fetch".to_string()),
+            Some("lib:lib.dom.d.ts".to_string()),
+            Some(39142),
+            None,
+            None,
+            FLAG_PUBLISHED,
+        );
+        assert!(
+            serde_json::to_string(&typed)
+                .unwrap()
+                .starts_with("[\"typed_decl\",")
+        );
+        let rows = RowsFile {
+            header: Header {
+                v: FORMAT_VERSION,
+                typescript: "6.0.2".to_string(),
+                service: "api".to_string(),
+                files: 1,
+            },
+            files: vec![file_rows(
+                "src/a.ts",
+                Some(text),
+                None,
+                vec![row(Kind::Call, 0, 10, Some("send"), 0), typed],
+            )],
+        };
+        let mut index = PositionIndex::of(root, rows);
+        let file = root.join("src/a.ts");
+        index.bind(&file, text);
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        let found = index
+            .lookup(&file, base, base + 10, Kind::TypedDecl)
+            .expect("typed row");
+        assert_eq!(
+            (found.symbol(), found.decl_file(), found.decl_line()),
+            (Some("fetch"), Some("lib:lib.dom.d.ts"), Some(39142))
+        );
+        assert_eq!(
+            index
+                .lookup(&file, base, base + 10, Kind::Call)
+                .map(Row::symbol),
+            Ok(Some("send"))
+        );
     }
 
     #[test]
