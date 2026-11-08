@@ -125,14 +125,6 @@ pub enum Unprepared {
         lockfile: &'static str,
         command: &'static str,
     },
-    /// A root `package.json` declares workspaces, no lockfile states their
-    /// install, and no `node_modules` is reachable (carrick#3289).
-    Workspace {
-        service: String,
-        /// Repo-relative directory of the root `package.json`.
-        install_root: String,
-        command: &'static str,
-    },
     /// A config mapping names a directory that is not on the checkout.
     Mapping {
         service: String,
@@ -147,9 +139,9 @@ impl Unprepared {
     /// The service this row is about.
     pub fn service(&self) -> &str {
         match self {
-            Unprepared::Dependencies { service, .. }
-            | Unprepared::Workspace { service, .. }
-            | Unprepared::Mapping { service, .. } => service,
+            Unprepared::Dependencies { service, .. } | Unprepared::Mapping { service, .. } => {
+                service
+            }
         }
     }
 
@@ -158,9 +150,7 @@ impl Unprepared {
     pub fn in_repo(&mut self, repo: &str) {
         let renamed = |service: &str| format!("{repo}/{service}");
         match self {
-            Unprepared::Dependencies { service, .. }
-            | Unprepared::Workspace { service, .. }
-            | Unprepared::Mapping { service, .. } => {
+            Unprepared::Dependencies { service, .. } | Unprepared::Mapping { service, .. } => {
                 *service = renamed(service);
             }
         }
@@ -179,18 +169,6 @@ impl Unprepared {
                 "`{service}`: dependencies are not installed. {lockfile} in {} states them and no \
                  node_modules is reachable from the service root, so every type that resolves \
                  through a package would be `any`. Run `{command}` in {}.",
-                display_dir(install_root),
-                display_dir(install_root)
-            ),
-            Unprepared::Workspace {
-                service,
-                install_root,
-                command,
-            } => format!(
-                "`{service}`: dependencies are not installed. package.json in {} declares \
-                 workspaces, no lockfile states them and no node_modules is reachable from the \
-                 service root, so every type that resolves through a package would be `any`. \
-                 Run `{command}` in {}.",
                 display_dir(install_root),
                 display_dir(install_root)
             ),
@@ -254,16 +232,6 @@ impl From<&Unprepared> for UnpreparedRow {
                     install_root.clone()
                 },
                 lockfile: (*lockfile).to_string(),
-            },
-            // The wire has no workspace kind (the blob shape is seams'): the
-            // file that states this install is the root `package.json`.
-            Unprepared::Workspace { install_root, .. } => UnpreparedRow::Dependencies {
-                install_root: if install_root.is_empty() {
-                    ".".to_string()
-                } else {
-                    install_root.clone()
-                },
-                lockfile: "package.json".to_string(),
             },
             Unprepared::Mapping {
                 declared_by,
@@ -394,22 +362,13 @@ fn dependencies_unprepared(
     // states an install, and nothing above it is asked about: a monorepo root
     // with its own lockfile and its own `node_modules` is not an install of a
     // nested workspace that has a lockfile of its own.
-    let Some((install_root, lockfile, command)) = ancestors_within(&service_root, repo_root)
-        .find_map(|dir| {
+    let (install_root, lockfile, command) =
+        ancestors_within(&service_root, repo_root).find_map(|dir| {
             candidates
                 .iter()
                 .find(|(lock, _)| dir.join(lock).is_file())
                 .map(|(lock, command)| (dir.clone(), *lock, *command))
-        })
-    else {
-        // No lockfile anywhere above the service. A Deno service has no
-        // workspace rule here; a package.json one does.
-        return if deno.is_none() {
-            workspace_unprepared(repo_root, &service_root, name)
-        } else {
-            None
-        };
-    };
+        })?;
     // An install that would install nothing is not one worth refusing over.
     if !declares_dependencies(&service_root, &install_root) {
         return None;
@@ -423,49 +382,6 @@ fn dependencies_unprepared(
         lockfile,
         command,
     })
-}
-
-/// A root `package.json` at or above the service that declares workspaces,
-/// with no lockfile and no `node_modules` between the service and it.
-///
-/// The caller has already found no lockfile above the service. The command is
-/// the package manager the root names in `packageManager`, else `npm install`.
-fn workspace_unprepared(repo_root: &Path, service_root: &Path, name: &str) -> Option<Unprepared> {
-    let (root, manifest) = ancestors_within(service_root, repo_root).find_map(|dir| {
-        let json = crate::packages::read_json_config(&dir.join("package.json")).ok()?;
-        declares_workspaces(&json).then_some((dir, json))
-    })?;
-    if ancestors_within(service_root, &root).any(|dir| dir.join("node_modules").is_dir()) {
-        return None;
-    }
-    let command = match manifest
-        .get("packageManager")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|spec| spec.split('@').next())
-    {
-        Some("pnpm") => "pnpm install",
-        Some("yarn") => "yarn install",
-        Some("bun") => "bun install",
-        _ => "npm install",
-    };
-    Some(Unprepared::Workspace {
-        service: name.to_string(),
-        install_root: relative(&root, repo_root),
-        command,
-    })
-}
-
-/// `workspaces` as an array, or as the object form with a `packages` array,
-/// naming at least one pattern.
-fn declares_workspaces(json: &serde_json::Value) -> bool {
-    match json.get("workspaces") {
-        Some(serde_json::Value::Array(patterns)) => !patterns.is_empty(),
-        Some(serde_json::Value::Object(object)) => object
-            .get("packages")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|patterns| !patterns.is_empty()),
-        _ => false,
-    }
 }
 
 /// Whether anything from the service root up to the install root declares a
