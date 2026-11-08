@@ -57,7 +57,7 @@
  "n-default-param": {
   "feature": "default-parameters",
   "source": "test262",
-  "status": "lead"
+  "status": "covered"
  },
  "n-destr-assign": {
   "feature": "destructuring-assignment",

@@ -55,6 +55,7 @@ use swc_common::{SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::resolve::Resolver;
 use super::row_calls::Reach;
 use super::{CallIr, FnIr, KeyState, Piece, RequestSummaryInputs, Value, concat, render_target};
 
@@ -1441,11 +1442,27 @@ fn argument(call: &CallIr, index: usize) -> Option<&Value> {
 /// parameter filled from the arguments `call` writes. A position the call
 /// does not write, or one after a spread, is not known.
 fn filled(pieces: &[Piece], call: &CallIr) -> Vec<Piece> {
+    filled_with(pieces, call, &|_| None)
+}
+
+/// [`filled`], where a position the call omits (no argument, no spread)
+/// takes `default(position)`, the text the callee gives it, when it states
+/// one (carrick#3504 S2b-2). A destructured key's default is a gap: its
+/// name is not read as a key of the parameter (`keyed_names`).
+fn filled_with(
+    pieces: &[Piece],
+    call: &CallIr,
+    default: &dyn Fn(usize) -> Option<String>,
+) -> Vec<Piece> {
+    let omitted = |index: usize| call.args.len() <= index && call.spread_from.is_none();
+    let lit = |text: Option<String>| vec![text.map_or(Piece::Unknown, Piece::Lit)];
     concat(pieces.iter().map(|piece| {
         match piece {
-            Piece::Param(index, _) => {
-                argument(call, *index).map_or(vec![Piece::Unknown], Value::pieces)
-            }
+            Piece::Param(index, _) => match argument(call, *index) {
+                Some(value) => value.pieces(),
+                None if omitted(*index) => lit(default(*index)),
+                None => vec![Piece::Unknown],
+            },
             Piece::ParamKey(index, key, name) => match argument(call, *index) {
                 Some(Value::Obj(object)) => object
                     .fields
@@ -1839,6 +1856,8 @@ pub(crate) fn relative(root: &Path, file: &Path) -> String {
 struct Walk<'a, 'i> {
     calls: &'i Calls<'a>,
     inputs: &'i RequestSummaryInputs,
+    /// Reads the defaults an omitted argument takes (carrick#3504 S2b-2).
+    resolver: Resolver<'i>,
     root: &'i Path,
     /// With the receiver trace on, the makers the store labels: each site's
     /// instance is walked to them ([`instances`]).
@@ -1897,6 +1916,25 @@ struct Join<'a> {
 }
 
 impl<'a> Walk<'a, '_> {
+    /// [`filled_with`], with the defaults the function `callee` (definition
+    /// `key` of `file`) gives its parameters, each read as exactly one text
+    /// (carrick#3504 S2b-2).
+    fn fill(&self, pieces: &[Piece], call: &CallIr, callee: (&Path, Option<&str>)) -> Vec<Piece> {
+        let function = callee
+            .1
+            .and_then(|key| self.resolver.function(callee.0, key));
+        let Some((at, function)) = function else {
+            return filled(pieces, call);
+        };
+        filled_with(pieces, call, &|index| {
+            let (_, text) = function
+                .param_default_texts
+                .iter()
+                .find(|(position, _)| *position == index)?;
+            self.resolver.text_of_value(at, text)
+        })
+    }
+
     /// `down` is the calls from the site (first) to the labelled call
     /// (last).
     fn site(
@@ -2262,7 +2300,7 @@ impl<'a> Walk<'a, '_> {
         }
         path.push(here);
         for caller in callers {
-            let value = filled(&own, caller.call);
+            let value = self.fill(&own, caller.call, (placed.file, placed.key));
             let mut longer = vec![*caller];
             longer.extend_from_slice(down);
             // The boundary rule (carrick#2618): a sibling's call never states
@@ -2839,6 +2877,7 @@ fn decide(
     let mut walk = Walk {
         calls: &calls,
         inputs,
+        resolver: Resolver::new(inputs, &calls.siblings),
         root,
         makers,
         scopes,
@@ -3009,7 +3048,7 @@ fn decide(
                 .and_then(|pieces| to_definition(pieces, below.depth))
                 .map(|own| {
                     args[k] = parameter_positions(&own);
-                    filled(&own, chain[k].call)
+                    walk.fill(&own, chain[k].call, (below.file, below.key))
                 });
         }
         let Some(top) = values[0].clone() else {

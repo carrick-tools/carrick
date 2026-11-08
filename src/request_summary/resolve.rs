@@ -1101,6 +1101,10 @@ pub(super) struct ParamValues {
     pub(super) held: HashMap<BindingKey, Vec<ValueAt>>,
     /// `(position, keys, the default's values)`.
     pub(super) defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
+    /// `(position, the default's text)` of each whole parameter with a
+    /// default: what a call that omits the position states ([`text_of`],
+    /// carrick#3504 S2b-2).
+    pub(super) default_texts: Vec<(usize, ValueAt)>,
 }
 
 impl Reader<'_> {
@@ -1465,6 +1469,7 @@ impl Reader<'_> {
     ) -> ParamValues {
         let mut out = ParamValues::default();
         let bound = guards::Bound::default();
+        let identity = |lo: u32| lo;
         for (index, pat) in params.into_iter().enumerate() {
             let pattern = match pat {
                 Pat::Assign(assign) => {
@@ -1474,6 +1479,8 @@ impl Reader<'_> {
                             Vec::new(),
                             self.value_of(&assign.right, scope, &bound),
                         ));
+                        out.default_texts
+                            .push((index, text_of(&assign.right, &identity)));
                     }
                     &*assign.left
                 }
