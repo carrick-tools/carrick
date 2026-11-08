@@ -1,0 +1,36 @@
+{
+  "library_claims": [
+    {
+      "package": "wirelink",
+      "version": "4.2.0",
+      "status": "answered",
+      "surface_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "exports": [
+        {
+          "specifier": "wirelink",
+          "export": "Link",
+          "role": "socket",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [
+            { "form": "new", "member": null, "picker": "fixture-picker" }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "send",
+              "on": "instance",
+              "name": { "arg": 0 },
+              "payload": { "arg": 1 },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "npm-alias-install-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "wirelink-v4": "npm:wirelink@4.x"
+  }
+}
