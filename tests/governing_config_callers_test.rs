@@ -112,6 +112,17 @@ fn alias_in_a_member_jsconfig_resolves() {
     assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
 }
 
+/// `web/tsconfig.json` lists only TypeScript sources and `web/jsconfig.json`
+/// beside it lists the JavaScript ones; the service is the root and has no
+/// fallback config. The language service asks the jsconfig for a file the
+/// tsconfig lists nowhere (carrick#3497 R-N1, regression of carrick#3533).
+#[test]
+fn a_jsconfig_beside_a_tsconfig_that_does_not_list_the_file_governs_it() {
+    let calls = scan_calls("ts-beside-js");
+    assert!(calls_get(&calls, "viaRelative"), "control: {calls:?}");
+    assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
+}
+
 /// The service names no config and holds no `tsconfig.json`: the fallback is
 /// the `tsconfig.app.json` at its root, not the repo root's `{}` above it.
 #[test]

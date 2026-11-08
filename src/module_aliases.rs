@@ -38,8 +38,9 @@ use crate::workspace_resolver::normalize;
 const MAX_EXTENDS_DEPTH: usize = 16;
 
 /// Config file names read here, in the order a directory is checked for the
-/// config that governs it. `tsconfig.json` shadows `jsconfig.json` in one
-/// directory, as it does for the TypeScript language service.
+/// config that governs it. In one directory `tsconfig.json` is asked first
+/// and a `jsconfig.json` beside it is asked when the tsconfig lists the file
+/// nowhere, as the TypeScript language service does.
 pub(crate) const TS_CONFIG_NAMES: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
 
 /// The names a service root is searched for, in order (carrick#3497). The
@@ -113,9 +114,9 @@ pub(crate) struct Governing {
     dir: PathBuf,
     /// The fallback ([`service_config`]); `None` for none.
     service: Option<PathBuf>,
-    /// Directory under the service -> the tsconfig (else jsconfig) in it,
-    /// repo-relative.
-    per_dir: BTreeMap<PathBuf, PathBuf>,
+    /// Directory under the service -> the tsconfig and the jsconfig in it
+    /// (those that exist, in [`TS_CONFIG_NAMES`] order), repo-relative.
+    per_dir: BTreeMap<PathBuf, Vec<PathBuf>>,
     /// Config -> the projects it and its `references` reach, for every
     /// config above that could be read.
     graphs: BTreeMap<PathBuf, ProjectGraph>,
@@ -123,16 +124,16 @@ pub(crate) struct Governing {
 }
 
 impl Governing {
-    /// `config_dirs` is directory -> the tsconfig or jsconfig in it (tsconfig
+    /// `config_dirs` is directory -> the tsconfig and jsconfig in it (tsconfig
     /// first), repo-relative, as the manifest walk found them.
     pub(crate) fn new(
         repo_root: &Path,
         scope: &ServiceScope,
-        config_dirs: &BTreeMap<PathBuf, PathBuf>,
+        config_dirs: &BTreeMap<PathBuf, Vec<PathBuf>>,
         internal_package_dirs: &BTreeMap<String, PathBuf>,
     ) -> Self {
         let service = service_config(repo_root, &scope.dir, scope.named.as_deref());
-        let per_dir: BTreeMap<PathBuf, PathBuf> = config_dirs
+        let per_dir: BTreeMap<PathBuf, Vec<PathBuf>> = config_dirs
             .iter()
             .filter(|(dir, _)| dir.starts_with(&scope.dir))
             .map(|(dir, config)| (dir.clone(), config.clone()))
@@ -140,7 +141,7 @@ impl Governing {
         let canonical_root = canonical(repo_root);
         let graphs = service
             .iter()
-            .chain(per_dir.values())
+            .chain(per_dir.values().flatten())
             .filter_map(|config| {
                 let graph = ProjectGraph::new(
                     &canonical_root,
@@ -185,7 +186,7 @@ impl Governing {
         let mut configs: BTreeSet<PathBuf> = self
             .service
             .iter()
-            .chain(self.per_dir.values())
+            .chain(self.per_dir.values().flatten())
             .cloned()
             .collect();
         for graph in self.graphs.values() {
@@ -204,12 +205,12 @@ impl Governing {
             if !dir.starts_with(&self.dir) {
                 return None;
             }
-            let owner = self
-                .per_dir
-                .get(dir)
-                .and_then(|config| self.graphs.get(config))
-                .and_then(|graph| graph.owner_of(absolute))
-                .and_then(|owner| self.relative(owner));
+            let owner = self.per_dir.get(dir).and_then(|configs| {
+                configs.iter().find_map(|config| {
+                    let owner = self.graphs.get(config)?.owner_of(absolute)?;
+                    self.relative(owner)
+                })
+            });
             if owner.is_some() {
                 return owner;
             }
@@ -384,6 +385,8 @@ impl ModuleAliases {
     ) -> Self {
         let mut aliases = ModuleAliases::default();
         let mut ts_dirs: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+        // Every tsconfig and jsconfig per directory, in `TS_CONFIG_NAMES` order.
+        let mut governing_dirs: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
         for config in configs {
             let Some(name) = config.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -398,7 +401,15 @@ impl ModuleAliases {
                 }
                 "deno.json" | "deno.jsonc" => aliases.read_deno_config(repo_root, config),
                 _ if TS_CONFIG_NAMES.contains(&name) => {
-                    // tsconfig.json wins over jsconfig.json in one directory.
+                    let beside = governing_dirs.entry(dir.clone()).or_default();
+                    beside.push(config.clone());
+                    beside.sort_by_key(|c| {
+                        TS_CONFIG_NAMES
+                            .iter()
+                            .position(|n| c.file_name() == Some((*n).as_ref()))
+                    });
+                    // The nearest mapping of a file outside every service
+                    // reads one config per directory: tsconfig.json first.
                     match ts_dirs.get(&dir) {
                         Some(existing)
                             if existing.file_name() == Some("tsconfig.json".as_ref()) => {}
@@ -415,7 +426,8 @@ impl ModuleAliases {
             aliases.ts_configs.insert(dir.clone(), mapping);
         }
         if let Some(scope) = scope {
-            let governing = Governing::new(repo_root, scope, &ts_dirs, internal_package_dirs);
+            let governing =
+                Governing::new(repo_root, scope, &governing_dirs, internal_package_dirs);
             for config in governing.configs() {
                 let mapping = aliases.ts_mapping(repo_root, &config, internal_package_dirs);
                 aliases.governing_mappings.insert(config, mapping);
@@ -1009,6 +1021,26 @@ mod tests {
         assert_eq!(
             governing(&repo, "", None, "src/b.ts").as_deref(),
             Some("tsconfig.json")
+        );
+    }
+
+    #[test]
+    fn a_jsconfig_beside_a_tsconfig_that_does_not_list_the_file_governs_it() {
+        let repo = tree(&[
+            ("web/tsconfig.json", r#"{"include":["src/**/*.ts"]}"#),
+            ("web/jsconfig.json", "{}"),
+            ("web/src/a.js", ""),
+            ("web/src/b.ts", ""),
+        ]);
+        assert_eq!(
+            governing(&repo, "", None, "web/src/a.js").as_deref(),
+            Some("web/jsconfig.json"),
+            "the tsconfig lists no JavaScript"
+        );
+        assert_eq!(
+            governing(&repo, "", None, "web/src/b.ts").as_deref(),
+            Some("web/tsconfig.json"),
+            "a tsconfig that lists the file stays first"
         );
     }
 

@@ -79,8 +79,9 @@ const FILE_CONFIG_NAMES = ['tsconfig.json', 'jsconfig.json'];
  * The config each file of one service is typed under (carrick#1604,
  * carrick#3497 ruling R-N1): the one the TypeScript language service picks.
  * From the file's directory up to the service root, inclusive, each directory's
- * `tsconfig.json`, else `jsconfig.json`, is asked whether its program, or a
- * project it references, lists the file; the first that does types it (a
+ * `tsconfig.json`, then the `jsconfig.json` beside it, is asked whether its
+ * program, or a project it references, lists the file; the first that does
+ * types it (a
  * solution config hands the file to the reference that lists it). A config
  * that lists the file nowhere is passed over. The climb stops after a
  * directory named `node_modules`, as tsserver's does. A file no config inside
@@ -94,8 +95,8 @@ const FILE_CONFIG_NAMES = ['tsconfig.json', 'jsconfig.json'];
  */
 export class GoverningConfigs {
   private readonly root: string;
-  /** Directory -> the config in it, for every directory a climb visited. */
-  private readonly dirConfigs = new Map<string, string | undefined>();
+  /** Directory -> the configs in it, in order, for every directory a climb visited. */
+  private readonly dirConfigs = new Map<string, string[]>();
   /** Config -> its projects; undefined for one that cannot be read. */
   private readonly graphs = new Map<string, { graph: ProjectGraph; reported: number } | undefined>();
 
@@ -119,9 +120,10 @@ export class GoverningConfigs {
     for (;;) {
       const from = path.relative(this.root, dir);
       if (from.startsWith('..') || path.isAbsolute(from)) break;
-      const config = this.configIn(dir);
-      const owner = config === undefined ? undefined : this.listingOwner(config, absolute);
-      if (owner !== undefined) return owner;
+      for (const config of this.configsIn(dir)) {
+        const owner = this.listingOwner(config, absolute);
+        if (owner !== undefined) return owner;
+      }
       // tsserver looks in a `node_modules` directory itself, then stops.
       if (dir === this.root || path.basename(dir) === 'node_modules') break;
       dir = path.dirname(dir);
@@ -130,12 +132,13 @@ export class GoverningConfigs {
     return this.listingOwner(this.serviceConfig, absolute) ?? this.serviceConfig;
   }
 
-  private configIn(dir: string): string | undefined {
-    if (!this.dirConfigs.has(dir)) {
-      const name = FILE_CONFIG_NAMES.find((n) => fs.existsSync(path.join(dir, n)));
-      this.dirConfigs.set(dir, name === undefined ? undefined : path.join(dir, name));
+  private configsIn(dir: string): string[] {
+    let configs = this.dirConfigs.get(dir);
+    if (configs === undefined) {
+      configs = FILE_CONFIG_NAMES.map((n) => path.join(dir, n)).filter((c) => fs.existsSync(c));
+      this.dirConfigs.set(dir, configs);
     }
-    return this.dirConfigs.get(dir);
+    return configs;
   }
 
   /** The project reached from `config` that lists `file`, absolute. */
