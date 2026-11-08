@@ -1,0 +1,14 @@
+{
+  "services": [
+    {
+      "name": "client",
+      "directory": "services/client",
+      "tsconfig": "tsconfig.json"
+    },
+    {
+      "name": "server",
+      "directory": "services/server",
+      "tsconfig": "tsconfig.json"
+    }
+  ]
+}
