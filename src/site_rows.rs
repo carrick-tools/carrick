@@ -7,16 +7,19 @@
 //! the first two into rows on the index's operation keys and folds them with
 //! the rows the file reader stated at the same file, line and side.
 //!
-//! - **Kind to key.** `http` is an HTTP key; `topic` a pub/sub key with no
-//!   name scope; `message` and `event` pub/sub keys scoped `global` and
-//!   `service`, as library-claim rows are; a site labelled `in_process_bus`
-//!   is `service`-scoped whatever its kind, as library-claim rows are
-//!   (`topic` and `socket_event` included); `socket_event` a socket key whose
+//! - **Kind to key.** `http` is an HTTP key; `topic`, `message`, `event` and
+//!   `socket_event` are message keys whose name scope and socket direction
+//!   are [`crate::message_key`]'s, the same the library-claim writer asks
+//!   (carrick#3498): the scope the label's claim states wins, an
+//!   `in_process_bus` is `service` whatever the claim says, then the kind
+//!   (`message` `global`, `event` `service`), else no scope (a `topic` or
+//!   `socket_event` nothing scopes crosses services, carrick#3531). A socket's
 //!   direction is read from the label's side: a send on a server's socket
 //!   goes server to client, a send on a client's client to server, and a
-//!   handler the other way. A label the store marks `by_origin` takes its side
-//!   from the instance the receiver trace walked to (`socket_side`,
-//!   carrick#1670). A side neither states (`both`, or no trace) is `Unknown`.
+//!   handler the other way; `both` is `Unknown`. A label the store marks
+//!   `by_origin` takes its side from the instance the receiver trace walked
+//!   to (`socket_side`, carrick#1670). A side nothing states (no trace) is
+//!   `Unknown`.
 //! - **Provenance** (decided on carrick#2439, 2026-10-16). A row whose every
 //!   slot is forced is a fact: `request_summary` for an HTTP send,
 //!   `library_claim` for the rest. A row with any asked slot is `model`, a
@@ -625,15 +628,7 @@ fn filled(record: &SiteRecord, answered: Option<&Answered>, slot: Slot) -> Optio
 /// The socket direction a call or handler on a socket the label says is a
 /// `side` end takes. `None` for a side the label does not state.
 fn direction(side: Option<&str>, row: RowSide) -> SocketDirection {
-    match (side, row) {
-        (Some("server"), RowSide::Call) | (Some("client"), RowSide::Endpoint) => {
-            SocketDirection::ServerToClient
-        }
-        (Some("client"), RowSide::Call) | (Some("server"), RowSide::Endpoint) => {
-            SocketDirection::ClientToServer
-        }
-        _ => SocketDirection::Unknown,
-    }
+    crate::message_key::socket_direction(side, row).unwrap_or(SocketDirection::Unknown)
 }
 
 /// The side of the connection a socket site's call is made on. The label's
@@ -649,7 +644,11 @@ fn socket_side(label: Option<&SiteLabel>, site: &DecidedSite) -> Option<String> 
     }
 }
 
-/// The key a kind names for `name`, and its name scope.
+/// The key a kind names for `name`, and its name scope. A message kind's
+/// scope is [`crate::message_key::name_scope`]'s, the same the library-claim
+/// writer asks (carrick#3498): `claimed` is the scope the label's claim
+/// states, `in_process` whether the labelled end is an in-process bus.
+#[allow(clippy::too_many_arguments)]
 fn key_of(
     kind: &str,
     name: String,
@@ -657,44 +656,28 @@ fn key_of(
     namespace: Option<String>,
     side: Option<&str>,
     row: RowSide,
+    claimed: Option<carrick_match::NameScope>,
+    in_process: bool,
 ) -> Option<(OperationKey, Option<carrick_match::NameScope>)> {
-    let scoped = |scope: &str| carrick_match::NameScope {
-        scope: scope.to_string(),
-        namespace: namespace.clone(),
+    let scoped = |kind_scope: Option<&str>| {
+        crate::message_key::name_scope(in_process, claimed.clone(), kind_scope, namespace.clone())
     };
     Some(match kind {
         "http" => (OperationKey::http(method.unwrap_or_default(), name), None),
-        "topic" => (OperationKey::pubsub(name), None),
+        "topic" => (OperationKey::pubsub(name), scoped(None)),
         "message" => (
             OperationKey::pubsub(name),
-            Some(scoped(carrick_match::GLOBAL_SCOPE)),
+            scoped(Some(carrick_match::GLOBAL_SCOPE)),
         ),
         "event" => (
             OperationKey::pubsub(name),
-            Some(scoped(carrick_match::SERVICE_SCOPE)),
+            scoped(Some(carrick_match::SERVICE_SCOPE)),
         ),
-        "socket_event" => (OperationKey::socket(name, direction(side, row)), None),
+        "socket_event" => (
+            OperationKey::socket(name, direction(side, row)),
+            scoped(None),
+        ),
         _ => return None,
-    })
-}
-
-/// The name scope of a non-HTTP row at a site whose labelled end has the role
-/// `in_process_bus`: `service`, whatever kind the answer names, with the
-/// answered namespace kept. An in-process name never leaves its service, as
-/// the library-claim writer (`library_claims.rs`, `scoped`, ruling D4 on
-/// carrick#1564) already holds. Every other role keeps the scope its kind
-/// gave, and HTTP keys carry none.
-fn in_process_scope(
-    role: &str,
-    key: &OperationKey,
-    scope: Option<carrick_match::NameScope>,
-) -> Option<carrick_match::NameScope> {
-    if role != "in_process_bus" || matches!(key, OperationKey::Http { .. }) {
-        return scope;
-    }
-    Some(carrick_match::NameScope {
-        scope: carrick_match::SERVICE_SCOPE.to_string(),
-        namespace: scope.and_then(|scope| scope.namespace),
     })
 }
 
@@ -914,12 +897,15 @@ pub fn of(
             namespace,
             socket_side(label, site).as_deref(),
             side,
+            label
+                .and_then(|label| label.name_scope.as_ref())
+                .map(crate::library_claims::wire_scope_of),
+            site.end.role == "in_process_bus",
         ) else {
             out.leads.push(lead(UnreadReason::BelowBand));
             continue;
         };
         let base = request_base(site, &name_written, &key, side);
-        let name_scope = in_process_scope(&site.end.role, &key, name_scope);
         let fact = record.bucket == Bucket::Forced;
         // Every slot the model answered that feeds the key or the side:
         // forced slots are 1.0 and agreeing, so only asked ones can lower it.
@@ -1181,13 +1167,10 @@ pub fn fold_rows(
     for lead in &site.leads {
         let on_call = held_at(calls, &lead.file_path, lead.line_number);
         let on_endpoint = held_at(endpoints, &lead.file_path, lead.line_number);
-        let pubsub = lead.kind.as_deref() == Some("pubsub");
-        let held = match lead.role.as_deref() {
-            Some("consumer") if pubsub => on_endpoint,
-            Some("producer") if pubsub => on_call,
-            Some("consumer") => on_call,
-            Some("producer") => on_endpoint,
-            _ => on_call || on_endpoint,
+        let held = match crate::message_key::lead_side(lead.kind.as_deref(), lead.role.as_deref()) {
+            Some(RowSide::Call) => on_call,
+            Some(RowSide::Endpoint) => on_endpoint,
+            None => on_call || on_endpoint,
         };
         if held {
             out.lead_on_row_line += 1;

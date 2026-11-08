@@ -8168,9 +8168,13 @@ impl LibrarySiteIndex {
                 .insert((file.clone(), row.line, row.name.clone()));
             match row.kind {
                 LibraryRowKind::Pubsub(role) => {
-                    if row.name_scope.scope == crate::services::type_sidecar::NameScopeKind::Global
-                        && row.name_scope.namespace.is_none()
-                    {
+                    // Only a stated `global` scope: a row that states none
+                    // is kept out, as it was while a silent claim read
+                    // `service` (carrick#3531).
+                    if row.name_scope.as_ref().is_some_and(|scope| {
+                        scope.scope == crate::services::type_sidecar::NameScopeKind::Global
+                            && scope.namespace.is_none()
+                    }) {
                         index
                             .global_pubsub
                             .push((file.clone(), row.line, row.name.clone(), role));
@@ -8316,7 +8320,7 @@ fn append_library_operations(
             resolution_source: Some(
                 crate::agents::file_analyzer_agent::ResolutionSource::LibraryClaim,
             ),
-            name_scope: Some(row.wire_scope()),
+            name_scope: row.wire_scope(),
             library_semantics: row.claim_ids.clone(),
             ..details
         };
@@ -25411,10 +25415,10 @@ unfollowed_member_calls_total: 0,
             span_end: 40,
             kind,
             name: name.to_string(),
-            name_scope: crate::services::type_sidecar::NameScope {
+            name_scope: Some(crate::services::type_sidecar::NameScope {
                 scope: crate::services::type_sidecar::NameScopeKind::Service,
                 namespace: Some("task".to_string()),
-            },
+            }),
             claim_ids: vec![format!("@fixture/jobs@3:task:op:{name}")],
             definition: false,
         }
@@ -29823,10 +29827,10 @@ io.on("bare:in", (event) => {});
         namespace: Option<&str>,
     ) -> crate::library_claims::LibraryRow {
         crate::library_claims::LibraryRow {
-            name_scope: crate::services::type_sidecar::NameScope {
+            name_scope: Some(crate::services::type_sidecar::NameScope {
                 scope: crate::services::type_sidecar::NameScopeKind::Global,
                 namespace: namespace.map(String::from),
-            },
+            }),
             ..library_row(
                 file,
                 line,

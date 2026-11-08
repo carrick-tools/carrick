@@ -158,6 +158,7 @@ fn labels() -> Vec<SiteLabel> {
         new: false,
         by_origin: false,
         yields: None,
+        name_scope: None,
         package: "@fixture/wire".to_string(),
         export: export.to_string(),
         member: Some("emit".to_string()),
@@ -353,7 +354,12 @@ fn an_in_process_site_stays_in_its_service_whatever_its_kind() {
         row_for_kind("broker", "message").name_scope,
         Some(global.clone())
     );
-    assert_eq!(row_for_kind("broker", "topic").name_scope, None);
+    // A topic and a bare socket event say no scope of their own, and the
+    // claim states none either: no scope, the name crosses services
+    // (carrick#3531).
+    for kind in ["topic", "socket_event"] {
+        assert_eq!(row_for_kind("broker", kind).name_scope, None, "{kind}");
+    }
 
     let scoped = |service, name_scope| carrick_match::ScopedRow {
         service,
@@ -1923,4 +1929,77 @@ fn every_route_the_trace_does_not_serve_is_counted_by_why() {
             ("unread_prefix".to_string(), 2),
         ])
     );
+}
+
+/// A socket lead flips its side as a pub/sub lead does: a producer lead on a
+/// call row's line is that row's site (carrick#3498).
+#[test]
+fn a_socket_producer_lead_on_a_call_row_is_dropped() {
+    let mut calls = vec![blob_row(
+        OperationKey::socket("chat", SocketDirection::ClientToServer),
+        "src/send.ts",
+        10,
+        None,
+    )];
+    let mut endpoints = vec![blob_row(
+        OperationKey::socket("chat", SocketDirection::ClientToServer),
+        "src/listen.ts",
+        5,
+        None,
+    )];
+    let socket = |file: &str, line: u32, role: &str| PossibleCall {
+        kind: Some("socket".to_string()),
+        ..lead_at(file, line, Some(role))
+    };
+    let site = SiteRows {
+        enabled: true,
+        rows: Vec::new(),
+        leads: vec![
+            socket("src/send.ts", 10, "producer"),
+            socket("src/listen.ts", 5, "consumer"),
+            socket("src/listen.ts", 5, "producer"),
+        ],
+        ..SiteRows::default()
+    };
+    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
+    assert_eq!(fold.lead_on_row_line, 2);
+    assert_eq!(fold.leads.len(), 1);
+}
+
+/// A broker topic reads the same scope on both writers (carrick#3498).
+#[test]
+fn a_topic_site_row_scopes_as_the_library_claim_row_does() {
+    let site = row_for_kind("broker", "topic").name_scope;
+    let library =
+        crate::library_claims::scoped(crate::services::type_sidecar::LibraryRole::Broker, None);
+    assert_eq!(
+        site,
+        library.as_ref().map(crate::library_claims::wire_scope_of)
+    );
+}
+
+/// A topic and a socket event at a cross-process end (a broker, a socket)
+/// whose claim states no scope write none, so the name crosses services, as
+/// it did before the two writers shared a key (carrick#3531).
+#[test]
+fn a_silent_cross_process_site_writes_no_scope_and_crosses_services() {
+    for role in ["broker", "socket"] {
+        for kind in ["topic", "socket_event"] {
+            let row = row_for_kind(role, kind);
+            assert_eq!(row.name_scope, None, "{role} {kind}");
+            assert!(
+                carrick_match::names_pair(
+                    carrick_match::ScopedRow {
+                        service: "hub",
+                        name_scope: None,
+                    },
+                    carrick_match::ScopedRow {
+                        service: "watch",
+                        name_scope: row.name_scope.as_ref(),
+                    },
+                ),
+                "{role} {kind}"
+            );
+        }
+    }
 }
