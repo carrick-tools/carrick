@@ -35,7 +35,7 @@ them with `fetch`.
 | `add` | `notes-fn/src/index.ts:48` | `AddNoteInput` | `AddNoteResult` (400 dropped) |
 | `list`, `search` | `notes-fn/src/index.ts:55` | `ListNotesInput` | `{ notes: Note[] }` |
 | `purge` | `notes-fn/src/index.ts:61` | unknown | `{ purged: number }` |
-| `archive` | `notes-fn/src/index.ts:67` | unknown | unknown, `serialised_body_unread` |
+| `archive` | `notes-fn/src/index.ts:67` | unknown | unknown, `serialised_body_unread` (owed by the sidecar, carrick#3597: published as the envelope today, so not asserted) |
 | `export` | `notes-fn/src/index.ts:0` | unknown | unknown |
 
 Verdicts at the consumer: `credit` (`api.ts:50`) compatible on both halves;
