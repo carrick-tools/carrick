@@ -2919,6 +2919,16 @@ impl FileOrchestrator {
             let content = match std::fs::read_to_string(file_path) {
                 Ok(c) => c,
                 Err(e) => {
+                    // Bytes that are not UTF-8 text: no scan of them reads a
+                    // row, so the PR delta names the file when the PR
+                    // changed it (carrick#3233). A lane reads ahead and
+                    // records nothing; the analysis reads the file again.
+                    if e.kind() == std::io::ErrorKind::InvalidData && !lane {
+                        crate::scan_health::record_unread_source(
+                            &path_str,
+                            crate::findings::FileNotReadReason::NotUtf8Text,
+                        );
+                    }
                     stats
                         .errors
                         .push(format!("Failed to read {}: {}", path_str, e));
@@ -2953,6 +2963,14 @@ impl FileOrchestrator {
                      will be missing from the index",
                     path_str
                 );
+                if !lane {
+                    // The PR delta names it when the PR changed it
+                    // (carrick#3233).
+                    crate::scan_health::record_unread_source(
+                        &path_str,
+                        crate::findings::FileNotReadReason::DoesNotParse,
+                    );
+                }
                 stats.errors.push(format!("Parse failure: {}", path_str));
                 stats.files_skipped += 1;
                 stats.files_parse_failed += 1;

@@ -434,7 +434,7 @@ pub fn anchor<T>(
                     .first()
                     .is_some_and(|row| is_lost(row, reason, reading_moved))
                 {
-                    let _ = candidate;
+                    lost.push(candidate);
                 }
             }
         }
