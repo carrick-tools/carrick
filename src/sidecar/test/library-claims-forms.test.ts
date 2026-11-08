@@ -84,7 +84,7 @@ export declare class Worker {
   on(event: string, listener: (...args: unknown[]) => void): this;
   close(): Promise<void>;
 }
-export interface ConsumerOptions { queueUrl: string; handleMessage?: (m: Message) => Promise<void> }
+export interface ConsumerOptions { queueUrl: string; region?: string; handleMessage?: (m: Message) => Promise<void> }
 export declare class Consumer {
   constructor(options: ConsumerOptions);
   static create(options: ConsumerOptions): Consumer;
@@ -275,9 +275,18 @@ describe('verify_library_claims: forms and returns (carrick#3047)', () => {
     });
 
     it('reads a receive on the construct signatures (carrick-cloud#3139)', () => {
-      assert.strictEqual(verdict(newReceive('Worker', { name: { arg: 0 } })), 'verified');
-      const consumer = newReceive('Consumer', { name: { arg: 0, key: 'queueUrl' }, handler: { arg: 0, key: 'handleMessage' } });
-      assert.strictEqual(verdict(consumer), 'verified');
+      const parts = { name: { arg: 0, key: 'queueUrl' }, handler: { arg: 0, key: 'handleMessage' } };
+      assert.strictEqual(verdict(newReceive('Consumer', { ...parts, key_labels: { region: 'not_name' } })), 'verified');
+      // Strict D2: the other string key competes with the name until labelled.
+      assert.strictEqual(verdict(newReceive('Consumer', parts)), 'failed name_ambiguous');
+    });
+
+    it('known gap: a name-only receive whose processor accepts a string stays ambiguous', () => {
+      // The unassigned processor (`string | URL | null | fn`) competes with the
+      // name and a positional cannot be labelled. Admitting it needs a
+      // name-rule exception in the judge (nameSiblings), parked with its own
+      // ruling (carrick-cloud#3139). Flip this when that change lands.
+      assert.strictEqual(verdict(newReceive('Worker', { name: { arg: 0 } })), 'failed name_ambiguous');
     });
 
     it('judges a stated handler as on a call receive', () => {
