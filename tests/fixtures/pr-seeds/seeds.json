@@ -222,10 +222,8 @@
       "repo": "admin-api",
       "edits": [
         {"op": "replace", "file": "src/admin.ts", "pairs": [
-          ["app.post(\"/api/v1/admin/orders/:orderId/cancel\", cancelOrder);", "app.post(\"/api/v1/admin/orders/:orderId/cancel\", cancelOrder);\napp.get(\"/api/v1/admin/orders/export\", exportOrders);"],
-          ["  app.get(`/api/v1/admin/reports/${period}`, report);\n}", "  app.get(`/api/v1/admin/reports/${period}`, report);\n}\n\nfunction exportOrders(_request: Request, response: Response): void {\n<<<<<<< HEAD\n  response.send({ format: \"csv\" });\n=======\n  response.send({ format: \"json\" };\n>>>>>>> export-json\n}"]
-        ]},
-        {"op": "replace", "file": "__llm__/analyze-file/admin.json", "pairs": [["\"candidate_id\": \"@line:20\",\n      \"line_number\": 20,", "\"candidate_id\": \"@line:21\",\n      \"line_number\": 21,"]]}
+          ["  app.get(`/api/v1/admin/reports/${period}`, report);\n}", "  app.get(`/api/v1/admin/reports/${period}`, report);\n}\napp.get(\"/api/v1/admin/orders/export\", exportOrders);\n\nfunction exportOrders(_request: Request, response: Response): void {\n<<<<<<< HEAD\n  response.send({ format: \"csv\" });\n=======\n  response.send({ format: \"json\" };\n>>>>>>> export-json\n}"]
+        ]}
       ],
       "expect": {
         "title": "not_clean",
