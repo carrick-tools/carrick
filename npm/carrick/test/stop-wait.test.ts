@@ -469,6 +469,46 @@ test("a reported gap is not repeated once the whole-change check answered it, un
   assert.match(fourth, /^Carrick did not check the whole change: user-service\/src\/routes\/users\.ts: /m);
 });
 
+/** A linked git worktree under the workspace (its `.git` is a file) holding one edited file. */
+function linkedWorktree(root: string, name: string): { top: string; file: string } {
+  const top = path.join(root, ".claude", "worktrees", name);
+  const file = path.join(top, "user-service", "src", "a.ts");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "export {};\n");
+  fs.writeFileSync(path.join(top, ".git"), "gitdir: /elsewhere/.git/worktrees/x\n");
+  return { top, file };
+}
+
+test("a file edited in a worktree that was removed is not named at Stop (carrick#3595)", async (t) => {
+  const { workspace, home } = setup(t);
+  const { top, file } = linkedWorktree(workspace.root, "gone");
+  edit(workspace.root, home, file, Date.now() - 5000);
+  fs.rmSync(top, { recursive: true, force: true });
+
+  const result = await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false });
+  assert.doesNotMatch(result.lines.join("\n"), /worktrees\/gone|a\.ts/, "the removed worktree's file is not named");
+  assert.equal(changedQueued(workspace.root).length, 0, "no whole-change check is queued for it");
+});
+
+test("a file edited in a worktree that still exists is still named (carrick#3595)", async (t) => {
+  const { workspace, home } = setup(t);
+  const { file } = linkedWorktree(workspace.root, "live");
+  edit(workspace.root, home, file, Date.now() - 5000);
+
+  const text = (await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false })).lines.join("\n");
+  assert.match(text, /worktrees\/live\/user-service\/src\/a\.ts: no re-check answered it/);
+});
+
+test("a file deleted in the main checkout is still named: only a gone worktree drops an entry (carrick#3595)", async (t) => {
+  const { workspace, home } = setup(t);
+  fs.mkdirSync(path.join(workspace.root, ".git"));
+  edit(workspace.root, home, workspace.file, Date.now() - 5000);
+  fs.rmSync(workspace.file);
+
+  const text = (await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false })).lines.join("\n");
+  assert.match(text, /user-service\/src\/routes\/users\.ts: no re-check answered it/);
+});
+
 test("stop delivers a finished check --changed answer: its verdict, never a clause", async (t) => {
   const { workspace, home } = setup(t);
   const entry = enqueueChanged(workspace.root, SESSION, Date.now(), { home })!;
