@@ -207,6 +207,23 @@ test("an entry removed on purpose after an update stays removed in the same vers
   assert.equal(fs.readFileSync(file, "utf8"), trimmed);
 });
 
+test("a session started in a repo of the folder rewrites that repo's entries after the folder's own", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const repo = path.join(workspace.root, "api");
+  const own = put(workspace.root, LOCAL, olderSettings());
+  const inRepo = put(repo, LOCAL, olderSettings());
+
+  assert.deepEqual(updateHooks(workspace.root, workspace.root, running), [LOCAL]);
+  assert.deepEqual(updateHooks(workspace.root, repo, running), [LOCAL]);
+
+  const expected = carrickHooks("carrick");
+  for (const file of [own, inRepo]) {
+    const after = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.deepEqual(after.hooks.Stop, expected.Stop, `${file} holds this version's entries`);
+  }
+});
+
 test("skills still ours are brought up to date under both roots, with their own scope, and the mismatch line goes", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
