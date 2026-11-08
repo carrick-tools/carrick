@@ -75,16 +75,16 @@ pub struct FactFiles {
     pub listed: BTreeMap<String, BTreeSet<(u32, u32)>>,
     /// What discovery recorded at each call, by file and SWC span.
     pub calls: BTreeMap<(String, u32, u32), Followed>,
-    /// The lines of the calls made through an export the store labels a
+    /// The span starts of the calls made through an export the store labels a
     /// server framework, or through an instance one built, by file
     /// (carrick#2745). A route registration (`app.get("/x", handler)`) has a
     /// request's shape; the role the store gives the export is what tells
     /// them apart. The orchestrator keeps these calls out of the request
-    /// members it joins to callers.
-    pub server_framework_calls: BTreeMap<String, BTreeSet<u32>>,
-    /// The span starts of the same calls, by file. A summary row stated at
-    /// one of these calls is a registration the store names, not a request,
-    /// and is withdrawn (`RequestSummaryIndex::withdraw_registrations`).
+    /// members it joins to callers, and a summary row stated at one of them
+    /// is a registration the store names, not a request, and is withdrawn
+    /// (`RequestSummaryIndex::withdraw_registrations`). The key is the start,
+    /// never the line: a decorator site sits on its method's name line, and a
+    /// registration broken across lines starts above its member name.
     pub server_framework_starts: BTreeMap<String, BTreeSet<u32>>,
     /// The spans of the calls whose labelled export is a GraphQL client and
     /// which carry no listed end, by file (carrick#2763). A hook that hands a document to a client executes
@@ -197,11 +197,6 @@ impl FactFiles {
                         && claim.export == site.export
                 }) {
                     facts
-                        .server_framework_calls
-                        .entry(file.clone())
-                        .or_default()
-                        .insert(site.line);
-                    facts
                         .server_framework_starts
                         .entry(file.clone())
                         .or_default()
@@ -234,7 +229,6 @@ impl FactFiles {
         self.files.retain(|file, _| owns(file));
         self.listed.retain(|file, _| owns(file));
         self.calls.retain(|(file, _, _), _| owns(file));
-        self.server_framework_calls.retain(|file, _| owns(file));
         self.server_framework_starts.retain(|file, _| owns(file));
         self
     }
@@ -282,14 +276,15 @@ impl FactFiles {
             .collect()
     }
 
-    /// Whether the call on `line` of `module` is made through a server
-    /// framework export or an instance one built (carrick#2745). `module` is
-    /// compared component-wise by its tail, so a canonical path still matches
-    /// the repo-relative key.
-    pub fn server_framework_call(&self, module: &Path, line: u32) -> bool {
-        self.server_framework_calls
+    /// Whether the call starting at `start` (file-local, from
+    /// `SWC_SPAN_BASE`) in `module` is made through a server framework export
+    /// or an instance one built (carrick#2745). `module` is compared
+    /// component-wise by its tail, so a canonical path still matches the
+    /// repo-relative key.
+    pub fn server_framework_call(&self, module: &Path, start: u32) -> bool {
+        self.server_framework_starts
             .iter()
-            .any(|(file, lines)| module.ends_with(Path::new(file)) && lines.contains(&line))
+            .any(|(file, starts)| module.ends_with(Path::new(file)) && starts.contains(&start))
     }
 
     /// Whether the call at `span` in `module` reaches an export the store
@@ -618,7 +613,7 @@ mod tests {
     /// carrick#2745: a route registration and a client call have the same
     /// shape; the store's role for the export is what separates them.
     #[test]
-    fn a_call_through_a_server_framework_export_is_recorded_by_line() {
+    fn a_call_through_a_server_framework_export_is_recorded_by_span_start() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical root");
         std::fs::write(
@@ -673,9 +668,9 @@ mod tests {
             &first,
             &root,
         );
-        assert!(facts.server_framework_call(&root.join("src/app.ts"), 5));
         let registered = files[0].1.find("srv.get").expect("the call") as u32 + 1;
         let sent = files[1].1.find("http.get").expect("the call") as u32 + 1;
+        assert!(facts.server_framework_call(&root.join("src/app.ts"), registered));
         assert!(
             facts
                 .server_framework_start_pairs()
@@ -687,7 +682,7 @@ mod tests {
                 .iter()
                 .all(|(_, start)| *start != sent)
         );
-        assert!(!facts.server_framework_call(&root.join("src/status.ts"), 4));
-        assert!(!facts.server_framework_call(&root.join("src/other/app.ts"), 5));
+        assert!(!facts.server_framework_call(&root.join("src/status.ts"), sent));
+        assert!(!facts.server_framework_call(&root.join("src/other/app.ts"), registered));
     }
 }

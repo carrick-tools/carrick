@@ -3964,11 +3964,11 @@ impl FileOrchestrator {
             debug!(
                 "fact files: server-framework calls {} in {} file(s)",
                 facts
-                    .server_framework_calls
+                    .server_framework_starts
                     .values()
-                    .map(|lines| lines.len())
+                    .map(|starts| starts.len())
                     .sum::<usize>(),
-                facts.server_framework_calls.len()
+                facts.server_framework_starts.len()
             );
             log_fact_files(
                 facts,
@@ -10657,7 +10657,7 @@ impl FileOrchestrator {
             return;
         };
         index.retain(|name, member| {
-            let registration = facts.server_framework_call(module, member.request_line);
+            let registration = facts.server_framework_call(module, member.request_start);
             if registration {
                 debug!(
                     "fact files: member {name} at {}:{} is a server-framework call, not a request",
@@ -20855,6 +20855,7 @@ export { routes };
             method: method.to_string(),
             target: target.to_string(),
             request_line: 0,
+            request_start: 0,
             body: None,
             base_unread: false,
         }
@@ -21139,17 +21140,17 @@ export { routes };
     #[test]
     fn a_server_framework_call_is_no_request_member() {
         let mut registration = ring_member("GET", "/health");
-        registration.request_line = 9;
+        registration.request_start = 90;
         let mut sender = ring_member("GET", "/api/v1/status");
-        sender.request_line = 4;
+        sender.request_start = 40;
         let index = RequestMemberIndex::from([
             ("createServer".to_string(), registration),
             ("readStatus".to_string(), sender),
         ]);
         let facts = crate::request_summary::fact_files::FactFiles {
-            server_framework_calls: BTreeMap::from([(
+            server_framework_starts: BTreeMap::from([(
                 "src/app.ts".to_string(),
-                BTreeSet::from([9]),
+                BTreeSet::from([90]),
             )]),
             ..Default::default()
         };
