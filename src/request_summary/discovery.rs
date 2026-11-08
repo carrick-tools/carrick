@@ -4901,7 +4901,7 @@ export function listen(): void {
         let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
-            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         // Each record's point, with the name it forces (None: forced nowhere).
         let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
         for record in &records {
