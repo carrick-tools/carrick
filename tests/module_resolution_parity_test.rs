@@ -148,10 +148,12 @@ const tsserverConfigs = async (files) => {
   });
   let seq = 0;
   const ask = (command, args) =>
-    new Promise((resolve) => {
+    new Promise((resolve, reject) => {
       pending.set(++seq, resolve);
       server.stdin.write(JSON.stringify({ seq, type: 'request', command, arguments: args }) + '\n');
-      setTimeout(() => resolve(null), 30000).unref();
+      // No answer is a failure, never a skip: a tsserver that did not start
+      // must not turn this column into a pass.
+      setTimeout(() => reject(new Error(`tsserver gave no ${command} answer in 30 s`)), 30000).unref();
     });
   const answers = [];
   for (const file of files) {
