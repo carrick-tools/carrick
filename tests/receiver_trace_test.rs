@@ -508,8 +508,8 @@ fn routes_on_a_maker_field_take_their_full_paths() {
 /// carrick#3489 W2: a route registered on a module-scope alias of an
 /// instance, or on a key of a module object literal destructured into a
 /// `const`, is a mount-graph row at its full path, `library_claim`, with no
-/// unread lead at its line. An alias a function declares is not read by this
-/// rule: it places no row.
+/// unread lead at its line. So is one on an alias a function declares once:
+/// the receiver is the value resolver's lowering (carrick#3504 S3a).
 #[test]
 fn routes_on_module_aliases_take_their_full_paths() {
     let on = scan_fixture("receiver-forms-routes");
@@ -522,6 +522,10 @@ fn routes_on_module_aliases_take_their_full_paths() {
         (
             "src/s-destructured.ts:4",
             "src/s-destructured.ts:4 GET /p/s-destructured library_claim",
+        ),
+        (
+            "src/s-local-alias.ts:3",
+            "src/s-local-alias.ts:3 GET /p/s-local-alias library_claim",
         ),
     ] {
         let rows: Vec<&String> = graph
@@ -536,16 +540,13 @@ fn routes_on_module_aliases_take_their_full_paths() {
         );
     }
     let unread = unread_reasons(&on);
-    for site in ["src/ri-const-alias.ts:4", "src/s-destructured.ts:4"] {
+    for site in [
+        "src/ri-const-alias.ts:4",
+        "src/s-destructured.ts:4",
+        "src/s-local-alias.ts:3",
+    ] {
         assert!(!unread.contains_key(site), "{site}: {unread:#?}");
     }
-    assert!(
-        graph
-            .iter()
-            .filter(|row| row.starts_with("src/s-local-alias.ts:3 "))
-            .all(|row| !row.contains("library_claim")),
-        "{graph:#?}"
-    );
 }
 
 /// carrick#3489 W4: a route registered on `this.app` where `app` is a class

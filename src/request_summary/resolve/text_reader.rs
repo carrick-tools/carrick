@@ -88,6 +88,7 @@ impl<'a> Resolver<'a> {
                 lo,
                 hi,
                 member: false,
+                ..
             } => self.text_of_name(file, *lo, *hi),
             ValueAt::Member {
                 lo,
@@ -217,6 +218,7 @@ impl<'a> Resolver<'a> {
             lo,
             hi,
             member: false,
+            ..
         } = object
         else {
             return hole(UnreadExpression);

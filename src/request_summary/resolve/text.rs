@@ -56,6 +56,7 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
                 lo,
                 hi,
                 member: false,
+                holds: super::Holds::Nothing,
             }
         }
         Expr::Member(member) => {

@@ -5220,7 +5220,8 @@ export function listen(): void {
     /// carrick#3489 W2: a module-scope `const` that names another module
     /// binding holds what it holds, and so does a key of a module object
     /// literal destructured into a `const`: the site's end is the maker.
-    /// An alias declared inside a function is not read by this rule.
+    /// An alias declared once inside a function reads through to its source
+    /// too: the receiver is the value resolver's lowering (carrick#3504 S3a).
     #[test]
     fn a_module_alias_or_destructured_key_holds_its_source_instance() {
         let Some((on, exports, declarations)) = traced_fixture_named("receiver-forms-routes")
@@ -5238,7 +5239,9 @@ export function listen(): void {
             texts(&[
                 "src/ri-const-alias.ts:4 <- src/ri-const-alias.ts:4 root src/ri-const-alias.ts:2",
                 "src/s-destructured.ts:4 <- src/s-destructured.ts:4 root src/s-destructured.ts:2",
-                "src/s-local-alias.ts:3 <- src/s-local-alias.ts:3 unread",
+                // A function's own alias reads through to its source
+                // (carrick#3504 S3a).
+                "src/s-local-alias.ts:3 <- src/s-local-alias.ts:3 root src/s-local-alias.ts:2",
             ]),
             "{got:#?}"
         );

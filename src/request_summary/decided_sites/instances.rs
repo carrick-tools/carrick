@@ -18,10 +18,11 @@
 //!
 //! - **a root**: the result of a maker the store labels (`make()`,
 //!   `new Server()`), at the maker call's `file:line`, read where the
-//!   syntax holds it ([`super::super::HeldInstance`]): a binding the
-//!   library-site reader holds an instance in, a maker or own factory call
-//!   (followed into what the factory returns), or an import of this
-//!   service's module, whose declaration the compiler names;
+//!   value resolver's lowering holds it ([`super::super::ValueAt`],
+//!   carrick#3504 S3): a binding the library-site reader holds an instance
+//!   in, a maker or own factory call (followed into what the factory
+//!   returns), a local declared once (read through to its value), or a name
+//!   whose declaration the compiler names;
 //! - **a scope** a labelled member opens (carrick#2474 R2b): the parameter
 //!   of a function a member labelled with `runs` and `yields` runs with a
 //!   scoped instance (`app.register(plugin, { prefix })`), under the prefix
@@ -51,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::constructions::Constructed;
 use super::super::{
-    CallIr, ClientRef, FoldPiece, HeldInstance, KeyState, Link, MadeBy, MakerForm, Piece,
+    CallIr, ClientRef, FoldPiece, Holds, KeyState, Link, MadeBy, MakerForm, Piece,
     RequestSummaryInputs, Root, Value, ValueAt, Way,
 };
 use super::boundaries::{Boundary, FnAt};
@@ -709,11 +710,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     pub(super) fn of(self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
         let last = down[down.len() - 1];
         let instance = &last.call.instance;
-        self.of_value(
-            down,
-            instance.receiver_value.as_ref(),
-            instance.receiver_held.as_ref(),
-        )
+        self.of_value(down, instance.receiver_value.as_ref(), &instance.receiver)
     }
 
     /// The instance ends of the site whose calls are `down`, when its
@@ -722,11 +719,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// `scope` reads in the body of the labelled call's function.
     pub(super) fn of_scoped(self, down: &[Placed<'a>], scope: &Placed<'a>) -> Vec<InstanceEnd> {
         let instance = &scope.call.instance;
-        self.of_value(
-            down,
-            instance.receiver_value.as_ref(),
-            instance.receiver_held.as_ref(),
-        )
+        self.of_value(down, instance.receiver_value.as_ref(), &instance.receiver)
     }
 
     /// The instance ends of what `placed`'s call is handed at `arg`
@@ -740,39 +733,35 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         let value = placed.call.args.get(arg);
         let held = placed.call.instance.args.get(arg);
         let (value, held) = match key {
-            None => (value, held.and_then(|held| held.whole.as_ref())),
+            None => (value, held.map(|held| held.whole.as_slice())),
             Some(key) => (
                 match value {
                     Some(Value::Obj(object)) => object.fields.get(key),
                     _ => None,
                 },
-                held.and_then(|held| held.keys.get(key)),
+                held.and_then(|held| held.keys.get(key)).map(Vec::as_slice),
             ),
         };
-        self.of_value(&[placed], value, held)
+        self.of_value(&[placed], value, held.unwrap_or_default())
     }
 
     fn of_value(
         mut self,
         down: &[Placed<'a>],
         value: Option<&Value>,
-        held: Option<&HeldInstance>,
+        held: &[ValueAt],
     ) -> Vec<InstanceEnd> {
         let last = down[down.len() - 1];
         let Some(value) = value else {
-            if let Some(held) = held {
-                let at = self.at(&last);
-                self.held(held, last.file, at);
-            }
+            let at = self.at(&last);
+            self.value(held, last.file, at);
             return self.ends;
         };
         let mut pieces = value.pieces();
         if !holds_parameter(&pieces) {
             let at = self.at(&last);
-            match held {
-                Some(held) => self.held(held, last.file, at),
-                None if self.field(last.file, &pieces) => {}
-                None => self.hole(at, InstanceHole::Unread, opaque_text(&pieces)),
+            if !self.value(held, last.file, at.clone()) && !self.field(last.file, &pieces) {
+                self.hole(at, InstanceHole::Unread, opaque_text(&pieces));
             }
             return self.ends;
         }
@@ -1274,14 +1263,17 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         let at = self.at(caller);
         let args = &caller.call.instance.args;
         let held = match own {
-            [Piece::Param(index, _)] => args.get(*index).and_then(|arg| arg.whole.as_ref()),
-            [Piece::ParamKey(index, key, _)] => args.get(*index).and_then(|arg| arg.keys.get(key)),
+            [Piece::Param(index, _)] => args.get(*index).map(|arg| arg.whole.as_slice()),
+            [Piece::ParamKey(index, key, _)] => args
+                .get(*index)
+                .and_then(|arg| arg.keys.get(key))
+                .map(Vec::as_slice),
             _ => None,
         };
-        match held {
-            Some(held) => self.held(held, caller.file, at),
-            None if self.field(caller.file, value) => {}
-            None => self.hole(at, InstanceHole::Unread, opaque_text(value)),
+        if !self.value(held.unwrap_or_default(), caller.file, at.clone())
+            && !self.field(caller.file, value)
+        {
+            self.hole(at, InstanceHole::Unread, opaque_text(value));
         }
     }
 
@@ -1350,14 +1342,40 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         true
     }
 
-    /// What `held`, read in `file`, ends at.
-    fn held(&mut self, held: &HeldInstance, file: &Path, at: String) {
-        match held {
-            HeldInstance::Client(client) => self.client(client, file, at),
-            HeldInstance::Imported(lo, hi) => self.imported(file, (*lo, *hi), at),
-            HeldInstance::Returned(lo, hi) => self.returned(file, (*lo, *hi), at),
-            HeldInstance::Field { class, field } => self.class_field(file, *class, field, at),
+    /// What `values`, the value resolver's lowering of an expression read in
+    /// `file`, ends at (carrick#3504 S3): a maker or own factory's instance,
+    /// a name whose declaration the compiler names, a scope a labelled
+    /// member returns, or a field of the class. `false` where it names no
+    /// instance, and the caller reads on (a field the pieces link, then a
+    /// hole).
+    fn value(&mut self, values: &[ValueAt], file: &Path, at: String) -> bool {
+        match one_reading(values) {
+            Some(
+                ValueAt::Read {
+                    holds: Holds::Made(client),
+                    ..
+                }
+                | ValueAt::Returned {
+                    made: Some(client), ..
+                }
+                | ValueAt::New { made: client, .. },
+            ) => self.client(client, file, at),
+            Some(ValueAt::Read {
+                lo,
+                hi,
+                member: false,
+                holds: Holds::Declared,
+            }) => self.imported(file, (*lo, *hi), at),
+            Some(ValueAt::Returned {
+                lo,
+                hi,
+                member: Some(_),
+                made: None,
+            }) => self.returned(file, (*lo, *hi), at),
+            Some(ValueAt::Field { class, field, .. }) => self.class_field(file, *class, field, at),
+            _ => return false,
         }
+        true
     }
 
     /// The instance a field of a class of `file` holds (carrick#3489 W1): the
@@ -1604,14 +1622,10 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         if binding.unplaceable {
             self.hole(at.to_string(), InstanceHole::Unread, unread);
         } else {
-            match &binding.init_held {
-                Some(held) => self.held(held, file, at.to_string()),
-                // An initialiser that names no instance.
-                None if !binding.init.is_empty() => {
-                    self.hole(at.to_string(), InstanceHole::Unread, unread.clone())
-                }
-                // No initialiser: the binding holds nothing until written.
-                None => {}
+            // An initialiser that names no instance is a hole; with none, the
+            // binding holds nothing until written.
+            if !self.value(&binding.init, file, at.to_string()) && !binding.init.is_empty() {
+                self.hole(at.to_string(), InstanceHole::Unread, unread.clone());
             }
             for start in &binding.writes {
                 let placed = super::super::resolve::placed_write(ir, *start);
@@ -1627,12 +1641,10 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     self.up_from(file, key, own, at.to_string());
                     continue;
                 }
-                match placed {
-                    Some((_, write)) => match &write.held {
-                        Some(held) => self.held(held, file, at.to_string()),
-                        None => self.hole(at.to_string(), InstanceHole::Unread, unread.clone()),
-                    },
-                    None => self.hole(at.to_string(), InstanceHole::Unread, unread.clone()),
+                let ended = placed
+                    .is_some_and(|(_, write)| self.value(&write.values, file, at.to_string()));
+                if !ended {
+                    self.hole(at.to_string(), InstanceHole::Unread, unread.clone());
                 }
             }
         }
@@ -1679,6 +1691,17 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             );
         }
         hosts
+    }
+}
+
+/// The one value an expression's lowering holds, or `None` where it holds
+/// several (`a ?? b`, a local written two ways): such a receiver or argument
+/// reads as naming no instance until the walk ends at each value
+/// (carrick#3504 S3b deletes this guard).
+pub(super) fn one_reading(values: &[ValueAt]) -> Option<&ValueAt> {
+    match values {
+        [one] => Some(one),
+        _ => None,
     }
 }
 
