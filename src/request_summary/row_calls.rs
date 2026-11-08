@@ -1325,6 +1325,38 @@ mod tests {
         );
     }
 
+    /// A class expression bound by a `const` is that class: a call through
+    /// its method reaches the method, and the request inside it is stated at
+    /// the call.
+    #[test]
+    fn a_call_through_a_class_expressions_method_reaches_it() {
+        let files = [
+            (
+                "src/catalog-class.ts",
+                "export const Catalog = class {\n  search(): Promise<Response> {\n    return fetch(\"/catalog/search\");\n  }\n};\n",
+            ),
+            (
+                "src/catalog-class-user.ts",
+                "import { Catalog } from \"./catalog-class\";\n\nexport function searchCatalog(): Promise<Response> {\n  return new Catalog().search();\n}\n",
+            ),
+        ];
+        let Some(on) = calls(&files, true) else {
+            return;
+        };
+        let user = "services/calls/src/catalog-class-user.ts";
+        // Line 4 holds two calls: `new Catalog()` (no constructor to reach)
+        // and the method call.
+        assert!(
+            reached_in(&on, user)[&4].contains(&"catalog-class.ts:Catalog.search".to_string()),
+            "{:?}",
+            reached_in(&on, user)
+        );
+        assert_eq!(
+            stated_in(&on, user),
+            BTreeMap::from([line(4, "/catalog/search")])
+        );
+    }
+
     /// carrick#3356: a function written as a member of a module `const`
     /// object nothing writes through (a method, an arrow or a function
     /// expression, one object down too) is a function of the module, keyed

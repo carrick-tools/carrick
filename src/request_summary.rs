@@ -2088,6 +2088,19 @@ pub fn extract_file_ir(
                             );
                             continue;
                         }
+                        // `const Api = class {…}` is the class `Api`; a named
+                        // expression keeps its own name.
+                        Expr::Class(class) => {
+                            let own = class.ident.as_ref().unwrap_or(&ident.id);
+                            reader.class(
+                                own,
+                                &class.class,
+                                module_scope,
+                                definition_keys,
+                                &mut file,
+                            );
+                            continue;
+                        }
                         _ => continue,
                     };
                     let name = ident.id.sym.to_string();

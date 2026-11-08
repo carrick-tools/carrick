@@ -629,6 +629,13 @@
   "kind": "call",
   "source": "test262 (class)"
  },
+ "t-class-expr-named": {
+  "carries": "target",
+  "expect": "/p/t-class-expr-named",
+  "feature": "named class expression",
+  "kind": "call",
+  "source": "test262 (class)"
+ },
  "t-class-field-client": {
   "carries": "target",
   "expect": "/p/t-class-field-client",
