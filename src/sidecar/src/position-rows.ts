@@ -463,6 +463,8 @@ interface RequireBinding {
   from: ts.SourceFile;
   /** `undefined` for the whole module. */
   exportName?: string;
+  /** `m` of an `as typeof import("m")` cast on the require, read when the require names no file. */
+  castSpecifier?: string;
 }
 
 /**
@@ -911,10 +913,28 @@ export class PositionWalker {
       exportName = key ? key.text : declaration.name.text;
       initializer = declaration.parent.parent.initializer;
     }
+    let castSpecifier: string | undefined;
+    while (
+      initializer &&
+      (ts.isParenthesizedExpression(initializer) ||
+        ts.isAsExpression(initializer) ||
+        ts.isSatisfiesExpression(initializer) ||
+        ts.isTypeAssertionExpression(initializer) ||
+        ts.isNonNullExpression(initializer))
+    ) {
+      const type = ts.isNonNullExpression(initializer) || ts.isParenthesizedExpression(initializer) ? undefined : initializer.type;
+      if (castSpecifier === undefined && type && ts.isImportTypeNode(type) && type.isTypeOf) {
+        const arg = type.argument;
+        if (ts.isLiteralTypeNode(arg) && ts.isStringLiteral(arg.literal)) castSpecifier = arg.literal.text;
+      }
+      initializer = initializer.expression;
+    }
     const specifier = initializer ? this.requireSpecifier(initializer) : undefined;
     if (specifier === undefined) return undefined;
     const from = declaration.getSourceFile();
-    return exportName === undefined ? { specifier, from } : { specifier, from, exportName };
+    const binding: RequireBinding = exportName === undefined ? { specifier, from } : { specifier, from, exportName };
+    if (castSpecifier !== undefined) binding.castSpecifier = castSpecifier;
+    return binding;
   }
 
   /** `"m"` of a call `require("m")` to the global `require`, else `undefined`. */
@@ -932,16 +952,21 @@ export class PositionWalker {
   }
 
   private exportOfRequired(binding: RequireBinding): ts.Symbol | undefined {
-    const resolved = ts.resolveModuleName(
-      binding.specifier,
-      binding.from.fileName,
-      this.program.getCompilerOptions(),
-      this.resolutionHost(),
-      undefined,
-      undefined,
-      ts.ModuleKind.CommonJS
-    ).resolvedModule;
-    const target = resolved ? this.program.getSourceFile(resolved.resolvedFileName) : undefined;
+    const sourceOf = (specifier: string): ts.SourceFile | undefined => {
+      const resolved = ts.resolveModuleName(
+        specifier,
+        binding.from.fileName,
+        this.program.getCompilerOptions(),
+        this.resolutionHost(),
+        undefined,
+        undefined,
+        ts.ModuleKind.CommonJS
+      ).resolvedModule;
+      return resolved ? this.program.getSourceFile(resolved.resolvedFileName) : undefined;
+    };
+    // The require that runs wins; the cast is read only when it names no file.
+    const target =
+      sourceOf(binding.specifier) ?? (binding.castSpecifier !== undefined ? sourceOf(binding.castSpecifier) : undefined);
     if (!target) return undefined;
     if (binding.exportName === undefined) return this.checker.getSymbolAtLocation(target);
     return moduleExport(this.checker, target, binding.exportName);
