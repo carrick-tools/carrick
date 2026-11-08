@@ -110,12 +110,14 @@ use super::{
 use crate::binding_scope::{BindingKey, ident_key, pat_key};
 use crate::graphql_document_sites::unwrap_expression;
 
-/// Whether a maker or a call site calls its callee (`m(…)`) or constructs it
-/// (`new m(…)`).
+/// Whether a maker or a call site calls its callee (`m(…)`), constructs it
+/// (`new m(…)`), or decorates a class method with what calling it returns
+/// (`@m(…)`, carrick#3043). A maker is never a decorator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MakerForm {
     Call,
     New,
+    Decorate,
 }
 
 /// One argument, as a library claim's slot reads it.
@@ -457,9 +459,10 @@ pub struct Selector<'a> {
     pub of: Option<&'a str>,
     pub path: &'a [String],
     pub member: Option<&'a str>,
-    /// The op is written as a construction of its receiver (`form: new`,
-    /// carrick#3439): it selects a `new` call and never a plain one.
-    pub new: bool,
+    /// How the op is written: a call, a construction of its receiver
+    /// (`form: new`, carrick#3439) or a method decorator (`form: decorate`,
+    /// carrick#3043). It selects a site written that way and no other.
+    pub form: MakerForm,
 }
 
 /// What a package's surface says one member use is, as the caller
@@ -609,9 +612,9 @@ impl LibrarySite {
     /// through one of its receivers: the export (`through` is `None`), or the
     /// instance of `through`, one of the site's makers (carrick#1689). `of`
     /// names exactly one receiver by its id, and `on` applies otherwise
-    /// (contract amendment 2, B3). An op is a call, unless its claim is
-    /// written as a construction (`selector.new`): then it is that and
-    /// nothing else.
+    /// (contract amendment 2, B3). The site is written in the op's form
+    /// (`selector.form`): a call, a construction or a decorator, and nothing
+    /// else.
     pub fn selected_by(&self, through: Option<&SiteMaker>, selector: &Selector<'_>) -> bool {
         let id = match (&self.receiver, through) {
             (SiteReceiver::Export, None) => "export".to_string(),
@@ -629,12 +632,7 @@ impl LibrarySite {
             _ => false,
         };
         receiver
-            && self.form
-                == if selector.new {
-                    MakerForm::New
-                } else {
-                    MakerForm::Call
-                }
+            && self.form == selector.form
             && self.path == selector.path
             && self.member.as_deref() == selector.member
     }
@@ -1321,7 +1319,7 @@ impl SiteReader<'_> {
         };
         let target = match instance.form {
             MakerForm::Call => self.resolves(file, &instance.site),
-            MakerForm::New => None,
+            MakerForm::New | MakerForm::Decorate => None,
         };
         let Some((target_file, key)) = target else {
             return match instance.made_by {
@@ -3739,7 +3737,7 @@ mod tests {
         assert!(trigger.selected_by(
             None,
             &Selector {
-                new: false,
+                form: MakerForm::Call,
                 on: Some(On::Export),
                 of: None,
                 path: &path,
@@ -3749,7 +3747,7 @@ mod tests {
         assert!(!trigger.selected_by(
             None,
             &Selector {
-                new: false,
+                form: MakerForm::Call,
                 on: Some(On::Export),
                 of: None,
                 path: &[],
@@ -3775,14 +3773,14 @@ mod tests {
              }\n",
         )]);
         let on = |on: On, member: &'static str| Selector {
-            new: false,
+            form: MakerForm::Call,
             on: Some(on),
             of: None,
             path: &[],
             member: Some(member),
         };
         let of = |of: &'static str, member: &'static str| Selector {
-            new: false,
+            form: MakerForm::Call,
             on: None,
             of: Some(of),
             path: &[],
@@ -3805,7 +3803,7 @@ mod tests {
             !on_task.selected_by(
                 task,
                 &Selector {
-                    new: false,
+                    form: MakerForm::Call,
                     on: Some(On::Instance),
                     of: Some("instance:task"),
                     path: &[],
@@ -3818,7 +3816,7 @@ mod tests {
             !on_task.selected_by(
                 task,
                 &Selector {
-                    new: false,
+                    form: MakerForm::Call,
                     on: None,
                     of: None,
                     path: &[],
@@ -4292,6 +4290,78 @@ mod tests {
         assert_eq!(maker(field).line, 7);
         assert_eq!(maker(field).args[0].text.as_deref(), Some("emails"));
         assert_eq!(field.contest(on_wire), None);
+    }
+
+    /// carrick#3043: a method decorator call on an import is a site of the
+    /// export, written in the decorate form, placed at the method's name (the
+    /// decorated method is the handler), with its arguments read as a call's.
+    /// Using the export as a decorator contests nothing. A class decorator
+    /// and a parameter decorator are not read here.
+    #[test]
+    fn a_method_decorator_call_is_a_decorate_site_of_its_export() {
+        let source = "import { OnMessage, Gateway, Peer } from \"@fixture/socket\";\n\
+             @Gateway()\n\
+             export class Chat {\n\
+             \x20 @OnMessage(\"room.join\")\n\
+             \x20 join(@Peer() peer: unknown, body: unknown) { return body; }\n\
+             \x20 @OnMessage(\"room.leave\")\n\
+             \x20 #leave(body: unknown) { return body; }\n\
+             }\n";
+        let sites = sites_of(&[("src/chat.ts", source)]);
+        type StatedSite<'a> = (
+            u32,
+            MakerForm,
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            bool,
+        );
+        let stated: Vec<StatedSite> = sites
+            .iter()
+            .map(|site| {
+                (
+                    site.line,
+                    site.form,
+                    site.export.as_str(),
+                    site.member.as_deref(),
+                    site.literal(0, None),
+                    site.contested,
+                )
+            })
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                (
+                    5,
+                    MakerForm::Decorate,
+                    "OnMessage",
+                    None,
+                    Some("room.join"),
+                    false
+                ),
+                (
+                    7,
+                    MakerForm::Decorate,
+                    "OnMessage",
+                    None,
+                    Some("room.leave"),
+                    false
+                ),
+            ],
+            "{sites:#?}"
+        );
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.receiver == SiteReceiver::Export)
+        );
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.contest(|_, _| MemberWire::OnWire).is_none()),
+            "{sites:#?}"
+        );
     }
 
     /// carrick#3389: `x?.member(…)` is the library site `x.member(…)` is, on
@@ -6043,7 +6113,7 @@ mod tests {
     fn a_set_of_makers_states_a_fact_only_when_every_maker_reads_the_same() {
         // `of` names one receiver; without it the op is on every instance.
         let on = |of: Option<&'static str>, member: &'static str| Selector {
-            new: false,
+            form: MakerForm::Call,
             on: of.is_none().then_some(On::Instance),
             of,
             path: &[],
@@ -6106,7 +6176,7 @@ mod tests {
             makers: &[],
             ops: vec![(
                 Selector {
-                    new: false,
+                    form: MakerForm::Call,
                     on: Some(On::Export),
                     of: None,
                     path: &[],

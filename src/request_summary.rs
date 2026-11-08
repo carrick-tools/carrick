@@ -3257,14 +3257,15 @@ impl BindingUses {
     }
 
     /// `new Client(…)`, `new lib.Worker(…)`, `new lib.a.Worker(…)`: the
-    /// binding is constructed (carrick#1661). Any other callee is read as
-    /// before.
-    fn constructed(&mut self, callee: &Expr) {
+    /// binding is constructed (carrick#1661), or, in the decorate `form`,
+    /// called as a decorator (`@lib.on(…)`, carrick#3043). Any other callee
+    /// is read as before.
+    fn constructed(&mut self, callee: &Expr, form: MakerForm) {
         let callee = crate::graphql_document_sites::unwrap_expression(callee);
         if let Some(key) = binding_key(callee) {
             self.mark(key, |used| {
                 used.library_calls.insert(MemberUse {
-                    form: MakerForm::New,
+                    form,
                     path: Vec::new(),
                     member: None,
                 });
@@ -3281,7 +3282,7 @@ impl BindingUses {
             if let Some((key, path)) = held {
                 self.mark(key, |used| {
                     used.library_calls.insert(MemberUse {
-                        form: MakerForm::New,
+                        form,
                         path,
                         member: Some(name.sym.to_string()),
                     });
@@ -3383,8 +3384,24 @@ impl Visit for BindingUses {
     }
 
     fn visit_new_expr(&mut self, new: &NewExpr) {
-        self.constructed(&new.callee);
+        self.constructed(&new.callee, MakerForm::New);
         new.args.visit_with(self);
+    }
+
+    /// `@m(…)`: the binding called is used as a decorator (carrick#3043),
+    /// which the caller classifies as it does a construction.
+    fn visit_decorator(&mut self, decorator: &Decorator) {
+        match crate::graphql_document_sites::unwrap_expression(&decorator.expr) {
+            Expr::Call(CallExpr {
+                callee: Callee::Expr(callee),
+                args,
+                ..
+            }) => {
+                self.constructed(callee, MakerForm::Decorate);
+                args.visit_with(self);
+            }
+            _ => decorator.visit_children_with(self),
+        }
     }
 
     fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
@@ -4905,6 +4922,38 @@ impl Reader<'_> {
         }
     }
 
+    /// The library sites a method's decorators write (carrick#3043): each
+    /// decorator that calls an export (`@OnMessage("x")`) is a site of it in
+    /// the decorate form, read in the module's scope, where a decorator is
+    /// evaluated, and placed at the method's name, `name`, as a route
+    /// decorator's row is. The method is the decorated handler, so the
+    /// site is the method's own.
+    fn decorator_sites(
+        &self,
+        decorators: &[Decorator],
+        name: Span,
+        module: &ModuleScope,
+        ir: &mut FnIr,
+    ) {
+        let scope = Scope::module(module);
+        for decorator in decorators {
+            let Expr::Call(call) =
+                crate::graphql_document_sites::unwrap_expression(&decorator.expr)
+            else {
+                continue;
+            };
+            let Callee::Expr(callee) = &call.callee else {
+                continue;
+            };
+            if let Some(mut site) =
+                self.library_site(call.span, MakerForm::Decorate, callee, &call.args, &scope)
+            {
+                site.op_line = self.line(name);
+                ir.library.push(site);
+            }
+        }
+    }
+
     /// A class: its field table, then each member keyed as the extractor
     /// keys it.
     fn class(
@@ -4953,6 +5002,12 @@ impl Reader<'_> {
                     };
                     let mut ir =
                         self.function(&method.function, table(method.is_static), module, &none);
+                    self.decorator_sites(
+                        &method.function.decorators,
+                        method.key.span(),
+                        module,
+                        &mut ir,
+                    );
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
                     if method.kind == MethodKind::Getter && !method.is_static {
                         file.class_getters.insert(
@@ -4969,6 +5024,12 @@ impl Reader<'_> {
                     let member_name = format!("#{}", method.key.name);
                     let mut ir =
                         self.function(&method.function, table(method.is_static), module, &none);
+                    self.decorator_sites(
+                        &method.function.decorators,
+                        method.key.span,
+                        module,
+                        &mut ir,
+                    );
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
                     if method.kind == MethodKind::Getter && !method.is_static {
                         file.class_getters.insert(

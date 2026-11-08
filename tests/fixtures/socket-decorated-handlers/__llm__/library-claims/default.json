@@ -1,0 +1,58 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/gateway",
+      "version": "3.0.0",
+      "status": "answered",
+      "surface_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "exports": [
+        {
+          "specifier": "@fixture/gateway",
+          "export": "OnMessage",
+          "role": "socket",
+          "side": "server",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": null,
+              "on": "export",
+              "form": "decorate",
+              "name": { "arg": 0 },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/gateway",
+          "export": "Link",
+          "role": "socket",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [
+            { "form": "new", "member": null, "picker": "fixture-picker" }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "send",
+              "on": "instance",
+              "name": { "arg": 0 },
+              "payload": { "arg": 1 },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
