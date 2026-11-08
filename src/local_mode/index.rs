@@ -898,7 +898,10 @@ pub(super) fn scan_command(
         // service it is (carrick#955).
         .env(crate::progress::PROGRESS_ENV, "1")
         .env_remove("CARRICK_OUTPUT_JSON")
-        .env_remove(super::JOIN_OUT_ENV);
+        .env_remove(super::JOIN_OUT_ENV)
+        // Named by its folder unless a caller says otherwise
+        // (`recheck::rescan_command`).
+        .env_remove(crate::utils::LOCAL_REPO_NAME_ENV);
     // Whatever the pass, the two flags that decide what this scan may do are
     // set here and nowhere else.
     command
@@ -1035,7 +1038,8 @@ pub(super) fn join_command(
         // Never a laptop scan: this phase analyses nothing and uploads
         // nothing, it reads blobs back and joins them.
         .env_remove(crate::cloud_storage::LAPTOP_SCAN_ENV)
-        .env_remove("CARRICK_OUTPUT_JSON");
+        .env_remove("CARRICK_OUTPUT_JSON")
+        .env_remove(crate::utils::LOCAL_REPO_NAME_ENV);
     match previous {
         Some(previous) => command.env(super::hosted::PREVIOUS_ENV, previous),
         None => command.env_remove(super::hosted::PREVIOUS_ENV),

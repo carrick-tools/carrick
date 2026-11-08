@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use super::checkout::Tree;
 use super::join::{JoinedOperation, Role};
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex, Source};
 use super::reads_same::{LineMap, reads_same_since};
@@ -460,9 +461,9 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     // (carrick#3245).
     let always = std::env::var(RESCAN_ENV).is_ok_and(|value| value == "always");
     let mut unmoved: BTreeMap<String, BTreeMap<String, LineMap>> = BTreeMap::new();
-    let mut rescan: Vec<&Path> = Vec::new();
+    let mut rescan: Vec<Tree> = Vec::new();
     let mut rescanned: BTreeSet<&String> = BTreeSet::new();
-    for (name, (path, _)) in &changed {
+    for (name, (tree, _)) in &changed {
         let lines = if always {
             None
         } else {
@@ -470,7 +471,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
                 .repos
                 .iter()
                 .find(|indexed| &indexed.name == name)
-                .and_then(|indexed| reads_the_same(path, indexed))
+                .and_then(|indexed| reads_the_same(&tree.checkout, indexed))
         };
         match lines {
             Some(lines) => {
@@ -481,7 +482,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
                 unmoved.insert(name.clone(), lines);
             }
             None => {
-                rescan.push(path.as_path());
+                rescan.push(tree.clone());
                 rescanned.insert(name);
             }
         }
@@ -540,6 +541,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         .iter()
         .map(|(name, (_, files))| (name.clone(), files))
         .collect();
+    let trees: Vec<Tree> = changed.values().map(|(tree, _)| tree.clone()).collect();
     let same_build = index.written_by_this_build();
     if !same_build {
         output.index_scanner = Some(index.scanner_shown());
@@ -551,7 +553,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &rejoined.index,
         &rejoined.join,
         &wanted,
-        &touched_since_index(&index),
+        &touched_since_index(&index, &trees),
     );
     let judged = remap_lines(judged, &root, &rejoined.index, &unmoved);
     output.routes = judged.routes;
@@ -571,8 +573,10 @@ pub(super) type Touched = BTreeMap<String, Option<BTreeSet<String>>>;
 
 /// What each repo of the index changed since the commit it was indexed at
 /// (untracked files, deletions and renames-away included). A repo whose
-/// services carry no commit, or that git cannot list, is `None`.
-pub(super) fn touched_since_index(index: &LocalIndex) -> Touched {
+/// services carry no commit, or that git cannot list, is `None`. A repo in
+/// `trees` is read from the checkout named there (carrick#3595); every other
+/// from its own folder.
+pub(super) fn touched_since_index(index: &LocalIndex, trees: &[Tree]) -> Touched {
     index
         .repos
         .iter()
@@ -582,29 +586,42 @@ pub(super) fn touched_since_index(index: &LocalIndex) -> Touched {
                 .iter()
                 .map(|service| service.commit.as_str())
                 .find(|commit| !commit.is_empty());
+            let checkout = trees
+                .iter()
+                .find(|tree| super::checkout::same_dir(&tree.repo, Path::new(&repo.path)))
+                .map_or(Path::new(&repo.path), |tree| tree.checkout.as_path());
             let files = commit
-                .and_then(|commit| super::query::changed_since(Path::new(&repo.path), commit))
+                .and_then(|commit| super::query::changed_since(checkout, commit))
                 .map(|files| files.into_iter().collect());
             (repo.name.clone(), files)
         })
         .collect()
 }
 
-/// Every repo's changed source files, keyed by repo name, with the repos
-/// listed as the answer states them.
-type Changed = BTreeMap<String, (PathBuf, BTreeSet<String>)>;
+/// Every repo's changed source files, keyed by repo name, with the checkout
+/// they were read from.
+type Changed = BTreeMap<String, (Tree, BTreeSet<String>)>;
 
+/// The changed files of every repo. Run inside a linked worktree of a repo,
+/// that repo's changes are the worktree's: git runs there (carrick#3595).
 fn changed_files(
     workspace: &super::workspace::Workspace,
     index: &LocalIndex,
 ) -> (Vec<ChangedRepo>, Changed) {
     let mut listed = Vec::new();
     let mut changed = Changed::new();
+    let cwd = std::env::current_dir().ok();
     for repo in &workspace.repos {
         let name = super::index::repo_label(repo);
-        let text = repo.to_string_lossy().to_string();
+        let tree = cwd
+            .as_deref()
+            .map_or_else(|| Tree::at(repo), |cwd| Tree::from_dir(repo, cwd));
+        let shown = repo.to_string_lossy().to_string();
+        let checkout = tree.checkout.clone();
+        let repo = &checkout;
+        let text = checkout.to_string_lossy().to_string();
         let mut entry = ChangedRepo {
-            repo: text.clone(),
+            repo: shown,
             main_branch: None,
             base: None,
             files: Vec::new(),
@@ -682,7 +699,7 @@ fn changed_files(
         entry.base = Some(base);
         entry.files = files.iter().cloned().collect();
         if !files.is_empty() {
-            changed.insert(name, (repo.clone(), files));
+            changed.insert(name, (tree, files));
         }
         listed.push(entry);
     }
@@ -709,16 +726,15 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
         });
     };
     for file in files {
-        let Some((repo, relative)) = index.locate_file(file) else {
+        let Some((repo, relative, tree)) = index.locate_file(file) else {
             skip(&mut listed, file, "not in a repo of this workspace");
             continue;
         };
-        let repo_path = PathBuf::from(&repo.path);
-        if super::workspace::excluded_repo(root, &repo_path) {
+        if super::workspace::excluded_repo(root, &tree.repo) {
             skip(&mut listed, file, "not in a repo of this workspace");
             continue;
         }
-        if !crate::file_finder::is_scanned_source(&repo_path.join(&relative), &repo_path) {
+        if !crate::file_finder::is_scanned_source(&tree.checkout.join(&relative), &tree.checkout) {
             skip(&mut listed, file, "not a source file the scan reads");
             continue;
         }
@@ -728,14 +744,14 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
         }
         changed
             .entry(repo.name.clone())
-            .or_insert_with(|| (repo_path, BTreeSet::new()))
+            .or_insert_with(|| (tree, BTreeSet::new()))
             .1
             .insert(relative);
     }
     let mut repos: Vec<ChangedRepo> = changed
         .iter()
-        .map(|(_, (path, files))| ChangedRepo {
-            repo: path.to_string_lossy().to_string(),
+        .map(|(_, (tree, files))| ChangedRepo {
+            repo: tree.repo.to_string_lossy().to_string(),
             main_branch: None,
             base: None,
             files: files.iter().cloned().collect(),

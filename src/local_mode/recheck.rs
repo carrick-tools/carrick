@@ -52,6 +52,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use super::checkout::Tree;
 use super::contract::{NotReread, RecheckScope};
 use super::index::{build, join_command, read_blobs, repo_label, scan_command, service_id};
 use super::read_model::{IndexedItem, IndexedRepo, IndexedService};
@@ -253,7 +254,7 @@ fn took(phase: &str, began: Instant) {
 /// and records no miss. A miss that holds still answers as a known miss.
 pub fn run(
     workspace: &Workspace,
-    repo: &Path,
+    tree: &Tree,
     relative: &str,
     index_generation: &str,
     reach: &Reach,
@@ -287,7 +288,7 @@ pub fn run(
         }
     };
     let began = Instant::now();
-    let new_functions = added_functions(&held, repo, relative);
+    let new_functions = added_functions(&held, tree, relative);
     took("added-functions", began);
     let began = Instant::now();
     let misses = ServiceMisses::path(workspace);
@@ -314,13 +315,13 @@ pub fn run(
         }));
     }
     let began = Instant::now();
-    let plan = Plan::make(workspace, repo, reach, index_generation, &held);
+    let plan = Plan::make(workspace, &tree.checkout, reach, index_generation, &held);
     took("plan-make", began);
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
     let outcome = inside(
         workspace,
         held,
-        (repo, relative),
+        (tree, relative),
         &generation,
         deadline,
         &plan,
@@ -846,9 +847,10 @@ impl Held {
 /// this tells the agent it was compared against. Either one alone would
 /// report every function in an edited file as new on the install the other
 /// covers.
-fn added_functions(held: &Held, repo: &Path, relative: &str) -> Vec<super::contract::NewFunction> {
-    let name = repo_label(repo);
-    let hosted = held.hosted.local_blobs(repo);
+fn added_functions(held: &Held, tree: &Tree, relative: &str) -> Vec<super::contract::NewFunction> {
+    let name = repo_label(&tree.repo);
+    let hosted = held.hosted.local_blobs(&tree.repo);
+    let repo = tree.checkout.as_path();
     let blobs: Vec<crate::cloud_storage::CloudRepoData> = held
         .local
         .iter()
@@ -905,17 +907,17 @@ fn named_additions(
 fn inside(
     workspace: &Workspace,
     held: Held,
-    (repo, relative): (&Path, &str),
+    (tree, relative): (&Tree, &str),
     generation: &Path,
     deadline: Instant,
     plan: &Plan,
     before: &super::read_model::LocalIndex,
 ) -> Result<Fresh, String> {
-    let name = repo_label(repo);
+    let name = repo_label(&tree.repo);
     let rejoined = rejoin_held(
         workspace,
         held,
-        &[repo],
+        std::slice::from_ref(tree),
         generation,
         deadline,
         None,
@@ -940,7 +942,7 @@ fn inside(
         .and_then(|rebuilt| rebuilt.files.get(relative))
         .cloned()
         .unwrap_or_default();
-    let (moved, no_route) = judge_edit(workspace, before, &rejoined, repo, relative, plan);
+    let (moved, no_route) = judge_edit(workspace, before, &rejoined, tree, relative, plan);
     state_no_route(&mut items, &no_route);
     // No rows where the index held some is an answer, not a failure: the edit
     // took the last route out of this file, and the fresh (empty) list is what
@@ -1011,11 +1013,11 @@ fn judge_edit(
     workspace: &Workspace,
     before: &super::read_model::LocalIndex,
     rejoined: &Rejoined,
-    repo: &Path,
+    tree: &Tree,
     relative: &str,
     plan: &Plan,
 ) -> (Vec<super::contract::MovedRow>, Vec<super::changed::Problem>) {
-    let edited = repo_label(repo);
+    let edited = repo_label(&tree.repo);
     let mut changed: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
     changed.insert(edited, std::iter::once(relative.to_string()).collect());
@@ -1039,7 +1041,7 @@ fn judge_edit(
         &rejoined.index,
         &rejoined.join,
         &wanted,
-        &super::changed::touched_since_index(before),
+        &super::changed::touched_since_index(before, std::slice::from_ref(tree)),
     );
     let (outside, inside): (Vec<_>, Vec<_>) = judged
         .problems
@@ -1150,7 +1152,7 @@ pub(super) struct Rejoined {
 /// line on its stderr has no reader.
 pub(super) fn rejoin(
     workspace: &Workspace,
-    repos: &[&Path],
+    repos: &[Tree],
     generation: &Path,
     deadline: Instant,
     narrator: Option<&Narrator>,
@@ -1176,7 +1178,7 @@ pub(super) fn rejoin(
 fn rejoin_held(
     workspace: &Workspace,
     held: Held,
-    repos: &[&Path],
+    repos: &[Tree],
     generation: &Path,
     deadline: Instant,
     narrator: Option<&Narrator>,
@@ -1197,7 +1199,7 @@ fn rejoin_held(
         .unwrap_or_else(|| generation.join("judged"));
     std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
     let names: std::collections::BTreeSet<String> =
-        repos.iter().map(|repo| repo_label(repo)).collect();
+        repos.iter().map(|tree| repo_label(&tree.repo)).collect();
     let mut services = std::collections::BTreeSet::new();
 
     // Everything except the re-scanned repos, exactly as the last index left it.
@@ -1237,9 +1239,9 @@ fn rejoin_held(
     // so the hosted snapshot and the retained blobs are not held for the
     // minutes the children run (carrick#2948): each repo reads back only its
     // own pair once its scan has finished.
-    for (position, repo) in repos.iter().enumerate() {
-        let name = repo_label(repo);
-        let mut previous_data = hosted.local_blobs(repo);
+    for (position, tree) in repos.iter().enumerate() {
+        let name = repo_label(&tree.repo);
+        let mut previous_data = hosted.local_blobs(&tree.repo);
         write_json(&staged(generation, "hosted", position), &previous_data)?;
         let hosted_ids: std::collections::BTreeSet<String> =
             previous_data.iter().map(service_id).collect();
@@ -1270,11 +1272,11 @@ fn rejoin_held(
         took("stage/hosted-and-previous-lists", began);
     }
 
-    for (position, repo) in repos.iter().enumerate() {
-        let name = repo_label(repo);
+    for (position, tree) in repos.iter().enumerate() {
+        let name = repo_label(&tree.repo);
         let previous = staged(generation, "previous", position);
         let scan_dir = generation.join(format!("scan-{position}"));
-        let mut scan = rescan_command(&exe, repo, &scan_dir, &previous);
+        let mut scan = rescan_command(&exe, tree, &scan_dir, &previous);
         scan.env(JUDGE_ANSWERS_ENV, &judged);
         if let Some(plan) = plan {
             scan.env(
@@ -1320,7 +1322,8 @@ fn rejoin_held(
             took("after-scan/read-staged-lists", began);
         }
         let began = Instant::now();
-        let carried = super::index::carried_services(repo, &hosted_data, &previous_data, &fresh)?;
+        let carried =
+            super::index::carried_services(&tree.checkout, &hosted_data, &previous_data, &fresh)?;
         // A check writes kept state under `.carrick` (carrick#3245): the rows
         // of the carried services it walked, bound on use by build stamp,
         // commit and every file's hash ([`crate::position_rows::kept_rows`]),
@@ -1345,10 +1348,16 @@ fn rejoin_held(
     // repo it is pointed at names the run, and reads its services from the
     // previous generation its own re-scan read (carrick#3366): every blob is
     // in `blobs`.
-    let anchor = repos.first().copied().unwrap_or(&workspace.root);
+    // It reads the anchor's checkout as its re-scan did, under the same name.
+    let anchor = repos
+        .first()
+        .map_or(workspace.root.as_path(), |tree| tree.checkout.as_path());
     let anchor_previous = (!repos.is_empty()).then(|| staged(generation, "previous", 0));
     let out = generation.join("join.json");
     let mut join = join_command(&exe, anchor, &blobs, &out, anchor_previous.as_deref());
+    if let Some(tree) = repos.first() {
+        join.env(crate::utils::LOCAL_REPO_NAME_ENV, repo_label(&tree.repo));
+    }
     join.env(JUDGE_ANSWERS_ENV, &judged);
     join.env_remove(crate::progress::PROGRESS_ENV);
     if let Some(narrator) = narrator {
@@ -1400,16 +1409,21 @@ const RESCAN_HEAP_CAP_MB: u64 = 3072;
 /// The subprocess one repo's re-scan runs as: the facts-only scan, analysing
 /// only the services whose inputs changed (`--changed-only`), with no
 /// signatures, no progress lines and the re-scan's heap cap.
-fn rescan_command(exe: &Path, repo: &Path, scan_dir: &Path, previous: &Path) -> Command {
+///
+/// It scans the checkout the files are read from under the indexed repo's
+/// name ([`crate::utils::LOCAL_REPO_NAME_ENV`]), so a scan of a linked
+/// worktree writes blobs the re-join reads as that repo's (carrick#3595).
+fn rescan_command(exe: &Path, tree: &Tree, scan_dir: &Path, previous: &Path) -> Command {
     let mut scan = scan_command(
         exe,
-        repo,
+        &tree.checkout,
         scan_dir,
         previous,
         None,
         &super::index::Pass::Facts,
     );
     scan.arg("--changed-only")
+        .env(crate::utils::LOCAL_REPO_NAME_ENV, repo_label(&tree.repo))
         .env(super::SKIP_SIGNATURES_ENV, "1")
         .env_remove(crate::progress::PROGRESS_ENV);
     if let Some(cap) = rescan_heap_cap(
@@ -1817,7 +1831,7 @@ mod tests {
         assert_eq!(rescan_heap_cap(Some(std::ffi::OsStr::new("0"))), None);
         let command = rescan_command(
             Path::new("carrick"),
-            Path::new("/repo"),
+            &Tree::at(Path::new("/repo")),
             Path::new("/out"),
             Path::new("/previous.json"),
         );
@@ -1837,6 +1851,30 @@ mod tests {
             crate::engine::service_workers::at_once_with(12_452, 12, Some(3072)),
             2
         );
+    }
+
+    /// A re-scan of a linked worktree reads the worktree and names itself as
+    /// the indexed repo (carrick#3595).
+    #[test]
+    fn a_re_scan_of_a_worktree_reads_it_under_the_repos_name() {
+        let tree = Tree {
+            repo: std::path::PathBuf::from("/work/api"),
+            checkout: std::path::PathBuf::from("/work/api/.claude/worktrees/b"),
+        };
+        let command = rescan_command(
+            Path::new("carrick"),
+            &tree,
+            Path::new("/out"),
+            Path::new("/previous.json"),
+        );
+        assert!(
+            command
+                .get_args()
+                .any(|arg| arg == "/work/api/.claude/worktrees/b")
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == crate::utils::LOCAL_REPO_NAME_ENV && value == Some(std::ffi::OsStr::new("api"))
+        }));
     }
 
     #[test]
