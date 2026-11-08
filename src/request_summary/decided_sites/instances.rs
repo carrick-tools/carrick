@@ -62,13 +62,16 @@ use crate::position_rows::{FLAG_ANY, FLAG_DECLARATION_UNNAMED, Kind};
 
 /// A maker the store labels: the package (as the store keys it), the
 /// export, the member (`None`: the export itself) and whether it is
-/// constructed.
+/// constructed, and the slot of its call that holds the name its instance
+/// is made with, when the claim states one (read for an op whose name is
+/// bound to its maker, carrick#3527).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MakerLabel {
     pub package: String,
     pub export: String,
     pub member: Option<String>,
     pub new: bool,
+    pub name: Option<super::ArgSlot>,
 }
 
 impl MakerLabel {
@@ -78,12 +81,19 @@ impl MakerLabel {
         let mut makers = Vec::new();
         for export in exports {
             for claim in &export.claims {
-                if let LibraryClaim::Make { form, member, .. } = claim {
+                if let LibraryClaim::Make {
+                    form, member, name, ..
+                } = claim
+                {
                     let maker = MakerLabel {
                         package: export.package.clone(),
                         export: export.export.clone(),
                         member: member.clone(),
                         new: *form == MakeForm::New,
+                        name: name.as_ref().map(|slot| super::ArgSlot {
+                            arg: slot.arg as usize,
+                            key: slot.key.clone(),
+                        }),
                     };
                     if !makers.contains(&maker) {
                         makers.push(maker);
@@ -373,6 +383,9 @@ pub enum InstanceAt {
 pub struct MakerCall {
     pub form: MakerForm,
     pub args: Vec<super::super::SiteArg>,
+    /// The maker call's span, in the file the root names: where a name
+    /// bound to the maker is read (carrick#3527).
+    pub span: (u32, u32),
 }
 
 /// One instance end of a decided site: the call that hands the instance
@@ -1500,6 +1513,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                             made: Some(MakerCall {
                                 form: instance.form,
                                 args: instance.args.clone(),
+                                span: (instance.site.span_start, instance.site.span_end),
                             }),
                         },
                     );

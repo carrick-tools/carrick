@@ -855,6 +855,28 @@ impl<'r> NameFold<'r> {
                 .collect(),
         )
     }
+
+    /// The one text the argument `arg` of the call at `span` in `file`
+    /// (repo-relative) always is, read by the resolver as a site's name is
+    /// ([`Resolver::text_read`]): where a name decided at one call is
+    /// stated at another (a maker-bound name, carrick#3527). `None` where it
+    /// reads no one text.
+    pub(super) fn arg_text(&mut self, file: &str, span: (u32, u32), arg: usize) -> Option<String> {
+        let expr = {
+            let parsed = self.sources.get(file)?;
+            let mut finder = CallFinder {
+                parsed,
+                target: span,
+                handing: Vec::new(),
+                found: None,
+            };
+            parsed.module.visit_with(&mut finder);
+            finder.found?.arg_exprs.get(arg)?.clone()
+        };
+        self.resolver
+            .text_read(self.sources.root, file, &expr)
+            .map(|(text, _)| text)
+    }
 }
 
 /// The file of a compiler row's declaration (`file:line`, or the file
