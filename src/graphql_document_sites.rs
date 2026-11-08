@@ -1083,7 +1083,10 @@ fn property_key(member: &TsTypeElement) -> Option<(String, &TsPropertySignature)
 /// object literal, or parsed from the text of a template or string.
 fn expression_operations(expr: &Expr) -> Vec<DocumentOperation> {
     match unwrap_expression(expr) {
-        Expr::Object(object) => object_operations(object),
+        Expr::Object(object) => match document_text_property(object) {
+            Some(text) => text_operations(&text),
+            None => object_operations(object),
+        },
         Expr::TaggedTpl(tagged) => text_operations(&template_text(&tagged.tpl)),
         Expr::Call(call) if call.args.len() == 1 && call.args[0].spread.is_none() => {
             match unwrap_expression(&call.args[0].expr) {
@@ -1347,27 +1350,33 @@ pub(crate) fn parsed_operation<'a, 'd>(
 ///
 /// - an object literal whose `kind` is the string `"Document"`, the graphql-js
 ///   AST node every generated typed document is written as;
+/// - an object literal with exactly one property holding a string or template
+///   whose text parses as an executable document (a generated module's
+///   `{ id, op, query: \`query x { ... }\` }`; the property's name is not read);
 /// - a tagged template, or a call with one template or string argument, whose
 ///   text parses as an executable document (an operation or a fragment).
 ///
 /// Type assertions and parentheses around either are looked through.
 pub fn is_document_expression(expr: &Expr) -> bool {
     match unwrap_expression(expr) {
-        Expr::Object(object) => object.props.iter().any(|prop| {
-            let PropOrSpread::Prop(prop) = prop else {
-                return false;
-            };
-            let Prop::KeyValue(pair) = &**prop else {
-                return false;
-            };
-            let key_is_kind = match &pair.key {
-                PropName::Ident(ident) => ident.sym == *"kind",
-                PropName::Str(s) => s.value == *"kind",
-                _ => false,
-            };
-            key_is_kind
-                && matches!(unwrap_expression(&pair.value), Expr::Lit(swc_ecma_ast::Lit::Str(s)) if s.value == *"Document")
-        }),
+        Expr::Object(object) => {
+            document_text_property(object).is_some()
+                || object.props.iter().any(|prop| {
+                    let PropOrSpread::Prop(prop) = prop else {
+                        return false;
+                    };
+                    let Prop::KeyValue(pair) = &**prop else {
+                        return false;
+                    };
+                    let key_is_kind = match &pair.key {
+                        PropName::Ident(ident) => ident.sym == *"kind",
+                        PropName::Str(s) => s.value == *"kind",
+                        _ => false,
+                    };
+                    key_is_kind
+                        && matches!(unwrap_expression(&pair.value), Expr::Lit(swc_ecma_ast::Lit::Str(s)) if s.value == *"Document")
+                })
+        }
         Expr::TaggedTpl(tagged) => is_executable_document(&template_text(&tagged.tpl)),
         Expr::Call(call) if call.args.len() == 1 && call.args[0].spread.is_none() => {
             match unwrap_expression(&call.args[0].expr) {
@@ -1380,6 +1389,28 @@ pub fn is_document_expression(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// The document text an object literal carries in a property: the one
+/// string or template property whose text parses as an executable document.
+/// Two such properties are ambiguous, so neither is read.
+fn document_text_property(object: &ObjectLit) -> Option<String> {
+    let mut found = object.props.iter().filter_map(|prop| {
+        let PropOrSpread::Prop(prop) = prop else {
+            return None;
+        };
+        let Prop::KeyValue(pair) = &**prop else {
+            return None;
+        };
+        let text = match unwrap_expression(&pair.value) {
+            Expr::Tpl(tpl) => template_text(tpl),
+            Expr::Lit(swc_ecma_ast::Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
+            _ => return None,
+        };
+        is_executable_document(&text).then_some(text)
+    });
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
 }
 
 pub(crate) fn unwrap_expression(expr: &Expr) -> &Expr {
@@ -2077,6 +2108,44 @@ export function CarrierList() {
             .iter()
             .map(|(field, text)| (field.to_string(), text.to_string()))
             .collect()
+    }
+
+    /// The operations `document_declarations` reads for `name` in `source`.
+    fn declared_operations(source: &str, name: &str) -> Option<Vec<(String, Vec<String>)>> {
+        let file = Path::new("documents.ts");
+        let (source_map, module) =
+            crate::swc_scanner::parse_standalone_module(file, source).expect("module parses");
+        let documents = document_declarations(&module, &source_map, file);
+        documents.get(name).map(|document| {
+            document
+                .operations
+                .iter()
+                .map(|operation| {
+                    (
+                        operation.name.clone().unwrap_or_default(),
+                        operation.fields.clone(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_declaration_holding_document_text_in_a_property_is_a_document() {
+        let source = r#"
+export const currentUserQuery = { id: "a1", op: "query", query: `query currentUser { currentUser { id } }` };
+export const plain = { id: "a2", note: "not a document", query: "select 1" };
+export const twice = { first: "query one { a }", second: "query two { b }" };
+"#;
+        let operations = declared_operations(source, "currentUserQuery")
+            .expect("the property text makes the declaration a document");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].1, vec!["currentUser".to_string()]);
+        assert!(declared_operations(source, "plain").is_none());
+        assert!(
+            declared_operations(source, "twice").is_none(),
+            "two document properties are ambiguous"
+        );
     }
 
     #[test]

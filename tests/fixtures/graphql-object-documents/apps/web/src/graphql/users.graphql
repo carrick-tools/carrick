@@ -1,0 +1,15 @@
+query currentUser {
+  currentUser
+}
+
+query users {
+  users
+}
+
+mutation updateUser($id: ID!) {
+  updateUser(id: $id)
+}
+
+query adminStats {
+  adminStats
+}

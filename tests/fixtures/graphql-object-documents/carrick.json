@@ -1,0 +1,13 @@
+{
+  "services": [
+    {
+      "serviceName": "users-api",
+      "directory": "apps/api",
+      "graphqlSchemas": ["apps/api/src/schema.graphql"]
+    },
+    {
+      "serviceName": "users-web",
+      "directory": "apps/web"
+    }
+  ]
+}
