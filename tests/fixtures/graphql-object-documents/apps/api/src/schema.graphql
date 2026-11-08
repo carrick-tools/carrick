@@ -1,0 +1,9 @@
+type Query {
+  currentUser: String
+  users: [String!]!
+  adminStats: Int
+}
+
+type Mutation {
+  updateUser(id: ID!): String
+}
