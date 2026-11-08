@@ -5442,6 +5442,50 @@ export function listen(): void {
         }
     }
 
+    /// carrick#3527: the walk up a maker-bound name's callers is capped
+    /// (`MAX_COMPOSED` calls visited). Past the cap, here 128 paths through
+    /// seven levels of parameter-passing helpers, the send stays one site
+    /// with its name asked, never dropped, and says the cap stopped it.
+    #[test]
+    fn a_maker_bound_name_past_the_walk_cap_stays_unnamed() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("queue-maker-fan-out", ".", "jobs")
+        else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for record in &records {
+            forced
+                .entry(record.state.point.at.clone())
+                .or_default()
+                .push(
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned(),
+                );
+        }
+        assert_eq!(
+            forced.get("src/open.ts:8").cloned(),
+            Some(vec![None]),
+            "{forced:#?}"
+        );
+        let sites: Vec<_> = decided
+            .sites
+            .iter()
+            .filter(|site| site.file == "src/open.ts" && site.line == 8)
+            .collect();
+        assert_eq!(sites.len(), 1, "{:#?}", decided.sites);
+        assert!(sites[0].composed_trimmed, "{:#?}", sites[0]);
+    }
+
     /// carrick#1678: a verb called on the object a scope member returns
     /// (`items.at("/items").get(list)`) is a route whose path is the scope
     /// call's argument and whose instance is the scope call's receiver: the

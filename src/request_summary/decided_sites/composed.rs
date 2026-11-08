@@ -383,14 +383,24 @@ fn edge_text(at: &str, member: &str, prefix: &Prefix) -> String {
 pub(super) const MAX_COMPOSED: usize = 64;
 
 /// What is left of one site's [`MAX_COMPOSED`], and whether it trimmed.
-struct Budget {
+/// Also bounds the walks up a maker-bound name's callers
+/// (`Walk::made_with`, `Walk::joins`, carrick#3527).
+pub(super) struct Budget {
     left: usize,
-    trimmed: bool,
+    pub(super) trimmed: bool,
 }
 
 impl Budget {
+    /// A whole [`MAX_COMPOSED`], nothing trimmed yet.
+    pub(super) fn full() -> Self {
+        Budget {
+            left: MAX_COMPOSED,
+            trimmed: false,
+        }
+    }
+
     /// Takes one, or says the cap is reached.
-    fn take(&mut self) -> bool {
+    pub(super) fn take(&mut self) -> bool {
         if self.left == 0 {
             self.trimmed = true;
             return false;
@@ -525,10 +535,7 @@ fn join_path(parts: &[&str]) -> String {
 /// holds it (carrick#2474 R5a): its edges and prefixes from where it ends
 /// down, and that end.
 pub(super) fn aboves(ends: &[InstanceEnd], mounts: &Mounts) -> Vec<Above> {
-    let mut budget = Budget {
-        left: MAX_COMPOSED,
-        trimmed: false,
-    };
+    let mut budget = Budget::full();
     let mut out: Vec<Above> = Vec::new();
     for end in ends {
         for chain in chains(end, mounts, &mut Vec::new(), &mut budget) {
@@ -564,10 +571,7 @@ pub(super) fn compose(
     mounts: &Mounts,
 ) -> (Vec<Composed>, bool) {
     let mut out: Vec<Composed> = Vec::new();
-    let mut budget = Budget {
-        left: MAX_COMPOSED,
-        trimmed: false,
-    };
+    let mut budget = Budget::full();
     let mut all: Vec<Chain> = Vec::new();
     for end in ends {
         all.extend(chains(end, mounts, &mut Vec::new(), &mut budget));

@@ -712,7 +712,9 @@ pub struct DecidedSite {
     pub composed: Vec<Composed>,
     /// Whether `composed` stopped at its cap
     /// ([`composed::MAX_COMPOSED`] chains, and paths): some paths are
-    /// left out.
+    /// left out. Also set where the same cap stopped the walk up a
+    /// maker-bound name's callers (carrick#3527): the site is unnamed and
+    /// its name asked.
     pub composed_trimmed: bool,
     /// With the receiver trace on, for a procedure op's site (its label
     /// names it by its key, carrick#2474 R6c), the paths the adapters that
@@ -1893,6 +1895,13 @@ struct MadeWith<'a> {
     passed: BTreeSet<(PathBuf, String)>,
 }
 
+/// One walk of the join ([`Walk::joins`]): the calls of the site, and the
+/// values in `made` (by index) that name it; `None` leaves it unnamed.
+struct Join<'a> {
+    down: Vec<Placed<'a>>,
+    fitting: Option<Vec<usize>>,
+}
+
 impl<'a> Walk<'a, '_> {
     /// `down` is the calls from the site (first) to the labelled call
     /// (last).
@@ -2295,6 +2304,9 @@ impl<'a> Walk<'a, '_> {
         let roots = self.instances(&[last]);
         let mut made: Vec<MadeWith<'a>> = Vec::new();
         let mut unread = roots.is_empty();
+        // Each caller multiplies the paths up: the walks share one cap, and
+        // a walk the cap stops reads no name.
+        let mut budget = composed::Budget::full();
         for root in &roots {
             let InstanceAt::Root {
                 file,
@@ -2334,13 +2346,36 @@ impl<'a> Walk<'a, '_> {
                 BTreeSet::new(),
                 &mut made,
                 &mut Vec::new(),
+                &mut budget,
             );
         }
         if unread || made.is_empty() {
-            return self.unnamed(chain, end);
+            return self.unnamed_trimmed(chain, end, budget.trimmed);
         }
         if made.iter().all(|value| !value.passed.is_empty()) {
-            self.joined(chain.to_vec(), &made, end, &mut Vec::new());
+            let mut joins = Vec::new();
+            self.joins(
+                chain.to_vec(),
+                &made,
+                &mut Vec::new(),
+                &mut budget,
+                &mut joins,
+            );
+            if budget.trimmed {
+                return self.unnamed_trimmed(chain, end, true);
+            }
+            for join in joins {
+                match join.fitting {
+                    None => {
+                        self.unnamed(&join.down, end);
+                    }
+                    Some(fitting) => {
+                        let fitting: Vec<&MadeWith<'a>> =
+                            fitting.iter().map(|&at| &made[at]).collect();
+                        self.named_by(&join.down, &fitting, end);
+                    }
+                }
+            }
             return false;
         }
         let made: Vec<&MadeWith<'a>> = made.iter().collect();
@@ -2359,7 +2394,9 @@ impl<'a> Walk<'a, '_> {
     /// constructor bodies its walk passed (`passed`, the function `placed` is
     /// written in included). False where a value is not read: a parameter
     /// nothing hands in (an entry point), a callback's own, or a value this
-    /// pass does not read. `path` ends a cycle.
+    /// pass does not read, or a walk `budget` stops (each call visited takes
+    /// one). `path` ends a cycle.
+    #[allow(clippy::too_many_arguments)]
     fn made_with(
         &self,
         placed: Placed<'a>,
@@ -2368,7 +2405,11 @@ impl<'a> Walk<'a, '_> {
         mut passed: BTreeSet<(PathBuf, String)>,
         made: &mut Vec<MadeWith<'a>>,
         path: &mut Vec<(PathBuf, String)>,
+        budget: &mut composed::Budget,
     ) -> bool {
+        if !budget.take() {
+            return false;
+        }
         if let Some(key) = placed.key
             && self.calls.is_constructor(placed.file, key)
         {
@@ -2409,6 +2450,7 @@ impl<'a> Walk<'a, '_> {
                 passed.clone(),
                 made,
                 path,
+                budget,
             );
         }
         path.pop();
@@ -2420,32 +2462,47 @@ impl<'a> Walk<'a, '_> {
     /// a construction written in place, named by the values `made` whose walk
     /// passed that class's constructor body. A walk that meets no such call,
     /// or a construction no value passed, names nothing ([`Self::unnamed`]).
+    /// Each walk's decision goes to `joins`, written only once the whole
+    /// walk is read: a walk `budget` stops (each call visited takes one)
+    /// leaves the site unnamed, never some paths named and the rest dropped.
     /// `path` ends a cycle.
-    fn joined(
-        &mut self,
+    fn joins(
+        &self,
         down: Vec<Placed<'a>>,
         made: &[MadeWith<'a>],
-        end: &LabelledEnd,
         path: &mut Vec<(PathBuf, String)>,
+        budget: &mut composed::Budget,
+        joins: &mut Vec<Join<'a>>,
     ) {
+        if !budget.take() {
+            return;
+        }
         for k in (0..down.len()).rev() {
             let Some(constructor) = self.calls.receiver_constructed(&down[k]) else {
                 continue;
             };
-            let fitting: Vec<&MadeWith<'a>> = made
-                .iter()
-                .filter(|value| value.passed.contains(&constructor))
+            let fitting: Vec<usize> = (0..made.len())
+                .filter(|&at| made[at].passed.contains(&constructor))
                 .collect();
-            if fitting.is_empty() {
-                self.unnamed(&down, end);
+            joins.push(if fitting.is_empty() {
+                Join {
+                    down,
+                    fitting: None,
+                }
             } else {
-                self.named_by(&down[k..], &fitting, end);
-            }
+                Join {
+                    down: down[k..].to_vec(),
+                    fitting: Some(fitting),
+                }
+            });
             return;
         }
         let top = down[0];
         let Some(key) = top.key else {
-            self.unnamed(&down, end);
+            joins.push(Join {
+                down,
+                fitting: None,
+            });
             return;
         };
         let here = (top.file.to_path_buf(), key.to_string());
@@ -2456,7 +2513,10 @@ impl<'a> Walk<'a, '_> {
         }
         let callers = self.calls.callers_of(top.file, key);
         if callers.is_empty() {
-            self.unnamed(&down, end);
+            joins.push(Join {
+                down,
+                fitting: None,
+            });
             return;
         }
         if path.contains(&here) {
@@ -2466,9 +2526,33 @@ impl<'a> Walk<'a, '_> {
         for caller in callers {
             let mut longer = vec![*caller];
             longer.extend_from_slice(&down);
-            self.joined(longer, made, end, path);
+            self.joins(longer, made, path, budget, joins);
         }
         path.pop();
+    }
+
+    /// [`Self::unnamed`], and where a walk's cap stopped the name being read
+    /// (`trimmed`), the site says so in `composed_trimmed`, as a site whose
+    /// paths the cap stopped does.
+    fn unnamed_trimmed(&mut self, down: &[Placed<'a>], end: &LabelledEnd, trimmed: bool) -> bool {
+        let at_labelled = self.unnamed(down, end);
+        if trimmed {
+            let placed = if at_labelled {
+                down[down.len() - 1]
+            } else {
+                down[0]
+            };
+            let id = (
+                relative(self.root, placed.file),
+                placed.call.site.span_start,
+                None,
+                end.at(),
+            );
+            if let Some(&at) = self.kept.get(&id) {
+                self.out.sites[at].composed_trimmed = true;
+            }
+        }
+        at_labelled
     }
 
     /// A maker-bound op whose name no walk reads (an instance the walk does
@@ -2982,7 +3066,7 @@ fn decide(
             let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
             let mut fold = super::site_record::NameFold::new(inputs, siblings, root);
             for site in &mut out.sites {
-                (site.composed, site.composed_trimmed) = match site.name_text() {
+                let (composed, trimmed) = match site.name_text() {
                     Some(own) => {
                         let (mut composed, trimmed) =
                             composed::compose(&site.instances, Some(&own), &mounts);
@@ -3028,6 +3112,9 @@ fn decide(
                         }
                     }
                 };
+                site.composed = composed;
+                // A maker-bound name's walk may have set it already.
+                site.composed_trimmed |= trimmed;
             }
             procedures::Pass {
                 calls: &calls,
