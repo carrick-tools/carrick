@@ -24,15 +24,12 @@ const VECTORS: &[u8] = include_bytes!("fixtures/pairing.vectors.json");
 /// (`lambdas/mcp-server/src/utils/__tests__/fixtures/pairing.vectors.json`)
 /// is byte-identical, so a change is a contract change: change the vectors
 /// on both sides and re-pin both values together.
-const PINNED_SHA256: &str = "f6a4081e8d1271e96d700b23087abe26093251077db4ac8fc3490b81fa2a42c7";
+const PINNED_SHA256: &str = "02c72f03cdc00bd538b6b3ee1f9d768d7b766698574032d32c7a6c7ad1b41868";
 
 /// The cases that pin today's answer for a named product gap (the file's
 /// `expected_red` marker). The change that closes a gap removes its marker
 /// and this entry together.
-const EXPECTED_RED: &[&str] = &[
-    "trailing-slash-route-is-not-canonical",
-    "template-hole-inside-a-route-segment-is-literal",
-];
+const EXPECTED_RED: &[&str] = &["template-hole-inside-a-route-segment-is-literal"];
 
 fn file() -> Value {
     serde_json::from_slice(VECTORS).expect("the vector file is JSON")

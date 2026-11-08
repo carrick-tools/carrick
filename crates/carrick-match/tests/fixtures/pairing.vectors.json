@@ -259,9 +259,8 @@
       }
     },
     {
-      "id": "trailing-slash-route-is-not-canonical",
-      "source": "rust_probe.out row 5; audit I5. Stays no_route: the route-side writer owes canonical_path (address chain join), pairing does not rewrite stored keys",
-      "expected_red": "Wanted: matched. A trailing slash on a stored route key is a writer's mistake: the route-side writers owe canonical_path (carrick#3496 follow-up F1, with the address chain join). pair_winners never rewrites its inputs, so this case answers no_route until the stored key is canonical.",
+      "id": "trailing-slash-stored-key-is-not-rewritten",
+      "source": "rust_probe.out row 5; audit I5. The route-side writers store canonical_path (carrick#3522), so a trailing slash on a stored key never arrives; pairing does not rewrite one that does",
       "input": {
         "producers": [
           {
