@@ -42,7 +42,7 @@
 //! (carrick#2448) added [`Kind::Decl`]; version 4 (carrick#2561) dropped
 //! `impl` rows, whose go-to-implementation search was most of the walk and
 //! which nothing read (carrick#2432 asks for implementations where discovery
-//! stops). A file of any other version is not
+//! stops); version 5 (carrick#2448) added [`Kind::TypedDecl`]. A file of any other version is not
 //! read: its service reads as [`HoleReason::RowsMissing`]. A walk removes any
 //! earlier rows file before it writes. The rows of a service a later laptop
 //! pass carries are used again instead of walked, only when [`kept_rows`]
@@ -73,7 +73,7 @@ use crate::services::type_sidecar::{PositionRowsCounts, SidecarRecipe};
 pub const POSITIONS_DIR: &str = "positions";
 
 /// The format version the header carries.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The type is `any`, declared or inferred. Never set with [`FLAG_ERROR_TYPE`].
 pub const FLAG_ANY: u8 = 1;
@@ -161,6 +161,14 @@ pub enum Kind {
     /// the tag names (for an intrinsic, the `JSX.IntrinsicElements` member)
     /// and the tag's type (an intrinsic's attributes).
     Jsx,
+    /// A `call` row's callee TYPE (carrick#2448): written beside a `call`
+    /// row, at its span, when the callee symbol is a value (a parameter, a
+    /// property, a local) and its type is a named function's own
+    /// (`send: typeof fetch`). The row names that function's declaration as
+    /// the compiler records it: symbol, file, line, package, and the
+    /// [`FLAG_PUBLISHED`] / [`FLAG_MODULE_DEFAULT`] bits; no type. None where
+    /// the callee symbol is that declaration, or the type is anonymous.
+    TypedDecl,
 }
 
 /// `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]`.
@@ -1203,13 +1211,13 @@ mod tests {
         }
     }
 
-    /// carrick#2448, #2561: the reader reads version 4 only; a file of any
+    /// carrick#2448, #2561: the reader reads version 5 only; a file of any
     /// other version is an error, so `load_index` over a version-3 file (with
     /// its `impl` rows) left by an earlier build gives every lookup
     /// [`HoleReason::RowsMissing`] and the scan goes on.
     #[test]
     fn a_rows_file_of_another_version_is_not_read() {
-        for v in [3, 5] {
+        for v in [3, 4] {
             let text = format!(
                 "{{\"v\":{v},\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}}\n\
                  {{\"f\":\"a.ts\",\"h\":\"00\",\"r\":[]}}\n"
@@ -1300,23 +1308,78 @@ mod tests {
         assert_eq!(index.union_declarations(&file, base, base + 3), Ok(&[][..]));
     }
 
+    /// carrick#2448: a `typed_decl` row shares its call row's span and is
+    /// looked up by its own kind; it reads as `typed_decl` in the file.
+    #[test]
+    fn a_typed_decl_row_is_looked_up_beside_its_call_row() {
+        let root = Path::new("/repo");
+        let text = "send('/a');\n";
+        let typed = Row(
+            Kind::TypedDecl,
+            0,
+            10,
+            Some("fetch".to_string()),
+            Some("lib:lib.dom.d.ts".to_string()),
+            Some(39142),
+            None,
+            None,
+            FLAG_PUBLISHED,
+        );
+        assert!(
+            serde_json::to_string(&typed)
+                .unwrap()
+                .starts_with("[\"typed_decl\",")
+        );
+        let rows = RowsFile {
+            header: Header {
+                v: FORMAT_VERSION,
+                typescript: "6.0.2".to_string(),
+                service: "api".to_string(),
+                files: 1,
+            },
+            files: vec![file_rows(
+                "src/a.ts",
+                Some(text),
+                None,
+                vec![row(Kind::Call, 0, 10, Some("send"), 0), typed],
+            )],
+        };
+        let mut index = PositionIndex::of(root, rows);
+        let file = root.join("src/a.ts");
+        index.bind(&file, text);
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        let found = index
+            .lookup(&file, base, base + 10, Kind::TypedDecl)
+            .expect("typed row");
+        assert_eq!(
+            (found.symbol(), found.decl_file(), found.decl_line()),
+            (Some("fetch"), Some("lib:lib.dom.d.ts"), Some(39142))
+        );
+        assert_eq!(
+            index
+                .lookup(&file, base, base + 10, Kind::Call)
+                .map(Row::symbol),
+            Ok(Some("send"))
+        );
+    }
+
     #[test]
     fn a_line_with_a_key_the_format_does_not_name_is_refused() {
-        let text = "{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[],\"extra\":1}\n";
         assert!(read_rows(text.as_bytes()).is_err());
     }
 
     #[test]
     fn a_row_is_a_nine_element_array() {
-        let text = "{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"call\",0,3,\"f\",\"a.ts\",1,null,\"void\",0]]}\n";
         let file = read_rows(text.as_bytes()).expect("a valid file");
         let row = &file.files[0].r[0];
         assert_eq!(row.kind(), Kind::Call);
         assert_eq!((row.start(), row.end()), (0, 3));
         assert_eq!(row.symbol(), Some("f"));
-        let short = "{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let short = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                      {\"f\":\"a.ts\",\"r\":[[\"call\",0,3]]}\n";
         assert!(read_rows(short.as_bytes()).is_err());
     }
@@ -1326,7 +1389,7 @@ mod tests {
     /// compiler version; a member row, and a declaration in a package, give none.
     #[test]
     fn the_index_names_the_default_library_globals_the_code_uses() {
-        let text = "{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[\
                     [\"ident\",0,5,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
                     [\"ident\",6,9,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
@@ -1362,7 +1425,7 @@ mod tests {
     ) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
         let mut lines = vec![format!(
-            "{{\"v\":4,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
+            "{{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
             files.len()
         )];
         let mut paths = Vec::new();

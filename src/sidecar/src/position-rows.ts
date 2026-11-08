@@ -60,7 +60,7 @@ import type { ProjectLoader } from './project-loader.js';
 import type { PositionRowsCounts } from './types.js';
 
 /** The format's version, written in the header. */
-export const POSITION_ROWS_VERSION = 4;
+export const POSITION_ROWS_VERSION = 5;
 
 /** The type is `any`, declared or inferred. Never set with the error type. */
 export const FLAG_ANY = 1;
@@ -98,7 +98,7 @@ export const DECL_CAP = 16;
 
 /** The kinds {@link kindOf} gives a node; `decl` and `jsx` rows are written beside them. */
 export type NodeKind = 'call' | 'member' | 'compare' | 'ident';
-export type PositionKind = NodeKind | 'decl' | 'jsx';
+export type PositionKind = NodeKind | 'decl' | 'jsx' | 'typed_decl';
 
 /** `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]` */
 export type PositionRow = [
@@ -493,6 +493,10 @@ export class PositionWalker {
         if ((kind === 'call' || kind === 'member') && !(row[8] & FLAG_CHECKER_THREW)) {
           for (const decl of this.declRows(kind, node)) rows.push(['decl', row[1], row[2], ...tail(decl)]);
         }
+        if (kind === 'call' && !(row[8] & FLAG_CHECKER_THREW)) {
+          const typed = this.typedDeclRow(node, row[1], row[2]);
+          if (typed) rows.push(typed);
+        }
       }
       if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
         rows.push(this.row('jsx', node.tagName, sourceFile));
@@ -503,7 +507,7 @@ export class PositionWalker {
     return rows;
   }
 
-  private row(kind: Exclude<PositionKind, 'decl'>, node: ts.Node, sourceFile: ts.SourceFile): PositionRow {
+  private row(kind: Exclude<PositionKind, 'decl' | 'typed_decl'>, node: ts.Node, sourceFile: ts.SourceFile): PositionRow {
     const start = node.getStart(sourceFile);
     const end = node.getEnd();
     try {
@@ -790,6 +794,38 @@ export class PositionWalker {
     return rows.map(({ row }) => row);
   }
 
+  /**
+   * The `typed_decl` row of a call (carrick#2448): the callee is a value
+   * (a parameter, a property, a local) whose type is a named function's own
+   * (`send: typeof fetch`), so the compiler gives the type a symbol whose
+   * declaration is that function's. Written only when the callee symbol is
+   * not already that declaration and the type's symbol is named (an
+   * anonymous function or type literal is `__function` / `__type`), so a
+   * direct call or a method call writes none.
+   */
+  private typedDeclRow(node: ts.Node, start: number, end: number): PositionRow | undefined {
+    if (!ts.isCallExpression(node)) return undefined;
+    try {
+      const symbol = this.symbolOf('call', node);
+      if (!symbol) return undefined;
+      const type = this.checker.getNonNullableType(this.checker.getTypeAtLocation(node.expression));
+      const typeSymbol = type.symbol;
+      if (!typeSymbol || typeSymbol.name.startsWith('__')) return undefined;
+      if (type.getCallSignatures().length === 0) return undefined;
+      const declaration = this.typeDeclaration(type);
+      if (!declaration) return undefined;
+      const own = symbol.declarations ?? [];
+      if (own.some((d) => (typeSymbol.declarations ?? []).includes(d))) return undefined;
+      const file = declaration.getSourceFile();
+      const { declFile, declLine, declPackage } = this.located(file, declaration.getStart(file));
+      let flags = this.publication(typeSymbol, declaration);
+      if (declFile === null) flags |= FLAG_DECLARATION_UNNAMED;
+      return ['typed_decl', start, end, ts.symbolName(typeSymbol), declFile, declLine, declPackage, null, flags];
+    } catch {
+      return undefined;
+    }
+  }
+
   /** The row's symbol, following aliases to a target that has a declaration. */
   symbolOf(kind: PositionKind, node: ts.Node): ts.Symbol | undefined {
     let symbol: ts.Symbol | undefined;
@@ -979,6 +1015,7 @@ function nameNodeOf(kind: PositionKind, node: ts.Node): ts.Node | undefined {
     case 'ident':
       return node;
     case 'decl':
+    case 'typed_decl':
       return undefined;
     case 'jsx':
       // The tag: `<Badge>`, `<ui.Button>`, `<this.Panel>`; a namespaced
