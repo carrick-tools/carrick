@@ -18,10 +18,9 @@ import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
 import {
   DenoProject,
   findDenoConfig,
-  fileConfigPath,
   findServiceTsconfig,
+  GoverningConfigs,
   referenceRedirectOf,
-  serviceConfigPath,
   sidecarCompilerOptions,
   untrustedReadBound,
   type ReadBound,
@@ -201,17 +200,12 @@ export class ProjectLoader {
   /** The tsconfig the service names, when the project is built from one. */
   private namedTsconfigPath: string | undefined;
   /**
-   * Set when the service has no config at or above its root: each file is then
-   * typed under the nearest `tsconfig.json`/`jsconfig.json` on its way up to
-   * the service root (carrick#1604), and the default project holds the rest.
+   * The config each file is typed under (carrick#1604, carrick#3497): set for
+   * a service built from a tsconfig, with it as the fallback, and for one
+   * with no config at or above its root, with none. Unset (a snapshot or a
+   * Deno project), every file is the default project's.
    */
-  private inferredService = false;
-  /** The per-directory answers of `fileConfigPath` for this service. */
-  private readonly fileConfigs = new Map<string, string | undefined>();
-  /** The reference owner rule of each config a file was found under. */
-  private readonly ownerRules = new Map<string, (file?: string) => string>();
-  /** Each file's owning config (carrick#1604), resolved on first use. */
-  private configPathFor: ((file?: string) => string) | undefined;
+  private governing: GoverningConfigs | undefined;
   /** Programs built for owning projects other than the named tsconfig. */
   private readonly ownerProjects = new Map<string, Project>();
   private readonly repoRoot: string;
@@ -321,10 +315,11 @@ export class ProjectLoader {
         } else if (tsconfigPath) {
           this.log(`Project will load with tsconfig: ${tsconfigPath}`);
           this.namedTsconfigPath = tsconfigPath;
+          this.governing = new GoverningConfigs(this.repoRoot, tsconfigPath, (d) => this.logError(d));
           this.buildProject = (kind) => this.projectFromConfig(tsconfigPath, kind);
         } else {
           this.log('No tsconfig.json found, using default compiler options');
-          this.inferredService = true;
+          this.governing = new GoverningConfigs(this.repoRoot, undefined, (d) => this.logError(d));
           this.buildProject = (kind) => {
             const project = new Project({
               ...this.fileSystemOption(),
@@ -447,7 +442,7 @@ export class ProjectLoader {
     // TypeScript reads a `jsconfig.json` with an implicit depth of 2, which
     // loads the JavaScript sources of installed packages; every other program
     // here reads 0. A depth the config states is kept (carrick#1604).
-    if (this.inferredService && path.basename(configPath) === 'jsconfig.json' && !statesJsDepth(configPath)) {
+    if (configPath !== this.namedTsconfigPath && path.basename(configPath) === 'jsconfig.json' && !statesJsDepth(configPath)) {
       options.maxNodeModuleJsDepth = 0;
     }
     const project = new Project({
@@ -472,39 +467,18 @@ export class ProjectLoader {
   }
 
   /**
-   * Which project types `file` (carrick#1604): the key of its owning
-   * project's program, or `''` for the default one. In a tsconfig that
-   * references other projects, a file belongs to the first project in search
-   * order (the named config, then its references depth-first, in declared
-   * order) that lists it while none of its own references does (carrick#2418),
-   * and is typed under that project's options. A file no project includes, and every request that
-   * names no file, uses the default project, built from the named tsconfig
-   * as before.
+   * Which project types `file` (carrick#1604, carrick#3497): the key of its
+   * owning project's program, or `''` for the default one. The owner is the
+   * config `GoverningConfigs` picks: the nearest config inside the service
+   * whose program, or a project it references (carrick#2418's search order),
+   * lists the file, else the service's tsconfig. The service's own tsconfig,
+   * every request that names no file, and a file no config governs use the
+   * default project.
    */
   projectKeyFor(file?: string): string {
-    if (this.inferredService) return this.inferredKeyFor(file);
-    if (!this.namedTsconfigPath || file === undefined) return '';
-    this.configPathFor ??= serviceConfigPath(this.namedTsconfigPath, (d) => this.logError(d));
-    const config = this.configPathFor(path.resolve(this.repoRoot, file));
-    return config === this.namedTsconfigPath ? '' : config;
-  }
-
-  /**
-   * `projectKeyFor` for a service with no config at its root: the owner of the
-   * nearest config on the file's way up to the service root, or `''` (the
-   * default project, under the inferred options) for a file with none.
-   */
-  private inferredKeyFor(file?: string): string {
-    if (file === undefined) return '';
-    const absolute = path.resolve(this.repoRoot, file);
-    const config = fileConfigPath(absolute, this.repoRoot, this.fileConfigs);
-    if (config === undefined) return '';
-    let owner = this.ownerRules.get(config);
-    if (!owner) {
-      owner = serviceConfigPath(config, (d) => this.logError(d));
-      this.ownerRules.set(config, owner);
-    }
-    return owner(absolute);
+    if (file === undefined || this.governing === undefined) return '';
+    const config = this.governing.configFor(path.resolve(this.repoRoot, file));
+    return config === undefined || config === this.namedTsconfigPath ? '' : config;
   }
 
   /**

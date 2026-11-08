@@ -22,10 +22,9 @@ For a specifier written in a file, first match wins:
    package.json decides alone, as in Node. It supports conditions and one `*`.
    A condition leaf that names TypeScript source beats build output, and a
    declaration file is never chosen.
-4. **tsconfig / jsconfig `paths`, then `baseUrl`.** The governing config is the
-   service's `carrick.json` `tsconfig` for files under the service directory.
-   For any other file it is the nearest `tsconfig.json` (or else
-   `jsconfig.json`) above the file. `extends` is followed (string or array,
+4. **tsconfig / jsconfig `paths`, then `baseUrl`**, read from the governing
+   config (see [Which config governs a file](#which-config-governs-a-file)).
+   `extends` is followed (string or array,
    relative, workspace package, or `node_modules`). Within that chain the
    nearest layer that sets `paths` supplies the whole map, and `baseUrl`
    resolves against the config that declares it. `paths` targets resolve
@@ -38,6 +37,13 @@ For a specifier written in a file, first match wins:
 
 Every candidate goes through one probe: the path as written, then with a source
 extension added, then `.js` swapped for `.ts`, then an `index` file.
+
+## Which config governs a file
+
+Carrick reads each file under the config your editor uses for it: the
+nearest `tsconfig.json` (or `jsconfig.json`) that includes the file,
+following project references. The `tsconfig` named in `carrick.json` is the
+fallback for files no closer config includes.
 
 ## Why a config reader and not the compiler
 
@@ -57,8 +63,10 @@ call edges, for these reasons:
   graph also reads sibling packages on demand.
 
 The compiler is the test oracle instead:
-`tests/module_resolution_parity_test.rs` resolves every case with
-`ts.resolveModuleName` and with this resolver, and fails on any disagreement.
+`tests/module_resolution_parity_test.rs` picks each case's config the way
+the compiler does (`ts.findConfigFile` and the parsed config's file list)
+and resolves it with `ts.resolveModuleName`; it asks the sidecar's built
+rule and this resolver the same questions, and fails on any disagreement.
 Deno maps are pinned by the Deno fixture in `tests/alias_import_callers_test.rs`.
 
 ## CommonJS

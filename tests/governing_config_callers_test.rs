@@ -6,11 +6,11 @@
 //! `get_callers` inverts. `viaAlias` imports `get` through `@/lib/api`;
 //! `viaRelative` imports it through `./lib/api`.
 //!
-//! `a-ws` is the failing case: the derived service named the workspace root's
-//! `tsconfig.json` (`{}`), so the type sidecar read no `paths` and the scanner
-//! recorded no alias edge. The rest are controls that resolve before the fix.
-//! `b-ws` (a referencing `tsconfig.json`) is the slice that follows and has no
-//! alias assertion here.
+//! `a-ws`: the derived service once named the workspace root's
+//! `tsconfig.json` (`{}`), so neither the type sidecar nor the scanner read
+//! the member's `paths`. `a-cj`, `a-solo`, `b-ws`, `b-solo` and `refs-named`
+//! are the layouts the scanner's own rule missed before it took the sidecar's
+//! (carrick#3497 S2). `pos-ws`, `j-only` and `j-under-cj` are controls.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -110,4 +110,65 @@ fn alias_in_a_member_jsconfig_resolves() {
     let calls = scan_calls("j-only");
     assert!(calls_get(&calls, "viaRelative"), "control: {calls:?}");
     assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
+}
+
+/// The service names no config and holds no `tsconfig.json`: the fallback is
+/// the `tsconfig.app.json` at its root, not the repo root's `{}` above it.
+#[test]
+fn a_named_service_without_a_tsconfig_reads_its_root_app_config() {
+    let calls = scan_calls("a-cj");
+    assert!(calls_get(&calls, "viaRelative"), "control: {calls:?}");
+    assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
+}
+
+/// The service scanned alone: `tsconfig.app.json` is its only config, and no
+/// directory holds a `tsconfig.json`.
+#[test]
+fn a_lone_app_config_governs_the_repo() {
+    let calls = scan_calls("a-solo");
+    assert!(calls_get(&calls, "viaRelative"), "control: {calls:?}");
+    assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
+}
+
+/// The member's `tsconfig.json` lists nothing and references
+/// `tsconfig.app.json`, which lists the file: the reference owns it.
+#[test]
+fn a_referencing_member_config_hands_the_file_to_its_reference() {
+    let calls = scan_calls("b-ws");
+    assert!(calls_get(&calls, "viaRelative"), "control: {calls:?}");
+    assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
+}
+
+#[test]
+fn a_referencing_config_scanned_alone_hands_the_file_to_its_reference() {
+    let calls = scan_calls("b-solo");
+    assert!(calls_get(&calls, "viaRelative"), "control: {calls:?}");
+    assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
+}
+
+/// A service-root `jsconfig.json` under a root `tsconfig.json` `{}`: the
+/// jsconfig, inside the service, lists the file before the ancestor is
+/// reached, as in the type sidecar.
+#[test]
+fn a_member_jsconfig_outranks_an_ancestor_tsconfig() {
+    let calls = scan_calls("j-under-cj");
+    assert!(calls_get(&calls, "viaRelative"), "control: {calls:?}");
+    assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
+}
+
+/// carrick#1425: the named root config references two leaves, each with its
+/// own `paths`; each leaf's file is read under its own leaf.
+#[test]
+fn a_named_root_config_hands_each_file_to_the_leaf_that_lists_it() {
+    let calls = scan_calls("refs-named");
+    for leaf in ["One", "Two"] {
+        assert!(
+            calls_get(&calls, &format!("viaRelative{leaf}")),
+            "control {leaf}: {calls:?}"
+        );
+        assert!(
+            calls_get(&calls, &format!("viaAlias{leaf}")),
+            "alias edge {leaf}: {calls:?}"
+        );
+    }
 }

@@ -10117,12 +10117,10 @@ fn service_module_index(
     repo_path: &str,
     config: &Config,
 ) -> crate::workspace_resolver::WorkspaceIndex {
-    let service_tsconfig = config.alias_tsconfig();
+    let repo_root = Path::new(repo_path);
     crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
-        Path::new(repo_path),
-        service_tsconfig
-            .as_ref()
-            .map(|(directory, tsconfig)| (directory.as_path(), tsconfig.as_path())),
+        repo_root,
+        config.alias_scope(repo_root).as_ref(),
     )
 }
 
@@ -11165,12 +11163,10 @@ fn discover_with_positions(
     // which is why only this index reads them; see
     // `docs/reference/module-resolution.md`.
     let repo_root = std::path::Path::new(repo_path);
-    let service_tsconfig = service.alias_tsconfig();
+    let service_scope = service.alias_scope(repo_root);
     let workspace = crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
         repo_root,
-        service_tsconfig
-            .as_ref()
-            .map(|(directory, config)| (directory.as_path(), config.as_path())),
+        service_scope.as_ref(),
     );
     // Every specifier matters only where some module holds an instance
     // another may import: that is the only reading it can turn off.
@@ -11204,7 +11200,7 @@ fn discover_with_positions(
             repo_root,
             &files,
             &workspace,
-            &service_tsconfig,
+            &service_scope,
             &service_ignore_patterns(service),
         );
         debug!(
@@ -21477,14 +21473,15 @@ unfollowed_member_calls_total: 0,
     /// carrick#1568 fix round 2, W1: an import the scan cannot follow to a
     /// file may name an instance under an alias it does not know. A use of
     /// one that would take a client away turns imported reading off: a
-    /// tsconfig whose `paths` sit in a referenced project, a bundler-only
-    /// alias in a `.js` file, an alias nothing maps, a computed call through
-    /// one, and a `require` or `import()` of one. Each declaring module still
-    /// reads its own calls.
+    /// bundler-only alias in a `.js` file, an alias nothing maps, a computed
+    /// call through one, and a `require` or `import()` of one. Each declaring
+    /// module still reads its own calls. (A tsconfig whose `paths` sit in a
+    /// referenced project is followed since carrick#3497: see
+    /// `a_write_through_paths_a_referenced_project_declares_is_followed`.)
     #[test]
     fn a_use_through_an_import_the_scan_cannot_follow_turns_imported_reading_off() {
         let write = "(api as any).defaults.baseURL = \"https://elsewhere.example\";\n";
-        let cases: [(&str, Vec<(String, String)>); 6] = [
+        let cases: [(&str, Vec<(String, String)>); 5] = [
             (
                 "re-exported",
                 vec![
@@ -21495,25 +21492,6 @@ unfollowed_member_calls_total: 0,
                     (
                         "src/w/boot.ts".to_string(),
                         format!("import {{ api }} from \"./barrel\";\n{write}"),
-                    ),
-                ],
-            ),
-            (
-                "references",
-                vec![
-                    (
-                        "tsconfig.json".to_string(),
-                        "{ \"files\": [], \"references\": [{ \"path\": \"./tsconfig.app.json\" }] }\n"
-                            .to_string(),
-                    ),
-                    (
-                        "tsconfig.app.json".to_string(),
-                        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@/*\": [\"./src/*\"] } }, \"include\": [\"src\"] }\n"
-                            .to_string(),
-                    ),
-                    (
-                        "src/w/boot.ts".to_string(),
-                        format!("import {{ api }} from \"@/w/api\";\n{write}"),
                     ),
                 ],
             ),
@@ -21559,6 +21537,42 @@ unfollowed_member_calls_total: 0,
                 "{case}: the declaring module still reads its own calls"
             );
         }
+    }
+
+    /// carrick#3497 (ruling R-N3): an import through `paths` that only a
+    /// referenced project declares (a solution `tsconfig.json` with `"files":
+    /// []`) resolves, as the compiler resolves it, so a base-URL write
+    /// through it is a write on the instance: no module reads through the
+    /// instance, the declaring module included. Before carrick#3497 the scan
+    /// could not follow the import and only turned imported reading off.
+    #[test]
+    fn a_write_through_paths_a_referenced_project_declares_is_followed() {
+        let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+        files.extend([
+            (
+                "tsconfig.json".to_string(),
+                "{ \"files\": [], \"references\": [{ \"path\": \"./tsconfig.app.json\" }] }\n"
+                    .to_string(),
+            ),
+            (
+                "tsconfig.app.json".to_string(),
+                "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@/*\": [\"./src/*\"] } }, \"include\": [\"src\"] }\n"
+                    .to_string(),
+            ),
+            (
+                "src/w/boot.ts".to_string(),
+                "import { api } from \"@/w/api\";\n(api as any).defaults.baseURL = \"https://elsewhere.example\";\n"
+                    .to_string(),
+            ),
+        ]);
+        let (dir, discovery) = discover_owned(&files);
+        let rows = library_rows_of(&dir, &discovery, "src/w/reader.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/w/api.ts"),
+            stated(&[]),
+            "the write in boot.ts reaches the instance, so its own call states no base"
+        );
     }
 
     /// carrick#1568 fix round 3: a module that names a specifier nothing

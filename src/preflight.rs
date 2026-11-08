@@ -435,15 +435,12 @@ fn missing_mappings(
     name: &str,
 ) -> Vec<Unprepared> {
     let configs = governing_configs(repo_root, directory);
-    let service_tsconfig = service
-        .tsconfig
-        .as_deref()
-        .map(|tsconfig| (directory, Path::new(tsconfig)));
+    let scope = service.alias_scope(repo_root);
     let aliases = crate::module_aliases::ModuleAliases::build(
         repo_root,
         &configs,
         &BTreeMap::new(),
-        service_tsconfig,
+        scope.as_ref(),
     );
     let missing: Vec<crate::module_aliases::ClaimedDirectory> = aliases
         .claimed_directories()

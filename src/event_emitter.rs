@@ -1151,7 +1151,10 @@ mod tests {
                     fs::write(dir.path().join("tsconfig.json"), config).unwrap();
                     WorkspaceIndex::build_with_aliases(
                         dir.path(),
-                        Some((Path::new(""), Path::new("tsconfig.json"))),
+                        Some(&crate::module_aliases::ServiceScope {
+                            dir: PathBuf::new(),
+                            named: Some(PathBuf::from("tsconfig.json")),
+                        }),
                     )
                 }
                 None => WorkspaceIndex::build_with_aliases(dir.path(), None),
