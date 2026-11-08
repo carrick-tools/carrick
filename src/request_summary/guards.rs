@@ -1450,6 +1450,7 @@ impl CallWalker<'_, '_, '_> {
             // field is set from (carrick#1670 T3).
             instance: self.reader.instance_ir(None, args, self.scope),
             constructs: true,
+            language_call: None,
         };
         self.ir.constructions.push(construction);
     }
@@ -1505,6 +1506,7 @@ impl CallWalker<'_, '_, '_> {
             receiver_object: super::discovery::receiver_object(&call.callee),
             instance: self.reader.instance_ir(Some(&call.callee), &[], self.scope),
             constructs: false,
+            language_call: None,
         });
     }
 

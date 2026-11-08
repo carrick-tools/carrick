@@ -20,3 +20,18 @@ value; the op's name is read from that call's arguments.
 | `m-publish-bind.ts` | 6 | `const pub = bus.publish.bind(bus)` | site, `bus` |
 | `m-fallback.ts` | 9 | `deps.post ?? http.post.bind(http)` | `several_values` (the own entry `deps.post` is not read yet: carrick#3504 S4b) |
 | `m-own-bind.ts` | 10 | `send.bind(null)`, `send` calls `http.post` | site, `http` (an own function, already followed) |
+
+## The language's `call` and `apply` (carrick#3504 S4d)
+
+`f.call(t, a)` and `f.apply(t, [a])` run `f` with the arguments shifted past
+`this`, where the compiler's row names the member as the language library's.
+Discovery's test `a_call_or_apply_fills_the_shifted_parameter` reads the
+call's discovery record and the name its decided site states.
+
+| File | Line | Call | Recorded | Name |
+|---|---|---|---|---|
+| `m-call.ts` | 4 | `http.post.call(http, "/p/m-call", null)` | site, `http` | `/p/m-call` |
+| `m-own-call.ts` | 8 | `send.call(null, "/p/m-own-call")` | site, `http` | `/p/m-own-call` |
+| `m-own-apply.ts` | 8 | `send.apply(null, ["/p/m-own-apply"])` | site, `http` | `/p/m-own-apply` |
+| `m-publish-call.ts` | 8 | `pub.call(null, "m-publish-call")`, `pub` calls `bus.publish` | site, `bus` | `m-publish-call` |
+| `m-rpc-call.ts` | 12 | `rpc.call("/p/m-rpc-call")`, a class's own `call` method (control: no shift) | site, `http` | `/p/m-rpc-call` |

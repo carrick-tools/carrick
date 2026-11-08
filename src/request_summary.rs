@@ -988,6 +988,109 @@ struct CallIr {
     /// A `new C(…)` or a `super(…)`: the call runs the constructor of the
     /// class its row names (carrick#3527, [`FileIr::constructor_at`]).
     constructs: bool,
+    /// `f.call(t, a)` or `f.apply(t, [a])`: the call runs `f` with the
+    /// arguments shifted past `this`, once the compiler's row names the
+    /// member as the language library's ([`LanguageCall::decided`],
+    /// carrick#3504 S4d). `None` for any other callee.
+    language_call: Option<Box<LanguageCall>>,
+}
+
+/// A call written as a function's `call` or `apply` member: what the
+/// function may hold and the arguments it is handed (carrick#3504 S4d).
+/// Read as a call of the function only where [`Self::decided`] is set:
+/// a user object's own `call` method is a member call like any other.
+#[derive(Debug, Clone)]
+struct LanguageCall {
+    /// What the function the member is read on may hold.
+    callee: Vec<ValueAt>,
+    /// `apply`'s arguments, the elements of the array written as its
+    /// second argument; `None` for `call`, whose arguments are the call's
+    /// own from position 1.
+    applied: Option<Applied>,
+    /// The compiler's row at the call names the language library's `call`
+    /// or `apply` ([`RequestSummaryInputs::read_language_calls`]).
+    decided: bool,
+}
+
+/// What `f.apply(t, [a, b])` hands `f`, by position, as [`CallIr::args`]
+/// and [`CallIr::arg_values`] hold a call's own: the array literal's
+/// elements, every position from a spread or a hole on unread. Anything
+/// but an array literal hands nothing the scan reads.
+#[derive(Debug, Clone, Default)]
+struct Applied {
+    args: Vec<Value>,
+    /// The first position no element states (a spread, a hole, or `0` for
+    /// no array literal): it and every one after it are unread.
+    open_from: Option<usize>,
+    /// What each element may hold; an empty entry from `open_from` on.
+    arg_values: Vec<Vec<ValueAt>>,
+}
+
+impl CallIr {
+    /// The argument the function this call runs receives at `index`, read
+    /// the way the call writes it: shifted past `this` for a decided
+    /// `call`, an element for a decided `apply`. `None` where no argument
+    /// is written there or a spread before it moves it.
+    fn passed_arg(&self, index: usize) -> Option<&Value> {
+        match self.language_call.as_deref() {
+            Some(LanguageCall {
+                decided: true,
+                applied: Some(applied),
+                ..
+            }) => match applied.open_from {
+                Some(from) if index >= from => None,
+                _ => applied.args.get(index),
+            },
+            Some(LanguageCall {
+                decided: true,
+                applied: None,
+                ..
+            }) => self.own_arg(index + 1),
+            _ => self.own_arg(index),
+        }
+    }
+
+    /// The argument this call writes at `index`, unless a spread before it
+    /// moves every position. With the receiver trace on, a spread leaves
+    /// the arguments before it as written ([`CallIr::spread_from`]).
+    fn own_arg(&self, index: usize) -> Option<&Value> {
+        match (&self.site_args, self.spread_from) {
+            (Some(_), _) => self.args.get(index),
+            (None, Some(from)) if index < from => self.args.get(index),
+            _ => None,
+        }
+    }
+
+    /// What each argument the function this call runs receives may hold,
+    /// by position, as [`CallIr::arg_values`] states a call's own, shifted
+    /// as [`Self::passed_arg`] shifts them.
+    fn passed_values(&self) -> &[Vec<ValueAt>] {
+        match self.language_call.as_deref() {
+            Some(LanguageCall {
+                decided: true,
+                applied: Some(applied),
+                ..
+            }) => &applied.arg_values,
+            Some(LanguageCall {
+                decided: true,
+                applied: None,
+                ..
+            }) => match self.arg_values.first() {
+                // `f.call(...args)`: the spread moves every position.
+                Some(this) if this.is_empty() => &self.arg_values[..1],
+                _ => self.arg_values.get(1..).unwrap_or_default(),
+            },
+            _ => &self.arg_values,
+        }
+    }
+
+    /// The function a decided `call` or `apply` runs, as what it may hold.
+    fn language_callee(&self) -> Option<&[ValueAt]> {
+        self.language_call
+            .as_deref()
+            .filter(|language| language.decided)
+            .map(|language| language.callee.as_slice())
+    }
 }
 
 /// What one argument holds, whole, and what each plain key of an object
@@ -7451,6 +7554,12 @@ impl Visit for CallWalker<'_, '_, '_> {
             _ => Vec::new(),
         };
         let arg_values = self.reader.arg_values(&call.args, self.scope, bound);
+        let language_call = match &call.callee {
+            Callee::Expr(callee) => self
+                .reader
+                .language_call(callee, &call.args, self.scope, bound),
+            _ => None,
+        };
         self.ir.calls.push(CallIr {
             site: call_site,
             callee,
@@ -7490,6 +7599,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 self.scope,
             ),
             constructs: matches!(call.callee, Callee::Super(_)),
+            language_call,
         });
     }
 
@@ -7560,6 +7670,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 receiver_object: None,
                 instance: InstanceIr::default(),
                 constructs: false,
+                language_call: None,
             });
         }
         element.visit_children_with(self);
@@ -8669,6 +8780,7 @@ impl RequestSummaryInputs {
                 // here.
                 let mut linked = self.read_through(reads);
                 linked.read_fields();
+                linked.read_language_calls();
                 return linked;
             }
             self.positions = None;
@@ -8678,6 +8790,43 @@ impl RequestSummaryInputs {
         }
         let reads = self.linked_reads(None).unwrap_or_default();
         self.read_through(reads)
+    }
+
+    /// Each call written as `f.call(…)` or `f.apply(…)` whose row names the
+    /// language library's `call` or `apply` reads as a call of `f`
+    /// (carrick#3504 S4d): the compiler's row decides it, so a user
+    /// object's own `call` method (declared in the repo) stays a member
+    /// call. Without rows nothing is decided.
+    fn read_language_calls(&mut self) {
+        let Some(positions) = self.positions.as_ref() else {
+            return;
+        };
+        for (path, ir) in &mut self.files {
+            ir.visit_calls(&mut |call| {
+                let Some(language) = call.language_call.as_deref_mut() else {
+                    return;
+                };
+                let member = if language.applied.is_some() {
+                    "apply"
+                } else {
+                    "call"
+                };
+                language.decided = positions
+                    .lookup(
+                        path,
+                        call.site.span_start,
+                        call.site.span_end,
+                        crate::position_rows::Kind::Call,
+                    )
+                    .ok()
+                    .is_some_and(|row| {
+                        row.symbol() == Some(member)
+                            && row
+                                .decl_file()
+                                .is_some_and(|declared| declared.starts_with("lib:"))
+                    });
+            });
+        }
     }
 
     /// The rows bound to the import links and the calls, and what the
@@ -8878,6 +9027,15 @@ impl FnIr {
         for call in &mut self.calls {
             for arg in &mut call.args {
                 visit_value_pieces(scope, arg, visit);
+            }
+            if let Some(applied) = call
+                .language_call
+                .as_deref_mut()
+                .and_then(|language| language.applied.as_mut())
+            {
+                for arg in &mut applied.args {
+                    visit_value_pieces(scope, arg, visit);
+                }
             }
             for spread in &mut call.spread_args {
                 if let SpreadArg::Keys(objects) = spread {

@@ -601,6 +601,13 @@
   "kind": "call",
   "source": "test262 (modules)"
  },
+ "t-bound-args": {
+  "carries": "target",
+  "expect": "/p/t-bound-args",
+  "feature": "Function.prototype.bind with bound arguments (built-in)",
+  "kind": "call",
+  "source": "test262 (built-in)"
+ },
  "t-call-apply": {
   "carries": "target",
   "expect": "/p/t-call-apply",

@@ -1150,6 +1150,82 @@ impl Reader<'_> {
         values
     }
 
+    /// A call written as `f.call(…)` or `f.apply(…)`: what `f` may hold and,
+    /// for `apply`, the elements of the array it hands on (carrick#3504
+    /// S4d). Undecided: only the compiler's row says the member is the
+    /// language's ([`super::RequestSummaryInputs::read_language_calls`]).
+    pub(super) fn language_call(
+        &self,
+        callee: &Expr,
+        args: &[ExprOrSpread],
+        scope: &Scope<'_>,
+        bound: &guards::Bound,
+    ) -> Option<Box<super::LanguageCall>> {
+        let Expr::Member(member) = crate::graphql_document_sites::unwrap_expression(callee) else {
+            return None;
+        };
+        let MemberProp::Ident(prop) = &member.prop else {
+            return None;
+        };
+        let applied = match prop.sym.as_ref() {
+            "call" => None,
+            "apply" => Some(self.applied(args.get(1), scope, bound)),
+            _ => return None,
+        };
+        Some(Box::new(super::LanguageCall {
+            callee: self.value_of(&member.obj, scope, bound),
+            applied,
+            decided: false,
+        }))
+    }
+
+    /// What `apply`'s second argument hands on by position: each element of
+    /// an array literal written there, unread from a spread or a hole on.
+    fn applied(
+        &self,
+        arg: Option<&ExprOrSpread>,
+        scope: &Scope<'_>,
+        bound: &guards::Bound,
+    ) -> super::Applied {
+        let elements = match arg {
+            Some(ExprOrSpread { spread: None, expr }) => {
+                match crate::graphql_document_sites::unwrap_expression(expr) {
+                    Expr::Array(array) => Some(&array.elems),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        // No argument at all hands nothing: every position is unwritten.
+        if arg.is_none() {
+            return super::Applied::default();
+        }
+        let Some(elements) = elements else {
+            return super::Applied {
+                args: Vec::new(),
+                open_from: Some(0),
+                arg_values: vec![Vec::new()],
+            };
+        };
+        let mut out = super::Applied::default();
+        for element in elements {
+            let Some(ExprOrSpread { spread: None, expr }) = element else {
+                out.open_from = Some(out.args.len());
+                out.arg_values.push(Vec::new());
+                break;
+            };
+            out.args.push(
+                match crate::graphql_document_sites::unwrap_expression(expr) {
+                    // A function written in place is no text.
+                    Expr::Arrow(_) | Expr::Fn(_) => Value::Str(vec![Piece::Unknown]),
+                    expr => self.eval(expr, scope),
+                },
+            );
+            out.arg_values.push(self.value_of(expr, scope, bound));
+        }
+        out
+    }
+
     /// The functions written as a parameter's default (`doFetch = (url, init)
     /// => fetch(url, init)`), positional or at a destructured key, read the
     /// way [`Self::param_values`] records them as [`ValueAt::Function`]. No
@@ -1898,7 +1974,9 @@ impl<'a> Resolver<'a> {
         let mut written: Vec<ValueAt> = Vec::new();
         let mut defaulted = at.is_none();
         if let Some(at) = at {
-            let args = &at.call.arg_values;
+            // Shifted past `this` for the language's `call` and `apply`
+            // (carrick#3504 S4d).
+            let args = at.call.passed_values();
             // A spread (an empty entry) at or before the position moves it.
             let spread = args.iter().take(index + 1).any(Vec::is_empty);
             match args.get(index) {

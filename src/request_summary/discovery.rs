@@ -1784,6 +1784,25 @@ impl<'a> Walker<'a> {
         call: &'a CallIr,
         construction: bool,
     ) -> Outcome<'a> {
+        let invoke = Invoke {
+            file,
+            call,
+            construction,
+        };
+        // `f.call(t, a)` or `f.apply(t, [a])`, the row naming the language's
+        // member (carrick#3504 S4d): the call runs `f`, followed through
+        // each value it may hold, its parameters filled from the arguments
+        // shifted past `this` ([`CallIr::passed_values`]). Read before the
+        // labelled export the member chain starts at, whose member this
+        // never is (`http.post.call(…)` is no `call` of `http`).
+        if !construction && let Some(callee) = call.language_callee() {
+            let resolver = self.values;
+            let mut values = Vec::new();
+            for value in callee {
+                values.extend(resolver.read_value(self, file, value, invoke, false));
+            }
+            return self.agree(values, invoke, Vec::new(), OF_VALUES);
+        }
         if let Some((end, reached)) = self.library_end(file, call, construction) {
             let traced = self.labels.declarations.is_some();
             return Outcome {
@@ -1797,11 +1816,6 @@ impl<'a> Walker<'a> {
                 ..Outcome::default()
             };
         }
-        let invoke = Invoke {
-            file,
-            call,
-            construction,
-        };
         // A callee that is a value (carrick#2432): followed through each
         // value it may hold, before the interface member that types it. A
         // member the compiler declares in a package or the language's
@@ -3434,6 +3448,60 @@ mod tests {
         .filter_map(|(file, line, want)| {
             let got = recorded_at(&discovery, file, line);
             (got != [want.to_string()]).then(|| format!("{file}:{line} want {want}, got {got:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// carrick#3504 S4d: `f.call(t, a)` and `f.apply(t, [a])`, the row
+    /// naming the language's member, run `f` with the arguments shifted past
+    /// `this`: an own function's parameter, or a labelled member's name
+    /// slot, is filled from the argument after `this`. A user object's own
+    /// `call` method shifts nothing. The answer key is
+    /// `tests/fixtures/callee-members/README.md`.
+    #[test]
+    fn a_call_or_apply_fills_the_shifted_parameter() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("callee-members", "services/web", "web")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let name_at = |file: &str, line: u32| -> Vec<String> {
+            let mut out: Vec<String> = decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .map(|site| {
+                    site.name
+                        .iter()
+                        .map(|piece| match piece {
+                            Piece::Lit(text) => text.clone(),
+                            _ => "?".to_string(),
+                        })
+                        .collect()
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let wrong: Vec<String> = [
+            ("m-call.ts", 4, "site http", "/p/m-call"),
+            ("m-own-call.ts", 8, "site http", "/p/m-own-call"),
+            ("m-own-apply.ts", 8, "site http", "/p/m-own-apply"),
+            ("m-publish-call.ts", 8, "site bus", "m-publish-call"),
+            ("m-rpc-call.ts", 12, "site http", "/p/m-rpc-call"),
+        ]
+        .into_iter()
+        .filter_map(|(file, line, want, name)| {
+            let got = recorded_at(&discovery, file, line);
+            let named = name_at(file, line);
+            (got != [want.to_string()] || named != [name.to_string()])
+                .then(|| format!("{file}:{line} want {want} {name}, got {got:?} {named:?}"))
         })
         .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");
