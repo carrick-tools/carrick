@@ -676,6 +676,97 @@ fn removed_rows(
         .collect()
 }
 
+/// A source file one service's analysis could not read (carrick#3233), at
+/// its place relative to the scan root (line 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnreadSource {
+    place: crate::pr_delta_anchor::Place,
+    reason: crate::findings::FileNotReadReason,
+}
+
+/// Sorted by (method, path, service), as the delta's rows are.
+fn sort_endpoint_refs(refs: &mut [crate::findings::EndpointRef]) {
+    refs.sort_by(|a, b| (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service)));
+}
+
+/// The files whose operation changes the delta cannot list (carrick#3233):
+/// each file holding a `lost` row (main's operation this scan does not state
+/// on a line the PR did not change), and each of `unread_changed`, a source
+/// file the PR changed that this scan could not read, with its reason from
+/// `unread_sources`. A file with both takes the read failure. Sorted by
+/// (service, file).
+fn files_not_read(
+    lost: Vec<crate::pr_delta_anchor::Candidate<DeltaItem>>,
+    unread_changed: &[crate::pr_delta_anchor::Place],
+    unread_sources: &[UnreadSource],
+) -> Vec<crate::findings::FileNotRead> {
+    use crate::findings::{FileNotRead, FileNotReadReason};
+    let mut files: std::collections::BTreeMap<(Option<String>, String), FileNotRead> =
+        std::collections::BTreeMap::new();
+    fn entry<'a>(
+        files: &'a mut std::collections::BTreeMap<(Option<String>, String), FileNotRead>,
+        place: &crate::pr_delta_anchor::Place,
+    ) -> &'a mut FileNotRead {
+        files
+            .entry((place.service.clone(), place.file.clone()))
+            .or_insert_with(|| FileNotRead {
+                file: place.file.clone(),
+                service: place.service.clone(),
+                reason: FileNotReadReason::OperationsMissing,
+                operations: Vec::new(),
+            })
+    }
+    for candidate in lost {
+        if let Some(place) = candidate.places.first() {
+            entry(&mut files, place)
+                .operations
+                .push(candidate.item.endpoint);
+        }
+    }
+    for place in unread_changed {
+        if let Some(source) = unread_sources.iter().find(|source| source.place == *place) {
+            entry(&mut files, place).reason = source.reason;
+        }
+    }
+    files
+        .into_values()
+        .map(|mut file| {
+            sort_endpoint_refs(&mut file.operations);
+            file
+        })
+        .collect()
+}
+
+/// One info line per file of [`files_not_read`], for the run's log.
+fn files_not_read_lines(files: &[crate::findings::FileNotRead]) -> Vec<String> {
+    use crate::findings::FileNotReadReason;
+    files
+        .iter()
+        .map(|file| {
+            let named = match &file.service {
+                Some(service) => format!("{} ({service})", file.file),
+                None => file.file.clone(),
+            };
+            let held = file.operations.len();
+            match file.reason {
+                FileNotReadReason::OperationsMissing => format!(
+                    "PR delta: {named}: main's index has {held} operation(s) here that this \
+                     scan does not state, on lines this PR does not change"
+                ),
+                reason if held == 0 => format!(
+                    "PR delta: {named}: this scan could not read it ({})",
+                    reason.code()
+                ),
+                reason => format!(
+                    "PR delta: {named}: this scan could not read it ({}); main's index has \
+                     {held} operation(s) here",
+                    reason.code()
+                ),
+            }
+        })
+        .collect()
+}
+
 /// The listed operations as the PR comment's delta, sorted by (method, path,
 /// service) so the output is deterministic even when two services add or drop
 /// the same operation.
@@ -683,16 +774,12 @@ fn delta_of(
     mut new_endpoints: Vec<crate::findings::EndpointRef>,
     mut removed_endpoints: Vec<crate::findings::EndpointRef>,
 ) -> crate::findings::PrDelta {
-    let sort_refs = |refs: &mut Vec<crate::findings::EndpointRef>| {
-        refs.sort_by(|a, b| {
-            (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
-        });
-    };
-    sort_refs(&mut new_endpoints);
-    sort_refs(&mut removed_endpoints);
+    sort_endpoint_refs(&mut new_endpoints);
+    sort_endpoint_refs(&mut removed_endpoints);
     crate::findings::PrDelta {
         new_endpoints,
         removed_endpoints,
+        files_not_read: Vec::new(),
     }
 }
 
@@ -700,8 +787,10 @@ fn delta_of(
 /// kept to the rows the PR's own diff places (carrick#3080). `None` when the
 /// run does not know the PR's base commit or git cannot read the diff, with
 /// the reason logged. `unread` is every route site this scan could not read
-/// a path for ([`removed_rows`]). The rules are in `docs/reference/runner.md`,
-/// "The endpoint delta".
+/// a path for ([`removed_rows`]), and `unread_sources` every source file it
+/// could not read ([`files_not_read`]). The rules are in
+/// `docs/reference/runner.md`, "The endpoint delta".
+#[allow(clippy::too_many_arguments)]
 fn anchored_delta(
     repo_path: &str,
     base: Option<&str>,
@@ -710,6 +799,7 @@ fn anchored_delta(
     services: &[Config],
     changes: Option<&crate::change_scope::ChangedSince>,
     unread: &[UnreadRoute],
+    unread_sources: &[UnreadSource],
 ) -> Option<crate::findings::PrDelta> {
     let Some(base) = base else {
         info!(
@@ -751,6 +841,10 @@ fn anchored_delta(
     let reading_moved = |merge_base: &str| {
         crate::change_scope::reading_moved_services(repo_path, services, changes, merge_base)
     };
+    let source_places: Vec<crate::pr_delta_anchor::Place> = unread_sources
+        .iter()
+        .map(|source| source.place.clone())
+        .collect();
     match crate::pr_delta_anchor::run(
         repo_path,
         base,
@@ -760,13 +854,20 @@ fn anchored_delta(
         main,
         reading_moved,
         &serving,
+        &source_places,
     ) {
         Ok(anchored) => {
             info!("{}", anchored.summary());
-            Some(delta_of(
+            let not_read = files_not_read(anchored.lost, &anchored.unread_changed, unread_sources);
+            for line in files_not_read_lines(&not_read) {
+                info!("{line}");
+            }
+            let mut delta = delta_of(
                 anchored.new.into_iter().map(|item| item.endpoint).collect(),
                 removed_rows(anchored.removed, &anchored.unread_written),
-            ))
+            );
+            delta.files_not_read = not_read;
+            Some(delta)
         }
         Err(reason) => {
             info!(
@@ -2292,6 +2393,24 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                         .map(|site| UnreadRoute::of(&run.data.service_name, site))
                 })
                 .collect();
+            // And the source files each of those services could not read
+            // (carrick#3233), relative to the scan root as a row's place is.
+            let unread_sources: Vec<UnreadSource> = runs
+                .iter()
+                .filter(|run| !run.held_back && !run.carried)
+                .flat_map(|run| {
+                    let service = run.data.service_name.clone();
+                    crate::scan_health::unread_sources_for(service.as_deref())
+                        .into_iter()
+                        .map(move |(path, reason)| UnreadSource {
+                            place: crate::pr_delta_anchor::Place::parse(
+                                &service,
+                                crate::utils::repo_relative_source_path(&path, repo_path),
+                            ),
+                            reason,
+                        })
+                })
+                .collect();
             anchored_delta(
                 repo_path,
                 pr_base.as_deref(),
@@ -2300,6 +2419,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 &services,
                 pr_changes.as_deref(),
                 &unread,
+                &unread_sources,
             )
         }
         DeltaBaseline::OtherScanner(versions) => {
@@ -31345,6 +31465,105 @@ io.on("bare:in", (event) => {});
         let dropped = key_delta(&previous, &[service_stating("web", Some(THIS), &[])]);
         assert_eq!(paths(&dropped.removed_endpoints), vec!["/orders"]);
         assert!(dropped.new_endpoints.is_empty());
+    }
+
+    /// carrick#3233: main's index, stored at the merge base, holds two rows
+    /// in `src/routes.ts`; this scan states neither, and the PR edits that
+    /// file on another line. Neither is listed as removed: the delta names
+    /// the file, its reason and main's two operations, and the log says so.
+    /// When this scan could not read the file either, the read failure is the
+    /// reason, with the same operations.
+    #[test]
+    fn a_file_whose_rows_this_scan_lost_is_named_not_listed() {
+        use crate::findings::FileNotReadReason;
+        const THIS: &str = "0.4.0";
+        let (repo, base) =
+            crate::git_state::tests::committed_repo(&[("src/routes.ts", "a\nb\nc\nd\n")]);
+        std::fs::write(repo.path().join("src/routes.ts"), "a\nb\nc\nedited\n").unwrap();
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let mut stored = service_stating("web", Some(THIS), &["/users", "/orders"]);
+        stored.commit_hash = base.clone();
+        let DeltaBaseline::Keys(previous) = DeltaBaseline::of([&stored], THIS) else {
+            panic!("this version's index is the baseline");
+        };
+        let current = [service_stating("web", Some(THIS), &[])];
+        let delta_with = |sources: &[UnreadSource]| {
+            anchored_delta(
+                &repo_path,
+                Some(&base),
+                &previous,
+                &current,
+                &[],
+                None,
+                &[],
+                sources,
+            )
+            .expect("git reads the diff")
+        };
+        let delta = delta_with(&[]);
+        assert!(delta.new_endpoints.is_empty() && delta.removed_endpoints.is_empty());
+        let named = |delta: &crate::findings::PrDelta| -> Vec<(String, Option<String>, FileNotReadReason, Vec<String>)> {
+            delta
+                .files_not_read
+                .iter()
+                .map(|file| {
+                    (
+                        file.file.clone(),
+                        file.service.clone(),
+                        file.reason,
+                        file.operations.iter().map(|op| op.path.clone()).collect(),
+                    )
+                })
+                .collect()
+        };
+        let both = vec!["/orders".to_string(), "/users".to_string()];
+        assert_eq!(
+            named(&delta),
+            vec![(
+                "src/routes.ts".to_string(),
+                Some("web".to_string()),
+                FileNotReadReason::OperationsMissing,
+                both.clone()
+            )]
+        );
+        assert_eq!(
+            files_not_read_lines(&delta.files_not_read),
+            vec![
+                "PR delta: src/routes.ts (web): main's index has 2 operation(s) here that this \
+                 scan does not state, on lines this PR does not change"
+                    .to_string()
+            ]
+        );
+        let unparsed = delta_with(&[UnreadSource {
+            place: crate::pr_delta_anchor::Place::parse(&Some("web".to_string()), "src/routes.ts"),
+            reason: FileNotReadReason::DoesNotParse,
+        }]);
+        assert_eq!(
+            named(&unparsed),
+            vec![(
+                "src/routes.ts".to_string(),
+                Some("web".to_string()),
+                FileNotReadReason::DoesNotParse,
+                both
+            )]
+        );
+        let wire = serde_json::to_value(&unparsed).unwrap();
+        assert_eq!(wire["files_not_read"][0]["reason"], "does_not_parse");
+        assert_eq!(
+            wire["files_not_read"][0]["operations"][0],
+            serde_json::json!({"method": "GET", "path": "/orders", "service": "web"})
+        );
+    }
+
+    /// A delta with nothing unread carries no `files_not_read` key on the
+    /// wire, so its payload is the one an older reader already reads.
+    #[test]
+    fn a_delta_with_nothing_unread_has_no_files_not_read_key() {
+        let wire = serde_json::to_value(delta_of(Vec::new(), Vec::new())).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"new_endpoints": [], "removed_endpoints": []})
+        );
     }
 
     /// carrick#3079: the delta tells routes apart by identity, not by how a

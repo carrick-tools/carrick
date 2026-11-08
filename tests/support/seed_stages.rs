@@ -106,8 +106,10 @@ fn at_site(finding: &Value, site: Option<&str>) -> bool {
     site.is_none_or(|site| call_sites(finding).contains(&site))
 }
 
-/// Findings that make a correct check not clean: an introduced (or not
-/// compared) type or method risk, or a break row the PR introduced.
+/// What makes a correct check not clean: an introduced (or not compared)
+/// type or method risk, a break row the PR introduced, or a file whose
+/// operation changes the delta could not list (`delta.files_not_read`,
+/// carrick#3233).
 fn raisers(payload: &Value) -> Vec<&Value> {
     array(&payload["findings"])
         .iter()
@@ -116,6 +118,7 @@ fn raisers(payload: &Value) -> Vec<&Value> {
             Some("missing_endpoint" | "orphaned_endpoint") => truthy(&f["removed"]) && marked(f),
             _ => false,
         })
+        .chain(array(&payload["delta"]["files_not_read"]))
         .collect()
 }
 

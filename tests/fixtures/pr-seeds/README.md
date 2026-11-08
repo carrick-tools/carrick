@@ -78,6 +78,7 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `convention-copy` | route module copied to `api.v1.invoices.$invoiceId.ts` | `loader` added in the new file; delta new route | passes |
 | `route-moved-within-its-file` (`admin-api`) | `GET` and `POST` registrations swapped (`src/admin.ts:16-17`) | empty delta | passes |
 | `loop-route-edit` (`admin-api`) | edit inside the loop at `src/admin.ts:20` | empty delta | passes |
+| `route-added-in-unparseable-file` (`admin-api`) | a route added after `src/admin.ts:17`, its handler left with a rebase conflict, so the file does not parse | empty delta; `delta.files_not_read` names `src/admin.ts`, `does_not_parse`, with main's routes there | passes; shown waits on carrick-cloud#3207 |
 | `http-field-type-change` | route field `total` from `number` to `string` | the same two rows as `http-field-rename` | passes |
 | `http-route-removed` | route module deleted | `missing_endpoint` at both sites; delta removed | passes |
 | `http-handler-body` | the loader's body changes, its type does not | empty delta, no introduced risk | passes |

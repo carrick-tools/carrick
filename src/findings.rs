@@ -1046,6 +1046,52 @@ pub struct EndpointRef {
 pub struct PrDelta {
     pub new_endpoints: Vec<EndpointRef>,
     pub removed_endpoints: Vec<EndpointRef>,
+    /// The files whose operation changes this delta cannot list: a file the
+    /// PR added or edited that this scan could not read, or one where main's
+    /// index holds operations this scan does not state on lines the PR did
+    /// not change (carrick#3233). Sorted by (service, file). Absent from the
+    /// wire when empty, so a payload with nothing unread is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files_not_read: Vec<FileNotRead>,
+}
+
+/// Why the delta cannot list a file's operation changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileNotReadReason {
+    /// The file does not parse, so no row of it is stated.
+    DoesNotParse,
+    /// The file is not UTF-8 text, so it was never read.
+    NotUtf8Text,
+    /// The file was read, and main's index holds operations in it that this
+    /// scan does not state, on lines the PR did not change: they are not
+    /// listed as removed, and other changes in that file may be missing.
+    OperationsMissing,
+}
+
+impl FileNotReadReason {
+    /// The reason as the wire spells it.
+    pub fn code(self) -> &'static str {
+        match self {
+            FileNotReadReason::DoesNotParse => "does_not_parse",
+            FileNotReadReason::NotUtf8Text => "not_utf8_text",
+            FileNotReadReason::OperationsMissing => "operations_missing",
+        }
+    }
+}
+
+/// One file of [`PrDelta::files_not_read`]. A file both unread and holding
+/// main's lost operations takes the read failure as its reason.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FileNotRead {
+    /// Relative to the scan root, as a row's `file_path` names it.
+    pub file: String,
+    /// `null` when unattributed, as on [`EndpointRef`].
+    pub service: Option<String>,
+    pub reason: FileNotReadReason,
+    /// Main's operations in the file that this scan does not state, every
+    /// protocol, sorted as the delta's rows are. Empty when main held none.
+    pub operations: Vec<EndpointRef>,
 }
 
 impl PrDelta {
@@ -1618,6 +1664,7 @@ mod tests {
                     service: None,
                     edge_source: None,
                 }],
+                files_not_read: Vec::new(),
             }),
             verified: vec![VerifiedEndpoint {
                 method: "GET".to_string(),

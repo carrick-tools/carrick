@@ -3571,6 +3571,51 @@ async fn seed_loop_route_edit() {
     assert_delta(&payload, &[], &[]);
 }
 
+/// carrick#3233: the PR adds a route to a file it leaves with a rebase
+/// conflict, so the head does not parse. The delta lists no new and no
+/// removed route (main's rows sit on lines the PR did not change), and names
+/// the file with `does_not_parse` and main's operations in it, so the check
+/// cannot read as "no endpoints added or removed".
+#[tokio::test]
+async fn seed_route_added_in_unparseable_file() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("route-added-in-unparseable-file").await;
+    assert_delta(&payload, &[], &[]);
+    let files = payload["delta"]["files_not_read"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no files_not_read: {payload:#}"));
+    assert_eq!(files.len(), 1, "one file: {payload:#}");
+    assert_eq!(files[0]["file"], "src/admin.ts", "{payload:#}");
+    assert_eq!(files[0]["reason"], "does_not_parse", "{payload:#}");
+    let operations: Vec<String> = files[0]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|op| {
+            format!(
+                "{} {}",
+                op["method"].as_str().unwrap(),
+                op["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for held in [
+        "GET /api/v1/admin/orders",
+        "POST /api/v1/admin/orders/:orderId/cancel",
+    ] {
+        assert!(
+            operations.iter().any(|op| op == held),
+            "main's {held} is named: {operations:?}"
+        );
+    }
+    assert!(
+        operations
+            .iter()
+            .any(|op| op.starts_with("GET /api/v1/admin/reports/")),
+        "main's report route is named: {operations:?}"
+    );
+}
+
 // ---- Non-HTTP negatives (carrick#3172) ---------------------------------
 //
 // An ordinary change to a GraphQL, socket or pub/sub operation: no risk the

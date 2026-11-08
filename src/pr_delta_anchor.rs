@@ -85,6 +85,10 @@ pub struct MainRow {
     /// The place as main stored it.
     pub place: Place,
     pub at_base: AtBase,
+    /// Whether main stored the row at the merge base itself. A row stored at
+    /// another commit may be one main removed itself since, by an edit to
+    /// another file, so its absence is never read as this scan's loss.
+    pub stored_at_base: bool,
 }
 
 /// Why a candidate was left out.
@@ -150,6 +154,15 @@ pub struct Anchored<T> {
     /// added: registrations the PR wrote in a form the scan cannot read, so
     /// a removal they could serve is not proven (carrick#3222).
     pub unread_written: Vec<Place>,
+    /// The removed candidates left out on a line the PR did not change, in a
+    /// service whose reading did not move, that main stored at the merge base
+    /// itself: main held the row there and this scan does not state it, so
+    /// the scan lost it (carrick#3233). Not listed, and counted in
+    /// `left_out` as before; the delta names their files instead.
+    pub lost: Vec<Candidate<T>>,
+    /// Of the source files this scan could not read that the caller named,
+    /// those the PR added or edited (carrick#3233).
+    pub unread_changed: Vec<Place>,
 }
 
 impl<T> Anchored<T> {
@@ -328,7 +341,11 @@ impl Context<'_> {
 /// `reading_moved`: a PR that changes an input of the service other than
 /// source files (carrick#1712).
 /// candidate. Of `unread`, the route sites this scan could not read a path
-/// for, the result keeps those the PR wrote (`unread_written`).
+/// for, the result keeps those the PR wrote (`unread_written`). Of
+/// `unread_sources`, the source files this scan could not read, it keeps
+/// those the PR added or edited (`unread_changed`). A removed candidate left
+/// out on a line main stored at the merge base is `lost` ([`is_lost`]).
+#[allow(clippy::too_many_arguments)]
 pub fn anchor<T>(
     new: Vec<Candidate<T>>,
     removed: Vec<Candidate<T>>,
@@ -337,6 +354,7 @@ pub fn anchor<T>(
     diff: &Diff,
     reading_moved: &BTreeSet<Option<String>>,
     unread: &[Place],
+    unread_sources: &[Place],
 ) -> Anchored<T> {
     let context = Context {
         diff,
@@ -349,6 +367,17 @@ pub fn anchor<T>(
         .filter(|place| context.written(place))
         .cloned()
         .collect();
+    let unread_changed = unread_sources
+        .iter()
+        .filter(|place| {
+            matches!(
+                diff.0.get(&place.file),
+                Some(FileDiff::Added | FileDiff::Modified(_))
+            )
+        })
+        .cloned()
+        .collect();
+    let mut lost = Vec::new();
     let mut left_out = LeftOut::default();
     let mut listed_new = Vec::new();
     for candidate in new {
@@ -376,6 +405,8 @@ pub fn anchor<T>(
                     .unwrap_or_else(|| MainRow {
                         place: place.clone(),
                         at_base: AtBase::At(place.line),
+                        // Main's commit for it is unknown: never lost.
+                        stored_at_base: false,
                     })
             })
             .collect();
@@ -399,6 +430,12 @@ pub fn anchor<T>(
                     reason.label()
                 );
                 left_out.count(reason);
+                if rows
+                    .first()
+                    .is_some_and(|row| is_lost(row, reason, reading_moved))
+                {
+                    let _ = candidate;
+                }
             }
         }
     }
@@ -407,7 +444,31 @@ pub fn anchor<T>(
         removed: listed_removed,
         left_out,
         unread_written,
+        lost,
+        unread_changed,
     }
+}
+
+/// Whether a removed candidate left out for `reason`, judged on `row` (its
+/// first place), is a row this scan lost: main held it at the merge base on a
+/// line the PR did not change, in a service whose reading did not move, and
+/// this scan does not state it there (carrick#3233). A row main moved itself,
+/// one git could not place, one with no line, and one in a service whose
+/// reading moved are never lost; so is one main stored at another commit,
+/// which may be main's own removal since (logged).
+fn is_lost(row: &MainRow, reason: Reason, reading_moved: &BTreeSet<Option<String>>) -> bool {
+    let left_on_its_line = matches!(reason, Reason::EditedFile | Reason::UntouchedFile)
+        && row.place.line > 0
+        && matches!(row.at_base, AtBase::At(_))
+        && !reading_moved.contains(&row.place.service);
+    if left_on_its_line && !row.stored_at_base {
+        debug!(
+            "PR delta: removed operation at {:?} not counted as lost: main stored it at \
+             another commit than the merge base",
+            row.place
+        );
+    }
+    left_on_its_line && row.stored_at_base
 }
 
 /// `Ok` when any place of `candidate` passes `rule`; else the reason the
@@ -524,7 +585,11 @@ fn place_main_rows(repo_path: &str, base: &str, rows: Vec<MainSource>) -> Vec<Ma
                     },
                 }
             };
-            MainRow { place, at_base }
+            MainRow {
+                place,
+                at_base,
+                stored_at_base: commit == base,
+            }
         })
         .collect()
 }
@@ -536,8 +601,8 @@ fn place_main_rows(repo_path: &str, base: &str, rows: Vec<MainSource>) -> Vec<Ma
 /// checkout it is the fork point, so commits main gained after the PR
 /// branched are never read as the PR's (as `pr_functions::block_for_run`
 /// reads it). Git is asked only about files that hold a candidate row or one
-/// of `unread`; a run with no candidate makes no git call. `Err` means git
-/// could not read the diff.
+/// of `unread` or `unread_sources`; a run with no candidate and no unread
+/// source makes no git call. `Err` means git could not read the diff.
 #[allow(clippy::too_many_arguments)]
 pub fn run<T>(
     repo_path: &str,
@@ -548,8 +613,9 @@ pub fn run<T>(
     main: Vec<MainSource>,
     reading_moved: impl FnOnce(&str) -> BTreeSet<Option<String>>,
     unread: &[Place],
+    unread_sources: &[Place],
 ) -> Result<Anchored<T>, String> {
-    if new.is_empty() && removed.is_empty() {
+    if new.is_empty() && removed.is_empty() && unread_sources.is_empty() {
         return Ok(anchor(
             new,
             removed,
@@ -558,6 +624,7 @@ pub fn run<T>(
             &Diff::default(),
             &BTreeSet::new(),
             unread,
+            unread_sources,
         ));
     }
     let files: BTreeSet<String> = new
@@ -566,7 +633,12 @@ pub fn run<T>(
         .flat_map(|candidate| candidate.places.iter().map(|place| place.file.clone()))
         .collect();
     let mut diff_files = files.clone();
-    diff_files.extend(unread.iter().map(|place| place.file.clone()));
+    diff_files.extend(
+        unread
+            .iter()
+            .chain(unread_sources)
+            .map(|place| place.file.clone()),
+    );
     let head = crate::git_state::head_commit(repo_path)?;
     let merge_base = crate::git_state::merge_base(repo_path, pr_base, &head)?;
     let diff = read_diff(repo_path, &merge_base, &diff_files)?;
@@ -576,7 +648,16 @@ pub fn run<T>(
         .collect();
     let main = place_main_rows(repo_path, &merge_base, in_files);
     let moved = reading_moved(&merge_base);
-    Ok(anchor(new, removed, scan, &main, &diff, &moved, unread))
+    Ok(anchor(
+        new,
+        removed,
+        scan,
+        &main,
+        &diff,
+        &moved,
+        unread,
+        unread_sources,
+    ))
 }
 
 #[cfg(test)]
@@ -621,6 +702,7 @@ mod tests {
         MainRow {
             place: place(file, line),
             at_base,
+            stored_at_base: true,
         }
     }
 
@@ -644,7 +726,7 @@ mod tests {
         diff: &Diff,
         reading_moved: &BTreeSet<Option<String>>,
     ) -> (Vec<&'static str>, Vec<&'static str>, LeftOut) {
-        let anchored = anchor(new, removed, scan, main, diff, reading_moved, &[]);
+        let anchored = anchor(new, removed, scan, main, diff, reading_moved, &[], &[]);
         (anchored.new, anchored.removed, anchored.left_out)
     }
 
@@ -793,6 +875,149 @@ mod tests {
         assert_eq!(out.untouched_file, 1);
     }
 
+    /// The removed items `lost`, and what was left out, for one removed
+    /// candidate at `row` with the services in `reading_moved`.
+    fn lost_of(
+        row: MainRow,
+        diff: &Diff,
+        reading_moved: &BTreeSet<Option<String>>,
+    ) -> (Vec<&'static str>, LeftOut) {
+        let candidate = Candidate {
+            item: "x",
+            places: vec![row.place.clone()],
+        };
+        let anchored = anchor(
+            vec![],
+            vec![candidate],
+            &[],
+            &[row],
+            diff,
+            reading_moved,
+            &[],
+            &[],
+        );
+        assert!(anchored.removed.is_empty(), "a lost row is never listed");
+        (
+            anchored.lost.into_iter().map(|c| c.item).collect(),
+            anchored.left_out,
+        )
+    }
+
+    /// carrick#3233: main held the row at the merge base on a line the PR
+    /// did not change, and this scan does not state it: the scan lost it.
+    /// It is still left out and counted as before.
+    #[test]
+    fn a_removed_row_on_an_untouched_line_is_lost() {
+        let edited = diff(vec![(ROUTES, FileDiff::Modified(vec![hunk(40, 1, 40, 1)]))]);
+        let none = BTreeSet::new();
+        let (lost, out) = lost_of(main_row(ROUTES, 5, AtBase::At(5)), &edited, &none);
+        assert_eq!(lost, vec!["x"]);
+        assert_eq!(
+            out,
+            LeftOut {
+                edited_file: 1,
+                ..LeftOut::default()
+            }
+        );
+        let (lost, out) = lost_of(main_row(ROUTES, 5, AtBase::At(5)), &Diff::default(), &none);
+        assert_eq!(lost, vec!["x"]);
+        assert_eq!(
+            out,
+            LeftOut {
+                untouched_file: 1,
+                ..LeftOut::default()
+            }
+        );
+    }
+
+    /// A row main moved itself, one git could not place, one with no line
+    /// and one in a service whose reading moved are left out as before, and
+    /// none is lost.
+    #[test]
+    fn a_moved_unreadable_line_zero_or_reading_moved_row_is_never_lost() {
+        let edited = diff(vec![(ROUTES, FileDiff::Modified(vec![hunk(40, 1, 40, 1)]))]);
+        let none = BTreeSet::new();
+        for (row, d) in [
+            (main_row(ROUTES, 5, AtBase::Moved), &edited),
+            (main_row(ROUTES, 5, AtBase::Unreadable), &Diff::default()),
+            (main_row(ROUTES, 0, AtBase::At(0)), &Diff::default()),
+        ] {
+            let (lost, out) = lost_of(row.clone(), d, &none);
+            assert!(lost.is_empty(), "{row:?} is not lost");
+            assert_eq!(out.total(), 1);
+        }
+        let (lost, out) = lost_of(main_row(ROUTES, 5, AtBase::At(5)), &edited, &web_moved());
+        assert!(lost.is_empty(), "the service's reading moved");
+        assert_eq!(out.edited_file, 1);
+    }
+
+    /// P2: main stored the row at a commit before the merge base. The line is
+    /// unchanged at the merge base and this scan lacks the row, but main may
+    /// have removed it itself since, by an edit to another file.
+    #[test]
+    fn a_row_main_stored_before_the_merge_base_is_never_lost() {
+        let row = MainRow {
+            stored_at_base: false,
+            ..main_row(ROUTES, 5, AtBase::At(5))
+        };
+        let edited = diff(vec![(ROUTES, FileDiff::Modified(vec![hunk(40, 1, 40, 1)]))]);
+        let (lost, out) = lost_of(row, &edited, &BTreeSet::new());
+        assert!(lost.is_empty());
+        assert_eq!(out.edited_file, 1);
+    }
+
+    /// Of the source files this scan could not read, the delta keeps those
+    /// the PR added or edited; a deleted or untouched one is not the PR's.
+    #[test]
+    fn an_unread_source_the_pr_added_or_edited_is_kept() {
+        let d = diff(vec![
+            ("src/added.ts", FileDiff::Added),
+            ("src/edited.ts", FileDiff::Modified(vec![hunk(3, 1, 3, 1)])),
+            ("src/deleted.ts", FileDiff::Deleted),
+        ]);
+        let sources = [
+            place("src/added.ts", 0),
+            place("src/edited.ts", 0),
+            place("src/deleted.ts", 0),
+            place("src/untouched.ts", 0),
+        ];
+        let anchored: Anchored<&str> = anchor(
+            vec![],
+            vec![],
+            &[],
+            &[],
+            &d,
+            &BTreeSet::new(),
+            &[],
+            &sources,
+        );
+        assert_eq!(
+            anchored.unread_changed,
+            vec![place("src/added.ts", 0), place("src/edited.ts", 0)]
+        );
+    }
+
+    /// A run with no candidate still reads the diff for an unread source.
+    #[test]
+    fn the_reader_reads_a_file_that_holds_only_an_unread_source() {
+        let (repo, base) = committed_repo(&[("broken.ts", "a\n"), ("kept.ts", "k\n")]);
+        let dir = repo.path();
+        std::fs::write(dir.join("broken.ts"), "a\nfunction (\n").unwrap();
+        let anchored: Anchored<&str> = run(
+            &dir.to_string_lossy(),
+            &base,
+            vec![],
+            vec![],
+            &[],
+            vec![],
+            |_| BTreeSet::new(),
+            &[],
+            &[place("broken.ts", 0), place("kept.ts", 0)],
+        )
+        .unwrap();
+        assert_eq!(anchored.unread_changed, vec![place("broken.ts", 0)]);
+    }
+
     #[test]
     fn a_removed_row_moves_through_the_hunks_to_find_its_scan_row() {
         // Two lines inserted above: main's line 5 is line 7 now, and this
@@ -902,6 +1127,7 @@ mod tests {
             &d,
             &BTreeSet::new(),
             &unread,
+            &[],
         );
         assert_eq!(anchored.removed, vec!["gone"]);
         assert_eq!(
@@ -923,6 +1149,8 @@ mod tests {
                 reading_moved: 0,
             },
             unread_written: Vec::new(),
+            lost: Vec::new(),
+            unread_changed: Vec::new(),
         };
         assert_eq!(
             anchored.summary(),
@@ -1017,6 +1245,7 @@ mod tests {
             vec![],
             |_| BTreeSet::new(),
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(anchored.new, vec!["in the pr"]);
@@ -1045,6 +1274,7 @@ mod tests {
             vec![],
             |_| BTreeSet::new(),
             &[place("plugin.ts", 2), place("kept.ts", 2)],
+            &[],
         )
         .unwrap();
         assert_eq!(anchored.removed, vec!["gone"]);
@@ -1064,6 +1294,7 @@ mod tests {
             vec![],
             |_| panic!("no candidate, no question"),
             &[place("a.ts", 1)],
+            &[],
         )
         .unwrap();
         assert!(anchored.new.is_empty() && anchored.removed.is_empty());
@@ -1077,6 +1308,7 @@ mod tests {
                 &[],
                 vec![],
                 |_| BTreeSet::new(),
+                &[],
                 &[],
             )
             .is_err(),
@@ -1190,6 +1422,8 @@ mod tests {
                 ..LeftOut::default()
             },
             unread_written: Vec::new(),
+            lost: Vec::new(),
+            unread_changed: Vec::new(),
         };
         assert!(
             anchored
@@ -1235,5 +1469,7 @@ mod tests {
                 AtBase::Unreadable,
             ]
         );
+        let stored: Vec<bool> = placed.iter().map(|row| row.stored_at_base).collect();
+        assert_eq!(stored, vec![false, false, false, true, false]);
     }
 }
