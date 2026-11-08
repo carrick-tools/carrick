@@ -652,6 +652,7 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
     };
     let called: HashSet<(String, String)> = positions
         .call_rows()
+        .chain(positions.member_rows())
         .filter(|row| !in_repo(row))
         .flat_map(|row| {
             let symbol = row.symbol().map(str::to_string);
@@ -1452,7 +1453,17 @@ impl<'a> Walker<'a> {
         // `app.get(…)` on an app handed in as a parameter, held in a field
         // or returned by a call: the member's declaration is one a verified
         // op claim resolves to (carrick#2474 R1).
-        let declarations = self.labels.declarations.filter(|_| !construction)?;
+        self.declared_op(row, invoke)
+            .map(|end| (end, ReachedBy::Declaration))
+    }
+
+    /// The call `invoke` is when the member `row` reads is declared where a
+    /// verified op claim resolves it ([`MemberDeclarations`]), whatever
+    /// holds the receiver. A declaration that stands for more than one op
+    /// ([`Self::one_op`]) is no site, and is counted. A construction states
+    /// no declared op.
+    fn declared_op(&self, row: &Row, invoke: Invoke<'_>) -> Option<SiteEnd> {
+        let declarations = self.labels.declarations.filter(|_| !invoke.construction)?;
         let ops = declarations.at(row.decl_file()?, row.decl_line()?);
         if ops.is_empty() {
             return None;
@@ -1462,14 +1473,11 @@ impl<'a> Walker<'a> {
             return None;
         };
         let claims = self.labels.get(&one.package, &one.export)?;
-        Some((
-            SiteEnd {
-                op: Some(one.op),
-                scope: one.scope.clone(),
-                ..end(&one.package, &one.export, Some(&one.member), claims)
-            },
-            ReachedBy::Declaration,
-        ))
+        Some(SiteEnd {
+            op: Some(one.op),
+            scope: one.scope.clone(),
+            ..self.end_at(invoke, &one.package, &one.export, Some(&one.member), claims)
+        })
     }
 
     /// The one op the ops a member declaration stands for are (carrick#3185):
@@ -2085,8 +2093,9 @@ impl<'a> Walker<'a> {
 
     /// The labelled call `invoke` is when the name or member read at
     /// `lo..hi` in `file` holds a labelled export: by the name its package
-    /// publishes the declaration the compiler's row there names, or a
-    /// global of the language's own library or the runtime's types.
+    /// publishes the declaration the compiler's row there names, a
+    /// global of the language's own library or the runtime's types, or a
+    /// member whose declaration a verified op claim resolves to.
     fn value_end(
         &self,
         file: &Path,
@@ -2125,7 +2134,9 @@ impl<'a> Walker<'a> {
         {
             return Some(self.end_at(invoke, &claims.package, symbol, None, claims));
         }
-        None
+        // `const post = http.post.bind(http)`: a member whose declaration a
+        // verified op claim resolves to, held as a value.
+        self.declared_op(row, invoke)
     }
 
     /// What `invoke` reaches when the value it runs is the definition `key`
@@ -3038,6 +3049,43 @@ mod tests {
             several,
             "a let a callback writes"
         );
+    }
+
+    /// carrick#3504 S4a (#3485 row 4): a labelled export's member held as a
+    /// value, bound (`http.post.bind(http)`) or read bare (`http.post`),
+    /// ends at the op the member's declaration names, at the call that runs
+    /// the value. HTTP and a broker's publish; an own function bound with
+    /// only a `this` was followed already (`m-own-bind.ts`, the pin). The
+    /// answer key is `tests/fixtures/callee-members/README.md`.
+    #[test]
+    fn a_labelled_members_value_reaches_its_op() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_in("callee-members", "services/web", "web")
+        else {
+            return;
+        };
+        let discovery = discover(
+            &on.inputs,
+            &Labels::traced(&exports, &declarations),
+            &on.repo,
+        );
+        let wrong: Vec<String> = [
+            ("m-bind.ts", 6, "site http"),
+            ("m-extract.ts", 6, "site http"),
+            ("m-bind-inline.ts", 4, "site http"),
+            ("m-publish-bind.ts", 6, "site bus"),
+            // The own entry `deps.post` is an object entry read (S4b): the
+            // union stays undecided until it is read.
+            ("m-fallback.ts", 9, "several_values"),
+            ("m-own-bind.ts", 10, "site http"),
+        ]
+        .into_iter()
+        .filter_map(|(file, line, want)| {
+            let got = recorded_at(&discovery, file, line);
+            (got != [want.to_string()]).then(|| format!("{file}:{line} want {want}, got {got:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// carrick#2813 slice S2: a function written as a parameter's default

@@ -625,6 +625,15 @@ impl PositionIndex {
             .filter(|row| row.kind() == Kind::Call)
     }
 
+    /// Every `member` row of every file, in no fixed order: the members the
+    /// code reads, called or held as a value (carrick#3504 S4a).
+    pub fn member_rows(&self) -> impl Iterator<Item = &Row> {
+        self.files
+            .values()
+            .flat_map(|file| file.rows.values())
+            .filter(|row| row.kind() == Kind::Member)
+    }
+
     /// Whether any call the rows hold may go through an import that did not
     /// resolve: a `call` row of the error type that names a symbol declared
     /// in the call's own file. That is the row an unresolved import's call
