@@ -72,10 +72,12 @@ pub const ALLOW_ENV: &str = "CARRICK_ALLOW_UNPREPARED";
 /// Lockfiles, and the command that installs what each of them locks. The list
 /// is the check's whole knowledge of package managers: a name here is a file
 /// on disk that states an install, not a framework or a library.
-const LOCKFILES: [(&str, &str); 3] = [
+const LOCKFILES: [(&str, &str); 5] = [
     ("pnpm-lock.yaml", "pnpm install"),
     ("yarn.lock", "yarn install"),
     ("package-lock.json", "npm install"),
+    ("bun.lock", "bun install"),
+    ("bun.lockb", "bun install"),
 ];
 
 /// The Deno lockfile and its install command, kept apart from [`LOCKFILES`]

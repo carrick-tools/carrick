@@ -162,3 +162,33 @@ fn the_override_scans_the_same_tree() {
         "and the scan it allows is an ordinary one: {said}"
     );
 }
+
+/// A bun-installed tree states its install in `bun.lock` (text) or
+/// `bun.lockb` (binary). Either is a lockfile that is not installed
+/// (carrick#3289).
+#[test]
+fn a_scan_is_refused_when_a_bun_lockfile_states_an_install_that_is_not_there() {
+    for lockfile in ["bun.lock", "bun.lockb"] {
+        let repo = repo(&[
+            (
+                "package.json",
+                r#"{"name":"api","dependencies":{"express":"4"}}"#,
+            ),
+            (lockfile, "{}\n"),
+        ]);
+        let output = scan(repo.path(), false);
+        let said = said(&output);
+        assert!(
+            !output.status.success(),
+            "{lockfile}: the scan proceeded on an unprepared tree: {said}"
+        );
+        assert!(
+            said.contains(&format!("{lockfile} in the repository root states them")),
+            "{lockfile}: the refusal names the lockfile: {said}"
+        );
+        assert!(
+            said.contains("Run `bun install`"),
+            "{lockfile}: and the command bun names: {said}"
+        );
+    }
+}
