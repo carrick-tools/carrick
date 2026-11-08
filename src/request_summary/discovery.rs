@@ -2850,6 +2850,105 @@ mod tests {
         );
     }
 
+    /// carrick#3504 S0b: a function a factory returns, called where the
+    /// factory's result is held, reads the factory's parameters from the call
+    /// that made it, whatever depth the maker call is written at. A key the
+    /// maker call does not write adds nothing; one it fills with a function
+    /// that sends nothing keeps the call undecided. The answer key is
+    /// `tests/fixtures/factory-closure/README.md`.
+    #[test]
+    fn a_function_a_factory_returns_reads_the_factorys_parameter_from_the_call_that_made_it() {
+        let Some(on) = walked("factory-closure", "services/web", "web", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/factory-closure/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .chain(&discovery.unfollowed)
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        let show = |file: &str, line: u32| -> String {
+            at(file, line)
+                .iter()
+                .map(|site| {
+                    format!(
+                        "{}:{} end={:?} stop={:?}",
+                        site.file,
+                        site.line,
+                        site.end
+                            .as_ref()
+                            .map(|end| (end.package.as_str(), end.export.as_str())),
+                        site.stop
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let decided = |file: &str, line: u32, package: &str, export: &str| -> bool {
+            let sites = at(file, line);
+            !sites.is_empty()
+                && sites.iter().all(|site| {
+                    site.stop.is_none()
+                        && site.end.as_ref().is_some_and(|end| {
+                            (end.package.as_str(), end.export.as_str()) == (package, export)
+                        })
+                })
+        };
+        let mut wrong = Vec::new();
+        for (file, line) in [
+            // The factory's parameter, read in the function it returns.
+            ("s-closure-coalesce.ts", 8),
+            ("s-closure-coalesce-arrow.ts", 7),
+            ("s-closure-param.ts", 7),
+            ("s-closure-param-key.ts", 7),
+            ("s-closure-param-local.ts", 8),
+            // The maker call passes the outer factory's own parameter.
+            ("s-two-level.ts", 17),
+            ("t-real.ts", 26),
+            // Already decided: a factory local, a direct send, a closed URL.
+            ("s-closure-local.ts", 7),
+            ("s-two-level-direct.ts", 11),
+            ("z-literal-fn.ts", 5),
+        ] {
+            if !decided(file, line, "@fixture/send", "send") {
+                wrong.push(format!("{file}:{line} not decided: {}", show(file, line)));
+            }
+        }
+        if !decided("b-closure-coalesce.ts", 5, "@fixture/pub", "publish") {
+            wrong.push(format!(
+                "b-closure-coalesce.ts:5 not decided: {}",
+                show("b-closure-coalesce.ts", 5)
+            ));
+        }
+        if at("b-closure-coalesce.ts", 8)
+            .iter()
+            .any(|site| site.stop.as_deref() == Some(INJECTED_CALLEE))
+        {
+            wrong.push(format!(
+                "b-closure-coalesce.ts:8 injected: {}",
+                show("b-closure-coalesce.ts", 8)
+            ));
+        }
+        // The maker call fills `send` with a function that sends nothing.
+        if decided("s-closure-coalesce-filled.ts", 9, "@fixture/send", "send") {
+            wrong.push(format!(
+                "s-closure-coalesce-filled.ts:9 decided: {}",
+                show("s-closure-coalesce-filled.ts", 9)
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// carrick#2813 S1: a walk that passed a call into a package the store has
     /// not answered records the package, whether it ends at a wrapper chain
     /// or at a value callee a parameter's fallback decides, and a walk that

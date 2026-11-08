@@ -1,0 +1,9 @@
+{
+  "name": "factory-closure-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/send": "^1.0.0",
+    "@fixture/pub": "^1.0.0"
+  }
+}
