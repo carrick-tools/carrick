@@ -1,0 +1,10 @@
+{
+  "name": "socket-per-connection-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": ["services/*"],
+  "dependencies": {
+    "socket.io": "^4.8.0",
+    "socket.io-client": "^4.8.0"
+  }
+}

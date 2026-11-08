@@ -1036,6 +1036,15 @@ pub struct SiteFold {
     /// (carrick#2795). A row an in-band candidate replaced is not here: the
     /// graph keeps the reader's row beside the candidate.
     pub replaced_by_fact: Vec<(String, u32, OperationKey)>,
+    /// Fact site rows kept out of their site by a row already there, by the
+    /// resolution source of the row that kept it (`socket_call`,
+    /// `event_bus`, `library_claim`, ...). The measure of how much a frozen
+    /// pass still hides from the fact layer.
+    pub kept_out: std::collections::BTreeMap<String, usize>,
+    /// Of `kept_out`, the fact socket rows a socket-pass row kept out: the
+    /// frozen pass and the fact layer disagree on the operation (or the
+    /// fact states no direction).
+    pub socket_disagrees: usize,
 }
 
 /// `file` relative to `root`, `/`-separated, whichever form it is held in
@@ -1209,10 +1218,37 @@ pub fn fold_rows(
         // replaces it as it replaces the reader's row (carrick#3283). One
         // that states the same operation keeps the site, which then changes
         // nothing.
+        // A socket-pass row gives way only to a fact stating the same
+        // operation with a direction: the fact takes the site and its
+        // provenance, the key unchanged (the frozen pass retires under
+        // carrick#1670). On any disagreement the socket pass's row stays and
+        // the fold counts it.
         let gives_way = |existing: &ApiEndpointDetails| {
-            is_reader(existing) || (row.fact() && is_old_path(existing) && existing.key != row.key)
+            is_reader(existing)
+                || (row.fact() && is_old_path(existing) && existing.key != row.key)
+                || (row.fact()
+                    && existing.resolution_source == Some(ResolutionSource::SocketCall)
+                    && existing.key == row.key
+                    && matches!(
+                        &row.key,
+                        OperationKey::Socket { direction, .. }
+                            if *direction != SocketDirection::Unknown
+                    ))
         };
-        if here.iter().any(|&index| !gives_way(&rows[index])) {
+        if let Some(&kept) = here.iter().find(|&&index| !gives_way(&rows[index])) {
+            if row.fact() {
+                let source = rows[kept].resolution_source;
+                let name = source
+                    .and_then(|source| serde_json::to_value(source).ok())
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unsourced".to_string());
+                *out.kept_out.entry(name).or_default() += 1;
+                if source == Some(ResolutionSource::SocketCall)
+                    && matches!(row.key, OperationKey::Socket { .. })
+                {
+                    out.socket_disagrees += 1;
+                }
+            }
             continue;
         }
         let readers: Vec<usize> = here;

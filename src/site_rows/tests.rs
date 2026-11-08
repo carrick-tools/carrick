@@ -2003,3 +2003,103 @@ fn a_silent_cross_process_site_writes_no_scope_and_crosses_services() {
         }
     }
 }
+
+/// The socket site row at `src/server-socket.ts:7` as a fact stating `key`.
+fn socket_fact(key: OperationKey) -> SiteRow {
+    let mut row = a_socket_fact_row();
+    row.inference = None;
+    row.source = ResolutionSource::LibraryClaim;
+    row.in_band = false;
+    row.needs_reader = false;
+    row.key = key;
+    row
+}
+
+/// `row` folded against a socket-pass row at its line stating `old`.
+fn fold_socket(row: SiteRow, old: OperationKey) -> (Vec<ApiEndpointDetails>, SiteFold) {
+    let mut calls = vec![blob_row(
+        old,
+        &row.file,
+        LINE,
+        Some(ResolutionSource::SocketCall),
+    )];
+    let one = SiteRows {
+        enabled: true,
+        rows: vec![row],
+        ..SiteRows::default()
+    };
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &one, Path::new("."), make);
+    (calls, fold)
+}
+
+const SOCKET_FILE: &str = "src/server-socket.ts";
+
+fn chat(direction: SocketDirection) -> OperationKey {
+    OperationKey::socket("chat", direction)
+}
+
+/// A row a fact is kept out by is counted, by the source of the row that
+/// kept it.
+#[test]
+fn a_row_a_fact_is_kept_out_by_is_counted_by_its_source() {
+    let old = chat(SocketDirection::ClientToServer);
+    let (calls, fold) = fold_socket(
+        socket_fact(chat(SocketDirection::ServerToClient)),
+        old.clone(),
+    );
+    assert_eq!(
+        at_site(&calls, SOCKET_FILE),
+        vec![(old, Some(ResolutionSource::SocketCall), None)]
+    );
+    assert_eq!(
+        fold.kept_out,
+        BTreeMap::from([("socket_call".to_string(), 1)])
+    );
+    assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
+}
+
+/// A socket-pass row stating another operation keeps its site and is counted
+/// as a disagreement.
+#[test]
+fn a_socket_pass_row_of_another_operation_keeps_its_site_and_is_counted() {
+    let old = chat(SocketDirection::ClientToServer);
+    let (calls, fold) = fold_socket(
+        socket_fact(chat(SocketDirection::ServerToClient)),
+        old.clone(),
+    );
+    assert_eq!(
+        at_site(&calls, SOCKET_FILE),
+        vec![(old, Some(ResolutionSource::SocketCall), None)]
+    );
+    assert_eq!(fold.socket_disagrees, 1);
+}
+
+/// A fact stating the socket pass's own operation takes the site: the key is
+/// unchanged and the source is the fact's.
+#[test]
+fn a_socket_fact_takes_its_site_from_the_socket_pass_row_of_the_same_operation() {
+    let key = chat(SocketDirection::ServerToClient);
+    let (calls, fold) = fold_socket(socket_fact(key.clone()), key.clone());
+    assert_eq!(
+        at_site(&calls, SOCKET_FILE),
+        vec![(key.clone(), Some(ResolutionSource::LibraryClaim), None)]
+    );
+    assert_eq!(
+        fold.withdrawn,
+        vec![(SOCKET_FILE.to_string(), LINE, key, RowSide::Call)]
+    );
+    assert!(fold.kept_out.is_empty() && fold.socket_disagrees == 0);
+}
+
+/// A fact of unknown direction states less than the socket pass: it never
+/// takes the site.
+#[test]
+fn a_socket_fact_of_unknown_direction_leaves_the_socket_pass_row() {
+    let key = chat(SocketDirection::Unknown);
+    let (calls, fold) = fold_socket(socket_fact(key.clone()), key.clone());
+    assert_eq!(
+        at_site(&calls, SOCKET_FILE),
+        vec![(key, Some(ResolutionSource::SocketCall), None)]
+    );
+    assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
+}

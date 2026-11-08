@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "srv", "directory": "services/srv" },
+    { "name": "cli", "directory": "services/cli" }
+  ]
+}
