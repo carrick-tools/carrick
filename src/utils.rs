@@ -39,18 +39,30 @@ pub fn declared_repository() -> Option<&'static str> {
     declared_slot().get().map(String::as_str)
 }
 
+/// The name of the indexed repo a local re-scan reads, set by the local check
+/// on the scans it starts (carrick#3595). A re-scan of a linked git worktree
+/// runs in the worktree's folder, whose name is not the repo's; this keeps its
+/// blobs named as the repo the index holds. Local only: the runner never sets
+/// it, `--repo` and `GITHUB_REPOSITORY` win over it, and the `owner/name` the
+/// cloud is told never reads it.
+pub const LOCAL_REPO_NAME_ENV: &str = "CARRICK_LOCAL_REPO_NAME";
+
 /// The name a scan compares its own stored blobs against: which stored
 /// generation it reuses, and which downloaded copies are this repo's rather
 /// than siblings in the join.
 ///
-/// `--repo` first, then `GITHUB_REPOSITORY`, each by its basename, then the
-/// scanned directory's name.
+/// `--repo` first, then `GITHUB_REPOSITORY`, each by its basename, then
+/// [`LOCAL_REPO_NAME_ENV`], then the scanned directory's name.
 pub fn get_repository_name(repo_path: &str) -> String {
     let github_repository = env::var("GITHUB_REPOSITORY").ok();
+    let local = env::var(LOCAL_REPO_NAME_ENV)
+        .ok()
+        .filter(|name| !name.is_empty());
     let name = repository_name_from(
         repo_path,
         declared_repository(),
         github_repository.as_deref(),
+        local.as_deref(),
     );
 
     // If we got "." (current directory), use the actual directory name
@@ -72,11 +84,15 @@ pub fn repository_name_from(
     repo_path: &str,
     declared: Option<&str>,
     github_repository: Option<&str>,
+    local: Option<&str>,
 ) -> String {
     if let Some(full_name) = declared.or(github_repository)
         && let Some(repo_name) = full_name.split('/').next_back()
     {
         return repo_name.to_string();
+    }
+    if let Some(local) = local {
+        return local.to_string();
     }
 
     repo_path
@@ -243,22 +259,40 @@ mod tests {
     #[test]
     fn a_declared_repository_wins_over_the_environment_and_the_folder() {
         assert_eq!(
-            repository_name_from("/work/checkout", Some("acme/api"), Some("acme/other")),
+            repository_name_from("/work/checkout", Some("acme/api"), Some("acme/other"), None),
             "api"
         );
         assert_eq!(
-            repository_name_from("/work/checkout", Some("acme/api"), None),
+            repository_name_from("/work/checkout", Some("acme/api"), None, None),
             "api"
         );
         assert_eq!(
-            repository_name_from("/work/checkout", None, Some("acme/other")),
+            repository_name_from("/work/checkout", None, Some("acme/other"), None),
             "other"
         );
         assert_eq!(
-            repository_name_from("/work/checkout/", None, None),
+            repository_name_from("/work/checkout/", None, None, None),
             "checkout"
         );
-        assert_eq!(repository_name_from(".", None, None), ".");
+        assert_eq!(repository_name_from(".", None, None, None), ".");
+    }
+
+    /// A local re-scan of a linked worktree is named as the indexed repo, and
+    /// never over a name the runner declared (carrick#3595).
+    #[test]
+    fn a_local_repo_name_names_a_worktree_scan_below_the_declared_names() {
+        assert_eq!(
+            repository_name_from("/work/api/.claude/worktrees/b", None, None, Some("api")),
+            "api"
+        );
+        assert_eq!(
+            repository_name_from("/work/b", Some("acme/declared"), None, Some("api")),
+            "declared"
+        );
+        assert_eq!(
+            repository_name_from("/work/b", None, Some("acme/ci"), Some("api")),
+            "ci"
+        );
     }
 
     /// A path outside the repo root must pass through unchanged, never be

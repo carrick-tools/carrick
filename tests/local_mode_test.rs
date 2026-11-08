@@ -549,6 +549,219 @@ fn an_edit_is_re_judged_before_the_index_catches_up() {
     );
 }
 
+/// The local-mode workspace, indexed, with a linked git worktree of
+/// `catalog-web` at `catalog-web/.claude/worktrees/b`, where an agent works on
+/// a branch while the index stays bound to the main checkout (carrick#3595).
+/// The folder is ignored as it is in a real repo, so the main checkout never
+/// lists the worktree's files as its own. Returns the worktree's top.
+fn indexed_with_a_worktree(root: &Path) -> PathBuf {
+    index(root);
+    let repo = root.join("catalog-web");
+    git(
+        &repo,
+        &["worktree", "add", "-q", ".claude/worktrees/b", "-b", "b"],
+    );
+    repo.join(".claude/worktrees/b")
+        .canonicalize()
+        .expect("the worktree exists")
+}
+
+/// A workspace whose repos ignore `.claude/worktrees/`, as a repo that hands
+/// agents their own worktrees does.
+fn workspace_ignoring_worktrees() -> tempfile::TempDir {
+    workspace_prepared(
+        "local-mode-workspace",
+        &["catalog-web", "inventory-svc"],
+        |repo| {
+            std::fs::write(repo.join(".gitignore"), ".claude/worktrees/\n")
+                .expect("write the ignore file")
+        },
+    )
+}
+
+/// A carrick command run from `dir` against the workspace at `root`, with its
+/// stdout. Exit codes are not asserted: `check --changed` exits non-zero on a
+/// failing pair, which is what one of these runs is for.
+fn run_from(dir: &Path, root: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
+    let mut command = Command::new(carrick());
+    command
+        .args(args)
+        .arg("--workspace")
+        .arg(root)
+        .current_dir(dir)
+        .env_remove("CARRICK_TOKEN")
+        .env_remove("CARRICK_CHECK_RESCAN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    String::from_utf8(output.stdout).expect("stdout was not UTF-8")
+}
+
+fn json_of(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
+}
+
+/// A file in a linked worktree of an indexed repo is that repo's file, read
+/// from the worktree (carrick#3595): the answer names it by its path in the
+/// repo and the service that path is in, an edit made only in the worktree
+/// makes it stale, and the re-check judges the worktree's bytes. The main
+/// checkout's answer for the same file does not move.
+#[test]
+#[serial]
+fn a_file_in_a_linked_worktree_is_checked_as_its_repos_file() {
+    let workspace = workspace_ignoring_worktrees();
+    let root = workspace.path();
+    let route = "app/routes/api.v1.widgets.$widgetId.ts";
+    let main_route = format!("catalog-web/{route}");
+    let worktree = indexed_with_a_worktree(root);
+    let worktree_route = worktree.join(route);
+    let budget = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
+
+    let main = check_json(root, &main_route);
+    let shown = worktree_route.to_string_lossy().to_string();
+    let before = json_of(&run_from(
+        &worktree,
+        root,
+        &["check", &shown, "--json"],
+        &[],
+    ));
+    assert_eq!(
+        before["file"],
+        serde_json::json!(route),
+        "named by its path in the repo, not under the worktree folder:\n{before:#}"
+    );
+    assert_eq!(
+        before["service"], main["service"],
+        "in the service that path is in:\n{before:#}"
+    );
+    assert_eq!(
+        before["repo"], main["repo"],
+        "of the repo the index holds:\n{before:#}"
+    );
+    assert_eq!(before["stale"], serde_json::json!(false), "{before:#}");
+
+    edit(
+        &worktree_route,
+        "activeCount: number",
+        "activeCount: string",
+    );
+    edit(&worktree_route, "activeCount: 3", "activeCount: \"3\"");
+
+    let edited = json_of(&run_from(
+        &worktree,
+        root,
+        &["check", &shown, "--json"],
+        &[],
+    ));
+    assert_eq!(
+        edited["stale"],
+        serde_json::json!(true),
+        "an edit only in the worktree is a change to the file:\n{edited:#}"
+    );
+    let fresh = json_of(&run_from(
+        &worktree,
+        root,
+        &["check", &shown, "--recheck", "--json"],
+        &budget,
+    ));
+    assert_eq!(
+        fresh["recheck"]["ran"],
+        serde_json::json!("extraction+types"),
+        "{fresh:#}"
+    );
+    assert_eq!(
+        fresh["items"][0]["verdict"]["result"],
+        serde_json::json!("type_mismatch"),
+        "the re-check judges the worktree's bytes:\n{fresh:#}"
+    );
+
+    // Must not change: the main checkout still reads its own copy.
+    let main_after = check_json(root, &main_route);
+    assert_eq!(
+        main_after["stale"],
+        serde_json::json!(false),
+        "{main_after:#}"
+    );
+    assert_eq!(
+        main_after["items"][0]["verdict"]["result"],
+        serde_json::json!("compatible"),
+        "{main_after:#}"
+    );
+}
+
+/// `check --changed` run inside a linked worktree lists the worktree's own
+/// changes, because git runs in the worktree; run from the main checkout it
+/// lists none of them (carrick#3595).
+#[test]
+#[serial]
+fn check_changed_inside_a_worktree_lists_the_worktrees_changes() {
+    let workspace = workspace_ignoring_worktrees();
+    let root = workspace.path();
+    let route = "app/routes/api.v1.widgets.$widgetId.ts";
+    let worktree = indexed_with_a_worktree(root);
+    edit(
+        &worktree.join(route),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    edit(
+        &worktree.join(route),
+        "activeCount: 3",
+        "activeCount: \"3\"",
+    );
+    let budget = [("CARRICK_CHECK_BUDGET_MS", "600000")];
+    let files_of = |json: &serde_json::Value| -> serde_json::Value {
+        json["repos"]
+            .as_array()
+            .and_then(|repos| {
+                repos.iter().find(|repo| {
+                    repo["repo"]
+                        .as_str()
+                        .is_some_and(|r| r.ends_with("catalog-web"))
+                })
+            })
+            .map(|repo| repo["files"].clone())
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    let from_main = json_of(&run_from(
+        root,
+        root,
+        &["check", "--changed", "--json"],
+        &budget,
+    ));
+    assert_eq!(
+        files_of(&from_main),
+        serde_json::json!([]),
+        "the main checkout has no change of its own:\n{from_main:#}"
+    );
+
+    let from_worktree = json_of(&run_from(
+        &worktree,
+        root,
+        &["check", "--changed", "--json"],
+        &budget,
+    ));
+    assert_eq!(
+        files_of(&from_worktree),
+        serde_json::json!([route]),
+        "the worktree's edit, by its path in the repo:\n{from_worktree:#}"
+    );
+    assert!(
+        from_worktree["problems"]
+            .as_array()
+            .is_some_and(|problems| problems
+                .iter()
+                .any(|problem| problem["kind"] == "incompatible")),
+        "judged from the worktree's bytes:\n{from_worktree:#}"
+    );
+}
+
 /// The re-check names the functions the file declares that the index does not
 /// hold (carrick#1330), and says nothing when an edit added none.
 ///

@@ -58,7 +58,7 @@ pub fn answer(
 ) -> Result<CheckOutput, ReadFailure> {
     let index = read_index(workspace_root)?;
 
-    let (repo, relative) = index
+    let (repo, relative, tree) = index
         .locate_file(file)
         .ok_or_else(|| ReadFailure::new(ReadError::NotInWorkspace))?;
     // A repo the workspace file excludes is one this install was told not to
@@ -93,7 +93,10 @@ pub fn answer(
         .map(|service| service.indexed_at.clone())
         .unwrap_or_else(|| index.indexed_at.clone());
 
-    let repo_root = PathBuf::from(&repo.path);
+    // Where the file is read: the repo's own folder, or the linked worktree
+    // the edit was made in (carrick#3595). The repo it answers for stays the
+    // indexed one.
+    let repo_root = tree.checkout.clone();
     // Git is the whole answer where git can give one: it compares CONTENT, and
     // a rewrite that lands the same bytes is not a change. The mtime signal is
     // the fallback for the tree git cannot speak for, and it is built into the
@@ -158,7 +161,7 @@ pub fn answer(
                 None => match super::recheck::Reach::of(repo, &relative, &service) {
                     Some(reach) => rechecked(
                         workspace_root,
-                        &repo_root,
+                        &tree,
                         &relative,
                         &indexed_at,
                         &reach,
@@ -433,7 +436,7 @@ const UNREAD_EDIT_REASON: &str =
 /// it is an answer of unknown age (carrick#1036).
 fn rechecked(
     workspace_root: &Path,
-    repo_root: &Path,
+    tree: &super::checkout::Tree,
     relative: &str,
     indexed_at: &str,
     reach: &super::recheck::Reach,
@@ -462,7 +465,7 @@ fn rechecked(
     };
     match super::recheck::run(
         &workspace,
-        repo_root,
+        tree,
         relative,
         &before.indexed_at,
         reach,

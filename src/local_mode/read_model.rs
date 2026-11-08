@@ -11,7 +11,9 @@
 //! index to rebuild, not one to migrate.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use super::checkout::Tree;
 
 use serde::{Deserialize, Serialize};
 
@@ -481,13 +483,50 @@ impl LocalIndex {
         result
     }
 
-    /// The repo a file belongs to, and the file's path relative to it.
+    /// The repo a file belongs to, the file's path relative to it, and the
+    /// checkout it is read from.
     ///
     /// Longest prefix wins, so a repo nested inside another (a workspace that
     /// lists both a monorepo and one of its packages) resolves to the nearest
     /// one rather than the first match.
-    pub fn locate_file(&self, file: &Path) -> Option<(&IndexedRepo, String)> {
+    ///
+    /// A file in a linked git worktree of an indexed repo is that repo's file,
+    /// at the same path, read from the worktree (carrick#3595): it is placed
+    /// as its twin in the repo's own folder would be, and the checkout is the
+    /// matching folder of the worktree. A worktree the workspace itself lists
+    /// as a repo is that repo.
+    pub fn locate_file(&self, file: &Path) -> Option<(&IndexedRepo, String, Tree)> {
         let absolute = file.canonicalize().unwrap_or_else(|_| absolutize(file));
+        let linked = absolute
+            .ancestors()
+            .find(|dir| dir.exists())
+            .and_then(super::checkout::linked_checkout)
+            .filter(|linked| {
+                !self
+                    .repos
+                    .iter()
+                    .any(|repo| super::checkout::same_dir(Path::new(&repo.path), &linked.top))
+            });
+        if let Some(linked) = linked
+            && let Ok(inside) = absolute.strip_prefix(&linked.top)
+            && let Some((repo, relative)) = self.by_prefix(&linked.main.join(inside))
+        {
+            let offset = Path::new(&repo.path)
+                .strip_prefix(&linked.main)
+                .unwrap_or(Path::new(""));
+            let tree = Tree {
+                repo: PathBuf::from(&repo.path),
+                checkout: linked.top.join(offset),
+            };
+            return Some((repo, relative, tree));
+        }
+        self.by_prefix(&absolute)
+            .map(|(repo, relative)| (repo, relative, Tree::at(Path::new(&repo.path))))
+    }
+
+    /// The indexed repo whose root is the longest prefix of `absolute`, and
+    /// the path relative to it.
+    fn by_prefix(&self, absolute: &Path) -> Option<(&IndexedRepo, String)> {
         let mut best: Option<(&IndexedRepo, String)> = None;
         for repo in &self.repos {
             let root = Path::new(&repo.path);
@@ -577,11 +616,12 @@ mod tests {
             repos: vec![repo("/w/mono", "mono"), repo("/w/mono/packages/api", "api")],
             type_check: None,
         };
-        let (found, relative) = index
+        let (found, relative, tree) = index
             .locate_file(Path::new("/w/mono/packages/api/src/routes.ts"))
             .unwrap();
         assert_eq!(found.name, "api");
         assert_eq!(relative, "src/routes.ts");
+        assert_eq!(tree, Tree::at(Path::new("/w/mono/packages/api")));
     }
 
     #[test]
