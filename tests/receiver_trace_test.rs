@@ -583,6 +583,29 @@ fn a_getter_receiver_route_takes_its_full_path() {
     }
 }
 
+/// carrick#3504 S3c: a route registered on the call of an own function that
+/// returns a module-scope instance is a mount-graph row at its full path,
+/// `library_claim`, with no unread lead at its line.
+#[test]
+fn a_function_result_receiver_route_takes_its_full_path() {
+    let on = scan_fixture("receiver-forms-routes");
+    let (graph, flat) = endpoint_rows(&on);
+    let site = "src/s-call-result.ts:4";
+    let want = "src/s-call-result.ts:4 GET /p/s-call-result library_claim";
+    let rows: Vec<&String> = graph
+        .iter()
+        .filter(|row| row.starts_with(&format!("{site} ")))
+        .collect();
+    assert_eq!(rows.len(), 1, "{site}: {graph:#?}");
+    assert!(rows[0].starts_with(want), "{site}: {graph:#?}");
+    assert!(
+        flat.iter().any(|row| row.starts_with(want)),
+        "{site}: {flat:#?}"
+    );
+    let unread = unread_reasons(&on);
+    assert!(!unread.contains_key(site), "{site}: {unread:#?}");
+}
+
 /// Why each possible call's path is unread, as `file:line` to reason. A call
 /// whose path is read and whose owner is not is `owner_unknown`.
 fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {
