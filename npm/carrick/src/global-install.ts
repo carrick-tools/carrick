@@ -306,8 +306,8 @@ export type SyncOutcome =
     };
 
 export type SyncOptions = {
-  /** The version this run is. */
-  running?: string | null;
+  /** The version to bring the global install to; this run's own when absent. */
+  target?: string | null;
   /** Progress, as it happens: what is being upgraded, and that it took. */
   say: (line: string) => void;
   machine?: GlobalMachine;
@@ -326,7 +326,7 @@ export type SyncOptions = {
 export function syncGlobalInstall(options: SyncOptions): SyncOutcome {
   const env = options.env ?? process.env;
   const machine = options.machine ?? realMachine(env);
-  const running = options.running === undefined ? currentVersion() : options.running;
+  const running = options.target === undefined ? currentVersion() : options.target;
   if (!running || !/^\d+\.\d+\.\d+$/.test(running)) {
     return { kind: "skipped", why: "this build does not state a plain version", warning: null };
   }

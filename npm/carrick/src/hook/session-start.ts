@@ -24,7 +24,8 @@ import { createLogger } from "../log.ts";
 import { CHECK_BEFORE_DONE, heldLine, hostedLine, renderSessionStart } from "../render.ts";
 import { lastSync } from "../hosted-snapshot.ts";
 import { resolveRoot, rootNote } from "../root.ts";
-import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
+import { currentVersion } from "../update.ts";
+import { upgradeLines } from "./upgrade.ts";
 import {
   claimRefresh,
   cooldownMs,
@@ -44,15 +45,15 @@ const log = createLogger("carrick-session");
  *
  * Read from the cache only: a hook has a 300 ms budget and no business dialling
  * a registry. The cache is refreshed by a detached child the shim starts, so
- * what this prints is at most one run behind. On stdout, unlike the shim's
+ * what this prints is at most one run behind. A global install that is behind
+ * is upgraded by a detached child (`./upgrade.ts`); everything else gets the
+ * notice. On stdout, unlike the shim's
  * stderr line, because stdout is what Claude Code adds to the session — the
  * agent is the one that can act on it, and an agent that forgets to upgrade is
  * the failure this exists for.
  */
-function versionLine(): string | null {
-  if (suppressed(process.env)) return null;
-  const state = readUpdateState(process.env);
-  return updateNotice(currentVersion(), state?.latest ?? null, { env: process.env });
+function versionLines(): string[] {
+  return upgradeLines();
 }
 
 async function readStdinUnlessTty(): Promise<string> {
@@ -102,8 +103,7 @@ async function main(): Promise<void> {
   // Printed whatever the index turns out to say, and before the read that may
   // have nothing to report: a machine with no index yet is a machine about to
   // run its first scan, which is the worst moment to be on a stale build.
-  const version = versionLine();
-  if (version) lines.push(version);
+  lines.push(...versionLines());
 
   // And the other mismatch: not "a newer one is published" but "the one
   // answering this hook is not the one that wrote these files". Unthrottled,
