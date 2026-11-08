@@ -129,6 +129,18 @@ describe('a service with no config at its root', () => {
     assert.strictEqual(loader.projectKeyFor(path.join(root, 'node_modules/dep/index.js')), '');
   });
 
+  it('hands a file the tsconfig lists nowhere to the jsconfig beside it', () => {
+    const root = writeRepo({
+      'web/tsconfig.json': JSON.stringify({ include: ['src/**/*.ts'] }),
+      'web/jsconfig.json': '{}',
+      'web/src/a.js': 'export const a = 1;\n',
+      'web/src/b.ts': 'export const b = 1;\n',
+    });
+    const loader = load(root);
+    assert.strictEqual(loader.projectKeyFor(path.join(root, 'web/src/a.js')), path.join(root, 'web/jsconfig.json'));
+    assert.strictEqual(loader.projectKeyFor(path.join(root, 'web/src/b.ts')), path.join(root, 'web/tsconfig.json'));
+  });
+
   it('keeps a nested config\'s files out of the default project', () => {
     const root = writeRepo({
       'src/top.ts': 'export const top = 1;\n',

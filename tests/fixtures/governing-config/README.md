@@ -10,6 +10,10 @@ calling `get` through an alias and a `viaRelative*()` calling it through
 - `b-solo`: `b-ws/web` scanned alone.
 - `pos-ws`: `paths` in `web/tsconfig.json` (known positive).
 - `j-only`: `paths` in `web/jsconfig.json`, JavaScript sources.
+- `ts-beside-js`: `web/tsconfig.json` lists only `.ts`/`.tsx` and
+  `web/jsconfig.json` beside it lists the JavaScript sources; the root
+  `package.json` has no `workspaces`, so the service is the root with no
+  fallback config. The jsconfig governs the `.js` files.
 - `j-under-cj`: `j-only` under a root `tsconfig.json` `{}`, with a `carrick.json`
   naming `web` and no `tsconfig`.
 - `refs-named`: `carrick.json` names the root `tsconfig.json`, which lists

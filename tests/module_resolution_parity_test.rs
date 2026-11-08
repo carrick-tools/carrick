@@ -10,8 +10,9 @@
 //!
 //! - by the compiler: from the importer's directory, `ts.findConfigFile` for
 //!   the nearest `tsconfig.json` and `jsconfig.json` inside the service, the
-//!   first whose parsed file list (or a referenced project's, in tsserver's
-//!   search order) holds the importer, climbing past one that does not; else
+//!   first (the tsconfig, then the jsconfig beside it) whose parsed file list
+//!   (or a referenced project's, in tsserver's search order) holds the
+//!   importer, climbing past a directory where neither does; else
 //!   the service config. Then `ts.resolveModuleName` under that config's
 //!   options, with the compiler the sidecar ships;
 //! - by the sidecar's built rule (`capture/service-config.js`
@@ -97,10 +98,15 @@ const compilerConfig = (file) => {
       .map((name) => ts.findConfigFile(dir, ts.sys.fileExists, name))
       .filter((c) => c !== undefined && inService(path.dirname(c)));
     if (found.length === 0) break;
-    // The nearer directory; within one, tsconfig.json first.
+    // The nearer directory; within it each config in turn, tsconfig.json
+    // first, passed over when it lists the file nowhere.
     const config = found.reduce((a, b) => (path.dirname(b).length > path.dirname(a).length ? b : a));
-    const owner = ownerAmong(config, file);
-    if (owner) return owner;
+    for (const name of ['tsconfig.json', 'jsconfig.json']) {
+      const candidate = path.join(path.dirname(config), name);
+      if (!found.includes(candidate)) continue;
+      const owner = ownerAmong(candidate, file);
+      if (owner) return owner;
+    }
     if (path.dirname(config) === service) break;
     dir = path.dirname(path.dirname(config));
   }
@@ -266,6 +272,15 @@ fn the_governing_config_is_the_compilers_on_every_layout() {
         "web",
         None,
         &[("web/src/App.js", "@/lib/api")],
+    );
+    // A tsconfig that lists only TypeScript sources hands a JavaScript file to
+    // the jsconfig beside it; a file the tsconfig lists stays with the tsconfig.
+    assert_parity(
+        &fixture("ts-beside-js"),
+        &[
+            ("web/src/App.js", "@/lib/api"),
+            ("web/src/typed.ts", "@/lib/api"),
+        ],
     );
 }
 
