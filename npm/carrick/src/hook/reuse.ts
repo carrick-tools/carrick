@@ -32,6 +32,12 @@ export type SessionRecord = {
    */
   read: string[];
   /**
+   * Absolute path -> the mtime (epoch ms) the shell hook last saw on a source
+   * file a command wrote. A later command names the file again and the hook
+   * sends it to the edit flow only when this moved.
+   */
+  written: Record<string, number>;
+  /**
    * Workspace root -> epoch ms of this session's newest recorded edit there.
    * `checked.ts` compares it with the last `carrick check --changed`.
    */
@@ -96,6 +102,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
   const empty: SessionRecord = {
     told: [],
     read: [],
+    written: {},
     edited: {},
     files: {},
     stated: {},
@@ -122,6 +129,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       read: Array.isArray(record.read)
         ? record.read.filter((entry): entry is string => typeof entry === "string")
         : [],
+      written: stamps(record.written),
       edited: stamps(record.edited),
       files: Object.fromEntries(
         Object.entries(record.files ?? {}).filter(
@@ -336,6 +344,19 @@ export function markRead(sessionId: string, file: string, home?: string): void {
   const current = readSession(sessionId, home);
   if (current.read.includes(file)) return;
   current.read.push(file);
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** The mtime the shell hook last recorded for this absolute path, or undefined. */
+export function writtenMtime(sessionId: string, file: string, home?: string): number | undefined {
+  return readSession(sessionId, home).written[file];
+}
+
+/** Remember the mtime of each source file a shell command wrote. */
+export function markWritten(sessionId: string, mtimes: Record<string, number>, home?: string): void {
+  const current = readSession(sessionId, home);
+  Object.assign(current.written, mtimes);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

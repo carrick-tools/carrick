@@ -7,10 +7,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { bashTargets } from "../src/hook/bash-targets.ts";
+import { bashTargets, movesTreeInBulk } from "../src/hook/bash-targets.ts";
 import { bringUpToDate, updateHooks } from "../src/init/self-update.ts";
 import { carrickHooks } from "../src/init/settings.ts";
-import { fakeEnv, fixturePath, runHook } from "./helpers.ts";
+import { editPayload, fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
 
 const USES_LINE =
   "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17";
@@ -118,12 +118,13 @@ test("a heredoc write to a TS file is not a read", async (t) => {
   const w = repoWithWorktree(t);
   const argvLog = path.join(w.base, "argv.log");
   const command = "cat > src/capture/backfill.ts <<'EOF'\nexport const b = 2;\nEOF";
-  const run = await runHook("post-bash.ts", {
+  await runHook("post-bash.ts", {
     payload: bashPayload(w.worktree, command, "sess-b4"),
     env: fakeEnv({ HOME: w.home, CARRICK_FAKE_ARGV_LOG: argvLog, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") }),
   });
-  assert.equal(run.stdout, "");
-  assert.equal(runs(argvLog), 0);
+  // The write is the other branch's: one probe, and no read check of the same file.
+  assert.equal(runs(argvLog), 1);
+  assert.ok(fs.readFileSync(argvLog, "utf8").includes("--no-rescan"));
 });
 
 test("a command that reads three TS files asks about the first two", async (t) => {
@@ -170,4 +171,130 @@ test("carrickHooks registers one Bash entry and self-update adds it to an existi
   const after = fs.readFileSync(target, "utf8");
   assert.ok(after.includes("carrick hook post-bash"), after);
   assert.equal(typeof bringUpToDate, "function");
+});
+
+// A shell write of a TypeScript file goes through the post-edit flow.
+
+function writeEnv(w: { base: string; home: string }, extra: Record<string, string> = {}) {
+  return fakeEnv({
+    HOME: w.home,
+    CARRICK_FAKE_ARGV_LOG: path.join(w.base, "argv.log"),
+    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+    ...extra,
+  });
+}
+
+function checkedFiles(argvLog: string): string[] {
+  if (!fs.existsSync(argvLog)) return [];
+  return fs
+    .readFileSync(argvLog, "utf8")
+    .split("\n")
+    .filter((line) => line.includes("--no-rescan"))
+    .map((line) => (JSON.parse(line) as { argv: string[] }).argv.find((arg) => arg.endsWith(".ts")) ?? "");
+}
+
+test("a heredoc that creates a TS file runs the post-edit flow for it", async (t) => {
+  const w = repoWithWorktree(t);
+  fs.writeFileSync(path.join(w.worktree, "src", "argv.ts"), "export const flag = 1;\n");
+  const command = "cat > src/argv.ts <<'EOF'\nexport const flag = 1;\nEOF";
+  const run = await runHook("post-bash.ts", {
+    payload: bashPayload(w.worktree, command, "sess-w1"),
+    env: writeEnv(w),
+  });
+  assert.equal(run.code, 0);
+  assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), [".claude/worktrees/wt/src/argv.ts"]);
+  assert.match(contextOf(run.stdout), /^Carrick re-checked .* after this edit: 1 contract problem\./);
+});
+
+test("a python heredoc rewrite of a TS file runs the post-edit flow once for it", async (t) => {
+  const w = repoWithWorktree(t);
+  const command = "python3 - <<'EOF'\nimport pathlib\np = pathlib.Path('src/capture/backfill.ts')\np.write_text('export const b = 2;\\n')\nEOF";
+  fs.writeFileSync(w.file, "export const b = 2;\n");
+  const run = await runHook("post-bash.ts", {
+    payload: bashPayload(w.worktree, command, "sess-w2"),
+    env: writeEnv(w),
+  });
+  assert.equal(run.code, 0);
+  assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), [".claude/worktrees/wt/src/capture/backfill.ts"]);
+});
+
+test("a git checkout that changes many files starts nothing", async (t) => {
+  const w = repoWithWorktree(t);
+  fs.writeFileSync(w.file, "export const b = 3;\n");
+  const run = await runHook("post-bash.ts", {
+    payload: bashPayload(w.worktree, "git checkout -q main && sed -i s/a/b/ src/capture/backfill.ts", "sess-w3"),
+    env: writeEnv(w),
+  });
+  assert.equal(run.stdout, "");
+  assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), []);
+});
+
+test("a command that names a TS file it did not change starts nothing", async (t) => {
+  const w = repoWithWorktree(t);
+  const env = writeEnv(w);
+  // No record, and the file is old: nothing.
+  const old = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(w.file, old, old);
+  const first = await runHook("post-bash.ts", {
+    payload: bashPayload(w.worktree, "python3 -c \"print(open('src/capture/backfill.ts').read())\"", "sess-w4"),
+    env,
+  });
+  assert.equal(first.stdout, "");
+  assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), []);
+  // A write is seen once; the same command again with the file as it was is not a second write.
+  fs.writeFileSync(w.file, "export const b = 4;\n");
+  const write = "sed -i s/4/5/ src/capture/backfill.ts";
+  await runHook("post-bash.ts", { payload: bashPayload(w.worktree, write, "sess-w4"), env });
+  await runHook("post-bash.ts", { payload: bashPayload(w.worktree, write, "sess-w4"), env });
+  assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), [".claude/worktrees/wt/src/capture/backfill.ts"]);
+});
+
+test("an Edit and then a Bash write of the same file keep one queue entry each, in order", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-pb-q-")));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = fakeEnv({
+    HOME: home,
+    CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred.json"),
+    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+  });
+  const session = "sess-w5";
+  await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: session }, env });
+  await runHook("post-bash.ts", {
+    payload: bashPayload(workspace.root, `sed -i s/a/b/ ${workspace.file}`, session),
+    env,
+  });
+  const answers = () =>
+    fs
+      .readdirSync(path.join(home, ".carrick", "sessions"))
+      .filter((name) => name.startsWith(`${session}.recheck.`) && name.endsWith(".answer.json"))
+      .sort();
+  const until = Date.now() + 20_000;
+  while (Date.now() < until && answers().length < 2) await new Promise((resolve) => setTimeout(resolve, 50));
+  const done = answers();
+  assert.equal(done.length, 2, "one answered entry per write");
+  assert.ok(done[0]! < done[1]!, "in order");
+});
+
+test("bashTargets reads the write shapes the agents use", (t) => {
+  const w = repoWithWorktree(t);
+  const f = w.file;
+  const g = path.join(w.worktree, "src", "g.ts");
+  fs.writeFileSync(g, "export {};\n");
+  const writes = (command: string) => bashTargets(command, w.worktree).writes;
+  assert.deepEqual(writes("cat > src/capture/backfill.ts <<'EOF'\nx\nEOF"), [f]);
+  assert.deepEqual(writes("cat <<'EOF' > src/capture/backfill.ts\nx\nEOF"), [f]);
+  assert.deepEqual(writes("echo hi | tee src/capture/backfill.ts"), [f]);
+  assert.deepEqual(writes("cp /tmp/x src/g.ts"), [g]);
+  assert.deepEqual(writes("node - <<EOF\nrequire('fs').writeFileSync('src/g.ts', 'x')\nEOF"), [g]);
+  assert.deepEqual(
+    writes("apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: src/g.ts\n@@\n-a\n+b\n*** End Patch\nEOF"),
+    [g],
+  );
+  // Text after a heredoc body is still commands, and the body is not.
+  assert.deepEqual(bashTargets("cat <<EOF\ncat src/g.ts\nEOF\nsed -n 1,5p src/g.ts", w.worktree).reads, [g]);
+  assert.ok(movesTreeInBulk("git -C x checkout main", w.worktree));
+  assert.ok(movesTreeInBulk("cd a && npm ci", w.worktree));
+  assert.ok(!movesTreeInBulk("git diff && npm test", w.worktree));
 });
