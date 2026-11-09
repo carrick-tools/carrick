@@ -509,6 +509,11 @@
   "source": "test262",
   "status": "covered"
  },
+ "t-entry-alias": {
+  "feature": "alias of an object literal entry (const g = obj.key; g())",
+  "source": "TS",
+  "status": "covered"
+ },
  "t-entry-own-function": {
   "feature": "own function held in an object entry, called under another name",
   "source": "TS",

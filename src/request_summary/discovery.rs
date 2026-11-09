@@ -3832,6 +3832,47 @@ mod tests {
         }
     }
 
+    /// carrick#3504 S4b-2: a name that holds an object's entry (`const g =
+    /// d.a`, `d["a"]`, one inside a function, one written into another
+    /// object) is that entry's value, read as `d.a` is. An entry something
+    /// writes and an open object keep the call undecided. The answer key is
+    /// `tests/fixtures/callee-values/README.md`.
+    #[test]
+    fn a_callee_held_in_an_alias_of_an_entry_is_that_entrys_value() {
+        let Some(discovery) = callee_values_discovery() else {
+            return;
+        };
+        let at = |file: &str, line: u32| recorded_at(&discovery, file, line);
+        let decided = ["site fetch".to_string()];
+        let wrong: Vec<String> = [
+            ("f-alias-dot.ts", 7, "a dotted alias"),
+            ("f-alias-keyed.ts", 7, "a keyed alias"),
+            ("f-alias-local.ts", 7, "an alias inside a function"),
+            (
+                "f-alias-into-object.ts",
+                7,
+                "an alias written into another object",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(file, line, form)| {
+            let got = at(file, line);
+            (got != decided).then(|| format!("{file}:{line} ({form}): {got:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        for (file, line, form) in [
+            ("f-alias-written.ts", 11, "an entry the module writes"),
+            ("f-alias-spread.ts", 6, "an open object"),
+        ] {
+            assert_ne!(
+                at(file, line),
+                decided,
+                "{file}:{line} ({form}) is undecided"
+            );
+        }
+    }
+
     /// carrick#3504 S4b-3a: an object a module keeps to itself is read
     /// whatever the service's exports are. An import used only as a
     /// shorthand property leaves the service open, which contests every
@@ -3985,6 +4026,8 @@ mod tests {
         let wrong: Vec<String> = [
             ("m-bind.ts", 6, "site http"),
             ("m-extract.ts", 6, "site http"),
+            // S4a pin for S4b-2: a library member held, not an object entry.
+            ("m-alias-member.ts", 6, "site http"),
             ("m-bind-inline.ts", 4, "site http"),
             ("m-publish-bind.ts", 6, "site bus"),
             ("m-publish-keyed.ts", 7, "site bus"),

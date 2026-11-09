@@ -347,7 +347,10 @@ fn read_call<'a>(
         }
         if !matches!(
             value,
-            ValueAt::Read { .. } | ValueAt::Field { .. } | ValueAt::Returned { .. }
+            ValueAt::Read { .. }
+                | ValueAt::KeyOf { .. }
+                | ValueAt::Field { .. }
+                | ValueAt::Returned { .. }
         ) {
             continue;
         }
