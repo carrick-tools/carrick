@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "serviceName": "client", "directory": "packages/client" },
+    { "serviceName": "web", "directory": "apps/web" }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": ["@fixture/query"],
+  "messaging_clients": [],
+  "notes": "A React client. @fixture/query holds the request hooks."
+}

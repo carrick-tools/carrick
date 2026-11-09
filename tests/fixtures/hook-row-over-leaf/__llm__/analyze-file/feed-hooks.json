@@ -1,0 +1,35 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "span:350-544",
+      "line_number": 7,
+      "target": "/api/v1/boards/${boardId}/feeds/${feedId}/refresh",
+      "method": "POST",
+      "call_kind": "internal_http",
+      "pattern_matched": "useMutation(",
+      "call_expression_text": "useMutation({ mutationFn: (variables: RefreshBody | void) => { return startRefresh(boardId, feedId, variables ?? undefined); }, onSuccess: () => cache.invalidate(\"feeds\"), })",
+      "call_expression_line": 7,
+      "payload_expression_text": "variables",
+      "payload_expression_line": 8,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "span:695-832",
+      "line_number": 17,
+      "target": "/api/v1/boards/${board}/feeds/${feed}/archive",
+      "method": "POST",
+      "call_kind": "internal_http",
+      "pattern_matched": "useMutation(",
+      "call_expression_text": "useMutation({ mutationFn: () => { return startArchive(board, feed); }, onSuccess: () => cache.invalidate(\"feeds\"), })",
+      "call_expression_line": 17,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

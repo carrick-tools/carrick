@@ -1,0 +1,9 @@
+{
+  "name": "@fixture/web",
+  "version": "1.0.0",
+  "main": "src/feed-hooks.ts",
+  "dependencies": {
+    "@fixture/client": "workspace:*",
+    "@fixture/query": "^1.0.0"
+  }
+}
