@@ -1287,6 +1287,7 @@ impl ValueAt {
                 out,
                 member,
                 made,
+                local,
             } => Self::Returned {
                 lo: *lo,
                 hi: *hi,
@@ -1298,6 +1299,7 @@ impl ValueAt {
                     })
                 }),
                 made: made.clone(),
+                local: local.clone(),
             },
             other => other.clone(),
         }
