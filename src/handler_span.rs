@@ -508,7 +508,7 @@ mod tests {
     /// as the model-row join does: `file_results` carries the call's span.
     fn join_calls(data: &mut CloudRepoData, file: &str, text: &str) {
         let candidates = crate::swc_scanner::SwcScanner::new()
-            .scan_content(Path::new(file), text, &[], &[])
+            .scan_every_call(Path::new(file), text)
             .candidates;
         let rows = data.mount_graph.as_ref().unwrap().endpoints.clone();
         let endpoints = rows

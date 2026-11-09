@@ -275,19 +275,16 @@ pub struct ScanResult {
 pub enum RegisterSignal {
     /// Signal 4: an awaited call with a string argument.
     C2,
-    /// Signal 5: the method-name and object-name lists.
-    C3,
     /// Signal 2: a call rooted at an import from a detected package.
     C4,
 }
 
 impl RegisterSignal {
-    pub const ALL: [Self; 3] = [Self::C2, Self::C3, Self::C4];
+    pub const ALL: [Self; 2] = [Self::C2, Self::C4];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::C2 => "C2",
-            Self::C3 => "C3",
             Self::C4 => "C4",
         }
     }
@@ -2550,102 +2547,6 @@ impl CandidateVisitor {
         }
     }
 
-    // FROZEN (old path, 2026-10-21): Signal 5's name lists,
-    // `is_potential_api_object` and `is_potential_api_method`. Deletions and
-    // safety fixes only. Fixes for wrong or missing rows go in discovery (a
-    // call that reaches a labelled library export). Delete when discovery is
-    // on by default and the four-repo replay shows no site only this signal
-    // raised (carrick#2440, target 3).
-    /// Check if an identifier looks like an API-related object
-    fn is_potential_api_object(&self, name: &str) -> bool {
-        // Common API object patterns (framework-agnostic)
-        let api_objects = [
-            // Generic router/app patterns
-            "app",
-            "router",
-            "server",
-            "api",
-            "route",
-            "routes",
-            // HTTP client patterns
-            "fetch",
-            "axios",
-            "http",
-            "https",
-            "request",
-            "client",
-            "response",
-            "res",
-            "resp",
-            // Common variations
-            "apiRouter",
-            "appRouter",
-            "mainRouter",
-            "authRouter",
-            "userRouter",
-            "v1Router",
-            "v2Router",
-        ];
-
-        // Check exact matches
-        if api_objects.contains(&name) {
-            return true;
-        }
-
-        // Check if name ends with common API suffixes
-        let lower = name.to_lowercase();
-        lower.ends_with("router")
-            || lower.ends_with("route")
-            || lower.ends_with("routes")
-            || lower.ends_with("app")
-            || lower.ends_with("server")
-            || lower.ends_with("api")
-            || lower.ends_with("client")
-            || lower.ends_with("handler")
-            || lower.ends_with("controller")
-    }
-
-    // FROZEN (old path, 2026-10-21): Signal 5's name lists. Deletions and
-    // safety fixes only. Fixes for wrong or missing rows go in discovery (a
-    // call that reaches a labelled library export). Delete when discovery is
-    // on by default and the four-repo replay shows no site only this signal
-    // raised (carrick#2440, target 3).
-    /// Check if a method name looks like an API method
-    fn is_potential_api_method(&self, name: &str) -> bool {
-        let api_methods = [
-            // HTTP methods
-            "get",
-            "post",
-            "put",
-            "delete",
-            "patch",
-            "head",
-            "options",
-            "all",
-            // Mounting/middleware
-            "use",
-            "mount",
-            "register",
-            "plugin",
-            "route",
-            // Data fetching
-            "fetch",
-            "json",
-            "text",
-            "blob",
-            "send",
-            "request",
-            // Common framework patterns
-            "listen",
-            "handle",
-            "handler",
-            "middleware",
-            "define",
-        ];
-
-        api_methods.contains(&name.to_lowercase().as_str())
-    }
-
     /// Check if this is a call to a global network primitive (`fetch(...)`).
     /// Other primitives (`WebSocket`, `EventSource`, `XMLHttpRequest`) are
     /// constructed with `new` and handled in `visit_new_expr`.
@@ -3406,32 +3307,6 @@ impl CandidateVisitor {
         }
     }
 
-    /// Extract callee object name from expression
-    /// The dotted text of a member chain rooted at `this`
-    /// (`this.options.client`), when every step is a plain identifier
-    /// property. A computed step, a call in the chain, or a root that is not
-    /// `this` is `None`: nothing is named that the source does not spell.
-    fn this_receiver_chain(expr: &Expr) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
-        let mut cursor = expr;
-        loop {
-            match cursor {
-                Expr::This(_) => break,
-                Expr::Member(member) => {
-                    let MemberProp::Ident(prop) = &member.prop else {
-                        return None;
-                    };
-                    parts.push(prop.sym.to_string());
-                    cursor = &member.obj;
-                }
-                _ => return None,
-            }
-        }
-        parts.push("this".to_string());
-        parts.reverse();
-        Some(parts.join("."))
-    }
-
     /// The immediate receiver of a call, when it is a bare identifier. See
     /// [`CandidateTarget::receiver_ident`] for why this is not
     /// `extract_callee_object`.
@@ -3747,55 +3622,6 @@ impl Visit for CandidateVisitor {
                 _ => ("<awaited-call>".to_string(), None),
             };
             self.push_candidate(call, obj, prop);
-        }
-
-        self.register_signal = Some(RegisterSignal::C3);
-        // FROZEN (old path, 2026-10-21): Signal 5, the name lists. Deletions
-        // and safety fixes only. Fixes for wrong or missing rows go in
-        // discovery (a call that reaches a labelled library export). Delete
-        // when discovery is on by default and the four-repo replay shows no
-        // site only this signal raised (carrick#2440, target 3).
-        // Signal 5 (existing): method calls matching the API name heuristics.
-        if let Callee::Expr(callee_expr) = &call.callee
-            && let Expr::Member(member) = &**callee_expr
-        {
-            let method_name = match &member.prop {
-                MemberProp::Ident(ident) => Some(ident.sym.to_string()),
-                MemberProp::Computed(computed) => {
-                    if let Expr::Lit(Lit::Str(s)) = &*computed.expr {
-                        Some(s.value.to_string_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                }
-                MemberProp::PrivateName(_) => None,
-            };
-
-            if let Some(method) = method_name {
-                // A receiver reached off `this` has no root identifier, so
-                // `extract_callee_object` names nothing for it and the site
-                // was judged on its method name alone. The chain's own text
-                // (`this.options.client`) is the name the receiver has, and
-                // the same suffix test applies to it that applies to a local
-                // called `client` (carrick#655).
-                let obj_name = Self::extract_callee_object(&member.obj)
-                    .or_else(|| Self::this_receiver_chain(&member.obj));
-
-                let is_api_call = match &obj_name {
-                    Some(name) => {
-                        self.is_potential_api_object(name) || self.is_potential_api_method(&method)
-                    }
-                    None => self.is_potential_api_method(&method),
-                };
-
-                if is_api_call {
-                    self.push_candidate(
-                        call,
-                        obj_name.unwrap_or_else(|| "<chain>".to_string()),
-                        Some(method),
-                    );
-                }
-            }
         }
 
         self.register_signal = None;
@@ -4217,8 +4043,8 @@ mod tests {
             .expect("the register signals raised the axios call");
         assert_eq!(
             axios.iter().copied().collect::<Vec<_>>(),
-            vec![RegisterSignal::C2, RegisterSignal::C3, RegisterSignal::C4],
-            "the await gate, the name lists and the detected import all raised it"
+            vec![RegisterSignal::C2, RegisterSignal::C4],
+            "the await gate and the detected import both raised it"
         );
         assert!(
             !result.register_signals.contains_key(&span_of("fetch(")),
@@ -4258,6 +4084,37 @@ mod tests {
         assert_eq!(candidate.callee_object, "relay");
         assert_eq!(candidate.line_number, 3);
         assert_eq!(candidate.enclosing_function.as_deref(), Some("ping"));
+    }
+
+    /// Old-path row C3 deleted: a member call is no candidate because its
+    /// object or method name looks like an API name. The call the fact layer
+    /// names (a compiler walk to a labelled export) still gets its candidate
+    /// through `scan_sites`.
+    #[test]
+    fn a_call_is_a_candidate_from_the_fact_layer_not_from_an_api_looking_name() {
+        let source = "export function wire(handler: () => void): void {\n\
+                      \x20 router.get(\"/orders\", handler);\n\
+                      \x20 this.options.client.send(\"/ping\");\n\
+                      }\n";
+        let by_name = scan_test_content(source);
+        assert!(
+            by_name.candidates.is_empty(),
+            "a name that looks like an API raises no candidate: {:?}",
+            by_name.candidates
+        );
+        let start = source.find("router.get(").unwrap() as u32 + 1;
+        let span = (
+            start,
+            start + "router.get(\"/orders\", handler)".len() as u32,
+        );
+        let named = SwcScanner::new().scan_sites(
+            Path::new("wire.ts"),
+            source,
+            &std::collections::BTreeSet::from([span]),
+        );
+        assert_eq!(named.candidates.len(), 1, "{:?}", named.candidates);
+        assert_eq!(named.candidates[0].callee_object, "router");
+        assert_eq!(named.candidates[0].callee_property.as_deref(), Some("get"));
     }
 
     #[test]
@@ -5656,32 +5513,6 @@ export async function run() {
     }
 
     #[test]
-    fn test_detects_express_style_endpoints() {
-        let content = r#"
-import express from 'express';
-const app = express();
-
-app.get('/users', getUsers);
-app.post('/users', createUser);
-router.delete('/users/:id', deleteUser);
-"#;
-
-        let result = scan_test_content(content);
-        assert!(!result.candidates.is_empty());
-        assert!(result.candidates.len() >= 3);
-
-        // Should detect app.get, app.post, router.delete
-        let methods: Vec<_> = result
-            .candidates
-            .iter()
-            .filter_map(|c| c.callee_property.as_ref())
-            .collect();
-        assert!(methods.contains(&&"get".to_string()));
-        assert!(methods.contains(&&"post".to_string()));
-        assert!(methods.contains(&&"delete".to_string()));
-    }
-
-    #[test]
     fn test_detects_fetch_calls() {
         let content = r#"
 async function getData() {
@@ -5694,17 +5525,8 @@ async function getData() {
         let result = scan_test_content(content);
         assert!(!result.candidates.is_empty());
 
-        // Should detect fetch and response.json
         let has_fetch = result.candidates.iter().any(|c| c.callee_object == "fetch");
-        let has_json = result.candidates.iter().any(|c| {
-            c.callee_property
-                .as_ref()
-                .map(|p| p == "json")
-                .unwrap_or(false)
-        });
-
         assert!(has_fetch, "Should detect global fetch call");
-        assert!(has_json, "Should detect response.json() call");
     }
 
     #[test]
@@ -5720,35 +5542,6 @@ async function getData() {
             candidate.candidate_id,
             format!("span:{}-{}", candidate.span_start, candidate.span_end)
         );
-    }
-
-    #[test]
-    fn test_detects_router_mounts() {
-        let content = r#"
-import userRouter from './routes/users';
-import authRouter from './routes/auth';
-
-app.use('/api/users', userRouter);
-app.use('/api/auth', authRouter);
-router.use('/v1', v1Router);
-"#;
-
-        let result = scan_test_content(content);
-        assert!(!result.candidates.is_empty());
-
-        // Should detect all .use() calls
-        let use_calls: Vec<_> = result
-            .candidates
-            .iter()
-            .filter(|c| {
-                c.callee_property
-                    .as_ref()
-                    .map(|p| p == "use")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        assert!(use_calls.len() >= 3, "Should detect all router mounts");
     }
 
     #[test]
@@ -5900,27 +5693,6 @@ async function run(baseUrl: string) {
     }
 
     #[test]
-    fn test_detects_chained_calls() {
-        let content = r#"
-createRouter()
-    .get('/health', healthCheck)
-    .post('/data', handleData);
-"#;
-
-        let result = scan_test_content(content);
-        assert!(!result.candidates.is_empty());
-
-        // Should detect the HTTP methods even in chained form
-        let methods: Vec<_> = result
-            .candidates
-            .iter()
-            .filter_map(|c| c.callee_property.as_ref())
-            .collect();
-        assert!(methods.contains(&&"get".to_string()));
-        assert!(methods.contains(&&"post".to_string()));
-    }
-
-    #[test]
     fn test_scan_content_per_file_offsets_no_accumulation() {
         // Regression test: verify that scanning multiple files with the same SwcScanner
         // produces per-file byte offsets (not cumulative offsets).
@@ -5981,7 +5753,7 @@ createRouter()
     }
 
     fn base_path_targets(content: &str) -> Vec<(String, bool, String)> {
-        scan_test_content(content)
+        scan_test_content_with_fetchers(content, &["axios".to_string()])
             .candidates
             .into_iter()
             .filter_map(|candidate| candidate.base_path_target)
@@ -6392,6 +6164,7 @@ export class UsersController {
     #[test]
     fn a_base_plus_path_target_is_read_off_the_call() {
         let template = r#"
+import axios from "axios";
 const API_URL = process.env.API_URL || 'http://localhost:3001';
 async function find(id: string) {
   return axios.get(`${API_URL}/api/users/${id}`);
@@ -6403,6 +6176,7 @@ async function find(id: string) {
         );
 
         let concatenated = r#"
+import axios from "axios";
 async function list() {
   return axios.get(API_URL + '/api/users');
 }
@@ -6546,28 +6320,6 @@ export class UsersController {
                 .iter()
                 .map(|c| &c.callee_object)
                 .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_detects_custom_router_names() {
-        let content = r#"
-const userRouter = createRouter();
-const authRouter = createRouter();
-const apiHandler = createHandler();
-
-userRouter.get('/profile', getProfile);
-authRouter.post('/login', login);
-apiHandler.route('/data', handleData);
-"#;
-
-        let result = scan_test_content(content);
-        assert!(!result.candidates.is_empty());
-
-        // Should detect calls on userRouter, authRouter, apiHandler
-        assert!(
-            result.candidates.len() >= 3,
-            "Should detect custom-named router calls"
         );
     }
 
@@ -7059,40 +6811,6 @@ bus.subscribe('user.deleted', handlerRef);
         assert!(
             !ops.iter().any(|op| op.topic == "user.deleted"),
             "a function-reference second arg must not anchor, got {ops:?}"
-        );
-    }
-
-    /// carrick#655: a receiver reached off `this` is named by its chain, so
-    /// `this.options.client.getEnvironmentVariables(ref)` raises a candidate
-    /// the way `projectClient.client.getEnvironmentVariables(ref)` does. A
-    /// chain that ends in nothing api-shaped still raises none.
-    #[test]
-    fn a_receiver_reached_off_this_is_named_by_its_chain() {
-        let content = r#"
-class Supervisor {
-  constructor(private readonly options: { client: ApiClient; store: Map<string, string> }) {}
-
-  async sync(ref: string) {
-    const env = await this.options.client.getEnvironmentVariables(ref);
-    const cached = this.options.store.lookup(ref);
-    return [env, cached];
-  }
-}
-"#;
-        let result = scan_test_content(content);
-        let client_site = result
-            .candidates
-            .iter()
-            .find(|c| c.callee_property.as_deref() == Some("getEnvironmentVariables"))
-            .expect("the call through the client field must raise a candidate");
-        assert_eq!(client_site.callee_object, "this.options.client");
-        assert!(
-            !result
-                .candidates
-                .iter()
-                .any(|c| c.callee_property.as_deref() == Some("lookup")),
-            "a chain naming nothing api-shaped raises no candidate: {:?}",
-            result.candidates
         );
     }
 }
