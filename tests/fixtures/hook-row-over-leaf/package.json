@@ -1,0 +1,5 @@
+{
+  "name": "hook-row-over-leaf",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*"]
+}

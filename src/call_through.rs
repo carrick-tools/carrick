@@ -1474,6 +1474,9 @@ pub struct Settled {
     /// Rows withdrawn at a client wrapper's call once a leaf row states the
     /// request at its caller ([`withdraw_wrapped`]).
     pub wrapper_rows_withdrawn: usize,
+    /// Model rows withdrawn at a call written around a leaf call whose row
+    /// states the same request ([`withdraw_enclosing_model_rows`]).
+    pub enclosing_model_rows_withdrawn: usize,
     /// Rows skipped because a fact site row replaced the model's row at the
     /// call, and the graph no longer holds it (carrick#2795).
     pub replaced_by_site_row: usize,
@@ -1631,6 +1634,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.boundary_third_service += stated.third_service;
         settled.boundary_unresolved += stated.unresolved;
         settled.wrapper_rows_withdrawn += stated.withdrawn;
+        settled.enclosing_model_rows_withdrawn += stated.enclosing_withdrawn;
         if (corrected > 0 || stated.own + stated.boundary > 0)
             && let Some(mut boundary) = service.data.boundary.take()
         {
@@ -1659,8 +1663,8 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.boundary_unresolved
     );
     debug!(
-        "Call-through wrapper rows withdrawn: {} at a client wrapper's call into another service, whose caller's leaf row now states the request (carrick#2618)",
-        settled.wrapper_rows_withdrawn
+        "Call-through wrapper rows withdrawn: {} at a client wrapper's call into another service, whose caller's leaf row now states the request (carrick#2618); {} model rows at a call written around a leaf call whose row states the same request",
+        settled.wrapper_rows_withdrawn, settled.enclosing_model_rows_withdrawn
     );
     debug!(
         "Call-through rows at a call of a helper of their own service: {} withdrawn, the helper writes and states one other route (carrick#1794); {} lost their response entry, the helper writes their route and hands back a value of its own (carrick#1801)",
@@ -1764,11 +1768,30 @@ fn withdraw_at_helper_call(data: &mut CloudRepoData, row: &SiteRow, request: &Un
     }) else {
         return false;
     };
-    let call = graph.data_calls.remove(index);
+    let call = withdraw_model_row(data, &row.file, row.line, index);
     debug!(
         "  - {location}: the model's {} {} withdrawn, the helper it calls writes {} {}, the request stated at {}",
         call.method, call.target_url, request.method, request.target_url, request.site
     );
+    true
+}
+
+/// Withdraw the model's row at `index` of the graph's calls, written at
+/// `file`:`line`, with its projection and the consumer type entries anchored
+/// at it. Returns the row withdrawn.
+fn withdraw_model_row(
+    data: &mut CloudRepoData,
+    file: &str,
+    line: u32,
+    index: usize,
+) -> DataFetchingCall {
+    let call = data
+        .mount_graph
+        .as_mut()
+        .expect("the caller found the row in the graph")
+        .data_calls
+        .remove(index);
+    let location = format!("{file}:{line}");
     let before = OperationKey::http(&call.method, call.canonical_path.clone());
     if let Some(projected) = data.calls.iter().position(|operation| {
         operation.key == before
@@ -1779,9 +1802,50 @@ fn withdraw_at_helper_call(data: &mut CloudRepoData, row: &SiteRow, request: &Un
         data.calls.remove(projected);
     }
     if let Some(manifest) = data.type_manifest.as_mut() {
-        manifest.retain(|entry| !anchored_at(entry, row, &call.method, &call.canonical_path));
+        manifest
+            .retain(|entry| !anchored_at(entry, file, line, &call.method, &call.canonical_path));
     }
-    true
+    call
+}
+
+/// Withdraw each model row no fact states, written on a line a call around
+/// a leaf call opens on, that states the operation the leaf row now states
+/// (`useMutation(` in `useMutation({ mutationFn: (input) => { return
+/// startRefresh(input); } })`). The model read the request off the outer
+/// call, whose value is the outer function's own (a hook's state), not the
+/// request's; the leaf row at the call inside is the request's row, and one
+/// request keeps one row. Paths agree whatever their holes are named
+/// ([`crate::site_rows::agrees`]). A model row stating the leaf's operation
+/// exactly holds the leaf ([`Occupied::holds`]), so none is stated and none
+/// of those goes here. Returns how many rows went.
+fn withdraw_enclosing_model_rows(
+    data: &mut CloudRepoData,
+    stated: &[(LeafCall, OperationKey)],
+) -> usize {
+    let mut withdrawn = 0;
+    for (leaf, key) in stated {
+        for line in &leaf.enclosing_lines {
+            let location = format!("{}:{}", leaf.file, line);
+            while let Some(index) = data.mount_graph.as_ref().and_then(|graph| {
+                graph.data_calls.iter().position(|call| {
+                    call.file_location == location
+                        && is_unstated_row(call)
+                        && crate::site_rows::agrees(
+                            &OperationKey::http(&call.method, call.canonical_path.clone()),
+                            key,
+                        )
+                })
+            }) {
+                let call = withdraw_model_row(data, &leaf.file, *line, index);
+                debug!(
+                    "  - {location}: the model's {} {} withdrawn, the call inside it at line {} states the request",
+                    call.method, call.target_url, leaf.line
+                );
+                withdrawn += 1;
+            }
+        }
+    }
+    withdrawn
 }
 
 /// Drop the consumer response entry at the model's row `row` names, where the
@@ -1827,7 +1891,8 @@ fn drop_copied_response(
     };
     let before = manifest.len();
     manifest.retain(|entry| {
-        !(entry.type_kind == ManifestTypeKind::Response && anchored_at(entry, row, &method, &path))
+        !(entry.type_kind == ManifestTypeKind::Response
+            && anchored_at(entry, &row.file, row.line, &method, &path))
     });
     let dropped = manifest.len() < before;
     if dropped {
@@ -1838,17 +1903,18 @@ fn drop_copied_response(
     dropped
 }
 
-/// Whether `entry` is a consumer entry anchored at `row`'s site under the
+/// Whether `entry` is a consumer entry anchored at `file`:`line` under the
 /// operation `method` `path`.
 fn anchored_at(
     entry: &crate::cloud_storage::TypeManifestEntry,
-    row: &SiteRow,
+    file: &str,
+    line: u32,
     method: &str,
     path: &str,
 ) -> bool {
     entry.role == ManifestRole::Consumer
-        && entry.file_path == row.file
-        && entry.line_number == row.line
+        && entry.file_path == file
+        && entry.line_number == line
         && entry
             .key
             .as_http()
@@ -1967,6 +2033,9 @@ struct LeafOutcome {
     unresolved: usize,
     /// Fact rows withdrawn at a client wrapper's call ([`withdraw_wrapped`]).
     withdrawn: usize,
+    /// Model rows withdrawn at a call around a leaf call
+    /// ([`withdraw_enclosing_model_rows`]).
+    enclosing_withdrawn: usize,
 }
 
 /// State a row at each of `service`'s leaf calls ([`LeafCall`]) that holds no
@@ -2048,6 +2117,10 @@ fn state_leaves<'g>(
     // The rows held before any leaf row is written: only those can be a
     // wrapper's own.
     let held = service.data.calls.len();
+    // Each leaf row stated, with its operation: the model's rows on the lines
+    // of the calls around it go once every leaf is stated, so the rows the
+    // passes below index by `held` stay where they are.
+    let mut stated: Vec<(LeafCall, OperationKey)> = Vec::new();
     for leaf in &service.sites.leaves {
         let LeafCallee::Own(callee) = &leaf.callee else {
             continue;
@@ -2083,7 +2156,12 @@ fn state_leaves<'g>(
             continue;
         }
         let filled = filled_request(service.data, held, callee, request);
-        if state_leaf(service.data, leaf, filled.as_ref().unwrap_or(request)) {
+        let reached = filled.as_ref().unwrap_or(request);
+        if state_leaf(service.data, leaf, reached) {
+            stated.push((
+                leaf.clone(),
+                OperationKey::http(&reached.method, reached.canonical_path.clone()),
+            ));
             outcome.own += 1;
             through.push((
                 callee.clone(),
@@ -2173,10 +2251,15 @@ fn state_leaves<'g>(
             continue;
         }
         if state_leaf(service.data, leaf, request) {
+            stated.push((
+                leaf.clone(),
+                OperationKey::http(&request.method, request.canonical_path.clone()),
+            ));
             outcome.boundary += 1;
         }
     }
     outcome.withdrawn = withdraw_wrapped(service.data, held, &through);
+    outcome.enclosing_withdrawn = withdraw_enclosing_model_rows(service.data, &stated);
     outcome
 }
 
