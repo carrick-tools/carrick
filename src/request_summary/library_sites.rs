@@ -101,6 +101,8 @@ use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::constructions::FieldOrigin;
+use super::resolve::ValueAt;
 use super::row_links::{RowLink, RowLinks};
 use super::{
     BindingUse, BindingUses, ClassFields, ClientBinding, ClientInstance, ClientRef, FileIr, FnIr,
@@ -2446,6 +2448,43 @@ impl Reader<'_> {
     }
 }
 
+impl Reader<'_> {
+    /// What each instance property's initialiser may hold, by the property's
+    /// start (carrick#3504 S4c): read in the module's scope with the class's
+    /// field table in it, so `g = send; f = this.g` reads `f` through `g`. A
+    /// function or an arrow is a member, read as one.
+    pub(super) fn initialiser_values(
+        &self,
+        class: &Class,
+        fields: &ClassFields,
+        module: &ModuleScope,
+    ) -> BTreeMap<String, BTreeMap<u32, Vec<ValueAt>>> {
+        let mut out: BTreeMap<String, BTreeMap<u32, Vec<ValueAt>>> = BTreeMap::new();
+        let mut scope = Scope::module(module);
+        scope.fields = Some(fields);
+        for member in &class.body {
+            let (field, init, at) = match member {
+                ClassMember::ClassProp(prop) if !prop.is_static => {
+                    (prop_name(&prop.key), prop.value.as_deref(), prop.span.lo.0)
+                }
+                ClassMember::PrivateProp(prop) if !prop.is_static => (
+                    Some(format!("#{}", prop.key.name)),
+                    prop.value.as_deref(),
+                    prop.span.lo.0,
+                ),
+                _ => continue,
+            };
+            if let (Some(field), Some(init)) = (field, init)
+                && !matches!(unwrap_expression(init), Expr::Arrow(_) | Expr::Fn(_))
+            {
+                let values = self.value_of(init, &scope, &super::guards::Bound::default());
+                out.entry(field).or_default().insert(at, values);
+            }
+        }
+        out
+    }
+}
+
 /// The function an own call's callee names, as the source writes it
 /// ([`OwnCallee`]): a binding that is not a parameter, or a chain of plain
 /// members on one or on `this`.
@@ -2716,6 +2755,100 @@ pub(super) fn take_field_writes(ir: &mut FnIr, out: &mut Vec<FieldWriteIr>) {
     out.append(&mut ir.field_writes);
     for nested in ir.nested.iter_mut().chain(ir.detached.iter_mut()) {
         take_field_writes(nested, out);
+    }
+}
+
+/// Move every `this.<field> = value` write out of a function body and those
+/// written inside it (carrick#3504 S4c). Only the constructor's own
+/// parameters mean something to a field's reader: in any other member a
+/// parameter is filled by that member's callers, so its values are unread
+/// (`in_constructor` false).
+pub(super) fn take_field_values(
+    ir: &mut FnIr,
+    in_constructor: bool,
+    out: &mut BTreeMap<String, BTreeMap<u32, Vec<ValueAt>>>,
+) {
+    for write in ir.field_values.drain(..) {
+        let values = if in_constructor {
+            write.values
+        } else {
+            write.values.iter().map(ValueAt::unparameterised).collect()
+        };
+        out.entry(write.field)
+            .or_default()
+            .entry(write.at)
+            .or_default()
+            .extend(values);
+    }
+    for nested in ir.nested.iter_mut().chain(ir.detached.iter_mut()) {
+        take_field_values(nested, in_constructor, out);
+    }
+}
+
+/// What each field of the class bound to `class` holds (carrick#3504 S4c,
+/// rule 2.3.4): `origins` already holds the fields the constructor sets
+/// once; `placed` holds every write the members and the property
+/// initialisers make, by where it starts.
+///
+/// A field `ClassThis` can place every write of holds them all: its
+/// initialiser and each write in any member, the constructor's included. A
+/// field it cannot (`this` leaves the class, a decorator or an accessor
+/// sets it, a related class writes or declares it, a write the reader does
+/// not lower: a compound assignment, a destructuring target, a write in a
+/// function with its own `this`) holds a value nothing reads, whatever the
+/// constructor set it from.
+pub(super) fn place_field_values(
+    class: &BindingKey,
+    classes: &HashMap<BindingKey, ClassThis>,
+    placed: BTreeMap<String, BTreeMap<u32, Vec<ValueAt>>>,
+    origins: &mut HashMap<String, FieldOrigin>,
+) {
+    let Some(own) = classes.get(class) else {
+        return;
+    };
+    let related = relatives(class, classes);
+    let leaks = own.escapes || related.iter().any(|class| class.escapes);
+    let unplaced = |field: &str| {
+        leaks
+            || (own.opaque.contains(field) && !own.param_props.contains(field))
+            || related.iter().any(|class| class.sets(field))
+    };
+    // The `this`-escape rule applies to the origins S4c adds only: a field
+    // the constructor sets keeps its reading when `this` leaves the class,
+    // and is counted so main's check reports how often that happens.
+    let escaped = origins.len()
+        + placed
+            .keys()
+            .filter(|field| !origins.contains_key(*field))
+            .count();
+    if leaks && escaped > 0 {
+        tracing::debug!(fields_this_escaped = escaped, "class hands `this` out");
+    }
+    let unplaced_but_ctor = |field: &str| {
+        (own.opaque.contains(field) && !own.param_props.contains(field))
+            || related.iter().any(|class| class.sets(field))
+    };
+    for (field, origin) in origins.iter_mut() {
+        if unplaced_but_ctor(field) {
+            origin.values = vec![ValueAt::Unread];
+        }
+    }
+    for (field, writes) in placed {
+        if origins.contains_key(&field)
+            || unplaced(&field)
+            || own.param_props.contains(&field)
+            || own.writes.get(&field) != Some(&writes.keys().copied().collect())
+        {
+            continue;
+        }
+        origins.insert(
+            field,
+            FieldOrigin {
+                values: writes.into_values().flatten().collect(),
+                text: None,
+                parameter: None,
+            },
+        );
     }
 }
 

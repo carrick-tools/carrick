@@ -3857,6 +3857,68 @@ mod tests {
         );
     }
 
+    /// carrick#3504 S4c: a callee held in an instance field is the field's
+    /// initialiser and every value written to it in any member, the
+    /// constructor's included, and `this.g` read in one is that field. A
+    /// field the class cannot place every write of (`this` handed out)
+    /// holds nothing a reader states, and a write of a member's parameter is
+    /// unread. The answer key is `tests/fixtures/callee-values/README.md`.
+    #[test]
+    fn a_callee_held_in_a_field_is_its_initialiser_and_every_write() {
+        let Some(discovery) = callee_values_discovery() else {
+            return;
+        };
+        let decided = vec!["site fetch".to_string()];
+        let several = vec!["several_values".to_string()];
+        let wrong: Vec<String> = [
+            ("f-field-init.ts", 7, true, "a property initialiser"),
+            ("f-field-copy.ts", 8, true, "f = this.g, g = send"),
+            ("f-field-ctor-copy.ts", 13, true, "ctor this.f = this.g"),
+            (
+                "f-field-method-agree.ts",
+                11,
+                true,
+                "a method writes the same end",
+            ),
+            (
+                "f-field-method-write.ts",
+                15,
+                false,
+                "a method writes another",
+            ),
+            (
+                "f-field-param.ts",
+                11,
+                false,
+                "a method writes its parameter",
+            ),
+            (
+                "f-field-escape.ts",
+                15,
+                true,
+                "ctor sets it, this handed to a call",
+            ),
+            (
+                "f-field-escape.ts",
+                23,
+                false,
+                "a method alone writes it, this handed to a call",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(file, line, is_decided, form)| {
+            let got = recorded_at(&discovery, file, line);
+            let ok = if is_decided {
+                got == decided
+            } else {
+                got != decided && (got == several || file == "f-field-escape.ts")
+            };
+            (!ok).then(|| format!("{file}:{line} ({form}): {got:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// carrick#3504 S1 (#3485 rows 1-2): a callee held in a module `const`
     /// alias is the function the alias names, and one held in a module `let`
     /// is every value written to it, its initialiser and each assignment.

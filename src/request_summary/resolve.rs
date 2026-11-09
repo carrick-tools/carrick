@@ -189,6 +189,19 @@ pub(super) struct BindingWrite {
     pub(super) text: ValueAt,
 }
 
+/// One write `this.<field> = value` in an instance member of a class
+/// (carrick#3504 S4c), with what the value may hold read in that member's
+/// scope. A class property's initialiser is one too, at the property's
+/// start.
+#[derive(Debug, Clone)]
+pub(super) struct FieldWrite {
+    pub(super) field: String,
+    /// Where the write starts (discovery numbering): the key
+    /// `ClassThis::writes` holds it by.
+    pub(super) at: u32,
+    pub(super) values: Vec<ValueAt>,
+}
+
 /// Every write of every binding in a module, by binding (the one write
 /// census, section 2.4). Syntax alone: it places where each plain
 /// assignment starts and marks every other form of write.
@@ -1295,6 +1308,48 @@ impl ValueAt {
                 member: member.as_ref().map(|call| {
                     Box::new(MemberCall {
                         object: call.object.iter().map(Self::enclosed).collect(),
+                        ..(**call).clone()
+                    })
+                }),
+                made: made.clone(),
+                local: local.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// The same value with every parameter unread: a parameter of a member
+    /// other than the constructor is filled by that member's callers, which
+    /// a field's reader does not follow.
+    pub(super) fn unparameterised(&self) -> Self {
+        match self {
+            Self::Param { .. } => Self::Unread,
+            Self::Object { fields, open } => Self::Object {
+                fields: fields
+                    .iter()
+                    .map(|(key, values)| {
+                        (
+                            key.clone(),
+                            values.iter().map(Self::unparameterised).collect(),
+                        )
+                    })
+                    .collect(),
+                open: *open,
+            },
+            Self::Returned {
+                lo,
+                hi,
+                out,
+                member,
+                made,
+                local,
+            } => Self::Returned {
+                lo: *lo,
+                hi: *hi,
+                out: *out,
+                member: member.as_ref().map(|call| {
+                    Box::new(MemberCall {
+                        object: call.object.iter().map(Self::unparameterised).collect(),
                         ..(**call).clone()
                     })
                 }),
@@ -3673,19 +3728,22 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             ),
             "{twice:?}"
         );
-        // A field of the class no constructor parameter sets.
+        // A field of the class no constructor parameter sets holds its
+        // initialiser (S4c).
         assert!(
-            ir.class_origins
-                .values()
-                .all(|origin| !origin.fields.contains_key("f")),
-            "no origin entry for `f`"
+            ir.class_origins.values().any(|origin| origin
+                .fields
+                .get("f")
+                .is_some_and(|from| matches!(from.values.as_slice(), [ValueAt::Returned { .. }]))),
+            "`f` holds its initialiser"
         );
         assert!(
             matches!(receiver("this.f.get").as_slice(), [ValueAt::Field { field, .. }] if field == "f"),
             "{:?}",
             receiver("this.f.get")
         );
-        // Discovery reads that field's call as the member it is.
+        // This resolver has no constructions to read the class through, so
+        // discovery reads that field's call as the member it is.
         let field_call = calls
             .iter()
             .find(|call| call.callee_text == "this.f")

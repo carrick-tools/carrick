@@ -529,6 +529,16 @@
   "source": "ES5",
   "status": "covered"
  },
+ "t-field-copy": {
+  "feature": "callee held in a field copied from another field",
+  "source": "ES2022 (class fields)",
+  "status": "covered"
+ },
+ "t-field-init": {
+  "feature": "callee held in a field initialiser",
+  "source": "ES2022 (class fields)",
+  "status": "covered"
+ },
  "t-generator": {
   "feature": "generators wrapper",
   "source": "test262",

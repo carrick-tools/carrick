@@ -741,6 +741,20 @@
   "kind": "call",
   "source": "ES5"
  },
+ "t-field-copy": {
+  "carries": "target",
+  "expect": "/p/t-field-copy",
+  "feature": "callee held in a field copied from another field",
+  "kind": "call",
+  "source": "ES2022 (class fields)"
+ },
+ "t-field-init": {
+  "carries": "target",
+  "expect": "/p/t-field-init",
+  "feature": "callee held in a field initialiser",
+  "kind": "call",
+  "source": "ES2022 (class fields)"
+ },
  "t-generator": {
   "carries": "target",
   "expect": "/p/t-generator",

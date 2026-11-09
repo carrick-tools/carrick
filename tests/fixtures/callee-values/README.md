@@ -81,3 +81,25 @@ at the line below.
 | `f-own-renamed.ts` | 8 | `d.go(…)`, `d = { go: send2 }` | site, `/p/f-own-renamed` |
 | `f-own-keyed.ts` | 8 | `d["send2"](…)`, `d = { send2 }` | site, `/p/f-own-keyed` |
 | `f-exported-arrow-keyed.ts` | 6 | `d["a"](…)`, `export const d = { a: (p) => fetch(p) }` | site, `/p/f-exported-arrow-keyed` |
+
+## Instance fields (carrick#3504 S4c)
+
+A field holds its property initialiser and every `this.f = value` any member
+writes, the constructor's included; `this.g` read in one of them is the field
+`g`. A class that hands `this` out leaves a field unread when only an initialiser
+or a member writes it (a field the constructor sets keeps its reading, S5's
+R3 shape: counted as `fields_this_escaped`, re-ruled with data); so does a
+write of a member's own parameter. Discovery's test
+`a_callee_held_in_a_field_is_its_initialiser_and_every_write` reads the call
+at the line below.
+
+| File | Line | Field | Recorded |
+|---|---|---|---|
+| `f-field-init.ts` | 7 | `f = send` | site, `fetch` |
+| `f-field-copy.ts` | 8 | `g = send; f = this.g` | site, `fetch` |
+| `f-field-ctor-copy.ts` | 13 | ctor `this.g = send; this.f = this.g` | site, `fetch` |
+| `f-field-method-agree.ts` | 11 | `f = send`, a method writes `sendToo` | site, `fetch` |
+| `f-field-method-write.ts` | 15 | ctor `this.f = send`, a method writes `other` | `several_values` |
+| `f-field-param.ts` | 11 | `f = send`, a method writes its parameter | `several_values` |
+| `f-field-escape.ts` | 15 | ctor `register(this); this.f = send` | site, `fetch` |
+| `f-field-escape.ts` | 23 | `register(this)` in the ctor; only `setup()` writes `g` | undecided (not a site) |
