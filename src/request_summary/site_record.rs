@@ -877,6 +877,93 @@ impl<'r> NameFold<'r> {
             .text_read(self.sources.root, file, &expr)
             .map(|(text, _)| text)
     }
+
+    /// Every text the argument `arg` of the call at `span` in `file`
+    /// (repo-relative) may be, or its entry `key` where it is an object
+    /// (carrick#3504 S5a): the set-valued, keyed sibling of
+    /// [`Self::arg_text`], never collapsed. An empty set says the argument
+    /// states no such key. `None` where the call is not found, or the
+    /// argument is an object the resolver does not read at all (a parameter,
+    /// a call result): the caller keeps its own reading.
+    ///
+    /// An object literal written in the argument gives its last entry with
+    /// the key; a spread (or a computed key) after that entry, or with no
+    /// such entry, may put the key there, so it is a hole.
+    pub(super) fn arg_texts(
+        &mut self,
+        file: &str,
+        span: (u32, u32),
+        arg: usize,
+        key: Option<&str>,
+    ) -> Option<Vec<TextValue>> {
+        use super::guards::HoleReason;
+        let expr = {
+            let parsed = self.sources.get(file)?;
+            let mut finder = CallFinder {
+                parsed,
+                target: span,
+                handing: Vec::new(),
+                found: None,
+            };
+            parsed.module.visit_with(&mut finder);
+            finder.found?.arg_exprs.get(arg)?.clone()
+        };
+        let root = self.sources.root;
+        let Some(key) = key else {
+            let set = self.resolver.text_set(root, file, &expr);
+            return (!set.is_empty()).then_some(set);
+        };
+        let Expr::Object(object) = super::unwrap_value(&expr) else {
+            return self.resolver.keyed_text_set(root, file, &expr, key, span.0);
+        };
+        // `Some(None)`: the key is written with a value no reader states.
+        let mut last: Option<Option<Expr>> = None;
+        let mut may_overwrite = false;
+        for prop in &object.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                may_overwrite = true;
+                continue;
+            };
+            let named = |name: &PropName| match name {
+                PropName::Computed(_) => None,
+                other => Some(super::prop_name(other).is_some_and(|name| name == key)),
+            };
+            let (hit, found) = match &**prop {
+                Prop::KeyValue(entry) => (named(&entry.key), Some((*entry.value).clone())),
+                Prop::Shorthand(ident) => {
+                    (Some(ident.sym == *key), Some(Expr::Ident(ident.clone())))
+                }
+                Prop::Getter(getter) => (named(&getter.key), None),
+                Prop::Setter(setter) => (named(&setter.key), None),
+                Prop::Method(method) => (named(&method.key), None),
+                Prop::Assign(_) => (Some(false), None),
+            };
+            match hit {
+                // A computed key may be this one.
+                None => may_overwrite = true,
+                Some(true) => {
+                    last = Some(found);
+                    may_overwrite = false;
+                }
+                Some(false) => {}
+            }
+        }
+        if may_overwrite {
+            return Some(vec![TextValue::Hole(HoleReason::UnreadExpression)]);
+        }
+        Some(match last {
+            None => Vec::new(),
+            Some(None) => vec![TextValue::Hole(HoleReason::UnreadExpression)],
+            Some(Some(value)) => {
+                let set = self.resolver.text_set(root, file, &value);
+                if set.is_empty() {
+                    vec![TextValue::Hole(HoleReason::OutsideService)]
+                } else {
+                    set
+                }
+            }
+        })
+    }
 }
 
 /// The file of a compiler row's declaration (`file:line`, or the file

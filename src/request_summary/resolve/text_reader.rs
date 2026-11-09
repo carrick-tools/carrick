@@ -559,6 +559,71 @@ impl Resolver<'_> {
         self.text_values(path, &value)
     }
 
+    /// Every text the entry `key` of the object `expr` holds may be, never
+    /// collapsed (carrick#3504 S5a): `expr` is a name the binding table
+    /// holds as an object literal. An empty set says the object, which the
+    /// module only reads through its entries, or hands to the call starting
+    /// at `call` alone, has no such key. `None` where
+    /// `expr` is no such name (a parameter, a call result, a name outside the
+    /// run): the object is not read at all.
+    pub(in crate::request_summary) fn keyed_text_set(
+        &self,
+        root: &Path,
+        file: &str,
+        expr: &Expr,
+        key: &str,
+        call: u32,
+    ) -> Option<Vec<TextValue>> {
+        let absolute = root.join(file);
+        let (path, ir) = self.inputs_for(&absolute).files.get_key_value(&absolute)?;
+        let object = text_of(expr, &|lo| ir.discovery_start(lo));
+        // The census numbers spans as discovery does.
+        let call = ir.discovery_start(call);
+        let ValueAt::Read {
+            lo,
+            hi,
+            member: false,
+            ..
+        } = &object
+        else {
+            return None;
+        };
+        let row = self.row_at(path, *lo, *hi, Kind::Ident)?;
+        let (at, binding, _) = self.declared_entry(row)?;
+        let Some(ValueAt::Entries(entries)) = &binding.text else {
+            return None;
+        };
+        let closed = match binding.kind {
+            BindingKind::Const => true,
+            BindingKind::Let => binding.writes.is_empty() && !binding.unplaceable,
+            BindingKind::Var
+            | BindingKind::Enum
+            | BindingKind::StaticField
+            | BindingKind::Getter => false,
+        };
+        // The entries are the literal's where the module only reads them, or
+        // hands the object on to the one call this entry is read for.
+        let kept = binding.entries_kept
+            || (binding.entries_handed && binding.handed.iter().all(|at| *at == call));
+        if closed && kept {
+            return Some(match self.entry_of(at.0, entries, key, true) {
+                Ok(None) => Vec::new(),
+                Ok(Some(value)) => match self.reading_text(&at) {
+                    Some(_reading) => self.text_values(at.0, value),
+                    None => vec![TextValue::Hole(guards::HoleReason::Recursion)],
+                },
+                Err(reason) => vec![TextValue::Hole(reason)],
+            });
+        }
+        let member = ValueAt::Member {
+            lo: 0,
+            hi: 0,
+            object: Box::new(object),
+            key: Box::new(ValueAt::Lit(key.to_string())),
+        };
+        Some(self.text_values(path, &member))
+    }
+
     /// The parts of the text `expr`, written in the repo file `file`
     /// (relative to `root`), states: a template's or a `+` chain's pieces in
     /// order, each with the file of the outermost declaration it was read

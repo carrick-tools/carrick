@@ -374,6 +374,7 @@ pub struct SiteMaker {
     /// The maker call's span start (SWC numbering) and line: the definition a
     /// name the maker binds resolves to.
     pub span_start: u32,
+    pub span_end: u32,
     pub line: u32,
     pub holder: Holder,
     /// The own factory call the holder was set by, when the instance came
@@ -1265,6 +1266,7 @@ impl SiteReader<'_> {
                                 args: made.instance.args,
                                 file: made.file,
                                 span_start: made.instance.site.span_start,
+                                span_end: made.instance.site.span_end,
                                 line: made.instance.site.line,
                                 holder,
                                 factory: made.factory,

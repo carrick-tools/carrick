@@ -55,7 +55,7 @@ use swc_common::{SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use super::resolve::Resolver;
+use super::resolve::{Resolver, TextValue};
 use super::row_calls::Reach;
 use super::{CallIr, FnIr, KeyState, Piece, RequestSummaryInputs, Value, concat, render_target};
 
@@ -3328,6 +3328,8 @@ fn maker_base(
     form: super::MakerForm,
     member: Option<&str>,
     args: &[super::SiteArg],
+    at: Option<(&str, (u32, u32))>,
+    reads: &mut BaseReads<'_, '_>,
 ) -> MadeBase {
     use crate::services::type_sidecar::{LibraryClaim, MakeForm};
     let slot = export.claims.iter().find_map(|claim| match claim {
@@ -3350,13 +3352,63 @@ fn maker_base(
         return MadeBase::None;
     };
     let (arg, key) = (slot.arg as usize, slot.key.as_deref());
+    // Text the callers filled in, first (carrick#3504 S5a, R2): the
+    // resolver's text reader has no fan-out over a factory's callers.
+    if let Some(text) = super::library_sites::arg_literal(args, arg, key) {
+        return MadeBase::Text(text.to_string());
+    }
+    // Then the argument as the maker call writes it, read by the resolver.
+    // A spread argument holds what the source does not state.
+    let spread = args.get(arg).is_some_and(|held| held.spread);
+    if !spread
+        && let Some((file, span)) = at
+        && let Some(values) = reads.fold.arg_texts(file, span, arg, key)
+    {
+        return agreed_text(&values);
+    }
     if !super::library_sites::arg_supplied(args, arg, key) {
+        // An options object the resolver does not read at all (a parameter
+        // no caller fills, a call result) reads as absent, as it always did.
+        // Counted: ruled on once main's check reports it (R3).
+        if args
+            .get(arg)
+            .is_some_and(|held| held.object.is_none() && held.text.is_none() && !held.spread)
+        {
+            reads.options_unread += 1;
+        }
         return MadeBase::None;
     }
-    match super::library_sites::arg_literal(args, arg, key) {
-        Some(text) => MadeBase::Text(text.to_string()),
-        None => MadeBase::Unstated,
+    MadeBase::Unstated
+}
+
+/// What a maker's base slot is, from every text the resolver reads there:
+/// none (the key is absent), the one text every value gives, or a base the
+/// code does not state as one text (a hole, or several texts).
+fn agreed_text(values: &[TextValue]) -> MadeBase {
+    let mut texts: BTreeSet<&str> = BTreeSet::new();
+    for value in values {
+        match value {
+            TextValue::Text { text, .. } => {
+                texts.insert(text);
+            }
+            TextValue::Hole(_) => return MadeBase::Unstated,
+        }
     }
+    let mut texts = texts.into_iter();
+    match (texts.next(), texts.next()) {
+        (None, _) => MadeBase::None,
+        (Some(text), None) => MadeBase::Text(text.to_string()),
+        _ => MadeBase::Unstated,
+    }
+}
+
+/// What reading the bases of one scan's makers needs and counts: the
+/// resolver that reads a maker call's argument, and how many options
+/// arguments it could not read at all (carrick#3504 S5a, R3).
+struct BaseReads<'f, 'r> {
+    fold: &'f mut super::site_record::NameFold<'r>,
+    root: &'f Path,
+    options_unread: usize,
 }
 
 /// One instance's base from the bases of its makers: every maker handed the
@@ -3384,6 +3436,7 @@ fn agreed_base(bases: impl IntoIterator<Item = MadeBase>) -> MadeBase {
 fn made_base(
     site: &super::LibrarySite,
     exports: &[crate::library_claims::ExportClaims],
+    reads: &mut BaseReads<'_, '_>,
 ) -> MadeBase {
     let super::SiteReceiver::Instance(makers) = &site.receiver else {
         return MadeBase::None;
@@ -3394,11 +3447,22 @@ fn made_base(
     else {
         return MadeBase::None;
     };
-    match agreed_base(
-        makers
-            .iter()
-            .map(|maker| maker_base(export, maker.form, maker.member.as_deref(), &maker.args)),
-    ) {
+    let root = reads.root;
+    let bases: Vec<MadeBase> = makers
+        .iter()
+        .map(|maker| {
+            let file = relative(root, &maker.file);
+            maker_base(
+                export,
+                maker.form,
+                maker.member.as_deref(),
+                &maker.args,
+                Some((&file, (maker.span_start, maker.span_end))),
+                reads,
+            )
+        })
+        .collect();
+    match agreed_base(bases) {
         MadeBase::Text(_) if site.contested => MadeBase::Unstated,
         base => base,
     }
@@ -3415,27 +3479,40 @@ fn made_base(
 fn walked_base(
     instances: &[InstanceEnd],
     exports: &[crate::library_claims::ExportClaims],
+    reads: &mut BaseReads<'_, '_>,
 ) -> MadeBase {
-    agreed_base(instances.iter().filter_map(|end| {
-        let InstanceAt::Root {
-            package,
-            export,
-            member,
-            made: Some(made),
-            ..
-        } = &end.end
-        else {
-            return None;
-        };
-        Some(
-            exports
-                .iter()
-                .find(|claims| claims.package == *package && claims.export == *export)
-                .map_or(MadeBase::None, |claims| {
-                    maker_base(claims, made.form, member.as_deref(), &made.args)
-                }),
-        )
-    }))
+    let bases: Vec<MadeBase> = instances
+        .iter()
+        .filter_map(|end| {
+            let InstanceAt::Root {
+                file,
+                package,
+                export,
+                member,
+                made: Some(made),
+                ..
+            } = &end.end
+            else {
+                return None;
+            };
+            Some(
+                exports
+                    .iter()
+                    .find(|claims| claims.package == *package && claims.export == *export)
+                    .map_or(MadeBase::None, |claims| {
+                        maker_base(
+                            claims,
+                            made.form,
+                            member.as_deref(),
+                            &made.args,
+                            Some((file, made.span)),
+                            reads,
+                        )
+                    }),
+            )
+        })
+        .collect();
+    agreed_base(bases)
 }
 
 impl Decided {
@@ -3472,13 +3549,23 @@ impl Decided {
     /// to that base, so the base is joined to the path as the summaries join
     /// one. A base the code does not state as text, or one the path cannot
     /// be written on, leaves the site out: a host-free path would read as a
-    /// call into this system. Returns how many sites were left out.
+    /// call into this system. Returns how many sites were left out, and how
+    /// many options arguments of a maker the resolver could not read at all
+    /// (carrick#3504 S5a, R3).
     pub fn carry_instance_bases(
         &mut self,
         root: &Path,
         library: &super::LibrarySites,
         exports: &[crate::library_claims::ExportClaims],
-    ) -> usize {
+        inputs: &RequestSummaryInputs,
+        siblings: &[&RequestSummaryInputs],
+    ) -> BaseCarry {
+        let mut fold = super::site_record::NameFold::new(inputs, siblings, root);
+        let mut reads = BaseReads {
+            fold: &mut fold,
+            root,
+            options_unread: 0,
+        };
         let at: HashMap<(String, u32, u32), &super::LibrarySite> = library
             .sites
             .iter()
@@ -3503,9 +3590,9 @@ impl Decided {
                 site.end.span_end,
             )) {
                 Some(called) if matches!(called.receiver, super::SiteReceiver::Instance(_)) => {
-                    made_base(called, exports)
+                    made_base(called, exports, &mut reads)
                 }
-                _ => walked_base(&site.instances, exports),
+                _ => walked_base(&site.instances, exports, &mut reads),
             };
             match base {
                 MadeBase::None => true,
@@ -3516,8 +3603,21 @@ impl Decided {
                 }
             }
         });
-        before - self.sites.len()
+        BaseCarry {
+            left_out: before - self.sites.len(),
+            options_unread: reads.options_unread,
+        }
     }
+}
+
+/// What [`Decided::carry_instance_bases`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseCarry {
+    /// Sites left out: their instance's base is not stated as one text.
+    pub left_out: usize,
+    /// Makers handed an options object the resolver does not read at all,
+    /// whose base reads as absent (carrick#3504 S5a, R3).
+    pub options_unread: usize,
 }
 
 /// The calls of `site` that run a function through a `bind` with bound
@@ -5660,7 +5760,9 @@ pub(crate) mod tests {
         let library = crate::request_summary::library_sites(&inputs);
         let root = decided_fixture();
         assert_eq!(
-            decided.carry_instance_bases(&root, &library, &http_claims()),
+            decided
+                .carry_instance_bases(&root, &library, &http_claims(), &inputs, &[])
+                .left_out,
             1
         );
         assert_eq!(
@@ -5679,7 +5781,12 @@ pub(crate) mod tests {
         );
         // No claim names a maker's base: every path is as it was.
         let (mut unclaimed, _, _) = decided_at(INSTANCES, &calls, &http_get_label());
-        assert_eq!(unclaimed.carry_instance_bases(&root, &library, &[]), 0);
+        assert_eq!(
+            unclaimed
+                .carry_instance_bases(&root, &library, &[], &inputs, &[])
+                .left_out,
+            0
+        );
         assert_eq!(names_at(&unclaimed, INSTANCES).len(), 4);
         assert_eq!(
             names_at(&unclaimed, INSTANCES)[0].1.as_deref(),
@@ -5762,15 +5869,19 @@ pub(crate) mod tests {
         ];
         let root = decided_fixture();
         for (case, instances, want) in cases {
-            let (mut decided, _, _) =
+            let (mut decided, _, inputs) =
                 decided_at(INSTANCES, &["plain.get(\"/status\")"], &http_get_label());
             assert_eq!(decided.sites.len(), 1, "{case}");
             decided.sites[0].instances = instances;
-            let left = decided.carry_instance_bases(
-                &root,
-                &crate::request_summary::LibrarySites::default(),
-                &http_claims(),
-            );
+            let left = decided
+                .carry_instance_bases(
+                    &root,
+                    &crate::request_summary::LibrarySites::default(),
+                    &http_claims(),
+                    &inputs,
+                    &[],
+                )
+                .left_out;
             let got = decided.sites.first().and_then(|site| site.name_text());
             assert_eq!(got.as_deref(), want, "{case}");
             assert_eq!(left, usize::from(want.is_none()), "{case}");

@@ -7079,16 +7079,19 @@ fn site_records_of(
     let yielded = context
         .placements
         .map_or(0, |placed| decided.yield_to_summaries(root, placed));
-    let unbased = context.library.map_or(0, |library| {
-        decided.carry_instance_bases(root, library, claims)
+    let based = context.library.map(|library| {
+        decided.carry_instance_bases(root, library, claims, inputs, context.siblings)
     });
+    let unbased = based.map_or(0, |based| based.left_out);
+    let bases_options_unread = based.map_or(0, |based| based.options_unread);
     debug!(
         yielded,
         unbased,
+        bases_options_unread,
         ran = decided.ran.len(),
         reserved = decided.reserved.len(),
         unplaced = decided.unplaced.len(),
-        "site questions: sites left to the summaries, sites with an unstated instance base, calls that hand a maker its function, sites named a reserved name, labelled calls the call index holds no call for"
+        "site questions: sites left to the summaries, sites with an unstated instance base, makers handed an options object the resolver does not read, calls that hand a maker its function, sites named a reserved name, labelled calls the call index holds no call for"
     );
     let records = crate::request_summary::site_record::site_records(
         inputs,

@@ -154,23 +154,50 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
                 let PropOrSpread::Prop(prop) = prop else {
                     return ValueAt::Unread;
                 };
-                let Prop::KeyValue(entry) = &**prop else {
-                    continue;
+                let entry = match &**prop {
+                    Prop::KeyValue(entry) => entry,
+                    // `{ a }` writes the key `a`, read as the name `a`.
+                    Prop::Shorthand(ident) => {
+                        entries.push((
+                            ValueAt::Lit(ident.sym.to_string()),
+                            next(&Expr::Ident(ident.clone())),
+                        ));
+                        continue;
+                    }
+                    // A method or an accessor writes its key with a value no
+                    // text reader states: the key is present (S5a).
+                    Prop::Getter(getter) => {
+                        entries.push((prop_key(&getter.key, &next), ValueAt::Unread));
+                        continue;
+                    }
+                    Prop::Setter(setter) => {
+                        entries.push((prop_key(&setter.key, &next), ValueAt::Unread));
+                        continue;
+                    }
+                    Prop::Method(method) => {
+                        entries.push((prop_key(&method.key, &next), ValueAt::Unread));
+                        continue;
+                    }
+                    _ => continue,
                 };
-                let key = match &entry.key {
-                    PropName::Ident(name) => ValueAt::Lit(name.sym.to_string()),
-                    PropName::Str(text) => text
-                        .value
-                        .as_str()
-                        .map_or(ValueAt::Unread, |text| ValueAt::Lit(text.to_string())),
-                    PropName::Computed(computed) => next(&computed.expr),
-                    PropName::Num(_) | PropName::BigInt(_) => ValueAt::Unread,
-                };
-                entries.push((key, next(&entry.value)));
+                entries.push((prop_key(&entry.key, &next), next(&entry.value)));
             }
             ValueAt::Entries(entries)
         }
         _ => ValueAt::Unread,
+    }
+}
+
+/// An object literal's key as the text reader states it.
+fn prop_key(key: &PropName, next: &dyn Fn(&Expr) -> ValueAt) -> ValueAt {
+    match key {
+        PropName::Ident(name) => ValueAt::Lit(name.sym.to_string()),
+        PropName::Str(text) => text
+            .value
+            .as_str()
+            .map_or(ValueAt::Unread, |text| ValueAt::Lit(text.to_string())),
+        PropName::Computed(computed) => next(&computed.expr),
+        PropName::Num(_) | PropName::BigInt(_) => ValueAt::Unread,
     }
 }
 

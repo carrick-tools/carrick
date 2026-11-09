@@ -1632,6 +1632,83 @@ fn client_bases_follow_the_instance_walk() {
     }
 }
 
+/// carrick#3504 S5a: a client's base is read through the value resolver
+/// where no caller fills it. Every form the text reader reads (an enum
+/// member, a `let` never written again, a `join`, a choice whose arms agree,
+/// an imported `const` at a walk root, an options object held in a `const`)
+/// gives the client its base; a base written by a spread after the key, or
+/// by anything else in the code the reader cannot read, leaves the site
+/// out; an options object with no base key states none (host-free path).
+/// Forms that already read keep their rows.
+#[test]
+fn a_client_base_reads_through_the_resolver() {
+    let on = scan_fixture("client-base-values");
+    let rows = call_rows(&on);
+    let paths = |file: &str| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.starts_with(&format!("src/{file}.ts:")))
+            .map(|row| row.split(' ').nth(1).unwrap_or_default().to_string())
+            .collect()
+    };
+    let based = |file: &str| vec![format!("https://m.test/p/{file}")];
+    // Already read before S5a (pins).
+    for file in [
+        "b-lit",
+        "b-const",
+        "b-const-import",
+        "b-template",
+        "b-shorthand",
+        "b-obj-entry",
+        "b-obj-entry-import",
+        "b-opts-spread",
+        "b-factory-param",
+        "b-factory-param-const",
+        "b-factory-opts",
+        "w-lit",
+        "w-const",
+    ] {
+        assert_eq!(paths(file), based(file), "{file}: {rows:#?}");
+    }
+    // Gained: the resolver reads the base.
+    for file in ["b-enum", "b-let-once", "b-cond-same", "w-const-import"] {
+        assert_eq!(paths(file), based(file), "{file}: {rows:#?}");
+    }
+    // `['https://m.test', 'v1'].join('/')` is the base the code writes.
+    assert_eq!(
+        paths("b-join"),
+        vec!["https://m.test/v1/p/b-join".to_string()],
+        "{rows:#?}"
+    );
+    // Corrected from a host-free path to the base the options object holds.
+    for file in ["b-opts-const", "w-opts-const"] {
+        assert_eq!(paths(file), based(file), "{file}: {rows:#?}");
+    }
+    // Corrected from a host-free path to no row: a spread after the key may
+    // overwrite it.
+    assert_eq!(
+        paths("b-opts-spread-after"),
+        Vec::<String>::new(),
+        "{rows:#?}"
+    );
+    // A base the code does not state as one text stays out.
+    for file in [
+        "b-env",
+        "b-env-fallback",
+        "b-cond-diff",
+        "b-let-written",
+        "w-env",
+        "b-contested",
+    ] {
+        assert_eq!(paths(file), Vec::<String>::new(), "{file}: {rows:#?}");
+    }
+    // An options object that states no base key hands the maker none.
+    assert_eq!(
+        paths("b-opts-const-nobase"),
+        vec!["/p/b-opts-const-nobase".to_string()],
+        "{rows:#?}"
+    );
+}
+
 /// carrick#3527 S5: a client made in a field of a class a sibling service
 /// declares is read where it is made, so the call that runs it in this
 /// service states the client's base. The site stands at this service's call.
