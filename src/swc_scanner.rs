@@ -3039,13 +3039,9 @@ impl CandidateVisitor {
     /// (`client.post({ url: "/v1/things" })`, see
     /// [`Self::verb_call_request_spec`]). `None` for every other call shape.
     ///
-    /// This is the config-object form of an outbound HTTP call, and nothing in
-    /// the candidate layer could see it before (#537): no argument is a
-    /// string, so the URL-scheme and stringish-argument signals never fire;
-    /// the callee is frequently a bare binding (a client passed in as a
-    /// parameter), so the member-name heuristics never fire either; and the
-    /// object's raw first-line snippet is `{`. The call was invisible, and the
-    /// path was whatever the model guessed.
+    /// This is the config-object form of an outbound HTTP call. A candidate
+    /// at such a call reads its URL here, because the object's raw first-line
+    /// snippet is `{`.
     ///
     /// Purely structural — the property names on the object are the whole
     /// signal, and no client library is named. A producer route declared the
@@ -3662,23 +3658,6 @@ impl Visit for CandidateVisitor {
         }
 
         self.register_signal = None;
-
-        // Signal 2b: the call declares its method and URL as data on a single
-        // object-literal argument (`client({ method: "post", url: "/x" })`).
-        // None of the other call-site signals can see this shape — see
-        // `call_request_spec` — so without this one the call raises no
-        // candidate at all and the file can be skipped before the analyzer
-        // ever reads it (#537).
-        if Self::call_request_spec(call).is_some() {
-            let (obj, prop) = match &call.callee {
-                Callee::Expr(e) => (
-                    Self::extract_callee_object(e).unwrap_or_else(|| "<request-spec>".to_string()),
-                    Self::callee_member_prop(e),
-                ),
-                _ => ("<request-spec>".to_string(), None),
-            };
-            self.push_candidate(call, obj, prop);
-        }
 
         // Signal 3: first argument is a URL with a network scheme.
         if Self::first_arg_has_url_scheme(call) {
@@ -5326,11 +5305,49 @@ export default new ReportController();
         assert!(class.methods.iter().all(|m| !m.returns_no_payload));
     }
 
+    /// Old-path row N22 deleted: a call whose single object argument states a
+    /// method and a URL is no candidate because of that shape. The call the
+    /// fact layer names still gets its candidate through `scan_sites`, and it
+    /// carries the structural request spec: the path is read off the object,
+    /// not left to the model (#537).
+    #[test]
+    fn a_config_object_call_is_a_candidate_from_the_fact_layer_not_from_its_shape() {
+        let content = r#"
+export const login = async ({ apiClient }) => {
+  return apiClient({
+    method: "post",
+    url: "/api/v1/auth/login",
+    data: {}
+  });
+};
+"#;
+        assert!(
+            scan_test_content(content).candidates.is_empty(),
+            "the object shape raises no candidate by itself"
+        );
+        let start = content.find("apiClient({").unwrap() as u32 + 1;
+        let end = content.find("  });").unwrap() as u32 + 1 + 4;
+        let named = SwcScanner::new().scan_sites(
+            Path::new("login.ts"),
+            content,
+            &std::collections::BTreeSet::from([(start, end)]),
+        );
+        assert_eq!(named.candidates.len(), 1, "{:?}", named.candidates);
+        let spec = named.candidates[0]
+            .request_spec
+            .as_ref()
+            .expect("the candidate carries the structural request spec");
+        assert_eq!(spec.method, "POST");
+        assert_eq!(spec.url, "/api/v1/auth/login");
+        assert_eq!(
+            named.candidates[0].path_snippet.as_deref(),
+            Some("'/api/v1/auth/login'")
+        );
+    }
+
     /// #537: the config-object call form. The client is a bare binding (here a
-    /// destructured parameter, the shape that makes every callee-name
-    /// heuristic useless), no argument is a string, and the object spans
-    /// several lines — so before this signal the call raised no candidate at
-    /// all and its path was left to the model, which produced a wildcard.
+    /// destructured parameter), no argument is a string, and the object spans
+    /// several lines, so the candidate reads the URL off the object.
     #[test]
     fn config_object_call_yields_a_candidate_carrying_method_and_url() {
         let content = r#"
@@ -5344,7 +5361,7 @@ export const login = async ({ clientId, apiClient }) => {
   return response.data.accessToken;
 };
 "#;
-        let result = scan_test_content(content);
+        let result = SwcScanner::new().scan_every_call(Path::new("test.ts"), content);
         let candidate = result
             .candidates
             .iter()
@@ -5380,7 +5397,7 @@ export async function run() {
   await client.request({ method: 'delete', url: '/api/v1/sessions/current' });
 }
 "#;
-        let result = scan_test_content(content);
+        let result = SwcScanner::new().scan_every_call(Path::new("test.ts"), content);
         let mut seen: Vec<(String, String)> = result
             .candidates
             .iter()
