@@ -1,0 +1,11 @@
+export function loadA(id: string) { return id + "a"; }
+export function loadB(id: string) { return id + "b"; }
+export function loadC(id: string) { return id + "c"; }
+export function loadD(id: string) { return id + "d"; }
+export function loadE(id: string) { return id + "e"; }
+export function loadF(id: string) { return id + "f"; }
+export function loadG(id: string) { return id + "g"; }
+export function loadH(id: string) { return id + "h"; }
+export function loadI(id: string) { return id + "i"; }
+export function loadJ(id: string) { return id + "j"; }
+export function loadK(id: string) { return id + "k"; }
