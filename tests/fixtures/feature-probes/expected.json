@@ -509,6 +509,11 @@
   "source": "test262",
   "status": "covered"
  },
+ "t-entry-own-function": {
+  "feature": "own function held in an object entry, called under another name",
+  "source": "TS",
+  "status": "covered"
+ },
  "t-explicit-resource": {
   "feature": "explicit-resource-management (using)",
   "source": "test262",

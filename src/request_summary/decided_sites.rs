@@ -1390,6 +1390,19 @@ impl<'a> Calls<'a> {
         )
     }
 
+    /// The function of the service the rows say `placed` reaches, where
+    /// they name one ([`RequestSummaryInputs::reach`], rows first).
+    fn row_target(&self, placed: &Placed<'a>) -> Option<(PathBuf, String)> {
+        match self.inputs_for(placed.file).reach(
+            placed.file,
+            placed.call.site.lo,
+            placed.call.site.hi,
+        ) {
+            Reach::Function(file, key) => Some((file, key)),
+            _ => None,
+        }
+    }
+
     pub(super) fn callers_of(&self, file: &Path, key: &str) -> &[Placed<'a>] {
         self.callers
             .get(&(file.to_path_buf(), key.to_string()))
@@ -3822,10 +3835,17 @@ fn place_chain<'a>(
     // unresolved enters the hop only when it calls the hop's function by its
     // own name (`openSession(url).notify` for `Session.notify`), so a log
     // line or a global function in the body is never the hop. A call it
-    // resolves elsewhere is not this hop.
+    // resolves elsewhere is not this hop. Where the call graph has no edge,
+    // the rows say what the call reaches (an own function held in an object
+    // entry and called under another name or a computed key): a function
+    // they name is the hop or is not, and only where they name none is the
+    // name the test.
     let enters = |placed: &Placed<'a>, hop: &ChainHop| match calls.target(placed) {
         Some((file, key)) => file == &root.join(&hop.file) && key == &hop.function,
-        None => called_name(&placed.call.callee_text) == called_name(&hop.function),
+        None => match calls.row_target(placed) {
+            Some((file, key)) => file == root.join(&hop.file) && key == hop.function,
+            None => called_name(&placed.call.callee_text) == called_name(&hop.function),
+        },
     };
     if !enters(&first, &site.chain[0]) {
         return None;
@@ -5123,6 +5143,60 @@ pub(crate) mod tests {
             "{:?}",
             decided.sites
         );
+    }
+
+    /// carrick#3504 S4b-3b: a hop the call graph has no edge to (an own
+    /// function held in an object entry, called under another name or a
+    /// computed key) is placed through what the rows say the call reaches.
+    /// The answer key is `tests/fixtures/callee-values/README.md`.
+    #[test]
+    fn a_hop_the_rows_resolve_is_placed_without_a_call_graph_edge() {
+        let Some(on) =
+            super::super::fixture_walk::walked("callee-values", "services/web", "web", &[], true)
+        else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            manifest().join("tests/fixtures/callee-values/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let labels = super::super::discovery::Labels::of_answer(&answer);
+        let discovery = super::super::discovery::discover(&on.inputs, &labels, &on.repo);
+        let sites: Vec<DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| {
+                serde_json::from_value(serde_json::to_value(site).unwrap()).expect("a site")
+            })
+            .collect();
+        let decided = decided_sites(
+            &on.inputs,
+            &on.repo,
+            &sites,
+            &SiteLabel::from_exports(&answer.exports),
+        );
+        let found = |file: &str| -> Vec<(u32, Option<String>)> {
+            decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file))
+                .map(|site| (site.line, site.name_text()))
+                .collect()
+        };
+        for (file, line, path) in [
+            ("f-own-renamed.ts", 8, "/p/f-own-renamed"),
+            ("f-own-keyed.ts", 8, "/p/f-own-keyed"),
+            ("f-exported-arrow-keyed.ts", 6, "/p/f-exported-arrow-keyed"),
+        ] {
+            let got = found(file);
+            assert!(
+                got.iter().any(|(at, name)| *at == line
+                    && name.as_deref().is_some_and(|name| name.ends_with(path))),
+                "{file}: {got:?} leads {:?}",
+                decided.leads
+            );
+        }
     }
 
     /// A call the call graph leaves unresolved (a log line, a global
