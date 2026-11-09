@@ -43,3 +43,27 @@ call at the line below.
 | `f-local-let.ts` | 8 | `let s = send`, `if (flag) s = other` | `several_values` |
 | `f-local-param.ts` | 8 | `let s = send`, `if (flag) s = next`; nothing calls the exported `f` | `several_values` |
 | `f-local-nested.ts` | 8 | `let s = send`, written inside a `setTimeout` callback | `several_values` |
+
+## A callee read off a kept object's entry (carrick#3504 S4b)
+
+Each file below calls the entry of an object literal the module (or the
+function) keeps: `d["a"]()`, `d[k]()` for a `const` key, `d.a()`. The entry is
+the value the call runs, where the object is a `const` nothing writes
+through, an exported one no importer writes through included (the
+cross-module check of carrick#2448). An object the module or an importer may
+change and an open object (a spread may put any key in it) keep the call
+undecided. Discovery's test
+`a_callee_read_off_a_kept_objects_entry_is_that_entrys_value` reads the call
+at the line below.
+
+| File | Line | Read | Recorded |
+|---|---|---|---|
+| `f-keyed.ts` | 6 | `d["a"](…)`, `d = { a: send }` | site, `fetch` |
+| `f-keyed-const.ts` | 7 | `d[k](…)`, `const k = "a"` | site, `fetch` |
+| `f-entry-dot.ts` | 6 | `d.a(…)` | site, `fetch` |
+| `f-entry-method.ts` | 10 | `d.a(…)`, `{ a(p) { return send(p); } }` | site, `fetch` |
+| `f-local-keyed.ts` | 5 | `d["a"](…)`, `d` a function-local `const` | site, `fetch` |
+| `f-keyed-written.ts` | 10 | `d.a = other` elsewhere | not decided |
+| `f-keyed-exported.ts` | 6 | `export const d`, no importer writes it | site, `fetch` |
+| `f-keyed-contested.ts` | 6 | `export const d`, `f-keyed-contested-writer.ts` writes `d.a` | not decided |
+| `f-keyed-spread.ts` | 5 | `{ a: send, ...x }` | not decided |

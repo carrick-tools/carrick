@@ -1039,7 +1039,10 @@ pub(super) enum ValueAt {
         lo: u32,
         hi: u32,
         object: Vec<ValueAt>,
-        key: String,
+        /// The key as the text lowering states it: a [`Self::Lit`] for
+        /// `.name` and `['name']`, else what a computed key states (a
+        /// `const`'s name), read by the text reader.
+        key: Box<ValueAt>,
     },
     /// A function written here, by where its node starts.
     Function(u32),
@@ -1589,7 +1592,11 @@ impl Reader<'_> {
         ) {
             return None;
         }
-        let key = static_key(member)?;
+        let key = match (&member.prop, static_key(member)) {
+            (_, Some(name)) => ValueAt::Lit(name),
+            (MemberProp::Computed(computed), None) => text::text_of(&computed.expr, &|lo| lo),
+            _ => return None,
+        };
         let object = self.values_in(&member.obj, scope, bound, 1);
         // A parameter alone is the callee-value walk's: its callers decide.
         if object.is_empty()
@@ -1603,7 +1610,7 @@ impl Reader<'_> {
             lo: member.span.lo.0,
             hi: member.span.hi.0,
             object,
-            key,
+            key: Box::new(key),
         })
     }
 
@@ -2330,6 +2337,9 @@ impl<'a> Resolver<'a> {
         let ValueAt::KeyOf { object, key, .. } = value else {
             return None;
         };
+        // The key is one text the code states (a literal, or a `const`).
+        let (key, _) = self.one_text(file, key).ok()?;
+        let key = &key;
         let _query = self.enter();
         let nothing = || Held::Reached(F::Reached::default());
         let mut out: Vec<Held<F::Reached>> = Vec::new();
@@ -2396,6 +2406,9 @@ impl<'a> Resolver<'a> {
             return false;
         }
         match value {
+            // A spread or a computed key may put any key in, over the one
+            // written: the written key is not known to be the entry.
+            ValueAt::Object { open: true, .. } => false,
             ValueAt::Object { fields, .. } => {
                 out.push(ObjectAt {
                     file,
