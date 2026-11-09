@@ -49,3 +49,6 @@ Not read (`refuse.ts`, `evalfile.ts`): each is a hole.
 `OUTER` and writes its entry, which does not block the outer one.
 
 Choices (`alt.ts`, carrick#3504 S2b-1): `?:`, `??` and `||` read every branch, never collapsed. `p_coalesce` is a hole (`maybe`, a runtime value) and `/fallback`; `p_cond` is `/api` and `/other`; `p_chain` is a hole, `/api` and `/last`; `p_union` is `/u/a`, `/u/b` and `/u/c`.
+
+`selfread.ts`: `p_self` reads itself; the second read is a recursion hole, and
+reading it again gives the same answer (the mark is released).

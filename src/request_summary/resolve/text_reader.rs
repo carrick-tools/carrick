@@ -529,13 +529,14 @@ impl<'a> Resolver<'a> {
     /// guard drops; `None` where it already is (a value that reads itself).
     fn reading_text(&self, at: &(&'a Path, u32, String)) -> Option<TextReading<'_>> {
         let id = (at.0.to_path_buf(), at.1, at.2.clone());
-        self.texts_reading
-            .borrow_mut()
-            .insert(id.clone())
-            .then_some(TextReading {
-                reading: &self.texts_reading,
-                id,
-            })
+        // The borrow ends before any guard exists: a guard built and dropped
+        // under it (`then_some` builds its argument eagerly) would release
+        // the mark while the set is still borrowed, and panic.
+        let marked = self.texts_reading.borrow_mut().insert(id.clone());
+        marked.then(|| TextReading {
+            reading: &self.texts_reading,
+            id,
+        })
     }
 
     /// The one text `value`, written in `file` (as `inputs` keys it), always
@@ -894,5 +895,25 @@ mod tests {
             matches!(shadow.as_slice(), [TextValue::Text { text, .. }] if text == "/outer"),
             "{shadow:?}"
         );
+    }
+
+    /// A constant that reads itself is a recursion hole. The reader marks
+    /// the declaration once; the second read finds the mark and must not
+    /// release it while the mark set is still borrowed (a panic, "RefCell
+    /// already borrowed", once #3649 made such reads reachable).
+    #[test]
+    fn a_constant_that_reads_itself_is_a_recursion_hole() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let got = probe(&resolver, &on, "src/selfread.ts", "p_self");
+        assert!(
+            got.iter()
+                .any(|value| matches!(value, TextValue::Hole(guards::HoleReason::Recursion))),
+            "{got:?}"
+        );
+        // The mark is released: reading again gives the same answer.
+        assert_eq!(probe(&resolver, &on, "src/selfread.ts", "p_self"), got);
     }
 }
