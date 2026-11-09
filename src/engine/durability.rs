@@ -189,6 +189,10 @@ pub struct ServiceAnalysis {
     /// ([`crate::site_rows::GuessedRoute`]), for a PR's endpoint delta
     /// (carrick#3222). Never serialised.
     pub unread_routes: Vec<crate::site_rows::GuessedRoute>,
+    /// The call edges discovery's walk entered, paths repo-relative,
+    /// written into its definitions once every service's call-through is
+    /// settled ([`crate::call_graph::plan_edges`]). Never serialised.
+    pub discovered_edges: crate::call_graph::PlannedEdges,
 }
 
 /// The model work one service still owes once its analysis has run.
