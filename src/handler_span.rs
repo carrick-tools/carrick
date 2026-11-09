@@ -21,10 +21,17 @@
 //!   file with that name. Two same-named definitions, or none (an imported
 //!   handler), place nothing.
 //! - Anything else (a wrapper call around the handler, an object), and a row
-//!   with no call span (a model row joined to no call site), fall back to the
-//!   name the model gave its handler, read as the identifier is. An inline
-//!   handler the model calls `anonymous` matches no definition and places
-//!   nothing.
+//!   whose call is not found, fall back to the name the model gave its
+//!   handler, read as the identifier is. An inline handler the model calls
+//!   `anonymous` matches no definition and places nothing.
+//!
+//! A row with no call span in `file_results` (a receiver-trace or library-fact
+//! row, or a model row joined to no call site) is read from the call its own
+//! file and line name instead (carrick#3655): a call whose callee is a member
+//! named by the row's method (`router.get(`, `app.post<…>(`) and which opens,
+//! or whose member sits, on that line. Two such calls on one line read as
+//! neither. A registration keyed some other way (`app.route({ … })`,
+//! `app.on("GET", …)`, a decorator) is not found by its line.
 //!
 //! A named definition that opens above the registration line and contains it
 //! is the function the route is registered FROM (a plugin), never the handler
@@ -38,7 +45,7 @@ use crate::visitor::FunctionDefinition;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use swc_common::{FileName, SourceMap, Span, Spanned, errors::Handler, sync::Lrc};
-use swc_ecma_ast::{CallExpr, Expr};
+use swc_ecma_ast::{CallExpr, Callee, Expr, MemberProp};
 use swc_ecma_visit::{Visit, VisitWith};
 
 /// What a registration call hands in last.
@@ -54,6 +61,23 @@ enum HandedIn {
 
 /// A call's span in SWC's numbering, as the candidate scanner records it.
 type CallSpan = (u32, u32);
+
+/// A registration named by a row's own place: its line and lower-cased method.
+type CallLine = (u32, String);
+
+/// The registration calls one file is asked about.
+#[derive(Default)]
+struct Wanted {
+    spans: HashSet<CallSpan>,
+    lines: HashSet<CallLine>,
+}
+
+/// What each asked-about call in one file hands in last.
+#[derive(Default)]
+struct HandedInByCall {
+    by_span: HashMap<CallSpan, HandedIn>,
+    by_line: HashMap<CallLine, HandedIn>,
+}
 
 /// Stamp `handler_span` onto every HTTP endpoint row the payload holds: the
 /// mount graph's rows, and the top-level `endpoints[]` rows projected from
@@ -74,23 +98,37 @@ pub fn attach_handler_spans(
     }
 
     let calls = registration_calls(data.file_results.as_ref());
-    let mut wanted: HashMap<&str, HashSet<CallSpan>> = HashMap::new();
-    for ((file, _, _), span) in &calls {
-        if let Some(span) = span {
-            wanted.entry(file.as_str()).or_default().insert(*span);
-        }
-    }
-    let handed_in: HashMap<String, HashMap<CallSpan, HandedIn>> = wanted
-        .into_iter()
-        .filter_map(|(file, spans)| {
-            let text = read(file)?;
-            Some((file.to_string(), last_arguments(file, text, &spans)))
-        })
-        .collect();
-
     let Some(graph) = data.mount_graph.as_mut() else {
         return 0;
     };
+
+    // A row joined to a call is read at that call's span; any other row at the
+    // call its own file and line name.
+    let mut wanted: HashMap<String, Wanted> = HashMap::new();
+    for endpoint in &graph.endpoints {
+        let Some((file, line)) = split_location(&endpoint.file_location) else {
+            continue;
+        };
+        let method = endpoint.method.to_ascii_lowercase();
+        let call = calls.get(&(file.clone(), line, method.clone())).copied();
+        let asked = wanted.entry(file).or_default();
+        match call.flatten() {
+            Some(span) => {
+                asked.spans.insert(span);
+            }
+            None => {
+                asked.lines.insert((line, method));
+            }
+        }
+    }
+    let handed_in: HashMap<String, HandedInByCall> = wanted
+        .into_iter()
+        .filter_map(|(file, asked)| {
+            let text = read(&file)?;
+            let found = last_arguments(&file, text, &asked);
+            Some((file, found))
+        })
+        .collect();
 
     let mut placed_rows: HashMap<(String, OperationKey, Option<String>), HandlerSpan> =
         HashMap::new();
@@ -100,17 +138,21 @@ pub fn attach_handler_spans(
             continue;
         };
         let defs = by_file.get(&file).map(Vec::as_slice).unwrap_or_default();
+        let method = endpoint.method.to_ascii_lowercase();
         let call = calls
-            .get(&(file.clone(), line, endpoint.method.to_ascii_lowercase()))
+            .get(&(file.clone(), line, method.clone()))
             .copied()
             .flatten();
-        let last = call.map(|span| {
-            handed_in
-                .get(&file)
-                .and_then(|calls| calls.get(&span))
-                .cloned()
-                .unwrap_or(HandedIn::Other)
-        });
+        let found = handed_in.get(&file);
+        let last = match call {
+            Some(span) => Some(
+                found
+                    .and_then(|found| found.by_span.get(&span))
+                    .cloned()
+                    .unwrap_or(HandedIn::Other),
+            ),
+            None => found.and_then(|found| found.by_line.get(&(line, method)).cloned()),
+        };
         let span = place(defs, line, last, endpoint.handler.as_deref());
         endpoint.handler_span = span;
         if let Some(span) = span {
@@ -181,14 +223,10 @@ fn registration_calls(
     calls
 }
 
-/// What each call at `spans` hands in last, read from the file's text parsed
+/// What each call `asked` names hands in last, read from the file's text parsed
 /// on a fresh source map: the numbering the candidate scanner recorded the
 /// spans in (`swc_scanner::SWC_SPAN_BASE`).
-fn last_arguments(
-    file: &str,
-    text: String,
-    spans: &HashSet<CallSpan>,
-) -> HashMap<CallSpan, HandedIn> {
+fn last_arguments(file: &str, text: String, asked: &Wanted) -> HandedInByCall {
     let source_map: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_emitter_writer(Box::new(std::io::sink()), None);
     let path = Path::new(file);
@@ -200,12 +238,12 @@ fn last_arguments(
         &handler,
         None,
     ) else {
-        return HashMap::new();
+        return HandedInByCall::default();
     };
     let mut reader = LastArguments {
         source_map: &source_map,
-        spans,
-        found: HashMap::new(),
+        asked,
+        found: HandedInByCall::default(),
     };
     module.visit_with(&mut reader);
     reader.found
@@ -213,33 +251,75 @@ fn last_arguments(
 
 struct LastArguments<'a> {
     source_map: &'a SourceMap,
-    spans: &'a HashSet<CallSpan>,
-    found: HashMap<CallSpan, HandedIn>,
+    asked: &'a Wanted,
+    found: HandedInByCall,
 }
 
 impl LastArguments<'_> {
+    fn line(&self, at: swc_common::BytePos) -> u32 {
+        self.source_map.lookup_char_pos(at).line as u32
+    }
+
     fn lines(&self, span: Span) -> HandlerSpan {
         HandlerSpan {
-            start_line: self.source_map.lookup_char_pos(span.lo).line as u32,
-            end_line: self.source_map.lookup_char_pos(span.hi).line as u32,
+            start_line: self.line(span.lo),
+            end_line: self.line(span.hi),
         }
+    }
+
+    fn handed_in(&self, call: &CallExpr) -> HandedIn {
+        let last = call.args.last().filter(|arg| arg.spread.is_none());
+        match last.map(|arg| crate::graphql_document_sites::unwrap_expression(&arg.expr)) {
+            Some(Expr::Arrow(arrow)) => HandedIn::Literal(self.lines(arrow.span)),
+            Some(Expr::Fn(function)) => HandedIn::Literal(self.lines(function.function.span())),
+            Some(Expr::Ident(ident)) => HandedIn::Named(ident.sym.to_string()),
+            _ => HandedIn::Other,
+        }
+    }
+
+    /// The asked-about rows this call is the registration of: its callee is a
+    /// member named by the row's method, and the call opens, or that member
+    /// sits, on the row's line.
+    fn asked_lines(&self, call: &CallExpr) -> Vec<CallLine> {
+        if self.asked.lines.is_empty() {
+            return Vec::new();
+        }
+        let Callee::Expr(callee) = &call.callee else {
+            return Vec::new();
+        };
+        let Expr::Member(member) = crate::graphql_document_sites::unwrap_expression(callee) else {
+            return Vec::new();
+        };
+        let MemberProp::Ident(property) = &member.prop else {
+            return Vec::new();
+        };
+        let method = property.sym.as_str().to_ascii_lowercase();
+        let mut lines = vec![self.line(call.span.lo), self.line(property.span.lo)];
+        lines.dedup();
+        lines
+            .into_iter()
+            .map(|line| (line, method.clone()))
+            .filter(|key| self.asked.lines.contains(key))
+            .collect()
     }
 }
 
 impl Visit for LastArguments<'_> {
     fn visit_call_expr(&mut self, call: &CallExpr) {
         let key = (call.span.lo.0, call.span.hi.0);
-        if self.spans.contains(&key) {
-            let last = call.args.last().filter(|arg| arg.spread.is_none());
-            let handed_in = match last
-                .map(|arg| crate::graphql_document_sites::unwrap_expression(&arg.expr))
-            {
-                Some(Expr::Arrow(arrow)) => HandedIn::Literal(self.lines(arrow.span)),
-                Some(Expr::Fn(function)) => HandedIn::Literal(self.lines(function.function.span())),
-                Some(Expr::Ident(ident)) => HandedIn::Named(ident.sym.to_string()),
-                _ => HandedIn::Other,
+        if self.asked.spans.contains(&key) {
+            let handed_in = self.handed_in(call);
+            self.found.by_span.insert(key, handed_in);
+        }
+        for key in self.asked_lines(call) {
+            // A second registration at one line and method: which one the
+            // row is cannot be told.
+            let handed_in = if self.found.by_line.contains_key(&key) {
+                HandedIn::Other
+            } else {
+                self.handed_in(call)
             };
-            self.found.insert(key, handed_in);
+            self.found.by_line.insert(key, handed_in);
         }
         call.visit_children_with(self);
     }
@@ -613,6 +693,39 @@ mod tests {
         );
 
         attach_handler_spans(&mut data, |_: &str| None);
+        assert_eq!(spans(&data), vec![None]);
+    }
+
+    /// carrick#3655: a receiver-trace or library-fact row has no call span in
+    /// `file_results`. Its own file and line name the registration call, and
+    /// the arrow that call hands in after its middleware is the handler.
+    #[test]
+    fn a_trace_row_with_no_call_span_is_placed_from_the_call_at_its_line() {
+        const FILE: &str = "src/routes/engagements.ts";
+        const TEXT: &str = "const router = new Hono()\n\nrouter.get('/:id', zValidator('param', idParam), async (c) => {\n  const { id } = c.req.valid('param')\n  return c.json(await getEngagement(id))\n})\n";
+        let mut data = payload(
+            vec![],
+            vec![row("GET", "/:id", "anonymous", &format!("{FILE}:3"))],
+        );
+        assert!(data.file_results.is_none());
+
+        assert_eq!(attach_handler_spans(&mut data, reader(FILE, TEXT)), 1);
+        assert_eq!(spans(&data), vec![span(3, 6)]);
+        assert_eq!(data.endpoints[0].handler_span, span(3, 6));
+    }
+
+    /// The same row whose call hands in a handler imported from another file
+    /// places nothing, as before: the file declares no function of that name.
+    #[test]
+    fn a_trace_row_whose_handler_is_imported_places_nothing() {
+        const FILE: &str = "src/routes/orders.ts";
+        const TEXT: &str = "import { listOrders } from '../handlers/orders'\n\nrouter.get('/orders', requireAuth, listOrders)\n";
+        let mut data = payload(
+            vec![def("listOrders", "src/handlers/orders.ts", 3, 9)],
+            vec![row("GET", "/orders", "listOrders", &format!("{FILE}:3"))],
+        );
+
+        assert_eq!(attach_handler_spans(&mut data, reader(FILE, TEXT)), 0);
         assert_eq!(spans(&data), vec![None]);
     }
 
