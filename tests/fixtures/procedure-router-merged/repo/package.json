@@ -1,0 +1,9 @@
+{
+  "name": "procedure-router-merged",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-procs": "^1.0.0",
+    "fixture-web": "^1.0.0"
+  }
+}

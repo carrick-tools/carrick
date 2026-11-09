@@ -236,6 +236,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
                 yields: None,
                 mounts: None,
                 collects: None,
+                merges: None,
             },
         ),
         check(

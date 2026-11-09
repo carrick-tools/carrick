@@ -1003,7 +1003,11 @@ export class LibraryClaimsVerifier {
         const builtAtDefaults = built === undefined ? undefined : atDefaults(check, built);
         // An adapter's `runs` is read against the request's collections only
         // when today's reading refuses it (#2474 R6a): `judgeMake` asks.
-        const collectionsOf = check.claim.kind === 'make' && check.claim.runs !== undefined ? collections : undefined;
+        const collectionsOf =
+          (check.claim.kind === 'make' && check.claim.runs !== undefined) ||
+          (check.claim.kind === 'scope' && check.claim.merges !== undefined)
+            ? collections
+            : undefined;
         const holding: ts.Signature[] = [];
         const declarations: DeclaredAt[] = [];
         const members: ts.Declaration[] = [];
@@ -2558,7 +2562,7 @@ class DeclarationReader {
       case 'make':
         return this.judgeMake(receiver, claim, built, collections);
       case 'scope':
-        return this.judgeScope(receiver, claim, built);
+        return this.judgeScope(receiver, claim, built, collections);
       case 'op':
         return { outcome: this.judgeOp(receiver, claim, rules) };
       case 'reserved':
@@ -2673,20 +2677,44 @@ class DeclarationReader {
    * beside `runs`, `yields` or `mounts` (`claim_invalid`). With `collects`
    * the member takes an object of procedures there (`collectsOutcome`), and
    * its return, the collection, is read as a plain scope's is.
+   *
+   * Merged collections (amendment 9): `merges` is a third way to carry the
+   * scope, alone and as `{ arg, each: true }`. The member's parameter at
+   * `arg`, read through a rest (`parameterAt`), takes what a verified
+   * `collects` scope of the request returns (`collectionSlotOutcome`), and
+   * the return is read as a plain scope's is.
    */
-  private judgeScope(receiver: MessageReceiver, claim: ScopeClaim, built?: ts.Signature): Judged {
+  private judgeScope(
+    receiver: MessageReceiver,
+    claim: ScopeClaim,
+    built?: ts.Signature,
+    collections?: () => readonly ts.Type[] | undefined
+  ): Judged {
     if (claim.form === 'decorate') return { outcome: this.decorateScopeOutcome(receiver, claim) };
     if ((claim.runs === undefined) !== (claim.yields === undefined)) return { outcome: unchecked('claim_invalid') };
     if (claim.mounts !== undefined && claim.runs !== undefined) return { outcome: unchecked('claim_invalid') };
-    if ((claim.name === undefined) === (claim.collects === undefined)) return { outcome: unchecked('claim_invalid') };
-    if (claim.collects !== undefined && (claim.runs !== undefined || claim.mounts !== undefined)) {
+    const carried = [claim.name, claim.collects, claim.merges].filter(part => part !== undefined).length;
+    if (carried !== 1) return { outcome: unchecked('claim_invalid') };
+    if (
+      (claim.collects !== undefined || claim.merges !== undefined) &&
+      (claim.runs !== undefined || claim.mounts !== undefined)
+    ) {
       return { outcome: unchecked('claim_invalid') };
     }
+    const merges = claim.merges;
+    if (
+      merges !== undefined &&
+      (merges.each !== true || merges.key !== undefined || merges.at !== undefined)
+    ) {
+      return { outcome: unchecked('claim_invalid') };
+    }
+    const collected = merges === undefined ? undefined : collections?.();
     const binds = claim.runs !== undefined || claim.mounts !== undefined;
     const layout = this.layout({ name: claim.name, runs: claim.runs, mounts: claim.mounts });
     if ('failure' in layout) return { outcome: layout.failure };
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
     if ('failure' in callee) return { outcome: callee.failure };
+    if (merges !== undefined && collected === undefined) return { outcome: failed('merges_unbound') };
     const labels = claim.key_labels ?? {};
     const holding: ts.Signature[] = [];
     let best: RankedFailure | undefined;
@@ -2703,6 +2731,12 @@ class DeclarationReader {
       if (result.rank === Infinity && claim.collects !== undefined) {
         const collected = this.collectsOutcome(signature, claim.collects);
         if (collected) result = { rank: 5, outcome: collected };
+      }
+      if (result.rank === Infinity && merges !== undefined && collected !== undefined) {
+        const merged =
+          this.mergesNotRest(signature, merges.arg) ??
+          this.collectionSlotOutcome(signature, this.mergedSlotAt(signature, merges.arg), collected, 'merges');
+        if (merged) result = { rank: 5, outcome: merged };
       }
       if (result.rank === Infinity && !binds && this.returnSaysNothing(this.returnOf(signature, built))) {
         result = { rank: 6, outcome: unchecked('scope_unresolved') };
@@ -2776,23 +2810,64 @@ class DeclarationReader {
 
   /**
    * An adapter's `runs` slot (#2474 R6a) takes one of `collections`, the
-   * types the request's verified `collects` scopes return, read as a mounted
-   * instance is (`fitsErased`, then assignability). A slot typed `any`,
-   * `unknown`, `{}` or by an unconstrained type parameter says nothing
-   * (`runs_untyped`). Undefined when it holds.
+   * types the request's verified `collects` scopes return.
    */
   private runsCollectionOutcome(
     signature: ts.Signature,
     declared: Slot | undefined,
     collections: readonly ts.Type[]
   ): Outcome | undefined {
+    return this.collectionSlotOutcome(signature, declared, collections, 'runs');
+  }
+
+  /** A merge's slot at `index` must be a rest parameter (or an element of one): a plain parameter fails `merges_not_rest`. */
+  private mergesNotRest(signature: ts.Signature, index: number): Outcome | undefined {
+    const restIndex = this.restIndexOf(signature);
+    const plain = restIndex === -1 || index < restIndex;
+    return plain && index < signature.getParameters().length ? failed('merges_not_rest') : undefined;
+  }
+
+  /**
+   * What a merge's rest slot takes at `index` (amendment 9): the element
+   * `parameterAt` reads, and when that is itself a type parameter spread into
+   * the rest (`...routers: [...R]` with `R extends Router[]`), its
+   * constraint's element. Only that spread is unwrapped: a parameter that
+   * takes an array of routers (`routers: Router[]`, `...lists: Router[][]`)
+   * is a merge over an array, which amendment 9 leaves out.
+   */
+  private mergedSlotAt(signature: ts.Signature, index: number): Slot | undefined {
+    const slot = this.parameterAt(signature, index, true);
+    if (slot === undefined || slot === VARIADIC) return slot;
+    const restIndex = this.restIndexOf(signature);
+    if (restIndex === -1 || index < restIndex || !(slot.flags & ts.TypeFlags.TypeParameter)) return slot;
+    const through = this.throughConstraint(slot);
+    if (through !== VARIADIC && this.checker.isArrayType(through)) {
+      return this.checker.getTypeArguments(through as ts.TypeReference)[0];
+    }
+    return slot;
+  }
+
+  /**
+   * A slot that takes one of `collections`, read as a mounted instance is
+   * (`fitsErased`, then assignability): an adapter's `runs` slot and a merge's
+   * rest slot (amendment 9). A slot typed `any`, `unknown`, `{}` or by an
+   * unconstrained type parameter says nothing (`<reason>_untyped`); one that
+   * takes none of them fails (`<reason>_not_collection`). Undefined when it
+   * holds.
+   */
+  private collectionSlotOutcome(
+    signature: ts.Signature,
+    declared: Slot | undefined,
+    collections: readonly ts.Type[],
+    reason: 'runs' | 'merges'
+  ): Outcome | undefined {
     if (declared === undefined) return failed('param_missing');
     const slot = this.throughConstraint(declared);
-    if (slot === VARIADIC) return unchecked('runs_untyped');
+    if (slot === VARIADIC) return unchecked(`${reason}_untyped`);
     const parts = this.parts(slot);
-    if (parts.length === 0) return failed('runs_not_collection');
+    if (parts.length === 0) return failed(`${reason}_not_collection`);
     if (parts.some(part => this.isOpenTop(part) || this.isUnconstrained(part) || this.isEmptyObject(part))) {
-      return unchecked('runs_untyped');
+      return unchecked(`${reason}_untyped`);
     }
     const own = signature.typeParameters ?? [];
     for (const collection of collections) {
@@ -2800,7 +2875,7 @@ class DeclarationReader {
       if (erased === true) return undefined;
       if (erased === undefined && this.checker.isTypeAssignableTo(collection, slot)) return undefined;
     }
-    return failed('runs_not_collection');
+    return failed(`${reason}_not_collection`);
   }
 
   /**
@@ -3253,6 +3328,7 @@ class DeclarationReader {
     if (
       claim.name === undefined ||
       claim.collects !== undefined ||
+      claim.merges !== undefined ||
       claim.runs !== undefined ||
       claim.yields !== undefined ||
       claim.mounts !== undefined
@@ -6028,6 +6104,13 @@ class DeclarationReader {
     return (type.isUnion() ? type.types : [type]).filter(part => !isNullish(part));
   }
 
+  /** The index of the signature's rest parameter, or -1 when it has none. */
+  private restIndexOf(signature: ts.Signature): number {
+    const parameters = signature.getParameters();
+    const declaration = parameters[parameters.length - 1]?.valueDeclaration;
+    return declaration && ts.isParameter(declaration) && declaration.dotDotDotToken ? parameters.length - 1 : -1;
+  }
+
   /**
    * What the signature has at parameter `index`, reading through a rest
    * parameter; `undefined` when it has none there. A rest typed by a type
@@ -6037,11 +6120,7 @@ class DeclarationReader {
   private parameterAt(signature: ts.Signature, index: number, readConstraint = false): Slot | undefined {
     const parameters = signature.getParameters();
     const last = parameters[parameters.length - 1];
-    const declaration = last?.valueDeclaration;
-    const restIndex =
-      declaration && ts.isParameter(declaration) && declaration.dotDotDotToken
-        ? parameters.length - 1
-        : -1;
+    const restIndex = this.restIndexOf(signature);
     if (restIndex === -1 || index < restIndex) {
       return index < parameters.length ? this.checker.getTypeOfSymbol(parameters[index]) : undefined;
     }

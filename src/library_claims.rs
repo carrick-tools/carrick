@@ -238,7 +238,8 @@ impl ExportClaims {
     /// (`<prefix>:scope:<path.member>:name@<slot>:<binds>[:on/of…]`, where
     /// `<binds>` is `runs@<slot>><param>`, `mounts@<slot>` or `returns` and
     /// a slot is `<arg>` or `<arg>.<key>`; a procedure router's member spells
-    /// `collects@<slot>/<join>` in the name's place, #2474 R6a): what the
+    /// `collects@<slot>/<join>` in the name's place, #2474 R6a, and a merging
+    /// member `merges@<arg>`, amendment 9): what the
     /// receiver trace sends in
     /// its own request (carrick#2474 R2b, carrick#1678), never the library
     /// check's.
@@ -556,6 +557,7 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             yields,
             mounts,
             collects,
+            merges,
             ..
         } => {
             // What it binds (carrick#2474 R0's fields): two scope claims of
@@ -585,13 +587,27 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
                 Some(key) => format!("collects@{}.{key}/{}", collects.arg, collects.join),
                 None => format!("collects@{}/{}", collects.arg, collects.join),
             };
-            let named = match (name, collects) {
-                (Some(name), None) => format!("name@{}:{binds}", slot(name)),
-                (None, Some(collects)) => collected(collects),
-                (Some(name), Some(collects)) => {
+            // Merged collections (amendment 9) spell `merges@<arg>` there.
+            let named = match (name, collects, merges) {
+                (Some(name), None, None) => format!("name@{}:{binds}", slot(name)),
+                (None, Some(collects), None) => collected(collects),
+                (Some(name), Some(collects), None) => {
                     format!("name@{}:{binds}:{}", slot(name), collected(collects))
                 }
-                (None, None) => return None,
+                (None, None, Some(merges)) => format!("merges@{}", slot(merges)),
+                (Some(name), None, Some(merges)) => {
+                    format!("name@{}:{binds}:merges@{}", slot(name), slot(merges))
+                }
+                (None, Some(collects), Some(merges)) => {
+                    format!("{}:merges@{}", collected(collects), slot(merges))
+                }
+                (Some(name), Some(collects), Some(merges)) => format!(
+                    "name@{}:{binds}:{}:merges@{}",
+                    slot(name),
+                    collected(collects),
+                    slot(merges)
+                ),
+                (None, None, None) => return None,
             };
             Some(format!(
                 "{prefix}:scope:{}:{named}{}{}",
@@ -2240,6 +2256,8 @@ mod tests {
                   "name": { "arg": 0 } },
                 { "kind": "scope", "member": "both", "of": "instance:create",
                   "name": { "arg": 0 }, "collects": { "arg": 1, "join": "." } },
+                { "kind": "scope", "member": "mergeRouters", "of": "instance:create",
+                  "merges": { "arg": 0, "each": true } },
                 { "kind": "op", "op": "receive", "member": "query", "path": ["procedure"],
                   "of": "instance:create", "name": { "bound": "key" },
                   "handler": { "arg": 0 }, "method": "GET" }
@@ -2257,6 +2275,7 @@ mod tests {
                 "fixture-procs@3:init:scope:router:collects@0.routes//:of:instance:create",
                 "fixture-procs@3:init:scope:basePath:name@0:returns:of:instance:create",
                 "fixture-procs@3:init:scope:both:name@0:returns:collects@1/.:of:instance:create",
+                "fixture-procs@3:init:scope:mergeRouters:merges@0:of:instance:create",
                 "fixture-procs@3:init:op:receive:procedure.query:of:instance:create",
             ]
         );

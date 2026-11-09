@@ -778,7 +778,7 @@ export type LibraryClaim =
       member: string;
       /** Amendment 7: absent is `call`; `decorate` is a class decorator whose name prefixes its methods' ops. */
       form?: 'call' | 'decorate';
-      /** Exactly one of `name` and `collects` (#2474 R6a). */
+      /** Exactly one of `name`, `collects` and `merges` (#2474 R6a). */
       name?: NameSlot;
       path?: string[];
       on?: ClaimOn;
@@ -797,6 +797,13 @@ export type LibraryClaim =
       mounts?: ClaimSlot;
       /** Procedure routers (#2474 R6a): the member collects procedures by key and returns the collection. */
       collects?: Collects;
+      /**
+       * Merged collections (amendment 9 on carrick#2434): the member takes
+       * the collections a verified `collects` member returns at `arg` and at
+       * every argument after it (`each: true`), and returns one collection
+       * serving all their procedures at the same level.
+       */
+      merges?: ClaimSlot;
     }
   | {
       kind: 'op';

@@ -60,6 +60,8 @@ pub struct ProcedureLabels {
     keyed: Vec<(String, String, String)>,
     /// The verified router members.
     collects: Vec<CollectsLabel>,
+    /// The verified members that merge the routers they are given.
+    merges: Vec<MergesLabel>,
     /// The makers that take a collection at their `runs` slot.
     adapters: Vec<AdapterLabel>,
 }
@@ -75,6 +77,16 @@ struct CollectsLabel {
     declarations: Vec<(String, u32)>,
 }
 
+/// A member the trace's own request verified as taking routers from `arg`
+/// on (a rest slot, contract amendment 9), and the declarations its
+/// verdicts name. Its return serves every argument's procedures at the
+/// level it is called at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergesLabel {
+    arg: usize,
+    declarations: Vec<(String, u32)>,
+}
+
 /// A maker that may serve a collection: the export, the member and form,
 /// the `runs` slot and the `prefix` slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +97,27 @@ struct AdapterLabel {
     new: bool,
     runs: (usize, Option<String>),
     prefix: Option<(usize, Option<String>)>,
+}
+
+/// The member declarations the request's verdicts name for the claim
+/// `claim_id` of `export`, sorted and without repeats.
+fn verified_declarations(
+    export: &crate::library_claims::ExportClaims,
+    claim_id: &str,
+    verified: &HashMap<super::super::discovery::AskedScope, Vec<(String, u32)>>,
+) -> Vec<(String, u32)> {
+    let mut declarations: Vec<(String, u32)> = verified
+        .iter()
+        .filter(|(asked, _)| {
+            asked.package == export.package
+                && asked.export == export.export
+                && asked.claim_id == claim_id
+        })
+        .flat_map(|(_, declarations)| declarations.iter().cloned())
+        .collect();
+    declarations.sort();
+    declarations.dedup();
+    declarations
 }
 
 impl ProcedureLabels {
@@ -105,17 +138,7 @@ impl ProcedureLabels {
                         path,
                         ..
                     } if path.is_empty() => {
-                        let mut declarations: Vec<(String, u32)> = verified
-                            .iter()
-                            .filter(|(asked, _)| {
-                                asked.package == export.package
-                                    && asked.export == export.export
-                                    && asked.claim_id == claim_id
-                            })
-                            .flat_map(|(_, declarations)| declarations.iter().cloned())
-                            .collect();
-                        declarations.sort();
-                        declarations.dedup();
+                        let declarations = verified_declarations(export, &claim_id, verified);
                         if declarations.is_empty() {
                             continue;
                         }
@@ -127,6 +150,24 @@ impl ProcedureLabels {
                         };
                         if !labels.collects.contains(&label) {
                             labels.collects.push(label);
+                        }
+                    }
+                    LibraryClaim::Scope {
+                        merges: Some(merges),
+                        collects: None,
+                        path,
+                        ..
+                    } if path.is_empty() => {
+                        let declarations = verified_declarations(export, &claim_id, verified);
+                        if declarations.is_empty() {
+                            continue;
+                        }
+                        let label = MergesLabel {
+                            arg: merges.arg as usize,
+                            declarations,
+                        };
+                        if !labels.merges.contains(&label) {
+                            labels.merges.push(label);
                         }
                     }
                     LibraryClaim::Op {
@@ -451,6 +492,40 @@ impl Pass<'_, '_> {
         matched.all(|other| other == label).then_some(label)
     }
 
+    /// The one `merges` label that holds `declared` as a declaration.
+    fn merges_at(&self, declared: &(String, u32)) -> Option<&MergesLabel> {
+        let mut matched = self
+            .labels
+            .merges
+            .iter()
+            .filter(|label| label.declarations.contains(declared));
+        let label = matched.next()?;
+        matched.all(|other| other == label).then_some(label)
+    }
+
+    /// The verified merging member the call at `span` in `file` resolves
+    /// to, directly or through one `const` alias. A declaration both a
+    /// `collects` and a `merges` label hold says nothing.
+    fn merges_of(
+        &self,
+        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
+        file: &Path,
+        span: swc_common::Span,
+    ) -> Option<&MergesLabel> {
+        let direct = self.inputs.positions.as_ref().and_then(|positions| {
+            let row = positions
+                .lookup(file, span.lo.0, span.hi.0, Kind::Call)
+                .ok()?;
+            Some((row.decl_file()?.to_string(), row.decl_line()?))
+        });
+        let declared = match direct.filter(|declared| self.merges_at(declared).is_some()) {
+            Some(declared) => declared,
+            None => self.aliased_declaration(modules, file, span)?,
+        };
+        let label = self.merges_at(&declared)?;
+        (self.collects_at(&declared).is_none()).then_some(label)
+    }
+
     /// The declaration (file and line) a call's callee names through one
     /// hop: the callee is an in-repo `const` whose initialiser is a member
     /// or a name, and the compiler's row at that initialiser names the
@@ -546,6 +621,33 @@ impl Pass<'_, '_> {
                             stopped: above.stopped,
                         };
                         self.walk(modules, file, &collected, below, leaves, stack, reached);
+                    }
+                } else if let Some(label) = self.merges_of(modules, file, span) {
+                    // Every argument from the slot on is a router served at
+                    // the level the merge is called at, under the same keys.
+                    let mut merged: Vec<Expr> = Vec::new();
+                    for arg in call.args.iter().skip(label.arg) {
+                        if arg.spread.is_some() {
+                            reached.stops += 1;
+                        } else {
+                            merged.push((*arg.expr).clone());
+                        }
+                    }
+                    let below = Above {
+                        owner: above.bound.clone().or(above.owner.clone()),
+                        bound: None,
+                        ..above.clone()
+                    };
+                    for argument in merged {
+                        self.walk(
+                            modules,
+                            file,
+                            &argument,
+                            below.clone(),
+                            leaves,
+                            stack,
+                            reached,
+                        );
                     }
                 } else if let Some((declared, line, _)) =
                     self.own_declaration(file, span, Kind::Call)

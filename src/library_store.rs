@@ -1629,14 +1629,16 @@ fn parse_export(
             });
             let parsed = tagged
                 .and_then(|()| serde_json::from_value::<LibraryClaim>(element).ok())
-                // A scope names a prefix or collects procedures (#2474 R6a);
-                // one that does neither is out of shape.
+                // A scope names a prefix, collects procedures (#2474 R6a) or
+                // merges collections (amendment 9); one that does none is
+                // out of shape.
                 .filter(|claim| {
                     !matches!(
                         claim,
                         LibraryClaim::Scope {
                             name: None,
                             collects: None,
+                            merges: None,
                             ..
                         }
                     )

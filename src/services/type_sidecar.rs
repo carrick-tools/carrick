@@ -1346,8 +1346,8 @@ pub enum LibraryClaim {
     },
     /// `member(name)` (after `path`) returns a receiver bound to that name.
     /// A procedure router's member (`collects`, #2474 R6a) has no name: a
-    /// scope carries exactly one of `name` and `collects`, and the store
-    /// reader drops one with neither.
+    /// scope carries exactly one of `name`, `collects` and `merges`, and the
+    /// store reader drops one with none.
     Scope {
         member: String,
         /// Amendment 7: absent is `call`.
@@ -1381,6 +1381,13 @@ pub enum LibraryClaim {
         /// key and returns the collection.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collects: Option<Collects>,
+        /// Merged collections (contract amendment 9): the member takes the
+        /// collections a verified `collects` member returns at `arg` and at
+        /// every argument after it (`each`), and returns one collection
+        /// serving all their procedures at the same level. A scope carries
+        /// exactly one of `name`, `collects` and `merges`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        merges: Option<ClaimSlot>,
     },
     /// A member that acts on the wire; `member: None` is the object `path`
     /// reaches (the receiver itself when `path` is empty).
@@ -6362,6 +6369,7 @@ mod tests {
                         })),
                         mounts: Some(slot()),
                         collects: None,
+                        merges: None,
                     }),
                     // Procedure routers (#2474 R6a): a router member with no
                     // name, and an op named by its key.
@@ -6383,6 +6391,7 @@ mod tests {
                             key: Some("routes".into()),
                             join: ".".into(),
                         }),
+                        merges: None,
                     }),
                     library(LibraryClaim::Op {
                         form: None,
@@ -7114,6 +7123,7 @@ mod tests {
                         yields: None,
                         mounts: None,
                         collects: None,
+                        merges: None,
                     },
                 ),
                 check(

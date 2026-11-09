@@ -2165,3 +2165,25 @@ fn a_router_member_called_through_a_const_alias_collects_its_procedures() {
         ]
     );
 }
+
+/// A merging member (a verified `merges` scope) serves each argument's
+/// procedures at the level it is called at, under the same keys: called
+/// directly, through `const` aliases with one argument a `const` in another
+/// module, and under a key. A spread argument names no router. Answer key:
+/// the fixture's README.
+#[test]
+fn merged_routers_serve_each_routers_procedures_at_one_level() {
+    let (on, _) = scan_fixture_reading("procedure-router-merged");
+    let (graph, _) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            "src/merged-alias-use.ts:7 GET /rpc-merged-alias/list library_claim aliasedMerge",
+            "src/merged-nested.ts:6 GET /rpc-merged-nested/admin.x library_claim nestedMerge",
+            "src/merged-nested.ts:7 GET /rpc-merged-nested/admin.y library_claim nestedMerge",
+            "src/merged.ts:5 GET /rpc-merged/a library_claim mergedRouter",
+            "src/merged.ts:6 POST /rpc-merged/b library_claim mergedRouter",
+            "src/orders.ts:5 GET /rpc-merged-alias/get library_claim ordersRouter",
+        ]
+    );
+}
