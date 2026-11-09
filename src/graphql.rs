@@ -237,17 +237,18 @@ impl GraphqlProducerHints {
     /// co-location check in the don't-skip routing. `declared_schemas` are
     /// the files the service's `graphqlSchemas` resolved to.
     pub fn collect(
-        scan_roots: Vec<PathBuf>,
+        walk_roots: &[WalkRoot],
         declared_schemas: &[PathBuf],
         service_files: &[PathBuf],
     ) -> Self {
+        let scan_roots: Vec<PathBuf> = walk_roots.iter().map(|root| root.dir.clone()).collect();
         // Declared schemas (`graphqlSchemas`) are deliberately NOT in the hint
         // list: the hints are part of every analysed file's prompt, so adding
         // them would re-ask the model for the whole service the first time the
         // setting appears, and the setting is meant to take effect on a free
         // rescan. Their producer rows come from `scan_repo` in the engine, and
         // their lines reach only the files that build the schema in code.
-        let extraction = scan_repo(&scan_roots, &[], service_files);
+        let extraction = scan_walk_roots(walk_roots, &[], service_files);
         let lines: Vec<String> = extraction
             .producers
             .iter()
@@ -347,8 +348,8 @@ impl GraphqlConsumerHints {
     /// the deterministic pass already anchored (`TaggedTplVisitor::capture_request_call`
     /// matched an explicit generic) needs no hint — there is nothing left to
     /// locate.
-    pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf], repo_root: &str) -> Self {
-        let extraction = scan_repo(&scan_roots, &[], service_files);
+    pub fn collect(walk_roots: &[WalkRoot], service_files: &[PathBuf], repo_root: &str) -> Self {
+        let extraction = scan_walk_roots(walk_roots, &[], service_files);
         let mut lines = Vec::new();
         let mut files = std::collections::HashSet::new();
         for op in &extraction.consumers {
@@ -424,19 +425,69 @@ fn is_graphql_file(path: &Path) -> bool {
 /// [`SchemaCatalogue::build`] reads the repository's other schema files
 /// through the same test-folder filter: a schema this walk leaves out must not
 /// come back as another API's.
-fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
+fn graphql_files_under(roots: &[WalkRoot]) -> Vec<PathBuf> {
     graphql_files_under_within(roots, crate::file_finder::untrusted_bound)
+}
+
+/// One root of a service's GraphQL walk, with the directories it leaves out.
+///
+/// A service's own directory leaves out its nested services' directories, as
+/// its source walk does (carrick#553): a `.graphql`/`.gql` file there is the
+/// nested service's, so the parent neither serves it, votes on it
+/// ([`SchemaCatalogue::settle_walked_schemas`]), nor executes it. An
+/// `include` root is walked whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalkRoot {
+    /// The directory walked.
+    pub dir: PathBuf,
+    /// Directories under `dir` the walk does not enter.
+    pub left_out: Vec<PathBuf>,
+}
+
+impl From<PathBuf> for WalkRoot {
+    /// A root walked whole.
+    fn from(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            left_out: Vec::new(),
+        }
+    }
+}
+
+/// The directories a service's GraphQL walk reads: its own directory (the
+/// repo root for a flat config), leaving out its nested services'
+/// directories ([`crate::file_finder::nested_left_out`]), plus its `include`
+/// roots, walked whole. The same scoping as the source walk, so a monorepo
+/// package's schema is attributed only to the package that holds it (#242).
+pub fn service_walk_roots(repo_root: &Path, service: &crate::config::Config) -> Vec<WalkRoot> {
+    let own = crate::file_finder::service_root(repo_root, service);
+    let left_out = crate::file_finder::nested_left_out(service)
+        .into_iter()
+        .map(|nested| own.join(nested))
+        .collect();
+    let mut roots = vec![WalkRoot { dir: own, left_out }];
+    roots.extend(
+        service
+            .include
+            .iter()
+            .map(|inc| WalkRoot::from(repo_root.join(inc))),
+    );
+    roots
 }
 
 /// [`graphql_files_under`] with `bound_of` naming where a root's walk stops.
 /// Untrusted, a schema file linked from outside the checkout is not listed
 /// (carrick#2260).
 fn graphql_files_under_within(
-    roots: &[PathBuf],
+    roots: &[WalkRoot],
     bound_of: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for root in roots {
+    for WalkRoot {
+        dir: root,
+        left_out,
+    } in roots
+    {
         let bound = bound_of(root);
         for entry in WalkDir::new(root)
             .sort_by_file_name()
@@ -453,6 +504,7 @@ fn graphql_files_under_within(
                     && !bound
                         .as_deref()
                         .is_some_and(|bound| crate::file_finder::links_outside(e, bound))
+                    && !left_out.iter().any(|nested| e.path() == nested)
             })
             .filter_map(Result::ok)
         {
@@ -474,6 +526,8 @@ fn graphql_files_under_within(
 /// `include` roots), NOT the whole monorepo. Walking the repo root here would
 /// attribute a sibling package's schema to every service in the monorepo (#242):
 /// `orders-pkg` would be credited with `gateway`'s `query order` producer.
+/// Nor does the service's directory root enter a nested service's directory
+/// ([`service_walk_roots`], carrick#553).
 ///
 /// `declared_schemas` are the files the service names in `graphqlSchemas`
 /// (resolved by [`resolve_declared_schemas`]). They are read wherever they
@@ -482,8 +536,21 @@ fn graphql_files_under_within(
 /// service serves, so an executable document in one is not a call this service
 /// makes. They go first, so a declared file that also sits under a scan root
 /// is read once, as a declaration.
+///
+/// Each of `scan_roots` is walked whole; [`scan_walk_roots`] is the same
+/// scan over roots that leave directories out.
 pub fn scan_repo(
     scan_roots: &[PathBuf],
+    declared_schemas: &[PathBuf],
+    service_files: &[PathBuf],
+) -> GraphqlExtraction {
+    let roots: Vec<WalkRoot> = scan_roots.iter().cloned().map(WalkRoot::from).collect();
+    scan_walk_roots(&roots, declared_schemas, service_files)
+}
+
+/// [`scan_repo`] over a service's walk roots ([`service_walk_roots`]).
+pub fn scan_walk_roots(
+    scan_roots: &[WalkRoot],
     declared_schemas: &[PathBuf],
     service_files: &[PathBuf],
 ) -> GraphqlExtraction {
@@ -720,8 +787,10 @@ pub struct KnownSchema {
 /// Where one service reads schemas from, for [`SchemaCatalogue::build`].
 #[derive(Debug, Clone, Default)]
 pub struct ServedSchemaSources {
-    /// The service's SDL walk roots (its `directory` and `include` roots).
-    pub roots: Vec<PathBuf>,
+    /// The service's SDL walk roots (its `directory` and `include` roots),
+    /// with what each leaves out: the same roots its extraction walks
+    /// ([`service_walk_roots`]), so the catalogue's walked set agrees with it.
+    pub roots: Vec<WalkRoot>,
     /// The files its `graphqlSchemas` entries resolved to.
     pub declared: Vec<PathBuf>,
 }
@@ -2298,6 +2367,7 @@ fn is_builtin_type(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     /// A repo with a `.graphql` file inside and a link to one outside it.
     /// Returns the temp dir and the repo root (canonical).
@@ -2327,6 +2397,11 @@ mod tests {
         (dir, root)
     }
 
+    /// Each of `roots`, walked whole.
+    fn whole(roots: Vec<PathBuf>) -> Vec<WalkRoot> {
+        roots.into_iter().map(WalkRoot::from).collect()
+    }
+
     fn names(root: &Path, files: Vec<PathBuf>) -> Vec<String> {
         files
             .iter()
@@ -2340,7 +2415,7 @@ mod tests {
     #[test]
     fn untrusted_service_schema_walk_skips_a_link_out_of_the_checkout() {
         let (_dir, root) = repo_with_linked_schemas();
-        let roots = vec![root.clone()];
+        let roots = vec![WalkRoot::from(root.clone())];
         let open = names(&root, graphql_files_under_within(&roots, |_| None));
         assert!(
             open.contains(&"schema/linked.graphql".to_string()),
@@ -2596,7 +2671,7 @@ mod tests {
         )
         .unwrap();
 
-        let hints = GraphqlProducerHints::collect(vec![dir.clone()], &[], &[]);
+        let hints = GraphqlProducerHints::collect(&whole(vec![dir.clone()]), &[], &[]);
         assert_eq!(hints.lines, vec!["query order: Order".to_string()]);
         assert!(!hints.is_empty());
         assert!(hints.file_within_scan_roots(&dir.join("resolvers.ts")));
@@ -2604,7 +2679,7 @@ mod tests {
         // A scan root with no SDL produces no hints (the no-op path).
         let empty_root = dir.join("nested-empty");
         std::fs::create_dir_all(&empty_root).unwrap();
-        let empty = GraphqlProducerHints::collect(vec![empty_root], &[], &[]);
+        let empty = GraphqlProducerHints::collect(&whole(vec![empty_root]), &[], &[]);
         assert!(empty.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2630,7 +2705,7 @@ mod tests {
         )
         .unwrap();
 
-        let hints = GraphqlProducerHints::collect(vec![root], &[printed], &[]);
+        let hints = GraphqlProducerHints::collect(&whole(vec![root]), &[printed], &[]);
 
         assert_eq!(hints.lines, vec!["query order: Order".to_string()]);
         assert_eq!(
@@ -2644,7 +2719,7 @@ mod tests {
         assert!(hints.has_schema_fields());
 
         let declared_only = GraphqlProducerHints::collect(
-            vec![tmp.path().join("missing")],
+            &whole(vec![tmp.path().join("missing")]),
             &[tmp.path().join("printed.graphql")],
             &[],
         );
@@ -2710,11 +2785,8 @@ function subscribe(cb) {
         )
         .unwrap();
 
-        let hints = GraphqlConsumerHints::collect(
-            vec![],
-            std::slice::from_ref(&file),
-            &dir.to_string_lossy(),
-        );
+        let hints =
+            GraphqlConsumerHints::collect(&[], std::slice::from_ref(&file), &dir.to_string_lossy());
         std::fs::remove_dir_all(&dir).ok();
 
         // Only the unanchored subscription produces a hint line.
@@ -2728,7 +2800,7 @@ function subscribe(cb) {
         assert!(hints.file_has_hint(&file));
 
         // A file with no unanchored consumers yields no hints at all.
-        let empty = GraphqlConsumerHints::collect(vec![], &[], &dir.to_string_lossy());
+        let empty = GraphqlConsumerHints::collect(&[], &[], &dir.to_string_lossy());
         assert!(empty.is_empty());
         assert!(!empty.file_has_hint(&file));
     }
@@ -3469,15 +3541,15 @@ export const typeDefs = gql`
             root,
             &[
                 ServedSchemaSources {
-                    roots: roots("api"),
+                    roots: whole(roots("api")),
                     declared: vec![],
                 },
                 ServedSchemaSources {
-                    roots: roots("web"),
+                    roots: whole(roots("web")),
                     declared: vec![],
                 },
                 ServedSchemaSources {
-                    roots: roots("ops"),
+                    roots: whole(roots("ops")),
                     declared: vec![],
                 },
             ],
@@ -3603,7 +3675,10 @@ export const typeDefs = gql`
                 .collect()
         };
         let read = ["api/schema.graphql", "contracts/partner.graphql"];
-        assert_eq!(relative(graphql_files_under(&[root.to_path_buf()])), read);
+        assert_eq!(
+            relative(graphql_files_under(&[root.to_path_buf().into()])),
+            read
+        );
         assert_eq!(relative(graphql_files_on_disk(root)), read);
     }
 
@@ -3633,11 +3708,11 @@ export const typeDefs = gql`
             root,
             &[
                 ServedSchemaSources {
-                    roots: roots("api"),
+                    roots: whole(roots("api")),
                     declared: vec![],
                 },
                 ServedSchemaSources {
-                    roots: roots("web"),
+                    roots: whole(roots("web")),
                     declared: vec![],
                 },
             ],
@@ -3659,6 +3734,97 @@ export const typeDefs = gql`
         assert_eq!(files, vec![Path::new("api/src/schema.graphql")]);
     }
 
+    /// A service with its nested services' directories, as
+    /// `Config::load_services` computes them.
+    fn service_over(directory: Option<&str>, nested: &[&str], include: &[&str]) -> Config {
+        Config {
+            directory: directory.map(str::to_owned),
+            nested_directories: nested.iter().map(|dir| dir.to_string()).collect(),
+            include: include.iter().map(|dir| dir.to_string()).collect(),
+            ..Config::default()
+        }
+    }
+
+    /// carrick#553 for GraphQL files: a parent service's walk leaves its
+    /// nested services' directories out, as its source walk does; an
+    /// `include` root is walked whole.
+    #[test]
+    fn a_parent_services_walk_leaves_a_nested_services_graphql_files_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for rel in ["apps/api/schema.graphql", "docs/ops.graphql"] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "type Query { orders: [String] }").unwrap();
+        }
+        let listed = |service: &Config| -> Vec<String> {
+            let mut files = names(
+                root,
+                graphql_files_under(&service_walk_roots(root, service)),
+            );
+            files.sort();
+            files.dedup();
+            files
+        };
+
+        let parent = service_over(Some("."), &["apps/api"], &[]);
+        assert_eq!(listed(&parent), vec!["docs/ops.graphql".to_string()]);
+        let flat = service_over(None, &["apps/api"], &[]);
+        assert_eq!(listed(&flat), vec!["docs/ops.graphql".to_string()]);
+
+        let including = service_over(Some("."), &["apps/api"], &["apps/api"]);
+        assert_eq!(
+            listed(&including),
+            vec![
+                "apps/api/schema.graphql".to_string(),
+                "docs/ops.graphql".to_string()
+            ]
+        );
+    }
+
+    /// The order that lost a monorepo's documents: the root service, which
+    /// serves nothing, settled first and voted the nested server's schema
+    /// "not served" before the server had voted, so a client's document
+    /// against it read `External`. The root does not walk that file, so it
+    /// casts no vote on it.
+    #[test]
+    fn a_parent_service_does_not_vote_on_a_nested_services_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        write(
+            "apps/api/src/schema.graphql",
+            "type Query { orders: [String] }",
+        );
+        let document = write("apps/web/src/orders.gql", "query Orders { orders }");
+        let parent = service_over(Some("."), &["apps/api", "apps/web"], &[]);
+        let api = service_over(Some("apps/api"), &[], &[]);
+        let web = service_over(Some("apps/web"), &[], &[]);
+        let sources = |service: &Config| ServedSchemaSources {
+            roots: service_walk_roots(root, service),
+            declared: vec![],
+        };
+        let catalogue =
+            SchemaCatalogue::build(root, &[sources(&parent), sources(&api), sources(&web)]);
+
+        let mut parent_extraction = scan_walk_roots(&service_walk_roots(root, &parent), &[], &[]);
+        catalogue.settle_walked_schemas("(root)", &mut parent_extraction, false);
+        let web_extraction = scan_walk_roots(&service_walk_roots(root, &web), &[], &[]);
+        let attribution = catalogue.attribute(&web_extraction, |_| TransportOrigin::Unknown);
+        assert_eq!(
+            identity_of(&attribution, &web_extraction, &document.to_string_lossy()),
+            &DocumentIdentity::Served
+        );
+        let mut api_extraction = scan_walk_roots(&service_walk_roots(root, &api), &[], &[]);
+        catalogue.settle_walked_schemas("api", &mut api_extraction, true);
+        assert_eq!(api_extraction.producers.len(), 1);
+    }
+
     /// A second service that walks the same file and serves a schema keeps it
     /// served, whichever of the two is settled first.
     #[test]
@@ -3672,7 +3838,7 @@ export const typeDefs = gql`
         )
         .unwrap();
         let sources = ServedSchemaSources {
-            roots: vec![root.join("shared")],
+            roots: vec![root.join("shared").into()],
             declared: vec![],
         };
         let catalogue = SchemaCatalogue::build(root, &[sources.clone(), sources]);
@@ -3708,7 +3874,7 @@ export const typeDefs = gql`
         let catalogue = SchemaCatalogue::build(
             &link,
             &[ServedSchemaSources {
-                roots: vec![link.join("web")],
+                roots: vec![link.join("web").into()],
                 declared: vec![],
             }],
         );
@@ -4015,11 +4181,11 @@ export const typeDefs = gql`
             repo.path(),
             &[
                 ServedSchemaSources {
-                    roots: vec![repo.path().join("apps/api")],
+                    roots: vec![repo.path().join("apps/api").into()],
                     declared: vec![repo.path().join("tools/dist/printed.graphql")],
                 },
                 ServedSchemaSources {
-                    roots: vec![repo.path().join("apps/web")],
+                    roots: vec![repo.path().join("apps/web").into()],
                     declared: vec![],
                 },
             ],

@@ -1,0 +1,11 @@
+query items {
+  items
+}
+
+mutation renameItem($id: ID!) {
+  renameItem(id: $id)
+}
+
+query adminStats {
+  adminStats
+}

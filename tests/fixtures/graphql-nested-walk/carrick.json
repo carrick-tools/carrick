@@ -1,0 +1,20 @@
+{
+  "services": [
+    {
+      "serviceName": "workspace-root",
+      "directory": "."
+    },
+    {
+      "serviceName": "catalog-api",
+      "directory": "apps/api"
+    },
+    {
+      "serviceName": "documents",
+      "directory": "packages/documents"
+    },
+    {
+      "serviceName": "catalog-web",
+      "directory": "apps/web"
+    }
+  ]
+}
