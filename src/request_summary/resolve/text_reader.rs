@@ -95,20 +95,7 @@ impl<'a> Resolver<'a> {
         let hole = |reason| vec![TextValue::Hole(reason)];
         match value {
             ValueAt::Lit(text) => vec![TextValue::stated(text.clone(), Vec::new())],
-            ValueAt::Concat(parts) => {
-                let mut text = String::new();
-                let mut read_from = Vec::new();
-                for part in parts {
-                    match self.one_text(file, part) {
-                        Ok((part, from)) => {
-                            text.push_str(&part);
-                            note_all(&mut read_from, from);
-                        }
-                        Err(reason) => return hole(reason),
-                    }
-                }
-                vec![TextValue::stated(text, read_from)]
-            }
+            ValueAt::Concat(parts) => self.joined(file, parts),
             ValueAt::Read {
                 lo,
                 hi,
@@ -165,6 +152,69 @@ impl<'a> Resolver<'a> {
             }
         }
         self.text_values(file, branch)
+    }
+
+    /// Every text `parts`, joined in order, may be (carrick#3191): one per
+    /// choice of a text of each part, a part read as a choice
+    /// (`${at ?? "/x"}/:id`, a name holding one) giving each of its texts. A
+    /// joining that takes a part's hole is that hole, so a consumer that
+    /// refuses any hole still does. A part that is only holes is its first
+    /// hole, and more than [`MAX_VALUES`] joinings are a
+    /// [`guards::HoleReason::FanOutCap`].
+    fn joined(&self, file: &Path, parts: &[ValueAt]) -> Vec<TextValue> {
+        let mut out = vec![TextValue::stated(String::new(), Vec::new())];
+        for part in parts {
+            let values = self.text_values(file, part);
+            if let Some(TextValue::Hole(reason)) = values
+                .iter()
+                .find(|value| matches!(value, TextValue::Hole(_)))
+                .filter(|_| {
+                    values
+                        .iter()
+                        .all(|value| matches!(value, TextValue::Hole(_)))
+                })
+            {
+                return vec![TextValue::Hole(*reason)];
+            }
+            if out.len() * values.len() > MAX_VALUES {
+                return vec![TextValue::Hole(guards::HoleReason::FanOutCap)];
+            }
+            let mut next: Vec<TextValue> = Vec::new();
+            for head in &out {
+                for tail in &values {
+                    let joined = match (head, tail) {
+                        (TextValue::Hole(reason), _) | (_, TextValue::Hole(reason)) => {
+                            TextValue::Hole(*reason)
+                        }
+                        (
+                            TextValue::Text {
+                                text,
+                                read_from,
+                                from_type,
+                            },
+                            TextValue::Text {
+                                text: more,
+                                read_from: from,
+                                from_type: typed,
+                            },
+                        ) => {
+                            let mut read_from = read_from.clone();
+                            note_all(&mut read_from, from.clone());
+                            TextValue::Text {
+                                text: format!("{text}{more}"),
+                                read_from,
+                                from_type: *from_type || *typed,
+                            }
+                        }
+                    };
+                    if !next.contains(&joined) {
+                        next.push(joined);
+                    }
+                }
+            }
+            out = next;
+        }
+        out
     }
 
     /// `part` read as exactly one text, else why not.
@@ -264,8 +314,16 @@ impl<'a> Resolver<'a> {
             return hole(Recursion);
         };
         let mut out: Vec<TextValue> = Vec::new();
-        for source in sources {
+        // A write's value the reader does not state is the reassignment's
+        // hole: the name may hold it wherever it is read, so a consumer that
+        // reads past other holes (a route's ways, carrick#3191) still stops.
+        let writes_from = sources.len() - if written { binding.writes.len() } else { 0 };
+        for (index, source) in sources.into_iter().enumerate() {
             for value in self.text_values(at.0, source) {
+                let value = match value {
+                    TextValue::Hole(_) if index >= writes_from => TextValue::Hole(Reassigned),
+                    value => value,
+                };
                 // An empty text names nothing; in a written set it drops out.
                 let empty = matches!(&value, TextValue::Text { text, .. } if text.is_empty());
                 if (written && empty) || out.contains(&value) {
