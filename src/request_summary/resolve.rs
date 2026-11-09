@@ -1015,6 +1015,10 @@ pub(super) enum ValueAt {
         out: u8,
         member: Option<Box<MemberCall>>,
         made: Option<Box<ClientRef>>,
+        /// Where the functions start that a callee written as a name held in
+        /// a local (`const make = (m) => …`) holds: the call row names such
+        /// a function by a key no file keys (carrick#2448 T2).
+        local: Vec<u32>,
     },
     /// A `new` of a maker ([`Reader::written_instance`]) spanning `lo..hi`:
     /// the instance it builds, which only the receiver walk reads. Every
@@ -1137,6 +1141,7 @@ impl ValueAt {
                 out,
                 member,
                 made,
+                local,
             } => Self::Returned {
                 lo: *lo,
                 hi: *hi,
@@ -1148,6 +1153,7 @@ impl ValueAt {
                     })
                 }),
                 made: made.clone(),
+                local: local.clone(),
             },
             other => other.clone(),
         }
@@ -1378,12 +1384,31 @@ impl Reader<'_> {
                     }
                     _ => None,
                 };
+                let local = match &call.callee {
+                    Callee::Expr(callee) => {
+                        match crate::graphql_document_sites::unwrap_expression(callee) {
+                            Expr::Ident(name) => scope
+                                .held
+                                .get(&ident_key(name))
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|value| match value {
+                                    ValueAt::Function(start) => Some(*start),
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        }
+                    }
+                    _ => Vec::new(),
+                };
                 vec![ValueAt::Returned {
                     lo: call.span.lo.0,
                     hi: call.span.hi.0,
                     out: 0,
                     member,
                     made: self.written_instance(expr, scope).map(Box::new),
+                    local,
                 }]
             }
             Expr::Object(object) => {
@@ -2125,7 +2150,12 @@ impl<'a> Resolver<'a> {
                 }
             }
             ValueAt::Returned {
-                lo, hi, out, member, ..
+                lo,
+                hi,
+                out,
+                member,
+                local,
+                ..
             } => {
                 // `f.bind(this)` is `f`: the member the compiler's row names
                 // as the language library's `bind` returns its object.
@@ -2170,11 +2200,7 @@ impl<'a> Resolver<'a> {
                         }
                     }
                 }
-                let Reach::Function(target, key) = self.inputs_for(file).reach(file, *lo, *hi)
-                else {
-                    return nothing();
-                };
-                let Some((factory_file, factory)) = self.function(&target, &key) else {
+                let Some((factory_file, factory)) = self.factory_of(file, *lo, *hi, local) else {
                     return nothing();
                 };
                 if self.returns_depth.get() >= MAX_VALUES {
@@ -2262,6 +2288,29 @@ impl<'a> Resolver<'a> {
             out: (self.bindings_reading.borrow().is_empty() && self.returns_depth.get() == 0)
                 .then_some(out),
         })
+    }
+
+    /// The factory the call spanning `lo..hi` of `file` calls, with the file
+    /// it is written in: the definition the row reaches, or the one function
+    /// a callee held in a local names (`const make = (m) => …`), which no
+    /// file keys (carrick#2448 T2).
+    fn factory_of(
+        &self,
+        file: &'a Path,
+        lo: u32,
+        hi: u32,
+        local: &[u32],
+    ) -> Option<(&'a Path, &'a FnIr)> {
+        if let Reach::Function(target, key) = self.inputs_for(file).reach(file, lo, hi)
+            && let Some(found) = self.function(&target, &key)
+        {
+            return Some(found);
+        }
+        let [start] = local else {
+            return None;
+        };
+        let (path, _) = self.inputs_for(file).files.get_key_value(file)?;
+        Some((path.as_path(), self.written_function(file, *start)?))
     }
 
     /// What the key of a [`ValueAt::KeyOf`] callee holds when `invoke` runs
@@ -2404,13 +2453,13 @@ impl<'a> Resolver<'a> {
             }
             // An in-repo factory's returned objects.
             ValueAt::Returned {
-                lo, hi, out: depth, ..
+                lo,
+                hi,
+                out: depth,
+                local,
+                ..
             } => {
-                let Reach::Function(target, key) = self.inputs_for(file).reach(file, *lo, *hi)
-                else {
-                    return false;
-                };
-                let Some((factory_file, factory)) = self.function(&target, &key) else {
+                let Some((factory_file, factory)) = self.factory_of(file, *lo, *hi, local) else {
                     return false;
                 };
                 if self.returns_depth.get() >= MAX_VALUES || factory.returned_values.is_empty() {

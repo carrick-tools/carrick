@@ -116,6 +116,20 @@ pub struct ChainHop {
     pub function: String,
     pub file: String,
     pub line: u32,
+    /// For a `<value>` hop into a function a maker call made, that call
+    /// (carrick#2448 T2): it fills the parameters of the maker the function
+    /// reads one function out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub made: Option<HopMaker>,
+}
+
+/// The maker call a `<value>` hop's function was made by, by its SWC span in
+/// the file parsed on its own, repo-relative.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct HopMaker {
+    pub file: String,
+    pub span_start: u32,
+    pub span_end: u32,
 }
 
 /// One discovery site (carrick#2431's record): a call whose callee reaches
@@ -1485,10 +1499,17 @@ fn filled_with(
                 None => vec![Piece::Unknown],
             },
             Piece::ParamKey(index, key, name) => match argument(call, *index) {
-                Some(Value::Obj(object)) => object
-                    .fields
-                    .get(key)
-                    .map_or(vec![Piece::Unknown], Value::pieces),
+                Some(Value::Obj(object)) => match (object.fields.get(key), &object.under_param) {
+                    (Some(value), _) => value.pieces(),
+                    // A spread of the caller's own parameter with no such key
+                    // written after it: the key waits on the caller's caller
+                    // (carrick#2448 T2). A key written before the spread may
+                    // be overwritten by it: not read.
+                    (None, Some((passed, before))) if !before.contains_key(key) => {
+                        vec![Piece::ParamKey(*passed, key.clone(), name.clone())]
+                    }
+                    _ => vec![Piece::Unknown],
+                },
                 // The caller passes its own parameter on whole: its key waits on
                 // the caller's caller.
                 Some(Value::Str(pieces)) => match pieces.as_slice() {
@@ -1727,15 +1748,42 @@ fn written_at(call: &CallIr, arg: usize, key: Option<&str>) -> MethodValue {
     }
 }
 
+/// `pieces`, read in a function a maker call made, with each parameter of
+/// the maker it reads one function out filled from what `maker` passes. A
+/// value that is still a parameter, or one further out, is not read.
+fn made_by(pieces: Vec<Piece>, maker: &CallIr) -> Vec<Piece> {
+    pieces
+        .into_iter()
+        .flat_map(|piece| match piece {
+            Piece::Outer(1, inner) => {
+                let filled = filled(std::slice::from_ref(&*inner), maker);
+                if holds_parameter(&filled) {
+                    vec![Piece::Unknown]
+                } else {
+                    filled
+                }
+            }
+            Piece::Outer(..) => vec![Piece::Unknown],
+            other => vec![other],
+        })
+        .collect()
+}
+
 /// The method `slot` reads at the labelled call (the last of `down`),
 /// composed up to the deciding call (the first) as the name is: each call
 /// fills the parameters of the function below it.
 ///
-/// With `value_hop`, the last pair of `down` is a value hop (carrick#2432):
-/// the first call runs, as a value, the function the labelled call is written
-/// in, so its arguments fill that function's own parameters at depth 0, as the
-/// name is filled, whatever depth the function is nested at.
-fn method_value(down: &[Placed<'_>], slot: &ArgSlot, value_hop: bool) -> Option<MethodValue> {
+/// With `hops`, the last `hops.len()` pairs of `down` are value hops
+/// (carrick#2432): the call runs, as a value, the function the next call is
+/// written in, so its arguments fill that function's own parameters at depth
+/// 0, as the name is filled, whatever depth the function is nested at. A hop
+/// that carries the maker call its function was made by (carrick#2448 T2)
+/// fills the parameter the function reads one function out from that call.
+fn method_value(
+    down: &[Placed<'_>],
+    slot: &ArgSlot,
+    hops: &[Option<Placed<'_>>],
+) -> Option<MethodValue> {
     let last = down.last()?;
     let mut value = written_at(last.call, slot.arg, slot.key.as_deref());
     for k in (0..down.len() - 1).rev() {
@@ -1745,14 +1793,16 @@ fn method_value(down: &[Placed<'_>], slot: &ArgSlot, value_hop: bool) -> Option<
         if !holds_parameter(pieces) {
             break;
         }
-        let depth = if value_hop && k + 2 == down.len() {
-            0
-        } else {
-            down[k + 1].depth
-        };
-        let Some(own) = to_definition(pieces, depth) else {
+        let hop = (k + 1 + hops.len())
+            .checked_sub(down.len())
+            .and_then(|at| hops.get(at));
+        let depth = if hop.is_some() { 0 } else { down[k + 1].depth };
+        let Some(mut own) = to_definition(pieces, depth) else {
             return Some(MethodValue::Pieces(vec![Piece::Unknown]));
         };
+        if let Some(Some(maker)) = hop {
+            own = made_by(own, maker.call);
+        }
         value = match own.as_slice() {
             [Piece::Param(index, _)] => written_at(down[k].call, *index, None),
             [Piece::ParamKey(index, key, _)] => written_at(down[k].call, *index, Some(key)),
@@ -1907,9 +1957,10 @@ struct Walk<'a, 'i> {
     /// of, when its op's name is that call's argument (carrick#1678): its
     /// instances are the scope call's receiver's.
     scope_call: Option<Placed<'a>>,
-    /// Set only while the value-hop branch of `decide` walks: the last pair
-    /// of `down` is a value hop ([`method_value`]).
-    value_hop: bool,
+    /// Set only while the value-hop branch of `decide` walks: the last
+    /// pairs of `down` are value hops, each with the maker call its function
+    /// was made by ([`method_value`]).
+    value_hops: Vec<Option<Placed<'a>>>,
     /// Reads a name decided at one call as text, for a site stated at
     /// another (a maker-bound name, carrick#3527).
     fold: super::site_record::NameFold<'i>,
@@ -1977,7 +2028,7 @@ impl<'a> Walk<'a, '_> {
             .label
             .and_then(|label| label.method.as_ref())
             .and_then(|method| method.from.as_ref())
-            .and_then(|slot| method_value(down, slot, self.value_hop));
+            .and_then(|slot| method_value(down, slot, &self.value_hops));
         if !self.seen.insert(id.clone()) {
             // Another walk reached this call and labelled end. The same
             // operation (a diamond) is one site; a different one means the
@@ -2926,7 +2977,7 @@ fn decide(
         receiver: None,
         reached: None,
         scope_call: None,
-        value_hop: false,
+        value_hops: Vec::new(),
         fold: super::site_record::NameFold::new(inputs, siblings, root),
         entered: &entered,
     };
@@ -3048,23 +3099,38 @@ fn decide(
         // The site's call runs, as a value, the function that makes the
         // labelled call (carrick#2432): its arguments fill that function's
         // own parameters, which no call-graph caller does.
-        if let [hop] = site.chain.as_slice()
-            && hop.function == VALUE_HOP
+        // Several such hops in a row (a function that runs a function a
+        // call of it made, which runs another) compose the same way, each
+        // call filling the parameters of the function it runs
+        // (carrick#2448 T2).
+        if !site.chain.is_empty()
+            && site.chain.iter().all(|hop| hop.function == VALUE_HOP)
             && !at_end.iter().any(|piece| matches!(piece, Piece::Outer(..)))
-            && let Some(first) =
-                calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
+            && let Some(down) = value_down(&calls, root, discovered, site, &last, shifted)
         {
-            let first = shift(first, shifted);
-            let value = filled(&at_end, first.call);
-            let down = [first, last];
-            walk.value_hop = true;
+            let first = down[0];
+            let mut value = at_end.clone();
+            let mut positions = parameter_positions(&at_end);
+            for k in (0..down.len() - 1).rev() {
+                positions = parameter_positions(&value);
+                value = filled(&value, down[k].call);
+            }
+            walk.value_hops = site
+                .chain
+                .iter()
+                .map(|hop| {
+                    hop.made.as_ref().and_then(|made| {
+                        calls.at_span(&root.join(&made.file), made.span_start, made.span_end)
+                    })
+                })
+                .collect();
             if walk.settles(&first, &value, end) {
-                walk.site(&down, end, value, parameter_positions(&at_end));
+                walk.site(&down, end, value, positions);
             } else {
                 walked.push(format!("{}:{}", site.file, site.line));
                 walk.up(&down, &value, end, &mut Vec::new());
             }
-            walk.value_hop = false;
+            walk.value_hops.clear();
             continue;
         }
         // A call into a function that runs a function written in place as a
@@ -3594,6 +3660,39 @@ fn enclosing_function_line(
         find(body, call, &mut best);
     }
     best.map(|(_, line)| line)
+}
+
+/// The calls from the site down to the labelled call `last`, when every hop
+/// of the site's chain is a function run as a value (carrick#2448 T2): the
+/// site's call, then for each further hop the call inside the function the
+/// hop before it entered, which another discovered site of the same end
+/// stands at (its chain is the rest of this one). `None` where a call is not
+/// found or is ambiguous.
+fn value_down<'a>(
+    calls: &Calls<'a>,
+    root: &Path,
+    discovered: &[DiscoverySite],
+    site: &DiscoverySite,
+    last: &Placed<'a>,
+    shifted: &'a [(Placed<'a>, CallIr)],
+) -> Option<Vec<Placed<'a>>> {
+    let first = calls.at_span(&root.join(&site.file), site.span_start, site.span_end)?;
+    let mut down = vec![shift(first, shifted)];
+    for at in 1..site.chain.len() {
+        let mut inner = discovered.iter().filter(|other| {
+            other.end == site.end
+                && other.stop.is_none()
+                && other.file == site.chain[at - 1].file
+                && other.chain == site.chain[at..]
+        });
+        let other = inner.next()?;
+        if inner.next().is_some() {
+            return None;
+        }
+        down.push(calls.at_span(&root.join(&other.file), other.span_start, other.span_end)?);
+    }
+    down.push(*last);
+    Some(down)
 }
 
 fn place_chain<'a>(
@@ -4948,11 +5047,13 @@ pub(crate) mod tests {
                     function: "Session.notify".into(),
                     file: "src/inert/session.ts".into(),
                     line: line_of(&session, "notify(name"),
+                    made: None,
                 },
                 ChainHop {
                     function: "relay".into(),
                     file: "src/inert/session.ts".into(),
                     line: line_of(&session, "function relay"),
+                    made: None,
                 },
             ],
             stop: None,
