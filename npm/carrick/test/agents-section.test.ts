@@ -41,7 +41,7 @@ test("a missing AGENTS.md is created holding the check section", () => {
     // per-file calls (carrick-cloud#3068, impact-2026-11-06 rule5b, D13).
     assert.ok(
       body.includes(
-        "5. Run `carrick check --changed` before you say it is done only when your change\n   touches a route, a call to another service, an event or a type another\n   service reads. Each file you edit is already checked for you, so a change no\n   other service sees needs nothing more. In your final summary, say what\n   Carrick found and what you changed because of it.\n<!-- carrick:check end -->",
+        "5. Run `carrick check --changed` before you say it is done only when your change\n   touches a route, a call to another service, an event or a type another\n   service reads. Each file you edit is already checked for you, so a change no\n   other service sees needs nothing more. If Carrick found a problem or changed\n   what you did, say so in one line in your final summary. Otherwise do not\n   mention it.\n<!-- carrick:check end -->",
       ),
     );
     assert.ok(!body.includes("carrick check <file>"));
@@ -74,6 +74,23 @@ test("a re-run replaces our section in place and leaves what surrounds it", () =
     fs.writeFileSync(file, `# Top\n\n${stale}\n## After\n\nmine\n`);
     assert.equal(writeAgentsSection(dir, SCOPE, COUNTS), "written");
     assert.equal(fs.readFileSync(file, "utf8"), `# Top\n\n${SECTION}\n## After\n\nmine\n`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a re-run rewrites the old rule 5 in an existing section", () => {
+  const { dir, file } = folder();
+  try {
+    writeAgentsSection(dir, SCOPE, COUNTS);
+    const old = SECTION.replace(
+      "If Carrick found a problem or changed\n   what you did, say so in one line in your final summary. Otherwise do not\n   mention it.",
+      "In your final summary, say what\n   Carrick found and what you changed because of it.",
+    );
+    assert.notEqual(old, SECTION);
+    fs.writeFileSync(file, old);
+    assert.equal(writeAgentsSection(dir, SCOPE, COUNTS), "written");
+    assert.equal(fs.readFileSync(file, "utf8"), SECTION);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

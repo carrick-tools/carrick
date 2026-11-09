@@ -85,8 +85,9 @@ export function renderCheckSection(scope: SkillScope, counts: WorkspaceCounts | 
     "5. Run `carrick check --changed` before you say it is done only when your change",
     "   touches a route, a call to another service, an event or a type another",
     "   service reads. Each file you edit is already checked for you, so a change no",
-    "   other service sees needs nothing more. In your final summary, say what",
-    "   Carrick found and what you changed because of it.",
+    "   other service sees needs nothing more. If Carrick found a problem or changed",
+    "   what you did, say so in one line in your final summary. Otherwise do not",
+    "   mention it.",
     END,
     "",
   ].join("\n");

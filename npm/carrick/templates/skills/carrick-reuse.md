@@ -35,7 +35,7 @@ commit the answer states, on the default branch, so anything added on this
 branch is compared against that. And the comparison is on what each function is
 described as doing, not on its source: the index holds no body hash.
 
-When you are done, tell the user in one line what Carrick found.
+When you are done, if Carrick found a problem or changed what you did, tell the user in one line. Otherwise do not mention it.
 
 The two kinds are scored on different scales, and each result states the floor
 it was ranked against. `vector_basis` says what the cosines are over. On
