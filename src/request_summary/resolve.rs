@@ -107,11 +107,12 @@ pub(super) struct ModuleBinding {
     /// every other reader (`scope.held`), so [`Resolver::binding_values`]
     /// does not answer for it.
     pub(super) text_only: bool,
-    /// The module only ever reads the object the binding holds through a
-    /// member and never changes it ([`WriteCensus::object_kept`]), whether
-    /// or not it exports the binding. Only a member read of the object is
-    /// then the key its literal states (carrick#2448); the importers' uses
-    /// are `Resolver::contested_exports`'s.
+    /// The module reads the object the binding holds only through a member,
+    /// and otherwise only writes it in place, tests it or returns it
+    /// ([`WriteCensus::object_held`], carrick#3670), whether or not it
+    /// exports the binding. Only then is a member read of the object the
+    /// key of a literal placed in it (carrick#2448); the importers' uses are
+    /// `Resolver::contested_exports`'s.
     pub(super) object_kept: bool,
 }
 
@@ -249,6 +250,11 @@ struct WriteCensus {
     /// Where each call or construction that is handed the binding as an
     /// argument starts (carrick#3504 S5a).
     handed: HashMap<BindingKey, Vec<u32>>,
+    /// Where each reference starts that only tests the binding (`if (c)`,
+    /// `!c`, `c && …`) or is a function's `return c` (carrick#3670, ruling
+    /// R5): neither hands the object to anything a factory's returned
+    /// object is not handed to.
+    tested_or_returned: HashMap<BindingKey, HashSet<u32>>,
 }
 
 /// A class that extends a named class.
@@ -481,6 +487,47 @@ impl WriteCensus {
             && count(&self.references) == count(&self.member_bases) + 1
     }
 
+    /// Whether the object a module binding holds is each value placed in it
+    /// (carrick#3670, ruling R5): besides its declaration and member reads,
+    /// its only references are plain writes the census places, truthiness
+    /// tests and `return <name>`, and nothing is written through it. A
+    /// returned binding reaches its holders as a factory's returned literal
+    /// does, which [`Resolver::objects_of`] already reads. A binding handed
+    /// to a call stays refused (carrick#3504 S5a).
+    fn object_held(&self, key: &BindingKey) -> bool {
+        let count = |counts: &HashMap<BindingKey, usize>| counts.get(key).copied().unwrap_or(0);
+        let writes = self.writes.get(key).map_or(0, Vec::len);
+        let tested = self.tested_or_returned.get(key).map_or(0, HashSet::len);
+        !self.is_unplaceable(key)
+            && !self.written_through.contains(key)
+            && count(&self.references) == count(&self.member_bases) + writes + tested + 1
+    }
+
+    /// Notes each binding `expr` only tests for truthiness: a name, or
+    /// either side of `&&`, `||` or `??` or the operand of `!`, in a test.
+    fn test_use(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Ident(ident) => {
+                self.tested_or_returned
+                    .entry(ident_key(ident))
+                    .or_default()
+                    .insert(ident.span.lo.0);
+            }
+            Expr::Paren(inner) => self.test_use(&inner.expr),
+            Expr::Unary(unary) if unary.op == UnaryOp::Bang => self.test_use(&unary.arg),
+            Expr::Bin(bin)
+                if matches!(
+                    bin.op,
+                    BinaryOp::NullishCoalescing | BinaryOp::LogicalOr | BinaryOp::LogicalAnd
+                ) =>
+            {
+                self.test_use(&bin.left);
+                self.test_use(&bin.right);
+            }
+            _ => {}
+        }
+    }
+
     /// Notes that an entry of each binding at the root of `expr` is
     /// written.
     fn write_through(&mut self, expr: &Expr) {
@@ -671,6 +718,9 @@ impl Visit for WriteCensus {
     }
 
     fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+        if unary.op == UnaryOp::Bang {
+            self.test_use(&unary.arg);
+        }
         if unary.op == UnaryOp::Delete {
             self.escape(&unary.arg);
             self.write_member(&unary.arg);
@@ -751,6 +801,59 @@ impl Visit for WriteCensus {
             }
         }
         call.visit_children_with(self);
+    }
+
+    fn visit_if_stmt(&mut self, stmt: &IfStmt) {
+        self.test_use(&stmt.test);
+        stmt.visit_children_with(self);
+    }
+
+    fn visit_while_stmt(&mut self, stmt: &WhileStmt) {
+        self.test_use(&stmt.test);
+        stmt.visit_children_with(self);
+    }
+
+    fn visit_do_while_stmt(&mut self, stmt: &DoWhileStmt) {
+        self.test_use(&stmt.test);
+        stmt.visit_children_with(self);
+    }
+
+    fn visit_for_stmt(&mut self, stmt: &ForStmt) {
+        if let Some(test) = &stmt.test {
+            self.test_use(test);
+        }
+        stmt.visit_children_with(self);
+    }
+
+    fn visit_cond_expr(&mut self, cond: &CondExpr) {
+        self.test_use(&cond.test);
+        cond.visit_children_with(self);
+    }
+
+    // `c && x` is `x` or a falsy `c`: no object is handed on through `c`.
+    fn visit_bin_expr(&mut self, bin: &BinExpr) {
+        if bin.op == BinaryOp::LogicalAnd {
+            self.test_use(&bin.left);
+        }
+        bin.visit_children_with(self);
+    }
+
+    // `return c` hands the object to the function's callers, as a factory's
+    // returned literal is handed (carrick#3670, ruling R5).
+    fn visit_return_stmt(&mut self, stmt: &ReturnStmt) {
+        if let Some(arg) = &stmt.arg {
+            let mut arg: &Expr = arg;
+            while let Expr::Paren(inner) = arg {
+                arg = &inner.expr;
+            }
+            if let Expr::Ident(ident) = arg {
+                self.tested_or_returned
+                    .entry(ident_key(ident))
+                    .or_default()
+                    .insert(ident.span.lo.0);
+            }
+        }
+        stmt.visit_children_with(self);
     }
 
     fn visit_ts_type(&mut self, _: &TsType) {}
@@ -865,7 +968,7 @@ pub(super) fn module_bindings(
                 handed: census.handed.get(&key).cloned().unwrap_or_default(),
                 exported,
                 text_only: false,
-                object_kept: census.object_kept(&key),
+                object_kept: census.object_held(&key),
             };
             out.insert((line, ident.id.sym.to_string()), binding);
         }
@@ -1409,8 +1512,26 @@ impl ValueAt {
                 None if *open => Some(vec![Self::Unread]),
                 None => None,
             },
-            // A key of a value read elsewhere has no span of its own to read
-            // a row at.
+            // A key of a factory call or of a name (`runWith(make())`,
+            // `deps = make()`): the key of each object the call returns or
+            // the binding holds, read as a callee's key is
+            // ([`Resolver::key_values`], carrick#3670). The term carries the
+            // value's own span, where no member row is, so its reader goes
+            // straight to the objects.
+            Self::Returned { lo, hi, .. }
+            | Self::Read {
+                lo,
+                hi,
+                member: false,
+                ..
+            } if rest.is_empty() => Some(vec![Self::KeyOf {
+                lo: *lo,
+                hi: *hi,
+                object: vec![self.clone()],
+                key: Box::new(Self::Lit(key.clone())),
+            }]),
+            // A deeper key, or a key of a value read elsewhere: no span of
+            // its own to read a row at.
             _ => Some(vec![Self::Unread]),
         }
     }
@@ -2630,6 +2751,10 @@ impl<'a> Resolver<'a> {
         if objects.is_empty() {
             return None;
         }
+        // One module binding read twice (`if (c) return c; …; return c`) is
+        // one object (carrick#3670): no factory call made it.
+        let mut seen: HashSet<*const BTreeMap<String, Vec<ValueAt>>> = HashSet::new();
+        objects.retain(|object| object.maker.is_some() || seen.insert(object.fields));
         for object in objects {
             let Some(values) = object.fields.get(key) else {
                 out.push(nothing());
@@ -2689,7 +2814,8 @@ impl<'a> Resolver<'a> {
                 true
             }
             // A module binding that holds the object, when every module
-            // reads only a member of it.
+            // reads only a member of it: its initialiser and each value a
+            // plain write places in it (carrick#3670, ruling R5).
             ValueAt::Read {
                 lo,
                 hi,
@@ -2717,9 +2843,8 @@ impl<'a> Resolver<'a> {
                     .get(&symbol)
                     .map_or(symbol.clone(), |(_, name)| name.clone());
                 if binding.unplaceable
-                    || !binding.writes.is_empty()
                     || !binding.object_kept
-                    || binding.init.is_empty()
+                    || (binding.init.is_empty() && binding.writes.is_empty())
                     || (binding.exported && self.contested_exports(path, &table_name))
                 {
                     return false;
@@ -2728,10 +2853,20 @@ impl<'a> Resolver<'a> {
                 if !self.bindings_reading.borrow_mut().insert(reading.clone()) {
                     return false;
                 }
+                // `let c;` adds nothing; a write is read where it is placed.
                 let held = binding
                     .init
                     .iter()
-                    .all(|init| self.objects_of(path, init, None, out));
+                    .all(|init| self.objects_of(path, init, None, out))
+                    && binding.writes.iter().all(|at| {
+                        placed_write(declaring, *at).is_some_and(|(_, write)| {
+                            !write.values.is_empty()
+                                && write
+                                    .values
+                                    .iter()
+                                    .all(|value| self.objects_of(path, value, None, out))
+                        })
+                    });
                 self.bindings_reading.borrow_mut().remove(&reading);
                 held
             }
@@ -3279,23 +3414,32 @@ mod tests {
     }
 
     /// The call at `line` of the file whose path ends with `file` whose
-    /// callee is a value, with the definition it is written in and how many
-    /// functions inside it.
+    /// callee is a value (with `keyed`, one whose callee is only a key of an
+    /// object, [`CallIr::callee_key`]), with the definition it is written in
+    /// and how many functions inside it.
     fn call_at<'a>(
         inputs: &'a RequestSummaryInputs,
         file: &str,
         line: u32,
+        keyed: bool,
     ) -> (&'a Path, Option<&'a str>, u8, &'a CallIr) {
-        fn find(body: &FnIr, depth: u8, line: u32) -> Option<(u8, &CallIr)> {
+        fn find(body: &FnIr, depth: u8, line: u32, keyed: bool) -> Option<(u8, &CallIr)> {
             body.read_calls()
                 .map(|(call, _)| call)
-                .find(|call| call.site.line == line && !call.callee_values.is_empty())
+                .find(|call| {
+                    call.site.line == line
+                        && if keyed {
+                            call.callee_values.is_empty() && call.callee_key.is_some()
+                        } else {
+                            !call.callee_values.is_empty()
+                        }
+                })
                 .map(|call| (depth, call))
                 .or_else(|| {
                     body.nested
                         .iter()
                         .chain(&body.detached)
-                        .find_map(|inner| find(inner, depth + 1, line))
+                        .find_map(|inner| find(inner, depth + 1, line, keyed))
                 })
         }
         let (path, ir) = inputs
@@ -3306,9 +3450,11 @@ mod tests {
         ir.functions
             .iter()
             .find_map(|(key, body)| {
-                find(body, 0, line).map(|(depth, call)| (Some(key.as_str()), depth, call))
+                find(body, 0, line, keyed).map(|(depth, call)| (Some(key.as_str()), depth, call))
             })
-            .or_else(|| find(&ir.module_level, 0, line).map(|(depth, call)| (None, depth, call)))
+            .or_else(|| {
+                find(&ir.module_level, 0, line, keyed).map(|(depth, call)| (None, depth, call))
+            })
             .map(|(key, depth, call)| (path.as_path(), key, depth, call))
             .unwrap_or_else(|| panic!("a call whose callee is a value at {file}:{line}"))
     }
@@ -3322,7 +3468,7 @@ mod tests {
         file: &str,
         line: u32,
     ) -> Vec<Got> {
-        let (path, key, depth, call) = call_at(inputs, file, line);
+        let (path, key, depth, call) = call_at(inputs, file, line, false);
         let invoke = Invoke {
             file: path,
             call,
@@ -3345,6 +3491,26 @@ mod tests {
             }
         }
         got(out)
+    }
+
+    /// What the key the callee of the call at `file:line` reads holds, as
+    /// discovery reads a callee that is only a key of an object
+    /// ([`Resolver::key_values`]); `None` where the object is not read.
+    fn key_callee<'a>(
+        resolver: &Resolver<'a>,
+        inputs: &'a RequestSummaryInputs,
+        file: &str,
+        line: u32,
+    ) -> Option<Vec<Got>> {
+        let (path, _, _, call) = call_at(inputs, file, line, true);
+        let invoke = Invoke {
+            file: path,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        let key = call.callee_key.as_ref()?;
+        resolver.key_values(&mut Ends, path, key, invoke).map(got)
     }
 
     fn written(line: u32) -> Got {
@@ -3436,6 +3602,120 @@ mod tests {
         );
     }
 
+    /// `discovery-factory-objects` (carrick#3670), its README the answer
+    /// key: the callee `deps.get` of each `run*With`, read at its callers.
+    fn factory_objects() -> Option<super::super::fixture_walk::Walked> {
+        walked(
+            "discovery-factory-objects",
+            "services/web",
+            "web",
+            &[],
+            true,
+        )
+    }
+
+    /// A key of a caller's argument that is a factory call, or of a
+    /// parameter's default that is one, is the key of the object the
+    /// factory returns (shapes b, d).
+    #[test]
+    fn a_key_of_a_factory_call_argument_reads_the_object_it_returns() {
+        let Some(on) = factory_objects() else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let read = |file: &str, line: u32| callee(&resolver, &on.inputs, file, line);
+        assert_eq!(read("b-literal.ts", 7), [definition("loadB")], "argument");
+        assert_eq!(read("d-default.ts", 10), [definition("loadD")], "default");
+    }
+
+    /// A module `let` a caching factory writes once and returns holds the
+    /// object written to it, read once (shape a, ruling R5).
+    #[test]
+    fn a_cached_module_binding_reads_the_object_written_to_it() {
+        let Some(on) = factory_objects() else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let read = |file: &str, line: u32| callee(&resolver, &on.inputs, file, line);
+        assert_eq!(read("a-cache.ts", 10), [definition("loadA")]);
+        assert_eq!(
+            key_callee(&resolver, &on.inputs, "f-direct.ts", 11),
+            Some(vec![definition("loadF")]),
+            "the factory call held in a local (shape f)"
+        );
+    }
+
+    /// A factory that returns a module `const` object returns the object the
+    /// binding holds (shape c, ruling R5).
+    #[test]
+    fn a_factory_returning_a_module_object_is_read() {
+        let Some(on) = factory_objects() else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            callee(&resolver, &on.inputs, "c-const.ts", 8),
+            [definition("loadC")]
+        );
+    }
+
+    /// A function written in the object a caching factory stores is entered
+    /// as a function the factory writes (shape e).
+    #[test]
+    fn a_function_written_in_a_cached_object_is_entered() {
+        let Some(on) = factory_objects() else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            callee(&resolver, &on.inputs, "e-arrow.ts", 10),
+            [written(6)]
+        );
+    }
+
+    /// A function a caller writes in the object it passes is a callback,
+    /// as before (shape i); an object literal and a factory returning a
+    /// function read as before (g, j).
+    #[test]
+    fn a_function_written_at_a_caller_stays_injected() {
+        let Some(on) = factory_objects() else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let read = |file: &str, line: u32| callee(&resolver, &on.inputs, file, line);
+        assert_eq!(read("i-passed-arrow.ts", 4), [Got::Callback]);
+        assert_eq!(read("g-passed.ts", 4), [definition("loadG")]);
+        assert_eq!(read("j-fn.ts", 6), [definition("loadJ")]);
+    }
+
+    /// A module object the module hands to a call may be changed by the
+    /// callee: it is not read (shape h, carrick#3504 S5a's rule).
+    #[test]
+    fn a_module_object_handed_to_a_call_stays_unread() {
+        let Some(on) = factory_objects() else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            callee(&resolver, &on.inputs, "h-passed-const.ts", 5),
+            [Got::End(End::Nothing)]
+        );
+    }
+
+    /// A closed object a factory returns without the key holds nothing
+    /// there.
+    #[test]
+    fn a_closed_object_without_the_key_reads_nothing() {
+        let Some(on) = factory_objects() else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            callee(&resolver, &on.inputs, "k-closed.ts", 7),
+            [Got::End(End::Nothing)]
+        );
+    }
+
     /// A function that passes its own parameter to itself unchanged adds no
     /// value (the decision record's soundness rule 7, pass-through half). A
     /// spread at or before the position makes the caller's value unread
@@ -3518,6 +3798,40 @@ mod tests {
         let (census, key) = census_over(source, name);
         let assigned = census.writes.contains_key(&key) || census.is_unplaceable(&key);
         (assigned, census.entries_kept(&key, false))
+    }
+
+    /// carrick#3670 (ruling R5): a module binding holds the objects placed in
+    /// it when, besides member reads, it is only written in place, tested or
+    /// returned. Handing it to a call, aliasing it, writing through it, or a
+    /// write no reader places, refuses it.
+    #[test]
+    fn a_binding_written_tested_and_returned_holds_its_objects() {
+        let held = |source: &str| {
+            let (census, key) = census_over(source, "c");
+            census.object_held(&key)
+        };
+        for source in [
+            "let c; function m() { if (c) return c; c = { get: f }; return c; }",
+            "let c; function m() { if (!c) { c = { get: f }; } return c; }",
+            "let c; function m() { while (!c) c = { get: f }; return (c); }",
+            "const c = { get: f }; function m() { return c; }",
+            "const c = { get: f }; function m() { return c && c.get(); }",
+            "let c; function m() { if (c ?? d) {} c = { get: f }; return c.get(); }",
+        ] {
+            assert!(held(source), "{source}");
+        }
+        for source in [
+            "const c = { get: f }; function m() { g(c); return c; }",
+            "const c = { get: f }; function m() { return c ?? d; }",
+            "const c = { get: f }; const d = c;",
+            "const c = { get: f }; function m() { return c ? c : d; }",
+            "let c; function m() { c = { get: f }; c.get = g; return c; }",
+            "let c; function m() { c += 1; return c; }",
+            "const c = { get: f }; export { c };",
+            "const c = { get: f }; const m = () => c;",
+        ] {
+            assert!(!held(source), "{source}");
+        }
     }
 
     /// carrick#3504 S2, the name fold's escape census moved onto the write
