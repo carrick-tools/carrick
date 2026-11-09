@@ -1815,7 +1815,9 @@ fn withdraw_model_row(
 /// call, whose value is the outer function's own (a hook's state), not the
 /// request's; the leaf row at the call inside is the request's row, and one
 /// request keeps one row. Paths agree whatever their holes are named
-/// ([`crate::site_rows::agrees`]). Returns how many rows went.
+/// ([`crate::site_rows::agrees`]). A model row stating the leaf's operation
+/// exactly holds the leaf ([`Occupied::holds`]), so none is stated and none
+/// of those goes here. Returns how many rows went.
 fn withdraw_enclosing_model_rows(
     data: &mut CloudRepoData,
     stated: &[(LeafCall, OperationKey)],
@@ -2437,27 +2439,21 @@ struct Occupied {
     lines: HashSet<(String, u32)>,
     /// The operations the graph's rows state at each file and line.
     operations: HashMap<(String, u32), HashSet<Operation>>,
-    /// The same, for the rows a fact states or a pass settled: every row but
-    /// the model's own unsettled readings ([`is_unstated_row`]).
-    stated: HashMap<(String, u32), HashSet<Operation>>,
 }
 
 impl Occupied {
     fn of(data: &CloudRepoData) -> Self {
         let mut operations: HashMap<(String, u32), HashSet<Operation>> = HashMap::new();
-        let mut stated: HashMap<(String, u32), HashSet<Operation>> = HashMap::new();
         for call in data.mount_graph.iter().flat_map(|graph| &graph.data_calls) {
             if let Some((file, line)) = site_of(call) {
-                let site = (file.to_string(), line);
-                let stated_operation =
-                    operation(&call.method, &call.canonical_path, call.dispatch.as_ref());
-                if !is_unstated_row(call) {
-                    stated
-                        .entry(site.clone())
-                        .or_default()
-                        .insert(stated_operation.clone());
-                }
-                operations.entry(site).or_default().insert(stated_operation);
+                operations
+                    .entry((file.to_string(), line))
+                    .or_default()
+                    .insert(operation(
+                        &call.method,
+                        &call.canonical_path,
+                        call.dispatch.as_ref(),
+                    ));
             }
         }
         let in_calls = data.calls.iter().filter_map(|call| {
@@ -2468,7 +2464,6 @@ impl Occupied {
         Self {
             lines: operations.keys().cloned().chain(in_calls).collect(),
             operations,
-            stated,
         }
     }
 
@@ -2480,16 +2475,13 @@ impl Occupied {
     }
 
     /// Whether a row already stands for `leaf`: one on its own lines, or one
-    /// of `operation` a fact states or a pass settled on the line a call
-    /// written around it opens on, the outer call's row for the same request
-    /// (one call, one row). The model's own reading there does not stand for
-    /// it: the leaf row is stated and that reading withdrawn
-    /// ([`withdraw_enclosing_model_rows`]).
+    /// of `operation` on the line a call written around it opens on, the
+    /// outer call's row for the same request (one call, one row).
     fn holds(&self, leaf: &LeafCall, operation: &Operation) -> bool {
         let file = &leaf.file;
         (leaf.line..=leaf.last_line).any(|line| self.lines.contains(&(file.clone(), line)))
             || leaf.enclosing_lines.iter().any(|line| {
-                self.stated
+                self.operations
                     .get(&(file.clone(), *line))
                     .is_some_and(|stated| stated.contains(operation))
             })
