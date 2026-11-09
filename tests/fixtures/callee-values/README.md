@@ -67,3 +67,17 @@ at the line below.
 | `f-keyed-exported.ts` | 6 | `export const d`, no importer writes it | site, `fetch` |
 | `f-keyed-contested.ts` | 6 | `export const d`, `f-keyed-contested-writer.ts` writes `d.a` | not decided |
 | `f-keyed-spread.ts` | 5 | `{ a: send, ...x }` | not decided |
+
+## A hop the rows resolve (carrick#3504 S4b-3b)
+
+Each file below calls a function held in an object entry under another name
+or a computed key. The call graph has no edge to the function; the rows do.
+The decided-sites test
+`a_hop_the_rows_resolve_is_placed_without_a_call_graph_edge` reads the call
+at the line below.
+
+| File | Line | Read | Recorded |
+|---|---|---|---|
+| `f-own-renamed.ts` | 8 | `d.go(…)`, `d = { go: send2 }` | site, `/p/f-own-renamed` |
+| `f-own-keyed.ts` | 8 | `d["send2"](…)`, `d = { send2 }` | site, `/p/f-own-keyed` |
+| `f-exported-arrow-keyed.ts` | 6 | `d["a"](…)`, `export const d = { a: (p) => fetch(p) }` | site, `/p/f-exported-arrow-keyed` |
