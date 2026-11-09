@@ -5097,8 +5097,6 @@ impl<'a> Scope<'a> {
     /// old path's request summaries, which stay as they are.
     fn site_binding(&self, ident: &Ident) -> Option<ClientBinding> {
         self.call_binding(ident).or_else(|| {
-            return None;
-            #[allow(unreachable_code)]
             if self.param_index(ident).is_some() {
                 return None;
             }
