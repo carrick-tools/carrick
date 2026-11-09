@@ -54,7 +54,7 @@ use super::RequestSummaryInputs;
 use super::decided_sites::{
     Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel, SlotBinding,
 };
-use super::resolve::{Resolver, TextValue};
+use super::resolve::{ArgTexts, Resolver, TextValue};
 use crate::position_rows::{Kind, PositionIndex};
 use crate::site_questions::{
     Place, PlaceFrom, Point, SiteCall, SiteState, Slot, Stated, StatedValue,
@@ -895,7 +895,7 @@ impl<'r> NameFold<'r> {
         span: (u32, u32),
         arg: usize,
         key: Option<&str>,
-    ) -> Option<Vec<TextValue>> {
+    ) -> Option<ArgTexts> {
         use super::guards::HoleReason;
         let expr = {
             let parsed = self.sources.get(file)?;
@@ -911,7 +911,7 @@ impl<'r> NameFold<'r> {
         let root = self.sources.root;
         let Some(key) = key else {
             let set = self.resolver.text_set(root, file, &expr);
-            return (!set.is_empty()).then_some(set);
+            return (!set.is_empty()).then_some(ArgTexts::Values(set));
         };
         let Expr::Object(object) = super::unwrap_value(&expr) else {
             return self.resolver.keyed_text_set(root, file, &expr, key, span.0);
@@ -919,6 +919,8 @@ impl<'r> NameFold<'r> {
         // `Some(None)`: the key is written with a value no reader states.
         let mut last: Option<Option<Expr>> = None;
         let mut may_overwrite = false;
+        // A computed key may be the key; a spread may carry it.
+        let mut computed = false;
         for prop in &object.props {
             let PropOrSpread::Prop(prop) = prop else {
                 may_overwrite = true;
@@ -940,7 +942,10 @@ impl<'r> NameFold<'r> {
             };
             match hit {
                 // A computed key may be this one.
-                None => may_overwrite = true,
+                None => {
+                    may_overwrite = true;
+                    computed = true;
+                }
                 Some(true) => {
                     last = Some(found);
                     may_overwrite = false;
@@ -948,10 +953,17 @@ impl<'r> NameFold<'r> {
                 Some(false) => {}
             }
         }
-        if may_overwrite {
-            return Some(vec![TextValue::Hole(HoleReason::UnreadExpression)]);
+        // Only spreads and no entry with the key: an object the resolver does
+        // not read (R3). A key written before a spread stays a hole.
+        if may_overwrite && last.is_none() && !computed {
+            return Some(ArgTexts::Unread);
         }
-        Some(match last {
+        if may_overwrite {
+            return Some(ArgTexts::Values(vec![TextValue::Hole(
+                HoleReason::UnreadExpression,
+            )]));
+        }
+        Some(ArgTexts::Values(match last {
             None => Vec::new(),
             Some(None) => vec![TextValue::Hole(HoleReason::UnreadExpression)],
             Some(Some(value)) => {
@@ -962,7 +974,7 @@ impl<'r> NameFold<'r> {
                     set
                 }
             }
-        })
+        }))
     }
 }
 

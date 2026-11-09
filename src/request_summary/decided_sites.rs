@@ -3362,9 +3362,18 @@ fn maker_base(
     let spread = args.get(arg).is_some_and(|held| held.spread);
     if !spread
         && let Some((file, span)) = at
-        && let Some(values) = reads.fold.arg_texts(file, span, arg, key)
+        && let Some(read) = reads.fold.arg_texts(file, span, arg, key)
     {
-        return agreed_text(&values);
+        return match read {
+            super::resolve::ArgTexts::Values(values) => agreed_text(&values),
+            // An options object the resolver cannot read keeps today's
+            // host-free reading, counted: ruled on once main's check
+            // reports it (R3).
+            super::resolve::ArgTexts::Unread => {
+                reads.options_unread += 1;
+                MadeBase::None
+            }
+        };
     }
     if !super::library_sites::arg_supplied(args, arg, key) {
         // An options object the resolver does not read at all (a parameter

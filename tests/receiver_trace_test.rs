@@ -69,6 +69,31 @@ fn scan_fixture_reading(name: &str) -> (Blobs, Fallbacks) {
     scan_runs_reading(name, &[], 1, true).remove(0)
 }
 
+/// [`scan_fixture`], and the run log the scan left (its `home` is the
+/// scan's own): the counts the scan states about itself.
+fn scan_fixture_logged(name: &str) -> (Blobs, String) {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let repo = tmp.path().join("workspace");
+    copy_dir(&fixture_dir(name).join("repo"), &repo);
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+    let storage = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let home = tmp.path().join("home");
+    let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home);
+    cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env_remove("CARRICK_PROGRESS");
+    let (blobs, _) = run_scan(&mut cmd, &storage);
+    let log = std::fs::read_dir(home.join(".carrick/logs/runs"))
+        .map(|logs| {
+            logs.map(|log| std::fs::read_to_string(log.unwrap().path()).unwrap_or_default())
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    (blobs, log)
+}
+
 /// `runs` scans of one committed copy of the fixture `name`, with `extra`
 /// files written into it before the commit, sharing one store and cache:
 /// every scan after the first takes the incremental path. The blobs after
@@ -1642,7 +1667,7 @@ fn client_bases_follow_the_instance_walk() {
 /// Forms that already read keep their rows.
 #[test]
 fn a_client_base_reads_through_the_resolver() {
-    let on = scan_fixture("client-base-values");
+    let (on, log) = scan_fixture_logged("client-base-values");
     let rows = call_rows(&on);
     let paths = |file: &str| -> Vec<String> {
         rows.iter()
@@ -1690,6 +1715,26 @@ fn a_client_base_reads_through_the_resolver() {
         Vec::<String>::new(),
         "{rows:#?}"
     );
+    // An options object the resolver cannot read keeps the host-free reading
+    // of today and is counted (R3): only a spread, an exported object, one
+    // handed to more than one maker call.
+    for file in ["b-opts-spread-only", "b-opts-exported"] {
+        assert_eq!(paths(file), vec![format!("/p/{file}")], "{file}: {rows:#?}");
+    }
+    assert_eq!(
+        paths("b-opts-twice"),
+        vec![
+            "/p/b-opts-twice".to_string(),
+            "/p/b-opts-twice-other".to_string()
+        ],
+        "{rows:#?}"
+    );
+    let unread = log.split("bases_options_unread=").nth(1).map(|rest| {
+        rest.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+    });
+    assert_eq!(unread.as_deref(), Some("4"), "{log}");
     // A base the code does not state as one text stays out.
     for file in [
         "b-env",

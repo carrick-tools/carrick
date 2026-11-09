@@ -31,6 +31,19 @@ pub(in crate::request_summary) enum TextValue {
     Hole(guards::HoleReason),
 }
 
+/// What the resolver reads of an argument of a maker call
+/// ([`Resolver::keyed_text_set`], `NameFold::arg_texts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::request_summary) enum ArgTexts {
+    /// Every text the argument, or its entry, may be.
+    Values(Vec<TextValue>),
+    /// An options object the resolver cannot read: a spread that may write
+    /// the key with none written, an exported object, one handed to more than
+    /// one call. It keeps today's host-free reading and is counted (carrick
+    /// #3504 S5a, R3).
+    Unread,
+}
+
 impl<'a> Resolver<'a> {
     /// The one text `value`, written in `file`, always is, where the code
     /// states every part of it and the compiler names each declaration it
@@ -573,7 +586,7 @@ impl Resolver<'_> {
         expr: &Expr,
         key: &str,
         call: u32,
-    ) -> Option<Vec<TextValue>> {
+    ) -> Option<ArgTexts> {
         let absolute = root.join(file);
         let (path, ir) = self.inputs_for(&absolute).files.get_key_value(&absolute)?;
         let object = text_of(expr, &|lo| ir.discovery_start(lo));
@@ -605,15 +618,22 @@ impl Resolver<'_> {
         // hands the object on to the one call this entry is read for.
         let kept = binding.entries_kept
             || (binding.entries_handed && binding.handed.iter().all(|at| *at == call));
+        // An exported object, or one handed to more than one call, is an
+        // object the resolver does not read (R3).
+        if closed && !kept && (binding.exported || binding.entries_handed) {
+            return Some(ArgTexts::Unread);
+        }
         if closed && kept {
-            return Some(match self.entry_of(at.0, entries, key, true) {
-                Ok(None) => Vec::new(),
-                Ok(Some(value)) => match self.reading_text(&at) {
-                    Some(_reading) => self.text_values(at.0, value),
-                    None => vec![TextValue::Hole(guards::HoleReason::Recursion)],
+            return Some(ArgTexts::Values(
+                match self.entry_of(at.0, entries, key, true) {
+                    Ok(None) => Vec::new(),
+                    Ok(Some(value)) => match self.reading_text(&at) {
+                        Some(_reading) => self.text_values(at.0, value),
+                        None => vec![TextValue::Hole(guards::HoleReason::Recursion)],
+                    },
+                    Err(reason) => vec![TextValue::Hole(reason)],
                 },
-                Err(reason) => vec![TextValue::Hole(reason)],
-            });
+            ));
         }
         let member = ValueAt::Member {
             lo: 0,
@@ -621,7 +641,7 @@ impl Resolver<'_> {
             object: Box::new(object),
             key: Box::new(ValueAt::Lit(key.to_string())),
         };
-        Some(self.text_values(path, &member))
+        Some(ArgTexts::Values(self.text_values(path, &member)))
     }
 
     /// The parts of the text `expr`, written in the repo file `file`

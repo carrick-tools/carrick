@@ -41,7 +41,7 @@ mod text_reader;
 
 pub(crate) use documents::{DocumentEnd, DocumentLookup, document_calls};
 pub(super) use text::{pattern_members, text_of};
-pub(super) use text_reader::TextValue;
+pub(super) use text_reader::{ArgTexts, TextValue};
 
 /// How many object literals deep an argument's keys are read (the decision
 /// record's object-depth cap, D7).
@@ -100,6 +100,8 @@ pub(super) struct ModuleBinding {
     /// whose reader is the labelled maker the entry is read for.
     pub(super) entries_handed: bool,
     pub(super) handed: Vec<u32>,
+    /// The module exports the declaration inline (`export const x`).
+    pub(super) exported: bool,
     /// The binding is in the table for the text reader alone: a function's
     /// own local its body never writes again. The scope already holds it for
     /// every other reader (`scope.held`), so [`Resolver::binding_values`]
@@ -763,6 +765,7 @@ pub(super) fn module_bindings(
                         entries_kept: false,
                         entries_handed: false,
                         handed: Vec::new(),
+                        exported: false,
                         text_only: true,
                         object_kept: false,
                     };
@@ -788,6 +791,7 @@ pub(super) fn module_bindings(
                 entries_kept: census.entries_kept(&key, exported),
                 entries_handed: census.entries_handed(&key, exported),
                 handed: census.handed.get(&key).cloned().unwrap_or_default(),
+                exported,
                 text_only: false,
                 object_kept: census.object_kept(&key),
             };
@@ -820,6 +824,7 @@ pub(super) fn module_bindings(
                 entries_kept: census.entries_kept(&local.key, false),
                 entries_handed: census.entries_handed(&local.key, false),
                 handed: census.handed.get(&local.key).cloned().unwrap_or_default(),
+                exported: false,
                 text_only: !local.reassigned,
                 object_kept: false,
             };
