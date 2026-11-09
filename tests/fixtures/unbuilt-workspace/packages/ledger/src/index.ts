@@ -3,3 +3,7 @@ export class Ledger {
     return account.length;
   }
 }
+
+export function openLedger(): Ledger {
+  return new Ledger();
+}

@@ -1,9 +1,6 @@
-import { Ledger } from '@acme/ledger';
+import { openLedger } from '@acme/ledger';
 
-export class Handler {
-  constructor(private readonly dep: Ledger) {}
-
-  run(account: string): number {
-    return this.dep.total(account);
-  }
+export function balance(account: string): number {
+  const ledger = openLedger();
+  return ledger.total(account);
 }
