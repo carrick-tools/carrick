@@ -1184,6 +1184,7 @@ pub fn fold(
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route,
+                static_asset: None,
             });
         }
     }

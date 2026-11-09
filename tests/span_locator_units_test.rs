@@ -147,6 +147,7 @@ fn analyzer_result(client_file: &str, site: &Site) -> HashMap<String, FileAnalys
         library_semantics: Vec::new(),
         at_caller: false,
         call_body: None,
+        static_asset: None,
     };
 
     let mut file_results = HashMap::new();

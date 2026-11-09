@@ -2448,6 +2448,7 @@ fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> b
         reaches_request: Some(reached.site.clone()),
         library_semantics: Vec::new(),
         own_route,
+        static_asset: None,
     };
     debug!(
         "  - {}: states {} {}, the request written at {}",
@@ -3628,6 +3629,7 @@ mod tests {
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         }
     }
 
@@ -3949,6 +3951,7 @@ mod tests {
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }
     }
 

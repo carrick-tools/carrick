@@ -16678,6 +16678,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             reaches_request: Some(abs("src/lib/search-client.ts:88")),
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         });
 
         let mut function_definitions = HashMap::new();
@@ -17364,6 +17365,7 @@ unfollowed_member_calls_total: 0,
                     library_semantics: Vec::new(),
                     at_caller: false,
                     call_body: None,
+                    static_asset: None,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -17414,6 +17416,7 @@ unfollowed_member_calls_total: 0,
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -17490,6 +17493,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.data_calls = vec![
@@ -17529,6 +17533,7 @@ unfollowed_member_calls_total: 0,
             library_semantics: Vec::new(),
             at_caller,
             call_body: None,
+            static_asset: None,
         };
         let declared =
             crate::forwarded_body::CallBody::Param(crate::forwarded_body::DeclaredParam {
@@ -17637,6 +17642,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route,
+            static_asset: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.data_calls = vec![
@@ -17797,6 +17803,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -18726,6 +18733,7 @@ unfollowed_member_calls_total: 0,
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -18753,6 +18761,7 @@ unfollowed_member_calls_total: 0,
                 reaches_request: None,
                 library_semantics: Vec::new(),
                 own_route: false,
+                static_asset: None,
             },
         ];
 
@@ -19668,6 +19677,7 @@ unfollowed_member_calls_total: 0,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let multi_line = "register(\n  listOrders,\n  \"orders.save\",\n)";
         let chain = "register(listOrders, \"orders.then\").then(() => undefined)";
@@ -19770,6 +19780,7 @@ unfollowed_member_calls_total: 0,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let mut result = FileAnalysisResult {
             data_calls: vec![
@@ -24396,6 +24407,7 @@ unfollowed_member_calls_total: 0,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -25305,6 +25317,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }
     }
 
@@ -25367,6 +25380,7 @@ unfollowed_member_calls_total: 0,
             reaches_request: None,
             library_semantics: Vec::new(),
             own_route: false,
+            static_asset: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],

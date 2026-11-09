@@ -4793,6 +4793,10 @@ impl FileOrchestrator {
             debug!("  - Rows stating unfollowed member call sites: {stamped}");
         }
 
+        // PHASE 5a (carrick#1989): mark the calls that request a file the
+        // service serves from a static folder its convention names.
+        Self::stamp_static_assets(&mut file_results, &conventions, service_root, repo_root);
+
         // PHASE 5b: settle the dispatch values summary rows send from their
         // own bodies (carrick#1555), then clear every model value its own file
         // does not write (carrick#2201).
@@ -8539,6 +8543,7 @@ impl FileOrchestrator {
                     library_semantics: Vec::new(),
                     at_caller: false,
                     call_body: None,
+                    static_asset: None,
                 })),
             });
         }
@@ -8672,6 +8677,7 @@ impl FileOrchestrator {
                 library_semantics: row.library_semantics.clone(),
                 at_caller: row.at_caller,
                 call_body: row.call_body.clone(),
+                static_asset: None,
             })),
         }
     }
@@ -8906,6 +8912,7 @@ impl FileOrchestrator {
             // Set by the one claim here that reads a call to a declared
             // function, the imported-member join (carrick#1782).
             call_body: None,
+            static_asset: None,
         }
     }
 
@@ -10752,6 +10759,37 @@ impl FileOrchestrator {
         homes
     }
 
+    /// Mark each read call whose path names a file the service serves from a
+    /// static folder its routing convention states (carrick#1989). Writes
+    /// only `static_asset`, on every scan, and nothing else on the row.
+    fn stamp_static_assets(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        conventions: &[RoutingConvention],
+        service_root: &Path,
+        repo_root: &Path,
+    ) {
+        for result in file_results.values_mut() {
+            for call in &mut result.data_calls {
+                // A static file is only ever read; a write to the same path
+                // is a call to a route.
+                let reads = call
+                    .method
+                    .as_deref()
+                    .is_none_or(|m| m.eq_ignore_ascii_case("GET"));
+                call.static_asset = if reads {
+                    crate::file_based_router::static_asset_for(
+                        &call.target,
+                        service_root,
+                        repo_root,
+                        conventions,
+                    )
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
     /// Stamp what the member join could not follow onto the rows that member
     /// DID produce (carrick#656).
     ///
@@ -11761,6 +11799,9 @@ impl FileOrchestrator {
                         // Decided by the seventh pass below, once every
                         // endpoint path is final (carrick#1926).
                         own_route: false,
+                        // Stamped over the folded rows by
+                        // `stamp_static_assets` (carrick#1989).
+                        static_asset: data_call.static_asset.clone(),
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));
@@ -14335,6 +14376,7 @@ export * from "./aFetch.js";"#,
                     library_semantics: Vec::new(),
                     at_caller: false,
                     call_body: None,
+                    static_asset: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -14395,6 +14437,7 @@ export * from "./aFetch.js";"#,
                     library_semantics: Vec::new(),
                     at_caller: false,
                     call_body: None,
+                    static_asset: None,
                 }
             };
 
@@ -14483,6 +14526,7 @@ export * from "./aFetch.js";"#,
                     library_semantics: Vec::new(),
                     at_caller: false,
                     call_body: None,
+                    static_asset: None,
                 }],
                 ..Default::default()
             },
@@ -14655,6 +14699,7 @@ export * from "./aFetch.js";"#,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         }
     }
 
@@ -15142,6 +15187,7 @@ export * from "./aFetch.js";"#,
                 library_semantics: Vec::new(),
                 at_caller: false,
                 call_body: None,
+                static_asset: None,
             }],
             ..Default::default()
         };
@@ -15240,6 +15286,7 @@ export * from "./aFetch.js";"#,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
 
         let mut file_results = HashMap::new();
@@ -15374,6 +15421,7 @@ export * from "./aFetch.js";"#,
                         library_semantics: Vec::new(),
                         at_caller: false,
                         call_body: None,
+                        static_asset: None,
                     }],
                     graphql_operations: vec![],
                     pubsub_operations: vec![],
@@ -15461,6 +15509,7 @@ export * from "./aFetch.js";"#,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
 
         let mut file_results = HashMap::new();
@@ -15563,6 +15612,7 @@ export * from "./aFetch.js";"#,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -15658,6 +15708,7 @@ export * from "./aFetch.js";"#,
                         library_semantics: Vec::new(),
                         at_caller: false,
                         call_body: None,
+                        static_asset: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -15685,6 +15736,7 @@ export * from "./aFetch.js";"#,
                         library_semantics: Vec::new(),
                         at_caller: false,
                         call_body: None,
+                        static_asset: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -15749,6 +15801,7 @@ export * from "./aFetch.js";"#,
                     library_semantics: Vec::new(),
                     at_caller: false,
                     call_body: None,
+                    static_asset: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -15816,6 +15869,7 @@ export * from "./aFetch.js";"#,
                         library_semantics: Vec::new(),
                         at_caller: false,
                         call_body: None,
+                        static_asset: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -15843,6 +15897,7 @@ export * from "./aFetch.js";"#,
                         library_semantics: Vec::new(),
                         at_caller: false,
                         call_body: None,
+                        static_asset: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -16082,6 +16137,7 @@ export * from "./aFetch.js";"#,
             library_semantics: Vec::new(),
             at_caller,
             call_body: None,
+            static_asset: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -16202,6 +16258,7 @@ export * from "./aFetch.js";"#,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body,
+            static_asset: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -16340,6 +16397,7 @@ export * from "./aFetch.js";"#,
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -17093,6 +17151,7 @@ export * from "./aFetch.js";"#,
                 library_semantics: Vec::new(),
                 at_caller: false,
                 call_body: None,
+                static_asset: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -17203,6 +17262,7 @@ export * from "./aFetch.js";"#,
                 library_semantics: Vec::new(),
                 at_caller: false,
                 call_body: None,
+                static_asset: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -17572,6 +17632,7 @@ export * from "./aFetch.js";"#,
                 library_semantics: Vec::new(),
                 at_caller: false,
                 call_body: None,
+                static_asset: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -20398,6 +20459,7 @@ export { routes };
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         }
     }
 
@@ -21345,6 +21407,7 @@ export { routes };
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         };
         let facts = crate::request_summary::fact_files::FactFiles {
             graphql_client_calls: BTreeMap::from([(
@@ -21604,6 +21667,110 @@ export { routes };
                 stats.dispatch_guesses_cleared
             ),
             (1, 1)
+        );
+    }
+
+    fn static_call(target: &str, method: Option<&str>) -> DataCallResult {
+        let mut value = serde_json::json!({
+            "candidate_id": "c",
+            "line_number": 1,
+            "target": target,
+            "pattern_matched": "fetch",
+            "payload_expression_text": null,
+            "payload_expression_line": null,
+            "primary_type_symbol": null,
+            "type_import_source": null
+        });
+        value["method"] = serde_json::json!(method);
+        // A value the model wrote must never survive the stamp.
+        value["static_asset"] = serde_json::json!("model/invented.png");
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// carrick#1989 on the fixture app: the existing file is marked, the
+    /// missing file and the route are not, a write to the file's path is not,
+    /// and the model's own value never survives.
+    #[test]
+    fn stamp_static_assets_marks_only_reads_of_files_the_service_serves() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/static-assets-next");
+        let conventions = builtin_conventions(&["next".to_string()]);
+        let mut results = HashMap::new();
+        results.insert(
+            "app/page.tsx".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    static_call("/images/banner.svg", Some("GET")),
+                    static_call("/images/banner.svg", None),
+                    static_call("/images/missing.svg", Some("GET")),
+                    static_call("/api/items", Some("GET")),
+                    static_call("/images/banner.svg", Some("POST")),
+                ],
+                ..Default::default()
+            },
+        );
+        FileOrchestrator::stamp_static_assets(&mut results, &conventions, &root, &root);
+        let marks: Vec<Option<&str>> = results["app/page.tsx"]
+            .data_calls
+            .iter()
+            .map(|c| c.static_asset.as_deref())
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                Some("public/images/banner.svg"),
+                Some("public/images/banner.svg"),
+                None,
+                None,
+                None
+            ]
+        );
+    }
+
+    /// carrick#1989 on the wire: the stamped row reaches the serialised
+    /// `mount_graph.data_calls[]` the cloud reads, carrying `static_asset`,
+    /// and a call that is not a request for a served file carries no key.
+    #[test]
+    fn mount_graph_data_calls_serialise_static_asset_only_where_stamped() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/static-assets-next");
+        let conventions = builtin_conventions(&["next".to_string()]);
+        let mut results = HashMap::new();
+        results.insert(
+            "app/page.tsx".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    static_call("/images/banner.svg", Some("GET")),
+                    static_call("/api/items", Some("GET")),
+                ],
+                ..Default::default()
+            },
+        );
+        FileOrchestrator::stamp_static_assets(&mut results, &conventions, &root, &root);
+
+        let graph = FileOrchestrator::new(AgentService::new()).build_mount_graph(
+            &results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let wire = serde_json::to_value(&graph).unwrap();
+        let rows = wire["data_calls"].as_array().unwrap();
+        let row = |path: &str| {
+            rows.iter()
+                .find(|r| r["canonical_path"] == path)
+                .unwrap_or_else(|| panic!("no data_calls row for {path}: {rows:?}"))
+        };
+        assert_eq!(
+            row("/images/banner.svg")["static_asset"],
+            "public/images/banner.svg"
+        );
+        assert!(
+            row("/api/items")
+                .as_object()
+                .unwrap()
+                .get("static_asset")
+                .is_none()
         );
     }
 
@@ -22993,6 +23160,7 @@ export function publishWrapped(order: OrderPlaced): void {
             library_semantics: Vec::new(),
             at_caller: false,
             call_body: None,
+            static_asset: None,
         }
     }
 
