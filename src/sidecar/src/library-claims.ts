@@ -2822,11 +2822,15 @@ class DeclarationReader {
    * What a merge's rest slot takes at `index` (amendment 9): the element
    * `parameterAt` reads, and when that is itself a type parameter spread into
    * the rest (`...routers: [...R]` with `R extends Router[]`), its
-   * constraint's element.
+   * constraint's element. Only that spread is unwrapped: a parameter that
+   * takes an array of routers (`routers: Router[]`, `...lists: Router[][]`)
+   * is a merge over an array, which amendment 9 leaves out.
    */
   private mergedSlotAt(signature: ts.Signature, index: number): Slot | undefined {
     const slot = this.parameterAt(signature, index, true);
     if (slot === undefined || slot === VARIADIC) return slot;
+    const restIndex = this.restIndexOf(signature);
+    if (restIndex === -1 || index < restIndex || !(slot.flags & ts.TypeFlags.TypeParameter)) return slot;
     const through = this.throughConstraint(slot);
     if (through !== VARIADIC && this.checker.isArrayType(through)) {
       return this.checker.getTypeArguments(through as ts.TypeReference)[0];
@@ -6091,6 +6095,13 @@ class DeclarationReader {
     return (type.isUnion() ? type.types : [type]).filter(part => !isNullish(part));
   }
 
+  /** The index of the signature's rest parameter, or -1 when it has none. */
+  private restIndexOf(signature: ts.Signature): number {
+    const parameters = signature.getParameters();
+    const declaration = parameters[parameters.length - 1]?.valueDeclaration;
+    return declaration && ts.isParameter(declaration) && declaration.dotDotDotToken ? parameters.length - 1 : -1;
+  }
+
   /**
    * What the signature has at parameter `index`, reading through a rest
    * parameter; `undefined` when it has none there. A rest typed by a type
@@ -6100,11 +6111,7 @@ class DeclarationReader {
   private parameterAt(signature: ts.Signature, index: number, readConstraint = false): Slot | undefined {
     const parameters = signature.getParameters();
     const last = parameters[parameters.length - 1];
-    const declaration = last?.valueDeclaration;
-    const restIndex =
-      declaration && ts.isParameter(declaration) && declaration.dotDotDotToken
-        ? parameters.length - 1
-        : -1;
+    const restIndex = this.restIndexOf(signature);
     if (restIndex === -1 || index < restIndex) {
       return index < parameters.length ? this.checker.getTypeOfSymbol(parameters[index]) : undefined;
     }

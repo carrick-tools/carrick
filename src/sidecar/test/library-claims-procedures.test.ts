@@ -76,6 +76,11 @@ export interface Kit {
   mergeRouters<R extends Router[]>(...routers: [...R]): Router;
   mergeNone(...names: string[]): Router;
   mergeLoose(...anything: any[]): Router;
+  mergeLists(...lists: Router[][]): Router;
+  mergeArray(routers: Router[]): Router;
+  mergeArrayOf<R extends Router[]>(routers: R): Router;
+  mergeRest(...routers: Router[]): Router;
+  mergeRestOf<R extends Router[]>(...routers: R): Router;
 }
 export interface Init {
   create(): Kit;
@@ -289,6 +294,28 @@ describe('verify_library_claims: procedure-router fields (carrick#2474 R6a)', ()
         merging('mergeLoose'),
       ]),
       ['verified', 'verified', 'failed merges_not_collection', 'unchecked merges_untyped']
+    );
+  });
+
+  it('merges reads a rest of routers, never an array of them (out of amendment 9)', async () => {
+    const merging = (member: string) => onKit(scope(member, { merges: { arg: 0, each: true } }));
+    assert.deepStrictEqual(
+      await send([
+        router(),
+        merging('mergeRest'),
+        merging('mergeRestOf'),
+        merging('mergeLists'),
+        merging('mergeArray'),
+        merging('mergeArrayOf'),
+      ]),
+      [
+        'verified',
+        'verified',
+        'verified',
+        'failed merges_not_collection',
+        'failed merges_not_collection',
+        'failed merges_not_collection',
+      ]
     );
   });
 
