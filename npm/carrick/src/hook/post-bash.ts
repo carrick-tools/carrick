@@ -21,7 +21,7 @@
 import { readStdin } from "./stdin.ts";
 import path from "node:path";
 import fs from "node:fs";
-import { bashTargets, MENTIONS_SOURCE, movesTreeInBulk } from "./bash-targets.ts";
+import { bashTargets, MENTIONS_SOURCE, movesTreeInBulk, searchedNames } from "./bash-targets.ts";
 
 /** At most this many files are asked about for one command. */
 const MAX_FILES = 2;
@@ -29,11 +29,15 @@ const MAX_FILES = 2;
 const MAX_WRITES = 5;
 /** A written file with no record counts when modified this recently. */
 const FRESH_MS = 120_000;
+/** A command that may search the tree. */
+const SEARCH_WORD = /\b(grep|rg|egrep|fgrep)\b/;
 
 type Payload = {
   cwd?: string;
   session_id?: string;
   tool_input?: { command?: string };
+  /** What the command printed: a string, or an object carrying `stdout`. */
+  tool_response?: string | { stdout?: string };
 };
 
 async function main(): Promise<void> {
@@ -44,11 +48,13 @@ async function main(): Promise<void> {
     return;
   }
   const command = payload.tool_input?.command;
-  if (!command || !MENTIONS_SOURCE.test(command)) return;
+  if (!command || !(MENTIONS_SOURCE.test(command) || SEARCH_WORD.test(command))) return;
   const cwd = payload.cwd ?? process.cwd();
   const { reads, writes } = bashTargets(command, path.resolve(cwd));
   const candidates = writes.length > 0 && !movesTreeInBulk(command, path.resolve(cwd)) ? writes : [];
-  if (reads.length === 0 && candidates.length === 0) return;
+  // A search for a function's name: the index sites its output did not print.
+  const searched = SEARCH_WORD.test(command) ? searchedNames(command, path.resolve(cwd)) : { names: [], operands: [] };
+  if (reads.length === 0 && candidates.length === 0 && searched.names.length === 0) return;
 
   const session = payload.session_id;
   const { markInvoker } = await import("./invoker.ts");
@@ -85,6 +91,16 @@ async function main(): Promise<void> {
   const answers = (await Promise.all(fresh.map((file) => answerRead(file, payload.cwd, session)))).filter(
     (line): line is string => line !== null,
   );
+
+  const response = payload.tool_response;
+  const output = typeof response === "string" ? response : response?.stdout;
+  if (channel.channel === "hook" && searched.names.length > 0 && typeof output === "string") {
+    const { resolveRoot } = await import("../root.ts");
+    const root = resolveRoot({ clientRoot: payload.cwd ?? null, projectDir: process.env["CLAUDE_PROJECT_DIR"] ?? null }).root;
+    const { missedSites } = await import("./grep-missed.ts");
+    const line = missedSites(searched.names, searched.operands, output, root, path.resolve(cwd), session);
+    if (line !== null) answers.push(line);
+  }
 
   if (toEdit.length > 0) {
     const { editFlow } = await import("./edit-flow.ts");
