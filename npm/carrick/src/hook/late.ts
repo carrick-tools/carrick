@@ -8,7 +8,7 @@
 // hooks print it once.
 
 import { createLogger } from "../log.ts";
-import { answersTheEdit, changedFailedLine, changedLines, notRecheckedLine, renderPostToolUse } from "../render.ts";
+import { answersTheEdit, changedLines, notRecheckedLine, renderPostToolUse } from "../render.ts";
 import { claimDelivery, finishedFor, isChanged } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
@@ -18,14 +18,10 @@ const log = createLogger("carrick-late");
 
 /** The words for one finished answer, or null when there is nothing to say. */
 export function lateContext(answer: Answer, uses: boolean, settled = false): string | null {
-  // The whole-change check a Stop queued (carrick#3466): its verdict, or that
-  // it gave none. Never a clause: it is the check the clause asks for.
-  if (isChanged(answer)) {
-    if (answer.changed) return changedLines(answer.changed);
-    return changedFailedLine(
-      answer.state === "stopped" ? (answer.failure ?? "it stopped") : "the binary failed or printed no answer",
-    );
-  }
+  // The whole-change check a Stop queued (carrick#3466) speaks only with a
+  // problem: a clean run, a run that could not check and a run that gave no
+  // answer print nothing (a failure is logged by `deliverLate`).
+  if (isChanged(answer)) return answer.changed ? changedLines(answer.changed) || null : null;
   if (!answer.result) {
     // An internal failure is logged, never shown: the reader needs the next step.
     const reason =

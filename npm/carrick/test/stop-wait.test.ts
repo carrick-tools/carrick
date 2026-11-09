@@ -411,6 +411,24 @@ test("a Stop whose only gap is a file no service reads prints nothing and queues
   assert.equal(changedQueued(workspace.root).length, 0);
 });
 
+test("a Stop whose only gap is an edit that changed nothing the scan reads prints nothing and queues nothing", async (t) => {
+  const { workspace, home } = setup(t);
+  edit(workspace.root, home, workspace.file, Date.now() - 5000);
+  const comment: CheckResult = {
+    ...fixture("check-deferred.json"),
+    recheck: {
+      ran: "none",
+      elapsed_ms: 0,
+      reason: "the edit changed nothing the scan reads (comments or layout); verdicts are the index's",
+    },
+  };
+  answer(home, queue(workspace.root, home, workspace.file), comment);
+
+  const result = await stopAnswers(SESSION, { waitS: 0, home, ensure: () => false });
+  assert.deepEqual(result.lines, []);
+  assert.equal(changedQueued(workspace.root).length, 0);
+});
+
 test("a Stop with 1 problem prints the header and its line", async (t) => {
   const { workspace, home } = setup(t);
   edit(workspace.root, home, workspace.file, Date.now() - 5000);
