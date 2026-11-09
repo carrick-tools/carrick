@@ -710,7 +710,11 @@ pub(super) fn module_bindings(
     reader: &Reader<'_>,
     scope: &Scope<'_>,
     functions: &HashMap<String, FnIr>,
-) -> (HashMap<(u32, String), ModuleBinding>, HashSet<String>) {
+) -> (
+    HashMap<(u32, String), ModuleBinding>,
+    HashSet<String>,
+    HashSet<(u32, u32)>,
+) {
     let mut census = WriteCensus::default();
     module.visit_with(&mut census);
     // Each import this module only reads a member of, and never changes: a
@@ -838,7 +842,36 @@ pub(super) fn module_bindings(
             }
         }
     }
-    (out, kept_imports)
+    (out, kept_imports, written_through_at(module, &census))
+}
+
+/// Where every name of a binding the module writes through starts, as
+/// `(lo, hi)` in discovery numbering (carrick#3504 S5b): the census's
+/// `written_through`, read at a use by its span. A walk root's receiver is a
+/// parameter no module binding row holds, so the use's span is how its
+/// reader asks whether the instance's entries are written.
+fn written_through_at(module: &Module, census: &WriteCensus) -> HashSet<(u32, u32)> {
+    struct Names<'c> {
+        census: &'c WriteCensus,
+        at: HashSet<(u32, u32)>,
+    }
+    impl Visit for Names<'_> {
+        fn visit_ident(&mut self, ident: &Ident) {
+            if self.census.written_through.contains(&ident_key(ident)) {
+                self.at.insert((ident.span.lo.0, ident.span.hi.0));
+            }
+        }
+        fn visit_ts_type(&mut self, _: &TsType) {}
+    }
+    if census.written_through.is_empty() {
+        return HashSet::new();
+    }
+    let mut names = Names {
+        census,
+        at: HashSet::new(),
+    };
+    module.visit_with(&mut names);
+    names.at
 }
 
 /// The class a module item declares, and whether it is exported inline.

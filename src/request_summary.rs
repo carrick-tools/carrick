@@ -1627,6 +1627,10 @@ pub struct FileIr {
     /// Each import (by its local name) this module only reads a member of
     /// and never changes ([`resolve::module_bindings`], carrick#2448).
     kept_imports: HashSet<String>,
+    /// Where each name of a binding this module writes through starts
+    /// (`api.defaults.baseURL = u` names `api`), from the one write census
+    /// ([`resolve::module_bindings`], carrick#3504 S5b).
+    written_through_at: HashSet<(u32, u32)>,
     /// Where this file starts in the discovery source map
     /// ([`Self::swc_start`]).
     source_start: u32,
@@ -2460,8 +2464,11 @@ pub fn extract_file_ir(
             }
         }
         file.module_level = module_level;
-        (file.module_bindings, file.kept_imports) =
-            resolve::module_bindings(module, source_map, &reader, &scope, &file.functions);
+        (
+            file.module_bindings,
+            file.kept_imports,
+            file.written_through_at,
+        ) = resolve::module_bindings(module, source_map, &reader, &scope, &file.functions);
     }
     // What a row stated in another module needs to say about a client's
     // base the way this module's own rows say it (carrick#1568). Any file
