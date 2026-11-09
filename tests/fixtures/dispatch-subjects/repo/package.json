@@ -1,0 +1,12 @@
+{
+  "name": "dispatch-routes-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-legacy-server": "^1.0.0",
+    "fixture-router": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

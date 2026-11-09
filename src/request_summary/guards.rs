@@ -50,6 +50,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::decided_sites::Calls;
 use super::library_sites::{LinkedNames, TextPiece, text_pieces};
+use super::resolve::ValueAt;
 use super::{
     CallIr, CallWalker, FileIr, FnIr, ImportBinding, Piece, Reader, Reassigned,
     RequestSummaryInputs, Scope, Site, Value, keyed_names, member_prop, prop_name,
@@ -214,6 +215,12 @@ pub(super) struct Subject {
     /// For a hole, the source text it stopped at (`this.client`,
     /// `parse(raw)`), when one expression is where it stopped.
     text: Option<String>,
+    /// For a hole at a binding a function declares: the binding, and how
+    /// many functions out from the one reading the subject it is declared
+    /// (carrick#3504 S7b-1). A chain with compiler rows reads every value
+    /// written to it ([`Chains::written_params`]); `None` for every other
+    /// root.
+    binding: Option<(BindingKey, u8)>,
 }
 
 impl Subject {
@@ -222,7 +229,18 @@ impl Subject {
             root,
             steps: Vec::new(),
             text: None,
+            binding: None,
         }
+    }
+
+    /// The hole `self` is, at the binding `key` the reading function
+    /// declares. A hole already at a binding (`const p = path`) stays at
+    /// that one.
+    fn at_binding(mut self, key: &BindingKey) -> Self {
+        if matches!(self.root, Root::Hole(_)) && self.binding.is_none() {
+            self.binding = Some((key.clone(), 0));
+        }
+        self
     }
 
     fn hole(reason: HoleReason) -> Self {
@@ -238,9 +256,10 @@ impl Subject {
         self
     }
 
-    /// One more access. A hole stays the hole it is.
+    /// One more access. A hole stays the hole it is; one at a binding keeps
+    /// the access for each value the binding may hold.
     fn then(mut self, step: Step) -> Self {
-        if !matches!(self.root, Root::Hole(_)) {
+        if !matches!(self.root, Root::Hole(_)) || self.binding.is_some() {
             self.steps.push(step);
         }
         self
@@ -260,6 +279,10 @@ impl Subject {
             root,
             steps: self.steps.clone(),
             text: self.text.clone(),
+            binding: self
+                .binding
+                .as_ref()
+                .map(|(key, out)| (key.clone(), out.saturating_add(1))),
         }
     }
 
@@ -1102,12 +1125,12 @@ impl Reader<'_> {
         match (pat, init) {
             (Pat::Ident(ident), None) => {
                 let key = ident_key(&ident.id);
-                let reason = if scope.reassigned.contains(&key.0) {
-                    HoleReason::Reassigned
-                } else {
-                    HoleReason::UnreadExpression
-                };
-                vec![(key, Subject::hole(reason))]
+                if scope.reassigned.contains(&key.0) {
+                    // `let path; path = req.url;`: every value written to it.
+                    let subject = Subject::hole(HoleReason::Reassigned).at_binding(&key);
+                    return vec![(key, subject)];
+                }
+                vec![(key, Subject::hole(HoleReason::UnreadExpression))]
             }
             // A function is no compared value: the name hands it on
             // ([`Reader::handed`]).
@@ -1118,12 +1141,14 @@ impl Reader<'_> {
             }
             (Pat::Ident(ident), Some(init)) => {
                 let key = ident_key(&ident.id);
+                // A hole (`OVERRIDE ?? req.url`, a `let` set again) is every
+                // value the binding may hold, read after the rows.
                 let subject = if settled(&key) {
                     self.subject(init, scope, bound)
                 } else {
                     Subject::hole(HoleReason::Reassigned)
                 };
-                vec![(key, subject)]
+                vec![(key.clone(), subject.at_binding(&key))]
             }
             (Pat::Object(object), Some(init)) => {
                 let base = self.subject(init, scope, bound);
@@ -2017,6 +2042,10 @@ enum At {
 /// the function inside the argument).
 type HandedAt = (usize, At, usize, Vec<String>);
 
+/// A parameter a value written to a binding reads as: how many functions out
+/// from the reading one, its position and the keys inside it.
+type WrittenParam = (u8, usize, Vec<String>);
+
 /// Every chain the guards in `inputs` state, sorted, with each file named
 /// relative to `root`.
 pub fn guard_chains(inputs: &RequestSummaryInputs, root: &Path) -> Vec<GuardChain> {
@@ -2424,10 +2453,85 @@ impl<'a> Chains<'a> {
         }
     }
 
+    /// For a hole at a binding (`let path; path = req.url;`, `const path =
+    /// OVERRIDE ?? req.url`), the parameters every value written to it reads
+    /// as (how many functions out from `node`, position, keys), and whether
+    /// a name or member read is among the values too (carrick#3504 S7b-1).
+    /// The values are the declaring body's: its initialiser
+    /// ([`super::resolve::LocalBinding::init`]) and each write the module's
+    /// write census places ([`super::resolve::PlacedWrites`]), lowered where
+    /// it is written ([`super::resolve::BindingWrite::values`]). `None`, and
+    /// the hole stays, where
+    /// the compiler's rows are not read, the census cannot place a write, a
+    /// write is in another body, a value is made from another (a call
+    /// result, a `new`: it may be a transform of one), or no value is a
+    /// parameter.
+    fn written_params(&self, node: usize, subject: &Subject) -> Option<(Vec<WrittenParam>, bool)> {
+        let (key, out) = subject.binding.as_ref()?;
+        if self.inputs.row_calls.is_none() || !matches!(subject.root, Root::Hole(_)) {
+            return None;
+        }
+        let mut declaring = node;
+        for _ in 0..*out {
+            declaring = self.nodes[declaring].parent?;
+        }
+        let body = self.nodes[declaring].ir;
+        let local = body.local_bindings.iter().find(|local| local.key == *key)?;
+        let writes = self
+            .inputs
+            .files
+            .get(self.nodes[declaring].file)?
+            .placed_writes
+            .of(key)?;
+        let mut values: Vec<&ValueAt> = local.init.iter().collect();
+        for at in writes {
+            let write = body.binding_writes.iter().find(|write| write.at == *at)?;
+            values.extend(&write.values);
+        }
+        let mut params = Vec::new();
+        let mut unread = false;
+        for value in values {
+            match value {
+                ValueAt::Param { depth, index, keys } => {
+                    let param = (depth.saturating_add(*out), *index, keys.clone());
+                    if !params.contains(&param) {
+                        params.push(param);
+                    }
+                }
+                ValueAt::Read { .. } => unread = true,
+                _ => return None,
+            }
+        }
+        (!params.is_empty()).then_some((params, unread))
+    }
+
     fn follow(&self, node: usize, mut trace: Trace, ends: &mut Ends) {
         trace.facts.stopped = Some(node);
         if ends.full() {
             ends.cap(self.hole(HoleReason::FanOutCap, node), trace);
+            return;
+        }
+        if let Some((params, unread)) = self.written_params(node, &trace.subject) {
+            // A binding the body sets: each value it may hold that reads as
+            // a parameter is followed as one (carrick#3504 S7b-1); a name
+            // beside them keeps the hole too.
+            let mut held = trace;
+            held.subject.binding = None;
+            if unread {
+                self.follow(node, held.clone(), ends);
+            }
+            let own = std::mem::take(&mut held.subject.steps);
+            held.subject.text = None;
+            for (depth, index, keys) in params {
+                let mut next = held.clone();
+                next.subject.root = if depth == 0 {
+                    Root::Param(index, String::new())
+                } else {
+                    Root::Outer(depth, index, String::new())
+                };
+                next.subject.steps = keys.into_iter().map(Step::Key).chain(own.clone()).collect();
+                self.follow(node, next, ends);
+            }
             return;
         }
         let steps = trace.subject.rendered_steps();

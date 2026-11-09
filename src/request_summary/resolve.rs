@@ -405,6 +405,53 @@ impl WriteCensus {
             || self.declared.get(key).copied().unwrap_or(0) > 1
     }
 
+    /// What the census places for every binding, kept for a reader of one
+    /// the binding table does not hold ([`PlacedWrites`]).
+    fn placed_writes(&self) -> PlacedWrites {
+        PlacedWrites {
+            writes: self.writes.clone(),
+            unplaceable: self
+                .unplaceable
+                .iter()
+                .chain(
+                    self.declared
+                        .iter()
+                        .filter(|(_, count)| **count > 1)
+                        .map(|(key, _)| key),
+                )
+                .cloned()
+                .collect(),
+            opaque: self.opaque,
+        }
+    }
+}
+
+/// The write census's verdict on every binding of a module, by binding
+/// (section 2.4), kept beside the binding table: a local of a function
+/// written in place (a handler passed to the call that runs it) is in no
+/// table entry, and a guard comparing it reads its writes here (carrick#3504
+/// S7b-1).
+#[derive(Debug, Clone, Default)]
+pub(super) struct PlacedWrites {
+    writes: HashMap<BindingKey, Vec<u32>>,
+    /// Written in a form no reader states, or declared twice.
+    unplaceable: HashSet<BindingKey>,
+    /// `with` or a direct `eval` may write any binding.
+    opaque: bool,
+}
+
+impl PlacedWrites {
+    /// Where each plain assignment to `key` starts, when every write of it
+    /// is one ([`WriteCensus::is_unplaceable`]); `None` otherwise.
+    pub(super) fn of(&self, key: &BindingKey) -> Option<&[u32]> {
+        if self.opaque || self.unplaceable.contains(key) {
+            return None;
+        }
+        Some(self.writes.get(key).map_or(&[], Vec::as_slice))
+    }
+}
+
+impl WriteCensus {
     /// Whether the module only ever reads the object `key` holds through a
     /// member, and never changes it (carrick#2448, soundness rule 2.3.3):
     /// nothing assigns the name or an entry of it, deletes one, or hands the
@@ -698,11 +745,13 @@ impl Visit for WriteCensus {
 
 /// What [`module_bindings`] returns: each binding by its line and name, the
 /// imports the module only reads a member of and never changes, and where a
-/// receiver is written through (carrick#3504 S5b).
+/// receiver is written through (carrick#3504 S5b), and the write census's
+/// verdict on every binding ([`PlacedWrites`], carrick#3504 S7b-1).
 pub(super) type ModuleBindings = (
     HashMap<(u32, String), ModuleBinding>,
     HashSet<String>,
     HashSet<(u32, u32)>,
+    PlacedWrites,
 );
 
 /// Each module-scope binding a plain name declares, with its initialiser
@@ -712,7 +761,8 @@ pub(super) type ModuleBindings = (
 /// level definition's own body declares once, and every enum at any depth.
 /// A local in a function written inside that body, and a declaration in a
 /// block at module scope, are unread. Two bindings declared on one line with
-/// one name are each unplaceable: no row says which one a use means.
+/// one name are each unplaceable: no row says which one a use means. The
+/// census's own verdict comes back beside the table ([`PlacedWrites`]).
 pub(super) fn module_bindings(
     module: &Module,
     source_map: &Lrc<SourceMap>,
@@ -847,7 +897,12 @@ pub(super) fn module_bindings(
             }
         }
     }
-    (out, kept_imports, written_through_at(module, &census))
+    (
+        out,
+        kept_imports,
+        written_through_at(module, &census),
+        census.placed_writes(),
+    )
 }
 
 /// Where every name of a binding the module writes through starts, as
