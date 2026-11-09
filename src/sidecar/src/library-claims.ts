@@ -67,6 +67,7 @@ import type {
   SurfaceKey,
   SurfaceMember,
   SurfaceParam,
+  SurfaceProperty,
   SurfaceReceiver,
   SurfaceSignature,
   SurfaceSettable,
@@ -1460,10 +1461,14 @@ export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
   // A member's `handlers` (carrick#2674), a signature's `result_candidates`
   // (carrick#2817) and a member's `scope_receiver` (carrick#2774) are out of
   // the hash at every depth, and so is a member's `runtime_events`
-  // (carrick#3032), so a package's key does not change when the lister
-  // learns to list them.
+  // (carrick#3032), and a receiver's `properties` (carrick#3696), so a
+  // package's key does not change when the lister learns to list them.
   const text = JSON.stringify(listed, (key, value) =>
-    key === 'handlers' || key === 'result_candidates' || key === 'scope_receiver' || key === 'runtime_events'
+    key === 'handlers' ||
+    key === 'result_candidates' ||
+    key === 'scope_receiver' ||
+    key === 'runtime_events' ||
+    key === 'properties'
       ? undefined
       : value
   );
@@ -4634,14 +4639,7 @@ class DeclarationReader {
         const made = this.madeBy(maker.signatures, built(name, maker.receiver), target === defaultTarget);
         if (!made) continue;
         // One level below the export, what the member builds must declare a callable member.
-        if (
-          maker.member &&
-          !this.namedProperties(made).some(
-            member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0
-          )
-        ) {
-          continue;
-        }
+        if (maker.member && !this.hasCallableMember(made)) continue;
         receiverOf(maker.receiver, made);
       }
     }
@@ -4651,13 +4649,17 @@ class DeclarationReader {
     this.listScopeReceivers(pkg, instances, maxEntries, withHandlers, built);
     surface.truncated = dropped;
     this.collectTypes = false;
+    const types = withHandlers || this.listTypes ? this.listTypeReceivers(pkg, typeExports, maxEntries) : undefined;
+    const receiverTypes = this.listTypes ? this.receiverTypes(types ?? []) : undefined;
+    const propertiesLeftOut = this.listReceiverProperties(pkg, instances, maxEntries, withHandlers);
     if (withHandlers) surface.handler_types = this.handlerTypes;
-    if (withHandlers || this.listTypes) surface.types = this.listTypeReceivers(pkg, typeExports, maxEntries);
+    if (types !== undefined) surface.types = types;
     if (withHandlers) surface.handler_params_left_out = this.handlerParamsLeftOut;
     if (this.listTypes) {
       surface.types_left_out = this.typesLeftOut;
-      surface.receiver_types = this.receiverTypes(surface.types ?? []);
+      surface.receiver_types = receiverTypes;
     }
+    if (propertiesLeftOut > 0) surface.properties_left_out = propertiesLeftOut;
     return surface;
   }
 
@@ -4960,6 +4962,66 @@ class DeclarationReader {
     for (const run of names) run();
     if (withHandlers) for (const run of handlers) run();
     for (const fill of fills) fill();
+  }
+
+  /**
+   * The seventh pass (carrick#3696): each own property of an instance
+   * receiver that has no call signature, and whose type has a callable
+   * member, is listed in the receiver's `properties` with those members,
+   * outlined as any receiver's are, from the home an op's `path: [name]`
+   * walks to (`walkHops`). Everything it lists draws on one budget of its
+   * own, spent after every other pass, so `truncated`, the hash, the handler
+   * type ids and `types` are the ones the lister gave before; it notes no
+   * type for `types[]`. Returns what that budget left out. One level: a
+   * property's members list no scope receiver and no properties.
+   */
+  private listReceiverProperties(
+    pkg: string,
+    sources: readonly ScopeSource[],
+    maxEntries: number,
+    withHandlers: boolean
+  ): number {
+    let budget = maxEntries;
+    let leftOut = 0;
+    const take = (): boolean => {
+      if (budget > 0) {
+        budget -= 1;
+        return true;
+      }
+      leftOut += 1;
+      return false;
+    };
+    const names: Array<() => void> = [];
+    const handlers: Array<() => void> = [];
+    const fills: Array<() => void> = [];
+    for (const source of sources) {
+      if (this.isOpenTop(source.type)) continue;
+      const holder = this.surfaceHolder(pkg, source.type, source.home);
+      const listed: SurfaceProperty[] = [];
+      for (const property of sortedByName(this.namedProperties(source.type))) {
+        const name = property.getName();
+        const walked = this.walkHops(holder, [name]);
+        if ('failure' in walked) continue;
+        const type = walked.holder.type;
+        if (this.checker.getNonNullableType(type).getCallSignatures().length > 0) continue;
+        if (!this.hasCallableMember(type) || !take()) continue;
+        this.typeContext = source.export;
+        const outlined = this.outlineReceiver(pkg, source.receiver.receiver, type, walked.holder.home, take, names, handlers, fills);
+        listed.push({ name, own: true, type: this.printed(type), members: outlined.members });
+      }
+      if (listed.length > 0) source.receiver.properties = listed;
+    }
+    for (const run of names) run();
+    if (withHandlers) for (const run of handlers) run();
+    for (const fill of fills) fill();
+    return leftOut;
+  }
+
+  /** Some named property of `type` has a call signature an installed package or the default library declares. */
+  private hasCallableMember(type: ts.Type): boolean {
+    return this.namedProperties(type).some(
+      member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0
+    );
   }
 
   /**

@@ -1501,6 +1501,25 @@ export interface SurfaceReceiver {
    * depth 1, sorted by name (carrick#3050). Absent when none.
    */
   settable?: SurfaceSettable[];
+  /**
+   * Own non-callable properties of an instance receiver whose type has callable
+   * members, each with those members (carrick#3696). Reached only as an op's
+   * `path: [name]` on this receiver, never as `of`. Not `settable` (what a `set`
+   * op may assign on a type receiver). One level, sorted by name, absent when
+   * none, and outside the hash.
+   */
+  properties?: SurfaceProperty[];
+}
+
+/** A property of an instance receiver that `properties` lists (carrick#3696). */
+export interface SurfaceProperty {
+  name: string;
+  /** As a member's `own`; only `true` is listed. */
+  own: boolean;
+  /** The property's type as the declarations print it, truncated. */
+  type: string;
+  /** Outlined as any receiver's members are; no `scope_receiver` and no `properties` of their own. */
+  members: SurfaceMember[];
 }
 
 /** A property of a type receiver that `settable` answers `ok` for. */
@@ -1541,6 +1560,12 @@ export interface LibrarySurface {
    * (carrick#3050). `truncated` does not count them.
    */
   types_left_out?: number;
+  /**
+   * Entries (properties, their members and signatures) the budget of the
+   * receivers' `properties` left out (carrick#3696); absent when none.
+   * `truncated` does not count them, and it is outside `surface_sha256`.
+   */
+  properties_left_out?: number;
   /**
    * With `types: true`: per export, per receiver the surface lists, the
    * `types` receiver ids its built type and base types are declared by
