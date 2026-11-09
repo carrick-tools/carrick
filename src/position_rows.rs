@@ -908,7 +908,7 @@ pub fn record_service_rows(
     }
     let started = Instant::now();
     let answer = recipe
-        .spawn_scoped_record_only(walk.service_root, walk.tsconfig)
+        .spawn_position_rows(walk.service_root, walk.tsconfig)
         .and_then(|sidecar| {
             let counts = sidecar.position_rows(walk.files, walk.scan_root, walk.out, walk.service);
             let peak = sidecar.peak_resident_bytes();

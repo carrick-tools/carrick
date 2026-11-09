@@ -251,6 +251,7 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
       scanRoot: request.scan_root,
       tsconfigSnapshot: request.tsconfig_snapshot,
       pinnedDependencies: request.pinned_dependencies,
+      workspaceSource: request.workspace_source,
     });
 
     const result = projectLoader.load();

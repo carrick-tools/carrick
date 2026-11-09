@@ -7,13 +7,19 @@
 //!
 //! Scanned as the Action scans it; the real sidecar walks the rows. `src/api-client.ts` declares the class, the
 //! other files call it. See `tests/fixtures/row-call-edges/`.
+//!
+//! carrick#1910: the same edge where the receiver's class comes from a
+//! workspace package whose declared types were never built
+//! (`tests/fixtures/unbuilt-workspace/`).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/row-call-edges")
+fn fixture_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 /// Whether the live sidecar can run. CI builds it before the Rust tests, so
@@ -33,11 +39,11 @@ fn sidecar_available() -> bool {
 }
 
 /// Every edge of the scan's blob: (caller, callee, callee file, call line).
-fn scan_edges() -> BTreeSet<(String, String, String, u64)> {
+fn scan_edges(fixture: &str) -> BTreeSet<(String, String, String, u64)> {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
-    cmd.arg(fixture_dir())
+    cmd.arg(fixture_dir(fixture))
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
@@ -104,7 +110,7 @@ fn a_member_call_on_a_call_bound_receiver_takes_its_edge_from_the_call_row() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
     }
-    let edges = scan_edges();
+    let edges = scan_edges("row-call-edges");
     for wanted in [
         // `make: (projectId: string) => ApiClient`, inline.
         edge("listInline", "ApiClient.list", 5),
@@ -128,5 +134,35 @@ fn a_member_call_on_a_call_bound_receiver_takes_its_edge_from_the_call_row() {
     assert!(
         !edges.iter().any(|(caller, ..)| caller == "listUnawaited"),
         "a promise of the client is not the client until it is awaited: {edges:#?}"
+    );
+}
+
+/// carrick#1910: `tests/fixtures/unbuilt-workspace/` is a checkout an install
+/// linked and nothing built. `@acme/ledger`'s `typings` names
+/// `build/main/index.d.ts`, which does not exist, and the service's config
+/// references no project. The rows' process reads the package from its
+/// source, so the call on the constructor-injected `Ledger` takes its edge.
+#[test]
+fn an_injected_receiver_typed_by_an_unbuilt_workspace_package_takes_its_edge() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert!(
+        !fixture_dir("unbuilt-workspace")
+            .join("packages/ledger/build")
+            .exists(),
+        "the package must stay unbuilt"
+    );
+    let edges = scan_edges("unbuilt-workspace");
+    let wanted = (
+        "Handler.run".to_string(),
+        "Ledger.total".to_string(),
+        "packages/ledger/src/index.ts".to_string(),
+        7,
+    );
+    assert!(
+        edges.contains(&wanted),
+        "missing {wanted:?}; the scan stated {edges:#?}"
     );
 }

@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "rootDir": "alt", "outDir": "dist", "declaration": true, "strict": true },
+  "include": ["alt"]
+}

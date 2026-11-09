@@ -23,6 +23,7 @@ import {
   referenceRedirectOf,
   sidecarCompilerOptions,
   untrustedReadBound,
+  workspaceSourceRedirectOf,
   type ReadBound,
 } from './capture/index.js';
 import { moduleFormatResolutionHost } from './module-format.js';
@@ -47,6 +48,12 @@ export interface ProjectLoaderOptions {
   tsconfigSnapshot?: TsconfigSnapshot;
   /** Optional pinned dependencies for this repo */
   pinnedDependencies?: PinnedDependencySnapshot;
+  /**
+   * The position rows' process only (carrick#1910): every program also reads
+   * the workspace packages the install links into the checkout from their
+   * source (`workspaceSourceRedirectOf`). Off for every other process.
+   */
+  workspaceSource?: boolean;
 }
 
 /**
@@ -211,6 +218,8 @@ export class ProjectLoader {
   private readonly repoRoot: string;
   private readonly tsconfigPath: string | undefined;
   private readonly scanRoot: string | undefined;
+  /** `ProjectLoaderOptions.workspaceSource`. */
+  private readonly workspaceSource: boolean;
   private readonly tsconfigSnapshot: TsconfigSnapshot | undefined;
   private readonly pinnedDependencies: PinnedDependencySnapshot | undefined;
   private initialized: boolean = false;
@@ -231,6 +240,7 @@ export class ProjectLoader {
     }
 
     this.scanRoot = options.scanRoot;
+    this.workspaceSource = options.workspaceSource === true;
 
     // Store snapshot if provided
     this.tsconfigSnapshot = options.tsconfigSnapshot;
@@ -458,7 +468,15 @@ export class ProjectLoader {
       // a referenced project's unbuilt output reads as its source, under its
       // own options (carrick#2418), and every external-library answer is kept
       // past the program rebuilds that drop it (carrick#1731).
-      resolutionHost: imports.recording(moduleFormatResolutionHost(referenceRedirectOf(configPath, this.repoRoot))),
+      // In the position rows' process, a workspace package it does not
+      // reference reads as its source too (carrick#1910).
+      resolutionHost: imports.recording(
+        moduleFormatResolutionHost(
+          this.workspaceSource
+            ? workspaceSourceRedirectOf(configPath, this.repoRoot)
+            : referenceRedirectOf(configPath, this.repoRoot)
+        )
+      ),
     });
     const resolved = kind === 'listed' ? project.resolveSourceFileDependencies() : [];
     registerExternalImports(project, imports);
