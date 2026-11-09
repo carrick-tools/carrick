@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "serviceName": "orders", "directory": "orders", "include": ["common"] },
+    { "serviceName": "billing", "directory": "billing", "include": ["common"] }
+  ]
+}
