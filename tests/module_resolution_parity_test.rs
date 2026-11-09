@@ -185,6 +185,16 @@ process.stdout.write(JSON.stringify(out));
 "#;
 
 /// The built sidecar the answer key runs from.
+/// One case's answers: the compiler's config, the sidecar's config, the
+/// resolved file, and the language service's config (None where it opens an
+/// inferred project).
+type Answers = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn sidecar() -> Option<PathBuf> {
     // `CARRICK_SIDECAR_DIR` points a checkout with no sidecar build at
     // another built copy of `src/sidecar`.
@@ -238,12 +248,7 @@ fn assert_service_parity(root: &Path, service: &str, named: Option<&str>, cases:
         "compiler script failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let answers: Vec<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = serde_json::from_slice(&output.stdout).expect("compiler answers");
+    let answers: Vec<Answers> = serde_json::from_slice(&output.stdout).expect("compiler answers");
 
     let scope = ServiceScope {
         dir: PathBuf::from(service),
