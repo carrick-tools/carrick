@@ -435,16 +435,61 @@ impl Pass<'_, '_> {
         let row = positions
             .lookup(file, span.lo.0, span.hi.0, Kind::Call)
             .ok()?;
-        let declared = (row.decl_file()?.to_string(), row.decl_line()?);
+        self.collects_at(&(row.decl_file()?.to_string(), row.decl_line()?))
+    }
+
+    /// The one `collects` label that holds `declared` as a declaration.
+    fn collects_at(&self, declared: &(String, u32)) -> Option<&CollectsLabel> {
         let mut matched = self
             .labels
             .collects
             .iter()
-            .filter(|label| label.declarations.contains(&declared));
+            .filter(|label| label.declarations.contains(declared));
         let label = matched.next()?;
         // Two router members at one declaration that collect differently
         // say nothing about which this is.
         matched.all(|other| other == label).then_some(label)
+    }
+
+    /// The declaration (file and line) a call's callee names through one
+    /// hop: the callee is an in-repo `const` whose initialiser is a member
+    /// or a name, and the compiler's row at that initialiser names the
+    /// declaration. A `let`, or any other initialiser, names nothing.
+    fn aliased_declaration(
+        &self,
+        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
+        file: &Path,
+        span: swc_common::Span,
+    ) -> Option<(String, u32)> {
+        let (declared, line, symbol) = self.own_declaration(file, span, Kind::Call)?;
+        let parsed = self.parsed(modules, &declared)?;
+        let (init, is_const) = binding_init(&parsed, &symbol?, line)?;
+        if !is_const {
+            return None;
+        }
+        let init = super::super::unwrap_value(&init);
+        let kinds: &[Kind] = match init {
+            Expr::Member(_) => &[Kind::Member, Kind::Ident],
+            Expr::Ident(_) => &[Kind::Ident, Kind::Member],
+            _ => return None,
+        };
+        let positions = self.inputs.positions.as_ref()?;
+        let at = init.span();
+        kinds.iter().find_map(|kind| {
+            let row = positions.lookup(&declared, at.lo.0, at.hi.0, *kind).ok()?;
+            Some((row.decl_file()?.to_string(), row.decl_line()?))
+        })
+    }
+
+    /// The verified router member a call goes through an alias to.
+    fn collects_through_alias(
+        &self,
+        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
+        file: &Path,
+        span: swc_common::Span,
+    ) -> Option<&CollectsLabel> {
+        let declared = self.aliased_declaration(modules, file, span)?;
+        self.collects_at(&declared)
     }
 
     /// Walk down `expr`, written in `file`, to every procedure site in
@@ -487,7 +532,10 @@ impl Pass<'_, '_> {
                             .ok_or("unread_key")
                     };
                     reached.leaves.push((leaf, path, above.owner.clone()));
-                } else if let Some(label) = self.collects_of(file, span) {
+                } else if let Some(label) = self
+                    .collects_of(file, span)
+                    .or_else(|| self.collects_through_alias(modules, file, span))
+                {
                     let collected = slot_expr(&call.args, &(label.arg, label.key.clone()));
                     if let Some(collected) = collected {
                         let below = Above {
