@@ -13,6 +13,7 @@ Answer key (`a_compared_binding_reads_every_value_written_to_it`, in
 |---|---|---|
 | `s-direct`, `s-const-local`, `s-method-alias`, `s-named-handler`, `s-reexport`, `s-imported-route`, `s-route-table` | the member read in place, or through a `const`, an alias, an import or a table | settled |
 | `s-let-later` | `let path; path = req.url;` | settled |
+| `s-late` | `let url: URL; try { url = new URL(req.url ?? "/", base) } catch { … }`, compared as `url.pathname` (S7b-2) | settled |
 | `s-coalesce` | `const path = OVERRIDE ?? req.url`, `OVERRIDE` a name that holds no request value | settled |
 | `s-let-normalised` | `let` set again with `path.slice(0, -1)` | asked |
 | `s-split` | `(req.url ?? "/").split("?")[0]` | asked |

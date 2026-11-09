@@ -1184,6 +1184,19 @@ pub(super) enum ValueAt {
         hi: u32,
         made: Box<ClientRef>,
     },
+    /// Any other `new <name>(first, …)` spanning `lo..hi`, its callee
+    /// written as a name and its first argument no spread: what the first
+    /// argument may hold (carrick#3504 S7b-2). Only the guards read it, as
+    /// the value the construction is read through (`new URL(req.url, base)`)
+    /// where the compiler's row at `lo..hi` names the language library's
+    /// declaration ([`super::guards`]); every other reader treats it as
+    /// [`Self::Unread`].
+    Constructed {
+        lo: u32,
+        hi: u32,
+        name: String,
+        first: Vec<ValueAt>,
+    },
     /// The value at `key` of an object, read where a call's callee is
     /// `object.key` and `object` is no parameter (carrick#2448): what
     /// `object` may hold, each an object literal an in-repo factory returns
@@ -1313,6 +1326,17 @@ impl ValueAt {
                 }),
                 made: made.clone(),
                 local: local.clone(),
+            },
+            Self::Constructed {
+                lo,
+                hi,
+                name,
+                first,
+            } => Self::Constructed {
+                lo: *lo,
+                hi: *hi,
+                name: name.clone(),
+                first: first.iter().map(Self::enclosed).collect(),
             },
             other => other.clone(),
         }
@@ -1495,15 +1519,26 @@ impl Reader<'_> {
             }
             // `await createApp()`: what the awaited expression holds.
             Expr::Await(awaited) => self.values_in(&awaited.arg, scope, bound, depth + 1),
-            // `new Queue(…)`: the instance a maker builds; any other `new`
-            // holds nothing a reader states.
-            Expr::New(_) => match self.written_instance(expr, scope) {
+            // `new Queue(…)`: the instance a maker builds. Any other `new`
+            // of a name is what its first argument holds, which only the
+            // guards read (carrick#3504 S7b-2).
+            Expr::New(new) => match self.written_instance(expr, scope) {
                 Some(made) => vec![ValueAt::New {
-                    lo: expr.span().lo.0,
-                    hi: expr.span().hi.0,
+                    lo: new.span.lo.0,
+                    hi: new.span.hi.0,
                     made: Box::new(made),
                 }],
-                None => vec![ValueAt::Unread],
+                None => match (&*new.callee, new.args.as_deref().and_then(<[_]>::first)) {
+                    (Expr::Ident(callee), Some(first)) if first.spread.is_none() => {
+                        vec![ValueAt::Constructed {
+                            lo: new.span.lo.0,
+                            hi: new.span.hi.0,
+                            name: callee.sym.to_string(),
+                            first: self.values_in(&first.expr, scope, bound, depth + 1),
+                        }]
+                    }
+                    _ => vec![ValueAt::Unread],
+                },
             },
             Expr::Member(member) => {
                 // A field of the class the member is written in. One its
@@ -2467,8 +2502,10 @@ impl<'a> Resolver<'a> {
             | ValueAt::Alt { .. }
             | ValueAt::Entries(_)
             | ValueAt::Elements(_)
-            // A maker's `new` is the receiver walk's alone.
+            // A maker's `new` is the receiver walk's alone, any other the
+            // guards' (carrick#3504 S7b-2).
             | ValueAt::New { .. }
+            | ValueAt::Constructed { .. }
             | ValueAt::Unread => nothing(),
         }
     }

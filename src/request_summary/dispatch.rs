@@ -727,7 +727,8 @@ mod tests {
 
     /// carrick#3504 S7b-1: a binding the handler sets (`let path; path =
     /// req.url`) or a constant holding a `??` with one readable arm is the
-    /// request's path, read through every value written to it. The helper
+    /// request's path, read through every value written to it, and through
+    /// a `new URL(…)` the language library declares (S7b-2). The helper
     /// that returns the member, a normalised `let`, a `split` and a field of
     /// a class the handler constructs stay as they were.
     #[test]
@@ -750,6 +751,8 @@ mod tests {
             "s-const-local.ts",
             "s-direct.ts",
             "s-imported-route.ts",
+            // S7b-2: `let url; try { url = new URL(req.url ?? "/", base) }`.
+            "s-late.ts",
             "s-let-later.ts",
             "s-method-alias.ts",
             "s-named-handler.ts",
