@@ -211,8 +211,9 @@ export function versionNoticeFile(workspace: string): string {
 /**
  * The same line, at most once a day in one workspace.
  *
- * For the hooks that fire on every edit and at the end of every task. Session
- * start says it without a throttle: it is one line per session, in the one
+ * For the hooks that fire on every edit and at the end of every task. Silent
+ * where this carrick is newer than the files: session start owns that case.
+ * Session start says it without a throttle: it is one line per session, in the one
  * place an agent reads before it does anything.
  *
  * The day is recorded only when there is a line, so a mismatch that appears an
@@ -226,6 +227,11 @@ export function throttledVersionMismatch(
   try {
     const line = versionMismatch(workspace, running);
     if (line === null) return null;
+    // A carrick newer than the files is the state right after an upgrade: the
+    // next session start refreshes them (`bringUpToDate`) and names any file it
+    // cannot. Sending someone to `carrick init` now is a false prompt.
+    const recorded = recordedCliVersion(workspace);
+    if (recorded !== null && running !== null && isNewer(running, recorded)) return null;
     const file = versionNoticeFile(workspace);
     let last: string | null;
     try {
