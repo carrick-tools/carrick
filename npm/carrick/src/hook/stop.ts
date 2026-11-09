@@ -12,11 +12,9 @@
 // sessions and changed nothing), and `decision: "block"` reaches the model by
 // refusing to let the turn end, which is a block.
 //
-// It states the session's contract check once per change (carrick#3466): one
-// line when the per-file re-checks answered every edited file, else the files
-// they did not and a queued `check --changed`. Otherwise it is silent when it
-// has nothing to say: no session id, no re-check answer with something to act
-// on, nothing still running.
+// It states the session's contract check only when there is something to say
+// (`stop-wait.ts`): a clean line naming the operations checked, once per set,
+// or the problems; a session that changed no route or call prints nothing.
 //
 // It exits 0 on every path, like the other hooks.
 //

@@ -13,6 +13,7 @@ import {
   itemLine,
   renderPostToolUse,
   renderSessionStart,
+  sessionCheckedLines,
   runningScanLine,
   serviceLine,
   hasSomethingToDo,
@@ -1017,4 +1018,66 @@ test("a check --changed that ran after the last edit drops the clause that sends
     scope: { reread: ["catalog"], not_reread: [], stale: ["inventory"] },
   };
   assert.doesNotMatch(renderPostToolUse(result) ?? "", /check --changed/);
+});
+
+// The Stop hook's session summary speaks only when it found something.
+
+function judgedItem(): CheckItem {
+  return {
+    kind: "route",
+    method: "GET",
+    path: "/api/users",
+    line: 10,
+    col: 1,
+    source: "fact",
+    counterparts: [{ role: "consumer", service: "web", file: "src/api.ts", line: 4 }],
+    verdict: { state: "resolved", result: "compatible", detail: "" },
+  };
+}
+
+test("a session whose edited files hold no route or call says nothing", () => {
+  const result = rechecked();
+  result.items = [];
+  assert.deepEqual(sessionCheckedLines([{ result, where: "api/users.ts" }], []), { text: "", key: null });
+});
+
+test("a session with a contract problem prints the header and its items", () => {
+  const result = rechecked();
+  const { text, key } = sessionCheckedLines(
+    [{ result, where: "src/routes/users.ts" }],
+    [{ result, where: "src/routes/users.ts" }],
+  );
+  assert.match(text, /^Carrick checked the 1 file this session edited \([^)]*\): \d+ contract problems?\.\n- /);
+  assert.equal(key, null, "a problem prints every time");
+});
+
+test("fresh lines with no problem in the covered answers still print under a header", () => {
+  const result = rechecked();
+  const quiet = rechecked();
+  quiet.items = [];
+  const { text } = sessionCheckedLines([{ result: quiet, where: "a.ts" }], [{ result, where: "a.ts" }]);
+  assert.match(text, /^Carrick checked the 1 file this session edited/);
+  assert.match(text, /\n- /);
+});
+
+test("judged operations with no problem are named, up to three, and the rest counted", () => {
+  const result = rechecked();
+  result.items = [0, 1, 2, 3, 4].map((n) => ({ ...judgedItem(), path: `/api/u${n}`, line: 10 + n }));
+  const { text, key } = sessionCheckedLines([{ result, where: "api/users.ts" }], []);
+  assert.match(text, /^Carrick checked the 5 operations this session changed \(GET \/api\/u0 at api\/users\.ts:10; GET \/api\/u1 at api\/users\.ts:11; GET \/api\/u2 at api\/users\.ts:12; and 2 more\): both sides agree\.$/);
+  assert.ok(key !== null && key.split("\n").length === 5);
+});
+
+test("a call is named as a call", () => {
+  const result = rechecked();
+  result.items = [{ ...judgedItem(), kind: "call", method: "POST", path: "/orders", line: 40 }];
+  assert.match(sessionCheckedLines([{ result, where: "web/cart.ts" }], []).text, /\(a call to POST \/orders at web\/cart\.ts:40\)/);
+});
+
+test("operations whose types were not checked are named with the reason", () => {
+  const result = rechecked();
+  result.items = [{ ...judgedItem(), verdict: { state: "not_checked", result: null } }];
+  result.type_check = { ran: false, reason: "no tsconfig found", pairs: 1, judged: 0 };
+  const { text } = sessionCheckedLines([{ result, where: "api/users.ts" }], []);
+  assert.match(text, /^Carrick found the 1 operation this session changed \(GET \/api\/users at api\/users\.ts:10\) but did not check their types \(no tsconfig found\), so there is no contract verdict\.$/);
 });
