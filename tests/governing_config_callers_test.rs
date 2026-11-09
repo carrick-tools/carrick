@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Caller key -> the callee names its edges record.
-fn scan_calls(variant: &str) -> BTreeMap<String, BTreeSet<String>> {
+/// The blob an offline scan of `variant` writes.
+fn scan_blob(variant: &str) -> serde_json::Value {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let cassettes = tempfile::tempdir().expect("temp cassette dir");
@@ -65,9 +65,12 @@ fn scan_calls(variant: &str) -> BTreeMap<String, BTreeSet<String>> {
         .collect::<Vec<_>>();
     blobs.sort();
     assert_eq!(blobs.len(), 1, "expected one written blob, got {blobs:?}");
-    let blob: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&blobs[0]).expect("read blob")).expect("parse blob");
-    blob["function_definitions"]
+    serde_json::from_slice(&std::fs::read(&blobs[0]).expect("read blob")).expect("parse blob")
+}
+
+/// Caller key -> the callee names its edges record.
+fn scan_calls(variant: &str) -> BTreeMap<String, BTreeSet<String>> {
+    scan_blob(variant)["function_definitions"]
         .as_object()
         .expect("blob has no function_definitions")
         .iter()
@@ -121,6 +124,47 @@ fn a_jsconfig_beside_a_tsconfig_that_does_not_list_the_file_governs_it() {
     let calls = scan_calls("ts-beside-js");
     assert!(calls_get(&calls, "viaRelative"), "control: {calls:?}");
     assert!(calls_get(&calls, "viaAlias"), "alias edge: {calls:?}");
+}
+
+/// `web/src/session/lookup.js` reads its path value off a construction
+/// (`new URL(returnTo, location.origin).searchParams.get("ticket")`) and its
+/// base through a call (`config.apiUrl.replace(...)`); `web/src/pages/Login.js`
+/// calls it through the jsconfig alias, so the request summary places the
+/// row at the caller (oss1109 T1). The row keeps its route, with the base it
+/// states, at the caller's line, and nowhere else.
+#[test]
+fn a_call_through_a_wrapper_whose_url_reads_a_value_built_off_a_construction_keeps_its_row() {
+    let blob = scan_blob("ts-beside-js");
+    let rows = blob["mount_graph"]["data_calls"]
+        .as_array()
+        .expect("mount_graph.data_calls");
+    let sessions: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| {
+            row["target_url"]
+                .as_str()
+                .is_some_and(|target| target.contains("/sessions/"))
+        })
+        .collect();
+    assert_eq!(sessions.len(), 1, "one sessions row: {rows:#?}");
+    let row = sessions[0];
+    assert_eq!(row["method"], "GET", "{row:#?}");
+    assert_eq!(row["canonical_path"], "/sessions/:id", "{row:#?}");
+    assert_eq!(
+        row["file_location"], "web/src/pages/Login.js:4",
+        "placed at the caller: {row:#?}"
+    );
+    assert_eq!(row["base"]["kind"], "injected", "{row:#?}");
+    assert_eq!(
+        row["base"]["written"], r#"${config.apiUrl.replace(/\/$/, "")}"#,
+        "{row:#?}"
+    );
+    // Control: the caller's own literal request.
+    assert!(
+        rows.iter()
+            .any(|row| row["canonical_path"] == "/health" && row["method"] == "GET"),
+        "control row: {rows:#?}"
+    );
 }
 
 /// The service names no config and holds no `tsconfig.json`: the fallback is

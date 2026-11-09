@@ -1716,6 +1716,36 @@ fn opens_on_interpolated_origin(target: &str) -> bool {
         .is_some_and(|(_, after)| after.starts_with('/'))
 }
 
+/// Whether a consumer row's target is a route, read after the base the row
+/// states (carrick oss1109 T1, ruling R6).
+///
+/// The stated base is where the request goes, not the route: a base built by
+/// a call (`${config.apiUrl.replace(/\/$/, "")}`) says no less than
+/// `${config.apiUrl}` does, so the shape question is asked of what follows
+/// it. A base holding a fallback operator (`${URL ?? "http://…"}`) is still
+/// judged whole: that rendering has to reach the collapse pass first
+/// (carrick#399), exactly as [`is_plain_interpolation`] keeps it. A target
+/// that is its base alone, or a row with no base, is judged whole.
+pub fn is_valid_call_target(
+    target: &str,
+    base: Option<&crate::call_base::CallBaseResolution>,
+) -> bool {
+    if is_valid_route_shape(target) {
+        return true;
+    }
+    let Some(written) = base.map(|base| base.written.as_str()) else {
+        return false;
+    };
+    if written.is_empty() || written.contains("||") || written.contains("??") {
+        return false;
+    }
+    target
+        .trim()
+        .trim_start_matches(['`', '"', '\''])
+        .strip_prefix(written)
+        .is_some_and(|rest| !rest.is_empty() && is_valid_route_shape(rest))
+}
+
 pub fn is_valid_route_shape(route: &str) -> bool {
     let route = route.trim();
     if route.is_empty() {
@@ -4529,6 +4559,46 @@ mod tests {
         for target in ["${AUDIT_WEBHOOK_URL}/audit/events", "/plain/path"] {
             assert_eq!(normalize_env_fallback_target(target), None);
         }
+    }
+
+    /// oss1109 T1 (ruling R6): the route-shape question is asked of what
+    /// follows a row's stated base, so a base built by a call does not fail
+    /// it. The path after the base is still judged, a base holding a
+    /// fallback operator is still judged whole, and with no stated base
+    /// the target is judged whole, as before.
+    #[test]
+    fn a_stated_base_built_by_a_call_does_not_fail_the_route_shape() {
+        let base = |written: &str| crate::call_base::CallBaseResolution {
+            written: written.to_string(),
+            kind: crate::call_base::CallBaseKind::Injected,
+            env_var: None,
+            fallback: None,
+            fallback_is_loopback: false,
+            declared_optional: None,
+        };
+        let replaced = r#"${config.apiUrl.replace(/\/$/, "")}"#;
+        let target = format!("{replaced}/sessions/${{id}}");
+        assert!(!is_valid_route_shape(&target), "control: judged whole");
+        assert!(!is_valid_call_target(&target, None));
+        assert!(is_valid_call_target(&target, Some(&base(replaced))));
+        assert!(is_valid_call_target(
+            &format!("`{target}`"),
+            Some(&base(replaced))
+        ));
+
+        // The path after the base is judged as before.
+        let bad_path = format!(r#"{replaced}/sessions/${{a || "b"}}"#);
+        assert!(!is_valid_call_target(&bad_path, Some(&base(replaced))));
+        // A target that is its base alone states no route.
+        assert!(!is_valid_call_target(replaced, Some(&base(replaced))));
+        // A fallback in the base still has to reach the collapse pass.
+        let fallback = r#"${URL ?? "http://localhost:1"}"#;
+        assert!(!is_valid_call_target(
+            &format!("{fallback}/events"),
+            Some(&base(fallback))
+        ));
+        // A base the target does not open with changes nothing.
+        assert!(!is_valid_call_target(&target, Some(&base("${other}"))));
     }
 
     /// Acceptance from carrick#399: feeding the run-29677844107 verbatim target

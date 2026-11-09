@@ -5305,6 +5305,16 @@ impl Reader<'_> {
             .unwrap_or_default()
     }
 
+    /// The text of the `new` expression `expr` is, when it is one: the text
+    /// the reading of an unread construction stops at ([`Self::new_url`]),
+    /// which a binding holding it keeps ([`bound`]).
+    fn construction_text(&self, expr: &Expr) -> Option<String> {
+        match crate::graphql_document_sites::unwrap_expression(expr) {
+            Expr::New(new) => Some(self.text(new.span)),
+            _ => None,
+        }
+    }
+
     fn site(&self, span: Span) -> Site {
         let local = self.source_map.lookup_byte_offset(span.lo).pos.0;
         let local_hi = self.source_map.lookup_byte_offset(span.hi).pos.0;
@@ -5715,6 +5725,9 @@ impl Reader<'_> {
         // constructions once every module is (carrick#2452).
         let mut origins: HashMap<String, constructions::FieldOrigin> = HashMap::new();
         let mut ctor_defaults = Vec::new();
+        // The `new` expression each field is set to, where it is set to one
+        // ([`bound`]).
+        let mut constructions: HashMap<String, String> = HashMap::new();
         let mut assign = |name: String,
                           value: Value,
                           client: Option<ClientRef>,
@@ -5736,6 +5749,9 @@ impl Reader<'_> {
                         if platform_fetch(init, module) {
                             fetches.insert(name.clone());
                         }
+                        if let Some(text) = self.construction_text(init) {
+                            constructions.insert(name.clone(), text);
+                        }
                         let scope = Scope::module(module);
                         let value = self.eval(init, &scope);
                         let client = self.factory_call(init, &scope);
@@ -5747,6 +5763,9 @@ impl Reader<'_> {
                         let name = format!("#{}", prop.key.name);
                         if platform_fetch(init, module) {
                             fetches.insert(name.clone());
+                        }
+                        if let Some(text) = self.construction_text(init) {
+                            constructions.insert(name.clone(), text);
                         }
                         let scope = Scope::module(module);
                         let value = self.eval(init, &scope);
@@ -5833,6 +5852,9 @@ impl Reader<'_> {
                                     fetches.insert(name.clone());
                                 }
                                 let client = self.factory_call(value, &scope);
+                                if let Some(text) = self.construction_text(value) {
+                                    constructions.insert(name.clone(), text);
+                                }
                                 let value = self.eval(value, &scope);
                                 assign(name, value, client, &mut fields);
                             }
@@ -5886,7 +5908,11 @@ impl Reader<'_> {
         let values = fields
             .into_iter()
             .map(|(name, value)| {
-                let mut value = bound(format!("this.{name}"), value);
+                let mut value = bound(
+                    format!("this.{name}"),
+                    value,
+                    constructions.get(&name).map(String::as_str),
+                );
                 if origins.get(&name).is_some_and(|from| from.text.is_some())
                     && let Value::Str(pieces) = &mut value
                     && let [Piece::Opaque { text, link, .. }] = pieces.as_mut_slice()
@@ -6254,7 +6280,11 @@ impl Reader<'_> {
                         let value = if unsettled {
                             Value::hole(name.clone(), HoleReason::Reassigned)
                         } else {
-                            bound(name.clone(), self.eval(init, scope))
+                            bound(
+                                name.clone(),
+                                self.eval(init, scope),
+                                self.construction_text(init).as_deref(),
+                            )
                         };
                         if !unsettled && let Some(pieces) = library_sites::text_pieces(init, scope)
                         {
@@ -7305,7 +7335,13 @@ const COLLECTIONS: &[&str] = &[
 /// the request itself writes it. An environment read and a construction keep
 /// their text: the first names where the value comes from, the second what the
 /// binding is.
-fn bound(name: String, value: Value) -> Value {
+///
+/// `construction` is the text of the `new` expression the binding's
+/// initialiser is, when it is one ([`Reader::construction_text`]): the value
+/// keeps its text only where reading stopped at that construction. A value
+/// read off one (`new URL(next, origin).searchParams.get("k")`) is not a
+/// construction and is written by the binding's name.
+fn bound(name: String, value: Value, construction: Option<&str>) -> Value {
     let Value::Str(pieces) = &value else {
         return value;
     };
@@ -7320,7 +7356,11 @@ fn bound(name: String, value: Value) -> Value {
         [Piece::ParamKey(index, key, _)] => {
             Value::Str(vec![Piece::ParamKey(*index, key.clone(), name)])
         }
-        [Piece::Opaque { text, .. }] if renders_as_written(text) => value,
+        [Piece::Opaque { text, .. }]
+            if construction == Some(text.as_str()) || renders_as_written(text) =>
+        {
+            value
+        }
         // Written by the binding's name, ending where the value it holds
         // does (carrick#2406).
         _ => {
@@ -7371,13 +7411,12 @@ fn states_a_value(value: &Value) -> bool {
 }
 
 /// Whether a binding holding only `text` is written by that text rather than
-/// by its own name ([`bound`]): a construction, or anything spelled from a
-/// runtime's environment object. A rendering rule, not the decision that a
-/// value is an environment read: it keeps `Deno.env.get(variable)` and
-/// `Deno.env.toObject()`, which [`crate::env_alias::env_read_name`] refuses.
+/// by its own name ([`bound`]): anything spelled from a runtime's environment
+/// object. A rendering rule, not the decision that a value is an environment
+/// read: it keeps `Deno.env.get(variable)` and `Deno.env.toObject()`, which
+/// [`crate::env_alias::env_read_name`] refuses.
 fn renders_as_written(text: &str) -> bool {
-    text.starts_with("new ")
-        || text.starts_with("process.env.")
+    text.starts_with("process.env.")
         || text.starts_with("import.meta.env.")
         || text.starts_with("Deno.env.")
 }
@@ -12929,6 +12968,45 @@ function build() { return {}; }
         assert_eq!(
             render_target(&request_url(destructured, "Api.x")).as_deref(),
             Some("/v4/x")
+        );
+    }
+
+    /// oss1109 T1: a binding holding a value read off a construction is
+    /// written by its own name, as any other opaque value is; a binding (or
+    /// a field) holding the construction itself keeps its text.
+    #[test]
+    fn a_binding_read_off_a_construction_is_written_by_its_name() {
+        let read_off = "export function load(next: string) {\n\
+                        \x20 const id = new URL(next, location.origin).searchParams.get(\"k\");\n\
+                        \x20 return fetch(`${api}/sessions/${id}`);\n\
+                        }\n";
+        assert_eq!(
+            render_target(&request_url(read_off, "load")).as_deref(),
+            Some("${api}/sessions/${id}")
+        );
+
+        let bare = "export function load() {\n\
+                    \x20 const stamp = new Stamp();\n\
+                    \x20 return fetch(`${api}/stamps/${stamp}`);\n\
+                    }\n";
+        assert_eq!(
+            render_target(&request_url(bare, "load")).as_deref(),
+            Some("${api}/stamps/${new Stamp()}")
+        );
+
+        let field = "class Api {\n\
+                     \x20 stamp = new Stamp();\n\
+                     \x20 read = new Stamp().value();\n\
+                     \x20 a() { return fetch(`${api}/a/${this.stamp}`); }\n\
+                     \x20 b() { return fetch(`${api}/b/${this.read}`); }\n\
+                     }\n";
+        assert_eq!(
+            render_target(&request_url(field, "Api.a")).as_deref(),
+            Some("${api}/a/${new Stamp()}")
+        );
+        assert_eq!(
+            render_target(&request_url(field, "Api.b")).as_deref(),
+            Some("${api}/b/${this.read}")
         );
     }
 
