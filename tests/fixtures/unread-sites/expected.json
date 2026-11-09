@@ -1,0 +1,9 @@
+{
+  "reasons": {
+    "src/value-callee.ts": "value_callee",
+    "src/declared.ts": "interface_member",
+    "src/recursion.ts": "recursion",
+    "src/possible-call.ts": "name_never_bound"
+  },
+  "none": ["src/stated.ts"]
+}

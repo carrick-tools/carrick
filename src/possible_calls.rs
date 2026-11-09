@@ -81,7 +81,7 @@ impl PossibleCall {
 }
 
 /// The protocol word for a store role.
-fn kind_of(role: &str) -> Option<&'static str> {
+pub(crate) fn kind_of(role: &str) -> Option<&'static str> {
     match role {
         "http_client" | "server_framework" => Some("http"),
         "graphql_client" => Some("graphql"),
@@ -95,7 +95,7 @@ fn kind_of(role: &str) -> Option<&'static str> {
 /// that requests or sends consumes a route; a server both receives and
 /// replies as part of the route it serves, so both produce; elsewhere a send
 /// produces and a receive consumes.
-fn role_of(role: &str, op: Option<&str>) -> Option<&'static str> {
+pub(crate) fn role_of(role: &str, op: Option<&str>) -> Option<&'static str> {
     if role == "server_framework" {
         return matches!(op?, "receive" | "send").then_some("producer");
     }
@@ -108,7 +108,7 @@ fn role_of(role: &str, op: Option<&str>) -> Option<&'static str> {
     }
 }
 
-fn labelled_end(end: &LabelledEnd) -> LabelledEndRef {
+pub(crate) fn labelled_end(end: &LabelledEnd) -> LabelledEndRef {
     LabelledEndRef {
         package: end.package.clone(),
         export: end.export.clone(),
@@ -116,7 +116,7 @@ fn labelled_end(end: &LabelledEnd) -> LabelledEndRef {
     }
 }
 
-fn slot_of(role: &str) -> &'static str {
+pub(crate) fn slot_of(role: &str) -> &'static str {
     if matches!(role, "http_client" | "server_framework") {
         "path"
     } else {
@@ -144,7 +144,7 @@ fn reason_of(record: &SiteRecord) -> Stop {
     record.unread.unwrap_or(Stop::Unanswered)
 }
 
-fn from_lead(lead: &DecidedLead) -> PossibleCall {
+pub(crate) fn from_lead(lead: &DecidedLead) -> PossibleCall {
     PossibleCall {
         file_path: lead.file.clone(),
         line_number: lead.line,
@@ -207,7 +207,7 @@ pub fn from_sites(decided: &Decided, records: &[SiteRecord]) -> Vec<PossibleCall
 /// operations are labelled by class only (the document names the operation,
 /// read by [`crate::graphql_document_sites`]), so such a call is not listed
 /// as a possible call. Every other export with no op is (carrick#2515).
-fn class_only_graphql(lead: &DecidedLead) -> bool {
+pub(crate) fn class_only_graphql(lead: &DecidedLead) -> bool {
     lead.reason == Stop::NoOpClaim && lead.end.role == "graphql_client"
 }
 
@@ -241,7 +241,9 @@ pub fn cap(mut rows: Vec<PossibleCall>) -> (Vec<PossibleCall>, usize) {
     (rows, omitted)
 }
 
-/// Write a service's possible calls on its blob.
+/// Write a service's possible calls on its blob. Its one caller is
+/// [`crate::unread_sites::attach`], which writes them from the unread
+/// sites' listed rows (carrick#3688 U3).
 pub fn attach(data: &mut CloudRepoData, rows: Vec<PossibleCall>) {
     let (rows, omitted) = cap(rows);
     data.possible_calls = Some(rows);
