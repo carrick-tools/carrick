@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::agents::file_analyzer_agent::ResolutionSource;
 use crate::analyzer::{CrossRepoMatch, location_file};
@@ -155,28 +155,6 @@ impl Removals {
 struct Removed<R> {
     rows: Vec<R>,
     places: Vec<Place>,
-    /// `service method path`, for the debug line naming the key.
-    label: String,
-    /// The head holds the key only as a documentation (descriptor) row.
-    head_documentation_only: bool,
-}
-
-/// How many removed keys the debug lines name.
-const KEY_LINES_CAP: usize = 200;
-
-/// The debug line for one removed key: the key, whether the PR's diff placed
-/// it, and for one not placed, whether the head holds it only as a
-/// documentation row.
-fn removed_key_line(what: &str, label: &str, placed: bool, documentation_only: bool) -> String {
-    if placed {
-        format!("Removed {what} key: {label} placed")
-    } else if documentation_only {
-        format!(
-            "Removed {what} key: {label} not placed (head holds it only as a documentation row)"
-        )
-    } else {
-        format!("Removed {what} key: {label} not placed")
-    }
 }
 
 trait Placeable {
@@ -238,17 +216,6 @@ fn place<R: Placeable>(
                 listed.len(),
                 removed.len() - listed.len()
             );
-            for (index, removal) in removed.iter().take(KEY_LINES_CAP).enumerate() {
-                debug!(
-                    "{}",
-                    removed_key_line(
-                        what,
-                        &removal.label,
-                        listed.contains(&index),
-                        removal.head_documentation_only,
-                    )
-                );
-            }
             for (index, removal) in removed.iter_mut().enumerate() {
                 for row in &mut removal.rows {
                     row.set_placed(listed.contains(&index));
@@ -319,14 +286,6 @@ fn removed_operations(
             let (method, path) = spelled[&id].key.display_labels();
             let key = operation_identity(&id.1);
             Removed {
-                label: format!(
-                    "{} {} {}",
-                    rows.first().map(|(s, _, _)| s.as_str()).unwrap_or(""),
-                    method,
-                    path
-                ),
-                head_documentation_only: current_keys.contains(&id)
-                    && !current_handler_keys.contains(&id),
                 places: rows
                     .iter()
                     .map(|(_, place, _)| Place::parse(&id.0, place))
@@ -397,13 +356,6 @@ fn removed_sends(
             let removal = by_key.entry(id.clone()).or_insert_with(|| Removed {
                 rows: Vec::new(),
                 places: Vec::new(),
-                label: format!(
-                    "{} {} {}",
-                    service_id(&repo.service_name, &repo.repo_name),
-                    method,
-                    path
-                ),
-                head_documentation_only: false,
             });
             removal
                 .places
@@ -481,24 +433,6 @@ mod tests {
             mismatch_reason: None,
             producer_provenance: Default::default(),
         }
-    }
-
-    /// The debug line names the key and its verdict; a key not placed says
-    /// whether the head holds it only as a documentation row.
-    #[test]
-    fn a_removed_key_line_names_the_key_and_its_placing() {
-        assert_eq!(
-            removed_key_line("operation", "orders GET /orders/:id", true, false),
-            "Removed operation key: orders GET /orders/:id placed"
-        );
-        assert_eq!(
-            removed_key_line("operation", "orders GET /orders/:id", false, false),
-            "Removed operation key: orders GET /orders/:id not placed"
-        );
-        assert_eq!(
-            removed_key_line("operation", "orders GET /orders/:id", false, true),
-            "Removed operation key: orders GET /orders/:id not placed (head holds it only as a documentation row)"
-        );
     }
 
     /// A pairing's producer is keyed as a removal of its route is, whatever
