@@ -290,6 +290,7 @@ mod tests {
                     end: Some(end),
                     chain: Vec::new(),
                     stop: None,
+                    also: Vec::new(),
                     receiver: None,
                     reached: None,
                     bound: Vec::new(),

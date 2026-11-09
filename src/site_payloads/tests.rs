@@ -68,6 +68,7 @@ fn record(role: &str, handler: bool, payloads: PayloadSlots) -> SiteRecord {
         names: Vec::new(),
         bucket: Bucket::Forced,
         lead: None,
+        unread: None,
         receiver: None,
     }
 }

@@ -122,6 +122,10 @@ pub struct DiscoverySite {
     pub chain: Vec<ChainHop>,
     /// Why a walk that entered code reached no labelled export.
     pub stop: Option<Stop>,
+    /// The other ways the callee's values stopped, when `stop` is one of
+    /// several (carrick#3688 R3). Distinct, at most four.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<Stop>,
     /// The binding the labelled call is made on (carrick#2474 R1). Only
     /// with the receiver trace on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +380,23 @@ impl<'a> Labels<'a> {
             .filter(|((package, export), _)| *export == name && is_language_key(package))
             .min_by_key(|((package, _), _)| *package)
             .map(|(_, claims)| *claims)
+    }
+}
+
+/// How many other ways a site's values stopped it keeps beside its reason
+/// (carrick#3688 R3).
+const MAX_ALSO: usize = 4;
+
+/// The one stop a callee's values that all reached nothing agree on
+/// (carrick#3688 U2): the way every one stopped, when they all stopped the
+/// same way and say so; otherwise `several`, with the distinct ways named
+/// (at most [`MAX_ALSO`]). The resolver never collapses: this is
+/// discovery's policy.
+fn agreed_stop(reasons: &[Option<Stop>], several: Stop) -> (Stop, Vec<Stop>) {
+    let ways: BTreeSet<Stop> = reasons.iter().flatten().copied().collect();
+    match (ways.iter().next(), ways.len()) {
+        (Some(one), 1) if reasons.iter().all(Option::is_some) => (*one, Vec::new()),
+        _ => (several, ways.into_iter().take(MAX_ALSO).collect()),
     }
 }
 
@@ -975,6 +996,13 @@ struct Outcome<'a> {
     ends: Vec<Found>,
     /// The first stop, when the walk entered code and found nothing there.
     stop: Option<(Vec<ChainHop>, Stop)>,
+    /// With `stop`: the other ways the callee's values stopped, when they
+    /// stopped in several (carrick#3688 U2, R3). Distinct, at most
+    /// [`MAX_ALSO`].
+    also: Vec<Stop>,
+    /// With `stop`: it is what the callee's values agree on ([`Walker::agree`]),
+    /// so the walk read values even where it entered no function.
+    valued: bool,
     /// The shallowest definition still being read that the walk came back
     /// to: until it is done, this answer is not final.
     cycle_at: Option<usize>,
@@ -1067,6 +1095,8 @@ impl<'a> Outcome<'a> {
         }
         if self.stop.is_none() {
             self.stop = other.stop;
+            self.also = other.also;
+            self.valued = other.valued;
         }
         self.missed |= other.missed;
         self.unanswered.extend(other.unanswered);
@@ -1459,9 +1489,11 @@ impl<'a> Walker<'a> {
     /// to a function or an export decides, whatever the callee is typed as.
     fn through_type(&self, invoke: Invoke<'_>, values: &[Held<'_>]) -> Option<Outcome<'a>> {
         let holes = !values.is_empty()
-            && values
-                .iter()
-                .all(|value| matches!(value, Held::Reached(outcome) if !outcome.known));
+            && values.iter().all(|value| match value {
+                Held::Reached(outcome) => !outcome.known,
+                Held::Stop(_) => true,
+                Held::Param(..) | Held::Callback => false,
+            });
         if !holes || invoke.construction {
             return None;
         }
@@ -2396,6 +2428,7 @@ impl<'a> Walker<'a> {
                     end,
                     chain,
                     stop,
+                    also: Vec::new(),
                     receiver: None,
                     reached: None,
                     bound: Vec::new(),
@@ -2412,6 +2445,7 @@ impl<'a> Walker<'a> {
                 // the call's own row reads (carrick#2813): the row's hole
                 // would hide that the walk passed code it did not finish.
                 let entered_missed = outcome.missed && outcome.stop.is_none();
+                let (also, valued) = (outcome.also, outcome.valued);
                 let Some((chain, stop)) = outcome.stop else {
                     let own = if entered_missed {
                         None
@@ -2441,8 +2475,10 @@ impl<'a> Walker<'a> {
                     continue;
                 };
                 // A call whose own row says nothing: the walk never entered
-                // code. Listed with the hole the row names.
+                // code. Listed with the hole the row names. A stop the
+                // callee's values agree on is the walk's, whatever its word.
                 if chain.is_empty()
+                    && !valued
                     && ![
                         Stop::InjectedCallee,
                         Stop::InterfaceMember,
@@ -2465,7 +2501,10 @@ impl<'a> Walker<'a> {
                     .counts
                     .entry(format!("stop/{}", stop.as_str()))
                     .or_default() += 1;
-                discovery.sites.push(record(None, chain, Some(stop)));
+                discovery.sites.push(DiscoverySite {
+                    also,
+                    ..record(None, chain, Some(stop))
+                });
                 continue;
             }
             let mut sibling_routes = 0;
@@ -2721,11 +2760,28 @@ impl<'a> Walker<'a> {
         if known.iter().all(|value| matches!(value, Held::Callback)) {
             return Outcome::stopped(Stop::InjectedCallee).below(&chain);
         }
+        // Why each value reached nothing, where it says: the resolver's
+        // reason, a callback's, or the stop the walk met inside it. A value
+        // that reached nothing and says no reason is `None`.
+        let mut reasons: Vec<Option<Stop>> = Vec::new();
         let mut outcomes: Vec<Outcome<'a>> = known
             .into_iter()
             .map(|value| match value {
-                Held::Reached(outcome) => outcome,
-                _ => Outcome::default(),
+                Held::Reached(outcome) => {
+                    if outcome.ends.is_empty() {
+                        reasons.push(outcome.stop.as_ref().map(|(_, stop)| *stop));
+                    }
+                    outcome
+                }
+                Held::Stop(stop) => {
+                    reasons.push(Some(stop));
+                    Outcome::default()
+                }
+                Held::Callback => {
+                    reasons.push(Some(Stop::InjectedCallee));
+                    Outcome::default()
+                }
+                Held::Param(..) => Outcome::default(),
             })
             .collect();
         if outcomes.len() == 1 {
@@ -2744,7 +2800,13 @@ impl<'a> Walker<'a> {
             out.absorb(outcome);
         }
         if !agree && out.ends.is_empty() {
-            out.stop = Some((Vec::new(), plural.several));
+            // No value reached a labelled export: every one stopped one
+            // way is that way; several ways, or one that says none, are
+            // one of several, with the ways named (carrick#3688 U2, R3).
+            let (stop, also) = agreed_stop(&reasons, plural.several);
+            out.stop = Some((Vec::new(), stop));
+            out.also = also;
+            out.valued = true;
         }
         out.below(&chain)
     }
@@ -4516,6 +4578,51 @@ mod tests {
         assert_eq!(
             local.end.as_ref().map(|end| end.export.as_str()),
             Some("fetch")
+        );
+    }
+
+    /// carrick#3688 U2: a callee whose every value the resolver reads to
+    /// nothing for one reason states that reason, not `several_values`
+    /// (`unread_twice.ts`: both callers spread). Values that stop in
+    /// different ways, or one that says no reason, stay `several_values`
+    /// and name the ways they stopped (`spread.ts`, R3). The answer key is
+    /// `tests/fixtures/resolve-values/README.md`.
+    #[test]
+    fn a_callee_every_value_of_which_stops_one_way_states_that_way() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let discovery = discover(&on.inputs, &Labels::of(&[]), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        let [twice] = at("unread_twice.ts", 4)[..] else {
+            panic!(
+                "a site at unread_twice.ts:4: {:?} {:?}",
+                discovery.sites, discovery.unfollowed
+            );
+        };
+        assert_eq!(
+            (twice.end.as_ref(), twice.stop, twice.also.as_slice()),
+            (None, Some(Stop::UnreadExpression), &[][..])
+        );
+        let [mixed] = at("spread.ts", 8)[..] else {
+            panic!(
+                "a site at spread.ts:8: {:?} {:?}",
+                discovery.sites, discovery.unfollowed
+            );
+        };
+        assert_eq!(
+            (mixed.end.as_ref(), mixed.stop, mixed.also.as_slice()),
+            (
+                None,
+                Some(Stop::SeveralValues),
+                &[Stop::UnreadExpression][..]
+            )
         );
     }
 

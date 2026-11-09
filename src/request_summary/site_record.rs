@@ -42,6 +42,7 @@
 //!
 //! Record-only: nothing in a scan reads it yet.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
@@ -55,6 +56,7 @@ use super::decided_sites::{
     Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel, SlotBinding,
 };
 use super::resolve::{ArgTexts, Resolver, TextValue};
+use super::stop::Stop;
 use crate::position_rows::{Kind, PositionIndex};
 use crate::site_questions::{
     Place, PlaceFrom, Point, SiteCall, SiteState, Slot, Stated, StatedValue,
@@ -375,6 +377,11 @@ pub struct SiteRecord {
     pub bucket: Bucket,
     /// Why a lead is one.
     pub lead: Option<&'static str>,
+    /// Why a lead's name is none the code states, where the resolver said
+    /// (carrick#3688 U2): the first hole it met reading the name. Off the
+    /// wire: no site's sha moves.
+    #[serde(skip)]
+    pub unread: Option<Stop>,
     /// The binding the labelled call is made on (carrick#2474 R1), with the
     /// receiver trace on. Scanner-side only, off the wire like the anchors:
     /// no site's sha moves.
@@ -526,6 +533,9 @@ struct Choices<'a, 'r> {
     /// the code does not state refuses the whole choice: stating the other
     /// side alone is the initialiser-alone error (carrick#3504 Q1).
     in_place: bool,
+    /// The first hole a branch met, why the choice is unread (carrick#3688
+    /// U2).
+    hole: &'a Cell<Option<Stop>>,
 }
 
 impl Choices<'_, '_> {
@@ -554,10 +564,20 @@ impl Choices<'_, '_> {
                     from_type |= typed;
                 }
                 TextValue::Text { .. } => {}
-                TextValue::Hole(_) => return None,
+                TextValue::Hole(reason) => {
+                    note_hole(self.hole, Stop::from(reason));
+                    return None;
+                }
             }
         }
         (!values.is_empty()).then_some(Whole { values, from_type })
+    }
+}
+
+/// Notes `reason` as why a name is unread, unless one is noted already.
+fn note_hole(hole: &Cell<Option<Stop>>, reason: Stop) {
+    if hole.get().is_none() {
+        hole.set(Some(reason));
     }
 }
 
@@ -671,12 +691,17 @@ fn name_literals(names: &[CompilerName], ident: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Each value a name's pieces fold to, by the value's text: the one text and
+/// the file it came from ([`folded_values`]).
+type FoldedValues = HashMap<String, (String, Option<String>)>;
+
 /// The one text each value `pieces` names always is, by the value's text
 /// ([`Resolver::text_read`], carrick#3479, carrick#3504 S2): a `let` never
 /// assigned again, an enum member, an entry of a constant object, a built-in
 /// over such parts. The value is read at the expression the call writes for
 /// it among `exprs` (the site's name arguments, in `file`). A value that
-/// does not fold is left out.
+/// does not fold is left out; the first one's reason is returned beside the
+/// values (carrick#3688 U2).
 fn folded_values(
     sources: &mut Sources<'_>,
     resolver: &Resolver<'_>,
@@ -685,10 +710,11 @@ fn folded_values(
     file: &str,
     pieces: &[super::Piece],
     exprs: &[&Expr],
-) -> HashMap<String, (String, Option<String>)> {
+) -> (FoldedValues, Option<Stop>) {
     let mut values = HashMap::new();
+    let hole: Cell<Option<Stop>> = Cell::new(None);
     if positions.is_none() {
-        return values;
+        return (values, None);
     }
     for piece in pieces {
         let super::Piece::Opaque { text, .. } = piece else {
@@ -703,17 +729,20 @@ fn folded_values(
         else {
             continue;
         };
-        if let Some((value, read_from)) = resolver.text_read(root, file, &expr) {
-            // The one file every declaration the value read lives in: where
-            // it came from. `None` where it read none, or several.
-            let origin = match read_from.as_slice() {
-                [one] => Some(one.clone()),
-                _ => None,
-            };
-            values.insert(text.clone(), (value, origin));
+        match resolver.text_read(root, file, &expr) {
+            Ok((value, read_from)) => {
+                // The one file every declaration the value read lives in:
+                // where it came from. `None` where it read none, or several.
+                let origin = match read_from.as_slice() {
+                    [one] => Some(one.clone()),
+                    _ => None,
+                };
+                values.insert(text.clone(), (value, origin));
+            }
+            Err(reason) => note_hole(&hole, reason),
         }
     }
-    values
+    (values, hole.get())
 }
 
 /// The literals for the value written as `text`: the compiler's literal
@@ -806,7 +835,7 @@ impl<'r> NameFold<'r> {
             .iter()
             .filter_map(|index| parts.arg_exprs.get(*index))
             .collect();
-        let folded = folded_values(
+        let (folded, _) = folded_values(
             &mut self.sources,
             &self.resolver,
             Some(positions),
@@ -919,6 +948,7 @@ impl<'r> NameFold<'r> {
         };
         self.resolver
             .text_read(self.sources.root, file, &expr)
+            .ok()
             .map(|(text, _)| text)
     }
 
@@ -1000,7 +1030,7 @@ impl<'r> NameFold<'r> {
         // Only spreads and no entry with the key: an object the resolver does
         // not read (R3). A key written before a spread stays a hole.
         if may_overwrite && last.is_none() && !computed {
-            return Some(ArgTexts::Unread);
+            return Some(ArgTexts::Unread(Stop::UnreadExpression));
         }
         if may_overwrite {
             return Some(ArgTexts::Values(vec![TextValue::Hole(
@@ -1867,8 +1897,9 @@ fn record(
     let names = compiler_names(sources, positions, root, file, &idents);
     // The literals a name's type stands for: one, or each of a union's;
     // else the one text the value the name slot writes folds to
-    // (carrick#3479).
-    let folded = {
+    // (carrick#3479). The first hole met reading the name is why a lead's
+    // name is unstated (carrick#3688 U2).
+    let (folded, folded_hole) = {
         let exprs: Vec<&Expr> = site
             .name_args
             .iter()
@@ -1876,6 +1907,7 @@ fn record(
             .collect();
         folded_values(sources, resolver, positions, root, file, &site.name, &exprs)
     };
+    let name_hole: Cell<Option<Stop>> = Cell::new(folded_hole);
     let literals = |text: &str| -> Vec<String> { piece_literals(&names, &folded, text) };
 
     // The functions the call runs, two levels down.
@@ -1965,6 +1997,7 @@ fn record(
                     root,
                     file,
                     in_place: true,
+                    hole: &name_hole,
                 },
             ) {
                 Some(values) => Some(values),
@@ -2137,6 +2170,7 @@ fn record(
                             root,
                             file,
                             in_place: false,
+                            hole: &Cell::new(None),
                         },
                     )
                     .map(|whole| whole.values)
@@ -2364,6 +2398,7 @@ fn record(
         names: several_names,
         bucket,
         lead: (bucket == Bucket::Lead).then_some("name_unstated"),
+        unread: (bucket == Bucket::Lead).then(|| name_hole.get()).flatten(),
         receiver: site.receiver.clone(),
     })
 }
@@ -2706,6 +2741,9 @@ mod tests {
             call.unread.reason,
             crate::request_summary::Stop::UnresolvedImport
         );
+        // The record keeps the hole the resolver met reading the name
+        // (carrick#3688 U2); the compiler's narrower fact names the row.
+        assert_eq!(fire.unread, Some(Stop::OutsideService));
         assert_eq!(call.unread.slot, "name");
         assert_eq!(call.kind.as_deref(), Some("socket"), "{call:?}");
         assert_eq!(call.role.as_deref(), Some("producer"), "{call:?}");
