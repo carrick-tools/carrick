@@ -290,7 +290,8 @@ fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::possible_calls::{PossibleCall, Unread, UnreadReason};
+    use crate::possible_calls::{PossibleCall, Unread};
+    use crate::request_summary::Stop;
 
     fn call(line: u32, role: Option<&str>) -> PossibleCall {
         PossibleCall {
@@ -303,7 +304,7 @@ mod tests {
             labelled_end: None,
             unread: Unread {
                 slot: "path".to_string(),
-                reason: UnreadReason::NameNeverBound,
+                reason: Stop::NameNeverBound,
             },
             trace_depth: 0,
         }

@@ -18,6 +18,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::super::RequestSummaryInputs;
+use super::super::stop::Stop;
 use super::boundaries::{Above, Boundary, End, Part};
 use super::instances::{
     InstanceAt, InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,
@@ -442,17 +443,14 @@ fn chains(
         InstanceAt::Hole {
             reason, boundary, ..
         } => ended(
-            serde_json::to_value(reason)
-                .ok()
-                .and_then(|reason| reason.as_str().map(str::to_string))
-                .unwrap_or_default(),
+            Stop::from(*reason).as_str().to_string(),
             boundary.clone(),
             budget,
         ),
         InstanceAt::Root { file, line, .. } => {
             let here = (file.clone(), *line);
             if seen.contains(&here) {
-                return ended("cycle".to_string(), None, budget);
+                return ended(Stop::Recursion.as_str().to_string(), None, budget);
             }
             let served: Vec<&MountEdge> = mounts
                 .edges
@@ -465,7 +463,7 @@ fn chains(
             let unverified = mounts.unverified.contains(&here);
             if served.is_empty() {
                 let end = if unverified {
-                    "mount_unverified"
+                    Stop::MountUnverified.as_str()
                 } else {
                     "top"
                 };
@@ -473,7 +471,7 @@ fn chains(
             }
             seen.push(here.clone());
             let mut out = if unverified {
-                ended("mount_unverified".to_string(), None, budget)
+                ended(Stop::MountUnverified.as_str().to_string(), None, budget)
             } else {
                 Vec::new()
             };
@@ -547,10 +545,11 @@ pub(super) fn aboves(ends: &[InstanceEnd], mounts: &Mounts) -> Vec<Above> {
                 .collect();
             let end = match (chain.end.as_str(), chain.boundary) {
                 ("top", _) => End::Top,
-                ("mount_unverified", _) => End::MountUnverified,
+                (end, _) if end == Stop::MountUnverified.as_str() => End::MountUnverified,
                 (_, Some(boundary)) => End::Boundary { boundary },
+                ("handed", None) => End::Handed,
                 (reason, None) => End::Hole {
-                    reason: reason.to_string(),
+                    reason: Stop::parse(reason).unwrap_or(Stop::Unread),
                 },
             };
             let above = Above { parts, end };

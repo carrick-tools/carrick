@@ -280,9 +280,9 @@ pub enum Prefix {
     },
 }
 
-/// Why an instance walk ends at no maker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// Why an instance walk ends at no maker. It has no spelling of its own: it
+/// serialises through [`crate::request_summary::Stop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InstanceHole {
     /// The function that holds the receiver is called by nothing in the
     /// service, and handed to no library call.

@@ -26,60 +26,19 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::cloud_storage::CloudRepoData;
-use crate::request_summary::decided_sites::{
-    Decided, DecidedLead, DecidedSite, LabelledEnd, Undecided,
-};
+use crate::request_summary::Stop;
+use crate::request_summary::decided_sites::{Decided, DecidedLead, DecidedSite, LabelledEnd};
 use crate::request_summary::site_record::{Bucket, SiteRecord};
 
 /// The most possible calls one service's blob carries.
 pub const MAX_PER_SERVICE: usize = 2000;
-
-/// Why a call is a possible call: a closed list, one phrase for each in the
-/// reader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnreadReason {
-    /// The name is only known when the program runs.
-    NameNeverBound,
-    /// The call could go to more than one implementation.
-    SeveralImplementations,
-    /// Too many implementations to follow.
-    ImplementationsOverCap,
-    /// The name comes from an import the scan could not read.
-    UnresolvedImport,
-    /// The function is passed in from elsewhere and nothing says which.
-    InjectedCallee,
-    /// The receiver's type is not known.
-    UntypedReceiver,
-    /// An answer was given and fell below the band that states a row.
-    BelowBand,
-    /// The call was not checked on this scan.
-    Unanswered,
-    /// The call reaches a library export the store labels with a network
-    /// role and no op, so nothing says what it sends or receives
-    /// (carrick#2515). The reader has no phrase for it yet: it keeps the
-    /// row and the word, and shows no `why`.
-    NoOpClaim,
-    /// A site answer says a route is registered here and names no request
-    /// method it serves (carrick#2517): a member that mounts an application
-    /// under a prefix reads this way. No route is written for it.
-    NoMethod,
-    /// A site answer says a route is registered here, and the scan cannot
-    /// tell which router it hangs from, so the prefix it is mounted under is
-    /// unknown (carrick#2517). No route is written for it.
-    OwnerUnknown,
-    /// A site answer's row rests on a slot only the store's label forced,
-    /// the code does not state its name, and no row the file reader stated
-    /// at the line agrees (carrick#2520). No row is written for it.
-    Uncorroborated,
-}
 
 /// The slot the code does not state, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unread {
     /// `name` (an event, topic or message name) or `path` (an HTTP path).
     pub slot: String,
-    pub reason: UnreadReason,
+    pub reason: Stop,
 }
 
 /// The labelled library call a possible call reaches.
@@ -168,7 +127,7 @@ fn slot_of(role: &str) -> &'static str {
 /// Why a decided site's name is unstated: an identifier the compiler reads
 /// as `any` with no declaration is an import the scan could not read.
 /// Otherwise nothing says, and the call was not checked on this scan.
-fn reason_of(record: &SiteRecord) -> UnreadReason {
+fn reason_of(record: &SiteRecord) -> Stop {
     let unreadable = record.compiler().is_some_and(|compiler| {
         compiler.names.iter().any(|name| {
             name.declaration.is_none()
@@ -177,30 +136,13 @@ fn reason_of(record: &SiteRecord) -> UnreadReason {
         })
     });
     if unreadable {
-        UnreadReason::UnresolvedImport
+        Stop::UnresolvedImport
     } else {
-        UnreadReason::Unanswered
+        Stop::Unanswered
     }
 }
 
-fn reason_of_undecided(reason: Undecided) -> UnreadReason {
-    match reason {
-        // A parameter of a callback this code does not call is, like a
-        // parameter nothing fills, a name only the running program knows.
-        Undecided::NameNeverBound | Undecided::CallbackParameter => UnreadReason::NameNeverBound,
-        // The program picks the name when it runs, by the call's arguments.
-        Undecided::SeveralOperations => UnreadReason::NameNeverBound,
-        Undecided::NoOpClaim => UnreadReason::NoOpClaim,
-        // A value passed in from elsewhere, and its values disagree on which
-        // labelled export runs.
-        Undecided::SeveralValues => UnreadReason::InjectedCallee,
-        // An interface member whose implementations reach different
-        // labelled exports.
-        Undecided::SeveralImplementations => UnreadReason::SeveralImplementations,
-    }
-}
-
-fn from_undecided(lead: &DecidedLead) -> PossibleCall {
+fn from_lead(lead: &DecidedLead) -> PossibleCall {
     PossibleCall {
         file_path: lead.file.clone(),
         line_number: lead.line,
@@ -211,7 +153,7 @@ fn from_undecided(lead: &DecidedLead) -> PossibleCall {
         labelled_end: Some(labelled_end(&lead.end)),
         unread: Unread {
             slot: slot_of(&lead.end.role).to_string(),
-            reason: reason_of_undecided(lead.reason),
+            reason: lead.reason,
         },
         trace_depth: lead.depth,
     }
@@ -254,7 +196,7 @@ pub fn from_sites(decided: &Decided, records: &[SiteRecord]) -> Vec<PossibleCall
             .leads
             .iter()
             .filter(|lead| !class_only_graphql(lead))
-            .map(from_undecided),
+            .map(from_lead),
     );
     out
 }
@@ -264,12 +206,12 @@ pub fn from_sites(decided: &Decided, records: &[SiteRecord]) -> Vec<PossibleCall
 /// read by [`crate::graphql_document_sites`]), so such a call is not listed
 /// as a possible call. Every other export with no op is (carrick#2515).
 fn class_only_graphql(lead: &DecidedLead) -> bool {
-    lead.reason == Undecided::NoOpClaim && lead.end.role == "graphql_client"
+    lead.reason == Stop::NoOpClaim && lead.end.role == "graphql_client"
 }
 
 /// A decided site that states no row, for `reason` (carrick#2439): its
 /// answer fell below the band, or it was not answered.
-pub fn from_site(site: &DecidedSite, reason: UnreadReason) -> PossibleCall {
+pub fn from_site(site: &DecidedSite, reason: Stop) -> PossibleCall {
     PossibleCall {
         file_path: site.file.clone(),
         line_number: site.line,
@@ -319,7 +261,7 @@ mod tests {
             labelled_end: None,
             unread: Unread {
                 slot: "name".into(),
-                reason: UnreadReason::Unanswered,
+                reason: Stop::Unanswered,
             },
             trace_depth: 0,
         }
@@ -427,7 +369,7 @@ mod tests {
              "unread": {"slot": "path", "reason": "injected_callee"}, "trace_depth": 1}
         ]);
         let rows: Vec<PossibleCall> = serde_json::from_value(reader.clone()).unwrap();
-        assert_eq!(rows[0].unread.reason, UnreadReason::UnresolvedImport);
+        assert_eq!(rows[0].unread.reason, Stop::UnresolvedImport);
         assert_eq!(serde_json::to_value(&rows).unwrap(), reader);
         // Every reason the reader names reads.
         for reason in [
@@ -440,7 +382,7 @@ mod tests {
             "below_band",
             "unanswered",
         ] {
-            let parsed: UnreadReason = serde_json::from_value(serde_json::json!(reason)).unwrap();
+            let parsed: Stop = serde_json::from_value(serde_json::json!(reason)).unwrap();
             assert_eq!(serde_json::to_value(parsed).unwrap(), reason);
         }
     }
@@ -469,7 +411,7 @@ mod tests {
             span_end: 20,
             depth: 0,
             end,
-            reason: Undecided::NoOpClaim,
+            reason: Stop::NoOpClaim,
         };
         let decided = Decided {
             leads: vec![
@@ -486,6 +428,66 @@ mod tests {
                 .as_ref()
                 .map(|end| end.package.as_str()),
             Some("a-storage-lib")
+        );
+    }
+
+    fn lead_of(reason: Stop) -> DecidedLead {
+        DecidedLead {
+            file: "src/a.ts".to_string(),
+            line: 3,
+            span_start: 10,
+            span_end: 20,
+            depth: 1,
+            end: LabelledEnd {
+                package: "a-http-lib".to_string(),
+                export: "Client".to_string(),
+                member: Some("get".to_string()),
+                role: "http_client".to_string(),
+                op: Some("get".to_string()),
+                file: "src/a.ts".to_string(),
+                line: 3,
+                span_start: 10,
+                new: false,
+                scope: None,
+                span_end: 20,
+            },
+            reason,
+        }
+    }
+
+    /// The reason a lead is written with is the lead's own stop, whatever it
+    /// is: no map to a coarser word (carrick#3688 U1).
+    fn written_reason(reason: Stop) -> String {
+        let decided = Decided {
+            leads: vec![lead_of(reason)],
+            ..Decided::default()
+        };
+        let found = from_sites(&decided, &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        serde_json::to_value(&found[0]).unwrap()["unread"]["reason"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn a_lead_whose_values_disagree_reads_several_values() {
+        assert_eq!(written_reason(Stop::SeveralValues), "several_values");
+    }
+
+    #[test]
+    fn a_callback_parameter_lead_reads_callback_parameter() {
+        assert_eq!(
+            written_reason(Stop::CallbackParameter),
+            "callback_parameter"
+        );
+    }
+
+    #[test]
+    fn several_operations_reads_several_operations() {
+        assert_eq!(
+            written_reason(Stop::SeveralOperations),
+            "several_operations"
         );
     }
 }

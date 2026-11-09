@@ -23,16 +23,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::cloud_storage::CloudRepoData;
+use crate::request_summary::Stop;
 
 /// The most rows one service's blob carries; the total beside them is exact.
 pub const MAX_PER_SERVICE: usize = 500;
 
 /// The receiver's source text is cut to this many characters.
 pub const RECEIVER_CHARS: usize = 60;
-
-/// The reason for a call whose declaration is a member of an interface or
-/// type in the service's own files, which is no definition.
-pub const INTERFACE_MEMBER: &str = "interface_member";
 
 /// One member call the scan could not follow (`unfollowed_member_calls[]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,9 +43,9 @@ pub struct UnfollowedMemberCall {
     pub member: String,
     /// The receiver's source text, cut to [`RECEIVER_CHARS`].
     pub receiver: String,
-    /// `interface_member`, or the name of the hole the rows left
-    /// ([`crate::request_summary::HoleReason`]), such as `untyped_receiver`.
-    pub reason: String,
+    /// `interface_member`, or the hole the rows left, such as
+    /// `untyped_receiver` (one [`Stop`] word).
+    pub reason: Stop,
     /// `<file>:<line>` of the declaration, for `interface_member`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_at: Option<String>,
@@ -136,7 +133,7 @@ mod tests {
             caller: "f".to_string(),
             member: member.to_string(),
             receiver: "r".to_string(),
-            reason: "untyped_receiver".to_string(),
+            reason: Stop::UntypedReceiver,
             declared_at: None,
         }
     }

@@ -57,6 +57,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::resolve::{Resolver, TextValue};
 use super::row_calls::Reach;
+use super::stop::Stop;
 use super::{CallIr, FnIr, KeyState, Piece, RequestSummaryInputs, Value, concat, render_target};
 
 pub mod boundaries;
@@ -149,7 +150,7 @@ pub struct DiscoverySite {
     #[serde(default)]
     pub chain: Vec<ChainHop>,
     #[serde(default)]
-    pub stop: Option<String>,
+    pub stop: Option<Stop>,
     /// The binding the labelled call is made on (carrick#2474 R1), with the
     /// receiver trace on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -881,31 +882,6 @@ fn is_reference(text: &str) -> bool {
         })
 }
 
-/// Why a discovered call names nothing a caller decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Undecided {
-    /// The slot keeps a parameter up to a function nothing calls.
-    NameNeverBound,
-    /// The slot holds a parameter of a callback this code does not call.
-    CallbackParameter,
-    /// The call reaches an export the store labels with a network role and
-    /// no op (carrick#2515): the store says nothing about what its members
-    /// do, so no slot can be read. The call is listed, not named.
-    NoOpClaim,
-    /// The callee is a value whose values reach different labelled exports,
-    /// or one of them none (carrick#2432): which one runs is the caller's.
-    SeveralValues,
-    /// The call goes through an interface member whose implementations reach
-    /// different labelled exports, or one of them none (carrick#2432 slice
-    /// B): which one runs is the receiver's.
-    SeveralImplementations,
-    /// Walks from different branches of one function reach the same labelled
-    /// call and settle at this one, each with a different operation
-    /// (carrick#2816): which runs depends on the call's arguments.
-    SeveralOperations,
-}
-
 /// A discovered call whose name no call of this code decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecidedLead {
@@ -917,7 +893,7 @@ pub struct DecidedLead {
     /// that holds the open name).
     pub depth: u32,
     pub end: LabelledEnd,
-    pub reason: Undecided,
+    pub reason: Stop,
 }
 
 /// What [`decided_sites`] finds.
@@ -2051,7 +2027,7 @@ impl<'a> Walk<'a, '_> {
                 && (self.out.sites[at].name != name || self.out.sites[at].method != method)
             {
                 self.withdrawn.insert(id);
-                self.lead(placed, end, Undecided::SeveralOperations);
+                self.lead(placed, end, Stop::SeveralOperations);
             }
             return;
         }
@@ -2235,7 +2211,7 @@ impl<'a> Walk<'a, '_> {
     /// twice, the result handed to a helper) is a lead.
     fn scoped(&mut self, last: &Placed<'a>, end: &LabelledEnd, scope: &LabelScope) {
         let Some((call, slot)) = self.scope_call_of(last, end, scope) else {
-            self.lead(last, end, Undecided::NameNeverBound);
+            self.lead(last, end, Stop::NameNeverBound);
             return;
         };
         let pieces = slot_value(call.call, &slot);
@@ -2271,7 +2247,7 @@ impl<'a> Walk<'a, '_> {
         }
     }
 
-    fn lead(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Undecided) {
+    fn lead(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Stop) {
         // A sibling's own call is a lead in that sibling's scan (carrick#2618).
         if !self.calls.is_own(placed.file) {
             return;
@@ -2308,7 +2284,7 @@ impl<'a> Walk<'a, '_> {
             span_end: end.span_end,
             depth: 0,
             end: end.clone(),
-            reason: Undecided::NoOpClaim,
+            reason: Stop::NoOpClaim,
         };
         if !self.out.leads.contains(&lead) {
             self.out.leads.push(lead);
@@ -2366,17 +2342,17 @@ impl<'a> Walk<'a, '_> {
     ) {
         let placed = down[0];
         let Some(own) = to_definition(pieces, placed.depth) else {
-            self.lead(&placed, end, Undecided::CallbackParameter);
+            self.lead(&placed, end, Stop::CallbackParameter);
             return;
         };
         let Some(key) = placed.key else {
             // Module level holds no parameter of its own.
-            self.lead(&placed, end, Undecided::NameNeverBound);
+            self.lead(&placed, end, Stop::NameNeverBound);
             return;
         };
         let callers = self.calls.callers_of(placed.file, key);
         if callers.is_empty() {
-            self.lead(&placed, end, Undecided::NameNeverBound);
+            self.lead(&placed, end, Stop::NameNeverBound);
             return;
         }
         let here = (placed.file.to_path_buf(), key.to_string());
@@ -2702,7 +2678,7 @@ impl<'a> Walk<'a, '_> {
             }
         }
         let [name] = names.as_slice() else {
-            self.lead(&down[0], end, Undecided::SeveralOperations);
+            self.lead(&down[0], end, Stop::SeveralOperations);
             return false;
         };
         self.site(down, end, name.clone(), BTreeSet::new());
@@ -3009,12 +2985,10 @@ fn decide(
             if let Some(placed) =
                 calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
             {
-                let reason =
-                    if site.stop.as_deref() == Some(super::discovery::SEVERAL_IMPLEMENTATIONS) {
-                        Undecided::SeveralImplementations
-                    } else {
-                        Undecided::SeveralValues
-                    };
+                // The reason is the stop discovery ended with: an end kept
+                // with a stop carries the one word its values or
+                // implementations stopped at.
+                let reason = site.stop.unwrap_or(Stop::SeveralValues);
                 walk.lead(&placed, end, reason);
             }
             continue;
@@ -3187,7 +3161,7 @@ fn decide(
                 });
         }
         let Some(top) = values[0].clone() else {
-            walk.lead(&chain[0], end, Undecided::CallbackParameter);
+            walk.lead(&chain[0], end, Stop::CallbackParameter);
             continue;
         };
         if walk.settles(&chain[0], &top, end) {
@@ -4355,7 +4329,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|lead| (lead.file.as_str(), lead.line, lead.reason))
                 .collect::<Vec<_>>(),
-            vec![("src/gql.ts", 3, Undecided::NoOpClaim)]
+            vec![("src/gql.ts", 3, Stop::NoOpClaim)]
         );
         // A GraphQL client's operations are labelled by class only: the lead
         // is counted here and not listed as a possible call (carrick#2519
@@ -4363,7 +4337,7 @@ pub(crate) mod tests {
         let found = crate::possible_calls::from_sites(&decided, &[]);
         assert!(found.is_empty(), "{found:?}");
         assert_eq!(
-            serde_json::to_value(crate::possible_calls::UnreadReason::NoOpClaim).unwrap(),
+            serde_json::to_value(Stop::NoOpClaim).unwrap(),
             "no_op_claim"
         );
     }
@@ -4446,11 +4420,8 @@ pub(crate) mod tests {
                 .map(|lead| (lead.line, lead.reason))
                 .collect::<Vec<_>>(),
             vec![
-                (line_of(&text, "useCached(options)"), Undecided::NoOpClaim),
-                (
-                    line_of(&text, "useCached({ ...options })"),
-                    Undecided::NoOpClaim
-                ),
+                (line_of(&text, "useCached(options)"), Stop::NoOpClaim),
+                (line_of(&text, "useCached({ ...options })"), Stop::NoOpClaim),
             ]
         );
         assert_eq!(
@@ -4710,11 +4681,11 @@ pub(crate) mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("api.ts".to_string(), 10, Undecided::NameNeverBound),
+                ("api.ts".to_string(), 10, Stop::NameNeverBound),
                 // A callee whose values reach two labelled exports
                 // (carrick#2432): one lead per export, at the call.
-                ("values.ts".to_string(), 32, Undecided::SeveralValues),
-                ("values.ts".to_string(), 32, Undecided::SeveralValues),
+                ("values.ts".to_string(), 32, Stop::SeveralValues),
+                ("values.ts".to_string(), 32, Stop::SeveralValues),
             ]
         );
     }
@@ -4732,8 +4703,7 @@ pub(crate) mod tests {
         assert!(
             values
                 .iter()
-                .all(|call| call.unread.reason
-                    == crate::possible_calls::UnreadReason::InjectedCallee),
+                .all(|call| call.unread.reason == Stop::SeveralValues),
             "{values:?}"
         );
         assert_eq!(found.len(), 1, "{found:?}");
@@ -4742,10 +4712,7 @@ pub(crate) mod tests {
         assert_eq!(call.line_number, 10);
         assert!(call.span_end > call.span_start, "{call:?}");
         assert!(!call.file_path.starts_with('/'), "{call:?}");
-        assert_eq!(
-            call.unread.reason,
-            crate::possible_calls::UnreadReason::NameNeverBound
-        );
+        assert_eq!(call.unread.reason, Stop::NameNeverBound);
         assert!(call.labelled_end.is_some(), "{call:?}");
     }
 
@@ -5517,7 +5484,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|lead| (lead.line, lead.reason))
                 .collect::<Vec<_>>(),
-            vec![(line("fetch(path)"), Undecided::NameNeverBound)]
+            vec![(line("fetch(path)"), Stop::NameNeverBound)]
         );
     }
 
@@ -6289,14 +6256,13 @@ pub(crate) mod tests {
             "{:?}",
             decided.sites
         );
-        let mut leads: Vec<(String, u32, Undecided)> = decided
+        let mut leads: Vec<(String, u32, Stop)> = decided
             .leads
             .iter()
             .map(|lead| (lead.file.clone(), lead.line, lead.reason))
             .collect();
         leads.sort();
-        let several =
-            |file: &str, line: u32| (file.to_string(), line, Undecided::SeveralOperations);
+        let several = |file: &str, line: u32| (file.to_string(), line, Stop::SeveralOperations);
         assert_eq!(
             leads,
             vec![

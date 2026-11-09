@@ -89,8 +89,10 @@ const STRING_METHODS: &[&str] = &[
 /// Why a chain stops before it reaches an end. A closed list: every chain
 /// that does not end at a kind of [`ChainEnd`] says which of these stopped
 /// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// It has no spelling of its own: it serialises through
+/// [`super::Stop`] (`stop.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HoleReason {
     /// The binding is assigned again, or declared more than once.
     Reassigned,

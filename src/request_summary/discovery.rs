@@ -84,50 +84,26 @@ use crate::services::type_sidecar::{
     SemanticsVerdict,
 };
 
-/// The stop for a walk that reaches a definition the extractor keys and
-/// this pass read no body of.
-const NO_BODY: &str = "no_body";
-
-/// Why a call that entered no code was not followed ([`Discovery::unfollowed`]).
-const VALUE_CALLEE: &str = "value_callee";
-const OUTSIDE_SERVICE: &str = "outside_service";
-const PACKAGE_UNMATCHED: &str = "package_unmatched";
-const UNANSWERED_PACKAGE: &str = "unanswered_package";
-
-/// Why a walk through a callee that is a value reached no one labelled
-/// export (carrick#2432): its values disagree or one reaches none, it holds
-/// more than [`MAX_VALUES`], nothing binds it, or each is a function written
-/// at a caller (what runs it decides).
-const SEVERAL_VALUES: &str = "several_values";
-const VALUES_OVER_CAP: &str = "values_over_cap";
-const VALUE_NEVER_BOUND: &str = "value_never_bound";
-const INJECTED_CALLEE: &str = "injected_callee";
-
-/// Why a walk through an interface member's implementations reached no one
-/// labelled export (carrick#2432 slice B): they disagree or one reaches
-/// none, or the sidecar found more than it lists.
-pub(crate) const SEVERAL_IMPLEMENTATIONS: &str = "several_implementations";
-const IMPLEMENTATIONS_OVER_CAP: &str = "implementations_over_cap";
-
 /// The two words [`Walker::agree`] stops with: for several values or
 /// implementations that disagree, and for more of them than it follows.
 #[derive(Clone, Copy)]
 struct Plural {
-    several: &'static str,
-    over_cap: &'static str,
+    several: Stop,
+    over_cap: Stop,
 }
 
 const OF_VALUES: Plural = Plural {
-    several: SEVERAL_VALUES,
-    over_cap: VALUES_OVER_CAP,
+    several: Stop::SeveralValues,
+    over_cap: Stop::ValuesOverCap,
 };
 const OF_IMPLEMENTATIONS: Plural = Plural {
-    several: SEVERAL_IMPLEMENTATIONS,
-    over_cap: IMPLEMENTATIONS_OVER_CAP,
+    several: Stop::SeveralImplementations,
+    over_cap: Stop::ImplementationsOverCap,
 };
 
 /// The hop a walk records where it enters a function through a value.
 use super::decided_sites::{BoundCall, HopMaker, VALUE_HOP};
+use super::stop::Stop;
 
 /// One discovered site, or one walk that entered code and stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,7 +121,7 @@ pub struct DiscoverySite {
     /// Each in-repo function the walk entered, outermost first.
     pub chain: Vec<ChainHop>,
     /// Why a walk that entered code reached no labelled export.
-    pub stop: Option<String>,
+    pub stop: Option<Stop>,
     /// The binding the labelled call is made on (carrick#2474 R1). Only
     /// with the receiver trace on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,7 +274,7 @@ impl<'a> Labels<'a> {
     /// default library is never `package_unmatched`: its calls are matched
     /// by their global's name, and a call it does not label is no client
     /// call. It is unanswered only when no default-library key is answered.
-    fn package_reason(&self, key: &str) -> Option<&'static str> {
+    fn package_reason(&self, key: &str) -> Option<Stop> {
         let unanswered = |answered: &HashSet<&str>| {
             if is_language_key(key) {
                 !answered.iter().any(|known| is_language_key(known))
@@ -307,12 +283,12 @@ impl<'a> Labels<'a> {
             }
         };
         if !is_language_key(key) && self.networked.contains(key) {
-            return Some(PACKAGE_UNMATCHED);
+            return Some(Stop::PackageUnmatched);
         }
         self.answered
             .as_ref()
             .is_some_and(unanswered)
-            .then_some(UNANSWERED_PACKAGE)
+            .then_some(Stop::UnansweredPackage)
     }
 
     /// These labels, following a call through an interface member into the
@@ -933,7 +909,7 @@ struct Found {
     reached: Option<ReachedBy>,
     /// Reached through a callee whose values reach different labelled
     /// exports (carrick#2432): one of several, so no site.
-    several: Option<&'static str>,
+    several: Option<Stop>,
     /// The calls the walk read through a `bind` with bound arguments
     /// (carrick#3504 S4d-b).
     bound: Vec<BoundCall>,
@@ -944,7 +920,7 @@ struct Found {
 struct Outcome<'a> {
     ends: Vec<Found>,
     /// The first stop, when the walk entered code and found nothing there.
-    stop: Option<(Vec<ChainHop>, String)>,
+    stop: Option<(Vec<ChainHop>, Stop)>,
     /// The shallowest definition still being read that the walk came back
     /// to: until it is done, this answer is not final.
     cycle_at: Option<usize>,
@@ -985,9 +961,9 @@ struct Open<'a> {
 type Held<'a> = super::resolve::Held<Outcome<'a>>;
 
 impl<'a> Outcome<'a> {
-    fn stopped(reason: impl Into<String>) -> Self {
+    fn stopped(reason: Stop) -> Self {
         Outcome {
-            stop: Some((Vec::new(), reason.into())),
+            stop: Some((Vec::new(), reason)),
             ..Outcome::default()
         }
     }
@@ -1778,15 +1754,15 @@ impl<'a> Walker<'a> {
     /// not followed: its callee is an in-repo value that is no definition, a
     /// function outside the service, or a member of a package the answer does
     /// not match or does not hold. `None` when nothing was missed.
-    fn unfollowed(&self, file: &Path, call: &CallIr, construction: bool) -> Option<&'static str> {
+    fn unfollowed(&self, file: &Path, call: &CallIr, construction: bool) -> Option<Stop> {
         match self.reach(file, call) {
-            Reach::OutsideService(..) => Some(OUTSIDE_SERVICE),
+            Reach::OutsideService(..) => Some(Stop::OutsideService),
             Reach::NoFunction => {
                 let row = self.row(file, call)?;
                 if in_repo(row) {
                     // A class built here has a constructor with no body to
                     // read; a value that is no definition is the gap.
-                    return (!construction).then_some(VALUE_CALLEE);
+                    return (!construction).then_some(Stop::ValueCallee);
                 }
                 // Missed only when every package the declaration stands for
                 // misses it: one labelled none, or answered and matched,
@@ -1798,7 +1774,7 @@ impl<'a> Walker<'a> {
                 {
                     return None;
                 }
-                let reasons: Vec<Option<&'static str>> = keys
+                let reasons: Vec<Option<Stop>> = keys
                     .iter()
                     .map(|key| self.labels.package_reason(key))
                     .collect();
@@ -1850,7 +1826,7 @@ impl<'a> Walker<'a> {
             .implementations?
             .at(file, call.site.lo, call.site.hi)?;
         let found = match followed {
-            Followed::OverCap => return Some(Outcome::stopped(IMPLEMENTATIONS_OVER_CAP)),
+            Followed::OverCap => return Some(Outcome::stopped(Stop::ImplementationsOverCap)),
             Followed::Found(found) => found,
         };
         let positions = self.inputs_for(file).positions.as_ref()?;
@@ -1952,7 +1928,7 @@ impl<'a> Walker<'a> {
             return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
         if call.invokes_param.is_some() {
-            return Outcome::stopped(INJECTED_CALLEE);
+            return Outcome::stopped(Stop::InjectedCallee);
         }
         let reach = self.reach(file, call);
         // A member of an object the compiler declares in the repository and
@@ -1993,7 +1969,7 @@ impl<'a> Walker<'a> {
                     // The walk came back to a definition it is reading.
                     Some(depth) => Outcome {
                         cycle_at: Some(*depth),
-                        ..Outcome::stopped("cycle")
+                        ..Outcome::stopped(Stop::Recursion)
                     },
                     None => {
                         let inner = self.definition(&id);
@@ -2032,7 +2008,7 @@ impl<'a> Walker<'a> {
             Reach::OutsideService(..) => Outcome::default(),
             Reach::NoFunction if self.interface_member(file, call) => self
                 .through_implementations(file, call, invoke)
-                .unwrap_or_else(|| Outcome::stopped("interface_member")),
+                .unwrap_or_else(|| Outcome::stopped(Stop::InterfaceMember)),
             // A call into a library whose declaration returns what the
             // function it is handed returns (carrick#2634): the compiler's
             // row says so, and the function written at the call is walked.
@@ -2051,7 +2027,7 @@ impl<'a> Walker<'a> {
             Reach::NoFunction => self
                 .through_type(invoke, &[Held::Reached(Outcome::default())])
                 .unwrap_or_default(),
-            Reach::Unknown(reason) => Outcome::stopped(super::row_calls::hole_key(reason)),
+            Reach::Unknown(reason) => Outcome::stopped(Stop::from(reason)),
         }
     }
 
@@ -2132,10 +2108,10 @@ impl<'a> Walker<'a> {
         // (an object's method, a function written inside another): what it
         // calls is not known, so the walk stops there and says so.
         let Some((file, ir)) = self.function(&id.0, &id.1) else {
-            return Outcome::stopped(NO_BODY);
+            return Outcome::stopped(Stop::NoBody);
         };
         if ir.bodyless {
-            return Outcome::stopped("interface_member");
+            return Outcome::stopped(Stop::InterfaceMember);
         }
         let depth = self.reading.len();
         self.reading.insert(id.clone(), depth);
@@ -2150,7 +2126,7 @@ impl<'a> Walker<'a> {
                 && out
                     .stop
                     .as_ref()
-                    .is_some_and(|(_, reason)| reason == "cycle");
+                    .is_some_and(|(_, reason)| *reason == Stop::Recursion);
             // A definition read inside a resolver query over its step cap
             // is not all it reaches (carrick#3504 S1).
             if !cycle_stop && !self.values.capping() {
@@ -2170,7 +2146,7 @@ impl<'a> Walker<'a> {
             }
             if inner.ends.is_empty()
                 && inner.stop.is_none()
-                && self.unfollowed(file, call, construction) == Some(UNANSWERED_PACKAGE)
+                && self.unfollowed(file, call, construction) == Some(Stop::UnansweredPackage)
             {
                 inner.unanswered.extend(self.unanswered_keys(file, call));
             }
@@ -2190,7 +2166,7 @@ impl<'a> Walker<'a> {
         };
         store_keys(row, self.labels.exports)
             .into_iter()
-            .filter(|key| self.labels.package_reason(key) == Some(UNANSWERED_PACKAGE))
+            .filter(|key| self.labels.package_reason(key) == Some(Stop::UnansweredPackage))
             .collect()
     }
 
@@ -2245,7 +2221,7 @@ impl<'a> Walker<'a> {
             let outcome = self.settle_at_callers(outcome, file, key, depth);
             let missed = self.misses(file, body, call, construction, &outcome);
             let record =
-                |end: Option<SiteEnd>, chain: Vec<ChainHop>, stop: Option<String>| DiscoverySite {
+                |end: Option<SiteEnd>, chain: Vec<ChainHop>, stop: Option<Stop>| DiscoverySite {
                     file: self.rel(file),
                     line: call.site.line,
                     span_start: call.site.span_start,
@@ -2280,13 +2256,11 @@ impl<'a> Walker<'a> {
                         Some(reason) => {
                             *discovery
                                 .counts
-                                .entry(format!("unfollowed/{reason}"))
+                                .entry(format!("unfollowed/{}", reason.as_str()))
                                 .or_default() += 1;
-                            discovery.unfollowed.push(record(
-                                None,
-                                Vec::new(),
-                                Some(reason.to_string()),
-                            ));
+                            discovery
+                                .unfollowed
+                                .push(record(None, Vec::new(), Some(reason)));
                         }
                         None => {
                             *discovery.counts.entry("no_site".to_string()).or_default() += 1;
@@ -2304,24 +2278,27 @@ impl<'a> Walker<'a> {
                 // code. Listed with the hole the row names.
                 if chain.is_empty()
                     && ![
-                        INJECTED_CALLEE,
-                        "interface_member",
-                        SEVERAL_VALUES,
-                        VALUES_OVER_CAP,
-                        SEVERAL_IMPLEMENTATIONS,
-                        IMPLEMENTATIONS_OVER_CAP,
-                        VALUE_NEVER_BOUND,
+                        Stop::InjectedCallee,
+                        Stop::InterfaceMember,
+                        Stop::SeveralValues,
+                        Stop::ValuesOverCap,
+                        Stop::SeveralImplementations,
+                        Stop::ImplementationsOverCap,
+                        Stop::ValueNeverBound,
                     ]
-                    .contains(&stop.as_str())
+                    .contains(&stop)
                 {
                     *discovery
                         .counts
-                        .entry(format!("unread/{stop}"))
+                        .entry(format!("unread/{}", stop.as_str()))
                         .or_default() += 1;
                     discovery.unfollowed.push(record(None, chain, Some(stop)));
                     continue;
                 }
-                *discovery.counts.entry(format!("stop/{stop}")).or_default() += 1;
+                *discovery
+                    .counts
+                    .entry(format!("stop/{}", stop.as_str()))
+                    .or_default() += 1;
                 discovery.sites.push(record(None, chain, Some(stop)));
                 continue;
             }
@@ -2343,9 +2320,9 @@ impl<'a> Walker<'a> {
                 }
                 // One of the labelled exports a callee's disagreeing values
                 // reach: the end is kept, with why it is no site.
-                let stop = found.several.map(str::to_string);
+                let stop = found.several;
                 let count = match &stop {
-                    Some(stop) => format!("stop/{stop}"),
+                    Some(stop) => format!("stop/{}", stop.as_str()),
                     None => format!("site/{}", role_key(found.end.role)),
                 };
                 *discovery.counts.entry(count).or_default() += 1;
@@ -2439,7 +2416,7 @@ impl<'a> Walker<'a> {
         if let Some(depth) = self.reading.get(&id) {
             return Outcome {
                 cycle_at: Some(*depth),
-                ..Outcome::stopped("cycle")
+                ..Outcome::stopped(Stop::Recursion)
             };
         }
         let inner = self.definition(&id);
@@ -2570,13 +2547,13 @@ impl<'a> Walker<'a> {
             };
         }
         if known.is_empty() {
-            return Outcome::stopped(VALUE_NEVER_BOUND).below(&chain);
+            return Outcome::stopped(Stop::ValueNeverBound).below(&chain);
         }
         if known.len() > MAX_VALUES {
             return Outcome::stopped(plural.over_cap).below(&chain);
         }
         if known.iter().all(|value| matches!(value, Held::Callback)) {
-            return Outcome::stopped(INJECTED_CALLEE).below(&chain);
+            return Outcome::stopped(Stop::InjectedCallee).below(&chain);
         }
         let mut outcomes: Vec<Outcome<'a>> = known
             .into_iter()
@@ -2601,7 +2578,7 @@ impl<'a> Walker<'a> {
             out.absorb(outcome);
         }
         if !agree && out.ends.is_empty() {
-            out.stop = Some((Vec::new(), plural.several.to_string()));
+            out.stop = Some((Vec::new(), plural.several));
         }
         out.below(&chain)
     }
@@ -2970,7 +2947,7 @@ mod tests {
                             end.line
                         )
                     });
-                    format!("{end} / {}", site.stop.as_deref().unwrap_or("site"))
+                    format!("{end} / {}", site.stop.map_or("site", Stop::as_str))
                 })
                 .collect();
             out.sort();
@@ -3031,7 +3008,10 @@ mod tests {
                 .sites
                 .iter()
                 .filter(|site| site.file.ends_with(file) && site.callee == callee)
-                .map(|site| site.stop.clone().unwrap_or_else(|| "site".to_string()))
+                .map(|site| {
+                    site.stop
+                        .map_or("site".to_string(), |stop| stop.as_str().to_string())
+                })
                 .collect();
             assert_eq!(
                 records,
@@ -3099,7 +3079,7 @@ mod tests {
             blind
                 .unfollowed
                 .iter()
-                .all(|site| site.stop.as_deref() != Some(UNANSWERED_PACKAGE))
+                .all(|site| site.stop != Some(Stop::UnansweredPackage))
         );
     }
 
@@ -3464,7 +3444,7 @@ mod tests {
         }
         if at("b-closure-coalesce.ts", 8)
             .iter()
-            .any(|site| site.stop.as_deref() == Some(INJECTED_CALLEE))
+            .any(|site| site.stop == Some(Stop::InjectedCallee))
         {
             wrong.push(format!(
                 "b-closure-coalesce.ts:8 injected: {}",
@@ -3478,7 +3458,7 @@ mod tests {
             !sites.is_empty()
                 && sites
                     .iter()
-                    .all(|site| site.stop.as_deref() == Some(SEVERAL_VALUES))
+                    .all(|site| site.stop == Some(Stop::SeveralValues))
         };
         if !several("s-closure-coalesce-filled.ts", 9) {
             wrong.push(format!(
@@ -3654,7 +3634,7 @@ mod tests {
         assert!(
             discovery.sites.iter().any(|site| site.file == runs.0
                 && site.span_start == runs.1
-                && site.stop.as_deref() == Some(INJECTED_CALLEE)),
+                && site.stop == Some(Stop::InjectedCallee)),
             "{:?}",
             discovery.sites
         );
@@ -3706,7 +3686,7 @@ mod tests {
             .filter(|site| site.file.ends_with(file) && site.line == line)
             .map(|site| match (&site.end, &site.stop) {
                 (Some(end), None) => format!("site {}", end.export),
-                (_, Some(stop)) => stop.clone(),
+                (_, Some(stop)) => stop.as_str().to_string(),
                 (None, None) => "none".to_string(),
             })
             .collect();
@@ -4220,7 +4200,7 @@ mod tests {
         let [several] = at("several.ts", 4)[..] else {
             unreachable!("asserted above")
         };
-        assert_eq!(several.stop.as_deref(), Some("several_values"));
+        assert_eq!(several.stop, Some(Stop::SeveralValues));
         // The control: the default is the global `fetch` itself, a site on
         // main, and it stays one.
         let [control] = at("control.ts", 4)[..] else {
@@ -4320,7 +4300,7 @@ mod tests {
         let [local] = at("local.ts", 11)[..] else {
             panic!("a site at local.ts:11: {:?}", discovery.sites);
         };
-        assert_eq!(local.stop.as_deref(), Some("several_values"));
+        assert_eq!(local.stop, Some(Stop::SeveralValues));
         assert_eq!(
             local.end.as_ref().map(|end| end.export.as_str()),
             Some("fetch")
@@ -4497,7 +4477,7 @@ export function listen(): void {
                     "{} {} stop {}",
                     site.line,
                     site.callee,
-                    site.stop.as_deref().unwrap_or("-")
+                    site.stop.map_or("-", Stop::as_str)
                 ),
             })
             .collect()
@@ -4840,7 +4820,7 @@ export function listen(): void {
         let unfollowed: Vec<(u32, Option<&str>)> = with
             .unfollowed
             .iter()
-            .map(|site| (site.line, site.stop.as_deref()))
+            .map(|site| (site.line, site.stop.map(Stop::as_str)))
             .collect();
         assert_eq!(unfollowed, vec![(22, Some("outside_service"))]);
         for record in with.sites.iter().chain(&with.unfollowed) {
@@ -7023,7 +7003,8 @@ export function listen(): void {
                     let end = match &above.end {
                         End::Top => "top".to_string(),
                         End::Boundary { boundary: at } => boundary(at),
-                        End::Hole { reason } => reason.clone(),
+                        End::Hole { reason } => reason.as_str().to_string(),
+                        End::Handed => "handed".to_string(),
                         End::MountUnverified => "mount_unverified".to_string(),
                     };
                     format!("({end}) {}", parts(&above.parts))

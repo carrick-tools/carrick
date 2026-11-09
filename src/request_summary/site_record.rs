@@ -2704,7 +2704,7 @@ mod tests {
         assert!(!call.file_path.starts_with('/'), "{call:?}");
         assert_eq!(
             call.unread.reason,
-            crate::possible_calls::UnreadReason::UnresolvedImport
+            crate::request_summary::Stop::UnresolvedImport
         );
         assert_eq!(call.unread.slot, "name");
         assert_eq!(call.kind.as_deref(), Some("socket"), "{call:?}");

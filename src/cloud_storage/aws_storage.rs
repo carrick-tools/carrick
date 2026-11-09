@@ -4922,7 +4922,10 @@ mod tests {
         );
         let back: CloudRepoData = serde_json::from_value(written).unwrap();
         assert_eq!(back.unfollowed_member_calls, data.unfollowed_member_calls);
-        assert_eq!(back.unfollowed_member_calls[0].reason, "interface_member");
+        assert_eq!(
+            back.unfollowed_member_calls[0].reason,
+            crate::request_summary::Stop::InterfaceMember
+        );
         assert_eq!(
             back.unfollowed_member_calls[0].declared_at.as_deref(),
             Some("src/store.ts:2")
