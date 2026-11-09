@@ -543,6 +543,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     bareCheckout,
     repoRoot: dependencyRoot,
     compilerHost,
+    outsideSources: written.outsideSources,
   });
   let aliases: CaptureAliasRecord[];
   let secondAliases: CaptureAliasRecord[] | undefined;
@@ -699,6 +700,8 @@ interface WrittenStub {
   unpinned: string[];
   /** Package -> installed directory, for specifiers rewritten into one. */
   installs: Record<string, string>;
+  /** Absolute stub path of each declaration of a source outside rootDir -> that source's own path. */
+  outsideSources: Record<string, string>;
 }
 
 /** A stub that cannot be written: the capture fails with this message alone. */
@@ -908,6 +911,9 @@ function writeStub(surface: SurfaceEmit, stubDir: string, ctx: StubContext): Wri
     pinned,
     unpinned,
     installs: rewritten.installs,
+    outsideSources: Object.fromEntries(
+      [...placed.outside].map(([source, rel]) => [path.join(typesDir, rel), `${source}.ts`])
+    ),
   };
 }
 

@@ -82,6 +82,13 @@ export interface SelfCheckArgs {
   /** Producer repo root; its node_modules (if any) backs resolution. */
   repoRoot: string;
   compilerHost?: (options: ts.CompilerOptions) => ts.CompilerHost;
+  /**
+   * Absolute stub path of each declaration emitted for a source outside the
+   * service's rootDir -> that source's own path. A bare specifier such a
+   * declaration names that the stub's links do not reach is resolved from the
+   * source's place in the checkout, as the compiler resolved it at emit.
+   */
+  outsideSources?: Readonly<Record<string, string>>;
 }
 
 interface FileFailures {
@@ -173,12 +180,30 @@ export const SELF_CHECK_OPTIONS: Readonly<ts.CompilerOptions> = sidecarCompilerO
   types: [],
 });
 
+/** The host of a self-check program, with outside declarations resolving from their source. */
+function selfCheckHost(args: SelfCheckArgs): ts.CompilerHost | undefined {
+  const outside = args.outsideSources;
+  if (!outside || Object.keys(outside).length === 0) return args.compilerHost?.(SELF_CHECK_OPTIONS);
+  const host = args.compilerHost?.(SELF_CHECK_OPTIONS) ?? ts.createCompilerHost(SELF_CHECK_OPTIONS);
+  const fallback = host.resolveModuleNames?.bind(host);
+  host.resolveModuleNames = (names, containingFile, reused, redirected, options, containingSourceFile) =>
+    names.map((name, index) => {
+      const resolved = fallback
+        ? fallback([name], containingFile, reused?.slice(index, index + 1), redirected, options, containingSourceFile)[0]
+        : ts.resolveModuleName(name, containingFile, options, host).resolvedModule;
+      const source = outside[path.resolve(containingFile)];
+      if (resolved || !source || name.startsWith('.') || path.isAbsolute(name)) return resolved;
+      return ts.resolveModuleName(name, source, options, host).resolvedModule;
+    });
+  return host;
+}
+
 function runSelfCheck(
   args: SelfCheckArgs,
   treeFiles: string[],
   repaired?: Map<string, RepairedFile>
 ): SelfCheckPass {
-  const program = ts.createProgram(treeFiles, SELF_CHECK_OPTIONS, args.compilerHost?.(SELF_CHECK_OPTIONS));
+  const program = ts.createProgram(treeFiles, SELF_CHECK_OPTIONS, selfCheckHost(args));
   const checker = program.getTypeChecker();
   const diagnostics = ts.getPreEmitDiagnostics(program);
 
