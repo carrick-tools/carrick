@@ -490,6 +490,12 @@ impl UrlNormalizer {
             .filter(|host| !host.is_empty() && !host.contains('$') && !host.contains('{'))
     }
 
+    /// The host of a call target that names an origin outside this system, or
+    /// `None`. STUB for the red commit: the fix fills it.
+    pub fn outside_origin(&self, _url: &str) -> Option<String> {
+        None
+    }
+
     /// True if `host` exactly equals, or is a subdomain of, one of `domains`.
     /// The rule lives in `carrick_match::host_matches_domains` (carrick#3441).
     fn host_matches_domains(host: &str, domains: &BTreeSet<String>) -> bool {
@@ -1190,6 +1196,38 @@ mod tests {
     /// destroys the only evidence downstream has that the call leaves the
     /// system — the key becomes `/user`, indistinguishable from an internal
     /// call to a producer nobody declares, and the call is reported missing.
+    /// `outside_origin` names only a literal `http(s)://` host that is not
+    /// loopback and not declared internal. The `//host` and `${host}` cases
+    /// are today's behaviour kept (`consumer_call_path` strips both, so no such
+    /// key reaches the join), not a new decision.
+    #[test]
+    fn outside_origin_names_only_literal_undeclared_hosts() {
+        let config = Config {
+            internal_domains: ["https://api.ledger.test".to_string()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let normalizer = UrlNormalizer::new(&config);
+
+        assert_eq!(
+            normalizer.outside_origin("https://api.vendor.test/x"),
+            Some("api.vendor.test".to_string())
+        );
+        for none in [
+            "http://localhost:7100/x",
+            "http://127.0.0.1/x",
+            "https://api.ledger.test/x",
+            "https://eu.api.ledger.test/x",
+            "https://${host}/v1",
+            "//cdn.vendor.test/x",
+            "/rel",
+            "${API_URL}/x",
+        ] {
+            assert_eq!(normalizer.outside_origin(none), None, "{none}");
+        }
+    }
+
     #[test]
     fn consumer_call_path_keeps_declared_external_absolute_url_verbatim() {
         // Written as full URLs, exactly as carrick.json allows.
