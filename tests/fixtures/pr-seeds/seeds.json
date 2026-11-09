@@ -216,6 +216,24 @@
       }
     },
     {
+      "name": "route-added-in-unparseable-file",
+      "protocol": "http",
+      "change": "delta_only",
+      "repo": "admin-api",
+      "edits": [
+        {"op": "replace", "file": "src/admin.ts", "pairs": [
+          ["  app.get(`/api/v1/admin/reports/${period}`, report);\n}", "  app.get(`/api/v1/admin/reports/${period}`, report);\n}\napp.get(\"/api/v1/admin/orders/export\", exportOrders);\n\nfunction exportOrders(_request: Request, response: Response): void {\n<<<<<<< HEAD\n  response.send({ format: \"csv\" });\n=======\n  response.send({ format: \"json\" };\n>>>>>>> export-json\n}"]
+        ]}
+      ],
+      "expect": {
+        "title": "not_clean",
+        "conclusion": "neutral",
+        "open": true,
+        "rows": []
+      },
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#3207"]}
+    },
+    {
       "name": "http-prefix-moved",
       "protocol": "http",
       "change": "delta_only",

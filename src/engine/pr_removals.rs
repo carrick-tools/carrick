@@ -208,6 +208,7 @@ fn place<R: Placeable>(
         main,
         reading_moved,
         &[],
+        &[],
     ) {
         Ok(anchored) => {
             let listed: HashSet<usize> = anchored.removed.into_iter().collect();

@@ -1673,6 +1673,7 @@ mod tests {
     #[test]
     fn test_pr_delta_flags_a_removed_endpoint_still_consumed_via_an_sdk() {
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![],
             removed_endpoints: vec![EndpointRef {
                 method: "POST".to_string(),
@@ -1698,6 +1699,7 @@ mod tests {
     #[test]
     fn sdk_still_consumed_marker_is_param_aware() {
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![],
             removed_endpoints: vec![EndpointRef {
                 method: "POST".to_string(),
@@ -1723,6 +1725,7 @@ mod tests {
     #[test]
     fn sdk_marker_ignores_non_http_producer_keys() {
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![],
             removed_endpoints: vec![EndpointRef {
                 method: "POST".to_string(),
@@ -2617,6 +2620,7 @@ mod tests {
     #[test]
     fn test_pr_delta_strip_lists_new_endpoints() {
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![
                 EndpointRef {
                     method: "POST".to_string(),
@@ -2659,6 +2663,7 @@ mod tests {
         // A PR can add an endpoint without introducing any issue, so the strip
         // must also appear on the clean (TIP) path.
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![EndpointRef {
                 method: "GET".to_string(),
                 path: "/health".to_string(),
@@ -2680,6 +2685,7 @@ mod tests {
         // A removed endpoint whose (method, path) still shows up as a missing
         // endpoint is a producer this PR deletes out from under a consumer.
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![],
             removed_endpoints: vec![
                 EndpointRef {
@@ -2717,6 +2723,7 @@ mod tests {
     #[test]
     fn test_pr_delta_still_consumed_join_is_param_aware() {
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![],
             removed_endpoints: vec![
                 // Param name differs from the missing finding's `:param`.
@@ -2779,6 +2786,7 @@ mod tests {
         // In a prose code span a pipe is literal (must not be backslash-escaped
         // the way a table cell would), and a backtick in the service is dropped.
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![EndpointRef {
                 method: "GET".to_string(),
                 path: "/a|b".to_string(),
@@ -2802,6 +2810,7 @@ mod tests {
         // A service name that sanitizes to empty (e.g. only backticks) must not
         // render an empty " (``)" suffix.
         let delta = PrDelta {
+            files_not_read: Vec::new(),
             new_endpoints: vec![EndpointRef {
                 method: "GET".to_string(),
                 path: "/x".to_string(),

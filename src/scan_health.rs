@@ -132,6 +132,11 @@ struct Registry {
     /// their per-position rows are missing from the index. Its own count: a
     /// walk death never stops a run, as `type_memory_deaths` can.
     walk_rows_lost: std::collections::BTreeSet<Scope>,
+    /// The source files each service's analysis could not read, by path as
+    /// the walk named them, and why (carrick#3233). Not a loss of the model's
+    /// answer and never a reason to hold a service back: no scan of those
+    /// bytes reads them. The PR delta names the ones the PR changed.
+    unread_sources: BTreeMap<Scope, BTreeMap<String, crate::findings::FileNotReadReason>>,
 }
 
 /// A type-checker process that died of memory (carrick#2208).
@@ -300,6 +305,36 @@ impl Registry {
         });
     }
 
+    /// Records that `scope`'s analysis could not read the source file
+    /// `path`. One entry per file: a file read twice is one file.
+    fn record_unread_source(
+        &mut self,
+        scope: &Scope,
+        path: &str,
+        reason: crate::findings::FileNotReadReason,
+    ) {
+        self.unread_sources
+            .entry(scope.clone())
+            .or_default()
+            .insert(path.to_string(), reason);
+    }
+
+    /// The source files `scope`'s analysis could not read, sorted by path.
+    fn unread_sources_for(
+        &self,
+        scope: &Scope,
+    ) -> Vec<(String, crate::findings::FileNotReadReason)> {
+        self.unread_sources
+            .get(scope)
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|(path, reason)| (path.clone(), *reason))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Records that `count` intents of `scope` failed, `for_capacity` of them
     /// because the model refused for capacity.
     fn record_intents_failed(&mut self, scope: &Scope, count: usize, for_capacity: usize) {
@@ -345,6 +380,7 @@ impl Registry {
         self.time_limits.remove(scope);
         self.library_pending.remove(scope);
         self.library_ask_failed.remove(scope);
+        self.unread_sources.remove(scope);
     }
 
     /// Records that `limit` ran out while `scope` was analysed, at a cost of
@@ -641,6 +677,28 @@ pub fn record_unanalysed_file(path: &str, reason: &LossReason) {
         .lock()
         .expect("scan health lock")
         .record_unanalysed_file(&crate::current_service::name(), path, reason);
+}
+
+/// Records that the analysis of the service running
+/// ([`crate::current_service`]) could not read the source file `path`
+/// (`does_not_parse` or `not_utf8_text`), so no row of it is stated
+/// (carrick#3233). The PR delta names it when the PR changed it.
+pub fn record_unread_source(path: &str, reason: crate::findings::FileNotReadReason) {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .record_unread_source(&crate::current_service::name(), path, reason);
+}
+
+/// The source files `service`'s analysis could not read, by path as the walk
+/// named them (absolute or `./`-led), and why.
+pub fn unread_sources_for(
+    service: Option<&str>,
+) -> Vec<(String, crate::findings::FileNotReadReason)> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .unread_sources_for(&service.map(str::to_string))
 }
 
 /// Records that the model was deliberately not asked about `path`, with the
@@ -1383,6 +1441,45 @@ mod tests {
         );
         run.forget_service_losses(&api);
         assert!(run.library_pending_lines().is_empty());
+    }
+
+    /// carrick#3233: a source file a service could not read is kept against
+    /// that service, once however often it is read, apart from its sibling's,
+    /// and dropped when the service is analysed again. It is never a lost
+    /// file: the service is not held back for it.
+    #[test]
+    fn an_unread_source_is_kept_per_service_and_owes_nothing() {
+        use crate::findings::FileNotReadReason;
+        let mut run = run();
+        let api = Some("api".to_string());
+        let web = Some("web".to_string());
+        run.record_unread_source(
+            &api,
+            "/repo/api/src/routes.ts",
+            FileNotReadReason::DoesNotParse,
+        );
+        run.record_unread_source(
+            &api,
+            "/repo/api/src/routes.ts",
+            FileNotReadReason::DoesNotParse,
+        );
+        run.record_unread_source(
+            &web,
+            "/repo/web/src/logo.ts",
+            FileNotReadReason::NotUtf8Text,
+        );
+        assert_eq!(
+            run.unread_sources_for(&api),
+            vec![(
+                "/repo/api/src/routes.ts".to_string(),
+                FileNotReadReason::DoesNotParse
+            )]
+        );
+        assert_eq!(run.lost_file_count(), 0);
+        assert!(run.unanalysed_files_for(&api).is_empty());
+        run.forget_service_losses(&api);
+        assert!(run.unread_sources_for(&api).is_empty());
+        assert_eq!(run.unread_sources_for(&web).len(), 1);
     }
 
     /// The regression: one lost file must reach the summary AND its service's
