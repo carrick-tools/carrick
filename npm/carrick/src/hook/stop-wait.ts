@@ -66,9 +66,12 @@ const POLL_MS = 250;
  * there is nothing to check in it, so Stop says nothing and queues nothing.
  */
 const UNREAD_FILE = "no service reads this file";
+/** The start of `UNREAD_EDIT_REASON` (same file): the edit changed nothing the scan reads. */
+const UNREAD_EDIT = "the edit changed nothing the scan reads";
 
 function readsNothing(result: CheckResult): boolean {
-  return !answersTheEdit(result) && result.recheck?.reason === UNREAD_FILE;
+  const reason = result.recheck?.reason;
+  return !answersTheEdit(result) && reason !== undefined && reason !== null && (reason === UNREAD_FILE || reason.startsWith(UNREAD_EDIT));
 }
 
 /** The `--wait-s <n>` (or `--wait-s=<n>`) in an argument list, else the default. */

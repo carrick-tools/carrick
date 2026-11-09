@@ -27,7 +27,7 @@ import { checkedSinceLastEdit } from "../src/hook/checked.ts";
 import { lateContext } from "../src/hook/late.ts";
 import { recordEdit } from "../src/hook/reuse.ts";
 import { sessionCoverage } from "../src/hook/stop-wait.ts";
-import { parseCheckResult } from "../src/contract.ts";
+import { parseChangedResult, parseCheckResult } from "../src/contract.ts";
 import { fakeBin, fakeEnv, fixturePath } from "./helpers.ts";
 
 function scratch() {
@@ -252,9 +252,16 @@ test("a changed entry runs after every per-file entry, one per session and root,
     assert.equal(changed.kind, "changed");
     assert.equal(changed.changed?.exit, 0);
     const line = lateContext(changed, false, checkedSinceLastEdit("s1", s.root, s.home));
-    assert.equal(
-      line,
-      "Carrick ran `carrick check --changed` for this session's change: no contract problem in 2 changed files.",
+    assert.equal(line, null, "a finished check --changed with exit 0 delivers nothing");
+    // Exit 2 (could not check) and a run that gave no answer are silent too; exit 1 speaks.
+    const exit = (code: number) => ({ ...changed, changed: { ...changed.changed!, exit: code, not_checked: "no usable type" } });
+    assert.equal(lateContext(exit(2), false), null);
+    assert.equal(lateContext({ ...changed, changed: undefined, state: "stopped", failure: "it stopped" }, false), null);
+    assert.equal(lateContext({ ...changed, changed: undefined, state: "answered" }, false), null);
+    const problem = parseChangedResult(fs.readFileSync(fixturePath("check-changed-problem.json"), "utf8"), 1)!;
+    assert.match(
+      lateContext({ ...changed, changed: problem }, false) ?? "",
+      /^Carrick ran `carrick check --changed` for this session's change: 1 contract problem in 1 changed file\.\n- /,
     );
     // The binary's marker (exit 0, begun after the edit) settles later lines.
     assert.equal(checkedSinceLastEdit("s1", s.root, s.home), true);

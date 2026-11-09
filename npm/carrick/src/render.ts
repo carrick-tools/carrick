@@ -481,7 +481,7 @@ export function notFinishedLine(gaps: ReadonlyArray<{ file: string; reason: stri
   return `Carrick could not finish checking this session's change in time: ${named}. Run \`carrick check --changed\` to see the answer.`;
 }
 
-/** What a background `check --changed` answered, for the next carrier. */
+/** What a background `check --changed` found: its problem lines, or "" when it found none. */
 export function changedLines(changed: ChangedResult): string {
   const head = "Carrick ran `carrick check --changed` for this session's change";
   const files = `${changed.files} changed ${changed.files === 1 ? "file" : "files"}`;
@@ -500,22 +500,9 @@ export function changedLines(changed: ChangedResult): string {
     }
     return lines.join("\n");
   }
-  if (changed.exit === 0) {
-    const tail =
-      changed.routes + changed.calls === 0
-        ? `no route or call in ${files}`
-        : changed.type_checked > 0
-          ? `no contract problem in ${files}`
-          : `no contract problem found in ${files}`;
-    return `${head}: ${tail}.`;
-  }
-  const why = changed.not_checked ?? "the matched routes and calls in it had no usable type on both sides, or the index was written by another carrick version";
-  return `${head}: it could not check the change (${why.replace(/\.+$/, "")}).`;
-}
-
-/** The line for a background `check --changed` that gave no answer. */
-export function changedFailedLine(reason: string): string {
-  return `Carrick could not check the whole change: the background \`carrick check --changed\` gave no answer (${reason.replace(/\.+$/, "")}).`;
+  // Exit 0 (clean), exit 2 (could not check) and a run that gave no answer say
+  // nothing: only a problem is worth the agent's attention (hook-wording audit T3).
+  return "";
 }
 
 function deletedLine(result: CheckResult, where: string): string {
