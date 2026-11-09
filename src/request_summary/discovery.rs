@@ -127,7 +127,7 @@ const OF_IMPLEMENTATIONS: Plural = Plural {
 };
 
 /// The hop a walk records where it enters a function through a value.
-use super::decided_sites::{BoundCall, VALUE_HOP};
+use super::decided_sites::{BoundCall, HopMaker, VALUE_HOP};
 
 /// One discovered site, or one walk that entered code and stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +196,9 @@ pub struct ChainHop {
     pub function: String,
     pub file: String,
     pub line: u32,
+    /// See [`super::decided_sites::ChainHop::made`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub made: Option<HopMaker>,
 }
 
 /// The sites of a service, sorted, and how the walks ended, for the census.
@@ -1297,6 +1300,7 @@ impl<'a> Walker<'a> {
             function: key.to_string(),
             file: self.rel(file),
             line,
+            made: None,
         }
     }
 
@@ -1988,6 +1992,7 @@ impl<'a> Walker<'a> {
                         .site
                         .as_ref()
                         .map_or(call.site.line, |site| site.line),
+                    made: None,
                 };
                 let inner = self.body(file, callback);
                 let mut inner = self.lifted(inner).under(written);
@@ -2581,6 +2586,11 @@ impl<'a> Follow<'a> for Walker<'a> {
             function: VALUE_HOP.to_string(),
             file: self.rel(file),
             line,
+            made: maker.map(|maker| HopMaker {
+                file: self.rel(maker.call.file),
+                span_start: maker.call.call.site.span_start,
+                span_end: maker.call.call.site.span_end,
+            }),
         };
         let inner = self.body(file, function);
         self.bind(inner, invoke, Some((file, function)), maker)
@@ -3027,6 +3037,71 @@ mod tests {
             at("n1/cache.ts", 19).iter().all(|site| site.end.is_none()),
             "a client that sends nothing has no end"
         );
+    }
+
+    /// carrick#2448 T2: the method a maker call binds. `get` and `post` of
+    /// the client are `makeMethodFn('GET')` and `makeMethodFn('POST')`; the
+    /// arrow they return reads `method` from its factory, so the site's method
+    /// is what the maker call passes. The answer key is
+    /// `tests/fixtures/generated-client/README.md`.
+    #[test]
+    fn a_method_a_maker_call_binds_is_the_sites_method() {
+        use super::super::decided_sites::{MethodValue, SiteLabel, decided_sites};
+        let Some(on) = walked("generated-client", "", "", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let decided = decided_sites(
+            &on.inputs,
+            &on.repo,
+            &discovered,
+            &SiteLabel::from_exports(&answer.exports),
+        );
+        for (line, method) in [(5, "GET"), (8, "POST")] {
+            let at: Vec<_> = decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("r2/sdk.ts") && site.line == line)
+                .collect();
+            let [site] = at[..] else {
+                panic!(
+                    "a decided site at r2/sdk.ts:{line}: {:?} {:?}",
+                    decided
+                        .sites
+                        .iter()
+                        .map(|s| (&s.file, s.line))
+                        .collect::<Vec<_>>(),
+                    discovery
+                        .sites
+                        .iter()
+                        .map(|s| (&s.file, s.line, &s.stop))
+                        .collect::<Vec<_>>()
+                );
+            };
+            assert_eq!(
+                site.method,
+                Some(MethodValue::Pieces(vec![Piece::Lit(method.to_string())])),
+                "r2/sdk.ts:{line}"
+            );
+            // The URL goes through `{ ...options, method }` to the send.
+            assert_eq!(
+                site.name,
+                vec![Piece::Lit("/r2/items".to_string())],
+                "r2/sdk.ts:{line}"
+            );
+        }
     }
 
     /// carrick#2448 T1, soundness rule 2.3.3 across modules: the object a
