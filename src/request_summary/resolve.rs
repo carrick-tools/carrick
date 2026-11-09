@@ -1204,12 +1204,10 @@ fn name_holds(ident: &Ident, scope: &Scope<'_>) -> Holds {
     }
     let module = &scope.module;
     let declared = module.imports.contains(name)
-        // A dropped `const` reads as declared by name, as before; a dropped
-        // import only at a use that names no declaration below (carrick#3559).
         || module
             .dropped
             .get(name)
-            .is_some_and(|dropped| !dropped.import || module.declared_below.binding_count(&key) == 0)
+            .is_some_and(|dropped| !dropped.import)
         || module.destructured.contains(name)
         || module.consts.contains_key(&key)
         // A module `let` (carrick#3489 W5) other than a lazy client a getter
