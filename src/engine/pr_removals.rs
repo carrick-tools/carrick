@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::agents::file_analyzer_agent::ResolutionSource;
 use crate::analyzer::{CrossRepoMatch, location_file};
@@ -155,28 +155,6 @@ impl Removals {
 struct Removed<R> {
     rows: Vec<R>,
     places: Vec<Place>,
-    /// `service method path`, for the debug line naming the key.
-    label: String,
-    /// The head holds the key only as a documentation (descriptor) row.
-    head_documentation_only: bool,
-}
-
-/// How many removed keys the debug lines name.
-const KEY_LINES_CAP: usize = 200;
-
-/// The debug line for one removed key: the key, whether the PR's diff placed
-/// it, and for one not placed, whether the head holds it only as a
-/// documentation row.
-fn removed_key_line(what: &str, label: &str, placed: bool, documentation_only: bool) -> String {
-    if placed {
-        format!("Removed {what} key: {label} placed")
-    } else if documentation_only {
-        format!(
-            "Removed {what} key: {label} not placed (head holds it only as a documentation row)"
-        )
-    } else {
-        format!("Removed {what} key: {label} not placed")
-    }
 }
 
 trait Placeable {
@@ -238,17 +216,6 @@ fn place<R: Placeable>(
                 listed.len(),
                 removed.len() - listed.len()
             );
-            for (index, removal) in removed.iter().take(KEY_LINES_CAP).enumerate() {
-                debug!(
-                    "{}",
-                    removed_key_line(
-                        what,
-                        &removal.label,
-                        listed.contains(&index),
-                        removal.head_documentation_only,
-                    )
-                );
-            }
             for (index, removal) in removed.iter_mut().enumerate() {
                 for row in &mut removal.rows {
                     row.set_placed(listed.contains(&index));
@@ -266,30 +233,14 @@ fn removed_operations(
     main_self: &[CloudRepoData],
     current: &[CloudRepoData],
 ) -> Vec<Removed<RemovedOperation>> {
-    let is_documentation = |row: &crate::analyzer::ApiEndpointDetails| {
-        crate::agents::FileOrchestrator::is_documentation_route(
-            row.resolution_source,
-            row.handler_name.as_deref(),
-        )
-    };
-    let keys_of = |handlers_only: bool| -> HashSet<ServiceEndpointKey> {
-        current
-            .iter()
-            .flat_map(|data| {
-                data.endpoints
-                    .iter()
-                    .filter(move |row| !(handlers_only && is_documentation(row)))
-                    .map(|row| (data.service_name.clone(), delta_identity(&row.key)))
-            })
-            .collect()
-    };
-    let current_keys = keys_of(false);
-    // A documentation row keeps the operation it states alive only for a row
-    // that documentation alone ever stated: a main row with a real handler
-    // is removed when no current row with a real handler shares its key, so
-    // a renamed path its documentation still states is seen to go (carrick#3252;
-    // `check --changed` reads the same rule).
-    let current_handler_keys = keys_of(true);
+    let current_keys: HashSet<ServiceEndpointKey> = current
+        .iter()
+        .flat_map(|data| {
+            data.endpoints
+                .iter()
+                .map(|row| (data.service_name.clone(), delta_identity(&row.key)))
+        })
+        .collect();
     // Main's spelling of each key, as the delta keeps it, beside each row.
     let mut spelled: HashMap<ServiceEndpointKey, DeltaRow> = HashMap::new();
     let mut rows: HashMap<ServiceEndpointKey, Vec<(String, String, Option<ResolutionSource>)>> =
@@ -297,12 +248,7 @@ fn removed_operations(
     for repo in main_self {
         for row in &repo.endpoints {
             let id = (repo.service_name.clone(), delta_identity(&row.key));
-            let still_there = if is_documentation(row) {
-                &current_keys
-            } else {
-                &current_handler_keys
-            };
-            if still_there.contains(&id) {
+            if current_keys.contains(&id) {
                 continue;
             }
             keep_first_spelling(&mut spelled, &repo.service_name, row, &repo.commit_hash);
@@ -319,14 +265,6 @@ fn removed_operations(
             let (method, path) = spelled[&id].key.display_labels();
             let key = operation_identity(&id.1);
             Removed {
-                label: format!(
-                    "{} {} {}",
-                    rows.first().map(|(s, _, _)| s.as_str()).unwrap_or(""),
-                    method,
-                    path
-                ),
-                head_documentation_only: current_keys.contains(&id)
-                    && !current_handler_keys.contains(&id),
                 places: rows
                     .iter()
                     .map(|(_, place, _)| Place::parse(&id.0, place))
@@ -397,13 +335,6 @@ fn removed_sends(
             let removal = by_key.entry(id.clone()).or_insert_with(|| Removed {
                 rows: Vec::new(),
                 places: Vec::new(),
-                label: format!(
-                    "{} {} {}",
-                    service_id(&repo.service_name, &repo.repo_name),
-                    method,
-                    path
-                ),
-                head_documentation_only: false,
             });
             removal
                 .places
@@ -483,24 +414,6 @@ mod tests {
         }
     }
 
-    /// The debug line names the key and its verdict; a key not placed says
-    /// whether the head holds it only as a documentation row.
-    #[test]
-    fn a_removed_key_line_names_the_key_and_its_placing() {
-        assert_eq!(
-            removed_key_line("operation", "orders GET /orders/:id", true, false),
-            "Removed operation key: orders GET /orders/:id placed"
-        );
-        assert_eq!(
-            removed_key_line("operation", "orders GET /orders/:id", false, false),
-            "Removed operation key: orders GET /orders/:id not placed"
-        );
-        assert_eq!(
-            removed_key_line("operation", "orders GET /orders/:id", false, true),
-            "Removed operation key: orders GET /orders/:id not placed (head holds it only as a documentation row)"
-        );
-    }
-
     /// A pairing's producer is keyed as a removal of its route is, whatever
     /// the route's parameters are called, and its consumer by file alone.
     #[test]
@@ -527,156 +440,5 @@ mod tests {
         let mut edge = http_edge("/orders/:orderId", "src/checkout.ts:4");
         edge.relationship = carrick_match::MatchRelationship::SharedExternalContract;
         assert!(main_pairings(&[edge]).is_empty());
-    }
-
-    // carrick#3252: a handler renamed to a new path while a documentation row
-    // still states the old one. The shapes mirror
-    // tests/fixtures/documented-route-moved (the same pair `check --changed`
-    // reads), as index rows, because this list compares two indexes.
-
-    fn route(
-        method: &str,
-        path: &str,
-        file: &str,
-        documentation: bool,
-    ) -> crate::analyzer::ApiEndpointDetails {
-        crate::analyzer::ApiEndpointDetails {
-            view_module: false,
-            owner: None,
-            key: OperationKey::http(method, path.to_string()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: Some(if documentation {
-                "__route_descriptor__".to_string()
-            } else {
-                "getWidget".to_string()
-            }),
-            request_type: None,
-            response_type: None,
-            file_path: std::path::PathBuf::from(file),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: documentation.then_some(ResolutionSource::DescriptorRoute),
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
-        }
-    }
-
-    fn repo(endpoints: Vec<crate::analyzer::ApiEndpointDetails>) -> CloudRepoData {
-        CloudRepoData {
-            repo_name: "widgets".to_string(),
-            service_name: Some("widgets".to_string()),
-            endpoints,
-            calls: vec![],
-            mounts: vec![],
-            apps: HashMap::new(),
-            imported_handlers: vec![],
-            function_definitions: HashMap::new(),
-            config_json: None,
-            package_json: None,
-            packages: None,
-            last_updated: chrono::Utc::now(),
-            commit_hash: "abc123".to_string(),
-            dirty: None,
-            mount_graph: None,
-            bundled_types: None,
-            type_manifest: None,
-            file_results: None,
-            cached_detection: None,
-            cached_guidance: None,
-            cached_extraction_config: None,
-            package_json_hash: None,
-            cache_version: None,
-            type_extraction_status: None,
-            types_degraded: None,
-            compat_verdicts: None,
-            capture_stub: None,
-            external_call_candidates: None,
-            sdk_surface: None,
-            sdk_edges: None,
-            sdk_unresolved: None,
-            scanner_version: None,
-            scanner_build: None,
-            boundary: None,
-            dispatch_tables: None,
-            possible_calls: None,
-            possible_calls_omitted: None,
-            call_through: None,
-            route_boundaries: None,
-            memory_peaks: None,
-            unfollowed_member_calls: Vec::new(),
-            unfollowed_member_calls_total: 0,
-            type_reach: None,
-            pair_outcomes: None,
-        }
-    }
-
-    fn removed_paths(removed: &[Removed<RemovedOperation>]) -> Vec<String> {
-        removed
-            .iter()
-            .flat_map(|r| r.rows.iter().map(|row| row.path.clone()))
-            .collect()
-    }
-
-    /// The handler moved to a new path; the documentation row still states
-    /// the old one, in both indexes. The old path is removed.
-    #[test]
-    fn a_handler_path_only_documentation_still_states_is_removed() {
-        let main = [repo(vec![
-            route("GET", "/widgets/:id", "src/widgets.ts", false),
-            route("GET", "/widgets/:id", "src/openapi.ts", true),
-        ])];
-        let now = [repo(vec![
-            route("GET", "/items/:id", "src/widgets.ts", false),
-            route("GET", "/widgets/:id", "src/openapi.ts", true),
-        ])];
-        let removed = removed_operations(&main, &now);
-        assert_eq!(removed_paths(&removed), vec!["/widgets/:id".to_string()]);
-        assert_eq!(removed[0].rows[0].place, "src/widgets.ts");
-    }
-
-    /// Control: a real deletion, no documentation anywhere, is removed.
-    #[test]
-    fn a_deleted_handler_is_still_removed() {
-        let main = [repo(vec![route(
-            "GET",
-            "/widgets/:id",
-            "src/widgets.ts",
-            false,
-        )])];
-        let now = [repo(vec![])];
-        assert_eq!(
-            removed_paths(&removed_operations(&main, &now)),
-            vec!["/widgets/:id".to_string()]
-        );
-    }
-
-    /// Control: the same path served from another file is no removal.
-    #[test]
-    fn a_handler_moved_to_another_file_at_the_same_path_is_not_removed() {
-        let main = [repo(vec![
-            route("GET", "/widgets/:id", "src/widgets.ts", false),
-            route("GET", "/widgets/:id", "src/openapi.ts", true),
-        ])];
-        let now = [repo(vec![
-            route("GET", "/widgets/:id", "src/handlers.ts", false),
-            route("GET", "/widgets/:id", "src/openapi.ts", true),
-        ])];
-        assert!(removed_operations(&main, &now).is_empty());
-    }
-
-    /// Control: an operation only documentation ever stated, still stated, is
-    /// not removed.
-    #[test]
-    fn an_operation_only_documentation_stated_is_not_removed() {
-        let docs = || vec![route("GET", "/legacy", "src/openapi.ts", true)];
-        assert!(removed_operations(&[repo(docs())], &[repo(docs())]).is_empty());
     }
 }
