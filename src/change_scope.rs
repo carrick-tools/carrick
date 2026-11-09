@@ -4446,6 +4446,255 @@ mod tests {
         );
     }
 
+    // --- carrick#3622: an added workspace package moves only the services
+    // that load it ---
+
+    /// Rewrites the fixture's lockfile as JSON, whichever manager wrote it.
+    fn edit_lock(repo: &Path, manager: Manager, edit: impl FnOnce(&mut serde_json::Value)) {
+        let (name, yaml) = match manager {
+            Manager::Npm => ("package-lock.json", false),
+            Manager::Pnpm => ("pnpm-lock.yaml", true),
+        };
+        let path = repo.join(name);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lock: serde_json::Value = if yaml {
+            serde_yaml_ng::from_str(&text).unwrap()
+        } else {
+            serde_json::from_str(&text).unwrap()
+        };
+        edit(&mut lock);
+        let text = if yaml {
+            serde_yaml_ng::to_string(&lock).unwrap()
+        } else {
+            serde_json::to_string_pretty(&lock).unwrap()
+        };
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn edit_manifest(repo: &Path, manifest: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = repo.join(manifest);
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut json);
+        std::fs::write(path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    /// Adds the workspace package `@fixture/added` at `packages/added`, which
+    /// depends on `@fixture/shared`, and installs it in the lockfile as the
+    /// manager would. With `consumer`, that service's package declares it
+    /// and a file of it imports `specifier`.
+    fn add_workspace_package(repo: &Path, manager: Manager, consumer: Option<(&str, &str)>) {
+        std::fs::create_dir_all(repo.join("packages/added/src")).unwrap();
+        let spec = workspace_spec(manager);
+        std::fs::write(
+            repo.join("packages/added/package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "@fixture/added",
+                "version": "1.0.0",
+                "main": "src/a.ts",
+                "dependencies": { "@fixture/shared": spec },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("packages/added/src/a.ts"),
+            "import { x } from \"@fixture/shared\";\nexport const a = x;\n",
+        )
+        .unwrap();
+        edit_lock(repo, manager, |lock| match manager {
+            Manager::Npm => {
+                lock["packages"]["packages/added"] = serde_json::json!({
+                    "name": "@fixture/added",
+                    "version": "1.0.0",
+                    "dependencies": { "@fixture/shared": "*" },
+                });
+                lock["packages"]["node_modules/@fixture/added"] =
+                    serde_json::json!({ "resolved": "packages/added", "link": true });
+            }
+            Manager::Pnpm => {
+                lock["importers"]["packages/added"] = serde_json::json!({
+                    "dependencies": {
+                        "@fixture/shared": { "specifier": "workspace:*", "version": "link:../shared" },
+                    },
+                });
+            }
+        });
+        let Some((consumer, specifier)) = consumer else {
+            return;
+        };
+        edit_manifest(repo, &format!("{consumer}/package.json"), |manifest| {
+            manifest["dependencies"]["@fixture/added"] = serde_json::json!(spec);
+        });
+        edit_lock(repo, manager, |lock| match manager {
+            Manager::Npm => {
+                lock["packages"][consumer]["dependencies"]["@fixture/added"] =
+                    serde_json::json!("*");
+            }
+            Manager::Pnpm => {
+                lock["importers"][consumer]["dependencies"]["@fixture/added"] = serde_json::json!({
+                    "specifier": "workspace:*",
+                    "version": "link:../../packages/added",
+                });
+            }
+        });
+        std::fs::write(
+            repo.join(format!("{consumer}/src/added.ts")),
+            format!("import {{ a }} from \"{specifier}\";\nexport const added = a;\n"),
+        )
+        .unwrap();
+    }
+
+    /// Each service's plan reason and whether its reading moved, after a
+    /// commit that `change` makes on the dependency fixture.
+    fn after_change(
+        manager: Manager,
+        change: impl FnOnce(&Path),
+    ) -> (Vec<Option<Reason>>, Vec<bool>) {
+        let (repo, base, services) = dependency_workspace(manager);
+        after_change_from(&repo, &base, &services, change)
+    }
+
+    fn after_change_from(
+        repo: &tempfile::TempDir,
+        base: &str,
+        services: &[Config],
+        change: impl FnOnce(&Path),
+    ) -> (Vec<Option<Reason>>, Vec<bool>) {
+        let blobs = stored_at(services, base);
+        change(repo.path());
+        commit_all(repo.path(), "change");
+        let scopes = scopes_of(repo.path(), services, &blobs, &names_of(services));
+        let path = repo.path().to_string_lossy().to_string();
+        let changes = ChangedSince::new(&path, services, &[]);
+        let moved = reading_moved_since(&path, services, &changes, base);
+        (reasons(&scopes), moved)
+    }
+
+    /// The fixture's services, in order: api, web, worker. `worker` imports
+    /// the added package; its own dependency on `@fixture/shared`, which
+    /// `worker` also loads, moves nothing.
+    #[test]
+    fn an_added_workspace_package_reaches_only_the_services_that_load_it() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (reasons, moved) = after_change(manager, |repo| {
+                add_workspace_package(repo, manager, Some(("apps/worker", "@fixture/added")))
+            });
+            assert_eq!(
+                reasons,
+                [None, None, Some(Reason::InputsChanged)],
+                "{moved:?}"
+            );
+            assert_eq!(moved, [false, false, true]);
+        }
+    }
+
+    #[test]
+    fn an_added_workspace_package_nothing_loads_moves_no_service() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (reasons, moved) =
+                after_change(manager, |repo| add_workspace_package(repo, manager, None));
+            assert_eq!(reasons, [None, None, None]);
+            assert_eq!(moved, [false, false, false]);
+        }
+    }
+
+    /// The import names a file the added package does not hold, so the walk
+    /// does not enter its directory: the specifier alone reaches it.
+    #[test]
+    fn an_added_workspace_name_reaches_through_the_loaded_walk() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (reasons, moved) = after_change(manager, |repo| {
+                add_workspace_package(
+                    repo,
+                    manager,
+                    Some(("apps/worker", "@fixture/added/missing")),
+                )
+            });
+            assert_eq!(
+                reasons,
+                [None, None, Some(Reason::InputsChanged)],
+                "{moved:?}"
+            );
+            assert_eq!(moved, [false, false, true]);
+        }
+    }
+
+    /// A package added under a directory no workspace glob covers changes an
+    /// install this rule does not read.
+    #[test]
+    fn an_added_manifest_outside_the_workspace_analyses_every_service() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (reasons, moved) = after_change(manager, |repo| {
+                std::fs::create_dir_all(repo.join("tools/gen")).unwrap();
+                std::fs::write(
+                    repo.join("tools/gen/package.json"),
+                    r#"{ "name": "@fixture/gen", "version": "1.0.0" }"#,
+                )
+                .unwrap();
+                edit_lock(repo, manager, |lock| match manager {
+                    Manager::Npm => {
+                        lock["packages"]["tools/gen"] =
+                            serde_json::json!({ "name": "@fixture/gen", "version": "1.0.0" });
+                    }
+                    Manager::Pnpm => lock["importers"]["tools/gen"] = serde_json::json!({}),
+                });
+            });
+            assert_eq!(reasons, [Some(Reason::RepoInputChanged); 3]);
+            assert_eq!(moved, [true, true, true]);
+        }
+    }
+
+    #[test]
+    fn an_added_lockfile_importer_without_its_manifest_analyses_every_service() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (reasons, moved) = after_change(manager, |repo| {
+                add_workspace_package(repo, manager, None);
+                std::fs::remove_file(repo.join("packages/added/package.json")).unwrap();
+            });
+            assert_eq!(reasons, [Some(Reason::RepoInputChanged); 3]);
+            assert_eq!(moved, [true, true, true]);
+        }
+    }
+
+    #[test]
+    fn an_added_workspace_package_beside_a_workspace_list_edit_analyses_every_service() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (reasons, moved) = after_change(manager, |repo| {
+                add_workspace_package(repo, manager, None);
+                match manager {
+                    Manager::Npm => edit_manifest(repo, "package.json", |manifest| {
+                        manifest["workspaces"] =
+                            serde_json::json!(["apps/*", "packages/*", "tools/*"]);
+                    }),
+                    Manager::Pnpm => std::fs::write(
+                        repo.join("pnpm-workspace.yaml"),
+                        "packages:\n  - 'apps/*'\n  - 'packages/*'\n  - 'tools/*'\n",
+                    )
+                    .unwrap(),
+                }
+            });
+            assert_eq!(reasons, [Some(Reason::RepoInputChanged); 3]);
+            assert_eq!(moved, [true, true, true]);
+        }
+    }
+
+    #[test]
+    fn a_deleted_workspace_package_analyses_every_service() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (repo, _, services) = dependency_workspace(manager);
+            add_workspace_package(repo.path(), manager, None);
+            let base = commit_all(repo.path(), "added");
+            let (reasons, moved) = after_change_from(&repo, &base, &services, |repo| {
+                std::fs::remove_dir_all(repo.join("packages/added")).unwrap();
+                let versions = first_versions();
+                write_dependencies(repo, manager, &versions, &versions);
+            });
+            assert_eq!(reasons, [Some(Reason::RepoInputChanged); 3]);
+            assert_eq!(moved, [true, true, true]);
+        }
+    }
+
     /// A blobless clone with no remote holds the commit's tree but not its
     /// copy of the lockfile, so nothing says what moved.
     #[test]
