@@ -251,6 +251,7 @@ impl Reader<'_> {
     pub(super) fn ctor_origins(
         &self,
         ctor: &Constructor,
+        class: u32,
         module: &ModuleScope,
     ) -> (HashMap<String, FieldOrigin>, ParamDefaults) {
         let module_scope = Scope::module(module);
@@ -340,7 +341,14 @@ impl Reader<'_> {
             pats.push(pat);
         }
 
+        // `this.g` in the constructor is the class's field, as in any
+        // member (carrick#3504 S4c).
+        let table = ClassFields {
+            class,
+            ..ClassFields::default()
+        };
         let mut scope = Scope::module(module);
+        scope.fields = Some(&table);
         scope.read_params(pats.iter(), ctor, module, &HashSet::new());
         let read = self.param_values(pats.iter(), &scope);
         scope.held.extend(read.held);

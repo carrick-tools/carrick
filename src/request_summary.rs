@@ -1255,6 +1255,10 @@ struct FnIr {
     /// the message-role field rule (carrick#1665). Taken out by the class
     /// that reads them ([`library_sites::take_field_writes`]).
     field_writes: Vec<FieldWriteIr>,
+    /// Each write `this.<field> = value` an instance member makes, with
+    /// what the value may hold: the class's field reader takes them out
+    /// (carrick#3504 S4c, [`library_sites::take_field_values`]).
+    field_values: Vec<resolve::FieldWrite>,
     /// Each plain assignment of a name written directly in this body, with
     /// what the value may hold read in its scope: a module binding's writes
     /// the value resolver reads (carrick#3504 S1).
@@ -5384,6 +5388,9 @@ impl Reader<'_> {
         // (carrick#1665): the initialisers' and the constructor's here, each
         // member's as it is read.
         let mut field_writes = self.initialiser_and_constructor_writes(class, &fields, module);
+        // Every value written to a field of an instance (carrick#3504 S4c):
+        // the initialisers' here, each member's as it is read.
+        let mut placed = self.initialiser_values(class, &fields, module);
         for member in &class.body {
             match member {
                 ClassMember::Method(method) if !matches!(method.kind, MethodKind::Setter) => {
@@ -5400,6 +5407,7 @@ impl Reader<'_> {
                         &mut ir,
                     );
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
+                    library_sites::take_field_values(&mut ir, false, &mut placed);
                     if method.kind == MethodKind::Getter && !method.is_static {
                         file.class_getters.insert(
                             (fields.class, member_name.clone()),
@@ -5423,6 +5431,7 @@ impl Reader<'_> {
                         &mut ir,
                     );
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
+                    library_sites::take_field_values(&mut ir, false, &mut placed);
                     if method.kind == MethodKind::Getter && !method.is_static {
                         file.class_getters.insert(
                             (fields.class, member_name.clone()),
@@ -5476,6 +5485,7 @@ impl Reader<'_> {
                         };
                         let mut ir = self.function(&function, table(false), module, &none);
                         library_sites::take_field_writes(&mut ir, &mut Vec::new());
+                        library_sites::take_field_values(&mut ir, true, &mut placed);
                         ir.constructor = true;
                         let constructor = format!("{name}.constructor");
                         let mut lines: Vec<u32> = class
@@ -5511,12 +5521,19 @@ impl Reader<'_> {
                         _ => continue,
                     };
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
+                    library_sites::take_field_values(&mut ir, false, &mut placed);
                     file.functions
                         .insert(key(&member_name, prop.is_static), in_class(ir));
                 }
                 _ => {}
             }
         }
+        library_sites::place_field_values(
+            &ident_key(ident),
+            &module.class_this,
+            placed,
+            &mut fields.origins,
+        );
         let receivers =
             library_sites::field_receivers(&ident_key(ident), &module.class_this, field_writes);
         for (field, client) in receivers {
@@ -5733,7 +5750,7 @@ impl Reader<'_> {
                     }
                 }
                 ClassMember::Constructor(ctor) => {
-                    (origins, ctor_defaults) = self.ctor_origins(ctor, module);
+                    (origins, ctor_defaults) = self.ctor_origins(ctor, class.span.lo.0, module);
                     let mut scope = Scope::module(module);
                     let mut fetch_params: HashSet<BindingKey> = HashSet::new();
                     for (position, param) in ctor.params.iter().enumerate() {
@@ -8143,6 +8160,25 @@ impl Visit for CallWalker<'_, '_, '_> {
     fn visit_assign_expr(&mut self, assign: &AssignExpr) {
         if let Some(write) = self.reader.field_write(assign, self.scope) {
             self.ir.field_writes.push(write);
+        }
+        // `this.f = value` in an instance member: a write the class's field
+        // reads (carrick#3504 S4c).
+        if self.scope.fields.is_some()
+            && resolve::is_placed_assign(assign.op)
+            && let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left
+            && matches!(
+                crate::graphql_document_sites::unwrap_expression(&member.obj),
+                Expr::This(_)
+            )
+            && let Some(field) = this_field(member)
+        {
+            self.ir.field_values.push(resolve::FieldWrite {
+                field,
+                at: assign.span.lo.0,
+                values: self
+                    .reader
+                    .value_of(&assign.right, self.scope, &guards::Bound::default()),
+            });
         }
         // `name = value`, `name ??= value`, `name ||= value`: a write the
         // value resolver reads for a module binding (carrick#3504 S1, S2b-4).
