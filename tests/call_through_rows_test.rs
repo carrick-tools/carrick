@@ -1238,12 +1238,13 @@ fn a_boundary_call_inside_a_wrapper_states_nothing() {
 #[test]
 fn a_call_inside_a_call_whose_row_states_its_request_states_no_second_row() {
     // The model states `GET /api/v1/status` at `Promise.all(` on line 7; the
-    // call into the client is on line 8, inside it.
+    // call into the client is on line 8, inside it. The request's row is the
+    // call's, not the array's (carrick#3640).
+    assert_eq!(rows_in(blobs(), "cli", NESTED, 7), []);
     assert_eq!(
-        rows_in(blobs(), "cli", NESTED, 7),
-        [as_stated("GET", "/api/v1/status", "/api/v1/status")]
+        rows_in(blobs(), "cli", NESTED, 8),
+        [corrected("GET", "/api/v1/status", 23)]
     );
-    assert_eq!(rows_in(blobs(), "cli", NESTED, 8), []);
 }
 
 /// Two calls on one line that reach one operation state one row.

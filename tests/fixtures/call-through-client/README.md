@@ -133,7 +133,7 @@ it, and `apps/web/src/page.tsx` with `badge.tsx`:
 
 | Site | Rows |
 |---|---|
-| `nested.ts:7`, `:8` | the model states `GET /api/v1/status` at `Promise.all(` (line 7); the call into the client inside it (line 8) is that row's call and states none |
+| `nested.ts:7`, `:8` | none at `Promise.all(` (line 7): the model's row there has the leaf's operation exactly, and the call into the client inside it (line 8) states the request (carrick#3640; #2698's key held the row at line 7) |
 | `nested.ts:16` | one `GET /api/v1/status` row: two functions called on one line reach the one operation |
 | `nested.ts:21` | none: `loadPair` reaches two operations |
 | `nested.ts:27` | none: `localPing` reaches a request the CLI writes itself (`local-fetch.ts:5`) |
