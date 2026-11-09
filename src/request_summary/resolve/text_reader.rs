@@ -142,7 +142,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// `part` read as exactly one text, else why not.
-    fn one_text(
+    pub(in crate::request_summary) fn one_text(
         &self,
         file: &Path,
         part: &ValueAt,

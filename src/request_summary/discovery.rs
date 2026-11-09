@@ -487,7 +487,11 @@ pub(crate) fn receiver_spans(callee: &Expr) -> Vec<(u32, u32, bool)> {
 fn root_name(call: &CallIr) -> Option<&str> {
     match call.receiver_spans.last() {
         None => Some(call.callee_text.as_str()),
-        Some((_, _, false)) => call.callee_text.split(['.', '?']).next().map(str::trim),
+        Some((_, _, false)) => call
+            .callee_text
+            .split(['.', '?', '['])
+            .next()
+            .map(str::trim),
         Some(_) => None,
     }
     .filter(|root| super::row_calls::is_identifier(root))
@@ -1371,6 +1375,18 @@ impl<'a> Walker<'a> {
         receiver_at(self.inputs, file, call)
     }
 
+    /// The member a call reads through a computed key the code states as
+    /// one text (`lib[k](…)`, `const k = "post"`): the compiler's row names
+    /// the key, so the text is the member (carrick#3504 S4b).
+    fn keyed_member(&self, file: &Path, call: &CallIr) -> Option<String> {
+        match call.callee_key.as_ref()? {
+            ValueAt::KeyOf { key, .. } if !matches!(**key, ValueAt::Lit(_)) => {
+                self.values.one_text(file, key).ok().map(|(text, _)| text)
+            }
+            _ => None,
+        }
+    }
+
     /// The labelled export `call` is made on, when it is one, and how it
     /// was matched:
     ///
@@ -1394,8 +1410,14 @@ impl<'a> Walker<'a> {
         construction: bool,
     ) -> Option<(SiteEnd, ReachedBy)> {
         let row = self.row(file, call)?;
-        let symbol = row.symbol()?;
-        if in_repo(row) {
+        // `lib[k](…)`: the compiler's row names the key `k`, not the member,
+        // so the member is the text the key states (carrick#3504 S4b).
+        let keyed = self.keyed_member(file, call);
+        let symbol = match keyed.as_deref() {
+            Some(member) => member,
+            None => row.symbol()?,
+        };
+        if in_repo(row) && keyed.is_none() {
             return None;
         }
         let invoke = Invoke {
@@ -1407,7 +1429,12 @@ impl<'a> Walker<'a> {
         let end = |package: &str, export: &str, member: Option<&str>, claims: &ExportClaims| {
             self.end_at(invoke, package, export, member, claims)
         };
-        let packages = store_keys(row, self.labels.exports);
+        // A keyed member has no declaration of its own to name a package.
+        let packages = if keyed.is_none() {
+            store_keys(row, self.labels.exports)
+        } else {
+            Vec::new()
+        };
         for package in &packages {
             for export in published_names(row) {
                 if let Some(claims) = self.labels.get(package, export) {
@@ -1437,6 +1464,9 @@ impl<'a> Walker<'a> {
                     }
                 }
             }
+        }
+        if keyed.is_some() {
+            return None;
         }
         // `fetch(…)`, `new WebSocket(…)`: a name no binding of the file
         // holds, declared by the language's own library or the runtime's
@@ -1847,21 +1877,26 @@ impl<'a> Walker<'a> {
             return Outcome::stopped(INJECTED_CALLEE);
         }
         let reach = self.reach(file, call);
+        // A member of an object the compiler declares in the repository and
+        // no body implements, or one whose entry names no definition of its
+        // file (`{ a: send }`): the function written at that key of each
+        // object the callee's object may hold (carrick#2448, #3504 S4b).
+        // Read before the module binding the row names, which for `d[k]()`
+        // is the key's, not the callee's.
+        if matches!(
+            reach,
+            Reach::NoFunction | Reach::Unknown(HoleReason::UnreadExpression)
+        ) && !construction
+            && let Some(values) = self.key_callee(file, call, invoke)
+        {
+            return self.agree(values, invoke, Vec::new(), OF_VALUES);
+        }
         // A callee the compiler declares as a module binding (`const s =
         // send; s(…)`, a `let` written elsewhere): every value written to it
         // (carrick#3504 S1).
         if reach == Reach::NoFunction
             && !construction
             && let Some(values) = self.binding_callee(file, call, invoke)
-        {
-            return self.agree(values, invoke, Vec::new(), OF_VALUES);
-        }
-        // A member of an object the compiler declares in the repository and
-        // no body implements: the function written at that key of each
-        // object the callee's object may hold (carrick#2448).
-        if reach == Reach::NoFunction
-            && !construction
-            && let Some(values) = self.key_callee(file, call, invoke)
         {
             return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
@@ -3530,6 +3565,55 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// carrick#3504 S4b (#3485 row 3): a callee read off an entry of an
+    /// object literal the module or function keeps (`d["a"]()`, `d[k]()` for
+    /// a `const` key, `d.a()`) is the value written at that key. An object
+    /// something writes through, an exported one and an open one keep the
+    /// call undecided. The answer key is
+    /// `tests/fixtures/callee-values/README.md`.
+    #[test]
+    fn a_callee_read_off_a_kept_objects_entry_is_that_entrys_value() {
+        let Some(discovery) = callee_values_discovery() else {
+            return;
+        };
+        let at = |file: &str, line: u32| recorded_at(&discovery, file, line);
+        let decided = ["site fetch".to_string()];
+        let wrong: Vec<String> = [
+            ("f-keyed.ts", 6, "a string-literal key"),
+            ("f-keyed-const.ts", 7, "a const key"),
+            ("f-entry-dot.ts", 6, "a dotted key"),
+            ("f-entry-method.ts", 10, "a method written in the object"),
+            ("f-local-keyed.ts", 5, "a function-local object"),
+            (
+                "f-keyed-exported.ts",
+                6,
+                "an exported object no importer writes",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(file, line, form)| {
+            let got = at(file, line);
+            (got != decided).then(|| format!("{file}:{line} ({form}): {got:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        for (file, line, form) in [
+            ("f-keyed-written.ts", 10, "an entry the module writes"),
+            (
+                "f-keyed-contested.ts",
+                6,
+                "an exported object an importer writes",
+            ),
+            ("f-keyed-spread.ts", 5, "an open object"),
+        ] {
+            assert_ne!(
+                at(file, line),
+                decided,
+                "{file}:{line} ({form}) is undecided"
+            );
+        }
+    }
+
     /// carrick#3504 S1 (#3485 rows 1-2): a callee held in a module `const`
     /// alias is the function the alias names, and one held in a module `let`
     /// is every value written to it, its initialiser and each assignment.
@@ -3598,8 +3682,11 @@ mod tests {
             ("m-extract.ts", 6, "site http"),
             ("m-bind-inline.ts", 4, "site http"),
             ("m-publish-bind.ts", 6, "site bus"),
-            // The own entry `deps.post` is an object entry read (S4b): the
-            // union stays undecided until it is read.
+            ("m-publish-keyed.ts", 7, "site bus"),
+            ("m-computed.ts", 6, "site http"),
+            ("m-keyed-arrow.ts", 6, "site http"),
+            // `deps.post` is a read, not a call: only a callee is read off
+            // an entry (S4b), so the union stays undecided.
             ("m-fallback.ts", 9, "several_values"),
             ("m-own-bind.ts", 10, "site http"),
         ]

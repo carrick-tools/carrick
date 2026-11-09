@@ -762,6 +762,13 @@
   "kind": "call",
   "source": "test262 (class)"
  },
+ "t-keyed-object": {
+  "carries": "target",
+  "expect": "/p/t-keyed-object",
+  "feature": "keyed read of an object literal entry (obj['key']())",
+  "kind": "call",
+  "source": "TS"
+ },
  "t-let-reassigned": {
   "carries": "target",
   "expect": "/p/t-let-reassigned",

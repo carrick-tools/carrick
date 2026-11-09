@@ -18,7 +18,10 @@ value; the op's name is read from that call's arguments.
 | `m-extract.ts` | 6 | `const post = http.post` | site, `http` |
 | `m-bind-inline.ts` | 4 | `http.post.bind(http)(…)` | site, `http` |
 | `m-publish-bind.ts` | 6 | `const pub = bus.publish.bind(bus)` | site, `bus` |
-| `m-fallback.ts` | 9 | `deps.post ?? http.post.bind(http)` | `several_values` (the own entry `deps.post` is not read yet: carrick#3504 S4b) |
+| `m-publish-keyed.ts` | 7 | `buses[k].publish(…)`, `buses = { main: bus }`, `const k = "main"` | site, `bus` |
+| `m-computed.ts` | 6 | `http[k](…)`, `const k = "post"` | site, `http` |
+| `m-keyed-arrow.ts` | 6 | `api["send"](…)`, `send` an arrow written in the object | site, `http` |
+| `m-fallback.ts` | 9 | `deps.post ?? http.post.bind(http)` | `several_values` (`deps.post` is a read, not a call: only a callee is read off an entry) |
 | `m-own-bind.ts` | 10 | `send.bind(null)`, `send` calls `http.post` | site, `http` (an own function, already followed) |
 
 ## The language's `call` and `apply` (carrick#3504 S4d)

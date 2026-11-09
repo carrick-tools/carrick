@@ -482,7 +482,7 @@
  "t-computed-member": {
   "feature": "computed member call (obj[key]())",
   "source": "ES5",
-  "status": "not_reached"
+  "status": "covered"
  },
  "t-const-alias": {
   "feature": "const alias of the client",
@@ -543,6 +543,11 @@
   "feature": "class extends (inherited method)",
   "source": "test262 (class)",
   "status": "covered"
+ },
+ "t-keyed-object": {
+  "feature": "keyed read of an object literal entry (obj['key']())",
+  "source": "TS",
+  "status": "lead"
  },
  "t-let-reassigned": {
   "feature": "let reassigned between two clients",
