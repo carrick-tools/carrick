@@ -3542,14 +3542,24 @@ mod tests {
 
     /// Discovery over `tests/fixtures/callee-values` with its one label.
     fn callee_values_discovery() -> Option<Discovery> {
-        let on = walked("callee-values", "services/web", "web", &[], true)?;
+        let (_, discovery) = fixture_discovery("callee-values")?;
+        Some(discovery)
+    }
+
+    /// Discovery over the `services/web` service of a fixture that carries
+    /// `library-claims.json`, with the walk it ran over.
+    fn fixture_discovery(fixture: &str) -> Option<(super::super::fixture_walk::Walked, Discovery)> {
+        let on = walked(fixture, "services/web", "web", &[], true)?;
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/callee-values/library-claims.json"),
+                .join("tests/fixtures")
+                .join(fixture)
+                .join("library-claims.json"),
         )
         .unwrap();
         let answer = crate::library_store::parse_answer(&text);
-        Some(discover(&on.inputs, &Labels::of_answer(&answer), &on.repo))
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        Some((on, discovery))
     }
 
     /// What the walk records at `file:line`: `site` for a call decided to
@@ -3687,6 +3697,31 @@ mod tests {
                 "{file}:{line} ({form}) is undecided"
             );
         }
+    }
+
+    /// carrick#3504 S4b-3a: an object a module keeps to itself is read
+    /// whatever the service's exports are. An import used only as a
+    /// shorthand property leaves the service open, which contests every
+    /// export; it does not contest a binding no other module can reach.
+    /// The answer key is `tests/fixtures/callee-open/README.md`.
+    #[test]
+    fn a_private_objects_entry_is_read_when_an_import_is_unread() {
+        let Some((on, discovery)) = fixture_discovery("callee-open") else {
+            return;
+        };
+        assert!(
+            on.inputs.links.as_ref().unwrap().open(),
+            "the fixture's service must be open for this test to mean anything"
+        );
+        assert_eq!(
+            recorded_at(&discovery, "f-keyed-open.ts", 6),
+            ["site fetch".to_string()]
+        );
+        assert_ne!(
+            recorded_at(&discovery, "f-keyed-exported-open.ts", 6),
+            ["site fetch".to_string()],
+            "an exported object stays contested in an open service"
+        );
     }
 
     /// carrick#3504 S1 (#3485 rows 1-2): a callee held in a module `const`
