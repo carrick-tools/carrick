@@ -6,36 +6,36 @@ Carrick ran `carrick check --changed` for this session's change: 1 contract prob
 - order-service/src/client.ts:14 call GET /users/:id: the response type does not match: email is missing (against user-service user-service/src/routes/users.ts:9).
 
 ### check-clean.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
+(silent)
 
 ### check-counterpart.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: 1 contract problem.
 - user-service/src/routes/users.ts:18:3 call GET /api/users/:id [fact, imported_member] type_mismatch: the response no longer carries `email`, which this call reads. Read off the client member this call goes through. Producers: user-service src/routes/users.ts:42
 
 ### check-deferred.json :: renderPostToolUse
-Carrick: user-service/src/routes/users.ts was not re-checked: this edit needs a re-scan, which this call was asked not to start. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.
+(silent)
 
 ### check-definition.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no contract problem.
+(silent)
 
 ### check-deleted.json :: renderPostToolUse
 Carrick: user-service/src/routes/users.ts is gone from disk and the index still holds 1 row(s) for it, with 1 counterpart(s) still on the other side.
 - user-service/src/routes/users.ts:42:3 route GET /api/users/:id [fact, file_based_route] producer_removed (no type verdict): the file is gone from disk and one consumer still calls this route. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18
 
 ### check-mismatch.json :: renderPostToolUse
-Carrick: user-service/src/routes/users.ts was not re-checked: no re-check of it ran. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.
+(silent)
 
 ### check-new-functions.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
+(silent)
 
 ### check-not-indexed.json :: renderPostToolUse
 (silent)
 
 ### check-pre-rendered-boundary.json :: renderPostToolUse
-Carrick: user-service/src/routes/users.ts was not re-checked: no re-check of it ran. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.
+(silent)
 
 ### check-silent.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
+(silent)
 
 ### check-types.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: 2 contract problems.
@@ -43,7 +43,6 @@ Carrick re-checked user-service/src/routes/users.ts after this edit: 2 contract 
 - user-service/src/routes/users.ts:71:5 call POST /api/users [fact, imported_member] request is { name: string }, producer at identity-service src/routes/users.ts:14 expects CreateUser { name: string; email: string }. Property 'email' is missing in type '{ name: string }'. Producers: identity-service src/routes/users.ts:14
 
 ### check-uses.json :: renderPostToolUse
-Carrick re-checked user-service/src/routes/users.ts after this edit: no route or call to check.
 Other files use what this file declares: `carrick check user-service/src/routes/users.ts` lists the 2 uses; open them if this edit changed a signature or a type.
 
 ### status-not-indexed.json :: renderSessionStart

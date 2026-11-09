@@ -309,11 +309,8 @@ test("a hook that is not the build that set the workspace up says so where the a
     // hook goes back to saying only what it found in the file.
     const second = run("hook", "post-edit");
     assert.doesNotMatch(second.stdout, /set this workspace up/, second.stdout);
-    // Every edit gets its own line, the not-re-checked ones included.
-    assert.match(
-      JSON.parse(second.stdout).hookSpecificOutput.additionalContext,
-      /^Carrick: src\/main\.ts was not re-checked: /,
-    );
+    // A gap is not a finding: the edit itself prints nothing.
+    assert.equal(second.stdout, "");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });

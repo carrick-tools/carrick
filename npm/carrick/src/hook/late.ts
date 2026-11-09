@@ -8,31 +8,24 @@
 // hooks print it once.
 
 import { createLogger } from "../log.ts";
-import { answersTheEdit, changedLines, notRecheckedLine, renderPostToolUse } from "../render.ts";
+import { answersTheEdit, changedLines, renderPostToolUse } from "../render.ts";
 import { claimDelivery, finishedFor, isChanged } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
-import { checkedSinceLastEdit } from "./checked.ts";
 import { markTold, toldKey, wasTold } from "./reuse.ts";
 
 const log = createLogger("carrick-late");
 
 /** The words for one finished answer, or null when there is nothing to say. */
-export function lateContext(answer: Answer, uses: boolean, settled = false): string | null {
+export function lateContext(answer: Answer, uses: boolean): string | null {
   // The whole-change check a Stop queued (carrick#3466) speaks only with a
   // problem: a clean run, a run that could not check and a run that gave no
   // answer print nothing (a failure is logged by `deliverLate`).
   if (isChanged(answer)) return answer.changed ? changedLines(answer.changed) || null : null;
-  if (!answer.result) {
-    // An internal failure is logged, never shown: the reader needs the next step.
-    const reason =
-      answer.state === "stopped" ? (answer.failure ?? "the background re-check stopped") : "the background re-check gave no answer";
-    return notRecheckedLine(answer.relative, reason, settled);
-  }
-  if (answer.result.error) return null;
-  if (!answersTheEdit(answer.result)) {
-    return notRecheckedLine(answer.relative, answer.result.recheck?.reason, settled);
-  }
-  return renderPostToolUse(answer.result, answer.relative, { uses, late: true, settled });
+  // A re-check that stopped, gave no answer or answered nothing prints
+  // nothing: a failure is logged by `deliverLate`, and the Stop hook names a
+  // file left unchecked.
+  if (!answer.result || answer.result.error || !answersTheEdit(answer.result)) return null;
+  return renderPostToolUse(answer.result, answer.relative, { uses, late: true });
 }
 
 /**
@@ -48,7 +41,7 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
       if (answer.failure) log("background re-check failed", answer.relative, answer.failure);
       const key = answer.result ? toldKey(answer.result, answer.relative) : null;
       const uses = key === null || !wasTold(session, key);
-      const context = lateContext(answer, uses, checkedSinceLastEdit(session, answer.root));
+      const context = lateContext(answer, uses);
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
       if (!context) continue;

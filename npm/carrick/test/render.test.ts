@@ -6,8 +6,6 @@ import {
   MAX_EDIT_LINE_CHARS,
   CHECK_BEFORE_DONE,
   answersTheEdit,
-  notRecheckedLine,
-  pendingLine,
   boundaryFor,
   boundaryLines,
   itemLine,
@@ -46,11 +44,7 @@ function connectedRows(count: number): CheckItem[] {
   }));
 }
 
-function expectedNotRechecked(reason?: string): string {
-  return `Carrick: src/routes/users.ts was not re-checked: ${reason ?? "no re-check of it ran"}. If this change touches a route, a call to another service, an event or a type another service reads, run \`carrick check --changed\` before you finish.`;
-}
-
-test("an edit the hook could not re-check lists none of the index's verdicts", () => {
+test("an edit the hook could not re-check prints nothing, and none of the index's verdicts", () => {
   const stale = fixture("check-mismatch.json");
   stale.items = [...(stale.items ?? []), ...connectedRows(40)];
   for (const recheck of [
@@ -63,10 +57,8 @@ test("an edit the hook could not re-check lists none of the index's verdicts", (
     },
     { ran: "none" as const, elapsed_ms: 40, known_miss: true },
   ]) {
-    assert.equal(
-      renderPostToolUse({ ...stale, recheck }),
-      expectedNotRechecked(recheck?.reason),
-    );
+    // A gap is not a finding: nothing is printed, and no stored verdict.
+    assert.equal(renderPostToolUse({ ...stale, recheck }), null);
   }
 });
 
@@ -82,24 +74,7 @@ test("an edit the scan reads the same gets no not-re-checked line", () => {
   assert.doesNotMatch(renderPostToolUse(same) ?? "", /not re-checked/);
 });
 
-test("a file left un-checked says why, and the pending and late lines read as pinned", () => {
-  assert.equal(
-    notRecheckedLine("src/a.ts", "an earlier re-check of this repo ran past its budget"),
-    "Carrick: src/a.ts was not re-checked: an earlier re-check of this repo ran past its budget. If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.",
-  );
-  // A reason that already names the command is not told to run it twice.
-  assert.equal(
-    notRecheckedLine("src/a.ts", "too big; run `carrick check --changed`"),
-    "Carrick: src/a.ts was not re-checked: too big; run `carrick check --changed`.",
-  );
-  assert.equal(
-    pendingLine("src/a.ts", "user-service"),
-    "Carrick is re-checking src/a.ts in the background (re-reading user-service). Its answer comes with the next Carrick line, and before you finish.",
-  );
-  assert.equal(
-    pendingLine("src/a.ts"),
-    "Carrick is re-checking src/a.ts in the background. Its answer comes with the next Carrick line, and before you finish.",
-  );
+test("a late problem names the earlier edit, and a clean or unchecked file prints nothing", () => {
   const late = renderPostToolUse(rechecked(), "src/a.ts", { late: true }) ?? "";
   assert.match(late, /^Carrick re-checked src\/a\.ts after your earlier edit to it: 2 contract problems\.\n/);
 });
@@ -129,19 +104,16 @@ test("a re-checked edit with many problems prints three and counts the rest", ()
   for (const line of lines) assert.ok(line.length <= MAX_EDIT_LINE_CHARS, line);
 });
 
-test("a re-checked edit with no problem says so in one line", () => {
+test("a re-checked edit with no problem prints nothing", () => {
   const result = rechecked();
   result.items = result.items!.filter((item) => item.verdict?.result == null || item.verdict.result === "compatible");
   result.items.push(...connectedRows(40));
-  assert.equal(
-    renderPostToolUse(result),
-    "Carrick re-checked src/routes/users.ts after this edit: no contract problem.",
-  );
+  assert.equal(renderPostToolUse(result), null);
 });
 
 // No run-the-check clause: the per-file re-check answered, and the Stop hook
 // queues `check --changed` itself for a change it could not state (carrick#3466).
-test("a re-check that judged a service reading the edit at its indexed version never says no contract problem", () => {
+test("a re-check that judged a service at its indexed version prints nothing without a problem, and names the version with one", () => {
   const result = rechecked();
   result.items = result.items!.filter((item) => item.verdict?.result == null || item.verdict.result === "compatible");
   result.recheck = {
@@ -149,16 +121,17 @@ test("a re-check that judged a service reading the edit at its indexed version n
     elapsed_ms: 900,
     scope: { reread: ["catalog"], not_reread: [], stale: ["inventory", "billing", "ledger", "search"] },
   };
-  assert.equal(
-    renderPostToolUse(result),
-    "Carrick re-checked src/routes/users.ts: no contract problem in what it re-read; 4 services that read this edit were judged at their indexed version (inventory, billing, ledger, and 1 more).",
+  assert.equal(renderPostToolUse(result), null);
+  // With a problem, its header states what was re-read.
+  const broken = rechecked();
+  broken.recheck = result.recheck;
+  assert.match(
+    renderPostToolUse(broken) ?? "",
+    /^Carrick re-checked src\/routes\/users\.ts: 2 contract problems in what it re-read; 4 services that read this edit were judged at their indexed version \(inventory, billing, ledger, and 1 more\)\.\n/,
   );
   // With nothing stale, the headline is the plain one.
   result.recheck.scope = { reread: ["catalog"], not_reread: [], stale: [] };
-  assert.equal(
-    renderPostToolUse(result),
-    "Carrick re-checked src/routes/users.ts after this edit: no contract problem.",
-  );
+  assert.equal(renderPostToolUse(result), null);
 });
 
 /** A routed file whose pairs the check did not judge: every verdict is `not_checked`. */
@@ -171,52 +144,24 @@ function unjudged(): CheckResult {
   return result;
 }
 
-test("a re-check that judged no type pair never says no contract problem", () => {
+test("a re-check that judged no type pair prints nothing", () => {
   const result = unjudged();
   result.boundary = { types_degraded: { stage: "type check", detail: "sidecar not found" } };
-  const line = renderPostToolUse(result, "src/routes/users.ts");
-  assert.equal(
-    line,
-    "Carrick re-checked src/routes/users.ts after this edit: types were not checked (sidecar not found), so no contract verdict.",
-  );
-  assert.doesNotMatch(line ?? "", /no contract problem/);
-  // With no reason on the answer, it still says types were not checked.
+  assert.equal(renderPostToolUse(result, "src/routes/users.ts"), null);
   delete result.boundary;
-  assert.match(
-    renderPostToolUse(result, "src/routes/users.ts") ?? "",
-    /: types were not checked \(no pair in this file was compared\), so no contract verdict\.$/,
-  );
+  assert.equal(renderPostToolUse(result, "src/routes/users.ts"), null);
 });
 
-test("a re-check whose pairs were compared but none resolved says so, with the count", () => {
+test("a re-check whose pairs did not resolve, or whose types were not checked, prints nothing", () => {
   const result = rechecked();
   result.items = connectedRows(3);
-  assert.match(
-    renderPostToolUse(result, "src/routes/users.ts") ?? "",
-    /: types were not checked \(3 pairs were compared but none resolved\), so no contract verdict\.$/,
-  );
+  assert.equal(renderPostToolUse(result, "src/routes/users.ts"), null);
   result.items = connectedRows(1);
-  assert.match(
-    renderPostToolUse(result, "src/routes/users.ts") ?? "",
-    /\(1 pair was compared but did not resolve\)/,
-  );
-  // A stated cause still comes first.
   result.boundary = { types_degraded: { stage: "type check", detail: "sidecar not found" } };
-  assert.match(renderPostToolUse(result, "src/routes/users.ts") ?? "", /\(sidecar not found\)/);
-});
-
-test("the post-edit line names the reason the whole index was not type-checked", () => {
-  const result = unjudged();
-  // The boundary says something else: the build's own statement wins.
-  result.boundary = { types_degraded: { stage: "type check", detail: "a different cause" } };
-  result.type_check = { ran: false, reason: "type checker not found.", pairs: 2, judged: 0 };
-  assert.equal(
-    renderPostToolUse(result, "src/routes/users.ts"),
-    "Carrick re-checked src/routes/users.ts after this edit: types were not checked (type checker not found), so no contract verdict.",
-  );
-  // A check that ran leaves the old reasons alone.
-  result.type_check = { ran: true, pairs: 2, judged: 0 };
-  assert.match(renderPostToolUse(result, "src/routes/users.ts") ?? "", /\(a different cause\)/);
+  assert.equal(renderPostToolUse(result, "src/routes/users.ts"), null);
+  const unchecked = unjudged();
+  unchecked.type_check = { ran: false, reason: "type checker not found.", pairs: 2, judged: 0 };
+  assert.equal(renderPostToolUse(unchecked, "src/routes/users.ts"), null);
 });
 
 test("session start says when the whole index was built without type checking", () => {
@@ -235,7 +180,7 @@ test("session start says when the whole index was built without type checking", 
   assert.doesNotMatch(renderSessionStart(status), /Types were not checked/);
 });
 
-test("a re-check that judged pairs and found none wrong still says no contract problem", () => {
+test("a re-check that judged pairs and found none wrong prints nothing", () => {
   const result = rechecked();
   result.items = [
     {
@@ -249,13 +194,10 @@ test("a re-check that judged pairs and found none wrong still says no contract p
       verdict: { state: "resolved", result: "compatible", detail: "" },
     },
   ];
-  assert.equal(
-    renderPostToolUse(result, "src/routes/users.ts"),
-    "Carrick re-checked src/routes/users.ts after this edit: no contract problem.",
-  );
+  assert.equal(renderPostToolUse(result, "src/routes/users.ts"), null);
 });
 
-test("a file restored to its indexed text says nothing was re-checked", () => {
+test("a file restored to its indexed text prints nothing", () => {
   const result = rechecked();
   result.items = [
     {
@@ -270,12 +212,12 @@ test("a file restored to its indexed text says nothing was re-checked", () => {
   ];
   result.stale = false;
   result.recheck = { ran: "none", elapsed_ms: 0, reason: "the file has not changed since the index" };
-  const line = renderPostToolUse(result, "src/routes/users.ts");
-  assert.equal(
-    line,
-    "Carrick: src/routes/users.ts matches the index, so there was nothing to re-check. The index shows: no contract problem.",
-  );
-  assert.doesNotMatch(line ?? "", /re-checked src/);
+  assert.equal(renderPostToolUse(result, "src/routes/users.ts"), null);
+  // With a problem in the index's own rows, the header drops "matches the index".
+  const broken = rechecked();
+  broken.stale = false;
+  broken.recheck = { ran: "none", elapsed_ms: 0, reason: "the file has not changed since the index" };
+  assert.match(renderPostToolUse(broken, "src/routes/users.ts") ?? "", /^Carrick: src\/routes\/users\.ts: 2 contract problems\.\n- /);
 });
 
 test("an edit never carries the service-wide boundary", () => {
@@ -362,18 +304,11 @@ test("a deleted file says so and names the problem it leaves", () => {
   assert.equal(lines.length, 2);
 });
 
-test("a file with nothing to report still prints one line, and only that", () => {
-  // The line is the only sign the hook ran: silence reads the same as a hook
-  // that is not installed.
+test("a file with nothing to report prints nothing", () => {
   for (const name of ["check-silent.json", "check-clean.json"]) {
     const result = fixture(name);
     result.boundary = { unemitted_literal_sites: [`${result.file}:7`] };
-    // No rows: there was nothing to judge, so no contract claim is made.
-    assert.equal(
-      renderPostToolUse(result),
-      "Carrick re-checked src/util/format.ts after this edit: no route or call to check.",
-      name,
-    );
+    assert.equal(renderPostToolUse(result), null, name);
   }
 });
 
@@ -908,7 +843,7 @@ test("an edit's uses are one counted line, never the list", () => {
   const uses = fixture("check-uses.json");
   assert.equal(
     renderPostToolUse(uses),
-    "Carrick re-checked src/client.ts after this edit: no route or call to check.\nOther files use what this file declares: `carrick check src/client.ts` lists the 2 uses; open them if this edit changed a signature or a type.",
+    "Other files use what this file declares: `carrick check src/client.ts` lists the 2 uses; open them if this edit changed a signature or a type.",
   );
 });
 
@@ -1002,12 +937,7 @@ test("a moved row of another build's index says that build may be the cause", ()
   assert.doesNotMatch(text, /agreed in the index/);
 });
 
-test("a check --changed that ran after the last edit drops the clause that sends the reader to it", () => {
-  assert.equal(
-    notRecheckedLine("src/a.ts", "an earlier re-check of this repo ran past its budget", true),
-    "Carrick: src/a.ts was not re-checked: an earlier re-check of this repo ran past its budget.",
-  );
-  assert.match(notRecheckedLine("src/a.ts", "an earlier re-check of this repo ran past its budget"), /run `carrick check --changed` before you finish\.$/);
+test("a re-check that answered with a service at its indexed version never names check --changed", () => {
   // A re-check that answered, with a service judged at its indexed version,
   // never carries it: the Stop hook queues the check (carrick#3466).
   const result = rechecked();

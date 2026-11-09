@@ -335,35 +335,6 @@ export function answersTheEdit(result: CheckResult): boolean {
 /** Services a stale re-check line names before it counts the rest. */
 const MAX_STALE_SERVICES = 3;
 
-/** What a "not re-checked" line says when the binary gave no reason. */
-const NO_RECHECK_REASON = "no re-check of it ran";
-
-/**
- * The line for an edited file that no re-check answered for: the index's
- * verdicts describe the file before the edit, so none is printed, and the
- * reader is told why and sent to the command that answers. Said on every
- * such edit, with that edit's own reason.
- */
-export function notRecheckedLine(file: string, reason?: string | null, settled = false): string {
-  const said = (reason?.trim() || NO_RECHECK_REASON).replace(/\.+$/, "");
-  return `Carrick: ${file} was not re-checked: ${said}.${said.includes("carrick check --changed") ? "" : runClause(settled)}`;
-}
-
-/**
- * The clause that sends the reader to `carrick check --changed`, with its
- * leading space; empty when one already ran after the last edit (`settled`,
- * from `hook/checked.ts`), because the agent would only repeat it.
- */
-export function runClause(settled: boolean): string {
-  return settled ? "" : " If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish.";
-}
-
-/** The line for an edit queued for the background re-check. */
-export function pendingLine(file: string, service?: string | null): string {
-  const reading = service ? ` (re-reading ${service})` : "";
-  return `Carrick is re-checking ${file} in the background${reading}. Its answer comes with the next Carrick line, and before you finish.`;
-}
-
 /** "N services that read <subject> were judged at their indexed version (a, b, and K more)". */
 export function staleClause(stale: readonly string[], subject: string): string {
   const names = stale.slice(0, MAX_STALE_SERVICES).join(", ");
@@ -554,33 +525,22 @@ function notJudgedReason(result: CheckResult): string {
 }
 
 /**
- * The first line of an edit's message. It claims only what ran: "re-checked"
- * only when a re-check ran, and "no contract problem" only when a type pair
- * was judged and none of the verdicts is a problem.
+ * The first line of an edit's message, or `null` when the edit has no finding
+ * to head: a clean file, a file that matches the index and a file no
+ * re-check answered for are all silent (hook-wording audit T4, 568 firings and
+ * no finding). A header exists only to introduce a problem or a moved row.
  */
-function headline(result: CheckResult, where: string, problems: number, late = false): string {
-  const noProblem = judgedAnyPair(result) ? "no contract problem" : null;
-  const unjudged =
-    (result.items ?? []).length === 0
-      ? "no route or call to check"
-      : `types were not checked (${notJudgedReason(result)}), so no contract verdict`;
-  const count = (suffix: string) =>
-    problems > 0 ? `${problems} contract ${problems === 1 ? "problem" : "problems"}${suffix}` : null;
-  if (recheckDidNotRun(result)) {
-    const tail = count("") ?? noProblem ?? unjudged;
-    return `Carrick: ${where} matches the index, so there was nothing to re-check. The index shows: ${tail}.`;
-  }
+function headline(result: CheckResult, where: string, problems: number, late: boolean): string | null {
+  const moved = movedLines(result).length > 0;
+  if (problems === 0) return moved ? `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}; rows elsewhere moved:` : null;
+  const count = `${problems} contract ${problems === 1 ? "problem" : "problems"}`;
+  if (recheckDidNotRun(result)) return `Carrick: ${where}: ${count}.`;
   const stale = result.recheck?.scope?.stale ?? [];
-  if (stale.length > 0) {
-    // A service that reads this edit was judged at a version that predates
-    // it, so a bare "no contract problem" would be a claim the check did not
-    // make. Problems found still list below.
-    const tail = count(" in what it re-read") ?? (noProblem ? `${noProblem} in what it re-read` : unjudged);
-    // No run-the-check clause: the re-check answered, and the Stop hook
-    // queues `check --changed` for a change with a stale service (carrick#3466).
-    return `Carrick re-checked ${where}: ${tail}; ${staleClause(stale, "this edit")}.`;
-  }
-  return `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}: ${count("") ?? noProblem ?? unjudged}.`;
+  // A service that reads this edit was judged at a version that predates it,
+  // so the problems are stated for what was re-read; the Stop hook queues
+  // `check --changed` for it (carrick#3466).
+  if (stale.length > 0) return `Carrick re-checked ${where}: ${count} in what it re-read; ${staleClause(stale, "this edit")}.`;
+  return `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}: ${count}.`;
 }
 
 /**
@@ -590,36 +550,35 @@ function headline(result: CheckResult, where: string, problems: number, late = f
  * large repo the index's stored verdicts for one file ran to 8.7 KB per edit,
  * every one of them about rows the edit did not touch. So:
  *
- * - A file the re-check did not answer for (it missed its budget, or none
- *   ran): one line, and no stored verdict, because those describe the file
- *   before the edit. It sends the reader to `carrick check --changed`.
+ * - A file the re-check did not answer for, or one that matches the index:
+ *   nothing, and no stored verdict, because those describe the file before
+ *   the edit. The Stop hook names a gap once.
  * - A file answered from the working tree: its problems (a result other than
  *   `compatible`), at most three, and nothing about the rows that are fine.
  * - Then, unless `options.uses` is `false`, one line counting who uses this
  *   file from elsewhere (carrick#2067); the hook shows it once per file per
  *   session, and the uses themselves are the Read hook's to list.
  *
- * Every checked file gets at least one line: it is the only sign the hook
- * ran, and silence reads the same as a hook that is not installed.
+ * A clean file prints nothing. Silence is the answer: 568 clean firings
+ * carried no information and cost the reader attention.
  */
 export function renderPostToolUse(
   result: CheckResult,
   displayFile?: string,
-  options: { uses?: boolean; late?: boolean; settled?: boolean } = {},
+  options: { uses?: boolean; late?: boolean } = {},
 ): string | null {
   if (result.error) return null;
   // `result.file` is relative to the repo that owns it, so the caller's own
   // workspace-relative path is the one a reader can open; it wins when given.
   const where = displayFile ?? result.file ?? "this file";
   const lines: string[] = [];
-  if (!answersTheEdit(result)) {
-    lines.push(notRecheckedLine(where, result.recheck?.reason, options.settled === true));
-  } else {
+  if (answersTheEdit(result)) {
     const problems = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
     if (result.deleted) {
       lines.push(deletedLine(result, where));
     } else {
-      lines.push(headline(result, where, problems.length, options.late === true));
+      const head = headline(result, where, problems.length, options.late === true);
+      if (head !== null) lines.push(head);
     }
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);
@@ -633,7 +592,7 @@ export function renderPostToolUse(
       `Other files use what this file declares: \`carrick check ${where}\` lists ${them} if this edit changed a signature or a type.`,
     );
   }
-  return lines.join("\n");
+  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 /**
