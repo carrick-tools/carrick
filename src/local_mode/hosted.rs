@@ -1612,6 +1612,36 @@ impl HostedInput {
         }
         result
     }
+
+    /// Every blob the cached snapshot holds, borrowed, each with the repo
+    /// label a reader of this workspace knows it by: the checkout's folder name
+    /// ([`super::index::repo_label`]) for a repo checked out here, as
+    /// [`Self::local_blobs`] labels it, and the indexed repo name otherwise.
+    /// Nothing is filtered: a reader that wants every indexed function, such
+    /// as the edit-time lead, reads them all.
+    pub(super) fn every_blob(&self) -> Vec<(String, &CloudRepoData)> {
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        snapshot
+            .projects
+            .values()
+            .flatten()
+            .map(|blob| {
+                let local = self.remotes.iter().find(|(_, remote)| {
+                    remote
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&blob.repo_name))
+                });
+                let label = match local {
+                    Some((path, _)) => super::index::repo_label(path),
+                    None => blob.repo_name.clone(),
+                };
+                (label, blob)
+            })
+            .collect()
+    }
 }
 
 /// Explicit per-repo handoff to the scan subprocess.

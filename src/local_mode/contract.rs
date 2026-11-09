@@ -547,7 +547,7 @@ fn role_label(counterparts: &[&Counterpart]) -> &'static str {
 /// this block is the only place that says which. A reader that does not know
 /// the field treats the answer as the indexed one, which is what it was before
 /// this existed.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Recheck {
     /// `extraction+types` — the file was re-extracted, re-joined against the
     /// blobs the index holds, and at least one of its rows carries a type
@@ -668,11 +668,63 @@ pub struct NotReread {
 }
 
 /// One function the working tree declares and the index does not.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct NewFunction {
     /// As the source spells it: `name`, or `Class.member`.
     pub name: String,
     /// Where it starts, so a reader can open it without searching.
+    pub line: u32,
+    /// An indexed function this one looks like, read from body tokens and
+    /// the name alone (`lead.rs`, carrick-cloud#3249). Absent when nothing
+    /// passes, which is the usual answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<Lead>,
+}
+
+/// The indexed function a new function looks like, with what a reader needs
+/// to decide whether to call it instead: where it is, who calls it, and up to
+/// two more like it. Reference: `docs/local-mode-output.md` (the `recheck`
+/// block, `new_functions[].lead`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Lead {
+    /// As the index spells it: `name`, or `Class.member`.
+    pub name: String,
+    /// The repo it is in: the checkout's folder name for a repo of this
+    /// workspace, the indexed repo name otherwise.
+    pub repo: String,
+    pub file: String,
+    pub line: u32,
+    /// 0 when the index holds no end line.
+    pub end_line: u32,
+    /// Weighted overlap of the two bodies' tokens, 0 to 1, three decimals.
+    pub score: f64,
+    pub basis: LeadBasis,
+    /// `[this function's, the lead's]`, set only when both are written out,
+    /// they differ, and no hit with a matching or unwritten type passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_types: Option<[String; 2]>,
+    /// Up to three indexed callers of the lead.
+    pub callers: Vec<LeadRef>,
+    /// How many indexed functions call the lead.
+    pub callers_total: usize,
+    /// Up to two more indexed functions like the lead.
+    pub also: Vec<LeadRef>,
+}
+
+/// What made a lead pass: its body tokens alone, or the same name with a
+/// lower token floor.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LeadBasis {
+    Tokens,
+    Name,
+}
+
+/// One indexed function a lead names beside itself.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LeadRef {
+    pub name: String,
+    pub file: String,
     pub line: u32,
 }
 
