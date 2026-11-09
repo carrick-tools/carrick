@@ -145,6 +145,7 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
                 (*slot, basis)
             })
             .collect(),
+        names: Vec::new(),
         lead: None,
         receiver: None,
     }
@@ -564,6 +565,104 @@ fn forced_rows_are_facts_and_asked_rows_are_candidates() {
             confidence: 0.9,
             orders_agree: true,
         })
+    );
+}
+
+/// A record whose name the code states as several values (carrick#3504
+/// S2b-8) writes one fact row per value, with the same anchors, side and
+/// method; a pub/sub one alike, as a library claim.
+#[test]
+fn a_record_with_several_names_writes_a_row_each() {
+    let http = site("src/several-http.ts", "http_client", "request", "get");
+    let topic = site("src/several-topic.ts", "broker", "receive", "Queue");
+    let mut http_record = record(
+        &http,
+        &[
+            (Slot::Kind, "http"),
+            (Slot::Role, "sends"),
+            (Slot::Method, "POST"),
+        ],
+        &[],
+    );
+    http_record.names = vec!["/v1/a".to_string(), "/v1/b".to_string()];
+    http_record.basis.insert(Slot::Name, Basis::Code);
+    let mut topic_record = record(
+        &topic,
+        &[(Slot::Kind, "topic"), (Slot::Role, "handles")],
+        &[],
+    );
+    topic_record.names = vec!["item.a".to_string(), "item.b".to_string()];
+    topic_record.basis.insert(Slot::Name, Basis::Code);
+    let decided = Decided {
+        sites: vec![http.clone(), topic.clone()],
+        ..Decided::default()
+    };
+    let rows = of(
+        &decided,
+        &[http_record.clone(), topic_record],
+        &labels(),
+        &cassette(),
+    );
+    let of_file =
+        |file: &str| -> Vec<&SiteRow> { rows.rows.iter().filter(|row| row.file == file).collect() };
+    let keys: Vec<OperationKey> = of_file("src/several-http.ts")
+        .iter()
+        .map(|row| row.key.clone())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            OperationKey::http("POST", "/v1/a"),
+            OperationKey::http("POST", "/v1/b")
+        ]
+    );
+    for row in of_file("src/several-http.ts") {
+        assert_eq!(row.source, ResolutionSource::RequestSummary);
+        assert_eq!(row.inference, None);
+        assert_eq!(row.side, RowSide::Call);
+        assert_eq!(row.anchors, http_record.anchors);
+        assert!(!row.needs_reader);
+    }
+    let topics = of_file("src/several-topic.ts");
+    assert_eq!(topics.len(), 2, "{topics:?}");
+    assert!(
+        topics
+            .iter()
+            .all(|row| row.source == ResolutionSource::LibraryClaim && row.inference.is_none())
+    );
+    assert!(
+        rows.leads
+            .iter()
+            .all(|lead| !lead.file_path.contains("several"))
+    );
+
+    // Folded over a reader's row at the site: the reader's row goes and
+    // both fact rows stand, neither keeping the site from the other.
+    let mut calls = vec![blob_row(
+        OperationKey::http("POST", "/v1/other"),
+        "src/several-http.ts",
+        LINE,
+        Some(ResolutionSource::Model),
+    )];
+    let mut endpoints = Vec::new();
+    fold_rows(&mut calls, &mut endpoints, &rows, Path::new("."), make);
+    let stood: Vec<(OperationKey, Option<ResolutionSource>)> =
+        at_site(&calls, "src/several-http.ts")
+            .into_iter()
+            .map(|(key, source, _)| (key, source))
+            .collect();
+    assert_eq!(
+        stood,
+        vec![
+            (
+                OperationKey::http("POST", "/v1/a"),
+                Some(ResolutionSource::RequestSummary)
+            ),
+            (
+                OperationKey::http("POST", "/v1/b"),
+                Some(ResolutionSource::RequestSummary)
+            ),
+        ]
     );
 }
 

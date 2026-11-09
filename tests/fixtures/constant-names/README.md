@@ -11,6 +11,8 @@ pub/sub topics and socket events.
 file's site forces and the scan writes as a fact row (a `kind_asked`
 pub/sub file waits on the broker's kind question instead); `same_as_const`
 pins that a `let` base and a `const` base, a path or a host, give the same
-row; `unnamed` lists the files where
-a part does not fold (a `let` assigned again, an object written through, a
-replacement read at runtime), which must write no fact row and stay leads.
+row; `several` lists the names a `let` assigned again states, its
+initialiser and each value written, one fact row each (carrick#3504 S2b-8);
+`unnamed` lists the files where a part does not fold (a `let` written in a
+form the census cannot place, an object written through, a replacement
+read at runtime), which must write no fact row and stay leads.

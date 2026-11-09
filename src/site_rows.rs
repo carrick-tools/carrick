@@ -596,14 +596,21 @@ struct Filled {
     asked: bool,
 }
 
-fn filled(record: &SiteRecord, answered: Option<&Answered>, slot: Slot) -> Option<Filled> {
-    if let Some(text) = record.state.forced.get(&slot) {
-        return Some(Filled {
-            text: Some(text.clone()),
+impl Filled {
+    /// A value the record decides: confidence 1, both orders.
+    fn stated(text: String) -> Self {
+        Filled {
+            text: Some(text),
             confidence: 1.0,
             orders_agree: true,
             asked: false,
-        });
+        }
+    }
+}
+
+fn filled(record: &SiteRecord, answered: Option<&Answered>, slot: Slot) -> Option<Filled> {
+    if let Some(text) = record.state.forced.get(&slot) {
+        return Some(Filled::stated(text.clone()));
     }
     let answer: &SlotAnswer = match slot {
         Slot::Kind => answered?.kind.as_ref(),
@@ -858,14 +865,26 @@ pub fn of(
             continue;
         }
         let slot = |slot| filled(record, answered, slot);
-        let (Some(kind), Some(role), Some(name)) =
-            (slot(Slot::Kind), slot(Slot::Role), slot(Slot::Name))
+        // A name the code states as several values is one row each
+        // (carrick#3504 S2b-8); else the one the slot holds.
+        let names: Vec<Filled> = if record.names.is_empty() {
+            slot(Slot::Name).into_iter().collect()
+        } else {
+            record
+                .names
+                .iter()
+                .map(|name| Filled::stated(name.clone()))
+                .collect()
+        };
+        let (Some(kind), Some(role), false) =
+            (slot(Slot::Kind), slot(Slot::Role), names.is_empty())
         else {
             out.leads.push(lead(UnreadReason::BelowBand));
             continue;
         };
-        let (Some(kind_text), Some(role_text), Some(name_text)) =
-            (kind.text.clone(), role.text.clone(), name.text.clone())
+        let name_texts: Option<Vec<String>> = names.iter().map(|name| name.text.clone()).collect();
+        let (Some(kind_text), Some(role_text), Some(name_texts)) =
+            (kind.text.clone(), role.text.clone(), name_texts)
         else {
             // The model chose none of the options for a slot the key needs.
             out.leads.push(lead(UnreadReason::BelowBand));
@@ -889,62 +908,74 @@ pub fn of(
             out.routes.push(lead(reason));
             continue;
         }
-        let name_written = name_text.clone();
-        let Some((key, name_scope)) = key_of(
-            &kind_text,
-            name_text,
-            method.as_deref(),
-            namespace,
-            socket_side(label, site).as_deref(),
-            side,
-            label
-                .and_then(|label| label.name_scope.as_ref())
-                .map(crate::library_claims::wire_scope_of),
-            site.end.role == "in_process_bus",
-        ) else {
-            out.leads.push(lead(UnreadReason::BelowBand));
-            continue;
-        };
-        let base = request_base(site, &name_written, &key, side);
         let fact = record.bucket == Bucket::Forced;
         // Every slot the model answered that feeds the key or the side:
         // forced slots are 1.0 and agreeing, so only asked ones can lower it.
-        let (confidence, orders_agree) = [Some(&kind), Some(&role), Some(&name)]
+        let (confidence, orders_agree) = [Some(&kind), Some(&role)]
             .into_iter()
+            .chain(names.iter().map(Some))
             .chain([method_slot.as_ref(), namespace_slot.as_ref()])
             .flatten()
             .filter(|slot| slot.asked)
             .fold((1.0_f64, true), |(low, agree), slot| {
                 (low.min(slot.confidence), agree && slot.orders_agree)
             });
-        let source = match (fact, &key) {
-            (true, OperationKey::Http { .. }) if side == RowSide::Call => {
-                ResolutionSource::RequestSummary
+        for name_text in name_texts {
+            let name_written = name_text.clone();
+            let Some((key, name_scope)) = key_of(
+                &kind_text,
+                name_text,
+                method.as_deref(),
+                namespace.clone(),
+                socket_side(label, site).as_deref(),
+                side,
+                label
+                    .and_then(|label| label.name_scope.as_ref())
+                    .map(crate::library_claims::wire_scope_of),
+                site.end.role == "in_process_bus",
+            ) else {
+                out.leads.push(lead(UnreadReason::BelowBand));
+                continue;
+            };
+            // Two names one key reads alike are one row.
+            if !record.names.is_empty()
+                && out
+                    .rows
+                    .iter()
+                    .any(|other| other.anchors == record.anchors && other.key == key)
+            {
+                continue;
             }
-            (true, _) => ResolutionSource::LibraryClaim,
-            (false, _) => ResolutionSource::Model,
-        };
-        out.rows.push(SiteRow {
-            file: site.file.clone(),
-            line: site.line,
-            key,
-            side,
-            source,
-            inference: (!fact).then(|| SiteInference {
-                by: InferenceBy::SiteQuestion,
-                question_set: answers.question_set.clone(),
-                confidence,
-                orders_agree,
-            }),
-            in_band: fact || (confidence >= BAND && orders_agree),
-            name_scope,
-            anchors: record.anchors.clone(),
-            lead: lead(UnreadReason::BelowBand),
-            needs_reader: needs_reader(record),
-            through: is_through(site),
-            within: Vec::new(),
-            base,
-        });
+            let base = request_base(site, &name_written, &key, side);
+            let source = match (fact, &key) {
+                (true, OperationKey::Http { .. }) if side == RowSide::Call => {
+                    ResolutionSource::RequestSummary
+                }
+                (true, _) => ResolutionSource::LibraryClaim,
+                (false, _) => ResolutionSource::Model,
+            };
+            out.rows.push(SiteRow {
+                file: site.file.clone(),
+                line: site.line,
+                key,
+                side,
+                source,
+                inference: (!fact).then(|| SiteInference {
+                    by: InferenceBy::SiteQuestion,
+                    question_set: answers.question_set.clone(),
+                    confidence,
+                    orders_agree,
+                }),
+                in_band: fact || (confidence >= BAND && orders_agree),
+                name_scope,
+                anchors: record.anchors.clone(),
+                lead: lead(UnreadReason::BelowBand),
+                needs_reader: needs_reader(record),
+                through: is_through(site),
+                within: Vec::new(),
+                base,
+            });
+        }
     }
     out
 }
@@ -1243,12 +1274,25 @@ pub fn fold_rows(
             RowSide::Call => &mut *calls,
             RowSide::Endpoint => &mut *endpoints,
         };
+        // The rows one record states for a name the code gives several
+        // values (carrick#3504 S2b-8) stand side by side: a row with a
+        // sibling's key is that sibling's, and neither keeps the site from
+        // this row nor gives way to it.
+        let siblings: Vec<&OperationKey> = site
+            .rows
+            .iter()
+            .filter(|other| {
+                !std::ptr::eq(*other, row) && other.side == row.side && other.anchors == row.anchors
+            })
+            .map(|other| &other.key)
+            .collect();
         let here: Vec<usize> = rows
             .iter()
             .enumerate()
             .filter(|(_, existing)| {
                 place(root, existing)
                     .is_some_and(|(file, line)| file == row.file && line == row.line)
+                    && !siblings.contains(&&existing.key)
             })
             .map(|(index, _)| index)
             .collect();

@@ -37,7 +37,7 @@
  "n-conditional": {
   "feature": "conditional (?:)",
   "source": "ES5",
-  "status": "lead"
+  "status": "covered"
  },
  "n-const": {
   "feature": "const",

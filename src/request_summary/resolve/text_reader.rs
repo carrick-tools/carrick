@@ -26,6 +26,10 @@ pub(in crate::request_summary) enum TextValue {
     Text {
         text: String,
         read_from: Vec<String>,
+        /// One literal of a union the compiler types a choice's branch as:
+        /// the type states the choice, not the code (record rule 2.3.6), so
+        /// a set holding it stays asked.
+        from_type: bool,
     },
     /// The name is none the reader states.
     Hole(guards::HoleReason),
@@ -42,6 +46,17 @@ pub(in crate::request_summary) enum ArgTexts {
     /// one call. It keeps today's host-free reading and is counted (carrick
     /// #3504 S5a, R3).
     Unread,
+}
+
+impl TextValue {
+    /// A text the code states, read through `read_from`.
+    fn stated(text: String, read_from: Vec<String>) -> Self {
+        TextValue::Text {
+            text,
+            read_from,
+            from_type: false,
+        }
+    }
 }
 
 impl<'a> Resolver<'a> {
@@ -79,10 +94,7 @@ impl<'a> Resolver<'a> {
         use guards::HoleReason::*;
         let hole = |reason| vec![TextValue::Hole(reason)];
         match value {
-            ValueAt::Lit(text) => vec![TextValue::Text {
-                text: text.clone(),
-                read_from: Vec::new(),
-            }],
+            ValueAt::Lit(text) => vec![TextValue::stated(text.clone(), Vec::new())],
             ValueAt::Concat(parts) => {
                 let mut text = String::new();
                 let mut read_from = Vec::new();
@@ -95,7 +107,7 @@ impl<'a> Resolver<'a> {
                         Err(reason) => return hole(reason),
                     }
                 }
-                vec![TextValue::Text { text, read_from }]
+                vec![TextValue::stated(text, read_from)]
             }
             ValueAt::Read {
                 lo,
@@ -147,6 +159,7 @@ impl<'a> Resolver<'a> {
                     .map(|text| TextValue::Text {
                         text,
                         read_from: read_from.clone(),
+                        from_type: true,
                     })
                     .collect();
             }
@@ -161,7 +174,11 @@ impl<'a> Resolver<'a> {
         part: &ValueAt,
     ) -> Result<(String, Vec<String>), guards::HoleReason> {
         match self.text_values(file, part).as_slice() {
-            [TextValue::Text { text, read_from }] => Ok((text.clone(), read_from.clone())),
+            [
+                TextValue::Text {
+                    text, read_from, ..
+                },
+            ] => Ok((text.clone(), read_from.clone())),
             [TextValue::Hole(reason)] => Err(*reason),
             _ => Err(guards::HoleReason::UnreadExpression),
         }
@@ -205,10 +222,10 @@ impl<'a> Resolver<'a> {
             return hole(RowsMissing);
         };
         if let Some(text) = typed_as_one_text(row) {
-            return vec![TextValue::Text {
+            return vec![TextValue::stated(
                 text,
-                read_from: in_repo_declaration(row).into_iter().collect(),
-            }];
+                in_repo_declaration(row).into_iter().collect(),
+            )];
         }
         let Some((at, binding, declared)) = self.declared_entry(row) else {
             return hole(OutsideService);
@@ -291,7 +308,7 @@ impl<'a> Resolver<'a> {
                 &mut read_from,
                 in_repo_declaration(row).into_iter().collect(),
             );
-            return vec![TextValue::Text { text, read_from }];
+            return vec![TextValue::stated(text, read_from)];
         }
         // A `static` property of a class the module keeps (`C.P`): the row
         // names the property, the binding table its initialiser.
@@ -505,7 +522,7 @@ impl<'a> Resolver<'a> {
             },
             _ => return hole(UnreadExpression),
         };
-        vec![TextValue::Text { text, read_from }]
+        vec![TextValue::stated(text, read_from)]
     }
 
     /// Marks the declaration `at` as being read for its text, until the
@@ -547,7 +564,11 @@ impl<'a> Resolver<'a> {
         let (path, ir) = self.inputs_for(&absolute).files.get_key_value(&absolute)?;
         let value = text_of(expr, &|lo| ir.discovery_start(lo));
         match self.text_values(path, &value).as_slice() {
-            [TextValue::Text { text, read_from }] => Some((text.clone(), read_from.clone())),
+            [
+                TextValue::Text {
+                    text, read_from, ..
+                },
+            ] => Some((text.clone(), read_from.clone())),
             _ => None,
         }
     }
@@ -673,7 +694,11 @@ impl Resolver<'_> {
                 ValueAt::Lit(text) if text.is_empty() => {}
                 ValueAt::Lit(text) => out.push((text.clone(), None)),
                 other => match self.text_values(path, other).as_slice() {
-                    [TextValue::Text { text, read_from }] => {
+                    [
+                        TextValue::Text {
+                            text, read_from, ..
+                        },
+                    ] => {
                         out.push((text.clone(), read_from.first().cloned()));
                     }
                     _ => return None,
@@ -799,7 +824,11 @@ mod tests {
         let read = |name: &str, want: &str| {
             let got = probe(&resolver, &on, forms, name);
             match got.as_slice() {
-                [TextValue::Text { text, read_from }] => {
+                [
+                    TextValue::Text {
+                        text, read_from, ..
+                    },
+                ] => {
                     assert_eq!(text, want, "{name}");
                     // Literals alone read no declaration.
                     let literal = ["p_join_default", "p_replace_all"].contains(&name);

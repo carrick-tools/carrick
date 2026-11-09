@@ -378,9 +378,55 @@ fn a_destructuring_assignment_writes_each_keys_value() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A name the code states as several whole values (`flag ? '/a' : '/b'`, a
+/// `let` written with a second value) writes one fact row per value, on
+/// every protocol (carrick#3504 S2b-8); a pub/sub file of `kind_asked` waits
+/// on the broker's kind question. A name typed as a union of literals stays
+/// asked (`unnamed`).
+#[test]
+fn a_name_stated_as_several_values_writes_each_on_every_protocol() {
+    let scan = scan();
+    let key = key();
+    let mut wrong = Vec::new();
+    let kind_asked: BTreeSet<&str> = key["kind_asked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file.as_str().unwrap())
+        .collect();
+    for (file, want) in key["several"].as_object().unwrap() {
+        let want: BTreeSet<String> = want
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect();
+        if kind_asked.contains(file.as_str()) {
+            if !scan.leads.contains(file) {
+                wrong.push(format!("{file}: want a possible call, got none"));
+            }
+            continue;
+        }
+        let got = scan.named.get(file).cloned().unwrap_or_default();
+        if got != want {
+            wrong.push(format!("{file}: want {want:?}, got {got:?}"));
+        }
+    }
+    for file in key["unnamed"].as_array().unwrap() {
+        let file = file.as_str().unwrap();
+        if let Some(got) = scan.named.get(file) {
+            wrong.push(format!("{file}: want no fact row, got {got:?}"));
+        }
+        if !scan.leads.contains(file) {
+            wrong.push(format!("{file}: want a possible call, got none"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// `??=` and `||=` are placed writes (carrick#3504 S2b-4): a `let` written
-/// once states that value on every protocol; one written with a second value
-/// (`c-let-written`) or by `&&=` stays asked.
+/// once states that value on every protocol; one written by `&&=` stays
+/// asked.
 #[test]
 fn a_logical_assignment_writes_its_value_and_a_written_let_reads_every_value() {
     let scan = scan();
