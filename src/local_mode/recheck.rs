@@ -912,21 +912,10 @@ fn with_leads(
 /// file, only a function someone named counts: the callbacks the extractor
 /// names for itself (`it_handler`) are indexed but cannot be imported, so
 /// they are not reuse candidates.
-fn named_additions(
-    services: &[crate::config::Config],
-    repo: &Path,
-    relative: &str,
-    indexed: &std::collections::BTreeSet<String>,
-) -> Vec<super::contract::NewFunction> {
-    additions(services, repo, relative, indexed)
-        .into_iter()
-        .map(|(function, _)| function)
-        .collect()
-}
-
-/// [`named_additions`], each with the lookup the lead reads, from the same one
-/// parse: the definition's tokens and written return type, and the names its
-/// body calls (the call graph has not filled `calls` on a single parse).
+///
+/// Each comes with the lookup the lead reads, from the same one parse: the
+/// definition's tokens and written return type, and the names its body calls
+/// (the call graph has not filled `calls` on a single parse).
 fn additions(
     services: &[crate::config::Config],
     repo: &Path,
@@ -2346,8 +2335,8 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    fn names(found: Vec<super::super::contract::NewFunction>) -> Vec<String> {
-        found.into_iter().map(|f| f.name).collect()
+    fn names(found: Vec<Added>) -> Vec<String> {
+        found.into_iter().map(|(f, _)| f.name).collect()
     }
 
     /// Test sources are not in the index, so an edit to one adds nothing,
@@ -2370,7 +2359,7 @@ mod tests {
         let none = std::collections::BTreeSet::new();
         for file in ["src/a.test.ts", "tests/b.ts"] {
             assert_eq!(
-                names(named_additions(&services, dir.path(), file, &none)),
+                names(additions(&services, dir.path(), file, &none)),
                 Vec::<String>::new(),
                 "{file}"
             );
@@ -2393,7 +2382,7 @@ mod tests {
         let indexed: std::collections::BTreeSet<String> =
             ["kept".to_string()].into_iter().collect();
         assert_eq!(
-            names(named_additions(&services, dir.path(), "src/a.ts", &indexed)),
+            names(additions(&services, dir.path(), "src/a.ts", &indexed)),
             vec!["added".to_string()]
         );
     }

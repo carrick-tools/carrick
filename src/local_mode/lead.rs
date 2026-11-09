@@ -454,7 +454,7 @@ fn camel_words(token: &str) -> Vec<&str> {
     let mut words = Vec::new();
     let mut at = 0;
     let run = |from: usize, test: fn(&u8) -> bool| {
-        from + bytes[from..].iter().take_while(|b| test(*b)).count()
+        from + bytes[from..].iter().take_while(|b| test(b)).count()
     };
     while at < bytes.len() {
         let byte = bytes[at];
