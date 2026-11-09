@@ -11759,7 +11759,16 @@ impl FileOrchestrator {
                 // (SDK ops, bare identifiers, member expressions). Filtering at
                 // the producer keeps the uploaded cross-repo index clean, not
                 // just the local report.
-                if !crate::analyzer::is_valid_route_shape(&data_call.target) {
+                // A request summary's row is judged after the base it states
+                // (ruling R6): that base is the first piece of the URL the
+                // source writes, read where it ends, so a base built by a
+                // call is a base, not part of the route. Any other row's base
+                // is read back off its target text, which states no such
+                // boundary (`${base + path}/p`), and is judged whole.
+                let stated_base = data_call.base.as_ref().filter(|_| {
+                    data_call.resolution_source == Some(ResolutionSource::RequestSummary)
+                });
+                if !crate::analyzer::is_valid_call_target(&data_call.target, stated_base) {
                     debug!(
                         "Skipping data call with non-route target: {} ({})",
                         data_call.target, file_path
