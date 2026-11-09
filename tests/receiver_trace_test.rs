@@ -1754,6 +1754,40 @@ fn a_client_base_reads_through_the_resolver() {
     );
 }
 
+/// carrick#3504 S5b: a walk root's base follows the agreement the reader's
+/// makers take. A root whose receiver is written through
+/// (`api.defaults.baseURL = u`), or that sits beside an instance the walk
+/// could not read inside the code, no longer keeps its base; a root beside an
+/// entry point (a caller outside the code) does. Protocols: HTTP clients; a
+/// socket or broker URL is not a base joined to a name today (a gap).
+#[test]
+fn a_walk_roots_base_follows_the_readers_agreement() {
+    let on = scan_fixture("client-base-values");
+    let rows = call_rows(&on);
+    let paths = |file: &str| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.starts_with(&format!("src/{file}.ts:")))
+            .map(|row| row.split(' ').nth(1).unwrap_or_default().to_string())
+            .collect()
+    };
+    // Corrected from the root's base to no row.
+    for file in ["w-contested", "w-root-unread"] {
+        assert_eq!(paths(file), Vec::<String>::new(), "{file}: {rows:#?}");
+    }
+    // An entry point adds nothing: the root's base stands.
+    assert_eq!(
+        paths("w-entry-hole"),
+        vec!["https://m.test/p/w-entry-hole".to_string()],
+        "{rows:#?}"
+    );
+    // Pins: a root nothing writes through keeps its base.
+    assert_eq!(
+        paths("w-lit"),
+        vec!["https://m.test/p/w-lit".to_string()],
+        "{rows:#?}"
+    );
+}
+
 /// carrick#3527 S5: a client made in a field of a class a sibling service
 /// declares is read where it is made, so the call that runs it in this
 /// service states the client's base. The site stands at this service's call.

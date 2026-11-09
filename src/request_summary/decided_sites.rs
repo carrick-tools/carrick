@@ -3537,8 +3537,19 @@ fn made_base(
             )
         })
         .collect();
+    instance_base(bases, site.contested)
+}
+
+/// One instance's base, from the bases of its makers and whether the code
+/// may change it after the maker (carrick#3504 S5b): the one agreement the
+/// library-site reader's makers and an instance walk's roots both take. A
+/// base the code states is kept only where nothing in the code may change
+/// it: the reader's `contested` (a use of the instance that writes through
+/// it), a write through a walk root's receiver, or an instance the walk
+/// could not read inside the code (R1, D6).
+fn instance_base(bases: impl IntoIterator<Item = MadeBase>, may_change: bool) -> MadeBase {
     match agreed_base(bases) {
-        MadeBase::Text(_) if site.contested => MadeBase::Unstated,
+        MadeBase::Text(_) if may_change => MadeBase::Unstated,
         base => base,
     }
 }
@@ -3546,16 +3557,26 @@ fn made_base(
 /// The base a site's instance was made with, read at the labelled maker
 /// calls its instance walk ends at (carrick#3488): where the library-site
 /// reader holds no instance for the call (a parameter, a constructor
-/// parameter property). Each root gives its maker's base and a hole gives
-/// nothing: one known instance that states its base is that base, roots
-/// that disagree are `Unstated`, and no root is `None`. A walk root carries
-/// no record of uses that may change the base (the reader's `contested`):
-/// it is read as made.
+/// parameter property). Each root gives its maker's base. A hole outside the
+/// code (an entry point, a callback parameter, a value from outside the
+/// service) adds nothing; a hole inside it that the walk could not read
+/// (`Unread`, `RunsByLibrary`, `CallbackOption`) may hold another base, so a
+/// stated base is dropped (carrick#3504 S5b, R1). Roots that disagree are
+/// `Unstated`, and no root is `None`. `receiver_written` is whether the
+/// code writes through the site's own receiver (`api.defaults.baseURL = u`),
+/// the walk root's `contested`.
 fn walked_base(
     instances: &[InstanceEnd],
     exports: &[crate::library_claims::ExportClaims],
+    receiver_written: bool,
     reads: &mut BaseReads<'_, '_>,
 ) -> MadeBase {
+    let unread_in_code = instances.iter().any(|end| {
+        matches!(
+            end.hole(),
+            Some(InstanceHole::Unread | InstanceHole::RunsByLibrary | InstanceHole::CallbackOption)
+        )
+    });
     let bases: Vec<MadeBase> = instances
         .iter()
         .filter_map(|end| {
@@ -3587,7 +3608,30 @@ fn walked_base(
             )
         })
         .collect();
-    agreed_base(bases)
+    instance_base(bases, receiver_written || unread_in_code)
+}
+
+/// Whether the code writes through the receiver of the call at `site`
+/// (`api.defaults.baseURL = u` where the call is `api.get(…)`), read from the
+/// write census at the receiver name's span. Only a call whose receiver is a
+/// plain name is read: a field (`this.api`) is a named gap.
+fn receiver_written(
+    calls: &Calls<'_>,
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    site: &DecidedSite,
+) -> bool {
+    let file = root.join(&site.end.file);
+    let Some(placed) = calls.at_span(&file, site.end.span_start, site.end.span_end) else {
+        return false;
+    };
+    let Some(&(lo, hi, false)) = placed.call.receiver_spans.last() else {
+        return false;
+    };
+    inputs
+        .files
+        .get(placed.file)
+        .is_some_and(|ir| ir.written_through_at.contains(&(lo, hi)))
 }
 
 impl Decided {
@@ -3636,6 +3680,7 @@ impl Decided {
         siblings: &[&RequestSummaryInputs],
     ) -> BaseCarry {
         let mut fold = super::site_record::NameFold::new(inputs, siblings, root);
+        let calls = Calls::index(inputs);
         let mut reads = BaseReads {
             fold: &mut fold,
             root,
@@ -3667,7 +3712,10 @@ impl Decided {
                 Some(called) if matches!(called.receiver, super::SiteReceiver::Instance(_)) => {
                     made_base(called, exports, &mut reads)
                 }
-                _ => walked_base(&site.instances, exports, &mut reads),
+                _ => {
+                    let written = receiver_written(&calls, inputs, root, site);
+                    walked_base(&site.instances, exports, written, &mut reads)
+                }
             };
             match base {
                 MadeBase::None => true,
