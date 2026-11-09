@@ -53,6 +53,11 @@ export type SessionRecord = {
    * `check --changed` marker.
    */
   covered: Record<string, number>;
+  /**
+   * `root::<sorted operations>` for every clean or not-checked line Stop has
+   * printed: the same set of operations is named once per session.
+   */
+  said: string[];
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -95,6 +100,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     files: {},
     stated: {},
     covered: {},
+    said: [],
     updated: "",
   };
   const file = sessionFile(sessionId, home);
@@ -130,6 +136,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       ),
       stated: stamps(record.stated),
       covered: stamps(record.covered),
+      said: Array.isArray(record.said) ? record.said.filter((entry): entry is string => typeof entry === "string") : [],
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -302,6 +309,19 @@ export function markStated(sessionId: string, root: string, upTo: number, covere
   const current = readSession(sessionId, home);
   current.stated[root] = Math.max(upTo, current.stated[root] ?? 0);
   if (covered) current.covered[root] = Math.max(upTo, current.covered[root] ?? 0);
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** Whether Stop has already printed a clean or not-checked line for `key` in `root`. */
+export function wasSaid(sessionId: string, root: string, key: string, home?: string): boolean {
+  return readSession(sessionId, home).said.includes(`${root}::${key}`);
+}
+
+/** Remember that Stop printed the line for the operations under `key` in `root`. */
+export function markSaid(sessionId: string, root: string, key: string, home?: string): void {
+  const current = readSession(sessionId, home);
+  current.said.push(`${root}::${key}`);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

@@ -373,30 +373,46 @@ export function staleClause(stale: readonly string[], subject: string): string {
     : `${stale.length} services that read ${subject} were judged at their indexed version (${names}${more})`;
 }
 
+/** Operations a Stop line names before it counts the rest. */
+const MAX_NAMED_OPERATIONS = 3;
+
+/** One checked operation, as a clause: "GET /users/:id at api/users.ts:12". */
+function operationClause(item: CheckItem, where: string): string {
+  const op = `${item.method ?? ""} ${item.path ?? ""}`.trim();
+  const at = `${where}${item.line ? `:${item.line}` : ""}`;
+  return item.kind === "call" ? `a call to ${op} at ${at}` : `${op} at ${at}`;
+}
+
+/** Up to three clauses, then "and N more". */
+function namedOperations(clauses: readonly string[]): string {
+  const shown = clauses.slice(0, MAX_NAMED_OPERATIONS).join("; ");
+  const more = clauses.length - MAX_NAMED_OPERATIONS;
+  return more > 0 ? `${shown}; and ${more} more` : shown;
+}
+
 /**
- * The Stop hook's one line for a change whose every edited file a per-file
- * re-check answered after its last edit (carrick#3466), worded with the
- * clauses `headline` uses, then the problem and moved lines of `fresh`: the
- * answers this Stop delivers (the others were printed when they landed).
+ * The Stop hook's words for a change whose every edited file a per-file
+ * re-check answered after its last edit (carrick#3466). It speaks only with
+ * something to say:
+ * - problems: a header and the problem and moved lines of `fresh` (the
+ *   answers this Stop delivers; the others were printed when they landed);
+ * - judged operations with no problem: one line naming them;
+ * - operations whose types were not checked: one line naming them and why;
+ * - no route or call in any edited file: nothing.
+ * `key` is the sorted list of the operations a clean or not-checked line
+ * names, so the caller prints the same set once; null when problems print.
  */
 export function sessionCheckedLines(
-  results: readonly CheckResult[],
+  covered: ReadonlyArray<{ result: CheckResult; where: string }>,
   fresh: ReadonlyArray<{ result: CheckResult; where: string }>,
-): string {
+): { text: string; key: string | null } {
+  const results = covered.map((entry) => entry.result);
   const files = results.length;
   const services = [...new Set(results.map((result) => result.service).filter((s): s is string => Boolean(s)))];
-  const problems = results.reduce((total, result) => total + problemItems(result).length, 0);
-  const unjudged = results.find((result) => (result.items ?? []).length > 0 && !judgedAnyPair(result));
-  const tail =
-    problems > 0
-      ? `${problems} contract ${problems === 1 ? "problem" : "problems"}`
-      : unjudged
-        ? `types were not checked (${notJudgedReason(unjudged)}), so no contract verdict`
-        : results.some(judgedAnyPair)
-          ? "no contract problem"
-          : `no route or call in ${files === 1 ? "it" : "them"}`;
   const where = services.length > 0 ? ` (${services.join(", ")})` : "";
-  const lines = [`Carrick checked the ${files} ${files === 1 ? "file" : "files"} this session edited${where}: ${tail}.`];
+  const problems = results.reduce((total, result) => total + problemItems(result).length, 0);
+
+  const lines: string[] = [];
   for (const { result, where: file } of fresh) {
     if (result.deleted) lines.push(deletedLine(result, file));
     const found = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
@@ -405,7 +421,46 @@ export function sessionCheckedLines(
     if (hidden > 0) lines.push(`- and ${hidden} more: \`carrick check ${file}\` lists them.`);
     lines.push(...movedLines(result));
   }
-  return lines.join("\n");
+  if (problems > 0 || lines.length > 0) {
+    const tail = problems > 0 ? `${problems} contract ${problems === 1 ? "problem" : "problems"}` : "this change affects other code";
+    return {
+      text: [`Carrick checked the ${files} ${files === 1 ? "file" : "files"} this session edited${where}: ${tail}.`, ...lines].join("\n"),
+      key: null,
+    };
+  }
+
+  type Named = { clause: string; id: string };
+  const judged: Named[] = [];
+  const unjudged: Named[] = [];
+  let unjudgedResult: CheckResult | undefined;
+  for (const { result, where: file } of covered) {
+    const named = (item: CheckItem): Named => ({
+      clause: operationClause(item, file),
+      id: `${file}|${item.kind}|${item.method ?? ""}|${item.path ?? ""}`,
+    });
+    const items = result.items ?? [];
+    if (judgedAnyPair(result)) {
+      judged.push(...items.filter((item) => item.verdict?.state === "resolved" && item.verdict.result != null).map(named));
+    } else if (items.length > 0) {
+      unjudged.push(...items.map(named));
+      unjudgedResult ??= result;
+    }
+  }
+  const out: string[] = [];
+  const noun = (n: number) => `${n} ${n === 1 ? "operation" : "operations"}`;
+  if (judged.length > 0) {
+    out.push(
+      `Carrick checked the ${noun(judged.length)} this session changed (${namedOperations(judged.map((n) => n.clause))}): both sides agree.`,
+    );
+  }
+  if (unjudged.length > 0) {
+    out.push(
+      `Carrick found the ${noun(unjudged.length)} this session changed (${namedOperations(unjudged.map((n) => n.clause))}) but did not check their types (${notJudgedReason(unjudgedResult!)}), so there is no contract verdict.`,
+    );
+  }
+  if (out.length === 0) return { text: "", key: null };
+  const key = [...judged, ...unjudged].map((n) => n.id).sort().join("\n");
+  return { text: out.join("\n"), key };
 }
 
 /**
@@ -415,6 +470,15 @@ export function sessionCheckedLines(
 export function notCoveredLine(gaps: ReadonlyArray<{ file: string; reason: string }>): string {
   const named = gaps.map((gap) => `${gap.file}: ${gap.reason.trim().replace(/\.+$/, "")}`).join("; ");
   return `Carrick did not check the whole change: ${named}. A background \`carrick check --changed\` is queued; its answer comes with the next Carrick line.`;
+}
+
+/**
+ * The Stop hook's line when the whole-change check it waited for did not
+ * answer inside the wait: the files not checked, and the command that does.
+ */
+export function notFinishedLine(gaps: ReadonlyArray<{ file: string; reason: string }>): string {
+  const named = gaps.map((gap) => `${gap.file}: ${gap.reason.trim().replace(/\.+$/, "")}`).join("; ");
+  return `Carrick could not finish checking this session's change in time: ${named}. Run \`carrick check --changed\` to see the answer.`;
 }
 
 /** What a background `check --changed` answered, for the next carrier. */
