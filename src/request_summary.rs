@@ -1631,6 +1631,10 @@ pub struct FileIr {
     /// (`api.defaults.baseURL = u` names `api`), from the one write census
     /// ([`resolve::module_bindings`], carrick#3504 S5b).
     written_through_at: HashSet<(u32, u32)>,
+    /// The write census's verdict on every binding of the module, for a
+    /// local the binding table does not hold ([`resolve::PlacedWrites`],
+    /// carrick#3504 S7b-1).
+    placed_writes: resolve::PlacedWrites,
     /// Where this file starts in the discovery source map
     /// ([`Self::swc_start`]).
     source_start: u32,
@@ -2468,6 +2472,7 @@ pub fn extract_file_ir(
             file.module_bindings,
             file.kept_imports,
             file.written_through_at,
+            file.placed_writes,
         ) = resolve::module_bindings(module, source_map, &reader, &scope, &file.functions);
     }
     // What a row stated in another module needs to say about a client's

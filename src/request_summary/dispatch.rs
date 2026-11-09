@@ -721,6 +721,54 @@ mod tests {
         );
     }
 
+    fn subjects_fixture() -> Option<Walked> {
+        walked("dispatch-subjects", ".", "web", &[], true)
+    }
+
+    /// carrick#3504 S7b-1: a binding the handler sets (`let path; path =
+    /// req.url`) or a constant holding a `??` with one readable arm is the
+    /// request's path, read through every value written to it. The helper
+    /// that returns the member, a normalised `let`, a `split` and a field of
+    /// a class the handler constructs stay as they were.
+    #[test]
+    fn a_compared_binding_reads_every_value_written_to_it() {
+        let Some(on) = subjects_fixture() else {
+            return;
+        };
+        let got = records_of(&on, &claims(|_| {}), HoleReach::Nested);
+        // Each comparison's file, and whether its record asks the model.
+        let mut stands: std::collections::BTreeMap<String, bool> = Default::default();
+        for record in got["records"].as_array().unwrap() {
+            for c in record["comparisons"].as_array().unwrap() {
+                let file = c["at"].as_str().unwrap().split(':').next().unwrap();
+                let asked = record["asked"].as_array().unwrap().contains(&c["id"]);
+                stands.insert(file.trim_start_matches("src/").to_string(), asked);
+            }
+        }
+        let settled = [
+            "s-coalesce.ts",
+            "s-const-local.ts",
+            "s-direct.ts",
+            "s-imported-route.ts",
+            "s-let-later.ts",
+            "s-method-alias.ts",
+            "s-named-handler.ts",
+            "s-reexport.ts",
+            "s-route-table.ts",
+        ];
+        let asked = ["s-helper-return.ts", "s-let-normalised.ts", "s-split.ts"];
+        for file in settled {
+            assert_eq!(stands.get(file), Some(&false), "{file}: {stands:?}");
+        }
+        for file in asked {
+            assert_eq!(stands.get(file), Some(&true), "{file}: {stands:?}");
+        }
+        // The class the handler constructs compares outside the handler:
+        // no record holds it.
+        assert!(!stands.contains_key("s-this-field.ts"), "{stands:?}");
+        assert_eq!(stands.len(), settled.len() + asked.len(), "{stands:?}");
+    }
+
     /// What the answer key is written against: today's chains and
     /// discovery's sites on the fixture, and this pass's output.
     #[test]
