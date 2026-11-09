@@ -1,0 +1,9 @@
+{
+  "name": "pr-empty-answer-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "role-fetcher": "^1.0.0",
+    "role-server": "^1.0.0"
+  }
+}
