@@ -3278,7 +3278,7 @@ fn decide(
                             }
                             None => composed::compose_ways(
                                 &site.instances,
-                                &route_ways(site, labels, &calls, root),
+                                &route_ways(site, labels, &calls, root, &mut fold),
                                 &mounts,
                             ),
                         }
@@ -3353,11 +3353,18 @@ fn decide(
 /// ([`instances::whole_ways`], carrick#2386), for a site whose name is not
 /// text. Only where the site is the labelled call itself: a name composed
 /// down a chain of calls is read as it was.
+///
+/// Where the call's own reading states no way, the value resolver reads the
+/// slot ([`super::site_record::NameFold::arg_texts`], carrick#3191): a local
+/// or a module constant holding a default (`at ?? "/x"`, `const { at = "/x" }
+/// = opts`) and text joined with one (`${at}/:id`). Each text it states is a
+/// path the route is served at; a way it cannot read adds nothing, as here.
 fn route_ways(
     site: &DecidedSite,
     labels: &[SiteLabel],
     calls: &Calls<'_>,
     root: &Path,
+    fold: &mut super::site_record::NameFold<'_>,
 ) -> Vec<String> {
     let at_end = site.file == site.end.file
         && site.span_start == site.end.span_start
@@ -3376,7 +3383,34 @@ fn route_ways(
     ) else {
         return Vec::new();
     };
-    instances::whole_ways(&placed, &(slot.arg, slot.key.clone()))
+    let ways = instances::whole_ways(&placed, &(slot.arg, slot.key.clone()));
+    if !ways.is_empty() {
+        return ways;
+    }
+    let Some(super::resolve::ArgTexts::Values(values)) = fold.arg_texts(
+        &site.end.file,
+        (site.end.span_start, site.end.span_end),
+        slot.arg,
+        slot.key.as_deref(),
+    ) else {
+        return Vec::new();
+    };
+    // A name written again may hold a value no reader states at the call:
+    // its first value is no way the route is served.
+    if values
+        .iter()
+        .any(|value| matches!(value, TextValue::Hole(super::HoleReason::Reassigned)))
+    {
+        return Vec::new();
+    }
+    let texts: BTreeSet<String> = values
+        .into_iter()
+        .filter_map(|value| match value {
+            TextValue::Text { text, .. } if !text.is_empty() => Some(text),
+            _ => None,
+        })
+        .collect();
+    texts.into_iter().collect()
 }
 
 /// Where the request summaries state each request's rows

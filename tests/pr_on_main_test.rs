@@ -3051,29 +3051,13 @@ async fn seed_http_edit_under_prefix() {
 }
 
 /// A route's path moves into an option whose default is the same path. The
-/// route is still served there, but the scan cannot read the path
-/// (carrick#3191), so main's row is missing from this run. That removal is
-/// inferred from a registration the PR rewrote into a path the scan cannot
-/// read, so no removed row is a fact (carrick#3222): a candidate, or none
-/// once the default is read.
+/// route is still served there, and the scan reads it at the default
+/// (carrick#3191): the delta is empty.
 #[tokio::test]
 async fn seed_http_path_into_option_default() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("http-path-into-option-default").await;
-    assert!(
-        delta_rows(&payload["delta"], "new_endpoints").is_empty(),
-        "{payload:#}"
-    );
-    for row in payload["delta"]["removed_endpoints"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
-        assert_eq!(
-            row["edge_source"], "candidate",
-            "a removal the PR's rewrite leaves unproven: {payload:#}"
-        );
-    }
+    assert_manifest_delta(&payload, "http-path-into-option-default");
 }
 
 /// Every removed row of the payload's delta is a fact: a removal whose

@@ -300,21 +300,25 @@ pub(in crate::request_summary) fn pattern_members(pattern: &ObjectPat) -> Vec<Pa
 impl PatternMember<'_> {
     /// What the bound name states as text: the member of `init` the key
     /// names, read where the property is written. A property with a default
-    /// is unread (`None`) until the names lowering reads `??`.
+    /// (`{ at = "/x" }`) is a choice, as `init.at ?? "/x"` is (carrick#3191):
+    /// the member, or the default.
     pub(in crate::request_summary) fn text(
         &self,
         init: &Expr,
         shift: &dyn Fn(u32) -> u32,
-    ) -> Option<ValueAt> {
-        if self.default.is_some() {
-            return None;
-        }
-        Some(ValueAt::Member {
+    ) -> ValueAt {
+        let member = ValueAt::Member {
             lo: shift(self.span.lo.0),
             hi: shift(self.span.hi.0),
             object: Box::new(text_of(init, shift)),
             key: Box::new(ValueAt::Lit(self.key.clone())),
-        })
+        };
+        match self.default {
+            Some(default) => ValueAt::Alt {
+                branches: vec![member, text_of(default, shift)],
+            },
+            None => member,
+        }
     }
 
     /// The member read `init.key` the property stands for, spanning the

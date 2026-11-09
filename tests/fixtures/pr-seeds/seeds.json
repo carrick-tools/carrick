@@ -301,8 +301,7 @@
         "conclusion": "success",
         "quiet": true,
         "rows": []
-      },
-      "known_miss": {"stage": "finding", "issues": ["carrick#3191"]}
+      }
     },
     {
       "name": "trpc-procedure-added",

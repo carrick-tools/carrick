@@ -162,7 +162,7 @@ impl From<VarDeclKind> for BindingKind {
 /// (carrick#3504 S1b, S2), with its initialiser read in the body's scope:
 /// the binding table takes it under the function's key, with the census's
 /// writes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalBinding {
     pub(super) key: BindingKey,
     /// The 1-based line its name is declared on.
@@ -833,7 +833,7 @@ pub(super) fn module_bindings(
                         writes: census.writes.get(&key).cloned().unwrap_or_default(),
                         unplaceable: census.is_unplaceable(&key),
                         kind: var.kind.into(),
-                        text: member.text(init, &identity),
+                        text: Some(member.text(init, &identity)),
                         entries_kept: false,
                         entries_handed: false,
                         handed: Vec::new(),
@@ -1466,6 +1466,11 @@ pub(super) struct ParamValues {
     /// default: what a call that omits the position states ([`text_of`],
     /// carrick#3504 S2b-2).
     pub(super) default_texts: Vec<(usize, ValueAt)>,
+    /// Each name a parameter binds with a default (`at = "/x"`, `{ at =
+    /// "/x" }`) that the body never writes, for the text reader
+    /// (carrick#3191): a choice of what a caller hands in, which the reader
+    /// does not state, and the default.
+    pub(super) defaulted_names: Vec<LocalBinding>,
 }
 
 /// The key a member read states: `.name` or `['name']`.
@@ -1929,10 +1934,22 @@ impl Reader<'_> {
         let mut out = ParamValues::default();
         let bound = guards::Bound::default();
         let identity = |lo: u32| lo;
+        let defaulted = |binding: &Ident, default: &Expr| {
+            (!scope.reassigned.contains(binding.sym.as_ref())).then(|| LocalBinding {
+                key: ident_key(binding),
+                line: self.source_map.lookup_char_pos(binding.span.lo).line as u32,
+                init: Vec::new(),
+                kind: BindingKind::Const,
+                text: Some(ValueAt::Alt {
+                    branches: vec![ValueAt::Unread, text_of(default, &identity)],
+                }),
+                reassigned: false,
+            })
+        };
         for (index, pat) in params.into_iter().enumerate() {
             let pattern = match pat {
                 Pat::Assign(assign) => {
-                    if matches!(&*assign.left, Pat::Ident(_)) {
+                    if let Pat::Ident(binding) = &*assign.left {
                         out.defaults.push((
                             index,
                             Vec::new(),
@@ -1940,6 +1957,8 @@ impl Reader<'_> {
                         ));
                         out.default_texts
                             .push((index, text_of(&assign.right, &identity)));
+                        out.defaulted_names
+                            .extend(defaulted(&binding.id, &assign.right));
                     }
                     &*assign.left
                 }
@@ -1983,6 +2002,7 @@ impl Reader<'_> {
                 if let Some(default) = default {
                     out.defaults
                         .push((index, vec![key], self.value_of(default, scope, &bound)));
+                    out.defaulted_names.extend(defaulted(binding, default));
                 }
             }
         }

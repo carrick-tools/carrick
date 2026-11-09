@@ -6017,6 +6017,7 @@ impl Reader<'_> {
             site: Some(self.site(function.span)),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
+            local_bindings: values.defaulted_names,
             param_functions,
             ..FnIr::default()
         };
@@ -6077,6 +6078,7 @@ impl Reader<'_> {
             site: Some(self.site(arrow.span)),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
+            local_bindings: values.defaulted_names,
             param_functions,
             ..FnIr::default()
         };
@@ -6221,7 +6223,7 @@ impl Reader<'_> {
                                     &guards::Bound::default(),
                                 ),
                                 kind: var.kind.into(),
-                                text: member.text(init, &|lo| lo),
+                                text: Some(member.text(init, &|lo| lo)),
                                 reassigned: reassigned.names.contains(name),
                             });
                         }
@@ -8281,16 +8283,19 @@ impl Visit for CallWalker<'_, '_, '_> {
             && let Some(object) = resolve::plain_object_target(target)
         {
             for member in resolve::pattern_members(object) {
-                let read = member.read(&assign.right);
-                if let Some(text) = member.text(&assign.right, &|lo| lo) {
-                    self.ir.binding_writes.push(resolve::BindingWrite {
-                        at: member.span.lo.0,
-                        values: self
-                            .reader
-                            .value_of(&read, self.scope, &guards::Bound::default()),
-                        text,
-                    });
+                // A key with a default writes no placed value: the values
+                // readers read the member alone (carrick#3504 S2b-5).
+                if member.default.is_some() {
+                    continue;
                 }
+                let read = member.read(&assign.right);
+                self.ir.binding_writes.push(resolve::BindingWrite {
+                    at: member.span.lo.0,
+                    values: self
+                        .reader
+                        .value_of(&read, self.scope, &guards::Bound::default()),
+                    text: member.text(&assign.right, &|lo| lo),
+                });
             }
         }
         assign.visit_children_with(self);

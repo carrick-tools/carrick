@@ -1,0 +1,8 @@
+{
+  "name": "receiver-route-default-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-router": "^1.0.0"
+  }
+}

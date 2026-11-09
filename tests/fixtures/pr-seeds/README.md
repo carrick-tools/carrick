@@ -85,7 +85,7 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `non-code-edit` | adds `docs/orders.md` | empty delta, no finding | passes |
 | `http-prefix-moved` (`rpc-api`) | sub-app mount `/api/v1` to `/api/v2` | delta new `/api/v2/reports/daily`, removed `/api/v1/...` | passes |
 | `http-edit-under-prefix` (`rpc-api`) | a handler body under the mounted prefix | empty delta | passes |
-| `http-path-into-option-default` (`rpc-api`) | `/reports/daily` moves into a destructured option whose default is the same path (`src/server.ts:7`) | no new row; any removed row is `edge_source: candidate` | passes; the correct check waits on carrick#3191 |
+| `http-path-into-option-default` (`rpc-api`) | `/reports/daily` moves into a destructured option whose default is the same path (`src/server.ts:7`) | empty delta | passes |
 | `trpc-procedure-added`, `-removed`, `-renamed` (`rpc-api`) | `orders.cancel` added, `orders.create` removed, `create` to `place` | delta under the adapter's endpoint (`POST /api/trpc/orders.cancel`) | passes |
 | `trpc-resolver-body` (`rpc-api`) | a mutation's body | empty delta, no introduced risk | passes |
 | `trpc-adapter-prefix-moved` (`rpc-api`) | the adapter's endpoint `/api/trpc` to `/trpc` | every procedure new under `/trpc`, removed under `/api/trpc` | passes |
