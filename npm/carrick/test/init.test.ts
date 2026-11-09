@@ -444,6 +444,9 @@ test("the hook entries land beside everything else the settings file holds", () 
   assert.equal(written.hooks.PostToolUse[1].matcher, "Read");
   assert.equal(written.hooks.PostToolUse[1].hooks[0].command, "carrick hook post-read");
   assert.equal(written.hooks.PostToolUse[1].hooks[0].timeout, 5);
+  // The same answer for a file a shell command reads.
+  assert.equal(written.hooks.PostToolUse[2].matcher, "Bash");
+  assert.equal(written.hooks.PostToolUse[2].hooks[0].command, "carrick hook post-bash");
   // The end-of-task re-check wait (carrick#3198). Installed beside the other
   // two rather than by anything the user has to add.
   assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop --wait-s 200");
@@ -538,7 +541,7 @@ test("an entry of ours that has moved on is replaced, not duplicated", () => {
   const commands = written.hooks.PostToolUse.flatMap((group: { hooks: Array<{ command: string }> }) =>
     group.hooks.map((entry) => entry.command),
   );
-  assert.deepEqual(commands, ["eslint --fix", "carrick hook post-edit", "carrick hook post-read"]);
+  assert.deepEqual(commands, ["eslint --fix", "carrick hook post-edit", "carrick hook post-read", "carrick hook post-bash"]);
 });
 
 test("a settings file that is not JSON is reported, never overwritten", () => {
@@ -577,7 +580,7 @@ test("an absolute hook command is written, and is still recognised as ours", () 
 
   // The same workspace, now with carrick installed globally: one entry, not two.
   const rewritten = JSON.parse(mergeCarrickHooks(JSON.stringify(written, null, 2)).body);
-  assert.equal(rewritten.hooks.PostToolUse.length, 2);
+  assert.equal(rewritten.hooks.PostToolUse.length, 3);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks.length, 1);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
   assert.equal(rewritten.hooks.SessionStart.length, 1);
@@ -610,6 +613,7 @@ test("a quoted absolute hook command is ours too, and a lookalike is not", () =>
     "carrickctl hook post-edit",
     "carrick hook post-edit",
     "carrick hook post-read",
+    "carrick hook post-bash",
   ]);
 });
 

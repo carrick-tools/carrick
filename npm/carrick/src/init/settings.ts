@@ -91,6 +91,12 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
         matcher: "Read",
         hooks: [{ type: "command", command: `${command} hook post-read`, timeout: 5 }],
       },
+      // The same answer for a file a shell command reads (`sed -n`, `cat`,
+      // `git show ref:path`), where the Read tool never fires.
+      {
+        matcher: "Bash",
+        hooks: [{ type: "command", command: `${command} hook post-bash`, timeout: 5 }],
+      },
     ],
     // No matcher: a resumed, cleared or compacted session has lost the map and
     // re-orients for one read of the index.

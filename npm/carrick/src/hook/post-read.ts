@@ -15,20 +15,16 @@
 
 import { readStdin } from "./stdin.ts";
 import path from "node:path";
-import { check } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { renderPostRead } from "../render.ts";
-import { resolveRoot, rootNote } from "../root.ts";
-import { markRead, markTold, toldKey, wasRead } from "./reuse.ts";
+import { wasRead } from "./reuse.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate } from "./late.ts";
+import { answerRead } from "./read-answer.ts";
 
 const log = createLogger("carrick-hook");
 /** The files the index has rows for. */
 const CHECKED = /\.(ts|tsx|mts|cts)$/;
-/** The limit on the one check, unless the caller set its own. */
-const CHECK_TIMEOUT_MS = "2000";
 
 type Payload = {
   cwd?: string;
@@ -71,32 +67,8 @@ async function main(): Promise<void> {
   const file = path.isAbsolute(named) ? named : path.resolve(payload.cwd ?? process.cwd(), named);
   if (session && wasRead(session, file)) return emit(late);
 
-  const choice = resolveRoot({
-    clientRoot: payload.cwd ?? null,
-    projectDir: process.env["CLAUDE_PROJECT_DIR"] ?? null,
-    filePath: file,
-  });
-  const note = rootNote(choice);
-  if (note) log(note);
-
-  const relative = path.relative(choice.root, file);
-  const env = { ...process.env, CARRICK_TIMEOUT_MS: process.env["CARRICK_TIMEOUT_MS"] ?? CHECK_TIMEOUT_MS };
-  const outcome = await check(relative, { cwd: choice.root, env });
-  // Asked once: an error or a timeout is not asked again on the next Read.
-  if (session) markRead(session, file);
-  if (!outcome.result) {
-    log("no answer for", relative, outcome.failure ?? "");
-    return emit(late);
-  }
-
-  const context = renderPostRead(outcome.result, relative);
-  log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${outcome.ms}ms`);
+  const context = await answerRead(file, payload.cwd, session);
   emit(context ? [...late, context] : late);
-  // The post-edit hook that follows prints this file's header and items but
-  // not the uses lines it was just shown.
-  if (session && outcome.result.uses_lines?.length) {
-    markTold(session, [toldKey(outcome.result, relative)]);
-  }
 }
 
 await main();
