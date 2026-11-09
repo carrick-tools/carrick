@@ -50,7 +50,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::decided_sites::Calls;
 use super::library_sites::{LinkedNames, TextPiece, text_pieces};
-use super::resolve::ValueAt;
+use super::resolve::{Resolver, ValueAt, text_of};
 use super::{
     CallIr, CallWalker, FileIr, FnIr, ImportBinding, Piece, Reader, Reassigned,
     RequestSummaryInputs, Scope, Site, Value, keyed_names, member_prop, prop_name,
@@ -369,6 +369,15 @@ pub(super) enum GuardLiteral {
         /// The source text, kept when the constant does not read as text.
         written: String,
         constant: Option<Constant>,
+    },
+    /// A name, a member, or `+` / a template over them that neither reader
+    /// above states (a module `let`, text built over one), lowered where it
+    /// is written and read after the rows by the resolver's text reader
+    /// (carrick#3504 S7c).
+    Term {
+        term: ValueAt,
+        /// The source text, kept when the term does not read as one text.
+        written: String,
     },
 }
 
@@ -1544,8 +1553,28 @@ impl CallWalker<'_, '_, '_> {
     fn guard_literal(&self, expr: &Expr) -> Option<GuardLiteral> {
         match self.plain_literal(expr) {
             Some(text) => Some(GuardLiteral::Text(text)),
-            None => self.named_literal(expr),
+            None => self.named_literal(expr).or_else(|| self.term_literal(expr)),
         }
+    }
+
+    /// `expr` as a term the text reader reads after the rows (carrick#3504
+    /// S7c): a name, a member, or `+` / a template over them, where the
+    /// subject reader states no value the function was handed (its root is
+    /// a hole that is no binding the body sets).
+    fn term_literal(&self, expr: &Expr) -> Option<GuardLiteral> {
+        let shaped = match unwrap_expression(expr) {
+            Expr::Ident(_) | Expr::Member(_) | Expr::Tpl(_) => true,
+            Expr::Bin(bin) => bin.op == BinaryOp::Add,
+            _ => false,
+        };
+        let subject = self.reader.subject(expr, self.scope, &self.guard.bound);
+        if !shaped || !matches!(subject.root, Root::Hole(_)) || subject.binding.is_some() {
+            return None;
+        }
+        Some(GuardLiteral::Term {
+            term: text_of(expr, &|lo| lo),
+            written: self.reader.text(expr.span()),
+        })
     }
 
     /// Which operand of a comparison is its literal, and the other, the
@@ -1567,7 +1596,12 @@ impl CallWalker<'_, '_, '_> {
             (None, None) => match (self.named_literal(left), self.named_literal(right)) {
                 (Some(named), None) => Some((named, right)),
                 (None, Some(named)) => Some((named, left)),
-                _ => None,
+                (Some(_), Some(_)) => None,
+                (None, None) => match (self.term_literal(left), self.term_literal(right)) {
+                    (Some(term), None) => Some((term, right)),
+                    (None, Some(term)) => Some((term, left)),
+                    _ => None,
+                },
             },
         }
     }
@@ -2017,6 +2051,8 @@ pub(super) struct Chains<'a> {
     /// What each constant a guard or a call argument names reads as, with
     /// every module's uses of it known.
     names: LinkedNames<'a>,
+    /// What a [`GuardLiteral::Term`] reads as: the resolver's text reader.
+    resolver: Resolver<'a>,
     pub(super) nodes: Vec<Node<'a>>,
     /// (file, span start, span end) of each call -> (node, call index).
     calls: HashMap<(&'a Path, u32, u32), (usize, usize)>,
@@ -2073,6 +2109,7 @@ impl<'a> Chains<'a> {
             inputs,
             root,
             names: LinkedNames::link(&inputs.files, &inputs.bindings, inputs.links.as_ref()),
+            resolver: Resolver::new(inputs, &[]),
             nodes: Vec::new(),
             calls: HashMap::new(),
             constructions: HashMap::new(),
@@ -2239,6 +2276,17 @@ impl<'a> Chains<'a> {
                 }
                 None => (written.clone(), GuardShape::Unresolved, constant.clone()),
             },
+            // Exactly one text is the literal; several, or a hole, keep the
+            // term as written (carrick#3504 S7c).
+            GuardLiteral::Term { term, written } => {
+                match self.resolver.text_of_value(self.nodes[node].file, term) {
+                    Some(text) => {
+                        let shape = shape_of(&text);
+                        (text, shape, None)
+                    }
+                    None => (written.clone(), GuardShape::Unresolved, None),
+                }
+            }
         }
     }
 
