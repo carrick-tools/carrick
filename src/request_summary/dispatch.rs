@@ -756,7 +756,9 @@ mod tests {
             "s-let-later.ts",
             "s-method-alias.ts",
             "s-named-handler.ts",
+            "s-module-let.ts",
             "s-reexport.ts",
+            "s-route-let.ts",
             "s-route-table.ts",
         ];
         let asked = ["s-helper-return.ts", "s-let-normalised.ts", "s-split.ts"];
@@ -769,7 +771,51 @@ mod tests {
         // The class the handler constructs compares outside the handler:
         // no record holds it.
         assert!(!stands.contains_key("s-this-field.ts"), "{stands:?}");
+        // A `let` the module sets again states no one route (S7c's control).
+        assert!(!stands.contains_key("s-route-let-written.ts"), "{stands:?}");
         assert_eq!(stands.len(), settled.len() + asked.len(), "{stands:?}");
+    }
+
+    /// carrick#3504 S7c: a route compared with a module `let`, or with text
+    /// built over one, is the one text the resolver's text reader states.
+    /// A `let` the module sets again to another route states two, and the
+    /// comparison stays unresolved: no record holds it.
+    #[test]
+    fn a_compared_constant_the_text_reader_states_is_its_text() {
+        let Some(on) = subjects_fixture() else {
+            return;
+        };
+        let got = records_of(&on, &claims(|_| {}), HoleReach::Nested);
+        let mut literals: std::collections::BTreeMap<String, (String, bool)> = Default::default();
+        for record in got["records"].as_array().unwrap() {
+            for c in record["comparisons"].as_array().unwrap() {
+                let file = c["at"].as_str().unwrap().split(':').next().unwrap();
+                let asked = record["asked"].as_array().unwrap().contains(&c["id"]);
+                literals.insert(
+                    file.trim_start_matches("src/").to_string(),
+                    (c["literal"].as_str().unwrap().to_string(), asked),
+                );
+            }
+        }
+        for (file, route) in [
+            ("s-route-let.ts", "/s-route-let"),
+            ("s-module-let.ts", "/s-module-let"),
+        ] {
+            assert_eq!(
+                literals.get(file),
+                Some(&(route.to_string(), false)),
+                "{file}: {literals:?}"
+            );
+        }
+        assert!(
+            !literals.contains_key("s-route-let-written.ts"),
+            "{literals:?}"
+        );
+        assert!(
+            got["not_attached"]["unresolved_constant"].as_u64() >= Some(1),
+            "{}",
+            got["not_attached"]
+        );
     }
 
     /// What the answer key is written against: today's chains and

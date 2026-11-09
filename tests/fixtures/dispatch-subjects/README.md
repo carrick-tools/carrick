@@ -19,4 +19,5 @@ Answer key (`a_compared_binding_reads_every_value_written_to_it`, in
 | `s-split` | `(req.url ?? "/").split("?")[0]` | asked |
 | `s-helper-return` | an own helper returns the member | asked |
 | `s-this-field` | `this.req.url` in a class the handler constructs | in no record (the comparison is outside the handler) |
-| `s-route-let`, `s-module-let` | the literal side is a module `let` | no comparison is stated (follow-up S7c) |
+| `s-route-let`, `s-module-let` | the literal side is a module `let`, or text built over one, read by the text reader (S7c, `a_compared_constant_the_text_reader_states_is_its_text`) | settled |
+| `s-route-let-written` | the module `let` is set again to another route | in no record (two texts: the literal stays unresolved) |
