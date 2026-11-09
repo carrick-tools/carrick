@@ -3616,6 +3616,30 @@ async fn seed_route_added_in_unparseable_file() {
     );
 }
 
+/// The conflict sits on a registration's own line, so main's row on the
+/// replaced line is not listed as removed: the file is named `does_not_parse`
+/// with that operation in it.
+#[tokio::test]
+async fn seed_route_line_replaced_by_conflict() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("route-line-replaced-by-conflict").await;
+    assert_delta(&payload, &[], &[]);
+    let files = payload["delta"]["files_not_read"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no files_not_read: {payload:#}"));
+    assert_eq!(files.len(), 1, "one file: {payload:#}");
+    assert_eq!(files[0]["file"], "src/admin.ts", "{payload:#}");
+    assert_eq!(files[0]["reason"], "does_not_parse", "{payload:#}");
+    assert!(
+        files[0]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op["path"] == "/api/v1/admin/orders"),
+        "the replaced registration is named: {payload:#}"
+    );
+}
+
 // ---- Non-HTTP negatives (carrick#3172) ---------------------------------
 //
 // An ordinary change to a GraphQL, socket or pub/sub operation: no risk the

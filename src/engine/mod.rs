@@ -31622,6 +31622,53 @@ io.on("bare:in", (event) => {});
         );
     }
 
+    /// A conflict on a registration's own line leaves the file unparsed at
+    /// head. Main's row on the replaced line is named with the file
+    /// (`does_not_parse`), never listed as removed; in a file this scan read,
+    /// the same replacement still lists the removal.
+    #[test]
+    fn a_removal_in_an_unparsed_file_is_named_not_listed() {
+        use crate::findings::FileNotReadReason;
+        const THIS: &str = "0.4.0";
+        let (repo, base) =
+            crate::git_state::tests::committed_repo(&[("src/routes.ts", "a\nb\nc\nd\n")]);
+        std::fs::write(repo.path().join("src/routes.ts"), "changed\nb\nc\nd\n").unwrap();
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let mut stored = service_stating("web", Some(THIS), &["/users"]);
+        stored.commit_hash = base.clone();
+        let DeltaBaseline::Keys(previous) = DeltaBaseline::of([&stored], THIS) else {
+            panic!("this version's index is the baseline");
+        };
+        let current = [service_stating("web", Some(THIS), &[])];
+        let delta_with = |sources: &[UnreadSource]| {
+            anchored_delta(
+                &repo_path,
+                Some(&base),
+                &previous,
+                &current,
+                &[],
+                None,
+                &[],
+                sources,
+            )
+            .expect("the diff reads")
+        };
+        let read = delta_with(&[]);
+        assert_eq!(read.removed_endpoints.len(), 1, "{read:?}");
+        assert!(read.files_not_read.is_empty(), "{read:?}");
+        let unparsed = delta_with(&[UnreadSource {
+            place: crate::pr_delta_anchor::Place::parse(&Some("web".to_string()), "src/routes.ts"),
+            reason: FileNotReadReason::DoesNotParse,
+        }]);
+        assert!(unparsed.removed_endpoints.is_empty(), "{unparsed:?}");
+        assert_eq!(unparsed.files_not_read.len(), 1, "{unparsed:?}");
+        assert_eq!(
+            unparsed.files_not_read[0].reason,
+            FileNotReadReason::DoesNotParse
+        );
+        assert_eq!(unparsed.files_not_read[0].operations[0].path, "/users");
+    }
+
     /// carrick#3641: main holds `/users` as a real handler row in
     /// `src/routes.ts` and as a documentation row in `src/openapi.ts`. This
     /// scan keeps only the documentation row. The PR edits `src/routes.ts`
