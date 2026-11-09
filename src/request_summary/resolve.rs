@@ -696,6 +696,15 @@ impl Visit for WriteCensus {
     fn visit_ts_type(&mut self, _: &TsType) {}
 }
 
+/// What [`module_bindings`] returns: each binding by its line and name, the
+/// imports the module only reads a member of and never changes, and where a
+/// receiver is written through (carrick#3504 S5b).
+pub(super) type ModuleBindings = (
+    HashMap<(u32, String), ModuleBinding>,
+    HashSet<String>,
+    HashSet<(u32, u32)>,
+);
+
 /// Each module-scope binding a plain name declares, with its initialiser
 /// read in module scope and every write the census finds (carrick#3504 S1),
 /// each function's own `let` its body writes again, under the function's key
@@ -710,11 +719,7 @@ pub(super) fn module_bindings(
     reader: &Reader<'_>,
     scope: &Scope<'_>,
     functions: &HashMap<String, FnIr>,
-) -> (
-    HashMap<(u32, String), ModuleBinding>,
-    HashSet<String>,
-    HashSet<(u32, u32)>,
-) {
+) -> ModuleBindings {
     let mut census = WriteCensus::default();
     module.visit_with(&mut census);
     // Each import this module only reads a member of, and never changes: a
