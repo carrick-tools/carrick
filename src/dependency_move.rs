@@ -27,6 +27,17 @@
 //! from a package its files, its tests or its tsconfig chain name: hoisting
 //! makes a package any manifest declares importable everywhere, and a
 //! lockfile moves packages no manifest names.
+//!
+//! A name a manifest only declared again in another map is not re-specified
+//! (carrick#3622) when every map that declared it before still declares it,
+//! every spec it has is one string, the install root's lockfile lists it
+//! for that manifest unchanged at that specifier (the install did not move),
+//! and it was already in a runtime map (`dependencies`, `peerDependencies`,
+//! `optionalDependencies`) of that manifest (what the service may call out
+//! to did not move). Framework detection sends a service root manifest's
+//! `dependencies` and `devDependencies` by name, so when the map it entered
+//! is one of those, the name still moves each service rooted at that
+//! manifest's directory.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -61,6 +72,14 @@ const DEPENDENCY_MAPS: [&str; 4] = [
     "optionalDependencies",
 ];
 
+/// The manifest maps a package is installed for at run time: a name in one
+/// is what a service may call out to.
+const RUNTIME_MAPS: [&str; 3] = ["dependencies", "peerDependencies", "optionalDependencies"];
+
+/// The manifest maps framework detection sends, by name, from a service's
+/// root manifest (`framework_detector::extract_package_summary`).
+const DETECTION_MAPS: [&str; 2] = ["dependencies", "devDependencies"];
+
 /// The maps of an installed lockfile entry that name what it loads.
 const ENTRY_DEPENDENCY_MAPS: [&str; 3] =
     ["dependencies", "optionalDependencies", "peerDependencies"];
@@ -94,7 +113,9 @@ impl DependencyMove {
     /// rewrite of a root or workspace package, a lockfile that differs in
     /// nothing a service loads. Holds for every service (carrick#3126).
     pub fn moves_nothing(&self) -> bool {
-        self.roots.iter().all(|root| root.moved.is_empty())
+        self.roots
+            .iter()
+            .all(|root| root.moved.is_empty() && root.own.is_empty())
     }
 }
 
@@ -104,6 +125,10 @@ struct InstallRoot {
     dir: String,
     /// Each moved package, with the first changed file that moved it.
     moved: BTreeMap<String, String>,
+    /// Each name a manifest declared again into a map framework detection
+    /// sends, which moves only the services rooted at that manifest's
+    /// directory: (top-relative directory, name, manifest path).
+    own: Vec<(String, String, String)>,
     /// Each package name to the names its entries load, in either copy of
     /// the lockfile, every version merged.
     graph: HashMap<String, BTreeSet<String>>,
@@ -124,7 +149,7 @@ pub fn dependency_move(
         Some(commit) => crate::git_state::file_at_commit(repo_path, commit, path),
         None => std::fs::read_to_string(top.join(path)).ok(),
     };
-    let mut manifests: Vec<(&str, BTreeSet<String>)> = Vec::new();
+    let mut manifests: Vec<(&str, BTreeMap<String, Declarations>)> = Vec::new();
     // Each added manifest's path and package name (carrick#3622).
     let mut added_manifests: Vec<(&str, String)> = Vec::new();
     let mut locks: BTreeMap<&str, (&str, Lockfile, Lockfile)> = BTreeMap::new();
@@ -218,6 +243,7 @@ pub fn dependency_move(
         let mut root = InstallRoot {
             dir: dir.to_string(),
             moved: BTreeMap::new(),
+            own: Vec::new(),
             graph: HashMap::new(),
         };
         let no_importers = BTreeSet::new();
@@ -250,11 +276,31 @@ pub fn dependency_move(
             continue;
         }
         let dir = install_root(repo_path, top, to, path, &locks)?;
+        let (_, before_lock, after_lock) = locks.get(dir)?;
+        let manifest_dir = parent_of(path);
+        let importer = match dir {
+            "" => manifest_dir,
+            dir => manifest_dir.strip_prefix(dir)?.strip_prefix('/')?,
+        };
         let root = roots.get_mut(dir)?;
-        for package in moved {
-            root.moved
-                .entry(package)
-                .or_insert_with(|| path.to_string());
+        for (package, declarations) in moved {
+            // A name the lockfile entry diff moved stays moved; a
+            // workspace package's name is refused below.
+            let again = !workspace.contains_key(&package)
+                && declarations.declared_again().is_some_and(|spec| {
+                    let entry = before_lock.importer(importer, &package);
+                    entry.is_some()
+                        && entry == after_lock.importer(importer, &package)
+                        && entry.and_then(specifier) == Some(spec)
+                });
+            if !again {
+                root.moved
+                    .entry(package)
+                    .or_insert_with(|| path.to_string());
+            } else if declarations.entered(&DETECTION_MAPS) {
+                root.own
+                    .push((manifest_dir.to_string(), package, path.to_string()));
+            }
         }
     }
     if roots.values().any(|root| {
@@ -320,16 +366,54 @@ fn join(dir: &str, path: &str) -> String {
     }
 }
 
-/// The names a manifest re-specified in its dependency maps, or `None` when
-/// either copy is not a JSON object or they differ in anything but those
-/// maps and the top-level `version`.
-fn manifest_moves(before: &str, after: &str) -> Option<BTreeSet<String>> {
+/// One name's declarations in both copies of a manifest: each map that
+/// declares it, with its spec.
+#[derive(Debug, Default)]
+struct Declarations {
+    before: BTreeMap<&'static str, Value>,
+    after: BTreeMap<&'static str, Value>,
+}
+
+impl Declarations {
+    /// The one spec the name is declared at, when the change only declared
+    /// it again in another map: every map that declared it before declares
+    /// it at the same spec after, every spec it has after is that string,
+    /// and one map that declared it before is a runtime map.
+    fn declared_again(&self) -> Option<&str> {
+        if !self.before.keys().any(|map| RUNTIME_MAPS.contains(map))
+            || self
+                .before
+                .iter()
+                .any(|(map, spec)| self.after.get(map) != Some(spec))
+        {
+            return None;
+        }
+        let mut specs = self.after.values();
+        let spec = specs.next()?.as_str()?;
+        specs
+            .all(|other| other.as_str() == Some(spec))
+            .then_some(spec)
+    }
+
+    /// Whether the name entered one of `maps`.
+    fn entered(&self, maps: &[&str]) -> bool {
+        maps.iter()
+            .any(|map| self.after.contains_key(map) && !self.before.contains_key(map))
+    }
+}
+
+/// The names a manifest re-specified in its dependency maps, each with its
+/// declarations in both copies, or `None` when either copy is not a JSON
+/// object or they differ in anything but those maps and the top-level
+/// `version`.
+fn manifest_moves(before: &str, after: &str) -> Option<BTreeMap<String, Declarations>> {
     let (Value::Object(mut before), Value::Object(mut after)) = (
         serde_json::from_str::<Value>(before).ok()?,
         serde_json::from_str::<Value>(after).ok()?,
     ) else {
         return None;
     };
+    let mut maps = Vec::new();
     let mut moved = BTreeSet::new();
     for map in DEPENDENCY_MAPS {
         let (before, after) = (
@@ -337,10 +421,38 @@ fn manifest_moves(before: &str, after: &str) -> Option<BTreeSet<String>> {
             object_or_empty(after.remove(map))?,
         );
         moved.extend(differing_keys(&before, &after));
+        maps.push((map, before, after));
     }
     before.remove("version");
     after.remove("version");
-    (before == after).then_some(moved)
+    if before != after {
+        return None;
+    }
+    let mut declarations: BTreeMap<String, Declarations> = moved
+        .into_iter()
+        .map(|name| (name, Declarations::default()))
+        .collect();
+    for (map, before, after) in maps {
+        for (name, found) in declarations.iter_mut() {
+            if let Some(spec) = before.get(name) {
+                found.before.insert(map, spec.clone());
+            }
+            if let Some(spec) = after.get(name) {
+                found.after.insert(map, spec.clone());
+            }
+        }
+    }
+    Some(declarations)
+}
+
+/// What a lockfile importer dependency is specified at: npm records the
+/// spec itself, pnpm a `specifier` beside the resolved version.
+fn specifier(entry: &Value) -> Option<&str> {
+    match entry {
+        Value::String(spec) => Some(spec),
+        Value::Object(entry) => entry.get("specifier").and_then(Value::as_str),
+        _ => None,
+    }
 }
 
 /// A map value, `{}` when absent, `None` when it is not an object.
@@ -385,6 +497,18 @@ struct Lockfile {
 }
 
 impl Lockfile {
+    /// The importer `importer` (relative to the lockfile, `""` for its own
+    /// directory) lists `name` at: npm keys the root `""`, pnpm `.`.
+    fn importer(&self, importer: &str, name: &str) -> Option<&Value> {
+        let key = |importer: &str| (importer.to_string(), name.to_string());
+        self.importers.get(&key(importer)).or_else(|| {
+            importer
+                .is_empty()
+                .then(|| self.importers.get(&key(".")))
+                .flatten()
+        })
+    }
+
     /// The packages `after` moved: entries added, removed or changed, and
     /// importer dependencies re-specified. `added` names the importers of
     /// workspace packages the change added: each must be new in `after`, and
@@ -581,6 +705,20 @@ impl DependencyMove {
         inputs: &ServiceInputs,
         packages: impl FnOnce(&DependencyMove) -> BTreeSet<String>,
     ) -> DependencyReach {
+        // Framework detection reads the service root's manifest by name per
+        // map, whatever the service loads.
+        for root in &self.roots {
+            if let Some((_, package, file)) = root
+                .own
+                .iter()
+                .find(|(dir, _, _)| inputs.roots.iter().any(|root| root.dir == *dir))
+            {
+                return DependencyReach::Reaches {
+                    file: file.clone(),
+                    package: package.clone(),
+                };
+            }
+        }
         let holding: Vec<&InstallRoot> = self
             .roots
             .iter()
@@ -842,8 +980,11 @@ mod tests {
         let before = r#"{"name":"a","version":"1","dependencies":{"x":"1","y":"1"}}"#;
         let after =
             r#"{"name":"a","version":"2","dependencies":{"x":"2"},"devDependencies":{"y":"1"}}"#;
+        let names = |moved: BTreeMap<String, Declarations>| -> BTreeSet<String> {
+            moved.into_keys().collect()
+        };
         assert_eq!(
-            manifest_moves(before, after),
+            manifest_moves(before, after).map(names),
             Some(["x".to_string(), "y".to_string()].into())
         );
         for after in [
@@ -852,7 +993,7 @@ mod tests {
             r#"{"name":"a","version":"1","dependencies":[]}"#,
             "[]",
         ] {
-            assert_eq!(manifest_moves(before, after), None, "{after}");
+            assert!(manifest_moves(before, after).is_none(), "{after}");
         }
     }
 
