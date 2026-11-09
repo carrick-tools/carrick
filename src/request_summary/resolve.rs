@@ -1197,13 +1197,14 @@ pub(super) enum ValueAt {
         name: String,
         first: Vec<ValueAt>,
     },
-    /// The value at `key` of an object, read where a call's callee is
-    /// `object.key` and `object` is no parameter (carrick#2448): what
-    /// `object` may hold, each an object literal an in-repo factory returns
-    /// or a module binding holds. Only a call's callee carries it
-    /// ([`CallIr::callee_key`]); discovery reads it where the row names no
-    /// definition ([`Resolver::key_values`]). Not [`Self::Member`], which is
-    /// the text reader's.
+    /// The value at `key` of an object, read where a member `object.key` is
+    /// held as a value and `object` is no parameter (carrick#2448, #3504
+    /// S4b-2): what `object` may hold, each an object literal an in-repo
+    /// factory returns or a module binding holds. A call's callee carries it
+    /// ([`CallIr::callee_key`]), and so does an alias (`const g = d.a`).
+    /// Discovery reads it where the row names no definition, and the value
+    /// walk where the member's own row names none ([`Resolver::key_values`]).
+    /// Not [`Self::Member`], which is the text reader's.
     KeyOf {
         lo: u32,
         hi: u32,
@@ -1479,6 +1480,33 @@ fn static_key(member: &MemberExpr) -> Option<String> {
     }
 }
 
+/// The value at the key a member read states, `object.key`, over what
+/// `object` may hold (carrick#2448, #3504 S4b-2): the one lowering a call's
+/// callee ([`Resolver::callee_key`]) and a member held as a value share.
+/// `None` when `object` is empty or holds parameters alone (their callers
+/// decide), or the key is not written; the caller reads the member as
+/// itself. The caller has ruled out `this.<field>`.
+fn key_over(member: &MemberExpr, object: Vec<ValueAt>) -> Option<ValueAt> {
+    let key = match (&member.prop, static_key(member)) {
+        (_, Some(name)) => ValueAt::Lit(name),
+        (MemberProp::Computed(computed), None) => text::text_of(&computed.expr, &|lo| lo),
+        _ => return None,
+    };
+    if object.is_empty()
+        || object
+            .iter()
+            .all(|value| matches!(value, ValueAt::Param { .. }))
+    {
+        return None;
+    }
+    Some(ValueAt::KeyOf {
+        lo: member.span.lo.0,
+        hi: member.span.hi.0,
+        object,
+        key: Box::new(key),
+    })
+}
+
 impl Reader<'_> {
     /// What `expr` may hold, each side of a fallback (`a ?? b`, `a || b`)
     /// one value.
@@ -1559,15 +1587,13 @@ impl Reader<'_> {
                         field,
                     }];
                 }
-                let key = static_key(member);
-                if let Some(key) = key
-                    && !matches!(
-                        crate::graphql_document_sites::unwrap_expression(&member.obj),
-                        Expr::This(_)
-                    )
-                {
+                if !matches!(
+                    crate::graphql_document_sites::unwrap_expression(&member.obj),
+                    Expr::This(_)
+                ) {
                     let base = self.values_in(&member.obj, scope, bound, depth + 1);
-                    if !base.is_empty()
+                    if let Some(key) = static_key(member)
+                        && !base.is_empty()
                         && base
                             .iter()
                             .all(|value| matches!(value, ValueAt::Param { .. }))
@@ -1577,6 +1603,10 @@ impl Reader<'_> {
                             .filter_map(|value| value.at(std::slice::from_ref(&key)))
                             .flatten()
                             .collect();
+                    }
+                    // The value at a key of an object (carrick#3504 S4b-2).
+                    if let Some(read) = key_over(member, base) {
+                        return vec![read];
                     }
                 }
                 vec![ValueAt::Read {
@@ -1722,7 +1752,7 @@ impl Reader<'_> {
     ) -> Vec<ValueAt> {
         let span = crate::graphql_document_sites::unwrap_expression(callee).span();
         let values = self.value_of(callee, scope, bound);
-        let itself = |value: &ValueAt| matches!(value, ValueAt::Read { lo, hi, .. } if *lo == span.lo.0 && *hi == span.hi.0);
+        let itself = |value: &ValueAt| matches!(value, ValueAt::Read { lo, hi, .. } | ValueAt::KeyOf { lo, hi, .. } if *lo == span.lo.0 && *hi == span.hi.0);
         if values.iter().all(itself) {
             return Vec::new();
         }
@@ -1825,26 +1855,7 @@ impl Reader<'_> {
         ) {
             return None;
         }
-        let key = match (&member.prop, static_key(member)) {
-            (_, Some(name)) => ValueAt::Lit(name),
-            (MemberProp::Computed(computed), None) => text::text_of(&computed.expr, &|lo| lo),
-            _ => return None,
-        };
-        let object = self.values_in(&member.obj, scope, bound, 1);
-        // A parameter alone is the callee-value walk's: its callers decide.
-        if object.is_empty()
-            || object
-                .iter()
-                .all(|value| matches!(value, ValueAt::Param { .. }))
-        {
-            return None;
-        }
-        Some(ValueAt::KeyOf {
-            lo: member.span.lo.0,
-            hi: member.span.hi.0,
-            object,
-            key: Box::new(key),
-        })
+        key_over(member, self.values_in(&member.obj, scope, bound, 1))
     }
 
     /// The functions written as a parameter's default (`doFetch = (url, init)
@@ -2068,9 +2079,9 @@ pub(super) struct Maker<'a> {
 
 /// An object literal a value may hold, with the factory call that made it
 /// (carrick#2448).
-struct ObjectAt<'a> {
+struct ObjectAt<'a, 'v> {
     file: &'a Path,
-    fields: &'a BTreeMap<String, Vec<ValueAt>>,
+    fields: &'v BTreeMap<String, Vec<ValueAt>>,
     maker: Option<Maker<'a>>,
 }
 
@@ -2490,8 +2501,22 @@ impl<'a> Resolver<'a> {
                 Some(function) => vec![Held::Reached(follow.written(file, function, invoke, None))],
                 None => nothing(),
             },
-            // Only `key_values` reads a key, at a call's callee.
-            ValueAt::KeyOf { .. }
+            // The value at a key of an object: what the member's own row
+            // reaches, as `Read` with `member` reads it, else the key of
+            // each object the object may hold (carrick#3504 S4b-2).
+            ValueAt::KeyOf { lo, hi, .. } => {
+                if let Some(reached) = follow.export(file, *lo, *hi, Kind::Member, invoke) {
+                    return vec![Held::Reached(reached)];
+                }
+                match self.inputs_for(file).row_names(file, *lo, *hi, Kind::Member) {
+                    Reach::Function(target, key) => {
+                        vec![Held::Reached(follow.definition(target, key, invoke))]
+                    }
+                    _ => self
+                        .key_values(follow, file, value, invoke)
+                        .unwrap_or_else(nothing),
+                }
+            }
             // The text variants are the names lowering's: this walk reads
             // none of them (carrick#3504 S2).
             | ValueAt::Object { .. }
@@ -2562,13 +2587,16 @@ impl<'a> Resolver<'a> {
     /// fill. `None` when some value the object may hold is no object
     /// literal this can read, or one something changes (soundness rule
     /// 2.3.3): the member is then read as itself.
-    pub(super) fn key_values<F: Follow<'a>>(
+    pub(super) fn key_values<'v, F: Follow<'a>>(
         &self,
         follow: &mut F,
         file: &'a Path,
-        value: &'a ValueAt,
+        value: &'v ValueAt,
         invoke: Invoke<'a>,
-    ) -> Option<Vec<Held<F::Reached>>> {
+    ) -> Option<Vec<Held<F::Reached>>>
+    where
+        'a: 'v,
+    {
         let ValueAt::KeyOf { object, key, .. } = value else {
             return None;
         };
@@ -2578,7 +2606,7 @@ impl<'a> Resolver<'a> {
         let _query = self.enter();
         let nothing = || Held::Reached(F::Reached::default());
         let mut out: Vec<Held<F::Reached>> = Vec::new();
-        let mut objects: Vec<ObjectAt<'a>> = Vec::new();
+        let mut objects: Vec<ObjectAt<'a, 'v>> = Vec::new();
         for held in object {
             match held {
                 // `options.client.get`: what the callers write at the key.
@@ -2630,13 +2658,16 @@ impl<'a> Resolver<'a> {
     /// Each object literal `value`, read in `file`, may hold, pushed to
     /// `out` with the factory call that made it. `false` when it may hold
     /// anything else, or an object something may change.
-    fn objects_of(
+    fn objects_of<'v>(
         &self,
         file: &'a Path,
-        value: &'a ValueAt,
+        value: &'v ValueAt,
         maker: Option<Maker<'a>>,
-        out: &mut Vec<ObjectAt<'a>>,
-    ) -> bool {
+        out: &mut Vec<ObjectAt<'a, 'v>>,
+    ) -> bool
+    where
+        'a: 'v,
+    {
         if self.step() {
             return false;
         }

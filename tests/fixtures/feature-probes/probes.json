@@ -713,6 +713,13 @@
   "kind": "call",
   "source": "test262"
  },
+ "t-entry-alias": {
+  "carries": "target",
+  "expect": "/p/t-entry-alias",
+  "feature": "alias of an object literal entry (const g = obj.key; g())",
+  "kind": "call",
+  "source": "TS"
+ },
  "t-entry-own-function": {
   "carries": "target",
   "expect": "/p/t-entry-own-function",

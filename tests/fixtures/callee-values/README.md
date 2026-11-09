@@ -103,3 +103,19 @@ at the line below.
 | `f-field-param.ts` | 11 | `f = send`, a method writes its parameter | `several_values` |
 | `f-field-escape.ts` | 15 | ctor `register(this); this.f = send` | site, `fetch` |
 | `f-field-escape.ts` | 23 | `register(this)` in the ctor; only `setup()` writes `g` | undecided (not a site) |
+
+## An alias of an object's entry (carrick#3504 S4b-2)
+
+A name that holds `d.a` or `d["a"]` is that entry's value, read as the direct
+`d.a(…)` is above. Discovery's test
+`a_callee_held_in_an_alias_of_an_entry_is_that_entrys_value` reads the call at
+the line below.
+
+| File | Line | Read | Recorded |
+|---|---|---|---|
+| `f-alias-dot.ts` | 7 | `const g = d.a; g(…)`, `d = { a: send }` | site, `fetch` |
+| `f-alias-keyed.ts` | 7 | `const g = d["a"]; g(…)` | site, `fetch` |
+| `f-alias-local.ts` | 7 | the alias inside `f` | site, `fetch` |
+| `f-alias-into-object.ts` | 7 | `h = { post: o.post }; h.post(…)`, `o = { post: send }` | site, `fetch` |
+| `f-alias-written.ts` | 11 | `d.a = other` in an exported function | not decided |
+| `f-alias-spread.ts` | 6 | `{ a: send, ...x }` | not decided |

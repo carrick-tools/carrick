@@ -1491,7 +1491,11 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         } else {
             for value in values {
                 match value {
-                    ValueAt::Read { lo, hi, .. } => self.imported(file, (lo, hi), at.to_string()),
+                    // A member read, or the value at a key of an object
+                    // (`const c = deps.client`), is named by the same row.
+                    ValueAt::Read { lo, hi, .. } | ValueAt::KeyOf { lo, hi, .. } => {
+                        self.imported(file, (lo, hi), at.to_string())
+                    }
                     ValueAt::Field { class, field, .. } => {
                         self.class_field(file, class, &field, at.to_string())
                     }
