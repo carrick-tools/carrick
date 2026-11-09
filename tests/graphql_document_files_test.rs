@@ -12,7 +12,7 @@
 //!
 //! | operation | executed at | consumer rows |
 //! |---|---|---|
-//! | `items` | `apps/web/src/list.ts:5`, and `:9` behind `&&` | one each, in `catalog-web`; none in `documents` |
+//! | `items` | `apps/web/src/list.ts:5`, `:9` behind `&&`, and `apps/web/src/store.ts:9` (a class field initialiser) | one each, in `catalog-web`; none in `documents` |
 //! | `renameItem` | nowhere | none |
 //! | `adminStats` | nowhere | none (the producer field stays) |
 
@@ -140,6 +140,19 @@ fn a_document_passed_behind_a_short_circuit_and_is_a_consumer_at_the_call() {
             "catalog-web".to_string(),
             "query|items".to_string(),
             "apps/web/src/list.ts:9".to_string()
+        )),
+        "{consumers:?}"
+    );
+}
+
+#[test]
+fn a_document_executed_inside_a_class_field_initialiser_is_a_consumer_at_the_call() {
+    let (consumers, _) = scan();
+    assert!(
+        consumers.contains(&(
+            "catalog-web".to_string(),
+            "query|items".to_string(),
+            "apps/web/src/store.ts:9".to_string()
         )),
         "{consumers:?}"
     );

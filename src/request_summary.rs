@@ -5516,19 +5516,40 @@ impl Reader<'_> {
                     else {
                         continue;
                     };
-                    let mut ir = match &**init {
-                        Expr::Arrow(arrow) => {
-                            self.arrow(arrow, table(prop.is_static), module, &none)
+                    let (mut ir, at) = match &**init {
+                        Expr::Arrow(arrow) => (
+                            self.arrow(arrow, table(prop.is_static), module, &none),
+                            key(&member_name, prop.is_static),
+                        ),
+                        Expr::Fn(fn_expr) => (
+                            self.function(&fn_expr.function, table(prop.is_static), module, &none),
+                            key(&member_name, prop.is_static),
+                        ),
+                        // Any other initialiser is a body that runs when the
+                        // class is built (carrick#3614 A4): read as the
+                        // expression of a function no one calls, under a key
+                        // no callee can name, so the calls it writes and the
+                        // functions written inside it are read as any body's.
+                        _ => {
+                            let body = ArrowExpr {
+                                span: init.span(),
+                                ctxt: Default::default(),
+                                params: Vec::new(),
+                                body: Box::new(ArrowFunctionBody::Expr(init.clone())),
+                                is_async: false,
+                                is_generator: false,
+                                type_params: None,
+                                return_type: None,
+                            };
+                            (
+                                self.arrow(&body, table(prop.is_static), module, &none),
+                                initialiser_key(name, &member_name, prop.is_static),
+                            )
                         }
-                        Expr::Fn(fn_expr) => {
-                            self.function(&fn_expr.function, table(prop.is_static), module, &none)
-                        }
-                        _ => continue,
                     };
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
                     library_sites::take_field_values(&mut ir, false, &mut placed);
-                    file.functions
-                        .insert(key(&member_name, prop.is_static), in_class(ir));
+                    file.functions.insert(at, in_class(ir));
                 }
                 _ => {}
             }
@@ -7631,6 +7652,15 @@ fn function_builds_query(function: &Function) -> bool {
             .body
             .as_ref()
             .is_some_and(|body| returns_only_queries(&body.stmts))
+}
+
+/// The key a class field's initialiser that is not a function is lowered
+/// under, beside the class's `Class.member` / `Class.static.member` keys
+/// (carrick#3614 A4). It holds `<` and `>`, so no callee name spells it:
+/// `this.field()` enters an arrow-valued field and never this body.
+fn initialiser_key(class: &str, member: &str, is_static: bool) -> String {
+    let statik = if is_static { "static " } else { "" };
+    format!("{class}.<{statik}initialiser {member}>")
 }
 
 /// [`function_builds_query`] for an arrow, whose expression body is what it
@@ -12453,6 +12483,55 @@ function build() { return {}; }
             .find_map(|call| call.request.as_ref())
             .map(|shape| join_base(&shape.base, &shape.url))
             .unwrap_or_else(|| panic!("{function} makes no request"))
+    }
+
+    /// carrick#3614 A4: a class field initialiser that is not a function is a
+    /// body the readers read, under a key no callee can name; an arrow-valued
+    /// field keeps its own key.
+    #[test]
+    fn a_class_field_initialiser_that_is_a_call_is_a_body() {
+        let source = "function watch<T>(f: () => T) { return f; }\n\
+                      export class Store {\n\
+                      \x20 refresh = watch(() => fetch(\"/api/items\"));\n\
+                      \x20 static seed = watch(() => fetch(\"/api/seed\"));\n\
+                      \x20 arrow = () => fetch(\"/api/arrow\");\n\
+                      }\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(&path, source).expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let file = extract_file_ir(&module, &cm, &HashSet::new());
+        let requests = |key: &str| {
+            let ir = file
+                .functions
+                .get(key)
+                .unwrap_or_else(|| panic!("no {key} among {:?}", file.functions.keys()));
+            // The callback the call is handed is a nested function.
+            fn count(ir: &FnIr) -> usize {
+                ir.calls
+                    .iter()
+                    .filter(|call| call.request.is_some())
+                    .count()
+                    + ir.nested
+                        .iter()
+                        .chain(&ir.detached)
+                        .map(count)
+                        .sum::<usize>()
+            }
+            count(ir)
+        };
+        assert_eq!(requests(&initialiser_key("Store", "refresh", false)), 1);
+        assert_eq!(requests(&initialiser_key("Store", "seed", true)), 1);
+        assert_eq!(requests("Store.arrow"), 1);
+        assert!(!file.functions.contains_key("Store.refresh"));
+        assert!(!file.functions.contains_key("Store.seed"));
     }
 
     /// carrick#2447: a builder with locals before its `return`, a `throw`
