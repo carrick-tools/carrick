@@ -86,10 +86,10 @@ fn expected(line: i64, path: &str, source: &str) -> (i64, String, String, String
     )
 }
 
-/// The refresh request is one row, at the call inside the hook's callback;
-/// no row sits on its hook's line (7), so no type anchored there is judged.
-/// The archive request's only row is still the model's at its hook (17),
-/// pending carrick#3640.
+/// Each request is one row, at the call inside its hook's callback; no row
+/// sits on either hook's line (7, 17), so no type anchored there is judged.
+/// The model names the refresh path's holes its own way (7) and the archive
+/// path's exactly as the client does (17); both give way (carrick#3640).
 #[test]
 fn a_hook_row_beside_the_leaf_row_of_its_request_goes() {
     let rows: Vec<_> = hook_rows().into_iter().map(summary).collect();
@@ -101,7 +101,11 @@ fn a_hook_row_beside_the_leaf_row_of_its_request_goes() {
                 "/api/v1/boards/:board/feeds/:feed/refresh",
                 "request_summary"
             ),
-            expected(17, "/api/v1/boards/:board/feeds/:feed/archive", "model"),
+            expected(
+                19,
+                "/api/v1/boards/:board/feeds/:feed/archive",
+                "request_summary"
+            ),
         ],
         "{rows:#?}"
     );
