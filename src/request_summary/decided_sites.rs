@@ -1081,7 +1081,7 @@ pub(super) struct Calls<'a> {
 }
 
 impl<'a> Calls<'a> {
-    fn index(inputs: &'a RequestSummaryInputs) -> Self {
+    pub(super) fn index(inputs: &'a RequestSummaryInputs) -> Self {
         Self::build(inputs, &[], |source, file, call| {
             source
                 .sites
