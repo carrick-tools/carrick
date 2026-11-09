@@ -1838,6 +1838,8 @@ fn client_receivers_in_every_held_form_are_sites() {
         "m-const-alias",
         "m-ctor-assign",
         "m-destructured",
+        "m-entry-alias",
+        "m-entry-returned",
         "m-field-init",
         "m-getter",
         "m-let",
@@ -1852,6 +1854,12 @@ fn client_receivers_in_every_held_form_are_sites() {
     .map(|name| format!("src/{name}.ts"))
     .collect();
     assert_eq!(stated, want);
+    // An alias of an object entry, and an entry a function returns, are
+    // named by the same row as a member read: no unread lead at their calls.
+    let unread = unread_reasons(&on);
+    for site in ["src/m-entry-alias.ts:5", "src/m-entry-returned.ts:3"] {
+        assert!(!unread.contains_key(site), "{site}: {unread:#?}");
+    }
 }
 
 /// Each mount-graph row's stored address (`docs/reference/address-chain.md`), by

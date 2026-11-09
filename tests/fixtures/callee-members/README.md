@@ -16,6 +16,7 @@ value; the op's name is read from that call's arguments.
 |---|---|---|---|
 | `m-bind.ts` | 6 | `const post = http.post.bind(http)` | site, `http` |
 | `m-extract.ts` | 6 | `const post = http.post` | site, `http` |
+| `m-alias-member.ts` | 6 | `const post = http.post` (S4b-2 pin: a library member stays a fact) | site, `http` |
 | `m-bind-inline.ts` | 4 | `http.post.bind(http)(…)` | site, `http` |
 | `m-publish-bind.ts` | 6 | `const pub = bus.publish.bind(bus)` | site, `bus` |
 | `m-publish-keyed.ts` | 7 | `buses[k].publish(…)`, `buses = { main: bus }`, `const k = "main"` | site, `bus` |

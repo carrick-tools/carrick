@@ -4026,6 +4026,8 @@ mod tests {
         let wrong: Vec<String> = [
             ("m-bind.ts", 6, "site http"),
             ("m-extract.ts", 6, "site http"),
+            // S4a pin for S4b-2: a library member held, not an object entry.
+            ("m-alias-member.ts", 6, "site http"),
             ("m-bind-inline.ts", 4, "site http"),
             ("m-publish-bind.ts", 6, "site bus"),
             ("m-publish-keyed.ts", 7, "site bus"),
