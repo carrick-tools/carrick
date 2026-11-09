@@ -225,6 +225,25 @@ test("an older carrick reading newer files is told to upgrade, and a newer one t
   }
 });
 
+test("the throttled hook line is silent when this carrick is newer than the files", () => {
+  const dir = workspace();
+  try {
+    recordCliVersion(dir, "0.3.150");
+    const monday = new Date("2026-09-21T08:00:00Z");
+    // Newer running: the next session start refreshes the files, and says so
+    // itself if it cannot. The hooks do not send anyone to `carrick init`.
+    assert.equal(throttledVersionMismatch(dir, "0.3.151", monday), null);
+    assert.equal(fs.existsSync(versionNoticeFile(dir)), false);
+    // The unthrottled session-start line still names the case.
+    assert.match(versionMismatch(dir, "0.3.151")!, /carrick init/);
+    // Older running (an old binary on PATH): today's line.
+    const older = throttledVersionMismatch(dir, "0.3.149", monday);
+    assert.match(older!, /This carrick is 0\.3\.149; 0\.3\.150 set this workspace up/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the hooks that fire on every edit say it once a day", () => {
   const dir = workspace();
   try {
