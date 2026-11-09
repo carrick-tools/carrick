@@ -639,9 +639,10 @@ impl Resolver<'_> {
         // hands the object on to the one call this entry is read for.
         let kept = binding.entries_kept
             || (binding.entries_handed && binding.handed.iter().all(|at| *at == call));
-        // An exported object, or one handed to more than one call, is an
-        // object the resolver does not read (R3).
-        if closed && !kept && (binding.exported || binding.entries_handed) {
+        // A closed object whose entries are not kept (exported, handed to
+        // more than one call, or written by the module) is an object the
+        // resolver does not read (R3).
+        if closed && !kept {
             return Some(ArgTexts::Unread);
         }
         if closed && kept {

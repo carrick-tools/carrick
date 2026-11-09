@@ -1718,7 +1718,7 @@ fn a_client_base_reads_through_the_resolver() {
     // An options object the resolver cannot read keeps the host-free reading
     // of today and is counted (R3): only a spread, an exported object, one
     // handed to more than one maker call.
-    for file in ["b-opts-spread-only", "b-opts-exported"] {
+    for file in ["b-opts-spread-only", "b-opts-exported", "b-opts-written"] {
         assert_eq!(paths(file), vec![format!("/p/{file}")], "{file}: {rows:#?}");
     }
     assert_eq!(
@@ -1734,7 +1734,7 @@ fn a_client_base_reads_through_the_resolver() {
             .take_while(char::is_ascii_digit)
             .collect::<String>()
     });
-    assert_eq!(unread.as_deref(), Some("4"), "{log}");
+    assert_eq!(unread.as_deref(), Some("5"), "{log}");
     // A base the code does not state as one text stays out.
     for file in [
         "b-env",
