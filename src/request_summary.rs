@@ -6110,7 +6110,12 @@ impl Reader<'_> {
                         && declared.binding_count(&ident_key(&ident.id)) == 1
                     {
                         let values = self.value_of(init, scope, &guards::Bound::default());
-                        if values.iter().any(|value| *value != ValueAt::Unread) {
+                        // Another `new` holds nothing these readers state
+                        // (only the guards read it, carrick#3504 S7b-2): the
+                        // name stays a read the rows answer.
+                        if values.iter().any(|value| {
+                            !matches!(value, ValueAt::Unread | ValueAt::Constructed { .. })
+                        }) {
                             scope.held.insert(ident_key(&ident.id), values);
                         }
                     }

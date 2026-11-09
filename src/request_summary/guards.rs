@@ -2043,8 +2043,8 @@ enum At {
 type HandedAt = (usize, At, usize, Vec<String>);
 
 /// A parameter a value written to a binding reads as: how many functions out
-/// from the reading one, its position and the keys inside it.
-type WrittenParam = (u8, usize, Vec<String>);
+/// from the reading one, its position and the steps down from it.
+type WrittenParam = (u8, usize, Vec<Step>);
 
 /// Every chain the guards in `inputs` state, sorted, with each file named
 /// relative to `root`.
@@ -2455,17 +2455,19 @@ impl<'a> Chains<'a> {
 
     /// For a hole at a binding (`let path; path = req.url;`, `const path =
     /// OVERRIDE ?? req.url`), the parameters every value written to it reads
-    /// as (how many functions out from `node`, position, keys), and whether
-    /// a name or member read is among the values too (carrick#3504 S7b-1).
-    /// The values are the declaring body's: its initialiser
-    /// ([`super::resolve::LocalBinding::init`]) and each write the module's
-    /// write census places ([`super::resolve::PlacedWrites`]), lowered where
-    /// it is written ([`super::resolve::BindingWrite::values`]). `None`, and
-    /// the hole stays, where
-    /// the compiler's rows are not read, the census cannot place a write, a
-    /// write is in another body, a value is made from another (a call
-    /// result, a `new`: it may be a transform of one), or no value is a
-    /// parameter.
+    /// as (how many functions out from `node`, position, steps down from
+    /// it), and whether a name or member read is among the values too
+    /// (carrick#3504 S7b-1). The values are the declaring body's: its
+    /// initialiser ([`super::resolve::LocalBinding::init`]) and each write
+    /// the module's write census places ([`super::resolve::PlacedWrites`]),
+    /// lowered where it is written ([`super::resolve::BindingWrite::values`]).
+    /// A value may be read through a construction or a no-argument method
+    /// call the language library declares (`new URL(req.url, base)`,
+    /// `req.url.toLowerCase()`; S7b-2, [`Self::written_steps`]). `None`, and
+    /// the hole stays, where the compiler's rows are not read, the census
+    /// cannot place a write, a write is in another body, a value is made from
+    /// another in any other way (a call result, a `new` of the service's
+    /// own: it may be a transform of one), or no value is a parameter.
     fn written_params(&self, node: usize, subject: &Subject) -> Option<(Vec<WrittenParam>, bool)> {
         let (key, out) = subject.binding.as_ref()?;
         if self.inputs.row_calls.is_none() || !matches!(subject.root, Root::Hole(_)) {
@@ -2476,13 +2478,9 @@ impl<'a> Chains<'a> {
             declaring = self.nodes[declaring].parent?;
         }
         let body = self.nodes[declaring].ir;
+        let file = self.nodes[declaring].file;
         let local = body.local_bindings.iter().find(|local| local.key == *key)?;
-        let writes = self
-            .inputs
-            .files
-            .get(self.nodes[declaring].file)?
-            .placed_writes
-            .of(key)?;
+        let writes = self.inputs.files.get(file)?.placed_writes.of(key)?;
         let mut values: Vec<&ValueAt> = local.init.iter().collect();
         for at in writes {
             let write = body.binding_writes.iter().find(|write| write.at == *at)?;
@@ -2491,18 +2489,108 @@ impl<'a> Chains<'a> {
         let mut params = Vec::new();
         let mut unread = false;
         for value in values {
-            match value {
-                ValueAt::Param { depth, index, keys } => {
-                    let param = (depth.saturating_add(*out), *index, keys.clone());
-                    if !params.contains(&param) {
-                        params.push(param);
-                    }
+            for (depth, index, steps) in self.written_steps(file, value, false, &mut unread)? {
+                let param = (depth.saturating_add(*out), index, steps);
+                if !params.contains(&param) {
+                    params.push(param);
                 }
-                ValueAt::Read { .. } => unread = true,
-                _ => return None,
             }
         }
         (!params.is_empty()).then_some((params, unread))
+    }
+
+    /// The parameters one value written to a binding reads as, each with the
+    /// steps down from it ([`Self::written_params`]). A name or member read
+    /// sets `unread` (the hole is followed too); so does any other value
+    /// beside a parameter inside a construction's argument or a method's
+    /// object (`new URL(req.url ?? "/", base)`), where it is `nested`.
+    /// `new X(a, …)` reads as `a` then [`Step::Url`] / [`Step::New`], and
+    /// `object.m()` as `object` then [`Step::Call`], only where the
+    /// compiler's row there names the language library's declaration of `X`
+    /// or `m`, the rule a `call` / `apply` is decided by
+    /// ([`super::RequestSummaryInputs::linked`]): a class or a method of the
+    /// service's own stays a value made from another. `None` where the
+    /// value is read no other way.
+    fn written_steps(
+        &self,
+        file: &Path,
+        value: &ValueAt,
+        nested: bool,
+        unread: &mut bool,
+    ) -> Option<Vec<WrittenParam>> {
+        let through = |inner: &[ValueAt], step: Step, unread: &mut bool| {
+            let mut out = Vec::new();
+            for value in inner {
+                for (depth, index, mut steps) in self.written_steps(file, value, true, unread)? {
+                    steps.push(step.clone());
+                    out.push((depth, index, steps));
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        };
+        match value {
+            ValueAt::Param { depth, index, keys } => Some(vec![(
+                *depth,
+                *index,
+                keys.iter().cloned().map(Step::Key).collect(),
+            )]),
+            ValueAt::Read { .. } => {
+                *unread = true;
+                Some(Vec::new())
+            }
+            ValueAt::Unread if nested => {
+                *unread = true;
+                Some(Vec::new())
+            }
+            ValueAt::Constructed {
+                lo,
+                hi,
+                name,
+                first,
+            } if self.language_declares(file, (*lo, *hi), name) => {
+                let step = if name == "URL" {
+                    Step::Url
+                } else {
+                    Step::New(name.clone())
+                };
+                through(first, step, unread)
+            }
+            ValueAt::Returned {
+                lo,
+                hi,
+                member: Some(call),
+                ..
+            } if call.args == 0 => {
+                let method = STRING_METHODS
+                    .iter()
+                    .find(|method| self.language_declares(file, (*lo, *hi), method))?;
+                through(&call.object, Step::Call((*method).to_string()), unread)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the compiler's row at the call or construction spanning
+    /// `lo..hi` (discovery numbering) of `file` names `name` as the language
+    /// library declares it.
+    fn language_declares(&self, file: &Path, (lo, hi): (u32, u32), name: &str) -> bool {
+        let (Some(ir), Some(positions)) = (self.inputs.files.get(file), &self.inputs.positions)
+        else {
+            return false;
+        };
+        positions
+            .lookup(
+                file,
+                ir.swc_start(lo),
+                ir.swc_start(hi),
+                crate::position_rows::Kind::Call,
+            )
+            .is_ok_and(|row| {
+                row.symbol() == Some(name)
+                    && row
+                        .decl_file()
+                        .is_some_and(|declared| declared.starts_with("lib:"))
+            })
     }
 
     fn follow(&self, node: usize, mut trace: Trace, ends: &mut Ends) {
@@ -2522,14 +2610,14 @@ impl<'a> Chains<'a> {
             }
             let own = std::mem::take(&mut held.subject.steps);
             held.subject.text = None;
-            for (depth, index, keys) in params {
+            for (depth, index, steps) in params {
                 let mut next = held.clone();
                 next.subject.root = if depth == 0 {
                     Root::Param(index, String::new())
                 } else {
                     Root::Outer(depth, index, String::new())
                 };
-                next.subject.steps = keys.into_iter().map(Step::Key).chain(own.clone()).collect();
+                next.subject.steps = steps.into_iter().chain(own.clone()).collect();
                 self.follow(node, next, ends);
             }
             return;
