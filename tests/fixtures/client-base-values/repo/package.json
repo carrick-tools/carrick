@@ -1,0 +1,8 @@
+{
+  "name": "receiver-forms-client-base",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/mk": "^3.0.0"
+  }
+}

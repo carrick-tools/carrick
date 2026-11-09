@@ -69,6 +69,31 @@ fn scan_fixture_reading(name: &str) -> (Blobs, Fallbacks) {
     scan_runs_reading(name, &[], 1, true).remove(0)
 }
 
+/// [`scan_fixture`], and the run log the scan left (its `home` is the
+/// scan's own): the counts the scan states about itself.
+fn scan_fixture_logged(name: &str) -> (Blobs, String) {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let repo = tmp.path().join("workspace");
+    copy_dir(&fixture_dir(name).join("repo"), &repo);
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+    let storage = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let home = tmp.path().join("home");
+    let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home);
+    cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env_remove("CARRICK_PROGRESS");
+    let (blobs, _) = run_scan(&mut cmd, &storage);
+    let log = std::fs::read_dir(home.join(".carrick/logs/runs"))
+        .map(|logs| {
+            logs.map(|log| std::fs::read_to_string(log.unwrap().path()).unwrap_or_default())
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    (blobs, log)
+}
+
 /// `runs` scans of one committed copy of the fixture `name`, with `extra`
 /// files written into it before the commit, sharing one store and cache:
 /// every scan after the first takes the incremental path. The blobs after
@@ -1630,6 +1655,103 @@ fn client_bases_follow_the_instance_walk() {
             "{rows:#?}"
         );
     }
+}
+
+/// carrick#3504 S5a: a client's base is read through the value resolver
+/// where no caller fills it. Every form the text reader reads (an enum
+/// member, a `let` never written again, a `join`, a choice whose arms agree,
+/// an imported `const` at a walk root, an options object held in a `const`)
+/// gives the client its base; a base written by a spread after the key, or
+/// by anything else in the code the reader cannot read, leaves the site
+/// out; an options object with no base key states none (host-free path).
+/// Forms that already read keep their rows.
+#[test]
+fn a_client_base_reads_through_the_resolver() {
+    let (on, log) = scan_fixture_logged("client-base-values");
+    let rows = call_rows(&on);
+    let paths = |file: &str| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.starts_with(&format!("src/{file}.ts:")))
+            .map(|row| row.split(' ').nth(1).unwrap_or_default().to_string())
+            .collect()
+    };
+    let based = |file: &str| vec![format!("https://m.test/p/{file}")];
+    // Already read before S5a (pins).
+    for file in [
+        "b-lit",
+        "b-const",
+        "b-const-import",
+        "b-template",
+        "b-shorthand",
+        "b-obj-entry",
+        "b-obj-entry-import",
+        "b-opts-spread",
+        "b-factory-param",
+        "b-factory-param-const",
+        "b-factory-opts",
+        "w-lit",
+        "w-const",
+    ] {
+        assert_eq!(paths(file), based(file), "{file}: {rows:#?}");
+    }
+    // Gained: the resolver reads the base.
+    for file in ["b-enum", "b-let-once", "b-cond-same", "w-const-import"] {
+        assert_eq!(paths(file), based(file), "{file}: {rows:#?}");
+    }
+    // `['https://m.test', 'v1'].join('/')` is the base the code writes.
+    assert_eq!(
+        paths("b-join"),
+        vec!["https://m.test/v1/p/b-join".to_string()],
+        "{rows:#?}"
+    );
+    // Corrected from a host-free path to the base the options object holds.
+    for file in ["b-opts-const", "w-opts-const"] {
+        assert_eq!(paths(file), based(file), "{file}: {rows:#?}");
+    }
+    // Corrected from a host-free path to no row: a spread after the key may
+    // overwrite it.
+    assert_eq!(
+        paths("b-opts-spread-after"),
+        Vec::<String>::new(),
+        "{rows:#?}"
+    );
+    // An options object the resolver cannot read keeps the host-free reading
+    // of today and is counted (R3): only a spread, an exported object, one
+    // handed to more than one maker call.
+    for file in ["b-opts-spread-only", "b-opts-exported"] {
+        assert_eq!(paths(file), vec![format!("/p/{file}")], "{file}: {rows:#?}");
+    }
+    assert_eq!(
+        paths("b-opts-twice"),
+        vec![
+            "/p/b-opts-twice".to_string(),
+            "/p/b-opts-twice-other".to_string()
+        ],
+        "{rows:#?}"
+    );
+    let unread = log.split("bases_options_unread=").nth(1).map(|rest| {
+        rest.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+    });
+    assert_eq!(unread.as_deref(), Some("4"), "{log}");
+    // A base the code does not state as one text stays out.
+    for file in [
+        "b-env",
+        "b-env-fallback",
+        "b-cond-diff",
+        "b-let-written",
+        "w-env",
+        "b-contested",
+    ] {
+        assert_eq!(paths(file), Vec::<String>::new(), "{file}: {rows:#?}");
+    }
+    // An options object that states no base key hands the maker none.
+    assert_eq!(
+        paths("b-opts-const-nobase"),
+        vec!["/p/b-opts-const-nobase".to_string()],
+        "{rows:#?}"
+    );
 }
 
 /// carrick#3527 S5: a client made in a field of a class a sibling service

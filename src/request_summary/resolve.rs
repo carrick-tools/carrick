@@ -41,7 +41,7 @@ mod text_reader;
 
 pub(crate) use documents::{DocumentEnd, DocumentLookup, document_calls};
 pub(super) use text::{pattern_members, text_of};
-pub(super) use text_reader::TextValue;
+pub(super) use text_reader::{ArgTexts, TextValue};
 
 /// How many object literals deep an argument's keys are read (the decision
 /// record's object-depth cap, D7).
@@ -94,6 +94,14 @@ pub(super) struct ModuleBinding {
     /// and every reference to it is an entry read. Only then is an entry's
     /// value the one its literal states.
     pub(super) entries_kept: bool,
+    /// As `entries_kept`, but the module also hands the name to calls as an
+    /// argument (`create(opts)`, carrick#3504 S5a): `handed` starts each. The
+    /// entries are then the literal's only where every such call is one
+    /// whose reader is the labelled maker the entry is read for.
+    pub(super) entries_handed: bool,
+    pub(super) handed: Vec<u32>,
+    /// The module exports the declaration inline (`export const x`).
+    pub(super) exported: bool,
     /// The binding is in the table for the text reader alone: a function's
     /// own local its body never writes again. The scope already holds it for
     /// every other reader (`scope.held`), so [`Resolver::binding_values`]
@@ -225,6 +233,9 @@ struct WriteCensus {
     /// deleted, through the binding or through a fallback of it
     /// (`(a ?? client).get = f`).
     written_through: HashSet<BindingKey>,
+    /// Where each call or construction that is handed the binding as an
+    /// argument starts (carrick#3504 S5a).
+    handed: HashMap<BindingKey, Vec<u32>>,
 }
 
 /// A class that extends a named class.
@@ -283,6 +294,34 @@ impl WriteCensus {
             && !self.writes.contains_key(key)
             && !self.entry_escapes.contains(key)
             && count(&self.references) == count(&self.entry_reads) + 1
+    }
+
+    /// [`Self::entries_kept`], except that the binding may also be handed to
+    /// calls as an argument (`create(opts)`): the caller judges those calls
+    /// ([`ModuleBinding::handed`]).
+    fn entries_handed(&self, key: &BindingKey, exported: bool) -> bool {
+        let count = |counts: &HashMap<BindingKey, usize>| counts.get(key).copied().unwrap_or(0);
+        let handed = self.handed.get(key).map_or(0, Vec::len);
+        handed > 0
+            && !exported
+            && !self.is_unplaceable(key)
+            && !self.writes.contains_key(key)
+            && !self.entry_escapes.contains(key)
+            && count(&self.references) == count(&self.entry_reads) + handed + 1
+    }
+
+    /// Notes the names a call or construction at `at` is handed as
+    /// arguments.
+    fn hand_on(&mut self, at: u32, args: &[ExprOrSpread]) {
+        for arg in args {
+            if arg.spread.is_some() {
+                continue;
+            }
+            if let Expr::Ident(ident) = crate::graphql_document_sites::unwrap_expression(&arg.expr)
+            {
+                self.handed.entry(ident_key(ident)).or_default().push(at);
+            }
+        }
     }
 
     /// Notes that the member `expr` names (if it is one) is written.
@@ -541,6 +580,7 @@ impl Visit for WriteCensus {
         if let Expr::Ident(ident) = &*new.callee {
             *self.constructions.entry(ident_key(ident)).or_default() += 1;
         }
+        self.hand_on(new.span.lo.0, new.args.as_deref().unwrap_or_default());
         new.visit_children_with(self);
     }
 
@@ -628,6 +668,7 @@ impl Visit for WriteCensus {
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
+        self.hand_on(call.span.lo.0, &call.args);
         if let Callee::Expr(callee) = &call.callee {
             if matches!(&**callee, Expr::Ident(ident) if ident.sym == "eval") {
                 self.opaque = true;
@@ -722,6 +763,9 @@ pub(super) fn module_bindings(
                         kind: var.kind.into(),
                         text: member.text(init, &identity),
                         entries_kept: false,
+                        entries_handed: false,
+                        handed: Vec::new(),
+                        exported: false,
                         text_only: true,
                         object_kept: false,
                     };
@@ -745,6 +789,9 @@ pub(super) fn module_bindings(
                 kind: var.kind.into(),
                 text: init.map(|init| text_of(init, &identity)),
                 entries_kept: census.entries_kept(&key, exported),
+                entries_handed: census.entries_handed(&key, exported),
+                handed: census.handed.get(&key).cloned().unwrap_or_default(),
+                exported,
                 text_only: false,
                 object_kept: census.object_kept(&key),
             };
@@ -775,6 +822,9 @@ pub(super) fn module_bindings(
                 kind: local.kind,
                 text: local.text.clone(),
                 entries_kept: census.entries_kept(&local.key, false),
+                entries_handed: census.entries_handed(&local.key, false),
+                handed: census.handed.get(&local.key).cloned().unwrap_or_default(),
+                exported: false,
                 text_only: !local.reassigned,
                 object_kept: false,
             };
