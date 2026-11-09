@@ -2076,7 +2076,7 @@ impl Reader<'_> {
         let outer = match callee {
             Expr::Ident(ident) => {
                 return Some((
-                    SiteBinding::Client(Box::new(scope.call_binding(ident)?)),
+                    SiteBinding::Client(Box::new(scope.site_binding(ident)?)),
                     Vec::new(),
                     None,
                     ident.span,
@@ -2102,7 +2102,7 @@ impl Reader<'_> {
             match obj {
                 Expr::Ident(ident) => {
                     path.reverse();
-                    let binding = SiteBinding::Client(Box::new(scope.call_binding(ident)?));
+                    let binding = SiteBinding::Client(Box::new(scope.site_binding(ident)?));
                     return Some((binding, path, Some(member), named));
                 }
                 Expr::Call(_) | Expr::New(_) | Expr::Await(_) => {
