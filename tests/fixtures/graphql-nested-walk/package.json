@@ -1,0 +1,1 @@
+{ "name": "graphql-nested-walk", "private": true, "workspaces": ["apps/*", "packages/*"] }

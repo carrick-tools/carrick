@@ -998,7 +998,7 @@ fn count_excluded(
 
 /// Where a service's own tree starts: its `directory` under the repo root, or
 /// the repo root itself for a single-service repo.
-fn service_root(repo_root: &Path, service: &crate::config::Config) -> PathBuf {
+pub(crate) fn service_root(repo_root: &Path, service: &crate::config::Config) -> PathBuf {
     match &service.directory {
         Some(dir) => repo_root.join(dir),
         None => repo_root.to_path_buf(),
@@ -1201,6 +1201,22 @@ pub fn walk_service(
     walk
 }
 
+/// The nested services' directories, relative to this service's own: what
+/// the service's directory walk leaves out (carrick#553), because each is
+/// read by its own service. Its `include` roots are walked whole. Every walk
+/// of a service's directory reads this, the source walk and the GraphQL walk
+/// ([`crate::graphql::WalkRoot`]) alike.
+pub(crate) fn nested_left_out(service: &crate::config::Config) -> Vec<PathBuf> {
+    let own = crate::config::directory_segments(service.directory.as_deref());
+    service
+        .nested_directories
+        .iter()
+        .map(|nested| crate::config::directory_segments(Some(nested)))
+        .filter(|nested| nested.len() > own.len() && nested.starts_with(&own))
+        .map(|nested| nested[own.len()..].iter().collect())
+        .collect()
+}
+
 /// [`walk_service`], saying nothing.
 pub fn walk_service_quietly(
     repo_path: &str,
@@ -1210,16 +1226,7 @@ pub fn walk_service_quietly(
     let root = Path::new(repo_path);
     let service_root = service_root(root, service);
 
-    // The nested services' directories, relative to this service's own, which
-    // is how the walk below sees them.
-    let own = crate::config::directory_segments(service.directory.as_deref());
-    let left_out: Vec<PathBuf> = service
-        .nested_directories
-        .iter()
-        .map(|nested| crate::config::directory_segments(Some(nested)))
-        .filter(|nested| nested.len() > own.len() && nested.starts_with(&own))
-        .map(|nested| nested[own.len()..].iter().collect())
-        .collect();
+    let left_out = nested_left_out(service);
 
     // The carrick.json lives at the repo root, not per service directory, so the
     // config returned here is ignored — config resolution is handled separately.

@@ -5137,7 +5137,7 @@ fn prompt_inputs(
         // over the full service `files` (not just `files_to_analyze`) so the
         // producer list is complete; empty for non-GraphQL services.
         graphql_producer_hints: crate::graphql::GraphqlProducerHints::collect(
-            service_graphql_roots(repo_path, service),
+            &service_graphql_roots(repo_path, service),
             &crate::graphql::resolve_declared_schemas(
                 Path::new(repo_path),
                 &service.graphql_schemas,
@@ -5150,7 +5150,7 @@ fn prompt_inputs(
         // their co-located result type. Same scan-root/files inputs as the
         // producer hints; empty for services with no unanchored consumers.
         graphql_consumer_hints: crate::graphql::GraphqlConsumerHints::collect(
-            service_graphql_roots(repo_path, service),
+            &service_graphql_roots(repo_path, service),
             files,
             repo_path,
         ),
@@ -6465,21 +6465,11 @@ fn yield_bus_to_sockets(extractions: &mut ProtocolExtractions, repo_path: &str, 
     extractions.socket_sites = sites;
 }
 
-/// The directories to walk for a service's own GraphQL SDL files: its
-/// `directory` (or the repo root for a flat single-service config) plus any
-/// `include` roots. Mirrors `find_service_files`' scoping so a monorepo
-/// package's schema is attributed only to the package that declares it, not its
-/// siblings (#242).
-fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<PathBuf> {
-    let root = Path::new(repo_path);
-    let mut roots = vec![match &service.directory {
-        Some(dir) => root.join(dir),
-        None => root.to_path_buf(),
-    }];
-    for inc in &service.include {
-        roots.push(root.join(inc));
-    }
-    roots
+/// The directories to walk for a service's own GraphQL SDL files
+/// ([`crate::graphql::service_walk_roots`]): its directory, leaving out its
+/// nested services' (carrick#553), plus its `include` roots.
+fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<crate::graphql::WalkRoot> {
+    crate::graphql::service_walk_roots(Path::new(repo_path), service)
 }
 
 /// Run the deterministic protocol scans (GraphQL SDL/documents, Socket.IO)
@@ -6507,7 +6497,7 @@ fn scan_protocol_extractions(
     // (`graphql_schema_notices`); here only the files matter.
     let declared =
         crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas);
-    let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
+    let mut graphql = crate::graphql::scan_walk_roots(&scan_roots, &declared.files, files);
     // A schema file the service excludes serves nothing (carrick#1990),
     // unless the service also names it in `graphqlSchemas`.
     let exclusion = crate::file_finder::Exclusion::of_service(Path::new(repo_path), service);
@@ -8017,7 +8007,11 @@ fn settle_graphql_documents(
     // What a document bound to a served schema selects that the schema does
     // not declare: a type check cannot see it (crate::graphql_selection).
     if builds_schema_in_code {
-        catalogue.record_builds_schema_in_code(&service_graphql_roots(repo_path, service));
+        let dirs: Vec<PathBuf> = service_graphql_roots(repo_path, service)
+            .into_iter()
+            .map(|root| root.dir)
+            .collect();
+        catalogue.record_builds_schema_in_code(&dirs);
     }
     let undeclared = catalogue.read_undeclared_selections(graphql);
     if undeclared > 0 {
@@ -13369,7 +13363,7 @@ async fn analyze_current_repo(
     // services. `append_deterministic_protocol_operations` scans the SDL again
     // later for the operation index; the duplicate parse is acceptable.
     let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
-        service_graphql_roots(repo_path, service),
+        &service_graphql_roots(repo_path, service),
         &crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas)
             .files,
         &files,
@@ -13378,7 +13372,7 @@ async fn analyze_current_repo(
     // call-site anchor, so the file-analyzer can locate their co-located
     // result type. Same duplicate-parse tradeoff as the producer hints above.
     let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
-        service_graphql_roots(repo_path, service),
+        &service_graphql_roots(repo_path, service),
         &files,
         repo_path,
     );
@@ -25656,7 +25650,7 @@ unfollowed_member_calls_total: 0,
         let catalogue = crate::graphql::SchemaCatalogue::build(
             repo.path(),
             &[crate::graphql::ServedSchemaSources {
-                roots: vec![repo.path().join("src")],
+                roots: vec![repo.path().join("src").into()],
                 declared: vec![],
             }],
         );
