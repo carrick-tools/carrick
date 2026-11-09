@@ -4702,6 +4702,215 @@ mod tests {
         }
     }
 
+    // --- carrick#3622 T2: a name declared again in another map, which the
+    // lockfile installs unchanged ---
+
+    /// Each service's plan reason and whether its reading moved, after a
+    /// commit that bumps `lib-b` (which only `worker` loads) and makes
+    /// `change`, from a stored commit that `prep` made on the dependency
+    /// fixture. `prep` is applied again after the bump rewrites every
+    /// manifest and the lockfile.
+    fn after_prep_and_change(
+        manager: Manager,
+        prep: impl Fn(&Path),
+        change: impl FnOnce(&Path),
+    ) -> (Vec<Option<Reason>>, Vec<bool>) {
+        let (repo, _, services) = dependency_workspace(manager);
+        prep(repo.path());
+        let base = commit_all(repo.path(), "prep");
+        after_change_from(&repo, &base, &services, |repo| {
+            let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+            write_dependencies(repo, manager, &bumped, &bumped);
+            prep(repo);
+            change(repo);
+        })
+    }
+
+    /// The root's `@types/node` leaves `devDependencies` for `dependencies`.
+    fn root_types_at_runtime(repo: &Path, manager: Manager) {
+        edit_manifest(repo, "package.json", |manifest| {
+            let spec = manifest["devDependencies"]
+                .as_object_mut()
+                .unwrap()
+                .remove("@types/node")
+                .unwrap();
+            manifest["dependencies"]["@types/node"] = spec;
+        });
+        edit_lock(repo, manager, |lock| {
+            let root = match manager {
+                Manager::Npm => &mut lock["packages"][""],
+                Manager::Pnpm => &mut lock["importers"]["."],
+            };
+            let value = root["devDependencies"]
+                .as_object_mut()
+                .unwrap()
+                .remove("@types/node")
+                .unwrap();
+            root["dependencies"]["@types/node"] = value;
+        });
+    }
+
+    /// The manifest in `dir` (`""` for the root) also declares `@types/node`
+    /// in `map` at `spec`, as npm records it; pnpm lists a name once per
+    /// importer, so its lockfile is unchanged.
+    fn declare_types_also(repo: &Path, manager: Manager, dir: &str, map: &str, spec: &str) {
+        let manifest = Path::new(dir).join("package.json");
+        edit_manifest(repo, &manifest.to_string_lossy(), |manifest| {
+            manifest[map]["@types/node"] = serde_json::json!(spec);
+        });
+        if let Manager::Npm = manager {
+            edit_lock(repo, manager, |lock| {
+                lock["packages"][dir][map]["@types/node"] = serde_json::json!(spec);
+            });
+        }
+    }
+
+    /// `web` declares `@types/node` at `1.0.0` in `dependencies`.
+    fn web_declares_types(repo: &Path, manager: Manager) {
+        edit_manifest(repo, "apps/web/package.json", |manifest| {
+            manifest["dependencies"]["@types/node"] = serde_json::json!("1.0.0");
+        });
+        edit_lock(repo, manager, |lock| match manager {
+            Manager::Npm => {
+                lock["packages"]["apps/web"]["dependencies"]["@types/node"] =
+                    serde_json::json!("1.0.0");
+            }
+            Manager::Pnpm => {
+                lock["importers"]["apps/web"]["dependencies"]["@types/node"] =
+                    serde_json::json!({ "specifier": "1.0.0", "version": "1.0.0" });
+            }
+        });
+    }
+
+    /// The root manifest declares `@types/node` again in `dependencies` at
+    /// `spec`, beside a bump of `lib-b` that only `worker` loads; with
+    /// `leave_dev`, it leaves `devDependencies`. The lockfile records it as
+    /// the manager would.
+    fn declare_types_again(repo: &Path, manager: Manager, spec: &str, leave_dev: bool) {
+        let bumped = moved(&first_versions(), "lib-b", "1.1.0");
+        write_dependencies(repo, manager, &bumped, &bumped);
+        edit_manifest(repo, "package.json", |manifest| {
+            manifest["dependencies"]["@types/node"] = serde_json::json!(spec);
+            if leave_dev {
+                manifest["devDependencies"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("@types/node");
+            }
+        });
+        edit_lock(repo, manager, |lock| match manager {
+            Manager::Npm => {
+                let root = &mut lock["packages"][""];
+                root["dependencies"]["@types/node"] = serde_json::json!(spec);
+                if leave_dev {
+                    root["devDependencies"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("@types/node");
+                }
+            }
+            Manager::Pnpm => {
+                // pnpm lists a name once per importer, under `dependencies`.
+                let root = &mut lock["importers"]["."];
+                let mut entry = root["devDependencies"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("@types/node")
+                    .unwrap();
+                entry["specifier"] = serde_json::json!(spec);
+                root["dependencies"]["@types/node"] = entry;
+            }
+        });
+    }
+
+    /// The root's runtime `@types/node` declared again in `devDependencies`
+    /// at the spec the lockfile installs moves nothing: the compiler's
+    /// types, the runtime set and the install are as they were, and no
+    /// service is rooted at the root. Only `worker` loads the bumped `lib-b`.
+    #[test]
+    fn a_runtime_dependency_declared_again_as_dev_moves_nothing() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (reasons, moved) = after_prep_and_change(
+                manager,
+                |repo| root_types_at_runtime(repo, manager),
+                |repo| declare_types_also(repo, manager, "", "devDependencies", "1.0.0"),
+            );
+            assert_eq!(
+                reasons,
+                [None, None, Some(Reason::InputsChanged)],
+                "{moved:?}"
+            );
+            assert_eq!(moved, [false, false, true]);
+        }
+    }
+
+    /// Framework detection sends a service root manifest's `dependencies`
+    /// and `devDependencies` by name, so a name declared again into one of
+    /// them moves the service rooted there; `peerDependencies` is not sent.
+    #[test]
+    fn a_service_manifest_declaring_again_keeps_its_own_detection_moved() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            for (map, expected) in [
+                ("devDependencies", [false, true, true]),
+                ("peerDependencies", [false, false, true]),
+            ] {
+                let (_, moved) = after_prep_and_change(
+                    manager,
+                    |repo| web_declares_types(repo, manager),
+                    |repo| declare_types_also(repo, manager, "apps/web", map, "1.0.0"),
+                );
+                assert_eq!(moved, expected, "{map}");
+            }
+        }
+    }
+
+    /// The same declaration with nothing else moving still moves `web`'s
+    /// detection, so the change does not read as moving nothing.
+    #[test]
+    fn a_service_manifest_declaring_again_alone_moves_something() {
+        let (repo, _, services) = dependency_workspace(Manager::Npm);
+        web_declares_types(repo.path(), Manager::Npm);
+        let base = commit_all(repo.path(), "prep");
+        declare_types_also(
+            repo.path(),
+            Manager::Npm,
+            "apps/web",
+            "devDependencies",
+            "1.0.0",
+        );
+        commit_all(repo.path(), "again");
+        let path = repo.path().to_string_lossy().to_string();
+        let top = crate::git_state::toplevel(&path).unwrap();
+        let changes = ChangedSince::new(&path, &services, &[]);
+        let moved = changes
+            .dependency_move(&base, &top)
+            .expect("a same-spec declaration is read");
+        assert!(!moved.moves_nothing());
+    }
+
+    /// A different spec, a name that was not at runtime before, or a name
+    /// that left a map is a re-specification: the compiler's own types reach
+    /// every service.
+    #[test]
+    fn a_dependency_declared_again_at_another_spec_or_status_stays_moved() {
+        for manager in [Manager::Npm, Manager::Pnpm] {
+            let (reasons, moved) = after_prep_and_change(
+                manager,
+                |repo| root_types_at_runtime(repo, manager),
+                |repo| declare_types_also(repo, manager, "", "devDependencies", "^1.0.0"),
+            );
+            assert_eq!(reasons, [Some(Reason::InputsChanged); 3], "spec");
+            assert_eq!(moved, [true, true, true], "spec");
+            for leave_dev in [false, true] {
+                let (reasons, moved) = after_change(manager, |repo| {
+                    declare_types_again(repo, manager, "1.0.0", leave_dev)
+                });
+                assert_eq!(reasons, [Some(Reason::InputsChanged); 3], "{leave_dev}");
+                assert_eq!(moved, [true, true, true], "{leave_dev}");
+            }
+        }
+    }
+
     /// A blobless clone with no remote holds the commit's tree but not its
     /// copy of the lockfile, so nothing says what moved.
     #[test]
