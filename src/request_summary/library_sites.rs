@@ -2813,8 +2813,23 @@ pub(super) fn place_field_values(
             || (own.opaque.contains(field) && !own.param_props.contains(field))
             || related.iter().any(|class| class.sets(field))
     };
+    // The `this`-escape rule applies to the origins S4c adds only: a field
+    // the constructor sets keeps its reading when `this` leaves the class,
+    // and is counted so main's check reports how often that happens.
+    let escaped = origins.len()
+        + placed
+            .keys()
+            .filter(|field| !origins.contains_key(*field))
+            .count();
+    if leaks && escaped > 0 {
+        tracing::debug!(fields_this_escaped = escaped, "class hands `this` out");
+    }
+    let unplaced_but_ctor = |field: &str| {
+        (own.opaque.contains(field) && !own.param_props.contains(field))
+            || related.iter().any(|class| class.sets(field))
+    };
     for (field, origin) in origins.iter_mut() {
-        if unplaced(field) {
+        if unplaced_but_ctor(field) {
             origin.values = vec![ValueAt::Unread];
         }
     }

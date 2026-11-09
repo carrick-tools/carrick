@@ -3892,7 +3892,18 @@ mod tests {
                 false,
                 "a method writes its parameter",
             ),
-            ("f-field-escape.ts", 14, false, "this handed to a call"),
+            (
+                "f-field-escape.ts",
+                15,
+                true,
+                "ctor sets it, this handed to a call",
+            ),
+            (
+                "f-field-escape.ts",
+                23,
+                false,
+                "a method alone writes it, this handed to a call",
+            ),
         ]
         .into_iter()
         .filter_map(|(file, line, is_decided, form)| {
