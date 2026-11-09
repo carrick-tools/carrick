@@ -31555,6 +31555,98 @@ io.on("bare:in", (event) => {});
         );
     }
 
+    /// carrick#3641: main holds `/users` as a real handler row in
+    /// `src/routes.ts` and as a documentation row in `src/openapi.ts`. This
+    /// scan keeps only the documentation row. The PR edits `src/routes.ts`
+    /// on another line: the handler row is lost, so the delta names the file
+    /// and never lists `/users` as removed, though documentation still states
+    /// it. When the PR replaces the handler's own line, the row is listed
+    /// neither as removed nor as lost: documentation still states the key.
+    /// An operation only documentation ever stated is neither.
+    #[test]
+    fn a_handler_row_lost_beside_a_documentation_row_is_named_not_listed() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::findings::FileNotReadReason;
+        const THIS: &str = "0.4.0";
+        let documented = |repo: &mut CloudRepoData, file: &str| {
+            for row in &mut repo.endpoints {
+                row.file_path = PathBuf::from(file);
+                row.resolution_source = Some(ResolutionSource::DescriptorRoute);
+                row.handler_name = Some("__route_descriptor__".to_string());
+            }
+        };
+        let (repo, base) = crate::git_state::tests::committed_repo(&[
+            ("src/routes.ts", "a\nb\nc\nd\n"),
+            ("src/openapi.ts", "doc\n"),
+        ]);
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let mut handler = service_stating("web", Some(THIS), &["/users"]);
+        let mut docs = service_stating("web", Some(THIS), &["/users"]);
+        documented(&mut docs, "src/openapi.ts:1");
+        handler.endpoints.extend(docs.endpoints.clone());
+        handler.commit_hash = base.clone();
+        let DeltaBaseline::Keys(previous) = DeltaBaseline::of([&handler], THIS) else {
+            panic!("this version's index is the baseline");
+        };
+        let delta_now = |current: &CloudRepoData, previous| {
+            anchored_delta(
+                &repo_path,
+                Some(&base),
+                previous,
+                std::slice::from_ref(current),
+                &[],
+                None,
+                &[],
+                &[],
+            )
+            .expect("git reads the diff")
+        };
+        let named =
+            |delta: &crate::findings::PrDelta| -> Vec<(String, FileNotReadReason, Vec<String>)> {
+                delta
+                    .files_not_read
+                    .iter()
+                    .map(|file| {
+                        (
+                            file.file.clone(),
+                            file.reason,
+                            file.operations.iter().map(|op| op.path.clone()).collect(),
+                        )
+                    })
+                    .collect()
+            };
+
+        std::fs::write(repo.path().join("src/routes.ts"), "a\nb\nc\nedited\n").unwrap();
+        let delta = delta_now(&docs, &previous);
+        assert!(delta.removed_endpoints.is_empty(), "{delta:?}");
+        assert!(delta.new_endpoints.is_empty(), "{delta:?}");
+        assert_eq!(
+            named(&delta),
+            vec![(
+                "src/routes.ts".to_string(),
+                FileNotReadReason::OperationsMissing,
+                vec!["/users".to_string()]
+            )]
+        );
+
+        // The PR replaces the handler's own line: not lost, and still not
+        // removed, since documentation states the key.
+        std::fs::write(repo.path().join("src/routes.ts"), "changed\nb\nc\nd\n").unwrap();
+        let delta = delta_now(&docs, &previous);
+        assert!(delta.removed_endpoints.is_empty(), "{delta:?}");
+        assert!(delta.files_not_read.is_empty(), "{delta:?}");
+
+        // Control: documentation alone stated it on main, and still does.
+        std::fs::write(repo.path().join("src/routes.ts"), "a\nb\nc\nedited\n").unwrap();
+        let mut only_docs = docs.clone();
+        only_docs.commit_hash = base.clone();
+        let DeltaBaseline::Keys(previous) = DeltaBaseline::of([&only_docs], THIS) else {
+            panic!("this version's index is the baseline");
+        };
+        let delta = delta_now(&docs, &previous);
+        assert!(delta.removed_endpoints.is_empty() && delta.files_not_read.is_empty());
+    }
+
     /// A delta with nothing unread carries no `files_not_read` key on the
     /// wire, so its payload is the one an older reader already reads.
     #[test]
