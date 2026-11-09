@@ -17,12 +17,15 @@ export const SOURCE_FILE = /\.(ts|tsx|mts|cts)$/;
 export const MENTIONS_SOURCE = /\.(ts|tsx|mts|cts)\b/;
 
 /** One command of a line. `body` is the text of the heredoc it reads, when it has one. */
-type Step = { words: string[]; writes: string[]; cwd: string; body: string };
+type Step = { words: string[]; writes: string[]; cwd: string; body: string; piped: boolean };
 
 const READERS = new Set(["cat", "head", "tail", "nl", "less", "more", "bat", "tac"]);
 const SEARCHERS = new Set(["grep", "egrep", "fgrep", "rg"]);
 /** Search flags that take the next word as their value. */
-const SEARCH_VALUE_FLAGS = new Set(["-e", "-f", "-g", "--regexp", "--file", "--glob"]);
+const SEARCH_VALUE_FLAGS = new Set([
+  "-e", "-f", "-g", "--regexp", "--file", "--glob",
+  "-A", "-B", "-C", "-m", "-t", "-T", "--type", "--include", "--exclude", "--exclude-dir", "--max-count", "--max-depth",
+]);
 /** Of these, the ones that stand in for the pattern word. */
 const PATTERN_FLAGS = new Set(["-e", "-f", "--regexp", "--file"]);
 
@@ -35,6 +38,8 @@ function steps(command: string, startCwd: string): Step[] {
   let word = "";
   let inWord = false;
   let redirect = false;
+  // The step being read is the right side of a `|`.
+  let piped = false;
   // Heredocs opened on the current line: the step that reads each and its delimiter.
   let docs: Array<{ owner: number; delimiter: string; strip: boolean }> = [];
   const endWord = () => {
@@ -52,8 +57,9 @@ function steps(command: string, startCwd: string): Step[] {
     if (words.length > 0 || writes.length > 0) {
       // `cd dir` moves every step after it.
       if (words[0] === "cd" && words[1] && words[1] !== "-") cwd = path.resolve(cwd, words[1]);
-      out.push({ words, writes, cwd, body: "" });
+      out.push({ words, writes, cwd, body: "", piped });
     }
+    piped = false;
     words = [];
     writes = [];
   };
@@ -90,7 +96,10 @@ function steps(command: string, startCwd: string): Step[] {
       }
       docs = [];
     } else if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === ")") {
+      // A lone `|` hands this step's output to the next; `||` does not.
+      const lone = ch === "|" && command[i + 1] !== "|" && command[i - 1] !== "|";
       endStep();
+      piped = lone;
     } else if (ch === "<" && command[i + 1] === "<" && command[i + 2] === "<") {
       // A here-string: its word is an argument, not a file.
       endWord();
@@ -278,4 +287,52 @@ export function bashTargets(command: string, cwd: string): { reads: string[]; wr
     reads: [...new Set(reads)].filter((file) => !written.has(file) && isFile(file)),
     writes: [...written].filter(isFile),
   };
+}
+
+/** Words a search pattern carries that are not the name searched for. */
+const DECLARING = new Set(["function", "const", "let", "var", "export", "async", "default", "class", "return", "await", "type", "interface"]);
+
+/**
+ * The identifiers a grep or rg searches for, and the files it was pointed at.
+ * A search piped from another command filters that command's output, not the
+ * tree, so it names nothing. Each `|`-separated alternative must reduce to one
+ * identifier of at least five characters (after dropping `function`, `const`
+ * ...), so a phrase or a regex with structure names nothing.
+ */
+export function searchedNames(command: string, cwd: string): { names: string[]; operands: string[] } {
+  const names: string[] = [];
+  const operands: string[] = [];
+  for (const step of steps(command, cwd)) {
+    if (step.piped) continue;
+    let at = 0;
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(step.words[at] ?? "")) at += 1;
+    let name = path.basename(step.words[at] ?? "");
+    let args = step.words.slice(at + 1);
+    if (name === "git" && args.includes("grep")) {
+      args = args.slice(args.indexOf("grep") + 1);
+      name = "grep";
+    }
+    if (!SEARCHERS.has(name)) continue;
+    const { rest, flags } = positionals(args, SEARCH_VALUE_FLAGS);
+    // `-v` and `-L` ask for the lines or files that do NOT match.
+    if ([...flags].some((flag) => /^-[a-zA-Z]*[vL]/.test(flag) && !flag.startsWith("--"))) continue;
+    const patterns: string[] = [];
+    for (let i = 0; i < args.length; i += 1) {
+      if ((args[i] === "-e" || args[i] === "--regexp") && args[i + 1] !== undefined) patterns.push(args[i + 1]!);
+    }
+    const patterned = patterns.length > 0 || [...flags].some((flag) => PATTERN_FLAGS.has(flag));
+    if (!patterned && rest[0] !== undefined) patterns.push(rest[0]);
+    for (const operand of patterned ? rest : rest.slice(1)) operands.push(path.resolve(step.cwd, operand));
+    for (const pattern of patterns) {
+      for (const alt of pattern.split(/\\\||\|/)) {
+        const tokens = alt
+          .replace(/\\[bBsSwWdD<>]|[\\^$()*+?.[\]{}"'`=:;,<>]/g, " ")
+          .split(/\s+/)
+          .filter((token) => token !== "" && !DECLARING.has(token));
+        const only = tokens.length === 1 ? tokens[0]! : "";
+        if (only.length >= 5 && /^[A-Za-z_$][\w$]*$/.test(only) && !names.includes(only)) names.push(only);
+      }
+    }
+  }
+  return { names, operands };
 }

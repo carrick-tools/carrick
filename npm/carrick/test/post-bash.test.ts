@@ -298,3 +298,77 @@ test("bashTargets reads the write shapes the agents use", (t) => {
   assert.ok(movesTreeInBulk("cd a && npm ci", w.worktree));
   assert.ok(!movesTreeInBulk("git diff && npm test", w.worktree));
 });
+
+// A grep for an indexed function names the sites its output did not print.
+
+/** A workspace whose index holds `readWidget` (defined in lib.ts) called from a.ts, b.ts and c.ts. */
+function indexedWorkspace(t: { after: (fn: () => void) => void }) {
+  const w = repoWithWorktree(t);
+  const root = w.repo;
+  const site = (file: string, line: number) => ({ service: "svc", file, line, function: "run" });
+  fs.writeFileSync(
+    path.join(root, ".carrick", "index.json"),
+    JSON.stringify({
+      repos: [
+        {
+          path: root,
+          name: "svc",
+          uses: {
+            "src/lib.ts": {
+              functions: [
+                { name: "readWidget", line: 4, callers_total: 3, callers: [site("src/a.ts", 3), site("src/b.ts", 9), site("src/c.ts", 2)] },
+                { name: "common", line: 1, callers_total: 1, callers: [site("src/a.ts", 1)] },
+                { name: "common", line: 1, callers_total: 1, callers: [site("src/b.ts", 1)] },
+              ],
+            },
+          },
+        },
+      ],
+    }),
+  );
+  return { ...w, root };
+}
+
+function grepRun(w: { root: string; home: string }, command: string, stdout: string, session: string, cwd = w.root) {
+  return runHook("post-bash.ts", {
+    payload: { ...bashPayload(cwd, command, session), tool_response: { stdout } },
+    env: fakeEnv({ HOME: w.home }),
+  });
+}
+
+test("a grep that printed every caller prints nothing", async (t) => {
+  const w = indexedWorkspace(t);
+  const out = "src/lib.ts:4:export function readWidget\nsrc/a.ts:3:readWidget()\nsrc/b.ts:9:readWidget()\nsrc/c.ts:2:readWidget()\n";
+  const run = await grepRun(w, "grep -rn readWidget src", out, "sess-g1");
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, "");
+});
+
+test("a grep scoped to one folder names the caller outside it", async (t) => {
+  const w = indexedWorkspace(t);
+  const out = "src/lib.ts:4:export function readWidget\nsrc/a.ts:3:readWidget()\n";
+  const run = await grepRun(w, "grep -rn 'function readWidget\\|readWidget(' src/a.ts src/lib.ts", out, "sess-g2");
+  const context = contextOf(run.stdout);
+  assert.equal(
+    context,
+    "Carrick: `readWidget` (src/lib.ts:4) is also called where this search did not reach: src/b.ts:9, src/c.ts:2.",
+  );
+  // Once per name per session.
+  const again = await grepRun(w, "rg readWidget src/a.ts", out, "sess-g2");
+  assert.equal(again.stdout, "");
+});
+
+test("a token the map does not hold prints nothing", async (t) => {
+  const w = indexedWorkspace(t);
+  for (const command of ["grep -rn otherThing src", "grep -rn common src", "grep -rn 'read widget' src", "ls | grep readWidget"]) {
+    const run = await grepRun(w, command, "", "sess-g3");
+    assert.equal(run.stdout, "", command);
+  }
+});
+
+test("a grep run from a sub-folder matches its output paths against the folder", async (t) => {
+  const w = indexedWorkspace(t);
+  const out = "lib.ts:4:readWidget\na.ts:3:readWidget\nb.ts:9:readWidget\nc.ts:2:readWidget\n";
+  const run = await grepRun(w, "grep -n readWidget *.ts", out, "sess-g4", path.join(w.root, "src"));
+  assert.equal(run.stdout, "");
+});
