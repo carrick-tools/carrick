@@ -396,7 +396,13 @@ fn agreed_stop(reasons: &[Option<Stop>], several: Stop) -> (Stop, Vec<Stop>) {
     let ways: BTreeSet<Stop> = reasons.iter().flatten().copied().collect();
     match (ways.iter().next(), ways.len()) {
         (Some(one), 1) if reasons.iter().all(Option::is_some) => (*one, Vec::new()),
-        _ => (several, ways.into_iter().take(MAX_ALSO).collect()),
+        _ => (
+            several,
+            ways.into_iter()
+                .filter(|way| *way != several)
+                .take(MAX_ALSO)
+                .collect(),
+        ),
     }
 }
 

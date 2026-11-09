@@ -3406,7 +3406,8 @@ mod tests {
     /// What the test follower makes of an end.
     #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
     enum End {
-        /// Nothing the resolver can read.
+        /// The follower's default, which [`Follow::Reached`] asks for; the
+        /// resolver says why it read nothing with [`Held::Stop`] instead.
         #[default]
         Nothing,
         /// An in-repo definition, by its key.
