@@ -1,0 +1,47 @@
+{
+  "library_claims": [
+    {
+      "package": "role-server",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "role-server",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "receive", "member": "get", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "GET", "picker": "fixture-picker" },
+            { "op": "receive", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "role-fetcher",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "role-fetcher",
+          "export": "default",
+          "role": "http_client",
+          "side": "client",
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "request", "member": "get", "of": "instance:()", "name": { "arg": 0 }, "method_default": "GET", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
