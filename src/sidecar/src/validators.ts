@@ -620,7 +620,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       kind: z.literal('scope'),
       member: z.string().min(1),
       form: z.enum(['call', 'decorate']).optional(),
-      // Exactly one of `name` and `collects`: the verifier's verdict (#2474 R6a).
+      // Exactly one of `name`, `collects` and `merges`: the verifier's verdict (#2474 R6a).
       name: NameSlotSchema.optional(),
       path: MemberPathSchema.optional(),
       on: ClaimOnSchema.optional(),
@@ -632,6 +632,8 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       yields: YieldsSchema.optional(),
       mounts: ClaimSlotSchema.optional(),
       collects: CollectsSchema.optional(),
+      // Amendment 9: a rest slot of collections; the verifier's verdict pairs it.
+      merges: ClaimSlotSchema.optional(),
     })
     .strict(),
   z

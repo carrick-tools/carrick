@@ -7,6 +7,8 @@
  *   name procedures and nested routers;
  * - `name: { bound: 'key' }` on a receive op: the procedure is named by the
  *   key it sits under, and the label states its method;
+ * - `merges` on a scope (amendment 9): the member takes, as a rest, the
+ *   routers a verified `collects` scope returns;
  * - an adapter, a maker whose `runs` slot takes the router a `collects`
  *   scope returns, with its endpoint at `prefix`.
  *
@@ -71,6 +73,9 @@ export interface Kit {
   router<R extends RouterRecord>(record: R): Router<R>;
   label(name: string): Kit;
   loose(record: any): Router;
+  mergeRouters<R extends Router[]>(...routers: [...R]): Router;
+  mergeNone(...names: string[]): Router;
+  mergeLoose(...anything: any[]): Router;
 }
 export interface Init {
   create(): Kit;
@@ -268,6 +273,42 @@ describe('verify_library_claims: procedure-router fields (carrick#2474 R6a)', ()
         adapter('serveLoose', serves),
       ]),
       ['failed runs_not_function', 'verified', 'unchecked runs_untyped']
+    );
+  });
+
+  it('merges: the member takes routers in a rest slot beside a verified collects scope', async () => {
+    const merging = (member: string, parts: Record<string, unknown> = {}) =>
+      onKit(scope(member, { merges: { arg: 0, each: true }, ...parts }));
+    assert.deepStrictEqual(
+      await send([
+        router(),
+        merging('mergeRouters'),
+        // Invalid: the rest takes strings, no router fits.
+        merging('mergeNone'),
+        // Says nothing: the rest is untyped.
+        merging('mergeLoose'),
+      ]),
+      ['verified', 'verified', 'failed merges_not_collection', 'unchecked merges_untyped']
+    );
+  });
+
+  it('merges is unbound with no verified collects scope in the request', async () => {
+    assert.deepStrictEqual(await send([onKit(scope('mergeRouters', { merges: { arg: 0, each: true } }))]), [
+      'failed merges_unbound',
+    ]);
+  });
+
+  it('merges pairs as the contract says: alone, and as a rest slot', async () => {
+    const claims = [
+      scope('mergeRouters', { merges: { arg: 0, each: true }, name: { arg: 0 } }),
+      scope('mergeRouters', { merges: { arg: 0, each: true }, collects: { arg: 0, join: '.' } }),
+      scope('mergeRouters', { merges: { arg: 0, each: true }, mounts: { arg: 0 } }),
+      scope('mergeRouters', { merges: { arg: 0 } }),
+      scope('mergeRouters', { merges: { arg: 0, each: true, key: 'k' } }),
+    ];
+    assert.deepStrictEqual(
+      await send([router(), ...claims.map(onKit)]),
+      ['verified', ...claims.map(() => 'unchecked claim_invalid')]
     );
   });
 
