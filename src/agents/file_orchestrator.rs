@@ -4493,24 +4493,14 @@ impl FileOrchestrator {
                 continue;
             };
             let calls_before = result.data_calls.len();
-            let _ = Self::emit_resolved_rows(
+            // The base is read as the analysed path reads it: from this
+            // file's own bindings (carrick#3427).
+            let symbols = Self::extract_symbol_table(&late.file_path, &cm, &handler);
+            Self::emit_late_summary_rows(
                 result,
-                Self::resolve_candidates(
-                    &HashMap::new(),
-                    &HashMap::new(),
-                    &[],
-                    &EnvAliasMap::new(),
-                    &WholeUrlFallbackMap::new(),
-                    &EnvFallbackMap::new(),
-                    &LiteralBaseMap::new(),
-                    &[],
-                    &[],
-                    &[],
-                    summary_rows,
-                    &env_schema,
-                    // Its rows skip the passes after the join.
-                    false,
-                ),
+                summary_rows,
+                &symbols,
+                &env_schema,
                 &mut stats.deterministic_rows_emitted,
             );
             if late.counts_data_calls {
@@ -10973,6 +10963,51 @@ impl FileOrchestrator {
             .as_deref()
             .unwrap_or(&data_call.target);
         normalizer.consumer_call_path(url, data_call.base.as_ref())
+    }
+
+    /// A no-model file's request-summary rows, emitted once the summaries are
+    /// composed. Each row states its base as the analysed path does
+    /// (carrick#3427): the file's own env alias, whole-URL, env-fallback and
+    /// literal-base maps, then the same base-slot rewrite and base read. Only
+    /// those two passes of the post-join run here.
+    fn emit_late_summary_rows(
+        result: &mut FileAnalysisResult,
+        summary_rows: &BTreeMap<u32, Vec<SummaryRow>>,
+        symbols: &FileSymbols,
+        env_schema: &EnvSchemaIndex,
+        emitted: &mut BTreeMap<ResolutionSource, usize>,
+    ) {
+        let _ = Self::emit_resolved_rows(
+            result,
+            Self::resolve_candidates(
+                &HashMap::new(),
+                &HashMap::new(),
+                &[],
+                &symbols.env_aliases,
+                &symbols.whole_url_fallbacks,
+                &symbols.env_fallbacks,
+                &symbols.literal_bases,
+                &[],
+                &[],
+                &[],
+                summary_rows,
+                env_schema,
+                true,
+            ),
+            emitted,
+        );
+        Self::resolve_target_bases(
+            result,
+            &symbols.env_aliases,
+            &symbols.whole_url_fallbacks,
+            &symbols.literal_bases,
+        );
+        Self::stamp_call_bases(
+            result,
+            &symbols.env_aliases,
+            &symbols.env_fallbacks,
+            env_schema,
+        );
     }
 
     /// Record how each call's base resolves (carrick#649).
@@ -20952,6 +20987,51 @@ export { routes };
             .expect("a base is stated");
         assert_eq!(reread.kind, CallBaseKind::Env);
         assert_eq!(reread.written, "${process.env.API_URL}");
+    }
+
+    /// carrick#3427: a request-summary row emitted late (a file no model
+    /// reads) states its base from the file's own bindings, as the analysed
+    /// path does. A target opening at a binding the file aliases to an env
+    /// read is rewritten to the read and its base is stated.
+    #[test]
+    fn a_late_summary_row_states_its_base_at_emission() {
+        use crate::call_base::CallBaseKind;
+        let row = crate::request_summary::SummaryRow {
+            callee: "relay".to_string(),
+            span_start: 100,
+            span_end: 140,
+            line: 4,
+            method: "POST".to_string(),
+            target: "${apiBase}/api/v1/resync".to_string(),
+            body_literals: Default::default(),
+            reaches_request: None,
+            own_site: true,
+            at_caller: false,
+            call_body: None,
+            library_semantics: Vec::new(),
+            base_fallbacks: None,
+            request_at: (std::path::PathBuf::from("src/sync.ts"), 100),
+            base_end: None,
+        };
+        let rows: BTreeMap<u32, Vec<crate::request_summary::SummaryRow>> =
+            BTreeMap::from([(100, vec![row])]);
+        let symbols = FileSymbols {
+            env_aliases: EnvAliasMap::from([("apiBase".to_string(), "API_URL".to_string())]),
+            ..Default::default()
+        };
+        let mut result = FileAnalysisResult::default();
+        FileOrchestrator::emit_late_summary_rows(
+            &mut result,
+            &rows,
+            &symbols,
+            &EnvSchemaIndex::default(),
+            &mut BTreeMap::new(),
+        );
+        let call = &result.data_calls[0];
+        assert_eq!(call.target, "${process.env.API_URL}/api/v1/resync");
+        let base = call.base.as_ref().expect("the late row states its base");
+        assert_eq!(base.kind, CallBaseKind::Env);
+        assert_eq!(base.written, "${process.env.API_URL}");
     }
 
     /// Two sites on one source line (a `Promise.all` of them) are two calls:

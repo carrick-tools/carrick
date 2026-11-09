@@ -25,7 +25,11 @@
 //!   package's function a callback that calls the labelled relay;
 //! - `src/helper.ts`, an in-module request helper that builds its URL with a
 //!   call and passes it to the labelled relay, called un-awaited from a
-//!   client object of arrow methods, beside a helper that never sends.
+//!   client object of arrow methods, beside a helper that never sends;
+//! - `src/sync.ts`, whose only call hands a template that starts at an origin
+//!   computed in `src/origin.ts` to a helper (`src/publish.ts`) that passes it
+//!   to a fetching wrapper (`src/enqueue.ts`): no candidate in the file and no
+//!   wrapper beside it, so no model reads it and its request-summary row is emitted late.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -135,6 +139,14 @@ const PROXY_CALLER: &str = "import { Proxy } from \"./proxy\";\n\ninterface Forw
 const CHAINED: &str = "import server from \"@fixture/server\";\n\nexport function createChained() {\n  const srv = server();\n  srv\n    .get(\"/health/chained\", () => \"ok\");\n  return srv;\n}\n";
 
 const CHAINED_CALLER: &str = "import { createChained } from \"./chained\";\n\nexport function startChained() {\n  return createChained();\n}\n";
+
+const SYNC: &str = "import { publish } from \"./publish\";\nimport { APP_ORIGIN } from \"./origin\";\n\nexport function resync(): void {\n  void publish(`${APP_ORIGIN}/api/v1/resync`);\n}\n";
+
+const ENQUEUE: &str = "export function enqueue(target: string): Promise<Response> {\n  return fetch(target, { method: \"POST\" });\n}\n";
+
+const PUBLISH: &str = "import { enqueue } from \"./enqueue\";\n\nexport function publish(target: string): Promise<Response> {\n  return enqueue(target);\n}\n";
+
+const ORIGIN: &str = "const pick = (env?: string): string => env ?? \"https://app.example.test\";\n\nexport const APP_ORIGIN: string = pick(process.env.APP_ORIGIN);\n";
 
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
@@ -261,6 +273,10 @@ fn repo(tmp: &Path) -> PathBuf {
     fs::write(repo.join("src/status.ts"), STATUS).unwrap();
     fs::write(repo.join("src/poll.ts"), POLL).unwrap();
     fs::write(repo.join("src/helper.ts"), HELPER).unwrap();
+    fs::write(repo.join("src/sync.ts"), SYNC).unwrap();
+    fs::write(repo.join("src/origin.ts"), ORIGIN).unwrap();
+    fs::write(repo.join("src/enqueue.ts"), ENQUEUE).unwrap();
+    fs::write(repo.join("src/publish.ts"), PUBLISH).unwrap();
     canned_answer(
         &repo,
         "notify",
@@ -847,5 +863,36 @@ fn a_row_at_a_call_with_a_graphql_end_and_an_http_end_is_kept() {
         !on.log_has(&["Withdrawing HTTP row", "/api/mixed"]),
         "no withdrawal at a call with an HTTP end: {}",
         on.log
+    );
+}
+
+/// carrick#3427: a file no model reads has its request-summary rows emitted
+/// late. They state
+/// their base as the analysed path does: the origin is the base, not a leading
+/// path segment of the key.
+#[test]
+fn a_fact_only_files_row_states_its_base() {
+    let scan = choosing();
+    assert!(
+        scan.log_has(&["Skipped (no API patterns)", "src/sync.ts"]),
+        "no model reads the file: {}",
+        scan.log
+    );
+    assert!(scan.prompt("src/sync.ts").is_none(), "{}", scan.log);
+    let rows: Vec<&serde_json::Value> = scan
+        .calls
+        .iter()
+        .filter(|call| {
+            call["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("sync.ts"))
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "{:#?}", scan.calls);
+    assert_eq!(rows[0]["path"], "/api/v1/resync", "{}", rows[0]);
+    assert_eq!(
+        rows[0]["base"]["written"], "${APP_ORIGIN}",
+        "the row states its base: {}",
+        rows[0]
     );
 }
