@@ -2709,12 +2709,12 @@ class DeclarationReader {
       return { outcome: unchecked('claim_invalid') };
     }
     const collected = merges === undefined ? undefined : collections?.();
-    if (merges !== undefined && collected === undefined) return { outcome: failed('merges_unbound') };
     const binds = claim.runs !== undefined || claim.mounts !== undefined;
     const layout = this.layout({ name: claim.name, runs: claim.runs, mounts: claim.mounts });
     if ('failure' in layout) return { outcome: layout.failure };
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
     if ('failure' in callee) return { outcome: callee.failure };
+    if (merges !== undefined && collected === undefined) return { outcome: failed('merges_unbound') };
     const labels = claim.key_labels ?? {};
     const holding: ts.Signature[] = [];
     let best: RankedFailure | undefined;
@@ -2733,7 +2733,9 @@ class DeclarationReader {
         if (collected) result = { rank: 5, outcome: collected };
       }
       if (result.rank === Infinity && merges !== undefined && collected !== undefined) {
-        const merged = this.collectionSlotOutcome(signature, this.mergedSlotAt(signature, merges.arg), collected, 'merges');
+        const merged =
+          this.mergesNotRest(signature, merges.arg) ??
+          this.collectionSlotOutcome(signature, this.mergedSlotAt(signature, merges.arg), collected, 'merges');
         if (merged) result = { rank: 5, outcome: merged };
       }
       if (result.rank === Infinity && !binds && this.returnSaysNothing(this.returnOf(signature, built))) {
@@ -2816,6 +2818,13 @@ class DeclarationReader {
     collections: readonly ts.Type[]
   ): Outcome | undefined {
     return this.collectionSlotOutcome(signature, declared, collections, 'runs');
+  }
+
+  /** A merge's slot at `index` must be a rest parameter (or an element of one): a plain parameter fails `merges_not_rest`. */
+  private mergesNotRest(signature: ts.Signature, index: number): Outcome | undefined {
+    const restIndex = this.restIndexOf(signature);
+    const plain = restIndex === -1 || index < restIndex;
+    return plain && index < signature.getParameters().length ? failed('merges_not_rest') : undefined;
   }
 
   /**

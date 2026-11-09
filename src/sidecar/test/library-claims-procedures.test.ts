@@ -79,6 +79,7 @@ export interface Kit {
   mergeLists(...lists: Router[][]): Router;
   mergeArray(routers: Router[]): Router;
   mergeArrayOf<R extends Router[]>(routers: R): Router;
+  mergePlain(first: Router, opts: { x: string }): Router;
   mergeRest(...routers: Router[]): Router;
   mergeRestOf<R extends Router[]>(...routers: R): Router;
 }
@@ -313,10 +314,25 @@ describe('verify_library_claims: procedure-router fields (carrick#2474 R6a)', ()
         'verified',
         'verified',
         'failed merges_not_collection',
-        'failed merges_not_collection',
-        'failed merges_not_collection',
+        'failed merges_not_rest',
+        'failed merges_not_rest',
       ]
     );
+  });
+
+  it('merges verifies only on a rest parameter, never a plain one', async () => {
+    const at = (member: string, arg: number) => onKit(scope(member, { merges: { arg, each: true } }));
+    assert.deepStrictEqual(await send([router(), at('mergePlain', 0), at('mergePlain', 1), at('mergePlain', 5)]), [
+      'verified',
+      'failed merges_not_rest',
+      'failed merges_not_rest',
+      'failed param_missing',
+    ]);
+  });
+
+  it('merges answers a missing member before it answers unbound', async () => {
+    const [outcome] = await send([onKit(scope('noSuchMerge', { merges: { arg: 0, each: true } }))]);
+    assert.ok(!outcome.includes('merges_unbound'), outcome);
   });
 
   it('merges is unbound with no verified collects scope in the request', async () => {
