@@ -582,7 +582,10 @@ impl MountGraph {
         normalizer: &UrlNormalizer,
     ) -> Option<Vec<&ResolvedEndpoint>> {
         let normalized = normalizer.normalize(url);
-        if normalized.is_external || normalized.is_unresolved {
+        if normalized.is_external
+            || normalized.is_unresolved
+            || normalizer.outside_origin(url).is_some()
+        {
             return None;
         }
         Some(
@@ -1581,7 +1584,10 @@ mod tests {
         normalizer: &UrlNormalizer,
     ) -> Option<Vec<&'g ResolvedEndpoint>> {
         let normalized = normalizer.normalize(url);
-        if normalized.is_external || normalized.is_unresolved {
+        if normalized.is_external
+            || normalized.is_unresolved
+            || normalizer.outside_origin(url).is_some()
+        {
             return None;
         }
         let pairing = graph.http_pairing_pool().pair(&carrick_match::Call {

@@ -491,9 +491,25 @@ impl UrlNormalizer {
     }
 
     /// The host of a call target that names an origin outside this system, or
-    /// `None`. STUB for the red commit: the fix fills it.
-    pub fn outside_origin(&self, _url: &str) -> Option<String> {
-        None
+    /// `None`: a literal `http(s)://` host that is not loopback and not
+    /// declared internal.
+    ///
+    /// This is the one statement of that rule. [`Self::consumer_call_path`]
+    /// keeps such a target whole on the key; the analyzer's join and the
+    /// wrong-verb lookup read the same answer, with every service's
+    /// declarations merged, and skip the call: a third party is neither a
+    /// pair, a gap nor a wrong verb (carrick#3468, carrick-cloud#656). A host
+    /// any service declares internal is not outside and still pairs by path.
+    pub fn outside_origin(&self, url: &str) -> Option<String> {
+        let trimmed = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            return None;
+        }
+        let host = self.absolute_host(trimmed)?;
+        if is_loopback_origin(trimmed) || self.is_internal_host(&host) {
+            return None;
+        }
+        Some(host)
     }
 
     /// True if `host` exactly equals, or is a subdomain of, one of `domains`.
@@ -626,11 +642,8 @@ impl UrlNormalizer {
         // as external. And an origin whose host is interpolated
         // (`https://${apiHost}/v1`) names no host at all — `absolute_host`
         // returns `None` for it — so there is nothing to classify by.
-        if has_scheme
-            && self
-                .absolute_host(trimmed)
-                .is_some_and(|_| !is_loopback_origin(trimmed))
-        {
+        // (`Self::outside_origin` states the rule; the join reads it too.)
+        if self.outside_origin(trimmed).is_some() {
             return trimmed.to_string();
         }
         if is_relative_path || is_absolute_url {

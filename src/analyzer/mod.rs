@@ -2708,8 +2708,16 @@ impl Analyzer {
             // External targets, and a URL that was one opaque variable we
             // could not resolve (e.g. `${url}`), name no path to pair:
             // reporting them produces bogus "missing endpoint" noise.
+            //
+            // So is a literal host no service declares internal: a third
+            // party, not a pair, a gap or a wrong verb (carrick#3468). A host
+            // any service declares internal still pairs by its path, because
+            // this normalizer reads the merged config.
             let normalized = normalizer.normalize(&lookup_url);
-            if normalized.is_external || normalized.is_unresolved {
+            if normalized.is_external
+                || normalized.is_unresolved
+                || normalizer.outside_origin(&lookup_url).is_some()
+            {
                 continue;
             }
             // The env-var edge keys on the extracted path (identical to the
@@ -5810,26 +5818,27 @@ mod tests {
                 .collect(),
             ..Config::default()
         };
-        let mut analyzer = Analyzer::new(config);
-        analyzer
-            .calls
-            .push(host_test_call("POST", "https://api.ledger.test/jobs/run"));
-        analyzer.calls.push(host_test_call(
-            "POST",
-            "https://eu.api.ledger.test/jobs/run",
-        ));
         let mut graph = MountGraph::new();
         graph.endpoints.push(host_test_route("POST", "/jobs/run"));
 
-        let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+        // One call per analysis: `verified` dedups by method and path.
+        for url in [
+            "https://api.ledger.test/jobs/run",
+            "https://eu.api.ledger.test/jobs/run",
+        ] {
+            let mut analyzer = Analyzer::new(config.clone());
+            analyzer.calls.push(host_test_call("POST", url));
 
-        assert!(
-            !findings
-                .iter()
-                .any(|f| matches!(f, Finding::MissingEndpoint { .. })),
-            "a declared-internal host went unpaired: {findings:?}"
-        );
-        assert_eq!(verified.len(), 2, "both hosts pair: {verified:?}");
+            let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| matches!(f, Finding::MissingEndpoint { .. })),
+                "{url} went unpaired: {findings:?}"
+            );
+            assert_eq!(verified.len(), 1, "{url} pairs: {verified:?}");
+        }
     }
 
     /// A consumer call whose path exists in the index under a different verb
