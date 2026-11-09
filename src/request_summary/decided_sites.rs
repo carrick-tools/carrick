@@ -1962,6 +1962,9 @@ struct Walk<'a, 'i> {
     /// pairs of `down` are value hops, each with the maker call its function
     /// was made by ([`method_value`]).
     value_hops: Vec<Option<Placed<'a>>>,
+    /// Set only while a carried request descriptor's site is written
+    /// ([`carried`]): its method, read off the object the site writes.
+    carried_method: Option<MethodValue>,
     /// Reads a name decided at one call as text, for a site stated at
     /// another (a maker-bound name, carrick#3527).
     fold: super::site_record::NameFold<'i>,
@@ -2025,11 +2028,12 @@ impl<'a> Walk<'a, '_> {
         }
         let file = relative(self.root, placed.file);
         let id = (file.clone(), placed.call.site.span_start, None, end.at());
-        let method = self
-            .label
-            .and_then(|label| label.method.as_ref())
-            .and_then(|method| method.from.as_ref())
-            .and_then(|slot| method_value(down, slot, &self.value_hops));
+        let method = self.carried_method.clone().or_else(|| {
+            self.label
+                .and_then(|label| label.method.as_ref())
+                .and_then(|method| method.from.as_ref())
+                .and_then(|slot| method_value(down, slot, &self.value_hops))
+        });
         if !self.seen.insert(id.clone()) {
             // Another walk reached this call and labelled end. The same
             // operation (a diamond) is one site; a different one means the
@@ -2979,6 +2983,7 @@ fn decide(
         reached: None,
         scope_call: None,
         value_hops: Vec::new(),
+        carried_method: None,
         fold: super::site_record::NameFold::new(inputs, siblings, root),
         entered: &entered,
     };
@@ -3101,6 +3106,16 @@ fn decide(
             continue;
         }
         let at_end = slot_value(last.call, slot);
+        // The request the site's call writes as an object its chain carries
+        // down to an HTTP send whose own URL reads nothing (carrick#2448 T4).
+        if let Some(carried) = carried(
+            &calls, inputs, root, discovered, site, &last, shifted, end, &at_end,
+        ) {
+            walk.carried_method = Some(carried.method);
+            walk.site(&carried.down, end, carried.name, BTreeSet::from([0]));
+            walk.carried_method = None;
+            continue;
+        }
         if last_is_own && walk.settles(&last, &at_end, end) {
             walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]));
             through_to_last(&mut walk);
@@ -3921,6 +3936,205 @@ fn inner_call_decides(discovered: &[DiscoverySite], site: &DiscoverySite) -> boo
                     && other.chain[..] == site.chain[at + 1..]
             })
     })
+}
+
+/// The request an HTTP site's call states by the object it writes, when the
+/// URL the labelled call is handed cannot be read (carrick#2448 T4, rulings
+/// R-B and R-C): the calls from the site down to the labelled call, the
+/// object's `url` as the site's name, and its `method` key as the call
+/// below the site writes it.
+struct Carried<'a> {
+    down: Vec<Placed<'a>>,
+    name: Vec<Piece>,
+    method: MethodValue,
+}
+
+/// The carried request descriptor (carrick#2448 T4, R-B): a call whose first
+/// argument is an object literal with a `url` key written as text states the
+/// request at that call when (1) every function its chain enters hands that
+/// object on, whole or spread first and its `url` untouched, down to the
+/// function that makes the labelled call; (2) every walk from the call ends
+/// at an HTTP client and nowhere else; and (3) the labelled call's own name
+/// slot reads nothing (`at_end`: a URL built by string operations, a
+/// `Request` an interceptor loop reassigns). The HTTP end is the
+/// corroboration, not the object's keys: `{ url, ...options }` is enough.
+///
+/// A `url` written before a spread of the function's own parameter stands
+/// unless an in-service caller's object writes `url` (R-C); at an entry
+/// point it stands. The method is the `method` key the object holds when
+/// it reaches the function that sends, composed up as a label's method slot
+/// is ([`method_value`]); a key nothing writes is the label's default.
+#[allow(clippy::too_many_arguments)]
+fn carried<'a>(
+    calls: &Calls<'a>,
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    discovered: &[DiscoverySite],
+    site: &DiscoverySite,
+    last: &Placed<'a>,
+    shifted: &'a [(Placed<'a>, CallIr)],
+    end: &LabelledEnd,
+    at_end: &[Piece],
+) -> Option<Carried<'a>> {
+    const URL: &str = "url";
+    const METHOD: &str = "method";
+    let reads_nothing = |piece: &Piece| {
+        matches!(
+            piece,
+            Piece::Unknown
+                | Piece::Opaque {
+                    end: super::guards::Root::Hole(_),
+                    ..
+                }
+        )
+    };
+    if end.role != "http_client" || site.chain.is_empty() || !at_end.iter().all(reads_nothing) {
+        return None;
+    }
+    // (2) Every walk from this call ends at an HTTP client.
+    let same_call = discovered.iter().filter(|other| {
+        other.file == site.file
+            && other.span_start == site.span_start
+            && other.span_end == site.span_end
+    });
+    for other in same_call {
+        match &other.end {
+            Some(other_end) if other.stop.is_none() && other_end.role == "http_client" => {}
+            Some(_) => return None,
+            None => {}
+        }
+    }
+    let down = value_down(calls, root, discovered, site, last, shifted)?;
+    let n = down.len();
+    if n < 2 || !calls.is_own(down[0].file) {
+        return None;
+    }
+    // (1) Each call below the site, in the function the hop above it
+    // entered, hands that function's own parameter 0 on, whole or spread
+    // first, and writes no `url` of its own.
+    for (placed, hop) in down[1..n - 1].iter().zip(&site.chain) {
+        let innermost = if hop.function == VALUE_HOP {
+            enclosing_function_line(inputs, placed.file, placed.call) == Some(hop.line)
+        } else {
+            placed.depth == 0
+        };
+        if !innermost || !hands_on_parameter_0(placed.call, URL) {
+            return None;
+        }
+    }
+    // The site's object and its `url`.
+    let Some(Value::Obj(object)) = argument(down[0].call, 0) else {
+        return None;
+    };
+    let written_after = object.fields.get(URL);
+    let written_before = object
+        .under_param
+        .as_ref()
+        .and_then(|(_, before)| before.get(URL));
+    let text = match (written_after, written_before) {
+        (Some(Value::Str(pieces)), _) => literal_name(pieces)?,
+        (None, Some(Value::Str(pieces))) => {
+            // R-C: the spread may overwrite it only where a caller's object
+            // writes the key.
+            let (spread, _) = object.under_param.as_ref()?;
+            if callers_write(calls, &down[0], *spread, URL)? {
+                return None;
+            }
+            literal_name(pieces)?
+        }
+        _ => return None,
+    };
+    if object.unsettled.contains(URL) {
+        return None;
+    }
+    // The method: the `method` key of the object as the call below the site
+    // writes it, filled up to the site. The trailing value hops carry the
+    // maker call their function was made by (T2).
+    let carrying = &down[..n - 1];
+    let value_hops: Vec<Option<Placed<'a>>> = site.chain[..n - 2]
+        .iter()
+        .rev()
+        .take_while(|hop| hop.function == VALUE_HOP)
+        .map(|hop| {
+            hop.made.as_ref().and_then(|made| {
+                calls.at_span(&root.join(&made.file), made.span_start, made.span_end)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let slot = ArgSlot {
+        arg: 0,
+        key: Some(METHOD.to_string()),
+    };
+    let method = match method_value(carrying, &slot, &value_hops)? {
+        MethodValue::Pieces(pieces) if holds_parameter(&pieces) => match pieces.as_slice() {
+            // A key of the site's own parameter that no caller's object
+            // writes: nothing writes it, so the label's default is sent.
+            [Piece::ParamKey(index, key, _)] if key == METHOD => {
+                if callers_write(calls, &down[0], *index, METHOD)? {
+                    return None;
+                }
+                MethodValue::Unwritten
+            }
+            _ => return None,
+        },
+        MethodValue::Pieces(pieces)
+            if pieces.iter().any(|piece| matches!(piece, Piece::Unknown)) =>
+        {
+            return None;
+        }
+        method => method,
+    };
+    Some(Carried {
+        down,
+        name: vec![Piece::Lit(crate::swc_scanner::normalize_path_params(&text))],
+        method,
+    })
+}
+
+/// Whether `call` hands the function it is written in its own parameter 0
+/// on as its first argument: whole, or as an object that spreads it first
+/// and writes no `key` after it.
+fn hands_on_parameter_0(call: &CallIr, key: &str) -> bool {
+    match argument(call, 0) {
+        Some(Value::Str(pieces)) => matches!(pieces.as_slice(), [Piece::Param(0, _)]),
+        Some(Value::Obj(object)) => {
+            let spread_first = matches!(&object.under_param, Some((0, before)) if before.is_empty())
+                || matches!(&object.under_rest, Some((0, 0, taken)) if !taken.contains(key));
+            spread_first && !object.fields.contains_key(key) && !object.unsettled.contains(key)
+        }
+        _ => false,
+    }
+}
+
+/// Whether some in-service caller of the function `placed` is written in
+/// writes `key` in the object it passes at `index` (carrick#2448 R-C).
+/// `None` where `placed` is not at its definition's own level, so its
+/// callers are not the call graph's.
+fn callers_write(calls: &Calls<'_>, placed: &Placed<'_>, index: usize, key: &str) -> Option<bool> {
+    if placed.depth != 0 {
+        return None;
+    }
+    let Some(own) = placed.key else {
+        // Module level: nothing calls it.
+        return Some(false);
+    };
+    Some(calls.callers_of(placed.file, own).iter().any(|caller| {
+        calls.is_own(caller.file)
+            && match argument(caller.call, index) {
+                Some(Value::Obj(object)) => {
+                    object.fields.contains_key(key)
+                        || object.unsettled.contains(key)
+                        || object
+                            .under_param
+                            .as_ref()
+                            .is_some_and(|(_, before)| before.contains_key(key))
+                }
+                _ => false,
+            }
+    }))
 }
 
 fn place_chain<'a>(

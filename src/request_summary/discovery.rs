@@ -3832,6 +3832,180 @@ mod tests {
         }
     }
 
+    /// carrick#2448 T4 (rulings R-B, R-C): the URL `_fetch(request)` is
+    /// handed is built by string operations no composition reads, so the
+    /// request is read off the object the SDK call writes and the client
+    /// hands on, whole or spread first, down to the send: its `url` is the
+    /// site's name and its `method` key, as the maker call binds it, the
+    /// site's method. A walk that ends at a broker (`n2/jobs.ts:20`) states
+    /// no HTTP site. The answer key is
+    /// `tests/fixtures/generated-client/README.md`.
+    #[test]
+    fn a_carried_request_descriptor_states_the_site() {
+        use super::super::decided_sites::{MethodValue, SiteLabel, decided_sites};
+        let Some(on) = walked("generated-client", "", "", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let decided = decided_sites(
+            &on.inputs,
+            &on.repo,
+            &discovered,
+            &SiteLabel::from_exports(&answer.exports),
+        );
+        let all: Vec<_> = decided
+            .sites
+            .iter()
+            .map(|s| (&s.file, s.line, &s.name, &s.method, &s.end.role))
+            .collect();
+        for (line, path, method) in [
+            (11, "/api/v1/widgets", Some("GET")),
+            (18, "/api/v1/widgets/:id", Some("GET")),
+            (25, "/api/v1/widgets", Some("POST")),
+        ] {
+            let at: Vec<_> = decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("r3/sdk.ts") && site.line == line)
+                .collect();
+            let [site] = at[..] else {
+                panic!("one decided site at r3/sdk.ts:{line}: {all:#?}");
+            };
+            assert_eq!(site.end.export, "fetch", "r3/sdk.ts:{line}");
+            assert_eq!(
+                site.name,
+                vec![Piece::Lit(path.to_string())],
+                "r3/sdk.ts:{line}"
+            );
+            // No method key on the way: the label's default is sent.
+            let want = method.map_or(MethodValue::Unwritten, |method| {
+                MethodValue::Pieces(vec![Piece::Lit(method.to_string())])
+            });
+            assert_eq!(site.method, Some(want), "r3/sdk.ts:{line}");
+            assert_eq!(site.name_args, BTreeSet::from([0]), "r3/sdk.ts:{line}");
+        }
+        // The walk from `n2/jobs.ts:20` does reach its broker, so the
+        // assertion below is about that walk, not about an empty set.
+        assert!(
+            discovery
+                .sites
+                .iter()
+                .any(|site| site.file.ends_with("n2/jobs.ts")
+                    && site.line == 20
+                    && site.stop.is_none()
+                    && site
+                        .end
+                        .as_ref()
+                        .is_some_and(|end| end.role == LibraryRole::Broker)),
+            "n2/jobs.ts:20 reaches the broker: {:?}",
+            discovery.sites
+        );
+        assert!(
+            decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("n2/jobs.ts") && site.line == 20)
+                .all(|site| site.end.role != "http_client"),
+            "a walk that ends at a broker states no HTTP site: {all:#?}"
+        );
+    }
+
+    /// carrick#2448 T4, condition (2): the carried `{ url, ...options }`
+    /// shape over a transport that publishes to a broker whose topic reads
+    /// nothing (a `let` an unrolled loop reassigns, as the HTTP client's
+    /// `Request` is). The HTTP end is the rule's corroboration, so a walk
+    /// that ends at a broker states no site off the object's `url`.
+    #[test]
+    fn a_carried_descriptor_at_a_broker_end_states_no_site() {
+        use super::super::decided_sites::{SiteLabel, decided_sites};
+        let queue = "import { bus } from '@fixture/queue';\n\
+            \n\
+            type Job = { url: string; body?: unknown };\n\
+            \n\
+            export const createQueue = (prefixes: string[]) => {\n\
+            \x20 const send = async (job: Job) => {\n\
+            \x20   let topic = 'jobs';\n\
+            \x20   for (const prefix of prefixes) {\n\
+            \x20     topic = prefix + topic;\n\
+            \x20   }\n\
+            \x20   return bus.publish(topic, job.body);\n\
+            \x20 };\n\
+            \x20 return { post: (job: Job) => send(job) };\n\
+            };\n\
+            \n\
+            export const queue = createQueue(['a.']);\n\
+            \n\
+            export const enqueue = (options?: { body?: unknown }) =>\n\
+            \x20 queue.post({ url: '/t4/reports', ...options });\n";
+        let Some(on) = walked(
+            "generated-client",
+            "",
+            "",
+            &[("src/t4/queue.ts", queue)],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        assert!(
+            discovery
+                .sites
+                .iter()
+                .any(|site| site.file.ends_with("t4/queue.ts")
+                    && site.line == 19
+                    && site.stop.is_none()
+                    && site
+                        .end
+                        .as_ref()
+                        .is_some_and(|end| end.role == LibraryRole::Broker)),
+            "t4/queue.ts:19 reaches the broker: {:?} {:?}",
+            discovery.sites,
+            discovery.unfollowed
+        );
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let decided = decided_sites(
+            &on.inputs,
+            &on.repo,
+            &discovered,
+            &SiteLabel::from_exports(&answer.exports),
+        );
+        let wrong: Vec<_> = decided
+            .sites
+            .iter()
+            .filter(|site| {
+                site.file.ends_with("t4/queue.ts")
+                    && site.line == 19
+                    && site.name == vec![Piece::Lit("/t4/reports".to_string())]
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "a site read off the object's url: {wrong:#?}"
+        );
+    }
+
     /// carrick#2448 T1, soundness rule 2.3.3 across modules: the object a
     /// module binding holds is read at a key only where no importer hands it
     /// on. A module that passes `client` to a call may have it changed, so
