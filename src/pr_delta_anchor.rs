@@ -157,7 +157,8 @@ pub struct Anchored<T> {
     /// The removed candidates left out on a line the PR did not change, in a
     /// service whose reading did not move, that main stored at the merge base
     /// itself: main held the row there and this scan does not state it, so
-    /// the scan lost it (carrick#3233). Not listed, and counted in
+    /// the scan lost it (carrick#3233), and those placed only in a changed
+    /// file this scan could not read. Not listed, and counted in
     /// `left_out` as before; the delta names their files instead.
     pub lost: Vec<Candidate<T>>,
     /// Of the source files this scan could not read that the caller named,
@@ -367,7 +368,7 @@ pub fn anchor<T>(
         .filter(|place| context.written(place))
         .cloned()
         .collect();
-    let unread_changed = unread_sources
+    let unread_changed: Vec<Place> = unread_sources
         .iter()
         .filter(|place| {
             matches!(
@@ -422,6 +423,16 @@ pub fn anchor<T>(
             }
         }
         match verdict {
+            // A file this scan could not read states none of its rows, so a
+            // removal placed only in such a file is unproven: named with the
+            // file, never listed.
+            Ok(()) if all_in_unread_files(&candidate.places, &unread_changed) => {
+                debug!(
+                    "PR delta: removed operation at {:?} is not listed: its file could not be read",
+                    candidate.places
+                );
+                lost.push(candidate);
+            }
             Ok(()) => listed_removed.push(candidate.item),
             Err(reason) => {
                 debug!(
@@ -447,6 +458,16 @@ pub fn anchor<T>(
         lost,
         unread_changed,
     }
+}
+
+/// Whether every place of a candidate is in one of the `unread` files.
+fn all_in_unread_files(places: &[Place], unread: &[Place]) -> bool {
+    !places.is_empty()
+        && places.iter().all(|place| {
+            unread
+                .iter()
+                .any(|file| file.service == place.service && file.file == place.file)
+        })
 }
 
 /// Whether a removed candidate left out for `reason`, judged on `row` (its

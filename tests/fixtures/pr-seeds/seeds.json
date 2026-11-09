@@ -234,6 +234,28 @@
       "known_miss": {"stage": "shown", "issues": ["carrick-cloud#3207"]}
     },
     {
+      "name": "route-line-replaced-by-conflict",
+      "protocol": "http",
+      "change": "delta_only",
+      "repo": "admin-api",
+      "edits": [
+        {"op": "replace", "file": "src/admin.ts", "pairs": [
+            [
+              "app.get(\"/api/v1/admin/orders\", listOrders);\n",
+              "<<<<<<< HEAD\napp.get(\"/api/v1/admin/orders\", listAllOrders);\n=======\napp.get(\"/api/v1/admin/orders\", listOrders;\n>>>>>>> orders-v2\n"
+            ]
+          ]
+        }
+      ],
+      "expect": {
+        "title": "not_clean",
+        "conclusion": "neutral",
+        "open": true,
+        "rows": []
+      },
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#3207"]}
+    },
+    {
       "name": "http-prefix-moved",
       "protocol": "http",
       "change": "delta_only",
