@@ -1559,7 +1559,14 @@ pub struct FileIr {
     /// a scope below declares its name again holds (carrick#2474 R2b): read
     /// only by the receiver trace, through the declaration the compiler
     /// names at a use, which tells the two bindings apart.
+    /// Published or not: a published one stays dropped for library sites
+    /// (carrick#3559 R3).
     shadowed_clients: HashMap<String, ClientRef>,
+    /// The dropped module-scope clients a library site may read at a use that
+    /// names no declaration below ([`Scope::site_binding`], carrick#3559),
+    /// with the uses of their own binding. Linked beside `module_clients`,
+    /// which the old path reads and this never joins.
+    dropped_clients: HashMap<String, ClientRef>,
     /// Each module-scope `const` whose initialiser is only a name
     /// (`export const alias = web`), by binding, with that name: read only
     /// by the receiver trace, which follows an import of `alias` to the
@@ -1870,7 +1877,7 @@ pub fn extract_file_ir(
         query_builders: module_query_builders(module, &reassigned),
         receivers: HashMap::new(),
         lazy_clients: HashMap::new(),
-        shadowed_clients: HashSet::new(),
+        dropped: HashMap::new(),
         destructured: HashSet::new(),
         lets: module
             .body
@@ -1905,11 +1912,12 @@ pub fn extract_file_ir(
         },
         guards: guards::ModuleGuards::default(),
     };
-    module_scope.receivers = import_receivers(&imports)
-        .into_iter()
+    let package_clients = import_receivers(&imports);
+    module_scope.receivers = package_clients
+        .iter()
         .map(|(name, client)| {
-            let client = module_scope.with_uses(client, &name, None);
-            (name, client)
+            let client = module_scope.with_uses(client.clone(), name, None);
+            (name.clone(), client)
         })
         .collect();
     // A name some function or block declares again means something else
@@ -1926,6 +1934,32 @@ pub fn extract_file_ir(
         })
         .map(|(name, _)| name.clone())
         .collect();
+    // The imports that table leaves out, for library sites: each is read at
+    // a use that names no declaration below, with the uses of its own
+    // binding (carrick#3559).
+    let dropped_imports: Vec<(String, Dropped)> = imports
+        .iter()
+        .filter(|(name, import)| {
+            !import.namespace && !import.reassignable && redeclared.declares_name(name)
+        })
+        .map(|(name, import)| {
+            let package = package_clients
+                .get(name)
+                .map(|client| module_scope.with_uses(client.clone(), name, Some(&import.key)));
+            let site = ClientBinding::Imported {
+                local: name.clone(),
+                package,
+            };
+            (
+                name.clone(),
+                Dropped {
+                    site: Some(site),
+                    import: true,
+                },
+            )
+        })
+        .collect();
+    module_scope.dropped.extend(dropped_imports);
     let value_specifiers = value_specifiers(module, |name| {
         module_scope.uses.contains_key(name) || jsx.contains(name)
     });
@@ -1983,6 +2017,8 @@ pub fn extract_file_ir(
     // Module constants first, in source order, so a later one can read an
     // earlier one (`const BASE = ...; const USERS = `${BASE}/users``).
     for item in &module.body {
+        // `export const …` publishes the bindings it declares.
+        let declared_exported = matches!(item, ModuleItem::ModuleDecl(_));
         if let Some(decl) = module_var_decl(item)
             && decl.kind == VarDeclKind::Const
         {
@@ -1991,13 +2027,14 @@ pub fn extract_file_ir(
                     // `const { key: alias } = object`: each alias holds what
                     // `const alias = <the key's value>` would
                     // (carrick#3489 W2).
-                    let found: Vec<(String, Option<ClientRef>, Option<String>)> = {
+                    let found: Vec<(String, BindingKey, Option<ClientRef>, Option<String>)> = {
                         let scope = Scope::module(&module_scope);
                         destructured_keys(pattern, init, &module_scope)
                             .into_iter()
                             .map(|(alias, value)| {
                                 (
                                     alias.0.to_string(),
+                                    alias.clone(),
                                     reader.written_instance(value, &scope),
                                     match crate::graphql_document_sites::unwrap_expression(value) {
                                         Expr::Ident(target) => Some(target.sym.to_string()),
@@ -2007,15 +2044,26 @@ pub fn extract_file_ir(
                             })
                             .collect()
                     };
-                    for (name, client, target) in found {
+                    for (name, key, client, target) in found {
                         module_scope.destructured.insert(name.clone());
                         match (client, target) {
                             (Some(client), _) => {
-                                let client = module_scope.with_uses(client, &name, None);
                                 if redeclared.declares_name(&name) {
-                                    module_scope.shadowed_clients.insert(name.clone());
-                                    file.shadowed_clients.insert(name, client);
+                                    let by_name =
+                                        module_scope.with_uses(client.clone(), &name, None);
+                                    let own = module_scope.with_uses(client, &name, Some(&key));
+                                    let published =
+                                        declared_exported || module_scope.published(&name);
+                                    record_dropped(
+                                        &mut module_scope.dropped,
+                                        &mut file,
+                                        name,
+                                        by_name,
+                                        own,
+                                        published,
+                                    );
                                 } else {
+                                    let client = module_scope.with_uses(client, &name, None);
                                     file.module_clients.insert(name.clone(), client.clone());
                                     module_scope.receivers.insert(name, client);
                                 }
@@ -2098,11 +2146,21 @@ pub fn extract_file_ir(
                             .insert(name.clone(), target.sym.to_string());
                     }
                     if let Some(client) = client {
-                        let client = module_scope.with_uses(client, &name, None);
                         if redeclared.declares_name(&name) {
-                            module_scope.shadowed_clients.insert(name.clone());
-                            file.shadowed_clients.insert(name, client);
+                            let by_name = module_scope.with_uses(client.clone(), &name, None);
+                            let own =
+                                module_scope.with_uses(client, &name, Some(&ident_key(&ident.id)));
+                            let published = declared_exported || module_scope.published(&name);
+                            record_dropped(
+                                &mut module_scope.dropped,
+                                &mut file,
+                                name,
+                                by_name,
+                                own,
+                                published,
+                            );
                         } else {
+                            let client = module_scope.with_uses(client, &name, None);
                             file.module_clients.insert(name.clone(), client.clone());
                             module_scope.receivers.insert(name, client);
                         }
@@ -2629,6 +2687,43 @@ fn module_declarations(
     declared
 }
 
+/// A module-scope binding a scope below declares the name of again
+/// (carrick#3559).
+struct Dropped {
+    /// What a library site reads it as at a use that names no declaration
+    /// below ([`Scope::site_binding`]). `None`: a `const` the module
+    /// publishes, whose importers' uses do not reach a dropped client.
+    site: Option<ClientBinding>,
+    /// An import, not a `const` or a destructured name.
+    import: bool,
+}
+
+/// Record a `const` or destructured name that holds an instance and that a
+/// scope below declares again: for the receiver trace (`file.shadowed_clients`,
+/// read as before) and for library sites (`dropped`, `file.dropped_clients`),
+/// unless the module publishes it (carrick#3559).
+fn record_dropped(
+    dropped: &mut HashMap<String, Dropped>,
+    file: &mut FileIr,
+    name: String,
+    by_name: ClientRef,
+    own: ClientRef,
+    published: bool,
+) {
+    let site = (!published && own.instance.is_some()).then(|| ClientBinding::Module(name.clone()));
+    if site.is_some() {
+        file.dropped_clients.insert(name.clone(), own);
+    }
+    dropped.insert(
+        name.clone(),
+        Dropped {
+            site,
+            import: false,
+        },
+    );
+    file.shadowed_clients.insert(name, by_name);
+}
+
 /// What module scope holds for every function in the file: its constants,
 /// and the bindings that name a library client (carrick#1564).
 #[derive(Default)]
@@ -2665,9 +2760,11 @@ struct ModuleScope {
     /// [`Reader::lazy_clients`]). Read only where a function returns it: no
     /// call is read through the `let`, for any role.
     lazy_clients: HashMap<BindingKey, ClientRef>,
-    /// The module-scope bindings that hold an instance a scope below
-    /// declares the name of again ([`FileIr::shadowed_clients`]).
-    shadowed_clients: HashSet<String>,
+    /// Every module-scope binding the by-name tables drop because a scope
+    /// below declares the name again, by name: the `const`s that hold an
+    /// instance ([`FileIr::shadowed_clients`]) and the imports a client may
+    /// be read through (carrick#3559).
+    dropped: HashMap<String, Dropped>,
     /// Each module-scope `const` a destructuring of a module object literal
     /// binds ([`destructured_keys`], carrick#3489 W2): a module name whose
     /// instance [`FileIr::module_instance`] follows.
@@ -2748,6 +2845,12 @@ impl ModuleScope {
             used.merge(unbound);
         }
         used
+    }
+
+    /// Whether the module exports `name` by name (`export { name }`,
+    /// `export default name`, `module.exports = name`).
+    fn published(&self, name: &str) -> bool {
+        self.uses.get(name).is_some_and(|used| used.exported)
     }
 
     /// Whether the file writes through `name` (`name.key = …`, `delete
@@ -4318,6 +4421,8 @@ struct ImportBinding {
     /// its uses count against what it was bound to, and no call through it is
     /// read as that (carrick#1568).
     reassignable: bool,
+    /// The binding the local identifier names ([`ident_key`]).
+    key: BindingKey,
 }
 
 /// Every module-scope binding an import introduces, with the export it names:
@@ -4333,14 +4438,15 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
     let mut bindings = HashMap::new();
     let mut require_calls = HashSet::new();
     let mut add =
-        |local: String, specifier: String, export: String, namespace: bool, reassignable: bool| {
+        |local: &Ident, specifier: String, export: String, namespace: bool, reassignable: bool| {
             bindings.insert(
-                local,
+                local.sym.to_string(),
                 ImportBinding {
                     specifier,
                     export,
                     namespace,
                     reassignable,
+                    key: ident_key(local),
                 },
             );
         };
@@ -4352,7 +4458,7 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
                     match import_specifier {
                         ImportSpecifier::Default(default) => {
                             add(
-                                default.local.sym.to_string(),
+                                &default.local,
                                 specifier.clone(),
                                 DEFAULT_EXPORT.to_string(),
                                 false,
@@ -4367,17 +4473,11 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
                                 }
                                 None => named.local.sym.to_string(),
                             };
-                            add(
-                                named.local.sym.to_string(),
-                                specifier.clone(),
-                                export,
-                                false,
-                                false,
-                            );
+                            add(&named.local, specifier.clone(), export, false, false);
                         }
                         ImportSpecifier::Namespace(namespace) => {
                             add(
-                                namespace.local.sym.to_string(),
+                                &namespace.local,
                                 specifier.clone(),
                                 DEFAULT_EXPORT.to_string(),
                                 true,
@@ -4391,7 +4491,7 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
             ModuleItem::ModuleDecl(ModuleDecl::TsImportEquals(decl)) if !decl.is_type_only => {
                 if let TsModuleRef::TsExternalModuleRef(external) = &decl.module_ref {
                     add(
-                        decl.id.sym.to_string(),
+                        &decl.id,
                         external.expr.value.to_string_lossy().into_owned(),
                         DEFAULT_EXPORT.to_string(),
                         false,
@@ -4415,7 +4515,7 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
                     {
                         require_calls.insert(member.obj.span().lo.0);
                         add(
-                            local.id.sym.to_string(),
+                            &local.id,
                             specifier,
                             property.sym.to_string(),
                             false,
@@ -4433,7 +4533,7 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
                             SymbolKind::Named | SymbolKind::Default => bound.imported,
                         };
                         add(
-                            bound.local.id.sym.to_string(),
+                            &bound.local.id,
                             specifier.clone(),
                             export,
                             false,
@@ -4985,6 +5085,31 @@ impl<'a> Scope<'a> {
                     package: package.cloned(),
                 }),
         }
+    }
+
+    /// [`call_binding`](Self::call_binding) for a library site, which also
+    /// reads a module binding that table dropped because a scope below
+    /// declares its name again (carrick#3559). A use that names a binding a
+    /// scope below declares is that binding's, so it reads nothing: the
+    /// count is the rule the `fetch` check uses, and without the resolver
+    /// every key is `(name, empty)`, so the count is not zero and the name
+    /// stays dropped. Separate from `call_binding` because that feeds the
+    /// old path's request summaries, which stay as they are.
+    fn site_binding(&self, ident: &Ident) -> Option<ClientBinding> {
+        self.call_binding(ident).or_else(|| {
+            if self.param_index(ident).is_some() {
+                return None;
+            }
+            let key = ident_key(ident);
+            if self.local_receivers.contains_key(&key) || self.locals.contains_key(&key) {
+                return None;
+            }
+            let dropped = self.module.dropped.get(ident.sym.as_ref())?;
+            if self.module.declared_below.binding_count(&key) != 0 {
+                return None;
+            }
+            dropped.site.clone()
+        })
     }
 }
 
@@ -9391,6 +9516,15 @@ impl LinkedClients {
                     .clients
                     .insert((file.clone(), name.clone()), client.clone());
             }
+            // A dropped `const` is no module client for another module
+            // (`imports` link through `module_clients` only), so this entry
+            // is read only by a library site in its own file
+            // ([`Scope::site_binding`], carrick#3559).
+            for (name, client) in &ir.dropped_clients {
+                linked
+                    .clients
+                    .insert((file.clone(), name.clone()), client.clone());
+            }
         }
         for (file, ir) in files {
             for (local, used) in &ir.imported {
@@ -11475,6 +11609,27 @@ mod tests {
         );
         let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
         extract_file_ir(&module, &cm, &HashSet::new())
+    }
+
+    /// carrick#3559 (R2): without the resolver every binding key is
+    /// `(name, empty)`, so a use cannot be told from a declaration below and
+    /// the count check fails closed: a dropped module name stays dropped.
+    #[test]
+    fn without_the_resolver_a_dropped_name_stays_dropped() {
+        let source = "import { Queue } from \"@fixture/queue\";\n\
+            const parcels = new Queue(\"parcels\");\n\
+            export async function ship() {\n\
+            \x20 await parcels.add(\"job\", {});\n\
+            }\n\
+            export function label(parcels: string) {\n\
+            \x20 return { url: parcels };\n\
+            }\n";
+        let file = super::file_ir_of(Path::new("src/ship.ts"), source).expect("parses");
+        let held = file.functions["ship"].library.iter().any(|site| {
+            matches!(&site.binding, library_sites::SiteBinding::Client(binding)
+                if matches!(**binding, ClientBinding::Module(_)))
+        });
+        assert!(!held, "{:#?}", file.functions["ship"].library);
     }
 
     /// The body object the first request `function` makes in `source` sends.

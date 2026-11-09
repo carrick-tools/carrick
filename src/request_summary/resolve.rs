@@ -1204,7 +1204,12 @@ fn name_holds(ident: &Ident, scope: &Scope<'_>) -> Holds {
     }
     let module = &scope.module;
     let declared = module.imports.contains(name)
-        || module.shadowed_clients.contains(name)
+        // A dropped `const` reads as declared by name, as before; a dropped
+        // import only at a use that names no declaration below (carrick#3559).
+        || module
+            .dropped
+            .get(name)
+            .is_some_and(|dropped| !dropped.import || module.declared_below.binding_count(&key) == 0)
         || module.destructured.contains(name)
         || module.consts.contains_key(&key)
         // A module `let` (carrick#3489 W5) other than a lazy client a getter
@@ -3299,6 +3304,64 @@ mod tests {
             walk(body, &mut out);
         }
         out
+    }
+
+    /// carrick#3559 slice B: a module name a scope below declares again is
+    /// still the module's at a use that names no such declaration. A dropped
+    /// import reads as declared (before: nothing); a dropped `const`, published
+    /// or not, reads as declared before and after.
+    #[test]
+    fn a_dropped_module_name_reads_as_declared_at_a_use_of_the_module_binding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, source) in [
+            (
+                "src/lib.ts",
+                "export const api = { get(p: string) { return p; } };\n",
+            ),
+            (
+                "src/use.ts",
+                "import { api } from './lib';\n\
+                 export const web = { get(p: string) { return p; } };\n\
+                 const mine = { get(p: string) { return p; } };\n\
+                 export function a() { return api.get('/a'); }\n\
+                 export function b() { return web.get('/b'); }\n\
+                 export function c() { return mine.get('/c'); }\n\
+                 export function d(api: string, web: string, mine: string) { return [api, web, mine]; }\n",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&path, source).expect("write source");
+        }
+        let inputs = crate::engine::discover_request_inputs(dir.path());
+        let (_, ir) = inputs
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with("src/use.ts"))
+            .expect("the file is read");
+        for (function, callee) in [("a", "api.get"), ("b", "web.get"), ("c", "mine.get")] {
+            let call = ir.functions[function]
+                .read_calls()
+                .map(|(call, _)| call)
+                .find(|call| call.callee_text == callee)
+                .unwrap_or_else(|| panic!("a call of `{callee}`"));
+            let [value] = call
+                .instance
+                .receiver
+                .clone()
+                .try_into()
+                .expect("one value");
+            assert!(
+                matches!(
+                    value,
+                    ValueAt::Read {
+                        holds: Holds::Declared,
+                        ..
+                    }
+                ),
+                "{callee}: {value:?}"
+            );
+        }
     }
 
     /// carrick#3504 S3a: the receiver trace reads the value resolver's one
