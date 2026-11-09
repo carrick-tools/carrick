@@ -2148,9 +2148,8 @@ pub fn extract_file_ir(
                     if let Some(client) = client {
                         if redeclared.declares_name(&name) {
                             let by_name = module_scope.with_uses(client.clone(), &name, None);
-                            let own =
-                                module_scope.with_uses(client, &name, Some(&ident_key(&ident.id)));
-                            let published = declared_exported || module_scope.published(&name);
+                            let own = module_scope.with_uses(client, &name, None);
+                            let published = false;
                             record_dropped(
                                 &mut module_scope.dropped,
                                 &mut file,
@@ -5105,9 +5104,6 @@ impl<'a> Scope<'a> {
                 return None;
             }
             let dropped = self.module.dropped.get(ident.sym.as_ref())?;
-            if self.module.declared_below.binding_count(&key) != 0 {
-                return None;
-            }
             dropped.site.clone()
         })
     }
