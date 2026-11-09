@@ -2708,8 +2708,16 @@ impl Analyzer {
             // External targets, and a URL that was one opaque variable we
             // could not resolve (e.g. `${url}`), name no path to pair:
             // reporting them produces bogus "missing endpoint" noise.
+            //
+            // So is a literal host no service declares internal: a third
+            // party, not a pair, a gap or a wrong verb (carrick#3468). A host
+            // any service declares internal still pairs by its path, because
+            // this normalizer reads the merged config.
             let normalized = normalizer.normalize(&lookup_url);
-            if normalized.is_external || normalized.is_unresolved {
+            if normalized.is_external
+                || normalized.is_unresolved
+                || normalizer.outside_origin(&lookup_url).is_some()
+            {
                 continue;
             }
             // The env-var edge keys on the extracted path (identical to the
@@ -5660,14 +5668,15 @@ mod tests {
         assert!(cross_repo_matches.is_empty());
     }
 
-    /// The `externalDomains` half of the same rule: a literal absolute URL to a
-    /// declared host reaches matching with its origin intact (see
+    /// The `externalDomains` half of the same rule, and the undeclared half
+    /// (carrick-cloud#656, carrick#3468): a literal absolute URL to a host
+    /// that is not declared internal is a third party, declared external or
+    /// not. It reaches matching with its origin intact (see
     /// `UrlNormalizer::consumer_call_path`) and is excluded — no missing
     /// endpoint, no cross-repo edge. Had the origin been stripped to
-    /// `/v1/charges`, the declaration would be invisible here and the call
-    /// would report as a gap in the service graph.
+    /// `/v1/charges`, the call would report as a gap in the service graph.
     #[test]
-    fn external_domain_calls_stay_excluded_and_silent() {
+    fn literal_hosts_not_declared_internal_stay_excluded_and_silent() {
         let config = Config {
             external_domains: ["https://api.vendor.test".to_string()]
                 .into_iter()
@@ -5714,14 +5723,123 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            missing,
-            vec!["/v1/orders"],
-            "only the UNDECLARED host reports a gap: {:?}",
+        assert!(
+            missing.is_empty(),
+            "neither the declared nor the undeclared host reports a gap: {:?}",
             findings
         );
         assert!(verified.is_empty());
         assert!(cross_repo_matches.is_empty());
+    }
+
+    /// A call-site fixture for the host tests below.
+    fn host_test_call(method: &str, url: &str) -> ApiEndpointDetails {
+        ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key: OperationKey::http(method, url),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("src/client.ts"),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: None,
+            schema_binding: None,
+            undeclared_selection: None,
+            handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
+            inference: None,
+        }
+    }
+
+    fn host_test_route(method: &str, path: &str) -> crate::mount_graph::ResolvedEndpoint {
+        crate::mount_graph::ResolvedEndpoint {
+            view_module: false,
+            method: method.to_string(),
+            path: path.to_string(),
+            full_path: path.to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "server.ts:10".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("api".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
+            dispatch: None,
+            handler_span: None,
+            address: None,
+        }
+    }
+
+    /// A host nobody declares internal is neither a pair nor a wrong verb
+    /// (carrick#3468): a vendor's root URL does not meet our `GET /`, and its
+    /// `/v1/send` does not meet our `POST /v1/send`.
+    #[test]
+    fn an_undeclared_host_is_neither_a_pair_nor_a_wrong_verb() {
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer
+            .calls
+            .push(host_test_call("POST", "https://api.vendor.test"));
+        analyzer
+            .calls
+            .push(host_test_call("POST", "https://api.vendor.test/v1/send"));
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(host_test_route("GET", "/"));
+        graph.endpoints.push(host_test_route("POST", "/v1/send"));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f,
+                Finding::MethodMismatch { .. } | Finding::MissingEndpoint { .. }
+            )),
+            "an outside host reported: {findings:?}"
+        );
+        assert!(verified.is_empty(), "paired: {verified:?}");
+        assert!(edges.is_empty());
+    }
+
+    /// The must-not-change guard at unit level: a host the merged config
+    /// declares internal (and its subdomains) still pairs by its path.
+    #[test]
+    fn a_host_the_merged_config_declares_internal_pairs_by_path() {
+        let config = Config {
+            internal_domains: ["https://api.ledger.test".to_string()]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(host_test_route("POST", "/jobs/run"));
+
+        // One call per analysis: `verified` dedups by method and path.
+        for url in [
+            "https://api.ledger.test/jobs/run",
+            "https://eu.api.ledger.test/jobs/run",
+        ] {
+            let mut analyzer = Analyzer::new(config.clone());
+            analyzer.calls.push(host_test_call("POST", url));
+
+            let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&graph);
+
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| matches!(f, Finding::MissingEndpoint { .. })),
+                "{url} went unpaired: {findings:?}"
+            );
+            assert_eq!(verified.len(), 1, "{url} pairs: {verified:?}");
+        }
     }
 
     /// A consumer call whose path exists in the index under a different verb

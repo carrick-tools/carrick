@@ -113,18 +113,29 @@ fn the_join_pairs_calls_through_a_host_a_sibling_declares_internal() {
     );
 }
 
-/// PINNED AS FOUND, not as wanted: the join pairs a call to a host NOBODY
-/// declares by its path too (`mailer` has no `internalDomains` entry anywhere,
-/// yet its `POST /v1/send` meets `ledger-api`'s route of the same path). This
-/// is the opposite of carrick-cloud#656 (an undeclared host cannot be told from
-/// a third party). Not fixed in this slice; see the carrick issue filed for
-/// the analyzer's HTTP pairing (`src/analyzer/mod.rs` `http_matches`). When that is
-/// fixed, flip this assertion and delete this note.
+/// A call to a host NOBODY declares internal is a third party
+/// (carrick-cloud#656, carrick#3468): `mailer` has no `internalDomains` entry
+/// anywhere, so its `POST /v1/send` does not meet `ledger-api`'s route of the
+/// same path. The call stays on the key with its host. The ledger edges are
+/// asserted in the same test, so a change that stops all absolute-host
+/// pairing cannot pass it.
 #[test]
-fn the_join_pairs_a_host_nobody_declares_by_its_path_today() {
-    let e = edges(&joined());
+fn the_join_never_pairs_a_host_nobody_declares() {
+    let p = joined();
+    let e = edges(&p);
     assert!(
-        e.iter().any(|(prod, _)| prod == "http|POST|/v1/send"),
-        "the join no longer pairs an undeclared host by path (flip this pin): {e:?}"
+        !e.iter().any(|(prod, _)| prod == "http|POST|/v1/send"),
+        "an undeclared host was paired by path: {e:?}"
     );
+    let calls: Vec<_> = p.calls.iter().map(|c| c.key.as_str()).collect();
+    assert!(
+        calls.contains(&"http|POST|https://api.mailer.example/v1/send"),
+        "the third-party call left the key: {calls:?}"
+    );
+    for want in ["http|POST|/jobs/run", "http|GET|/jobs/status"] {
+        assert!(
+            e.iter().any(|(prod, _)| prod == want),
+            "{want} unpaired: {e:?}"
+        );
+    }
 }
