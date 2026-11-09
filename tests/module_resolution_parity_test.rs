@@ -6,7 +6,12 @@
 //! sidecar being present. That is a second implementation of rules the
 //! compiler already owns, and the sidecar is a third reader of the same
 //! configs; this test is what keeps all three from drifting. Every case is
-//! answered three times:
+//! answered by the compiler, the sidecar and the scanner, and a fourth time by
+//! the language service itself (tsserver `projectInfo`) wherever it opens the
+//! file in a configured project; a case it opens in an inferred project is
+//! skipped there. The hand-written oracle below is an imitation of tsserver,
+//! so tsserver is the check on the imitation (carrick#3533). Every case is
+//! answered:
 //!
 //! - by the compiler: from the importer's directory, `ts.findConfigFile` for
 //!   the nearest `tsconfig.json` and `jsconfig.json` inside the service, the
@@ -45,6 +50,7 @@ const RESOLVE_SCRIPT: &str = r#"
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { spawn } from 'node:child_process';
 const capture = path.join(process.env.CARRICK_SIDECAR, 'dist/src/capture');
 const load = (name) => import(pathToFileURL(path.join(capture, name)).href);
 const { findServiceTsconfig, GoverningConfigs } = await load('service-config.js');
@@ -113,20 +119,82 @@ const compilerConfig = (file) => {
   return serviceConfig === undefined ? undefined : ownerAmong(serviceConfig, file) ?? serviceConfig;
 };
 
+// The language service's answer: the config of the project tsserver opens the
+// file in (`projectInfo`). null when it opens an inferred project (no config
+// lists the file) or the file is missing; the test skips those cases, since
+// the service fallback is Carrick's notion and tsserver has none.
+const tsserverConfigs = async (files) => {
+  const server = spawn(
+    process.execPath,
+    [path.join(path.dirname(createRequire(path.join(capture, 'index.js')).resolve('typescript')), 'tsserver.js'), '--disableAutomaticTypingAcquisition'],
+    { stdio: ['pipe', 'pipe', 'inherit'] },
+  );
+  const pending = new Map();
+  let buffer = '';
+  server.stdout.on('data', (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('{')) continue;
+      try {
+        const message = JSON.parse(line);
+        if (message.type === 'response' && pending.has(message.request_seq)) {
+          pending.get(message.request_seq)(message.body);
+          pending.delete(message.request_seq);
+        }
+      } catch {}
+    }
+  });
+  let seq = 0;
+  const ask = (command, args) =>
+    new Promise((resolve, reject) => {
+      pending.set(++seq, resolve);
+      server.stdin.write(JSON.stringify({ seq, type: 'request', command, arguments: args }) + '\n');
+      // No answer is a failure, never a skip: a tsserver that did not start
+      // must not turn this column into a pass.
+      setTimeout(() => reject(new Error(`tsserver gave no ${command} answer in 30 s`)), 30000).unref();
+    });
+  const answers = [];
+  for (const file of files) {
+    if (!ts.sys.fileExists(file)) {
+      answers.push(null);
+      continue;
+    }
+    server.stdin.write(JSON.stringify({ seq: ++seq, type: 'request', command: 'open', arguments: { file } }) + '\n');
+    const info = await ask('projectInfo', { file, needFileNameList: false });
+    const name = info?.configFileName;
+    answers.push(name && path.isAbsolute(name) && ts.sys.fileExists(name) ? path.resolve(name) : null);
+  }
+  server.kill();
+  return answers;
+};
+
 const sidecar = new GoverningConfigs(service, serviceConfig);
 const relative = (p) => (p === undefined ? null : path.relative(root, p).split(path.sep).join('/'));
-const out = cases.map(([from, spec]) => {
+const language = await tsserverConfigs(cases.map(([from]) => path.join(root, from)));
+const out = cases.map(([from, spec], i) => {
   const importer = path.join(root, from);
   const config = compilerConfig(importer);
   const options = config === undefined ? {} : parse(config)?.options ?? {};
   const resolved = ts.resolveModuleName(spec, importer, options, ts.sys).resolvedModule;
   const file = !resolved || resolved.isExternalLibraryImport ? null : relative(resolved.resolvedFileName);
-  return [relative(config), relative(sidecar.configFor(importer)), file];
+  return [relative(config), relative(sidecar.configFor(importer)), file, language[i] === null ? null : relative(language[i])];
 });
 process.stdout.write(JSON.stringify(out));
 "#;
 
 /// The built sidecar the answer key runs from.
+/// One case's answers: the compiler's config, the sidecar's config, the
+/// resolved file, and the language service's config (None where it opens an
+/// inferred project).
+type Answers = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn sidecar() -> Option<PathBuf> {
     // `CARRICK_SIDECAR_DIR` points a checkout with no sidecar build at
     // another built copy of `src/sidecar`.
@@ -180,8 +248,7 @@ fn assert_service_parity(root: &Path, service: &str, named: Option<&str>, cases:
         "compiler script failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let answers: Vec<(Option<String>, Option<String>, Option<String>)> =
-        serde_json::from_slice(&output.stdout).expect("compiler answers");
+    let answers: Vec<Answers> = serde_json::from_slice(&output.stdout).expect("compiler answers");
 
     let scope = ServiceScope {
         dir: PathBuf::from(service),
@@ -189,7 +256,30 @@ fn assert_service_parity(root: &Path, service: &str, named: Option<&str>, cases:
     };
     let index = WorkspaceIndex::build_with_aliases(root, Some(&scope));
     let slash = |path: PathBuf| path.to_string_lossy().replace('\\', "/");
-    for ((from, specifier), (config, sidecar_config, expected)) in cases.iter().zip(answers) {
+    for ((from, specifier), (config, sidecar_config, expected, language)) in
+        cases.iter().zip(answers)
+    {
+        // The language service itself, where it can answer. It cannot for a
+        // file no config lists (an inferred project, None), and its ancestor
+        // search climbs past the service root to a config the service does
+        // not own (carrick#3533 finding: the a-ws/a-cj fallback, where the
+        // oracle takes the member's `tsconfig.app.json` and tsserver the
+        // repo-root `tsconfig.json`); the service is Carrick's notion, so a
+        // config outside it is skipped, not faked.
+        match language {
+            Some(language) if Path::new(&language).starts_with(service) => {
+                eprintln!("tsserver answered {from}: {language}");
+                assert_eq!(
+                    Some(language),
+                    config,
+                    "{from}: tsserver (projectInfo) and the oracle read it under different configs"
+                );
+            }
+            Some(language) => {
+                eprintln!("tsserver skipped {from}: {language} is outside the service")
+            }
+            None => eprintln!("tsserver skipped {from}: inferred project"),
+        }
         assert_eq!(
             sidecar_config, config,
             "{from}: the sidecar and the compiler read it under different configs"
