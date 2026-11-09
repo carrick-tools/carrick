@@ -8,9 +8,17 @@
 //! lockfile this module reads (`pnpm-lock.yaml` v6 and v9,
 //! `package-lock.json` and `npm-shrinkwrap.json` v2 and v3), each copy read
 //! and parsed. A manifest whose dependency maps moved must have its install
-//! root's lockfile among them, so the install is frozen to what moved. No
-//! moved name may be a workspace package. Anything else is not read, and the
-//! caller analyses every service as before.
+//! root's lockfile among them, so the install is frozen to what moved.
+//!
+//! An added `package.json` is read when its install root's workspace globs
+//! (npm `workspaces`, `pnpm-workspace.yaml`) hold its directory, the
+//! workspace index names it there, and the install root's changed lockfile
+//! gained an importer for that directory (carrick#3622). What the new package itself
+//! declares moves nothing; the registry packages it pulls in move as lockfile
+//! entries, and its own name moves for the services whose files load it. No
+//! other moved name may be a workspace package, and a deleted manifest, an
+//! edit to the workspace list or a lockfile this module does not read is not
+//! read: the caller analyses every service as before.
 //!
 //! What moved is kept per install root (the directory holding the lockfile):
 //! every name a manifest under it re-specified, and every package whose
@@ -76,6 +84,9 @@ pub struct DependencyMove {
     /// root: what a service's files load from the workspace is read through
     /// its closure, not through the lockfile.
     workspace: BTreeMap<String, PathBuf>,
+    /// The workspace packages this change added: a service reaches one
+    /// through what its files load, like a registry package (carrick#3622).
+    added: BTreeSet<String>,
 }
 
 impl DependencyMove {
@@ -114,16 +125,24 @@ pub fn dependency_move(
         None => std::fs::read_to_string(top.join(path)).ok(),
     };
     let mut manifests: Vec<(&str, BTreeSet<String>)> = Vec::new();
+    // Each added manifest's path and package name (carrick#3622).
+    let mut added_manifests: Vec<(&str, String)> = Vec::new();
     let mut locks: BTreeMap<&str, (&str, Lockfile, Lockfile)> = BTreeMap::new();
     // A `.gitignore` is judged by its own rule (carrick#3113).
     let repo_inputs = changed
         .iter()
         .filter(|change| is_repo_input(&change.path) && !is_gitignore(&change.path));
     for change in repo_inputs {
+        let name = change.path.rsplit('/').next().unwrap_or(&change.path);
+        if change.status == 'A' && name == "package.json" {
+            let after = serde_json::from_str::<Value>(&read_to(&change.path)?).ok()?;
+            let package = after.get("name")?.as_str()?.to_string();
+            added_manifests.push((&change.path, package));
+            continue;
+        }
         if change.status != 'M' {
             return None;
         }
-        let name = change.path.rsplit('/').next().unwrap_or(&change.path);
         let format = match name {
             "package.json" => None,
             "package-lock.json" | "npm-shrinkwrap.json" => Some(Lockfile::npm as fn(&str) -> _),
@@ -165,6 +184,35 @@ pub fn dependency_move(
             (join(&scan_root, &dir), name.as_str())
         })
         .collect();
+    // An added manifest is read only when it is a workspace package under
+    // the same name and its install root's changed lockfile gained an
+    // importer for its directory ([`Lockfile::moved_in`]).
+    let mut added: BTreeSet<String> = BTreeSet::new();
+    let mut added_importers: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (path, package) in &added_manifests {
+        let dir = parent_of(path);
+        if importer_names.get(dir) != Some(&package.as_str()) {
+            return None;
+        }
+        let lock_dir = install_root(repo_path, top, to, path, &locks)?;
+        let importer = match lock_dir {
+            "" => dir,
+            lock_dir => dir.strip_prefix(lock_dir)?.strip_prefix('/')?,
+        };
+        // Every manifest with a name is in the workspace index; a member is
+        // one the install root's workspace globs hold.
+        let globs = crate::service_derivation::workspace_patterns(&top.join(lock_dir))
+            .and_then(|sources| crate::service_derivation::WorkspaceGlobs::compile(&sources))
+            .ok()?;
+        if importer.is_empty() || !globs.holds(Path::new(importer)) {
+            return None;
+        }
+        added_importers
+            .entry(lock_dir)
+            .or_default()
+            .insert(importer.to_string());
+        added.insert(package.clone());
+    }
     let mut roots: BTreeMap<&str, InstallRoot> = BTreeMap::new();
     for (dir, (file, before, after)) in &locks {
         let mut root = InstallRoot {
@@ -172,7 +220,9 @@ pub fn dependency_move(
             moved: BTreeMap::new(),
             graph: HashMap::new(),
         };
-        for package in before.moved_in(after)? {
+        let no_importers = BTreeSet::new();
+        let added_here = added_importers.get(dir).unwrap_or(&no_importers);
+        for package in before.moved_in(after, added_here)? {
             root.moved.insert(package, file.to_string());
         }
         for lock in [before, after] {
@@ -210,13 +260,14 @@ pub fn dependency_move(
     if roots.values().any(|root| {
         root.moved
             .keys()
-            .any(|package| workspace.contains_key(package))
+            .any(|package| workspace.contains_key(package) && !added.contains(package))
     }) {
         return None;
     }
     Some(DependencyMove {
         roots: roots.into_values().collect(),
         workspace,
+        added,
     })
 }
 
@@ -335,10 +386,21 @@ struct Lockfile {
 
 impl Lockfile {
     /// The packages `after` moved: entries added, removed or changed, and
-    /// importer dependencies re-specified. `None` when the copies differ in
-    /// anything else.
-    fn moved_in(&self, after: &Lockfile) -> Option<BTreeSet<String>> {
-        if self.header != after.header || self.importer_rest != after.importer_rest {
+    /// importer dependencies re-specified. `added` names the importers of
+    /// workspace packages the change added: each must be new in `after`, and
+    /// what it declares moves nothing (the registry packages it pulls in
+    /// move as entries). `None` when the copies differ in anything else.
+    fn moved_in(&self, after: &Lockfile, added: &BTreeSet<String>) -> Option<BTreeSet<String>> {
+        if added.iter().any(|importer| {
+            self.importer_rest.contains_key(importer) || !after.importer_rest.contains_key(importer)
+        }) {
+            return None;
+        }
+        if self.header != after.header
+            || differing_keys(&self.importer_rest, &after.importer_rest)
+                .iter()
+                .any(|importer| !added.contains(importer))
+        {
             return None;
         }
         let mut moved = BTreeSet::new();
@@ -350,6 +412,7 @@ impl Lockfile {
         moved.extend(
             differing_keys(&self.importers, &after.importers)
                 .into_iter()
+                .filter(|(importer, _)| !added.contains(importer))
                 .map(|(_, name)| name),
         );
         Some(moved)
@@ -575,7 +638,8 @@ fn holds(inputs: &ServiceInputs, dir: &str) -> bool {
         || inputs.files.iter().any(|file| under(file, dir))
 }
 
-/// Every package `service` loads, workspace packages left out: the package
+/// Every package `service` loads, workspace packages left out unless the
+/// change added them: the package
 /// of each bare specifier its source files read (its tests included), every
 /// file of its closure and every source file under the directories it reads
 /// whole, and the packages its tsconfig chain names.
@@ -626,7 +690,8 @@ pub fn loaded_packages(
         }
     }
     packages.extend(tsconfig_packages(repo_path, service, &moved.workspace));
-    packages.retain(|package| !moved.workspace.contains_key(package));
+    packages
+        .retain(|package| !moved.workspace.contains_key(package) || moved.added.contains(package));
     packages
 }
 
@@ -810,7 +875,11 @@ mod tests {
             Lockfile::pnpm(before).unwrap(),
             Lockfile::pnpm(&after).unwrap(),
         );
-        assert_eq!(before.moved_in(&after), Some(["lib-z".to_string()].into()));
+        let none_added = BTreeSet::new();
+        assert_eq!(
+            before.moved_in(&after, &none_added),
+            Some(["lib-z".to_string()].into())
+        );
         assert_eq!(before.graph["lib-x"], ["lib-y".to_string()].into());
         assert_eq!(before.graph["lib-y"], ["lib-z".to_string()].into());
         let changed_setting = Lockfile::pnpm(&format!(
@@ -818,6 +887,6 @@ mod tests {
             "lockfileVersion: '6.0'\n"
         ))
         .unwrap();
-        assert_eq!(before.moved_in(&changed_setting), None);
+        assert_eq!(before.moved_in(&changed_setting, &none_added), None);
     }
 }

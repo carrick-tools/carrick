@@ -162,6 +162,81 @@ pub fn workspace_patterns(root: &Path) -> Result<Vec<(String, Vec<String>)>, Str
     Ok(sources)
 }
 
+/// The workspace globs [`workspace_patterns`] reads, compiled: which
+/// directories, relative to the root that declares them, are members.
+pub struct WorkspaceGlobs {
+    /// Each positive pattern as written, with its compiled form.
+    positive: Vec<(String, glob::Pattern)>,
+    /// The `!` patterns, which leave a matched directory out.
+    negative: Vec<glob::Pattern>,
+}
+
+const WORKSPACE_MATCH: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: true,
+};
+
+impl WorkspaceGlobs {
+    /// `Err` on a pattern this rule does not read: absolute, outside the
+    /// root, or using braces or backslashes.
+    pub fn compile(sources: &[(String, Vec<String>)]) -> Result<Self, String> {
+        let mut globs = WorkspaceGlobs {
+            positive: Vec::new(),
+            negative: Vec::new(),
+        };
+        for (_, patterns) in sources {
+            for raw in patterns {
+                let pattern = raw
+                    .strip_prefix('!')
+                    .unwrap_or(raw)
+                    .trim_start_matches("./")
+                    .trim_end_matches('/');
+                if pattern.is_empty()
+                    || Path::new(pattern).is_absolute()
+                    || pattern.contains(['{', '}', '\\'])
+                    || Path::new(pattern)
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+                {
+                    return Err(format!(
+                        "Unsupported workspace pattern '{raw}'; use repository-relative glob paths or an explicit carrick.json."
+                    ));
+                }
+                let compiled = glob::Pattern::new(pattern)
+                    .map_err(|e| format!("Invalid workspace pattern '{raw}': {e}"))?;
+                if raw.starts_with('!') {
+                    globs.negative.push(compiled);
+                } else {
+                    globs.positive.push((raw.clone(), compiled));
+                }
+            }
+        }
+        Ok(globs)
+    }
+
+    /// The index of each positive pattern that matches `relative`.
+    pub fn matching<'a>(&'a self, relative: &'a Path) -> impl Iterator<Item = usize> + 'a {
+        self.positive
+            .iter()
+            .enumerate()
+            .filter(move |(_, (_, pattern))| pattern.matches_path_with(relative, WORKSPACE_MATCH))
+            .map(|(index, _)| index)
+    }
+
+    /// Whether a `!` pattern leaves `relative` out.
+    pub fn excludes(&self, relative: &Path) -> bool {
+        self.negative
+            .iter()
+            .any(|pattern| pattern.matches_path_with(relative, WORKSPACE_MATCH))
+    }
+
+    /// Whether the directory `relative` is a workspace member.
+    pub fn holds(&self, relative: &Path) -> bool {
+        self.matching(relative).next().is_some() && !self.excludes(relative)
+    }
+}
+
 /// The services a scan of `root` reads (carrick#2221): the ones in the tree's
 /// `carrick.json`, or, for a no-model re-read of a repo without one, the
 /// configs its hosted index was written with.
@@ -319,40 +394,8 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     if !sources.is_empty() {
-        let options = glob::MatchOptions {
-            case_sensitive: true,
-            require_literal_separator: true,
-            require_literal_leading_dot: true,
-        };
-        let mut positive = Vec::new();
-        let mut negative = Vec::new();
-        for (_, patterns) in &sources {
-            for raw in patterns {
-                let pattern = raw
-                    .strip_prefix('!')
-                    .unwrap_or(raw)
-                    .trim_start_matches("./")
-                    .trim_end_matches('/');
-                if pattern.is_empty()
-                    || Path::new(pattern).is_absolute()
-                    || pattern.contains(['{', '}', '\\'])
-                    || Path::new(pattern)
-                        .components()
-                        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-                {
-                    return Err(format!(
-                        "Unsupported workspace pattern '{raw}'; use repository-relative glob paths or an explicit carrick.json."
-                    ));
-                }
-                let compiled = glob::Pattern::new(pattern)
-                    .map_err(|e| format!("Invalid workspace pattern '{raw}': {e}"))?;
-                if raw.starts_with('!') {
-                    negative.push(compiled);
-                } else {
-                    positive.push((raw, compiled, false));
-                }
-            }
-        }
+        let globs = WorkspaceGlobs::compile(&sources)?;
+        let mut seen = vec![false; globs.positive.len()];
         let walker = walkdir::WalkDir::new(&root)
             .sort_by_file_name()
             .into_iter()
@@ -382,21 +425,15 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 relative
             };
             let mut matched = false;
-            for (_, pattern, seen) in &mut positive {
-                if pattern.matches_path_with(relative, options) {
-                    *seen = true;
-                    matched = true;
-                }
+            for index in globs.matching(relative) {
+                seen[index] = true;
+                matched = true;
             }
-            if matched
-                && !negative
-                    .iter()
-                    .any(|p| p.matches_path_with(relative, options))
-            {
+            if matched && !globs.excludes(relative) {
                 members.insert(directory.to_path_buf(), entry.path().to_path_buf());
             }
         }
-        for (raw, _, seen) in positive {
+        for ((raw, _), seen) in globs.positive.iter().zip(seen) {
             // A folder emptied or optional in a real monorepo: nothing to
             // propose for it, which is not a reason to refuse the rest.
             if !seen
