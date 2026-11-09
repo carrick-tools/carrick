@@ -1274,6 +1274,28 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
   }
 });
 
+// Blueprint row N35 (carrick#3361): config comes only from the cloud. The
+// workspace here DERIVES a config worth writing, which is the case the laptop
+// lane used to save to `.carrick/proposal.json` for an agent to turn into a
+// carrick.json. The replacement is that init writes neither, and tells nobody
+// to write one.
+test("init saves no derive proposal and no carrick.json even when the workspace derives a config", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "monorepo");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".carrick", "proposal.json")), false);
+    assert.equal(fs.existsSync(path.join(fixture.repo, "carrick.json")), false);
+    assert.doesNotMatch(result.stdout, /proposal|carrick\.json|derives one for your agent to write/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("init writes the check block into an existing CLAUDE.md, and creates none where there is none (carrick#3515)", posixNativeFixture, () => {
   for (const existing of ["# Team rules\n", null]) {
     const fixture = executableInitFixture("payments", "absent", "monorepo");

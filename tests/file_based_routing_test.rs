@@ -343,6 +343,28 @@ fn other_conventions_reject_the_flat_route_layout() {
     }
 }
 
+/// Blueprint row N7a (carrick#3383): conventions are chosen by the declared
+/// package name, matched by exact equality. The deleted rule matched a
+/// substring of detection's free-text label, so a name that merely contained
+/// "next", "astro" or "remix" claimed a convention.
+#[test]
+fn a_package_name_that_only_contains_a_framework_word_opens_no_convention() {
+    let lookalikes: Vec<String> = ["nextra", "my-next-thing", "astro-icon", "remix-utils"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert!(
+        builtin_conventions(&lookalikes).is_empty(),
+        "a substring of a framework name is not a declared framework"
+    );
+
+    let declared = builtin_conventions(&["Next".to_string()]);
+    assert!(
+        !declared.is_empty(),
+        "the exact package name opens its convention, whatever its case"
+    );
+}
+
 #[test]
 fn file_based_pass_is_noop_without_matching_framework() {
     // No convention-bearing framework detected → empty conventions → no routes,
