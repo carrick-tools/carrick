@@ -27,7 +27,7 @@
   "runs_by_library": "a library runs the function holding it, and no known scope applies",
   "callback_option": "the function holding it sits under a key of an options object, and what reads that key is not read",
   "unread": "it is a value Carrick does not read (a field, a call's result, a conditional)",
-  "reassigned": "the name is assigned more than once, so no one value is its",
+  "reassigned": "the name is assigned more than once, so it has no single value",
   "unread_expression": "it is written in a form Carrick does not read (a computed key, a call result, a spread, an await)",
   "in_repo_value_import": "the value is imported from another module of this service, and Carrick did not read it there",
   "unresolved_import": "the name comes from an import Carrick couldn't read",
@@ -45,5 +45,5 @@
   "checker_threw": "the type checker failed at this position",
   "unresolved_name": "the compiler engine could not find what this name refers to",
   "untyped_receiver": "Carrick can't tell what kind of object this is",
-  "several_paths": "the value reads as more than one path, so no one path is its"
+  "several_paths": "the value reads as more than one path, so it has no single path"
 }
