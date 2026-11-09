@@ -547,7 +547,7 @@
  "t-keyed-object": {
   "feature": "keyed read of an object literal entry (obj['key']())",
   "source": "TS",
-  "status": "lead"
+  "status": "covered"
  },
  "t-let-reassigned": {
   "feature": "let reassigned between two clients",
@@ -577,7 +577,7 @@
  "t-object-method": {
   "feature": "object literal method wrapper",
   "source": "ES5",
-  "status": "lead"
+  "status": "covered"
  },
  "t-optional-chain": {
   "feature": "optional-chaining (?.)",
@@ -662,6 +662,6 @@
  "t-wrapper-in-object-method": {
   "feature": "path forwarded through an object literal method",
   "source": "ES5",
-  "status": "lead"
+  "status": "covered"
  }
 }

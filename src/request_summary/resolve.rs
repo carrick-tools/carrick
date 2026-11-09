@@ -111,7 +111,7 @@ pub(super) struct ModuleBinding {
     /// member and never changes it ([`WriteCensus::object_kept`]), whether
     /// or not it exports the binding. Only a member read of the object is
     /// then the key its literal states (carrick#2448); the importers' uses
-    /// are [`Resolver::exported_object_kept`]'s.
+    /// are `Resolver::contested_exports`'s.
     pub(super) object_kept: bool,
 }
 
@@ -2499,7 +2499,7 @@ impl<'a> Resolver<'a> {
                     || !binding.writes.is_empty()
                     || !binding.object_kept
                     || binding.init.is_empty()
-                    || self.contested_exports(path, &table_name)
+                    || (binding.exported && self.contested_exports(path, &table_name))
                 {
                     return false;
                 }
