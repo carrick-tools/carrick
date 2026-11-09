@@ -95,7 +95,7 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
       // `git show ref:path`), where the Read tool never fires.
       {
         matcher: "Bash",
-        hooks: [{ type: "command", command: `${command} hook post-bash`, timeout: 5 }],
+        hooks: [{ type: "command", command: `${command} hook post-bash`, timeout: 15 }],
       },
     ],
     // No matcher: a resumed, cleared or compacted session has lost the map and
