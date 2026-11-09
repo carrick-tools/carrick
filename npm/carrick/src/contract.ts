@@ -267,7 +267,40 @@ export type NewFunction = {
   name: string;
   /** Where it starts, so a reader can open it without searching. */
   line: number;
+  /**
+   * An indexed function this one looks like, read from body tokens and the
+   * name alone. Absent when nothing passes, which is the usual answer.
+   */
+  lead?: Lead;
 };
+
+/** The indexed function a new function looks like. */
+export type Lead = {
+  /** As the index spells it: `name`, or `Class.member`. */
+  name: string;
+  /**
+   * The checkout's folder name for a repo of this workspace, the indexed repo
+   * name otherwise.
+   */
+  repo: string;
+  file: string;
+  line: number;
+  /** 0 when the index holds no end line. */
+  end_line: number;
+  /** Weighted token overlap, 0 to 1. For logs, never for a reader's text. */
+  score: number;
+  basis: "tokens" | "name";
+  /** `[this function's, the lead's]` when both are written and differ. */
+  return_types?: [string, string];
+  /** Up to three indexed callers of the lead. */
+  callers: LeadRef[];
+  callers_total: number;
+  /** Up to two more indexed functions like the lead. */
+  also: LeadRef[];
+};
+
+/** One indexed function a lead names beside itself. */
+export type LeadRef = { name: string; file: string; line: number };
 
 export const SCHEMA = "carrick.check/0";
 export const STATUS_SCHEMA = "carrick.status/0";

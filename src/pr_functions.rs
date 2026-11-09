@@ -59,45 +59,66 @@ pub struct Stated {
 /// The extractor keys a file's definitions by name, so a name stated twice in
 /// one file is one definition here, the one the index holds.
 pub fn stated_in(path: &Path, label: String, source: String) -> BTreeMap<String, Stated> {
+    extracted_in(path, label, source).map_or_else(BTreeMap::new, |extracted| extracted.stated())
+}
+
+/// One parse of one copy of a file, through the extractor discovery runs: the
+/// definitions as the index would hold them before the call graph fills their
+/// `calls`, and the call sites written in each body.
+pub struct Extracted {
+    pub source_map: Lrc<SourceMap>,
+    pub extractor: FunctionDefinitionExtractor,
+}
+
+/// Parse and extract one copy of `path`. `None` when the copy does not parse.
+pub fn extracted_in(path: &Path, label: String, source: String) -> Option<Extracted> {
     let source_map: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_emitter_writer(Box::new(std::io::sink()), None);
-    let Some(module) = crate::parser::parse_source(
+    let module = crate::parser::parse_source(
         path,
         FileName::Custom(label),
         source,
         &source_map,
         &handler,
         None,
-    ) else {
-        return BTreeMap::new();
-    };
+    )?;
     let mut extractor = FunctionDefinitionExtractor::new(path.to_path_buf(), source_map.clone());
     module.visit_with(&mut extractor);
     extractor.finalize_exports();
-    extractor
-        .function_definitions
-        .into_iter()
-        .filter(|(key, _)| key != MODULE_SCOPE_KEY)
-        .filter_map(|(key, definition)| {
-            let anonymous = extractor.synthetic_names.contains(&key);
-            let span = definition.node_type.span();
-            if span.is_dummy() {
-                return None;
-            }
-            let text = source_map.span_to_snippet(span).ok()?;
-            Some((
-                definition.name.clone(),
-                Stated {
-                    name: definition.name,
-                    text,
-                    line: definition.line_number,
-                    end_line: definition.end_line,
-                    exported: definition.is_exported,
-                    anonymous,
-                },
-            ))
-        })
-        .collect()
+    Some(Extracted {
+        source_map,
+        extractor,
+    })
+}
+
+impl Extracted {
+    /// The definitions this copy states, by name ([`stated_in`]).
+    pub fn stated(&self) -> BTreeMap<String, Stated> {
+        self.extractor
+            .function_definitions
+            .iter()
+            .filter(|(key, _)| key.as_str() != MODULE_SCOPE_KEY)
+            .filter_map(|(key, definition)| {
+                let anonymous = self.extractor.synthetic_names.contains(key);
+                let span = definition.node_type.span();
+                if span.is_dummy() {
+                    return None;
+                }
+                let text = self.source_map.span_to_snippet(span).ok()?;
+                Some((
+                    definition.name.clone(),
+                    Stated {
+                        name: definition.name.clone(),
+                        text,
+                        line: definition.line_number,
+                        end_line: definition.end_line,
+                        exported: definition.is_exported,
+                        anonymous,
+                    },
+                ))
+            })
+            .collect()
+    }
 }
 
 /// How one file's definitions differ between its two copies.

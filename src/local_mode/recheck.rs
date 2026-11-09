@@ -288,8 +288,11 @@ pub fn run(
         }
     };
     let began = Instant::now();
-    let new_functions = added_functions(&held, tree, relative);
+    let added = added_functions(&held, tree, relative);
     took("added-functions", began);
+    let began = Instant::now();
+    let new_functions = with_leads(&held, tree, relative, added);
+    took("leads", began);
     let began = Instant::now();
     let misses = ServiceMisses::path(workspace);
     let known = ServiceMisses::read(&misses);
@@ -847,7 +850,7 @@ impl Held {
 /// this tells the agent it was compared against. Either one alone would
 /// report every function in an edited file as new on the install the other
 /// covers.
-fn added_functions(held: &Held, tree: &Tree, relative: &str) -> Vec<super::contract::NewFunction> {
+fn added_functions(held: &Held, tree: &Tree, relative: &str) -> Vec<Added> {
     let name = repo_label(&tree.repo);
     let hosted = held.hosted.local_blobs(&tree.repo);
     let repo = tree.checkout.as_path();
@@ -865,7 +868,39 @@ fn added_functions(held: &Held, tree: &Tree, relative: &str) -> Vec<super::contr
         return Vec::new();
     };
     let indexed = functions_in(blobs.iter(), relative);
-    named_additions(&services, repo, relative, &indexed)
+    additions(&services, repo, relative, &indexed)
+}
+
+/// One function the edit added, with what the lead is looked up by.
+type Added = (super::contract::NewFunction, super::lead::Query);
+
+/// Attach to each added function the indexed function it looks like
+/// ([`super::lead`]), read from every blob `held` has, in every repo. The
+/// index is built once per call and only when the edit added a function: an
+/// edit that adds none pays nothing here.
+fn with_leads(
+    held: &Held,
+    tree: &Tree,
+    relative: &str,
+    added: Vec<Added>,
+) -> Vec<super::contract::NewFunction> {
+    if added.is_empty() {
+        return Vec::new();
+    }
+    let index = super::lead::LeadIndex::build(
+        held.local
+            .iter()
+            .map(|blob| (blob.repo_name.clone(), blob))
+            .chain(held.hosted.every_blob()),
+    );
+    let repo = repo_label(&tree.repo);
+    added
+        .into_iter()
+        .map(|(function, query)| super::contract::NewFunction {
+            lead: index.lead(&query, &repo, relative),
+            ..function
+        })
+        .collect()
 }
 
 /// What an edit to `relative` adds that the index would hold.
@@ -883,6 +918,21 @@ fn named_additions(
     relative: &str,
     indexed: &std::collections::BTreeSet<String>,
 ) -> Vec<super::contract::NewFunction> {
+    additions(services, repo, relative, indexed)
+        .into_iter()
+        .map(|(function, _)| function)
+        .collect()
+}
+
+/// [`named_additions`], each with the lookup the lead reads, from the same one
+/// parse: the definition's tokens and written return type, and the names its
+/// body calls (the call graph has not filled `calls` on a single parse).
+fn additions(
+    services: &[crate::config::Config],
+    repo: &Path,
+    relative: &str,
+    indexed: &std::collections::BTreeSet<String>,
+) -> Vec<Added> {
     let path = repo.join(relative);
     let skip = crate::packages::MANIFEST_SKIP_DIRS;
     let repo_path = repo.to_string_lossy();
@@ -897,11 +947,44 @@ fn named_additions(
     let Some(source) = crate::parser::read_source(&path) else {
         return Vec::new();
     };
-    let stated = crate::pr_functions::stated_in(Path::new(relative), relative.to_string(), source);
-    new_functions(
+    let Some(extracted) =
+        crate::pr_functions::extracted_in(Path::new(relative), relative.to_string(), source)
+    else {
+        return Vec::new();
+    };
+    let found = new_functions(
         indexed,
-        stated.into_values().filter(|function| !function.anonymous),
-    )
+        extracted
+            .stated()
+            .into_values()
+            .filter(|function| !function.anonymous),
+    );
+    let extractor = &extracted.extractor;
+    found
+        .into_iter()
+        .map(|function| {
+            // The stated name came from this parse, so its definition is
+            // here; a lookup without one has nothing to score and finds none.
+            let query = extractor
+                .function_definitions
+                .iter()
+                .find(|(_, definition)| definition.name == function.name)
+                .map_or_else(
+                    || super::lead::Query::named(&function.name),
+                    |(key, definition)| {
+                        let callees = extractor
+                            .callee_refs
+                            .get(key)
+                            .into_iter()
+                            .flatten()
+                            .map(|callee| callee.name.clone())
+                            .collect();
+                        super::lead::Query::of(definition, callees)
+                    },
+                );
+            (function, query)
+        })
+        .collect()
 }
 
 fn inside(
@@ -1485,6 +1568,7 @@ fn new_functions(
         .map(|function| super::contract::NewFunction {
             name: function.name,
             line: function.line,
+            lead: None,
         })
         .collect();
     // Line order, so the list reads down the file rather than out of a hash
@@ -2314,3 +2398,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "recheck_lead_tests.rs"]
+mod lead_tests;
