@@ -11,7 +11,8 @@ import { createLogger } from "../log.ts";
 import { answersTheEdit, changedLines, renderPostToolUse } from "../render.ts";
 import { claimDelivery, finishedFor, isChanged } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
-import { markTold, toldKey, wasTold } from "./reuse.ts";
+import { markLed, markTold, toldKey, wasLed, wasTold } from "./reuse.ts";
+import { leadLines } from "./lead.ts";
 
 const log = createLogger("carrick-late");
 
@@ -44,6 +45,15 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
       const context = lateContext(answer, uses);
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
+      // A lead the probe already delivered is in `led`; this one is for a file
+      // whose probe had no answer (carrick#3249).
+      const found = answer.result
+        ? leadLines(answer.result, answer.relative, (leadKey) => !wasLed(session, leadKey), log)
+        : null;
+      if (found && found.lines.length > 0) {
+        contexts.push(...found.lines);
+        markLed(session, found.keys);
+      }
       if (!context) continue;
       contexts.push(context);
       if (key !== null && uses && answer.result?.uses_lines?.length) markTold(session, [key]);

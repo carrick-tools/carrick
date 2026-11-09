@@ -12,7 +12,9 @@ import { renderPostToolUse } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { markTold, recordEdit, toldKey, wasTold } from "./reuse.ts";
+import { markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
+import { leadLines } from "./lead.ts";
+import type { LeadLines } from "./lead.ts";
 import { deliverLate } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
@@ -64,6 +66,8 @@ export async function editFlow(
   // Files whose uses lines this message carries, remembered only once it is
   // delivered: who uses a file is shown once per file per session (carrick#2067).
   const told: string[] = [];
+  // Lead lines (carrick#3249) are remembered the same way, once delivered.
+  const led: string[] = [];
   const relatives = edited.map((file) => path.relative(choice.root, file));
   // The edit just landed, so the index describes the file as it was before
   // it. The hook asks the binary once, with a probe that never starts a
@@ -74,6 +78,7 @@ export async function editFlow(
   const queueable = channel.channel === "hook" && Boolean(session);
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();
+  const leads = new Map<number, LeadLines>();
   for (const [index, relative] of relatives.entries()) {
     const result = answers.results[index] ?? null;
     if (!result) {
@@ -83,6 +88,9 @@ export async function editFlow(
       if (queueable) toQueue.push(index);
       continue;
     }
+    // The lead rides on the probe answer, so a queued file gets it too.
+    const found = leadLines(result, relative, (key) => !session || !wasLed(session, key), log);
+    if (found.lines.length > 0) leads.set(index, found);
     if (queueable && needsBackground(result)) {
       toQueue.push(index);
       continue;
@@ -129,6 +137,15 @@ export async function editFlow(
   for (const index of relatives.keys()) {
     const context = rendered.get(index);
     if (context) contexts.push(context);
+    const found = leads.get(index);
+    if (found) {
+      // A late answer delivered just above may have claimed the same function.
+      for (const [at, key] of found.keys.entries()) {
+        if (session && wasLed(session, key)) continue;
+        contexts.push(found.lines[at]!);
+        led.push(key);
+      }
+    }
   }
 
   if (channel.channel !== "hook") {
@@ -143,6 +160,7 @@ export async function editFlow(
   const mismatch = throttledVersionMismatch(choice.root, currentVersion());
   if (mismatch) contexts.push(mismatch);
   if (told.length > 0 && session) markTold(session, told);
+  if (led.length > 0 && session) markLed(session, led);
   contexts.unshift(...extra);
   if (contexts.length > 0) emit(contexts.join("\n\n"));
 }
