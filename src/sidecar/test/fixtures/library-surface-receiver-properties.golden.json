@@ -1,0 +1,179 @@
+{
+  "surface_sha256": "ba89c7c4ade3fbb2beb509b1290fb9dea2db1ba90eef0666a71b4d163b755322",
+  "handlers": {
+    "surfaces": [
+      {
+        "package": "fixture-procedure-root",
+        "truncated": 0,
+        "exports": [
+          {
+            "export": "initRoot",
+            "receivers": [
+              {
+                "receiver": "export",
+                "members": [
+                  {
+                    "name": "create",
+                    "own": true,
+                    "signatures": [
+                      {
+                        "params": [],
+                        "returns": "Root"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "receiver": "instance:create",
+                "members": [
+                  {
+                    "name": "callable",
+                    "own": true,
+                    "signatures": [
+                      {
+                        "params": [
+                          {
+                            "name": "label",
+                            "optional": false,
+                            "rest": false,
+                            "type": "string",
+                            "accepts_string": true,
+                            "function": false
+                          }
+                        ],
+                        "returns": "void"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "middleware",
+                    "own": true,
+                    "signatures": [
+                      {
+                        "params": [
+                          {
+                            "name": "fn",
+                            "optional": false,
+                            "rest": false,
+                            "type": "(opts: { ctx: Context; }) => void",
+                            "accepts_string": false,
+                            "function": true
+                          }
+                        ],
+                        "returns": "Builder"
+                      }
+                    ],
+                    "handlers": [
+                      {
+                        "arg": 0,
+                        "params": [
+                          {
+                            "param": 0,
+                            "name": "opts",
+                            "type_id": 1
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "name": "router",
+                    "own": true,
+                    "signatures": [
+                      {
+                        "params": [
+                          {
+                            "name": "routes",
+                            "optional": false,
+                            "rest": false,
+                            "type": "Record<string, Procedure>",
+                            "accepts_string": false,
+                            "function": false
+                          }
+                        ],
+                        "returns": "unknown"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "installed_version": "1.0.0",
+        "handler_types": [
+          {
+            "id": 1,
+            "type": "{ ctx: Context; }",
+            "members": [
+              {
+                "path": [
+                  "ctx"
+                ],
+                "type": "Context",
+                "optional": false,
+                "function": false
+              },
+              {
+                "path": [
+                  "ctx",
+                  "user"
+                ],
+                "type": "string",
+                "optional": false,
+                "function": false
+              }
+            ],
+            "dropped": 0
+          }
+        ],
+        "types": [],
+        "handler_params_left_out": 0
+      }
+    ]
+  },
+  "tiny": {
+    "max_entries": 6,
+    "surfaces": [
+      {
+        "package": "fixture-procedure-root",
+        "truncated": 4,
+        "exports": [
+          {
+            "export": "initRoot",
+            "receivers": [
+              {
+                "receiver": "export",
+                "members": [
+                  {
+                    "name": "create",
+                    "own": true,
+                    "signatures": []
+                  }
+                ]
+              },
+              {
+                "receiver": "instance:create",
+                "members": [
+                  {
+                    "name": "callable",
+                    "own": true,
+                    "signatures": []
+                  },
+                  {
+                    "name": "middleware",
+                    "own": true,
+                    "signatures": []
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "installed_version": "1.0.0"
+      }
+    ],
+    "surface_sha256": "f387441f4277822299e76030d80fdf4c6a47dd5e30b1654b5a2ff464dea2d4c9"
+  }
+}
