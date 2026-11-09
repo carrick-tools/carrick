@@ -2111,3 +2111,23 @@ fn a_let_receiver_route_takes_its_full_path() {
         "{graph:#?}"
     );
 }
+
+/// A router member called through a `const` alias (`const mk = t.router`,
+/// or one exported from another module) collects its procedures like the
+/// member called directly: the call's row names the in-repo alias, and one
+/// hop at its declaration reaches the verified member. A `let` alias may be
+/// set again, so the procedures under it read nothing.
+#[test]
+fn a_router_member_called_through_a_const_alias_collects_its_procedures() {
+    let (on, _) = scan_fixture_reading("procedure-router-alias");
+    let (graph, _) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            "src/aliased-import.ts:5 GET /rpc-alias-import/list library_claim importedRouter",
+            "src/aliased-import.ts:7 GET /rpc-alias-import/nested.get library_claim importedRouter",
+            "src/aliased.ts:7 GET /rpc-alias/ping library_claim aliasedRouter",
+            "src/direct.ts:5 GET /rpc-direct/ping library_claim directRouter",
+        ]
+    );
+}
