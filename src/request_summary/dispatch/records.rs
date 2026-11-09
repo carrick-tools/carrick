@@ -599,7 +599,11 @@ impl Attacher<'_, '_> {
         }
         if self.reach == HoleReach::OneCallBelow {
             let mut to: Vec<(usize, Handler)> = Vec::new();
-            for up in self.chains.one_call_up(stopped) {
+            let mut ups = self.chains.calling_nodes(stopped);
+            ups.extend((self.chains.handed_calls(stopped).into_iter()).map(|(caller, ..)| caller));
+            ups.sort();
+            ups.dedup();
+            for up in ups {
                 if let Some(found) = self.enclosing(up)
                     && !to.iter().any(|(handler, _)| *handler == found.0)
                 {

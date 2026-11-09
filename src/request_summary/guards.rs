@@ -48,6 +48,7 @@ use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::decided_sites::Calls;
 use super::library_sites::{LinkedNames, TextPiece, text_pieces};
 use super::{
     CallIr, CallWalker, FileIr, FnIr, ImportBinding, Piece, Reader, Reassigned,
@@ -1996,14 +1997,13 @@ pub(super) struct Chains<'a> {
     calls: HashMap<(&'a Path, u32, u32), (usize, usize)>,
     /// The same for each construction.
     constructions: HashMap<(&'a Path, u32, u32), (usize, usize)>,
-    /// Each definition's in-repo callers: (file, span start, span end).
-    callers: HashMap<(PathBuf, String), Vec<CallerSite>>,
+    /// Each definition's callers: the one index discovery's value walk
+    /// reads, each call's edge from what the rows say it reaches (carrick#2432)
+    /// or, without rows, from the call graph.
+    callers: Calls<'a>,
     /// (file, function name) -> each call that hands it on.
     handed: HashMap<(&'a Path, String), Vec<HandedAt>>,
 }
-
-/// A call site that reaches a definition: its file, span start and end.
-type CallerSite = (PathBuf, u32, u32);
 
 /// One call or construction of a node, by its index in [`FnIr::calls`] or
 /// [`FnIr::constructions`].
@@ -2047,7 +2047,11 @@ impl<'a> Chains<'a> {
             nodes: Vec::new(),
             calls: HashMap::new(),
             constructions: HashMap::new(),
-            callers: HashMap::new(),
+            callers: if inputs.row_calls.is_some() {
+                Calls::through_reach(inputs)
+            } else {
+                Calls::index(inputs)
+            },
             handed: HashMap::new(),
         };
         let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
@@ -2094,38 +2098,6 @@ impl<'a> Chains<'a> {
                         .push((index, at, *arg, path.clone()));
                 }
             }
-        }
-        if inputs.row_calls.is_some() {
-            // With rows, each call and construction reaches what its row
-            // names (carrick#2413 slice D).
-            let mut every: Vec<(&'a Path, u32, u32)> = chains
-                .calls
-                .keys()
-                .chain(chains.constructions.keys())
-                .copied()
-                .collect();
-            every.sort();
-            every.dedup();
-            for (file, lo, hi) in every {
-                if let Some(target) = inputs.call_target(file, lo, hi) {
-                    chains
-                        .callers
-                        .entry(target)
-                        .or_default()
-                        .push((file.to_path_buf(), lo, hi));
-                }
-            }
-        } else {
-            for (file, lo, hi, target) in inputs.sites.every_site() {
-                chains.callers.entry(target.clone()).or_default().push((
-                    file.to_path_buf(),
-                    lo,
-                    hi,
-                ));
-            }
-        }
-        for callers in chains.callers.values_mut() {
-            callers.sort();
         }
         chains
     }
@@ -2175,11 +2147,10 @@ impl<'a> Chains<'a> {
     pub(super) fn is_entry(&self, node: usize) -> bool {
         let current = &self.nodes[node];
         current.exported
-            && current.key.as_ref().is_some_and(|key| {
-                self.callers
-                    .get(&(current.file.to_path_buf(), key.clone()))
-                    .is_none_or(|callers| callers.is_empty())
-            })
+            && current
+                .key
+                .as_ref()
+                .is_some_and(|key| self.callers.callers_of(current.file, key).is_empty())
             && self.handed_at(node).is_empty()
     }
 
@@ -2193,24 +2164,18 @@ impl<'a> Chains<'a> {
             .collect()
     }
 
-    /// The functions one call above `node` (carrick#2474 R4b, the census's
-    /// what-if arm alone): its in-repo callers and the functions that hand
-    /// it on.
-    pub(super) fn one_call_up(&self, node: usize) -> Vec<usize> {
+    /// The functions that call `node`'s definition, in the repository.
+    pub(super) fn calling_nodes(&self, node: usize) -> Vec<usize> {
         let current = &self.nodes[node];
         let mut up = Vec::new();
-        if let Some(key) = &current.key
-            && let Some(callers) = self.callers.get(&(current.file.to_path_buf(), key.clone()))
-        {
-            for (file, lo, hi) in callers {
-                if let Some(&(caller, _)) = self.calls.get(&(file.as_path(), *lo, *hi)) {
+        if let Some(key) = &current.key {
+            for placed in self.callers.callers_of(current.file, key) {
+                let at = (placed.file, placed.call.site.lo, placed.call.site.hi);
+                if let Some(&(caller, _)) = self.calls.get(&at) {
                     up.push(caller);
                 }
             }
         }
-        up.extend(self.handed_at(node).into_iter().map(|(caller, ..)| caller));
-        up.sort();
-        up.dedup();
         up
     }
 
@@ -2529,12 +2494,20 @@ impl<'a> Chains<'a> {
         }
         trace.passed.push(node);
         let current = &self.nodes[node];
-        let callers = current
+        // Sorted by file and span: the order the chains' fan-out cap counts in.
+        let mut callers: Vec<(&Path, u32, u32)> = current
             .key
             .as_ref()
-            .and_then(|key| self.callers.get(&(current.file.to_path_buf(), key.clone())))
-            .filter(|callers| !callers.is_empty());
-        if let Some(callers) = callers {
+            .map(|key| {
+                self.callers
+                    .callers_of(current.file, key)
+                    .iter()
+                    .map(|placed| (placed.file, placed.call.site.lo, placed.call.site.hi))
+                    .collect()
+            })
+            .unwrap_or_default();
+        callers.sort();
+        if !callers.is_empty() {
             for (file, lo, hi) in callers {
                 if ends.full() {
                     ends.cap(self.hole(HoleReason::FanOutCap, node), trace.clone());
@@ -2550,8 +2523,7 @@ impl<'a> Chains<'a> {
                     ends.push(trace.clone(), end);
                     continue;
                 }
-                let Some(&(caller, call_index)) = self.calls.get(&(file.as_path(), *lo, *hi))
-                else {
+                let Some(&(caller, call_index)) = self.calls.get(&(file, lo, hi)) else {
                     let end = self.hole(HoleReason::CallerArgMissing, node);
                     ends.push(trace.clone(), end);
                     continue;
