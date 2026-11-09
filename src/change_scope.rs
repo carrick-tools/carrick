@@ -4599,24 +4599,31 @@ mod tests {
         }
     }
 
-    /// The import names a file the added package does not hold, so the walk
-    /// does not enter its directory: the specifier alone reaches it.
+    /// What a service loads keeps the name of a workspace package the change
+    /// added, so the lockfile walk reaches it as it reaches a registry
+    /// package; the workspace packages already there stay out.
     #[test]
     fn an_added_workspace_name_reaches_through_the_loaded_walk() {
         for manager in [Manager::Npm, Manager::Pnpm] {
-            let (reasons, moved) = after_change(manager, |repo| {
-                add_workspace_package(
-                    repo,
-                    manager,
-                    Some(("apps/worker", "@fixture/added/missing")),
-                )
-            });
-            assert_eq!(
-                reasons,
-                [None, None, Some(Reason::InputsChanged)],
-                "{moved:?}"
+            let (repo, base, services) = dependency_workspace(manager);
+            add_workspace_package(
+                repo.path(),
+                manager,
+                Some(("apps/worker", "@fixture/added")),
             );
-            assert_eq!(moved, [false, false, true]);
+            commit_all(repo.path(), "added");
+            let path = repo.path().to_string_lossy().to_string();
+            let top = crate::git_state::toplevel(&path).unwrap();
+            let changes = ChangedSince::new(&path, &services, &[]);
+            let moved = changes
+                .dependency_move(&base, &top)
+                .expect("an added workspace package is read");
+            let reads = ClosureReads::default();
+            let worker = &services[2];
+            let inputs = service_inputs(&path, &top, worker, &reads);
+            let loaded = loaded_packages(&path, &top, worker, &inputs, &reads, &moved);
+            assert!(loaded.contains("@fixture/added"), "{loaded:?}");
+            assert!(!loaded.contains("@fixture/shared"), "{loaded:?}");
         }
     }
 
