@@ -317,10 +317,10 @@ pub struct PubsubAnchorOp {
     /// shape where the handler param IS the decoded payload binding, so the
     /// backfill records it as a FunctionParam payload locator. Recorded only
     /// when the param is a simple identifier. `None` for every other anchor
-    /// shape: the single-arg call has no handler, and the options-object /
-    /// constructor-worker shapes (kafkajs `eachMessage`, BullMQ `Job`) pass an
-    /// ENVELOPE to the handler, where a deterministic param locator would
-    /// replace an honest Unknown with a wrong type.
+    /// shape: the single-arg call has no handler, and the options-object
+    /// shape (kafkajs `eachMessage`) passes an ENVELOPE to the
+    /// handler, where a deterministic param locator would replace an honest
+    /// Unknown with a wrong type.
     pub handler_param: Option<String>,
     /// 1-based line of that parameter (the handler may start on a later line
     /// than the call the op is keyed on).
@@ -643,7 +643,6 @@ impl SwcScanner {
             const_string_values,
             new_url_paths,
             repo_has_messaging_clients,
-            package_import_locals(&module, messaging_clients),
             Declarations::of(&module),
         );
         module.visit_with(&mut visitor);
@@ -791,7 +790,6 @@ impl SwcScanner {
             const_string_values,
             new_url_paths,
             repo_has_messaging_clients,
-            package_import_locals(&module, messaging_clients),
             Declarations::of(&module),
         );
         visitor.wanted = wanted;
@@ -2376,15 +2374,6 @@ struct CandidateVisitor {
     /// string. Collected alongside the Signal 7 candidates (same gates, same
     /// position rule) and merged into the file's extraction after the LLM pass.
     pubsub_anchor_ops: Vec<PubsubAnchorOp>,
-    /// Local binding names imported from a package the framework-detect step
-    /// flagged as a messaging client (`Worker` from `import { Worker } from
-    /// 'bullmq'`). Gate for the NewExpr subscriber anchor (carrick#402 shape
-    /// b): `new X("literal", fn)` anchors only when `X` is one of these
-    /// bindings — resolution to a detected messaging-client IMPORT, not merely
-    /// any file-level import, which is what keeps `new CronJob("0 * * * *",
-    /// fn)` from becoming a phantom subscriber. Empty when the repo detected
-    /// no messaging clients.
-    messaging_import_locals: HashSet<String>,
     /// Every declaration in the file, for [`CandidateTarget::url_binding`].
     declarations: Declarations,
     /// The signal whose block is running ([`RegisterSignal`]), set at the
@@ -2413,7 +2402,6 @@ impl CandidateVisitor {
         const_string_values: HashMap<String, String>,
         new_url_paths: NewUrlPathMap,
         repo_has_messaging_clients: bool,
-        messaging_import_locals: HashSet<String>,
         declarations: Declarations,
     ) -> Self {
         Self {
@@ -2429,7 +2417,6 @@ impl CandidateVisitor {
             in_pubsub_call_position: false,
             repo_has_messaging_clients,
             pubsub_anchor_ops: Vec::new(),
-            messaging_import_locals,
             declarations,
             register_signal: None,
             register_hits: BTreeMap::new(),
@@ -2668,15 +2655,14 @@ impl CandidateVisitor {
     }
 
     /// Does this expression occupy a Signal-7 position when it forms a whole
-    /// statement expression or variable initializer? Directly a call or a
-    /// constructor (`nc.publish(SUBJECT, payload);`, `const w = new
-    /// Worker("q", fn)`), or either under a single `await` (`await
+    /// statement expression or variable initializer? Directly a call
+    /// (`nc.publish(SUBJECT, payload);`), or under a single `await` (`await
     /// consumer.subscribe({ topic });`) — the idiom every promise-returning
     /// subscribe API forces, which the bare-call check missed (carrick#402).
     fn is_pubsub_positioned_expr(expr: &Expr) -> bool {
         match expr {
-            Expr::Call(_) | Expr::New(_) => true,
-            Expr::Await(awaited) => matches!(&*awaited.arg, Expr::Call(_) | Expr::New(_)),
+            Expr::Call(_) => true,
+            Expr::Await(awaited) => matches!(&*awaited.arg, Expr::Call(_)),
             _ => false,
         }
     }
@@ -3474,60 +3460,9 @@ impl Visit for CandidateVisitor {
     }
 
     fn visit_new_expr(&mut self, node: &NewExpr) {
-        // Snapshot-and-clear the Signal-7 position flag exactly like
-        // `visit_call_expr`: the constructor-worker anchor below only fires
-        // when the NewExpr itself is the statement expression or variable
-        // initializer, and calls nested inside its arguments must not inherit
-        // the position.
-        let in_pubsub_call_position = self.in_pubsub_call_position;
+        // Clear the Signal-7 position flag as `visit_call_expr` does, so a call
+        // nested in the arguments does not inherit the position.
         self.in_pubsub_call_position = false;
-
-        // Constructor-registered subscriber (carrick#402 shape b): `new
-        // X("literal", fn, …)` — the BullMQ `new Worker(queueName, handler)`
-        // idiom, where the queue name is the contract topic. GATED on the
-        // constructor identifier being an import binding resolved from a
-        // framework-detect `messaging_clients` package — NOT merely any
-        // file-level import — which is what keeps `new CronJob("0 * * * *",
-        // fn)` from becoming a phantom subscriber. The second argument must be
-        // an inline function (a reference identifier could be an options
-        // object). Payload-less by policy: the handler receives a job ENVELOPE
-        // (`Job`), so a deterministic param locator would replace an honest
-        // Unknown with a wrong type.
-        if in_pubsub_call_position
-            && let Expr::Ident(ident) = &*node.callee
-            && self.messaging_import_locals.contains(ident.sym.as_ref())
-            && let Some(args) = node.args.as_ref()
-            && args.len() >= 2
-            && args[0].spread.is_none()
-            && args[1].spread.is_none()
-            && matches!(&*args[1].expr, Expr::Arrow(_) | Expr::Fn(_))
-            && let Some(topic) = self.resolve_topic_string(&args[0].expr)
-        {
-            let path_snippet = self
-                .source_map
-                .span_to_snippet(args[0].expr.span())
-                .ok()
-                .map(|s| s.lines().next().unwrap_or("").chars().take(120).collect());
-            self.push_span_candidate(
-                node.span,
-                // Same routing as the Signal 7 call-site candidates: the
-                // pub/sub guidance lives in the HTTP analyze-file prompt, so
-                // this must reach it rather than be set aside as unrouted.
-                Protocol::Http,
-                ident.sym.to_string(),
-                None,
-                path_snippet,
-            );
-            self.pubsub_anchor_ops.push(PubsubAnchorOp {
-                topic,
-                role: PubsubRole::Subscriber,
-                // The constructor name's line, as a method call's row sits on
-                // its method name (carrick#1626).
-                line_number: self.get_line_number(node.callee.span()),
-                handler_param: None,
-                handler_param_line: None,
-            });
-        }
 
         // Network primitives constructed with `new`: `new WebSocket(url)`,
         // `new EventSource(url)`, `new XMLHttpRequest()`. Emitting these as
@@ -6644,14 +6579,14 @@ export class PollController {
     }
 
     /// carrick#1626: a pub/sub call written across lines sits on the line of
-    /// its method (or constructor) name, not the line its receiver chain
+    /// its method name, not the line its receiver chain
     /// starts on, so a row and anything joined to it by line name the call.
     #[test]
     fn pubsub_anchor_ops_sit_on_the_method_line() {
         use crate::operation::PubsubRole;
 
         let src = r#"
-import { connect, Worker } from "fakebus";
+import { connect } from "fakebus";
 const client = connect();
 export async function start() {
   await client
@@ -6660,8 +6595,6 @@ export async function start() {
     .publish(
       "feed.refreshed",
     );
-  const worker = new
-    Worker("resize-images", async () => {});
 }
 "#;
         let scanner = SwcScanner::new();
@@ -6682,7 +6615,6 @@ export async function start() {
             vec![
                 ("feed.updated".to_string(), PubsubRole::Subscriber, 6),
                 ("feed.refreshed".to_string(), PubsubRole::Publisher, 8),
-                ("resize-images".to_string(), PubsubRole::Subscriber, 12),
             ]
         );
     }
@@ -6834,84 +6766,31 @@ export async function start(): Promise<void> {
         );
     }
 
-    /// carrick#402 shape b, on the exact corpus-3 file that flaked (BullMQ
-    /// `export const dispatchWorker = new Worker("shipments.dispatch", async
-    /// (job) => {...})`): the constructor site must surface as a candidate AND
-    /// emit a payload-less subscriber anchor, gated on `Worker` being an
-    /// import binding from a detected messaging-client package.
+    /// Old-path row N20 deleted: `new X("queue", fn)` is no subscriber
+    /// candidate and no anchor op because `X` is imported from a detected
+    /// messaging package. A construction is a site through discovery, which
+    /// reads the queue name at the construction and forces it (proved by
+    /// `request_summary::discovery::tests::
+    /// a_queue_opened_in_a_constructor_chain_is_a_site`).
     #[test]
-    fn bullmq_new_worker_is_candidate_and_anchor() {
-        use crate::operation::PubsubRole;
-        use std::fs;
-
+    fn a_queue_construction_raises_no_candidate_from_the_import_list() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/xrepo-corpus-3/fulfillment-worker/src/worker.ts");
-        let src =
-            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-        let scanner = SwcScanner::new();
-
-        let gated_in = scanner.scan_content(&path, &src, &[], &["bullmq".to_string()]);
-        assert!(
-            gated_in
-                .candidates
-                .iter()
-                .any(|c| c.callee_object == "Worker"),
-            "new Worker(queue, handler) must surface as a candidate, got {:?}",
-            gated_in.candidates
-        );
-        assert!(
-            gated_in.pubsub_anchor_ops.iter().any(|op| {
-                op.topic == "shipments.dispatch"
-                    && op.role == PubsubRole::Subscriber
-                    && op.handler_param.is_none()
-            }),
-            "new Worker must emit a payload-less subscriber anchor (the handler \
-             param is a Job envelope, never a payload locator), got {:?}",
-            gated_in.pubsub_anchor_ops
-        );
-
-        let gated_out = scanner.scan_content(&path, &src, &[], &[]);
-        assert!(
-            gated_out.pubsub_anchor_ops.is_empty(),
-            "empty messaging_clients must keep the worker file anchor-inert, got {:?}",
-            gated_out.pubsub_anchor_ops
-        );
-    }
-
-    /// carrick#402 shape b negative: the NewExpr gate is IMPORT-BINDING
-    /// resolution, not method shape and not any file-level import. A
-    /// `new CronJob("literal", fn)` whose binding comes from a package the
-    /// detect step did NOT flag as a messaging client must not anchor — even
-    /// when the repo has detected messaging clients, and even when the same
-    /// file also imports one.
-    #[test]
-    fn new_expr_gate_rejects_non_messaging_constructors() {
-        let src = r#"
-import { Worker } from 'bullmq';
-import { CronJob } from 'cron';
-export const job = new CronJob('0 * * * *', () => {});
-export const unused = Worker;
-"#;
-        let scanner = SwcScanner::new();
-        let result = scanner.scan_content(
-            &PathBuf::from("scheduler.ts"),
-            src,
-            &[],
-            &["bullmq".to_string()],
-        );
-        assert!(
-            result.pubsub_anchor_ops.is_empty(),
-            "new CronJob('lit', fn) must NOT anchor: cron is not a detected \
-             messaging client, got {:?}",
-            result.pubsub_anchor_ops
-        );
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let result = SwcScanner::new().scan_content(&path, &src, &[], &["bullmq".to_string()]);
         assert!(
             !result
                 .candidates
                 .iter()
-                .any(|c| c.callee_object == "CronJob"),
-            "CronJob must not surface as a pub/sub candidate, got {:?}",
+                .any(|c| c.callee_object == "Worker"),
+            "a construction from a listed package is no candidate: {:?}",
             result.candidates
+        );
+        assert!(
+            result.pubsub_anchor_ops.is_empty(),
+            "a construction anchors no op: {:?}",
+            result.pubsub_anchor_ops
         );
     }
 
