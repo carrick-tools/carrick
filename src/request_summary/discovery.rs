@@ -1272,9 +1272,109 @@ struct Walker<'a> {
     /// Calls whose member declaration stands for more than one op
     /// (carrick#2474 R1, [`Self::one_op`]): no site.
     ambiguous: std::cell::Cell<usize>,
+    /// DEBUG (discovery-dump branch only): every call's resolution.
+    dump: Option<CallDump>,
+}
+
+/// DEBUG: one row per call the walk resolved, with each definition (or
+/// library end) the call entered and how its walk ended.
+#[derive(Debug, Default)]
+struct CallDump {
+    frames: Vec<usize>,
+    rows: Vec<serde_json::Value>,
+    targets: Vec<BTreeSet<String>>,
 }
 
 impl<'a> Walker<'a> {
+    fn dump_open(&mut self, file: &Path, call: &CallIr, phase: &str) -> Option<usize> {
+        let row = serde_json::json!({
+            "file": self.rel(file),
+            "own": self.inputs.files.contains_key(file),
+            "line": call.site.line,
+            "span_start": call.site.span_start,
+            "span_end": call.site.span_end,
+            "callee": call.callee_text,
+            "phase": phase,
+            "callee_values": call.callee_values.len(),
+            "invokes_param": call.invokes_param,
+            "reach": format!("{:?}", self.reach(file, call)),
+        });
+        let dump = self.dump.as_mut()?;
+        dump.rows.push(row);
+        dump.targets.push(BTreeSet::new());
+        let at = dump.rows.len() - 1;
+        dump.frames.push(at);
+        Some(at)
+    }
+
+    fn dump_close(&mut self, at: Option<usize>, out: &Outcome<'a>) {
+        let (Some(at), Some(dump)) = (at, self.dump.as_mut()) else {
+            return;
+        };
+        dump.frames.pop();
+        let row = &mut dump.rows[at];
+        row["stop"] = serde_json::json!(out.stop.as_ref().map(|(_, reason)| reason.clone()));
+        row["ends"] = serde_json::json!(out.ends.len());
+        row["missed"] = serde_json::json!(out.missed);
+        row["open"] = serde_json::json!(out.open.len());
+    }
+
+    fn dump_target(&mut self, target: String) {
+        if let Some(dump) = self.dump.as_mut()
+            && let Some(&top) = dump.frames.last()
+        {
+            dump.targets[top].insert(target);
+        }
+    }
+
+    fn dump_hop(&mut self, prefix: &str, file: &Path, key: &str) {
+        if self.dump.is_none() {
+            return;
+        }
+        let hop = self.hop(file, key);
+        self.dump_target(format!(
+            "{prefix}{}:{} {}",
+            hop.file, hop.line, hop.function
+        ));
+    }
+
+    fn call(
+        &mut self,
+        file: &'a Path,
+        body: &'a FnIr,
+        call: &'a CallIr,
+        construction: bool,
+    ) -> Outcome<'a> {
+        let at = self.dump_open(file, call, "walk");
+        let out = self.call_inner(file, body, call, construction);
+        if at.is_some() {
+            for found in &out.ends {
+                if found.chain.is_empty() {
+                    let end = format!(
+                        "lib:{}/{}{}",
+                        found.end.package,
+                        found.end.export,
+                        found
+                            .end
+                            .member
+                            .as_deref()
+                            .map(|m| format!(".{m}"))
+                            .unwrap_or_default()
+                    );
+                    self.dump_target_at(at, end);
+                }
+            }
+        }
+        self.dump_close(at, &out);
+        out
+    }
+
+    fn dump_target_at(&mut self, at: Option<usize>, target: String) {
+        if let (Some(at), Some(dump)) = (at, self.dump.as_mut()) {
+            dump.targets[at].insert(target);
+        }
+    }
+
     /// The inputs that hold `file`: this service's, else the first sibling's
     /// that does. Every read keyed by a file goes through this, so a body the
     /// walk enters in a sibling is read with the sibling's own IR and rows.
@@ -1890,7 +1990,7 @@ impl<'a> Walker<'a> {
     }
 
     /// What `call`, written in `body` of `file`, reaches.
-    fn call(
+    fn call_inner(
         &mut self,
         file: &'a Path,
         body: &'a FnIr,
@@ -1989,6 +2089,9 @@ impl<'a> Walker<'a> {
                 let hop = self.hop(&target, &key);
                 let id = (target, key);
                 let callee = self.function(&id.0, &id.1);
+                if self.reading.contains_key(&id) {
+                    self.dump_hop("cycle ", &id.0, &id.1);
+                }
                 let mut out = match self.reading.get(&id) {
                     // The walk came back to a definition it is reading.
                     Some(depth) => Outcome {
@@ -2125,6 +2228,7 @@ impl<'a> Walker<'a> {
 
     /// What the definition `id` reaches, read once it is final.
     fn definition(&mut self, id: &(PathBuf, String)) -> Outcome<'a> {
+        self.dump_hop("", &id.0, &id.1);
         if let Some(known) = self.memo.get(id) {
             return known.clone();
         }
@@ -2436,6 +2540,9 @@ impl<'a> Walker<'a> {
             ..self.hop(&target, &key)
         };
         let id = (target, key);
+        if self.reading.contains_key(&id) {
+            self.dump_hop("cycle <value> ", &id.0, &id.1);
+        }
         if let Some(depth) = self.reading.get(&id) {
             return Outcome {
                 cycle_at: Some(*depth),
@@ -2620,6 +2727,7 @@ impl<'a> Walker<'a> {
         let resolver = self.values;
         for open in std::mem::take(&mut outcome.open) {
             let mut values = open.known;
+            let at = self.dump_open(open.invoke.file, open.invoke.call, "settle");
             for (out, index, keys) in &open.refs {
                 values.extend(resolver.callers_pass(
                     self,
@@ -2630,6 +2738,11 @@ impl<'a> Walker<'a> {
                 ));
             }
             let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
+            for found in &settled.ends {
+                let end = format!("lib:{}/{}", found.end.package, found.end.export);
+                self.dump_target_at(at, end);
+            }
+            self.dump_close(at, &settled);
             outcome.absorb(settled);
         }
         if !outcome.ends.is_empty() {
@@ -2654,6 +2767,7 @@ impl<'a> Follow<'a> for Walker<'a> {
         invoke: Invoke<'a>,
     ) -> Option<Outcome<'a>> {
         let end = self.value_end(file, lo, hi, kind, invoke)?;
+        self.dump_target(format!("lib:{}/{} (value)", end.package, end.export));
         Some(Outcome {
             ends: vec![Found {
                 chain: Vec::new(),
@@ -2704,6 +2818,8 @@ impl<'a> Follow<'a> for Walker<'a> {
         maker: Option<Maker<'a>>,
     ) -> Outcome<'a> {
         let line = function.site.as_ref().map_or(0, |site| site.line);
+        let rel = self.rel(file);
+        self.dump_target(format!("<written> {rel}:{line}"));
         let hop = ChainHop {
             function: VALUE_HOP.to_string(),
             file: self.rel(file),
@@ -2769,6 +2885,7 @@ pub fn discover_with(
         memo: HashMap::new(),
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
+        dump: std::env::var_os("CARRICK_DISCOVERY_CALL_DUMP").map(|_| CallDump::default()),
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
     paths.sort();
@@ -2800,6 +2917,32 @@ pub fn discover_with(
             census.steps,
             census.capped_queries
         );
+    }
+    // DEBUG (discovery-dump branch only): one file per discovery run.
+    if let (Some(dir), Some(dump)) = (
+        std::env::var_os("CARRICK_DISCOVERY_CALL_DUMP"),
+        walker.dump.take(),
+    ) {
+        static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let run = RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut own: Vec<String> = inputs.files.keys().map(|p| walker.rel(p)).collect();
+        own.sort();
+        let mut text = serde_json::json!({
+            "header": true,
+            "root": root.display().to_string(),
+            "files": own.len(),
+            "first_file": own.first(),
+            "implementations_asked": labels.implementations.map(|i| i.asked),
+        })
+        .to_string();
+        text.push('\n');
+        for (mut row, targets) in dump.rows.into_iter().zip(dump.targets) {
+            row["targets"] = serde_json::json!(targets);
+            text.push_str(&row.to_string());
+            text.push('\n');
+        }
+        let path = PathBuf::from(dir).join(format!("{}-{run}.jsonl", std::process::id()));
+        let _ = std::fs::write(path, text);
     }
     let ambiguous = walker.ambiguous.get();
     if ambiguous > 0 {
