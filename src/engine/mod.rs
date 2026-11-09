@@ -479,6 +479,21 @@ struct DeltaRow {
     /// The `resolution_source` of every row in `places`, in the same order:
     /// what the delta row's `edge_source` folds over.
     sources: Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
+    /// Whether each row in `places`, in the same order, is a documentation
+    /// row with no handler of its own
+    /// ([`FileOrchestrator::is_documentation_route`]).
+    documentation: Vec<bool>,
+}
+
+impl DeltaRow {
+    /// The places of the rows that have a real handler.
+    fn handler_places(&self) -> impl Iterator<Item = &std::path::PathBuf> {
+        self.places
+            .iter()
+            .zip(&self.documentation)
+            .filter(|(_, documentation)| !**documentation)
+            .map(|(place, _)| place)
+    }
 }
 
 /// `endpoint` under its identity for `service`. When two spellings of one
@@ -497,12 +512,18 @@ fn keep_first_spelling(
             places: Vec::new(),
             commit: commit.to_string(),
             sources: Vec::new(),
+            documentation: Vec::new(),
         });
     if endpoint.key.display_labels() < row.key.display_labels() {
         row.key = endpoint.key.clone();
     }
     row.places.push(endpoint.file_path.clone());
     row.sources.push(endpoint.resolution_source);
+    row.documentation
+        .push(FileOrchestrator::is_documentation_route(
+            endpoint.resolution_source,
+            endpoint.handler_name.as_deref(),
+        ));
 }
 
 impl DeltaBaseline {
@@ -571,6 +592,8 @@ struct DeltaItem {
     /// service it could not read a path for and whose method serves the
     /// route's ([`carrick_match::method_matches`]). Empty for any other row.
     serving: Vec<crate::pr_delta_anchor::Place>,
+    /// One of [`DeltaCandidates::documented`]: never listed as removed.
+    documented: bool,
 }
 
 /// The delta's candidates: the operations `current` states that `previous`
@@ -580,6 +603,12 @@ struct DeltaItem {
 struct DeltaCandidates {
     new: Vec<crate::pr_delta_anchor::Candidate<DeltaItem>>,
     removed: Vec<crate::pr_delta_anchor::Candidate<DeltaItem>>,
+    /// The operations `previous` states with a real handler that `current`
+    /// states only by documentation rows, at the places of `previous`'s
+    /// handler rows. The operation is still stated, so none is ever listed
+    /// as removed; a handler row this scan lost is named by the delta's
+    /// `files_not_read` (carrick#3641).
+    documented: Vec<crate::pr_delta_anchor::Candidate<DeltaItem>>,
 }
 
 /// `unread` is every route site this scan could not read a path for: a
@@ -589,7 +618,11 @@ fn delta_candidates(
     current: &[CloudRepoData],
     unread: &[UnreadRoute],
 ) -> DeltaCandidates {
-    let candidate = |service: &Option<String>, row: &DeltaRow, removed: bool| {
+    let candidate = |service: &Option<String>,
+                     row: &DeltaRow,
+                     removed: bool,
+                     places: Vec<&std::path::PathBuf>,
+                     documented: bool| {
         let (label, name) = row.key.display_labels();
         let serving = match &row.key {
             crate::operation::OperationKey::Http { method, .. } if removed => unread
@@ -615,17 +648,17 @@ fn delta_candidates(
                     edge_source: crate::findings::EdgeSource::fold(row.sources.iter().copied()),
                 },
                 serving,
+                documented,
             },
-            places: row
-                .places
-                .iter()
+            places: places
+                .into_iter()
                 .map(|place| {
                     crate::pr_delta_anchor::Place::parse(service, &place.to_string_lossy())
                 })
                 .collect(),
         }
     };
-    let mut current_keys = HashMap::new();
+    let mut current_keys: HashMap<ServiceEndpointKey, DeltaRow> = HashMap::new();
     for service_data in current {
         for endpoint in &service_data.endpoints {
             keep_first_spelling(&mut current_keys, &service_data.service_name, endpoint, "");
@@ -635,12 +668,28 @@ fn delta_candidates(
         new: current_keys
             .iter()
             .filter(|(id, _)| !previous.contains_key(*id))
-            .map(|((service, _), row)| candidate(service, row, false))
+            .map(|((service, _), row)| {
+                candidate(service, row, false, row.places.iter().collect(), false)
+            })
             .collect(),
         removed: previous
             .iter()
             .filter(|(id, _)| !current_keys.contains_key(*id))
-            .map(|((service, _), row)| candidate(service, row, true))
+            .map(|((service, _), row)| {
+                candidate(service, row, true, row.places.iter().collect(), false)
+            })
+            .collect(),
+        documented: previous
+            .iter()
+            .filter(|(id, row)| {
+                current_keys
+                    .get(*id)
+                    .is_some_and(|now| now.handler_places().next().is_none())
+                    && row.handler_places().next().is_some()
+            })
+            .map(|((service, _), row)| {
+                candidate(service, row, false, row.handler_places().collect(), true)
+            })
             .collect(),
     }
 }
@@ -808,7 +857,11 @@ fn anchored_delta(
         );
         return None;
     };
-    let DeltaCandidates { new, removed } = delta_candidates(previous, current, unread);
+    let DeltaCandidates {
+        new,
+        mut removed,
+        documented,
+    } = delta_candidates(previous, current, unread);
     // Only the unread sites that could serve a removed row are asked about.
     let serving: Vec<crate::pr_delta_anchor::Place> = removed
         .iter()
@@ -845,6 +898,10 @@ fn anchored_delta(
         .iter()
         .map(|source| source.place.clone())
         .collect();
+    // A handler row only documentation still states is judged as a removal
+    // would be, so one this scan lost is `lost`; it is never listed
+    // (carrick#3641).
+    removed.extend(documented);
     match crate::pr_delta_anchor::run(
         repo_path,
         base,
@@ -856,7 +913,17 @@ fn anchored_delta(
         &serving,
         &source_places,
     ) {
-        Ok(anchored) => {
+        Ok(mut anchored) => {
+            anchored.removed.retain(|item| {
+                if item.documented {
+                    debug!(
+                        "PR delta: {} {} is not listed as removed: documentation still states \
+                         it, though no row with a handler does",
+                        item.endpoint.method, item.endpoint.path
+                    );
+                }
+                !item.documented
+            });
             info!("{}", anchored.summary());
             let not_read = files_not_read(anchored.lost, &anchored.unread_changed, unread_sources);
             for line in files_not_read_lines(&not_read) {
@@ -31415,7 +31482,7 @@ io.on("bare:in", (event) => {});
         previous: &HashMap<ServiceEndpointKey, DeltaRow>,
         current: &[CloudRepoData],
     ) -> crate::findings::PrDelta {
-        let DeltaCandidates { new, removed } = delta_candidates(previous, current, &[]);
+        let DeltaCandidates { new, removed, .. } = delta_candidates(previous, current, &[]);
         delta_of(
             new.into_iter().map(|c| c.item.endpoint).collect(),
             removed.into_iter().map(|c| c.item.endpoint).collect(),
@@ -31836,7 +31903,7 @@ io.on("bare:in", (event) => {});
         let plugin = site("web", "src/plugin.ts", 2, "ALL");
         let elsewhere = site("jobs", "src/routes.ts", 4, "GET");
         let unread = [rewritten.clone(), plugin.clone(), elsewhere.clone()];
-        let DeltaCandidates { new, removed } = delta_candidates(&previous, &[current], &unread);
+        let DeltaCandidates { new, removed, .. } = delta_candidates(&previous, &[current], &unread);
 
         let serving = |items: &[DeltaItem]| -> Vec<(String, Vec<Place>)> {
             let mut rows: Vec<(String, Vec<Place>)> = items
