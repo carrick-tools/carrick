@@ -3301,6 +3301,64 @@ mod tests {
         out
     }
 
+    /// carrick#3559 slice B: a module name a scope below declares again is
+    /// still the module's at a use that names no such declaration. A dropped
+    /// import reads as declared (before: nothing); a dropped `const`, published
+    /// or not, reads as declared before and after.
+    #[test]
+    fn a_dropped_module_name_reads_as_declared_at_a_use_of_the_module_binding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, source) in [
+            (
+                "src/lib.ts",
+                "export const api = { get(p: string) { return p; } };\n",
+            ),
+            (
+                "src/use.ts",
+                "import { api } from './lib';\n\
+                 export const web = { get(p: string) { return p; } };\n\
+                 const mine = { get(p: string) { return p; } };\n\
+                 export function a() { return api.get('/a'); }\n\
+                 export function b() { return web.get('/b'); }\n\
+                 export function c() { return mine.get('/c'); }\n\
+                 export function d(api: string, web: string, mine: string) { return [api, web, mine]; }\n",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&path, source).expect("write source");
+        }
+        let inputs = crate::engine::discover_request_inputs(dir.path());
+        let (_, ir) = inputs
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with("src/use.ts"))
+            .expect("the file is read");
+        for (function, callee) in [("a", "api.get"), ("b", "web.get"), ("c", "mine.get")] {
+            let call = ir.functions[function]
+                .read_calls()
+                .map(|(call, _)| call)
+                .find(|call| call.callee_text == callee)
+                .unwrap_or_else(|| panic!("a call of `{callee}`"));
+            let [value] = call
+                .instance
+                .receiver
+                .clone()
+                .try_into()
+                .expect("one value");
+            assert!(
+                matches!(
+                    value,
+                    ValueAt::Read {
+                        holds: Holds::Declared,
+                        ..
+                    }
+                ),
+                "{callee}: {value:?}"
+            );
+        }
+    }
+
     /// carrick#3504 S3a: the receiver trace reads the value resolver's one
     /// lowering. A maker call and a maker's `new` carry the instance they
     /// build (`made`), as does a name the scope holds one in; a field of the

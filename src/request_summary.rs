@@ -11477,6 +11477,27 @@ mod tests {
         extract_file_ir(&module, &cm, &HashSet::new())
     }
 
+    /// carrick#3559 (R2): without the resolver every binding key is
+    /// `(name, empty)`, so a use cannot be told from a declaration below and
+    /// the count check fails closed: a dropped module name stays dropped.
+    #[test]
+    fn without_the_resolver_a_dropped_name_stays_dropped() {
+        let source = "import { Queue } from \"@fixture/queue\";\n\
+            const parcels = new Queue(\"parcels\");\n\
+            export async function ship() {\n\
+            \x20 await parcels.add(\"job\", {});\n\
+            }\n\
+            export function label(parcels: string) {\n\
+            \x20 return { url: parcels };\n\
+            }\n";
+        let file = super::file_ir_of(Path::new("src/ship.ts"), source).expect("parses");
+        let held = file.functions["ship"].library.iter().any(|site| {
+            matches!(&site.binding, library_sites::SiteBinding::Client(binding)
+                if matches!(**binding, ClientBinding::Module(_)))
+        });
+        assert!(!held, "{:#?}", file.functions["ship"].library);
+    }
+
     /// The body object the first request `function` makes in `source` sends.
     fn request_body(source: &str, function: &str) -> ObjValue {
         let file = file_ir_of(source);

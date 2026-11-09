@@ -6813,4 +6813,144 @@ mod tests {
             assert_eq!(arg.object, None, "{operand}");
         }
     }
+
+    /// Every site in `file` at `line` whose member is `member`.
+    fn sites_at<'s>(
+        sites: &'s [LibrarySite],
+        file: &str,
+        line: u32,
+        member: &str,
+    ) -> Vec<&'s LibrarySite> {
+        sites
+            .iter()
+            .filter(|site| {
+                site.file.ends_with(file)
+                    && site.line == line
+                    && site.member.as_deref() == Some(member)
+            })
+            .collect()
+    }
+
+    /// carrick#3559: a module `const` whose name a function below declares
+    /// again (a parameter) is the module's at a use that names no such
+    /// declaration. Before, the name was dropped from the file wholesale and
+    /// the call wrote no site.
+    #[test]
+    fn a_module_receiver_is_read_beside_a_parameter_of_its_name() {
+        let sites = sites_of(&[(
+            "src/ship.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             const parcels = new Queue(\"parcels\");\n\
+             export async function ship() {\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             }\n\
+             export function label(parcels: string) {\n\
+             \x20 return { url: parcels };\n\
+             }\n",
+        )]);
+        let add = site(&sites, "src/ship.ts", 4, Some("add"));
+        let made = maker(add);
+        assert_eq!(made.holder, Holder::Module);
+        assert_eq!(made.args[0].text.as_deref(), Some("parcels"));
+        assert_eq!(add.contest(on_wire), None);
+    }
+
+    /// carrick#3559: the same for an import. The parameter that re-declares
+    /// the name is left unread on purpose, so this does not depend on the
+    /// importer's uses of a handed-on parameter.
+    #[test]
+    fn an_imported_receiver_is_read_beside_a_parameter_of_its_name() {
+        let sites = sites_of(&[
+            (
+                "src/q.ts",
+                "import { Queue } from \"@fixture/queue\";\n\
+                 export const outbox = new Queue(\"outbox\");\n",
+            ),
+            (
+                "src/send.ts",
+                "import { outbox } from \"./q\";\n\
+                 export async function send() {\n\
+                 \x20 await outbox.add(\"job\", {});\n\
+                 }\n\
+                 export function relay(outbox: string) {\n\
+                 \x20 return \"/relay\";\n\
+                 }\n",
+            ),
+        ]);
+        let add = site(&sites, "src/send.ts", 3, Some("add"));
+        let made = maker(add);
+        assert_eq!(made.holder, Holder::Module);
+        assert_eq!(made.args[0].text.as_deref(), Some("outbox"));
+    }
+
+    /// carrick#3559: a use that names a binding a scope below declares (a
+    /// block `const`, an arrow's parameter) is that binding's, not the
+    /// module's; the use in the function body proper is the module's.
+    #[test]
+    fn a_name_a_block_declares_again_is_not_the_modules() {
+        let sites = sites_of(&[(
+            "src/block.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             const parcels = new Queue(\"parcels\");\n\
+             export async function ship(flag: boolean) {\n\
+             \x20 if (flag) {\n\
+             \x20   const parcels = other();\n\
+             \x20   await parcels.add(\"job\", {});\n\
+             \x20 }\n\
+             \x20 [1].forEach((parcels: any) => parcels.add(\"job\", {}));\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             }\n\
+             declare function other(): any;\n",
+        )]);
+        assert!(sites_at(&sites, "src/block.ts", 6, "add").is_empty());
+        assert!(sites_at(&sites, "src/block.ts", 8, "add").is_empty());
+        let module = site(&sites, "src/block.ts", 9, Some("add"));
+        assert_eq!(maker(module).holder, Holder::Module);
+    }
+
+    /// carrick#3559 (R3): a module `const` the module publishes stays
+    /// dropped when a scope below declares its name again: another module
+    /// may hand it on, and its importers' uses do not reach a dropped
+    /// client. A gap, pinned.
+    #[test]
+    fn a_published_module_receiver_beside_a_parameter_of_its_name_stays_unread() {
+        let sites = sites_of(&[(
+            "src/ship.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export const parcels = new Queue(\"parcels\");\n\
+             export async function ship() {\n\
+             \x20 await parcels.add(\"job\", {});\n\
+             }\n\
+             export function label(parcels: string) {\n\
+             \x20 return { url: parcels };\n\
+             }\n",
+        )]);
+        assert!(sites_at(&sites, "src/ship.ts", 4, "add").is_empty());
+    }
+
+    /// carrick#3559: the fact-path twin of the old-path pin
+    /// `an_imported_name_declared_again_reads_nothing_in_that_file`: the
+    /// import's use that names the import is a site; the parameter's is not.
+    #[test]
+    fn an_imported_client_is_read_beside_a_parameter_of_its_name() {
+        let sites = sites_of(&[
+            (
+                "src/lib/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/api/v1\" });\n",
+            ),
+            (
+                "src/shadowed.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 interface Getter { get(path: string): unknown }\n\
+                 export function viaParam(api: Getter) { return api.get(\"/shadowed\"); }\n\
+                 export function viaImport() { return api.get(\"/import\"); }\n",
+            ),
+        ]);
+        assert!(sites_at(&sites, "src/shadowed.ts", 4, "get").is_empty());
+        let get = site(&sites, "src/shadowed.ts", 5, Some("get"));
+        assert_eq!(maker(get).holder, Holder::Module);
+    }
 }
