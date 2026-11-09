@@ -12,7 +12,7 @@
 //!
 //! | operation | executed at | consumer rows |
 //! |---|---|---|
-//! | `items` | `apps/web/src/list.ts:5` | one, in `catalog-web`; none in `documents` |
+//! | `items` | `apps/web/src/list.ts:5`, and `:9` behind `&&` | one each, in `catalog-web`; none in `documents` |
 //! | `renameItem` | nowhere | none |
 //! | `adminStats` | nowhere | none (the producer field stays) |
 
@@ -130,4 +130,17 @@ fn a_document_nothing_executes_is_no_consumer() {
         .collect();
     assert!(dead.is_empty(), "{dead:?}");
     assert!(producers.contains("query|adminStats"), "{producers:?}");
+}
+
+#[test]
+fn a_document_passed_behind_a_short_circuit_and_is_a_consumer_at_the_call() {
+    let (consumers, _) = scan();
+    assert!(
+        consumers.contains(&(
+            "catalog-web".to_string(),
+            "query|items".to_string(),
+            "apps/web/src/list.ts:9".to_string()
+        )),
+        "{consumers:?}"
+    );
 }

@@ -1623,6 +1623,11 @@ impl Reader<'_> {
                 out.extend(self.values_in(&bin.right, scope, bound, depth + 1));
                 out
             }
+            // `a && b` is `b` or a falsy `a`, and no reader acts on a falsy
+            // value (never a document, a client or a URL): only `b` is read.
+            Expr::Bin(bin) if bin.op == BinaryOp::LogicalAnd => {
+                self.values_in(&bin.right, scope, bound, depth + 1)
+            }
             // `options?.client`: the member read, as `options.client` is
             // (carrick#2448).
             Expr::OptChain(chain) => match &*chain.base {
@@ -3448,6 +3453,20 @@ mod tests {
             [Got::End(End::Nothing), definition("sendGo")]
         );
         assert_eq!(read("spread.ts", 20), [definition("sendGo")]);
+    }
+
+    /// `a && b` is `b` or a falsy `a`: only `b` is read, and `a` adds no
+    /// alternative.
+    #[test]
+    fn a_short_circuit_and_holds_its_right_side() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            callee(&resolver, &on.inputs, "short_circuit.ts", 6),
+            [definition("sendOne")]
+        );
     }
 
     /// The census of the module binding `s` in `source`: how many plain
