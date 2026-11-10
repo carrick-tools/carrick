@@ -307,9 +307,9 @@ pub fn from_scan(
             .into_iter()
             .filter_map(|keys| keys.get(&at))
             .flatten()
-            .filter_map(|key| causes.get(key))
+            .filter_map(|key| causes.get(key).map(|cause| (key, cause)))
             .min()
-            .cloned();
+            .map(|(_, cause)| cause.clone());
     }
     out.extend(decided.stops.iter().map(UnreadSite::of_decided));
     out.extend(
