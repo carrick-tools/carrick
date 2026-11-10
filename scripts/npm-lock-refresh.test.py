@@ -92,20 +92,25 @@ class Wiring(unittest.TestCase):
         self.assertIsNotNone(m, f"job {name} missing")
         return m.group(1)
 
-    def test_lock_test_runs_in_ci_and_gates(self):
-        body = self.job(self.ci, "npm-lock")
-        self.assertIn("python3 scripts/npm-lock-version.test.py", body)
-        gate = self.job(self.ci, "ci-result")
-        self.assertRegex(gate, r"(?m)^      - npm-lock$")
+    lockwf = (ROOT / ".github/workflows/npm-lock.yml").read_text()
 
-    def test_lock_test_is_skipped_on_the_release_pr_by_head_branch(self):
-        body = self.job(self.ci, "npm-lock")
-        self.assertIn(RELEASE_BRANCH, body)
-        # The merge queue has no head branch: it is read from the PR number.
-        self.assertIn("merge_group.head_ref", body)
-        self.assertRegex(body, r"if: steps\.\w+\.outputs\.skip != 'true'")
-        # A skipped job would fail ci-result, so the skip is on the step only.
-        self.assertNotRegex(body, r"(?m)^    if:")
+    def test_lock_test_does_not_gate_prs(self):
+        # Main's lockfile lags by design between a publish and the refresh PR
+        # merging; a gating check would fail every PR and stop the merge queue.
+        self.assertNotIn("npm-lock", self.job(self.ci, "ci-result"))
+        self.assertNotIn("npm-lock-version.test.py", self.ci)
+        self.assertNotRegex(self.ci, r"(?m)^  npm-lock:")
+
+    def test_lock_test_runs_on_main_push_and_the_refresh_pr_only(self):
+        wf = self.lockwf
+        self.assertIn("python3 scripts/npm-lock-version.test.py", wf)
+        self.assertRegex(wf, r"(?m)^  push:\n    branches: \[main\]")
+        self.assertRegex(wf, r"(?m)^  pull_request:")
+        # Not the merge queue, and not a PR unless it is the refresh PR.
+        self.assertNotIn("merge_group", wf)
+        body = self.job(wf, "npm-lock")
+        self.assertRegex(body, r"(?m)^    if: github\.event_name == 'push' \|\| startsWith\(github\.head_ref, 'lock-refresh-'\)$")
+        self.assertIn("python3 scripts/npm-lock-version.test.py", body)
 
     def test_refresh_job_follows_the_publish(self):
         body = self.job(self.rel, "lock-refresh")
