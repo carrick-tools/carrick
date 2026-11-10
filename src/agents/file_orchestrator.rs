@@ -2966,7 +2966,6 @@ impl FileOrchestrator {
                         crate::findings::FileNotReadReason::DoesNotParse,
                     );
                 }
-                stats.errors.push(format!("Parse failure: {}", path_str));
                 stats.files_skipped += 1;
                 stats.files_parse_failed += 1;
                 // An empty joined result, because downstream readers key on
