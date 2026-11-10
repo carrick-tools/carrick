@@ -4935,6 +4935,51 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         found.remove(0)
     }
 
+    /// What the module binding the call at `file:line` names as its callee
+    /// holds, as discovery's `binding_callee` reads it: the compiler's call
+    /// row names the declaration, and the resolver reads the table entry.
+    /// `None` where the row names no binding of the run.
+    fn named_callee<'a>(
+        resolver: &Resolver<'a>,
+        inputs: &'a RequestSummaryInputs,
+        file: &str,
+        line: u32,
+    ) -> Option<Vec<Got>> {
+        let (path, ir) = inputs
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with(file))
+            .unwrap_or_else(|| panic!("{file} is read"));
+        let found: Vec<&CallIr> = super::row_calls::every_call(&inputs.files)
+            .into_iter()
+            .filter(|(at, call, _)| *at == path.as_path() && call.site.line == line)
+            .map(|(_, call, _)| call)
+            .collect();
+        let [call] = found.as_slice() else {
+            panic!("one call at {file}:{line}: {}", found.len());
+        };
+        let row = inputs
+            .positions
+            .as_ref()?
+            .lookup(
+                path,
+                ir.swc_start(call.site.lo),
+                ir.swc_start(call.site.hi),
+                Kind::Call,
+            )
+            .ok()?;
+        let (declared, decl_line, symbol) = resolver.declared_binding(row)?;
+        let invoke = Invoke {
+            file: path,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        resolver
+            .binding_values(&mut Ends, declared, decl_line, &symbol, invoke)
+            .map(got)
+    }
+
     /// carrick#3794 T3: a client held in a local of a block is reached
     /// through its name, as one held in the body is.
     ///
@@ -4947,8 +4992,8 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         };
         let resolver = Resolver::new(&on.inputs, &[]);
         assert_eq!(
-            callee(&resolver, &on.inputs, "scoped.ts", 16),
-            [definition("sendBlock")]
+            named_callee(&resolver, &on.inputs, "scoped.ts", 16),
+            Some(vec![definition("sendBlock")])
         );
     }
 
@@ -4964,12 +5009,12 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         };
         let resolver = Resolver::new(&on.inputs, &[]);
         assert_eq!(
-            callee(&resolver, &on.inputs, "scoped.ts", 25),
-            [definition("sendPicked")]
+            named_callee(&resolver, &on.inputs, "scoped.ts", 32),
+            Some(vec![written(29)])
         );
         assert_eq!(
-            callee(&resolver, &on.inputs, "scoped.ts", 32),
-            [written(29)]
+            callee(&resolver, &on.inputs, "scoped.ts", 25),
+            [definition("sendPicked")]
         );
     }
 
@@ -4986,16 +5031,15 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         };
         let resolver = Resolver::new(&on.inputs, &[]);
         assert_eq!(
-            callee(&resolver, &on.inputs, "scoped.ts", 39),
-            [Got::Stop(Stop::CallbackParameter)]
+            named_callee(&resolver, &on.inputs, "scoped.ts", 39),
+            Some(vec![Got::Stop(Stop::CallbackParameter)])
         );
     }
 
-    /// carrick#3794 T3, pins: the readers that stay closed to the class.
-    /// `objects_of` refuses a local (`object_kept` is false for each), and
-    /// the two readers that filter on `declared.module_scope()` (`const_call`,
-    /// the receiver walk's module binding) see every entry here as outside
-    /// module scope, whether or not the value readers read it.
+    /// carrick#3794 T3, pin: every entry of the class is outside module
+    /// scope and holds no object the object reader would take
+    /// (`object_kept`), so `objects_of`, `const_call` and the receiver walk's
+    /// module binding, which filter on those, keep refusing them.
     ///
     /// Proof it ran: `walked` is `None` without the built compiler engine
     /// (the test then returns early); CI builds it first.
@@ -5004,22 +5048,13 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
             return;
         };
-        let resolver = Resolver::new(&on.inputs, &[]);
-        let (path, _, _, call) = call_at(&on.inputs, "scoped.ts", 16, false);
-        let held = &call.callee_values;
-        assert!(!held.is_empty());
-        for value in held {
-            let mut out = Vec::new();
-            assert!(!resolver.objects_of(path, value, None, &mut out));
-            assert!(out.is_empty());
-        }
-        let file = &on.inputs.files[path];
-        let scoped: Vec<_> = file
+        let path = on.path("services/web/src/scoped.ts");
+        let scoped: Vec<_> = on.inputs.files[&path]
             .module_bindings
             .values()
             .filter(|binding| binding.scoped_entry())
             .collect();
-        assert!(!scoped.is_empty());
+        assert!(scoped.len() >= 3, "{scoped:?}");
         for binding in scoped {
             assert!(!binding.declared.module_scope(), "{binding:?}");
             assert!(!binding.object_kept, "{binding:?}");
