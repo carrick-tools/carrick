@@ -2651,7 +2651,7 @@ impl Analyzer {
                 debug!("Skipping call with non-route value: {}", call.key);
                 continue;
             }
-            // Every query call of a file shares the key `http|QUERY|`: the
+            // Every query call of a file shares the key `http|GET|`: the
             // procedure is part of what tells two calls apart.
             let key = format!(
                 "{}:{}{}",

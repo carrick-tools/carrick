@@ -2419,21 +2419,21 @@ fn matched_producers(name: &str) -> Vec<String> {
 /// Each client form is a proxy whose members are the router's keys: a
 /// vanilla client (`query`/`mutate`), hooks (`useQuery`/`useMutation`), and
 /// an options proxy a hook returns (`queryOptions`). Each call through one is
-/// an HTTP call row with the label's RPC word as its method, an empty path,
+/// an HTTP call row with the wire method the server row states (query GET, mutation POST), an empty path,
 /// and the procedure it names: the key path read on the proxy and the router
 /// its first key is declared in, wherever the proxy is held. Two calls on
 /// one line are two rows.
 fn procedure_client_rows() -> Vec<String> {
     let router = "workspace:src/router.ts#appRouter";
     let mut rows = vec![
-        format!("src/web/hooks.ts:7 QUERY \"\" {router} shelf.list request_summary"),
-        format!("src/web/hooks.ts:8 MUTATION \"\" {router} shelf.add request_summary"),
-        format!("src/web/hooks.ts:16 QUERY \"\" {router} count request_summary"),
-        format!("src/web/vanilla.ts:11 MUTATION \"\" {router} shelf.add request_summary"),
-        format!("src/web/vanilla.ts:15 QUERY \"\" {router} shelf.inner.get request_summary"),
-        format!("src/web/vanilla.ts:16 QUERY \"\" {router} count request_summary"),
-        format!("src/web/vanilla.ts:16 QUERY \"\" {router} shelf.list request_summary"),
-        format!("src/web/vanilla.ts:7 QUERY \"\" {router} shelf.list request_summary"),
+        format!("src/web/hooks.ts:7 GET \"\" {router} shelf.list request_summary"),
+        format!("src/web/hooks.ts:8 POST \"\" {router} shelf.add request_summary"),
+        format!("src/web/hooks.ts:16 GET \"\" {router} count request_summary"),
+        format!("src/web/vanilla.ts:11 POST \"\" {router} shelf.add request_summary"),
+        format!("src/web/vanilla.ts:15 GET \"\" {router} shelf.inner.get request_summary"),
+        format!("src/web/vanilla.ts:16 GET \"\" {router} count request_summary"),
+        format!("src/web/vanilla.ts:16 GET \"\" {router} shelf.list request_summary"),
+        format!("src/web/vanilla.ts:7 GET \"\" {router} shelf.list request_summary"),
     ];
     rows.sort();
     rows
@@ -2453,7 +2453,7 @@ fn a_client_procedure_call_states_its_router_and_key_path() {
 #[test]
 fn a_client_procedure_call_pairs_only_its_own_router() {
     let edges = matched_producers("procedure-client");
-    let call = "http|QUERY|";
+    let call = "http|GET|";
     assert_eq!(
         edges,
         vec![
@@ -2463,9 +2463,29 @@ fn a_client_procedure_call_pairs_only_its_own_router() {
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
-            "http|POST|/api/rpc/shelf.add <- http|MUTATION|".to_string(),
-            "http|POST|/api/rpc/shelf.add <- http|MUTATION|".to_string(),
+            "http|POST|/api/rpc/shelf.add <- http|POST|".to_string(),
+            "http|POST|/api/rpc/shelf.add <- http|POST|".to_string(),
         ]
+    );
+}
+
+/// A hook `useMutation` call states POST, the wire method tRPC's HTTP adapter
+/// serves a mutation on, and pairs with the POST server procedure row. The
+/// fixture labels state HTTP method words, as the label writer does.
+#[test]
+fn a_hook_use_mutation_call_states_post_and_pairs_a_post_server_row() {
+    let (flat, _) = client_rows(&scan_fixture("procedure-client"));
+    let router = "workspace:src/router.ts#appRouter";
+    assert!(
+        flat.contains(&format!(
+            "src/web/hooks.ts:8 POST \"\" {router} shelf.add request_summary"
+        )),
+        "{flat:?}"
+    );
+    let edges = matched_producers("procedure-client");
+    assert!(
+        edges.contains(&"http|POST|/api/rpc/shelf.add <- http|POST|".to_string()),
+        "{edges:?}"
     );
 }
 
@@ -2510,14 +2530,14 @@ fn a_procedure_call_writes_no_consumer_manifest_entry() {
 }
 
 /// Two procedure queries in one file, and two on one line, share their key
-/// (`QUERY` and an empty path): each is a row of its own on the blob, and
+/// (`GET` and an empty path): each is a row of its own on the blob, and
 /// each pairs its own server row.
 #[test]
 fn two_procedure_queries_in_one_file_and_on_one_line_are_two_rows() {
     let (flat, graph) = client_rows(&scan_fixture("procedure-client"));
     let vanilla = |rows: &[String]| -> Vec<String> {
         rows.iter()
-            .filter(|row| row.starts_with("src/web/vanilla.ts") && row.contains(" QUERY "))
+            .filter(|row| row.starts_with("src/web/vanilla.ts") && row.contains(" GET "))
             .cloned()
             .collect()
     };
@@ -2558,7 +2578,7 @@ fn a_model_row_at_a_procedure_call_folds_into_it() {
         assert_eq!(
             at,
             vec![
-                "src/web/vanilla.ts:7 QUERY \"\" workspace:src/router.ts#appRouter shelf.list request_summary"
+                "src/web/vanilla.ts:7 GET \"\" workspace:src/router.ts#appRouter shelf.list request_summary"
             ],
         );
     }

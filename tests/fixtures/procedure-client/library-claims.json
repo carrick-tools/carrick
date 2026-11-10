@@ -123,7 +123,7 @@
                 "bound": "path",
                 "join": "."
               },
-              "method": "QUERY"
+              "method": "GET"
             },
             {
               "op": "request",
@@ -134,7 +134,7 @@
                 "bound": "path",
                 "join": "."
               },
-              "method": "MUTATE"
+              "method": "POST"
             }
           ],
           "reserved": [],
@@ -168,7 +168,7 @@
                 "bound": "path",
                 "join": "."
               },
-              "method_default": "QUERY"
+              "method_default": "GET"
             },
             {
               "op": "request",
@@ -179,7 +179,7 @@
                 "bound": "path",
                 "join": "."
               },
-              "method_default": "MUTATION"
+              "method_default": "POST"
             }
           ],
           "reserved": [],
@@ -213,7 +213,7 @@
                 "bound": "path",
                 "join": "."
               },
-              "method_default": "QUERY"
+              "method_default": "GET"
             },
             {
               "op": "request",
@@ -224,7 +224,7 @@
                 "bound": "path",
                 "join": "."
               },
-              "method_default": "MUTATION"
+              "method_default": "POST"
             }
           ],
           "reserved": [],

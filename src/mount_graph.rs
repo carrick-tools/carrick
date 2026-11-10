@@ -408,7 +408,7 @@ pub struct MountGraph {
 }
 
 /// The procedure a call names, as a key suffix (carrick#3186): two
-/// procedure calls share their HTTP key (`QUERY` and an empty path), so every
+/// procedure calls share their HTTP key (its wire method and an empty path), so every
 /// map keyed on a call's key alone keys on this too. Empty for a call with no
 /// procedure, so no other key moves.
 pub fn procedure_suffix(procedure: Option<&carrick_match::ProcedureKey>) -> String {
@@ -731,7 +731,7 @@ impl MountGraph {
                     // calls at one site sending different values are two
                     // consumers, and `file_location` alone folds them.
                     // So is the procedure (carrick#3186): every
-                    // query call on one line shares `QUERY::<line>`.
+                    // query call on one line shares `GET::<line>`.
                     let key = format!(
                         "{}:{}:{}{}{}",
                         call.method,
@@ -1834,7 +1834,7 @@ mod tests {
                     binding: "appRouter".to_string(),
                 },
             }),
-            method: "QUERY".to_string(),
+            method: "GET".to_string(),
             target_url: String::new(),
             canonical_path: String::new(),
             client: String::new(),
