@@ -10,7 +10,9 @@
 //! from the code, top down, one adapter call at a time:
 //!
 //! - **The collection** the adapter is handed at its `runs` slot is read
-//!   through the syntax: a call the compiler resolves to a verified
+//!   through what the scan's IR holds of each value ([`ValueAt`], with an
+//!   object literal's entries in order, [`super::super::resolve::ObjectEntries`],
+//!   and the binding table, carrick#3538): a call the compiler resolves to a verified
 //!   `collects` member (its object at the label's slot, each key joined
 //!   with the label's `join`), a name the compiler resolves to a binding of
 //!   this service (its initialiser, in its own module), a call of one of
@@ -25,7 +27,10 @@
 //!   whose binding it cannot read (a destructured one), a function whose
 //!   returns it cannot read, and the depth cap are counted on the pass
 //!   ([`super::Decided::procedure_stops`]), apart from a procedure no
-//!   adapter serves.
+//!   adapter serves. A name declared in a nested block, and a function no
+//!   definition key joins, are read from a fallback the binding table does
+//!   not yet replace (carrick#3794), and each such read is counted there
+//!   too.
 //! - **The adapter's mount**: every value its `prefix` slot states; with
 //!   none, the host call the adapter's result is handed to: a verified
 //!   `mounts` member at its mounted slot, under its prefix and the scopes
@@ -41,13 +46,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
-use swc_common::{SourceMap, Spanned, sync::Lrc};
-use swc_ecma_ast::*;
-use swc_ecma_visit::{Visit, VisitWith};
-
-use super::super::RequestSummaryInputs;
+use super::super::resolve::{BindingKind, MAX_PROCEDURE_DEPTH, ValueAt};
+use super::super::row_calls::Reach;
+use super::super::{CallIr, FileIr, RequestSummaryInputs};
 use super::composed::{Mounts, compose};
 use super::instances::{InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex};
 use super::{Calls, Decided, LabelledEnd, SiteLabel, relative};
@@ -273,18 +275,6 @@ pub struct ProcedureAt {
     pub router_binding: String,
 }
 
-/// One parsed module, with the source map its spans are in.
-struct Parsed {
-    cm: Lrc<SourceMap>,
-    module: Module,
-}
-
-impl Parsed {
-    fn line(&self, span: swc_common::Span) -> u32 {
-        self.cm.lookup_char_pos(span.lo).line as u32
-    }
-}
-
 /// The key path above a value: `Some` while every key is read.
 #[derive(Clone)]
 struct Above {
@@ -300,10 +290,26 @@ struct Above {
     /// The value is read through a binding that may be set again: a
     /// procedure below it is counted, never named.
     stopped: bool,
+    /// The value is part of what a function returns, read with the
+    /// function's own locals in place: a local it is held in binds no
+    /// router name, as the returns were always read (carrick#3538 M1).
+    inlined: bool,
 }
 
-/// The deepest a value is followed before the walk gives up on it.
-const MAX_DEPTH: usize = 32;
+/// A span in SWC's own numbering, as the compiler's rows and the sites key
+/// one.
+type SwcSpan = (u32, u32);
+
+/// A binding a name reads, as [`Pass::binding`] finds it.
+struct Binding {
+    init: Vec<ValueAt>,
+    /// Declared `const`: never set again.
+    constant: bool,
+    /// Read from the fallback (carrick#3794).
+    fallback: bool,
+    /// A function's own local, not a module binding.
+    local: bool,
+}
 
 pub(super) struct Pass<'w, 'a> {
     pub(super) calls: &'w Calls<'a>,
@@ -356,7 +362,9 @@ impl Pass<'_, '_> {
         if leaves.is_empty() {
             return;
         }
-        let mut modules: HashMap<PathBuf, Option<Rc<Parsed>>> = HashMap::new();
+        // The router each first key's property is held by, by its file and
+        // line ([`super::router_holder::router_holder`]).
+        let mut holders: HashMap<(String, u32), Option<String>> = HashMap::new();
         let mut served: HashMap<(String, u32, u32), Procedure> = HashMap::new();
         let mut adapters: BTreeSet<(String, u32, u32)> = BTreeSet::new();
         for site in discovered {
@@ -370,18 +378,10 @@ impl Pass<'_, '_> {
                 continue;
             }
             let file = self.root.join(&end.file);
-            let Some(parsed) = self.parsed(&mut modules, &file) else {
+            let Some(placed) = self.calls.at_span(&file, end.span_start, end.span_end) else {
                 continue;
             };
-            let mut at = super::CallAt {
-                target: (end.span_start, end.span_end),
-                args: None,
-            };
-            parsed.module.visit_with(&mut at);
-            let Some(args) = at.args else {
-                continue;
-            };
-            let Some(collection) = slot_expr(&args, &adapter.runs) else {
+            let Some(collection) = slot_values(placed.call, &adapter.runs) else {
                 continue;
             };
             let mut reached = Reached::default();
@@ -392,30 +392,36 @@ impl Pass<'_, '_> {
                 first_key: None,
                 bound: None,
                 stopped: false,
+                inlined: false,
             };
-            self.walk(
-                &mut modules,
-                &file,
-                &collection,
-                above,
-                &leaves,
-                &mut Vec::new(),
-                &mut reached,
-            );
+            let mut stack = Vec::new();
+            for value in &collection {
+                self.walk(
+                    &file,
+                    value,
+                    above.clone(),
+                    &leaves,
+                    &mut stack,
+                    &mut reached,
+                );
+            }
             out.procedure_stops += reached.stops;
             if reached.leaves.is_empty() {
                 continue;
             }
-            let mounts = self.mounts_of(&mut modules, &file, end, adapter, &out.sites);
+            let mounts = self.mounts_of(&file, end, adapter, &out.sites);
             for (leaf, path, owner, first_key) in reached.leaves {
                 let procedure = served.entry(leaf).or_default();
                 if procedure.owner.is_none() {
                     procedure.owner = owner;
                 }
                 let router = first_key.and_then(|(router_file, line)| {
-                    let parsed = self.parsed(&mut modules, &self.root.join(&router_file))?;
-                    let binding =
-                        super::router_holder::holder_in(&parsed.cm, &parsed.module, line)?;
+                    let binding = holders
+                        .entry((router_file.clone(), line))
+                        .or_insert_with(|| {
+                            super::router_holder::router_holder(self.root, &router_file, line)
+                        })
+                        .clone()?;
                     Some((router_file, binding))
                 });
                 for mount in &mounts {
@@ -461,27 +467,6 @@ impl Pass<'_, '_> {
         }
     }
 
-    fn parsed(
-        &self,
-        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
-        file: &Path,
-    ) -> Option<Rc<Parsed>> {
-        modules
-            .entry(file.to_path_buf())
-            .or_insert_with(|| {
-                let cm: Lrc<SourceMap> = Default::default();
-                let handler = swc_common::errors::Handler::with_tty_emitter(
-                    swc_common::errors::ColorConfig::Never,
-                    false,
-                    false,
-                    Some(cm.clone()),
-                );
-                let module = crate::parser::parse_file(file, &cm, &handler)?;
-                Some(Rc::new(Parsed { cm, module }))
-            })
-            .clone()
-    }
-
     /// The declaration the compiler's row of `kind` at `span` in `file`
     /// names, as this service's file and line, with the name it declares
     /// (an import's alias resolved: `import { a as b }` names `a`); `None`
@@ -489,11 +474,11 @@ impl Pass<'_, '_> {
     fn own_declaration(
         &self,
         file: &Path,
-        span: swc_common::Span,
+        span: SwcSpan,
         kind: Kind,
     ) -> Option<(PathBuf, u32, Option<String>)> {
         let positions = self.inputs.positions.as_ref()?;
-        let row = positions.lookup(file, span.lo.0, span.hi.0, kind).ok()?;
+        let row = positions.lookup(file, span.0, span.1, kind).ok()?;
         if !super::super::discovery::in_repo(row) {
             return None;
         }
@@ -507,11 +492,9 @@ impl Pass<'_, '_> {
 
     /// The verified router member the call at `span` in `file` resolves
     /// to, as the compiler's call row names its declaration.
-    fn collects_of(&self, file: &Path, span: swc_common::Span) -> Option<&CollectsLabel> {
+    fn collects_of(&self, file: &Path, span: SwcSpan) -> Option<&CollectsLabel> {
         let positions = self.inputs.positions.as_ref()?;
-        let row = positions
-            .lookup(file, span.lo.0, span.hi.0, Kind::Call)
-            .ok()?;
+        let row = positions.lookup(file, span.0, span.1, Kind::Call).ok()?;
         self.collects_at(&(row.decl_file()?.to_string(), row.decl_line()?))
     }
 
@@ -542,21 +525,14 @@ impl Pass<'_, '_> {
     /// The verified merging member the call at `span` in `file` resolves
     /// to, directly or through one `const` alias. A declaration both a
     /// `collects` and a `merges` label hold says nothing.
-    fn merges_of(
-        &self,
-        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
-        file: &Path,
-        span: swc_common::Span,
-    ) -> Option<&MergesLabel> {
+    fn merges_of(&self, file: &Path, span: SwcSpan) -> Option<&MergesLabel> {
         let direct = self.inputs.positions.as_ref().and_then(|positions| {
-            let row = positions
-                .lookup(file, span.lo.0, span.hi.0, Kind::Call)
-                .ok()?;
+            let row = positions.lookup(file, span.0, span.1, Kind::Call).ok()?;
             Some((row.decl_file()?.to_string(), row.decl_line()?))
         });
         let declared = match direct.filter(|declared| self.merges_at(declared).is_some()) {
             Some(declared) => declared,
-            None => self.aliased_declaration(modules, file, span)?,
+            None => self.aliased_declaration(file, span)?,
         };
         let label = self.merges_at(&declared)?;
         (self.collects_at(&declared).is_none()).then_some(label)
@@ -566,202 +542,208 @@ impl Pass<'_, '_> {
     /// hop: the callee is an in-repo `const` whose initialiser is a member
     /// or a name, and the compiler's row at that initialiser names the
     /// declaration. A `let`, or any other initialiser, names nothing.
-    fn aliased_declaration(
-        &self,
-        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
-        file: &Path,
-        span: swc_common::Span,
-    ) -> Option<(String, u32)> {
+    fn aliased_declaration(&self, file: &Path, span: SwcSpan) -> Option<(String, u32)> {
         let (declared, line, symbol) = self.own_declaration(file, span, Kind::Call)?;
-        let parsed = self.parsed(modules, &declared)?;
-        let (init, is_const) = binding_init(&parsed, &symbol?, line)?;
-        if !is_const {
+        let binding = self.binding(&declared, line, &symbol?)?;
+        if !binding.constant {
             return None;
         }
-        let init = super::super::unwrap_value(&init);
-        let kinds: &[Kind] = match init {
-            Expr::Member(_) => &[Kind::Member, Kind::Ident],
-            Expr::Ident(_) => &[Kind::Ident, Kind::Member],
+        let ir = self.calls.file_ir(&declared)?;
+        let (lo, hi, kinds): (u32, u32, &[Kind]) = match binding.init.as_slice() {
+            [
+                ValueAt::KeyOf { lo, hi, .. }
+                | ValueAt::Field { lo, hi, .. }
+                | ValueAt::Read {
+                    lo,
+                    hi,
+                    member: true,
+                    ..
+                },
+            ] => (*lo, *hi, &[Kind::Member, Kind::Ident]),
+            [
+                ValueAt::Read {
+                    lo,
+                    hi,
+                    member: false,
+                    ..
+                },
+            ] => (*lo, *hi, &[Kind::Ident, Kind::Member]),
             _ => return None,
         };
         let positions = self.inputs.positions.as_ref()?;
-        let at = init.span();
+        let (lo, hi) = (ir.swc_start(lo), ir.swc_start(hi));
         kinds.iter().find_map(|kind| {
-            let row = positions.lookup(&declared, at.lo.0, at.hi.0, *kind).ok()?;
+            let row = positions.lookup(&declared, lo, hi, *kind).ok()?;
             Some((row.decl_file()?.to_string(), row.decl_line()?))
         })
     }
 
     /// The verified router member a call goes through an alias to.
-    fn collects_through_alias(
-        &self,
-        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
-        file: &Path,
-        span: swc_common::Span,
-    ) -> Option<&CollectsLabel> {
-        let declared = self.aliased_declaration(modules, file, span)?;
+    fn collects_through_alias(&self, file: &Path, span: SwcSpan) -> Option<&CollectsLabel> {
+        let declared = self.aliased_declaration(file, span)?;
         self.collects_at(&declared)
     }
 
-    /// Walk down `expr`, written in `file`, to every procedure site in
+    /// The initialiser of the plain binding `name` declared on `line` of
+    /// `declared`, whether it is a `const` (one that is not may be set
+    /// again), and whether it was read from the fallback: the binding
+    /// table's row, or, for a declarator a nested block writes, the fallback
+    /// (carrick#3794). `None` for anything else the name declares (a
+    /// destructured key, a parameter, an enum, a class member, a function)
+    /// and for a declaration with no initialiser.
+    fn binding(&self, declared: &Path, line: u32, name: &str) -> Option<Binding> {
+        let ir = self.calls.file_ir(declared)?;
+        let key = (line, name.to_string());
+        let binding = match ir.module_bindings.get(&key) {
+            Some(binding) => {
+                let plain = binding.plain
+                    && matches!(
+                        binding.kind,
+                        BindingKind::Const | BindingKind::Let | BindingKind::Var
+                    );
+                if !plain {
+                    return None;
+                }
+                Binding {
+                    init: binding.init.clone(),
+                    constant: binding.kind == BindingKind::Const,
+                    fallback: false,
+                    local: binding.declared_in.is_some(),
+                }
+            }
+            // FALLBACK (carrick#3794): delete once block-scoped and
+            // nested-function locals are in the one binding table.
+            None => {
+                let block = ir.block_bindings.get(&key)?;
+                Binding {
+                    init: block.init.clone(),
+                    constant: block.constant,
+                    fallback: true,
+                    local: true,
+                }
+            }
+        };
+        (!binding.init.is_empty()).then_some(binding)
+    }
+
+    /// The values the function the declaration of `name` on `line` of
+    /// `declared` is returns: its definition's, or, for a function no
+    /// definition key joins, the fallback (counted on `reached`).
+    fn returns_of(
+        &self,
+        declared: &Path,
+        line: u32,
+        name: Option<&str>,
+        reached: &mut Reached,
+    ) -> Vec<ValueAt> {
+        let Some(name) = name else {
+            return Vec::new();
+        };
+        let Some(ir) = self.calls.file_ir(declared) else {
+            return Vec::new();
+        };
+        if let Reach::Function(_, key) = self.inputs.definition_at(declared, Some(line), name)
+            && let Some(function) = ir.functions.get(&key)
+        {
+            return function.returned_values.clone();
+        }
+        // FALLBACK (carrick#3794): delete once block-scoped and
+        // nested-function locals are in the one binding table.
+        match ir.block_returns.get(&(line, name.to_string())) {
+            Some(values) => {
+                reached.stops += 1;
+                values.clone()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The call of `file` handed the expression at `span` (SWC numbering) as
+    /// one of its arguments, before any spread: its span and that argument.
+    fn host_of(&self, file: &Path, lo: u32, hi: u32) -> Option<(u32, u32, usize)> {
+        let ir = self.calls.file_ir(file)?;
+        let target = (ir.discovery_start(lo), ir.discovery_start(hi));
+        self.calls
+            .by_span
+            .iter()
+            .filter(|(key, placed)| key.0 == file && !placed.call.constructs)
+            .find_map(|(_, placed)| {
+                let index = placed.call.arg_spans.iter().position(|at| *at == target)?;
+                Some((
+                    placed.call.site.span_start,
+                    placed.call.site.span_end,
+                    index,
+                ))
+            })
+    }
+
+    /// Walk down `value`, read in `file`, to every procedure site in
     /// `leaves` it holds, each with the key path above it.
-    #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
-        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
         file: &Path,
-        expr: &Expr,
+        value: &ValueAt,
         above: Above,
         leaves: &HashSet<(String, u32, u32)>,
         stack: &mut Vec<(PathBuf, u32, u32)>,
         reached: &mut Reached,
     ) {
-        let expr = super::super::unwrap_value(expr);
-        let span = expr.span();
-        let here = (file.to_path_buf(), span.lo.0, span.hi.0);
+        let (lo, hi) = match value {
+            // A parameter's binding holds no initialiser to read.
+            ValueAt::Param { .. } => {
+                reached.stops += 1;
+                return;
+            }
+            ValueAt::Returned { lo, hi, .. }
+            | ValueAt::Read {
+                lo,
+                hi,
+                member: false,
+                ..
+            } => (*lo, *hi),
+            ValueAt::Object { entries, .. } => (entries.lo, entries.hi),
+            _ => return,
+        };
+        let here = (file.to_path_buf(), lo, hi);
         if stack.contains(&here) {
             return;
         }
-        if stack.len() >= MAX_DEPTH {
+        if stack.len() >= MAX_PROCEDURE_DEPTH {
             reached.stops += 1;
             return;
         }
+        let Some(ir) = self.calls.file_ir(file) else {
+            return;
+        };
+        // A value read through a function-local name is the binding's
+        // (carrick#3538 M1), as one read through a module binding is.
+        let held = ir.held_inits.get(&(lo, hi)).filter(|_| !above.inlined);
+        let above = match held {
+            Some(held) => Above {
+                bound: Some(held.name.clone()),
+                stopped: above.stopped || !held.constant,
+                ..above
+            },
+            None => above,
+        };
         stack.push(here);
-        match expr {
-            Expr::Call(call) => {
-                let leaf = (relative(self.root, file), span.lo.0, span.hi.0);
-                if leaves.contains(&leaf) {
-                    // A procedure is named by its keys only under a router,
-                    // and never below a binding that may be set again.
-                    let path = if above.stopped {
-                        Err("walk_stopped")
-                    } else {
-                        above
-                            .join
-                            .as_ref()
-                            .and(above.path.clone())
-                            .ok_or("unread_key")
-                    };
-                    reached
-                        .leaves
-                        .push((leaf, path, above.owner.clone(), above.first_key.clone()));
-                } else if let Some(label) = self
-                    .collects_of(file, span)
-                    .or_else(|| self.collects_through_alias(modules, file, span))
-                {
-                    let collected = slot_expr(&call.args, &(label.arg, label.key.clone()));
-                    if let Some(collected) = collected {
-                        let below = Above {
-                            path: above.path.clone(),
-                            join: Some(label.join.clone()),
-                            owner: above.bound.clone().or(above.owner.clone()),
-                            first_key: above.first_key.clone(),
-                            bound: None,
-                            stopped: above.stopped,
-                        };
-                        self.walk(modules, file, &collected, below, leaves, stack, reached);
-                    }
-                } else if let Some(label) = self.merges_of(modules, file, span) {
-                    // Every argument from the slot on is a router served at
-                    // the level the merge is called at, under the same keys.
-                    let mut merged: Vec<Expr> = Vec::new();
-                    for arg in call.args.iter().skip(label.arg) {
-                        if arg.spread.is_some() {
-                            reached.stops += 1;
-                        } else {
-                            merged.push((*arg.expr).clone());
-                        }
-                    }
-                    let below = Above {
-                        owner: above.bound.clone().or(above.owner.clone()),
-                        bound: None,
-                        ..above.clone()
-                    };
-                    for argument in merged {
-                        self.walk(
-                            modules,
-                            file,
-                            &argument,
-                            below.clone(),
-                            leaves,
-                            stack,
-                            reached,
-                        );
-                    }
-                } else if let Some((declared, line, _)) =
-                    self.own_declaration(file, span, Kind::Call)
-                {
-                    let values = self
-                        .parsed(modules, &declared)
-                        .map(|parsed| returned_values(&parsed, line))
-                        .unwrap_or_default();
-                    if values.is_empty() {
-                        reached.stops += 1;
-                    }
-                    for value in values {
-                        let below = Above {
-                            bound: None,
-                            ..above.clone()
-                        };
-                        self.walk(modules, &declared, &value, below, leaves, stack, reached);
-                    }
-                }
+        match value {
+            ValueAt::Returned { .. } => {
+                self.call(file, ir, (lo, hi), above, leaves, stack, reached);
             }
-            Expr::Ident(_) => {
-                if let Some((declared, line, symbol)) =
-                    self.own_declaration(file, span, Kind::Ident)
-                {
-                    // The binding the compiler resolves the name to, by the
-                    // name it declares: a use under an import alias reads
-                    // the declaration's own name.
-                    let binding = symbol.and_then(|symbol| {
-                        let parsed = self.parsed(modules, &declared)?;
-                        binding_init(&parsed, &symbol, line).map(|binding| (symbol, binding))
-                    });
-                    match binding {
-                        Some((symbol, (init, constant))) => {
-                            let below = Above {
-                                bound: Some(symbol),
-                                stopped: above.stopped || !constant,
-                                ..above
-                            };
-                            self.walk(modules, &declared, &init, below, leaves, stack, reached);
+            ValueAt::Read { .. } => self.name(file, ir, (lo, hi), above, leaves, stack, reached),
+            ValueAt::Object {
+                fields, entries, ..
+            } => {
+                for entry in &entries.props {
+                    let path = match (&above.path, &above.join, &entry.key) {
+                        (Some(path), Some(join), Some(key)) if !entry.widened => {
+                            Some(if path.is_empty() {
+                                key.clone()
+                            } else {
+                                format!("{path}{join}{key}")
+                            })
                         }
-                        None => reached.stops += 1,
-                    }
-                }
-            }
-            Expr::Object(object) => {
-                // A key some later spread, computed key or accessor may set
-                // again is not read as written.
-                let wide_after: Vec<bool> = {
-                    let mut wide = false;
-                    let mut after = vec![false; object.props.len()];
-                    for (index, prop) in object.props.iter().enumerate().rev() {
-                        after[index] = wide;
-                        wide |= widens(prop);
-                    }
-                    after
-                };
-                for (prop, wide) in object.props.iter().zip(wide_after) {
-                    let (key, value): (Option<String>, Expr) = match prop {
-                        PropOrSpread::Spread(spread) => (None, (*spread.expr).clone()),
-                        PropOrSpread::Prop(prop) => match &**prop {
-                            Prop::KeyValue(entry) => {
-                                (super::super::prop_name(&entry.key), (*entry.value).clone())
-                            }
-                            Prop::Shorthand(name) => {
-                                (Some(name.sym.to_string()), Expr::Ident(name.clone()))
-                            }
-                            _ => continue,
-                        },
-                    };
-                    let path = match (&above.path, &above.join, key) {
-                        (Some(path), Some(join), Some(key)) if !wide => Some(if path.is_empty() {
-                            key
-                        } else {
-                            format!("{path}{join}{key}")
-                        }),
                         _ => None,
                     };
                     // The first key read under a router is the property the
@@ -769,10 +751,7 @@ impl Pass<'_, '_> {
                     let first_key =
                         match (&above.path, &above.join, &path, above.first_key.is_none()) {
                             (Some(before), Some(_), Some(_), true) if before.is_empty() => {
-                                let line = self
-                                    .parsed(modules, file)
-                                    .map(|parsed| parsed.line(prop.span()));
-                                line.map(|line| (relative(self.root, file), line))
+                                Some((relative(self.root, file), entry.line))
                             }
                             _ => above.first_key.clone(),
                         };
@@ -782,7 +761,9 @@ impl Pass<'_, '_> {
                         bound: None,
                         ..above.clone()
                     };
-                    self.walk(modules, file, &value, below, leaves, stack, reached);
+                    for value in entry.values(fields) {
+                        self.walk(file, value, below.clone(), leaves, stack, reached);
+                    }
                 }
             }
             _ => {}
@@ -790,11 +771,159 @@ impl Pass<'_, '_> {
         stack.pop();
     }
 
+    /// The name read at `at` (discovery numbering) in `file`: the
+    /// initialiser of the binding the compiler's row names.
+    #[allow(clippy::too_many_arguments)]
+    fn name(
+        &self,
+        file: &Path,
+        ir: &FileIr,
+        at: (u32, u32),
+        above: Above,
+        leaves: &HashSet<(String, u32, u32)>,
+        stack: &mut Vec<(PathBuf, u32, u32)>,
+        reached: &mut Reached,
+    ) {
+        let span = (ir.swc_start(at.0), ir.swc_start(at.1));
+        let Some((declared, line, symbol)) = self.own_declaration(file, span, Kind::Ident) else {
+            return;
+        };
+        // The binding the compiler resolves the name to, by the name it
+        // declares: a use under an import alias reads the declaration's own
+        // name.
+        let binding = symbol.and_then(|symbol| {
+            let binding = self.binding(&declared, line, &symbol)?;
+            Some((symbol, binding))
+        });
+        match binding {
+            Some((symbol, binding)) => {
+                // FALLBACK (carrick#3794): each read is counted.
+                if binding.fallback {
+                    reached.stops += 1;
+                }
+                let stopped = above.stopped || !binding.constant;
+                // A function's own local read inside what it returns is in
+                // place there, as the returns were always read: it names
+                // no router.
+                let below = if above.inlined && binding.local {
+                    Above { stopped, ..above }
+                } else {
+                    Above {
+                        bound: Some(symbol),
+                        stopped,
+                        inlined: false,
+                        ..above
+                    }
+                };
+                for value in &binding.init {
+                    self.walk(&declared, value, below.clone(), leaves, stack, reached);
+                }
+            }
+            None => reached.stops += 1,
+        }
+    }
+
+    /// The call at `at` (discovery numbering) in `file`: a procedure, a
+    /// router member, a merge, or a function of this service.
+    #[allow(clippy::too_many_arguments)]
+    fn call(
+        &self,
+        file: &Path,
+        ir: &FileIr,
+        at: (u32, u32),
+        above: Above,
+        leaves: &HashSet<(String, u32, u32)>,
+        stack: &mut Vec<(PathBuf, u32, u32)>,
+        reached: &mut Reached,
+    ) {
+        let span = (ir.swc_start(at.0), ir.swc_start(at.1));
+        let leaf = (relative(self.root, file), span.0, span.1);
+        if leaves.contains(&leaf) {
+            // A procedure is named by its keys only under a router, and
+            // never below a binding that may be set again.
+            let path = if above.stopped {
+                Err("walk_stopped")
+            } else {
+                above
+                    .join
+                    .as_ref()
+                    .and(above.path.clone())
+                    .ok_or("unread_key")
+            };
+            reached
+                .leaves
+                .push((leaf, path, above.owner.clone(), above.first_key.clone()));
+            return;
+        }
+        if let Some(label) = self
+            .collects_of(file, span)
+            .or_else(|| self.collects_through_alias(file, span))
+        {
+            let collected = self
+                .calls
+                .at_span(file, span.0, span.1)
+                .and_then(|placed| slot_values(placed.call, &(label.arg, label.key.clone())));
+            if let Some(collected) = collected {
+                let below = Above {
+                    path: above.path.clone(),
+                    join: Some(label.join.clone()),
+                    owner: above.bound.clone().or(above.owner.clone()),
+                    first_key: above.first_key.clone(),
+                    bound: None,
+                    stopped: above.stopped,
+                    inlined: above.inlined,
+                };
+                for value in &collected {
+                    self.walk(file, value, below.clone(), leaves, stack, reached);
+                }
+            }
+        } else if let Some(label) = self.merges_of(file, span) {
+            // Every argument from the slot on is a router served at the
+            // level the merge is called at, under the same keys.
+            let Some(placed) = self.calls.at_span(file, span.0, span.1) else {
+                return;
+            };
+            let below = Above {
+                owner: above.bound.clone().or(above.owner.clone()),
+                bound: None,
+                ..above.clone()
+            };
+            let arguments = placed
+                .call
+                .arg_values
+                .iter()
+                .chain(&placed.call.rest_values)
+                .skip(label.arg);
+            for argument in arguments {
+                // A spread argument: an empty entry.
+                if argument.is_empty() {
+                    reached.stops += 1;
+                }
+                for value in argument {
+                    self.walk(file, value, below.clone(), leaves, stack, reached);
+                }
+            }
+        } else if let Some((declared, line, symbol)) = self.own_declaration(file, span, Kind::Call)
+        {
+            let values = self.returns_of(&declared, line, symbol.as_deref(), reached);
+            if values.is_empty() {
+                reached.stops += 1;
+            }
+            let below = Above {
+                bound: None,
+                inlined: true,
+                ..above.clone()
+            };
+            for value in &values {
+                self.walk(&declared, value, below.clone(), leaves, stack, reached);
+            }
+        }
+    }
+
     /// Where the adapter call `end`, written in `file`, serves what it
     /// runs: each mount path, or why one is unread.
     fn mounts_of(
         &self,
-        modules: &mut HashMap<PathBuf, Option<Rc<Parsed>>>,
         file: &Path,
         end: &LabelledEnd,
         adapter: &AdapterLabel,
@@ -820,11 +949,7 @@ impl Pass<'_, '_> {
                 Prefix::Unstated => {}
             }
         }
-        let Some(parsed) = self.parsed(modules, file) else {
-            return vec![Err("unread_mount")];
-        };
-        let Some((host_lo, host_hi, arg)) = host_of(&parsed.module, end.span_start, end.span_end)
-        else {
+        let Some((host_lo, host_hi, arg)) = self.host_of(file, end.span_start, end.span_end) else {
             return vec![Err("unread_mount")];
         };
         let Some(host) = self.calls.at_span(file, host_lo, host_hi) else {
@@ -931,169 +1056,38 @@ fn below_catch_all(path: &str) -> Option<String> {
     })
 }
 
-/// Whether `prop` may set a key the object writes before it: a spread, a
-/// computed key, or an accessor or method.
-fn widens(prop: &PropOrSpread) -> bool {
-    match prop {
-        PropOrSpread::Spread(_) => true,
-        PropOrSpread::Prop(prop) => match &**prop {
-            Prop::KeyValue(entry) => super::super::prop_name(&entry.key).is_none(),
-            Prop::Shorthand(_) => false,
-            _ => true,
-        },
-    }
-}
-
-/// The expression at `slot` (an argument, or one key of the object written
-/// there) of a call's arguments; `None` past a spread argument, for a key
-/// of anything but an object literal, or for a key a later spread or
-/// computed key may set.
-fn slot_expr(args: &[ExprOrSpread], slot: &(usize, Option<String>)) -> Option<Expr> {
+/// What the call's argument at `slot` (an argument, or one key of the
+/// object literal written there) may hold; `None` past a spread argument,
+/// for a key of anything but an object literal written in place, or for a
+/// key a later spread or computed key may set.
+fn slot_values(call: &CallIr, slot: &(usize, Option<String>)) -> Option<Vec<ValueAt>> {
     let (arg, key) = slot;
-    if args.iter().take(arg + 1).any(|arg| arg.spread.is_some()) {
-        return None;
-    }
-    let written = super::super::unwrap_value(&args.get(*arg)?.expr);
+    // A spread at or before the position leaves it empty or absent.
+    let values = call
+        .arg_values
+        .get(*arg)
+        .filter(|values| !values.is_empty())?;
     let Some(key) = key else {
-        return Some(written.clone());
+        return Some(values.clone());
     };
-    let Expr::Object(object) = written else {
+    let written = call.arg_spans.get(*arg)?;
+    let (fields, entries) = values.iter().find_map(|value| match value {
+        ValueAt::Object {
+            fields, entries, ..
+        } if (entries.lo, entries.hi) == *written => Some((fields, entries)),
+        _ => None,
+    })?;
+    let mut matching = entries
+        .props
+        .iter()
+        .filter(|entry| entry.key.as_deref() == Some(key.as_str()));
+    let first = matching.next()?;
+    if first.widened {
         return None;
-    };
-    let mut found = None;
-    for prop in &object.props {
-        if found.is_some() && widens(prop) {
-            return None;
-        }
-        if let PropOrSpread::Prop(prop) = prop {
-            match &**prop {
-                Prop::KeyValue(entry)
-                    if super::super::prop_name(&entry.key).as_ref() == Some(key) =>
-                {
-                    found = Some((*entry.value).clone());
-                }
-                Prop::Shorthand(name) if name.sym == *key.as_str() => {
-                    found = Some(Expr::Ident(name.clone()));
-                }
-                _ => {}
-            }
-        }
     }
-    found
-}
-
-/// The call of `module` handed the expression at `lo..hi` as one of its
-/// arguments (before any spread): its span and that argument.
-fn host_of(module: &Module, lo: u32, hi: u32) -> Option<(u32, u32, usize)> {
-    struct Find {
-        target: (u32, u32),
-        found: Option<(u32, u32, usize)>,
-    }
-    impl Visit for Find {
-        fn visit_call_expr(&mut self, call: &CallExpr) {
-            for (index, arg) in call.args.iter().enumerate() {
-                if arg.spread.is_some() {
-                    break;
-                }
-                let span = super::super::unwrap_value(&arg.expr).span();
-                if (span.lo.0, span.hi.0) == self.target {
-                    self.found = Some((call.span.lo.0, call.span.hi.0, index));
-                }
-            }
-            call.visit_children_with(self);
-        }
-    }
-    let mut find = Find {
-        target: (lo, hi),
-        found: None,
-    };
-    module.visit_with(&mut find);
-    find.found
-}
-
-/// The initialiser of the binding `name` declared on `line`, and whether
-/// the binding is `const` (one that is not may be set again).
-fn binding_init(parsed: &Parsed, name: &str, line: u32) -> Option<(Expr, bool)> {
-    struct Find<'p> {
-        parsed: &'p Parsed,
-        name: &'p str,
-        line: u32,
-        found: Option<(Expr, bool)>,
-    }
-    impl Visit for Find<'_> {
-        fn visit_var_decl(&mut self, var: &VarDecl) {
-            for declarator in &var.decls {
-                if let Pat::Ident(binding) = &declarator.name
-                    && binding.id.sym == *self.name
-                    && self.parsed.line(binding.id.span) == self.line
-                    && let Some(init) = &declarator.init
-                {
-                    self.found = Some(((**init).clone(), var.kind == VarDeclKind::Const));
-                }
-            }
-            var.visit_children_with(self);
-        }
-    }
-    let mut find = Find {
-        parsed,
-        name,
-        line,
-        found: None,
-    };
-    parsed.module.visit_with(&mut find);
-    find.found
-}
-
-/// The values the function declared on `line` returns: an arrow's body
-/// expression, or each value its body returns as a builder's is read
-/// ([`super::super::returned_values`]: a body of `const`s and `return`s,
-/// none for any other).
-fn returned_values(parsed: &Parsed, line: u32) -> Vec<Expr> {
-    fn of_body(body: &FunctionBody) -> Vec<Expr> {
-        super::super::returned_values(&body.stmts).unwrap_or_default()
-    }
-    fn of_arrow(arrow: &ArrowExpr) -> Vec<Expr> {
-        match &*arrow.body {
-            ArrowFunctionBody::Expr(expr) => vec![(**expr).clone()],
-            ArrowFunctionBody::FunctionBody(body) => of_body(body),
-        }
-    }
-    struct Find<'p> {
-        parsed: &'p Parsed,
-        line: u32,
-        found: Option<Vec<Expr>>,
-    }
-    impl Visit for Find<'_> {
-        fn visit_fn_decl(&mut self, decl: &FnDecl) {
-            if self.parsed.line(decl.ident.span) == self.line
-                && let Some(body) = &decl.function.body
-            {
-                self.found = Some(of_body(body));
-            }
-            decl.visit_children_with(self);
-        }
-        fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-            if let Pat::Ident(binding) = &declarator.name
-                && self.parsed.line(binding.id.span) == self.line
-            {
-                match declarator.init.as_deref().map(super::super::unwrap_value) {
-                    Some(Expr::Arrow(arrow)) => self.found = Some(of_arrow(arrow)),
-                    Some(Expr::Fn(function)) => {
-                        self.found = function.function.body.as_ref().map(of_body);
-                    }
-                    _ => {}
-                }
-            }
-            declarator.visit_children_with(self);
-        }
-    }
-    let mut find = Find {
-        parsed,
-        line,
-        found: None,
-    };
-    parsed.module.visit_with(&mut find);
-    find.found.unwrap_or_default()
+    // The last write of the key is the value.
+    let last = matching.last().unwrap_or(first);
+    Some(last.values(fields).to_vec())
 }
 
 #[cfg(test)]

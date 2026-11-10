@@ -117,6 +117,11 @@ pub(super) struct ModuleBinding {
     /// key of a literal placed in it (carrick#2448); the importers' uses are
     /// `Resolver::contested_exports`'s.
     pub(super) object_kept: bool,
+    /// A `const`, `let` or `var` declarator of a plain name: not a
+    /// destructured key, a parameter's default, an enum or a class member.
+    /// Only such a binding's initialiser is what the procedures walk reads
+    /// a router name as (carrick#3538).
+    pub(super) plain: bool,
 }
 
 impl ModuleBinding {
@@ -178,6 +183,8 @@ pub(super) struct LocalBinding {
     /// The body writes the name again: the value readers read it (S1b).
     /// Otherwise the scope holds it and only the text reader needs it here.
     pub(super) reassigned: bool,
+    /// As [`ModuleBinding::plain`].
+    pub(super) plain: bool,
 }
 
 /// A placed assignment `name = value`, `name ??= value` or `name ||= value`
@@ -946,6 +953,7 @@ pub(super) fn module_bindings(
                         exported: false,
                         text_only: true,
                         object_kept: false,
+                        plain: false,
                     };
                     out.insert((line, member.bound.id.sym.to_string()), binding);
                 }
@@ -972,6 +980,7 @@ pub(super) fn module_bindings(
                 exported,
                 text_only: false,
                 object_kept: census.object_held(&key),
+                plain: true,
             };
             out.insert((line, ident.id.sym.to_string()), binding);
         }
@@ -1005,6 +1014,7 @@ pub(super) fn module_bindings(
                 exported: false,
                 text_only: !local.reassigned,
                 object_kept: false,
+                plain: local.plain,
             };
             match out.entry((local.line, local.key.0.clone())) {
                 std::collections::hash_map::Entry::Occupied(mut taken) => {
@@ -1426,10 +1436,12 @@ pub(super) enum ValueAt {
     /// A function written here, by where its node starts.
     Function(u32),
     /// An object literal: each key's values, and whether a spread or a
-    /// computed key may put any other key in it.
+    /// computed key may put any other key in it. `entries` is the
+    /// procedures walk's alone; every other reader reads `fields`.
     Object {
         fields: BTreeMap<String, Vec<ValueAt>>,
         open: bool,
+        entries: ObjectEntries,
     },
     /// Text a name states (carrick#3504 S2, [`text::text_of`]): only the
     /// text reader ([`Resolver::text_values`]) reads the variants below.
@@ -1483,6 +1495,112 @@ pub(super) enum ValueAt {
     Unread,
 }
 
+/// How many object literals deep the procedures walk reads a router's keys
+/// (carrick#3538 M3): its walk's own cap, past [`MAX_VALUE_DEPTH`].
+pub(super) const MAX_PROCEDURE_DEPTH: usize = 32;
+
+/// An object literal's properties in source order, as the procedures walk
+/// reads a router's keys (carrick#3538): each key or spread with the line
+/// its property starts on, whether a later property may set it again, and
+/// its values where [`ValueAt::Object`]'s `fields` does not hold them.
+///
+/// It is the procedures walk's alone, so it never tells two values apart:
+/// two objects with the same fields are one value to every other reader,
+/// as they were before it existed.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ObjectEntries {
+    /// The literal's span (discovery numbering).
+    pub(super) lo: u32,
+    pub(super) hi: u32,
+    /// The key-value, shorthand and spread properties; a method or an
+    /// accessor is none, though it may set a key again.
+    pub(super) props: Vec<ObjectEntry>,
+}
+
+impl PartialEq for ObjectEntries {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ObjectEntries {}
+
+impl ObjectEntries {
+    /// The same entries with `f` applied to each value they hold.
+    fn map(&self, f: impl Fn(&ValueAt) -> ValueAt) -> Self {
+        Self {
+            props: self
+                .props
+                .iter()
+                .map(|entry| ObjectEntry {
+                    values: entry
+                        .values
+                        .as_ref()
+                        .map(|values| values.iter().map(&f).collect()),
+                    ..entry.clone()
+                })
+                .collect(),
+            ..self.clone()
+        }
+    }
+}
+
+/// One property of an [`ObjectEntries`].
+#[derive(Debug, Clone)]
+pub(super) struct ObjectEntry {
+    /// The key as written; `None` for a spread or a computed key.
+    pub(super) key: Option<String>,
+    /// The 1-based line the property starts on.
+    pub(super) line: u32,
+    /// A later spread, computed key, method or accessor may set the key
+    /// again.
+    pub(super) widened: bool,
+    /// The values, where `fields` does not hold them: a spread, a computed
+    /// key, a key set again later, or one past [`MAX_VALUE_DEPTH`]. `None`:
+    /// `fields` under the key holds them.
+    pub(super) values: Option<Vec<ValueAt>>,
+}
+
+impl ObjectEntry {
+    /// What the property may hold, read from `fields` where it holds them.
+    pub(super) fn values<'v>(
+        &'v self,
+        fields: &'v BTreeMap<String, Vec<ValueAt>>,
+    ) -> &'v [ValueAt] {
+        match (&self.values, &self.key) {
+            (Some(values), _) => values,
+            (None, Some(key)) => fields.get(key).map_or(&[], Vec::as_slice),
+            (None, None) => &[],
+        }
+    }
+}
+
+/// Whether `prop` may set a key the object writes before it: a spread, a
+/// computed key, or an accessor or method.
+fn widens(prop: &PropOrSpread) -> bool {
+    match prop {
+        PropOrSpread::Spread(_) => true,
+        PropOrSpread::Prop(prop) => match &**prop {
+            Prop::KeyValue(entry) => prop_name(&entry.key).is_none(),
+            Prop::Shorthand(_) => false,
+            _ => true,
+        },
+    }
+}
+
+/// The key `prop` puts in [`ValueAt::Object`]'s `fields`, if any.
+fn sets_key(prop: &PropOrSpread) -> Option<String> {
+    let PropOrSpread::Prop(prop) = prop else {
+        return None;
+    };
+    match &**prop {
+        Prop::KeyValue(entry) => prop_name(&entry.key),
+        Prop::Shorthand(ident) => Some(ident.sym.to_string()),
+        Prop::Method(method) => prop_name(&method.key),
+        _ => None,
+    }
+}
+
 /// What the receiver walk reads a name as, decided where the name is read
 /// (carrick#3504 S3a). Only the walk reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1523,12 +1641,17 @@ impl ValueAt {
                 index: *index,
                 keys: keys.clone(),
             },
-            Self::Object { fields, open } => Self::Object {
+            Self::Object {
+                fields,
+                open,
+                entries,
+            } => Self::Object {
                 fields: fields
                     .iter()
                     .map(|(key, values)| (key.clone(), values.iter().map(Self::enclosed).collect()))
                     .collect(),
                 open: *open,
+                entries: entries.map(Self::enclosed),
             },
             Self::Returned {
                 lo,
@@ -1571,7 +1694,11 @@ impl ValueAt {
     pub(super) fn unparameterised(&self) -> Self {
         match self {
             Self::Param { .. } => Self::Unread,
-            Self::Object { fields, open } => Self::Object {
+            Self::Object {
+                fields,
+                open,
+                entries,
+            } => Self::Object {
                 fields: fields
                     .iter()
                     .map(|(key, values)| {
@@ -1582,6 +1709,7 @@ impl ValueAt {
                     })
                     .collect(),
                 open: *open,
+                entries: entries.map(Self::unparameterised),
             },
             Self::Returned {
                 lo,
@@ -1620,7 +1748,7 @@ impl ValueAt {
                 index: *index,
                 keys: keys.iter().chain(path).cloned().collect(),
             }]),
-            Self::Object { fields, open } => match fields.get(key) {
+            Self::Object { fields, open, .. } => match fields.get(key) {
                 Some(values) => {
                     let mut out = Vec::new();
                     for value in values {
@@ -1813,17 +1941,22 @@ impl Reader<'_> {
         scope: &Scope<'_>,
         bound: &guards::Bound,
     ) -> Vec<ValueAt> {
-        self.values_in(expr, scope, bound, 0)
+        self.values_in(expr, scope, bound, 0, MAX_VALUE_DEPTH)
     }
 
+    /// What `expr` may hold, read at most `cap` levels deep. Every reader
+    /// reads [`MAX_VALUE_DEPTH`]; only an object literal's entries past it
+    /// read on to [`MAX_PROCEDURE_DEPTH`], for the procedures walk alone
+    /// ([`ObjectEntries`], carrick#3538 M3).
     fn values_in(
         &self,
         expr: &Expr,
         scope: &Scope<'_>,
         bound: &guards::Bound,
         depth: usize,
+        cap: usize,
     ) -> Vec<ValueAt> {
-        if depth > MAX_VALUE_DEPTH {
+        if depth > cap {
             return vec![ValueAt::Unread];
         }
         let expr = crate::graphql_document_sites::unwrap_expression(expr);
@@ -1843,7 +1976,7 @@ impl Reader<'_> {
                 }
             }
             // `await createApp()`: what the awaited expression holds.
-            Expr::Await(awaited) => self.values_in(&awaited.arg, scope, bound, depth + 1),
+            Expr::Await(awaited) => self.values_in(&awaited.arg, scope, bound, depth + 1, cap),
             // `new Queue(…)`: the instance a maker builds. Any other `new`
             // of a name is what its first argument holds, which only the
             // guards read (carrick#3504 S7b-2).
@@ -1859,7 +1992,7 @@ impl Reader<'_> {
                             lo: new.span.lo.0,
                             hi: new.span.hi.0,
                             name: callee.sym.to_string(),
-                            first: self.values_in(&first.expr, scope, bound, depth + 1),
+                            first: self.values_in(&first.expr, scope, bound, depth + 1, cap),
                         }]
                     }
                     _ => vec![ValueAt::Unread],
@@ -1888,7 +2021,7 @@ impl Reader<'_> {
                     crate::graphql_document_sites::unwrap_expression(&member.obj),
                     Expr::This(_)
                 ) {
-                    let base = self.values_in(&member.obj, scope, bound, depth + 1);
+                    let base = self.values_in(&member.obj, scope, bound, depth + 1, cap);
                     if let Some(key) = static_key(member)
                         && !base.is_empty()
                         && base
@@ -1916,20 +2049,20 @@ impl Reader<'_> {
             Expr::Bin(bin)
                 if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) =>
             {
-                let mut out = self.values_in(&bin.left, scope, bound, depth + 1);
-                out.extend(self.values_in(&bin.right, scope, bound, depth + 1));
+                let mut out = self.values_in(&bin.left, scope, bound, depth + 1, cap);
+                out.extend(self.values_in(&bin.right, scope, bound, depth + 1, cap));
                 out
             }
             // `a && b` is `b` or a falsy `a`, and no reader acts on a falsy
             // value (never a document, a client or a URL): only `b` is read.
             Expr::Bin(bin) if bin.op == BinaryOp::LogicalAnd => {
-                self.values_in(&bin.right, scope, bound, depth + 1)
+                self.values_in(&bin.right, scope, bound, depth + 1, cap)
             }
             // `options?.client`: the member read, as `options.client` is
             // (carrick#2448).
             Expr::OptChain(chain) => match &*chain.base {
                 OptChainBase::Member(member) => {
-                    self.values_in(&Expr::Member(member.clone()), scope, bound, depth + 1)
+                    self.values_in(&Expr::Member(member.clone()), scope, bound, depth + 1, cap)
                 }
                 OptChainBase::Call(_) => vec![ValueAt::Unread],
             },
@@ -1944,7 +2077,13 @@ impl Reader<'_> {
                                     lo: member.span.lo.0,
                                     hi: member.span.hi.0,
                                     args: call.args.len(),
-                                    object: self.values_in(&member.obj, scope, bound, depth + 1),
+                                    object: self.values_in(
+                                        &member.obj,
+                                        scope,
+                                        bound,
+                                        depth + 1,
+                                        cap,
+                                    ),
                                 }))
                             }
                             _ => None,
@@ -1982,41 +2121,117 @@ impl Reader<'_> {
             Expr::Object(object) => {
                 let mut fields: BTreeMap<String, Vec<ValueAt>> = BTreeMap::new();
                 let mut open = false;
-                for prop in &object.props {
-                    let PropOrSpread::Prop(prop) = prop else {
-                        open = true;
-                        continue;
-                    };
-                    match &**prop {
-                        Prop::KeyValue(kv) => match prop_name(&kv.key) {
-                            Some(key) => {
-                                fields.insert(
-                                    key,
-                                    self.values_in(&kv.value, scope, bound, depth + 1),
-                                );
-                            }
-                            None => open = true,
-                        },
-                        Prop::Shorthand(ident) => {
-                            let value = Expr::Ident(ident.clone());
-                            fields.insert(
-                                ident.sym.to_string(),
-                                self.values_in(&value, scope, bound, depth + 1),
-                            );
-                        }
-                        Prop::Method(method) => match prop_name(&method.key) {
-                            Some(key) => {
-                                fields.insert(
-                                    key,
-                                    vec![ValueAt::Function(method.function.span.lo.0)],
-                                );
-                            }
-                            None => open = true,
-                        },
-                        _ => open = true,
+                // The props in source order, for the procedures walk
+                // (carrick#3538): a value `fields` holds is read there, and
+                // only what it does not hold is lowered again here.
+                let mut entries = ObjectEntries {
+                    lo: object.span.lo.0,
+                    hi: object.span.hi.0,
+                    props: Vec::new(),
+                };
+                let mut widened = vec![false; object.props.len()];
+                let mut wide = false;
+                for (index, prop) in object.props.iter().enumerate().rev() {
+                    widened[index] = wide;
+                    wide |= widens(prop);
+                }
+                // The last property that sets each key: the one `fields`
+                // holds.
+                let mut last: HashMap<String, usize> = HashMap::new();
+                for (index, prop) in object.props.iter().enumerate() {
+                    if let Some(key) = sets_key(prop) {
+                        last.insert(key, index);
                     }
                 }
-                vec![ValueAt::Object { fields, open }]
+                // A value past the cap is unread for every reader but the
+                // procedures walk, which reads on to its own cap (M3).
+                let deep = |value: &Expr| {
+                    if cap < MAX_PROCEDURE_DEPTH {
+                        self.values_in(value, scope, bound, depth + 1, MAX_PROCEDURE_DEPTH)
+                    } else {
+                        vec![ValueAt::Unread]
+                    }
+                };
+                let over = depth + 1 > cap;
+                for (index, prop) in object.props.iter().enumerate() {
+                    let line = self.source_map.lookup_char_pos(prop.span().lo).line as u32;
+                    let entry = |key: Option<String>, values: Option<Vec<ValueAt>>| ObjectEntry {
+                        key,
+                        line,
+                        widened: widened[index],
+                        values,
+                    };
+                    let PropOrSpread::Prop(prop) = prop else {
+                        open = true;
+                        if let PropOrSpread::Spread(spread) = prop {
+                            let values = if over {
+                                deep(spread.expr.as_ref())
+                            } else {
+                                self.values_in(&spread.expr, scope, bound, depth + 1, cap)
+                            };
+                            entries.props.push(entry(None, Some(values)));
+                        }
+                        continue;
+                    };
+                    let (key, value): (Option<String>, std::borrow::Cow<'_, Expr>) = match &**prop {
+                        Prop::KeyValue(kv) => {
+                            (prop_name(&kv.key), std::borrow::Cow::Borrowed(&*kv.value))
+                        }
+                        Prop::Shorthand(ident) => (
+                            Some(ident.sym.to_string()),
+                            std::borrow::Cow::Owned(Expr::Ident(ident.clone())),
+                        ),
+                        Prop::Method(method) => {
+                            match prop_name(&method.key) {
+                                Some(key) => {
+                                    fields.insert(
+                                        key,
+                                        vec![ValueAt::Function(method.function.span.lo.0)],
+                                    );
+                                }
+                                None => open = true,
+                            }
+                            continue;
+                        }
+                        _ => {
+                            open = true;
+                            continue;
+                        }
+                    };
+                    let held = key
+                        .as_ref()
+                        .is_some_and(|key| last.get(key) == Some(&index));
+                    let values = if over {
+                        vec![ValueAt::Unread]
+                    } else {
+                        self.values_in(value.as_ref(), scope, bound, depth + 1, cap)
+                    };
+                    match (&key, held) {
+                        // `fields` holds it: read there, unless the cap cut
+                        // it short.
+                        (Some(key), true) => {
+                            fields.insert(key.clone(), values);
+                            let values = over.then(|| deep(value.as_ref()));
+                            entries.props.push(entry(Some(key.clone()), values));
+                        }
+                        // A key set again later.
+                        (Some(key), false) => {
+                            let values = if over { deep(value.as_ref()) } else { values };
+                            entries.props.push(entry(Some(key.clone()), Some(values)));
+                        }
+                        // A computed key.
+                        (None, _) => {
+                            open = true;
+                            let values = if over { deep(value.as_ref()) } else { values };
+                            entries.props.push(entry(None, Some(values)));
+                        }
+                    }
+                }
+                vec![ValueAt::Object {
+                    fields,
+                    open,
+                    entries,
+                }]
             }
             _ => vec![ValueAt::Unread],
         }
@@ -2039,6 +2254,27 @@ impl Reader<'_> {
             out.push(self.value_of(&arg.expr, scope, bound));
         }
         out
+    }
+
+    /// What each argument after the first spread may hold, which
+    /// [`Self::arg_values`] ends before: a spread is an empty entry. Empty
+    /// for a call with no spread.
+    pub(super) fn rest_values(
+        &self,
+        args: &[ExprOrSpread],
+        scope: &Scope<'_>,
+        bound: &guards::Bound,
+    ) -> Vec<Vec<ValueAt>> {
+        let Some(first) = args.iter().position(|arg| arg.spread.is_some()) else {
+            return Vec::new();
+        };
+        args.iter()
+            .skip(first + 1)
+            .map(|arg| match arg.spread {
+                Some(_) => Vec::new(),
+                None => self.value_of(&arg.expr, scope, bound),
+            })
+            .collect()
     }
 
     /// What a call's callee may hold, when it is a value: a parameter, a key
@@ -2160,7 +2396,10 @@ impl Reader<'_> {
         ) {
             return None;
         }
-        key_over(member, self.values_in(&member.obj, scope, bound, 1))
+        key_over(
+            member,
+            self.values_in(&member.obj, scope, bound, 1, MAX_VALUE_DEPTH),
+        )
     }
 
     /// The functions written as a parameter's default (`doFetch = (url, init)
@@ -2243,6 +2482,7 @@ impl Reader<'_> {
                     branches: vec![ValueAt::Unread, text_of(default, &identity)],
                 }),
                 reassigned: false,
+                plain: false,
             })
         };
         let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {
