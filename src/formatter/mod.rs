@@ -1,5 +1,5 @@
 use crate::analyzer::ApiAnalysisResult;
-use crate::findings::{Finding, PrDelta, Topology, tier};
+use crate::findings::{BreakStatus, Finding, PrDelta, Topology, tier};
 use std::collections::{BTreeMap, BTreeSet};
 
 // Display helpers for the wire [`Topology`]. Defined here (not in
@@ -856,7 +856,13 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
 
     for finding in findings {
         match finding {
-            Finding::TypeMismatch { .. } | Finding::MethodMismatch { .. } => risks.push(finding),
+            // The terminal lists every mismatch as a risk, whatever its
+            // certainty; only "not a break" would stay out of the list.
+            Finding::TypeMismatch { .. } | Finding::MethodMismatch { .. } => {
+                if finding.break_status() != BreakStatus::NotABreak {
+                    risks.push(finding);
+                }
+            }
             Finding::MissingEndpoint { .. } => missing.push(finding),
             Finding::OrphanedEndpoint { .. } => orphaned.push(finding),
             Finding::EnvVarCall { .. } => env_var_calls.push(finding),

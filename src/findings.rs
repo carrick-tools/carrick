@@ -222,6 +222,80 @@ fn serialize_removal<M: SerializeMap>(map: &mut M, removal: &Removal) -> Result<
     serialize_on_main(map, &removal.on_main, &removal.on_main_unknown)
 }
 
+/// Whether a finding is a break, and how sure the scanner is (the one break
+/// answer; plan R2). Every surface that decides "does this fail / post / count"
+/// reads this instead of folding `edge_source`, `verdict_state` and `on_main`
+/// itself. A pure function of the finding; it is not on the wire yet, so the
+/// PR comment, MCP and dashboard still carry their own copies until they read
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BreakStatus {
+    /// Proven and introduced by the change: `fact` edge (or an SDK-mediated
+    /// one, which states no source by design and is enforced), a verdict that
+    /// was reached or needs none, and main did not have it.
+    Certain,
+    /// A fact the run could not place against main (`on_main_unknown`, or no
+    /// comparison was made).
+    Possible { reason: &'static str },
+    /// Not proven: a row the model stated, an unresolved type side (R4), or a
+    /// removal row with no source or main marking behind it.
+    Candidate { reason: &'static str },
+    /// Main already had it.
+    OnMain,
+    /// Not a break at all (a gap, an advisory, a dependency conflict).
+    NotABreak,
+}
+
+impl OnMainUnknown {
+    fn reason(self) -> &'static str {
+        match self {
+            OnMainUnknown::NoMainIndex => "no_main_index",
+            OnMainUnknown::MainIndexStale => "main_index_stale",
+            OnMainUnknown::MainIndexOtherScanner => "main_index_other_scanner",
+            OnMainUnknown::MainSideFailed => "main_side_failed",
+            OnMainUnknown::MainTypesUnjudged => "main_types_unjudged",
+            OnMainUnknown::RemovalUnplaced => "removal_unplaced",
+            OnMainUnknown::ReadingMoved => "reading_moved",
+        }
+    }
+}
+
+/// The break answer for a type or method mismatch, from its inputs. Shared by
+/// [`Finding::break_status`] and the local check, which holds the same inputs
+/// as strings read off the index and derives `on_main` from its own "before"
+/// instead of a baseline (so it passes that, and decides nothing itself).
+///
+/// An absent `edge_source` is the SDK-mediated case (no source by design,
+/// enforced today at `render_pr_comment.ts` `isCandidateRisk`); a caller that
+/// must not enforce an unstated source passes `Some(EdgeSource::Candidate)`.
+pub fn mismatch_break_status(
+    edge_source: Option<EdgeSource>,
+    verdict_state: Option<VerdictState>,
+    on_main: Option<bool>,
+    on_main_unknown: Option<OnMainUnknown>,
+) -> BreakStatus {
+    if edge_source == Some(EdgeSource::Candidate) {
+        return BreakStatus::Candidate {
+            reason: "rests_on_a_model_stated_row",
+        };
+    }
+    if verdict_state == Some(VerdictState::Unresolved) {
+        return BreakStatus::Candidate {
+            reason: "type_side_unresolved",
+        };
+    }
+    match (on_main, on_main_unknown) {
+        (Some(true), _) => BreakStatus::OnMain,
+        (Some(false), _) => BreakStatus::Certain,
+        (None, Some(why)) => BreakStatus::Possible {
+            reason: why.reason(),
+        },
+        (None, None) => BreakStatus::Possible {
+            reason: "not_compared_with_main",
+        },
+    }
+}
+
 /// One repo's pinned version of a conflicting package.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PackageVersionRef {
@@ -719,6 +793,57 @@ impl Finding {
                 *on_main_unknown = Some(reason);
             }
             _ => {}
+        }
+    }
+
+    /// The one break answer for this finding (plan R2). See [`BreakStatus`].
+    pub fn break_status(&self) -> BreakStatus {
+        match self {
+            Finding::TypeMismatch {
+                edge_source,
+                verdict_state,
+                on_main,
+                on_main_unknown,
+                ..
+            }
+            | Finding::MethodMismatch {
+                edge_source,
+                verdict_state,
+                on_main,
+                on_main_unknown,
+                ..
+            } => mismatch_break_status(*edge_source, *verdict_state, *on_main, *on_main_unknown),
+            // A row that lost a pairing main had, of any protocol and either
+            // side (`missing_endpoint`, `orphaned_endpoint`). It is proven
+            // only with a fact edge, a verdict that was not withheld and a
+            // marking against main; anything less is a candidate.
+            Finding::MissingEndpoint { removal, .. }
+            | Finding::OrphanedEndpoint { removal, .. } => match removal {
+                None => BreakStatus::NotABreak,
+                Some(removal) => {
+                    let marked = removal.on_main.is_some() || removal.on_main_unknown.is_some();
+                    if removal.edge_source != Some(EdgeSource::Fact)
+                        || removal.verdict_state == Some(VerdictState::Unresolved)
+                        || !marked
+                    {
+                        BreakStatus::Candidate {
+                            reason: "removal_not_proven",
+                        }
+                    } else {
+                        mismatch_break_status(
+                            removal.edge_source,
+                            removal.verdict_state,
+                            removal.on_main,
+                            removal.on_main_unknown,
+                        )
+                    }
+                }
+            },
+            Finding::EnvVarCall { .. }
+            | Finding::DispatchOperations { .. }
+            | Finding::DependencyConflict { .. }
+            | Finding::SharedExternalContract { .. }
+            | Finding::DegradedTypes { .. } => BreakStatus::NotABreak,
         }
     }
 
@@ -2223,6 +2348,171 @@ mod tests {
         assert_eq!(
             finding,
             Finding::missing_endpoint("GET", "/a", None, vec![])
+        );
+    }
+
+    fn mismatch(
+        source: Option<EdgeSource>,
+        verdict: Option<VerdictState>,
+        on_main: Option<bool>,
+    ) -> Finding {
+        let mut f = Finding::type_mismatch("GET", "/x", None, vec![], "A", "B", "boom")
+            .with_edge_source(source)
+            .with_verdict_state(verdict);
+        f.set_on_main(on_main);
+        f
+    }
+
+    fn removal(
+        source: Option<EdgeSource>,
+        verdict: Option<VerdictState>,
+        on_main: Option<bool>,
+        unknown: Option<OnMainUnknown>,
+    ) -> Removal {
+        Removal {
+            removed: RemovedSide {
+                method: "GET".into(),
+                path: "/x".into(),
+                service: None,
+                place: "a.ts:1".into(),
+            },
+            edge_source: source,
+            verdict_state: verdict,
+            on_main,
+            on_main_unknown: unknown,
+        }
+    }
+
+    #[test]
+    fn break_status_fact_resolved_introduced_is_certain() {
+        let f = mismatch(
+            Some(EdgeSource::Fact),
+            Some(VerdictState::Resolved),
+            Some(false),
+        );
+        assert_eq!(f.break_status(), BreakStatus::Certain);
+        let verb = Finding::method_mismatch("PUT", "/x", None, vec![], "POST")
+            .with_edge_source(Some(EdgeSource::Fact))
+            .with_verdict_state(Some(VerdictState::NotChecked));
+        let mut verb = verb;
+        verb.set_on_main(Some(false));
+        assert_eq!(verb.break_status(), BreakStatus::Certain);
+    }
+
+    #[test]
+    fn break_status_main_already_had_it() {
+        let f = mismatch(Some(EdgeSource::Fact), None, Some(true));
+        assert_eq!(f.break_status(), BreakStatus::OnMain);
+    }
+
+    #[test]
+    fn break_status_fact_with_main_unknown_is_possible() {
+        let mut f = mismatch(Some(EdgeSource::Fact), None, None);
+        f.set_on_main_unknown(OnMainUnknown::MainIndexStale);
+        assert_eq!(
+            f.break_status(),
+            BreakStatus::Possible {
+                reason: "main_index_stale"
+            }
+        );
+    }
+
+    #[test]
+    fn break_status_candidate_edge_is_a_candidate_even_when_introduced() {
+        let f = mismatch(Some(EdgeSource::Candidate), None, Some(false));
+        assert!(matches!(f.break_status(), BreakStatus::Candidate { .. }));
+    }
+
+    #[test]
+    fn break_status_mismatch_with_an_unresolved_side_is_a_candidate() {
+        let f = mismatch(
+            Some(EdgeSource::Fact),
+            Some(VerdictState::Unresolved),
+            Some(false),
+        );
+        assert_eq!(
+            f.break_status(),
+            BreakStatus::Candidate {
+                reason: "type_side_unresolved"
+            }
+        );
+    }
+
+    /// An SDK-mediated mismatch states no source by design and is enforced.
+    #[test]
+    fn break_status_sdk_mediated_mismatch_with_no_source_is_certain() {
+        let f = mismatch(None, None, Some(false));
+        assert_eq!(f.break_status(), BreakStatus::Certain);
+    }
+
+    #[test]
+    fn break_status_orphaned_removal_fact_introduced_is_certain() {
+        let f = Finding::orphaned_endpoint("CLIENT->SERVER", "evt", None).with_removal(
+            removal(
+                Some(EdgeSource::Fact),
+                Some(VerdictState::NotChecked),
+                Some(false),
+                None,
+            ),
+            vec![],
+        );
+        assert_eq!(f.break_status(), BreakStatus::Certain);
+        let g = Finding::missing_endpoint("GET", "/x", None, vec![]).with_removal(
+            removal(
+                Some(EdgeSource::Fact),
+                Some(VerdictState::NotChecked),
+                Some(false),
+                None,
+            ),
+            vec![],
+        );
+        assert_eq!(g.break_status(), BreakStatus::Certain);
+    }
+
+    #[test]
+    fn break_status_removal_without_proof_is_a_candidate() {
+        let unmarked = Finding::missing_endpoint("GET", "/x", None, vec![])
+            .with_removal(removal(Some(EdgeSource::Fact), None, None, None), vec![]);
+        assert!(matches!(
+            unmarked.break_status(),
+            BreakStatus::Candidate { .. }
+        ));
+        let nosource = Finding::missing_endpoint("GET", "/x", None, vec![])
+            .with_removal(removal(None, None, Some(false), None), vec![]);
+        assert!(matches!(
+            nosource.break_status(),
+            BreakStatus::Candidate { .. }
+        ));
+        let unknown = Finding::missing_endpoint("GET", "/x", None, vec![]).with_removal(
+            removal(
+                Some(EdgeSource::Fact),
+                None,
+                None,
+                Some(OnMainUnknown::RemovalUnplaced),
+            ),
+            vec![],
+        );
+        assert_eq!(
+            unknown.break_status(),
+            BreakStatus::Possible {
+                reason: "removal_unplaced"
+            }
+        );
+    }
+
+    #[test]
+    fn break_status_gaps_and_advisories_are_not_breaks() {
+        assert_eq!(
+            Finding::missing_endpoint("GET", "/x", None, vec![]).break_status(),
+            BreakStatus::NotABreak
+        );
+        assert_eq!(
+            Finding::orphaned_endpoint("GET", "/x", None).break_status(),
+            BreakStatus::NotABreak
+        );
+        assert_eq!(
+            Finding::env_var_call("GET", "/x", "API", vec![]).break_status(),
+            BreakStatus::NotABreak
         );
     }
 }
