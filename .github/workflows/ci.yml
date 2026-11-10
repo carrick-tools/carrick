@@ -581,6 +581,9 @@ jobs:
       - name: Auto-release decision tests
         run: python3 scripts/auto-release.test.py
 
+      - name: Lockfile refresh tests and CI wiring
+        run: python3 scripts/npm-lock-refresh.test.py
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
