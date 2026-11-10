@@ -2377,6 +2377,9 @@ pub(crate) fn run_check(
     };
 
     let mut outcomes: Vec<PairCheckOutcome> = Vec::new();
+    // Which side's type left a pair unresolved, as the check returned it: the
+    // outcome does not carry it, the run's record of the pair does.
+    let mut unresolved_sides: HashMap<String, VerdictSide> = HashMap::new();
     // Pairs whose CONSUMER side left the verdict unresolved: the ones the
     // retype check can judge from the consumer's own code (carrick#1491).
     let mut consumer_blamed: HashSet<String> = HashSet::new();
@@ -2453,6 +2456,9 @@ pub(crate) fn run_check(
                 for pair in &probing {
                     match by_key.get(pair.spec.pair_key.as_str()) {
                         Some(verdict) => {
+                            if let Some(side) = verdict.unresolved_side {
+                                unresolved_sides.insert(pair.spec.pair_key.clone(), side);
+                            }
                             if consumer_to_blame(verdict) {
                                 consumer_blamed.insert(pair.spec.pair_key.clone());
                             }
@@ -2534,10 +2540,18 @@ pub(crate) fn run_check(
     abstain_on_unstated_modes(&pairs, &mut outcomes);
     abstain_on_unwidened_out_of_budget(&pairs, &mut outcomes);
     hold_back_same_service_mismatches(&mut outcomes);
+    let settled_keys: HashSet<String> = settled.iter().map(|o| o.pair_key.clone()).collect();
     outcomes.append(&mut settled);
 
     // Deterministic order for every downstream consumer.
     outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
+    record_pair_verdicts(
+        &outcomes,
+        pairs.iter().chain(&settled_pairs),
+        local_consumers,
+        &unresolved_sides,
+        &settled_keys,
+    );
     log_unresolved_pairs(
         &outcomes,
         pairs.iter().chain(&settled_pairs),
@@ -3817,6 +3831,148 @@ fn log_unresolved_pairs<'a>(
         .filter_map(unresolved_pair_line)
     {
         info!("{line}");
+    }
+}
+
+/// Why a pair's stored outcome reads as it does, for the run's record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairReasonKind {
+    /// A fact about two known types: nothing to explain.
+    Fact,
+    /// The run did not judge the pair (the check did not run, returned no
+    /// verdict, or a stub was missing): the next run may answer differently.
+    NotJudged,
+    /// A mismatch the check found and the scanner holds back on purpose
+    /// (an unstated response case, an unwidened reading out of time, a
+    /// same-service pair), or a consumer retype that did not decide it.
+    Abstain,
+    /// The check named a side whose type it could not read.
+    UnresolvedSide(VerdictSide),
+    /// Unresolved with no side named (a pair with no capture surface, a
+    /// probe diagnostic, a walk that could not run).
+    Unresolved,
+    /// Not a fact and no reason stored: the record says so rather than
+    /// staying silent.
+    Unrecorded,
+}
+
+impl PairReasonKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fact => "fact",
+            Self::NotJudged => "not-judged",
+            Self::Abstain => "abstain",
+            Self::UnresolvedSide(VerdictSide::Producer) => "unresolved-side:producer",
+            Self::UnresolvedSide(VerdictSide::Consumer) => "unresolved-side:consumer",
+            Self::Unresolved => "unresolved",
+            Self::Unrecorded => "unrecorded",
+        }
+    }
+}
+
+fn pair_reason_kind(outcome: &PairCheckOutcome, side: Option<VerdictSide>) -> PairReasonKind {
+    let gate = outcome.gate.as_deref();
+    if !outcome.judged {
+        return PairReasonKind::NotJudged;
+    }
+    if matches!(
+        gate,
+        Some(
+            UNSTATED_MODE_GATE
+                | SAME_SERVICE_GATE
+                | UNWIDENED_OUT_OF_BUDGET_GATE
+                | CONSUMER_UNWIDENED_OUT_OF_BUDGET_GATE
+        )
+    ) || outcome
+        .unresolved_reason
+        .as_deref()
+        .is_some_and(|r| r.contains("did not decide it"))
+    {
+        return PairReasonKind::Abstain;
+    }
+    if outcome.resolved && outcome.bucket != VerdictBucket::Unverifiable {
+        return PairReasonKind::Fact;
+    }
+    if outcome.unresolved_reason.is_none() && outcome.diagnostic.is_none() {
+        return PairReasonKind::Unrecorded;
+    }
+    match side {
+        Some(side) => PairReasonKind::UnresolvedSide(side),
+        None => PairReasonKind::Unresolved,
+    }
+}
+
+/// The run's record of one judged pair: its outcome and why, whatever the
+/// outcome is (the "Types not verified" line speaks only for an unresolved
+/// pair, so a pair stored unverifiable with nothing unresolved left no trace).
+fn pair_verdict_line(
+    outcome: &PairCheckOutcome,
+    side: Option<VerdictSide>,
+    from_main: bool,
+) -> String {
+    let kind = match outcome.type_kind {
+        ManifestTypeKind::Request => "request",
+        ManifestTypeKind::Response => "response",
+    };
+    let bucket = match outcome.bucket {
+        VerdictBucket::Compatible => "compatible",
+        VerdictBucket::Incompatible => "incompatible",
+        VerdictBucket::Unverifiable => "unverifiable",
+        VerdictBucket::GateCaughtBakedAny => "gate_caught_baked_any",
+        VerdictBucket::ProducerWider => "producer_wider",
+    };
+    let reason = outcome
+        .unresolved_reason
+        .as_deref()
+        .or(outcome.diagnostic.as_deref())
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "));
+    format!(
+        "Pair verdict: {} {} {} ({}:{} in {} against {}): {bucket} resolved={} judged={} gate={} reason_kind={}{}{}",
+        outcome.pseudo_method,
+        outcome.identity,
+        kind,
+        outcome.consumer_file,
+        outcome.consumer_line,
+        outcome.consumer_service,
+        outcome.producer_service,
+        outcome.resolved,
+        outcome.judged,
+        outcome.gate.as_deref().unwrap_or("none"),
+        pair_reason_kind(outcome, side).label(),
+        if from_main { " source=main" } else { "" },
+        reason.map(|r| format!(": {r}")).unwrap_or_default(),
+    )
+}
+
+/// One debug line per pair this run is answerable for, written to the run's
+/// log file (the file layer keeps `carrick=debug`).
+fn record_pair_verdicts<'a>(
+    outcomes: &[PairCheckOutcome],
+    pairs: impl IntoIterator<Item = &'a BuiltPair>,
+    local_consumers: &LocalConsumers,
+    sides: &HashMap<String, VerdictSide>,
+    settled: &HashSet<String>,
+) {
+    let local: HashSet<&str> = pairs
+        .into_iter()
+        .filter(|pair| {
+            local_consumers.contains_key(&pair.producer_service)
+                || local_consumers.contains_key(&pair.consumer_service)
+        })
+        .map(|pair| pair.spec.pair_key.as_str())
+        .collect();
+    for outcome in outcomes
+        .iter()
+        .filter(|o| local.contains(o.pair_key.as_str()))
+    {
+        debug!(
+            "{}",
+            pair_verdict_line(
+                outcome,
+                sides.get(&outcome.pair_key).copied(),
+                settled.contains(&outcome.pair_key)
+            )
+        );
     }
 }
 
@@ -5722,6 +5878,97 @@ mod tests {
         assert!(half.producer_wider);
         assert!(half.resolved);
         assert_eq!(half.reason, None);
+    }
+
+    /// T4a: every judged pair carries its outcome and why in
+    /// the run's record, one reason kind per way the code can leave a pair
+    /// unverifiable.
+    #[test]
+    fn a_pair_verdict_record_states_the_outcome_and_the_reason_kind() {
+        let pair = retype_pair(ManifestTypeKind::Response, Some("{ y: number; }"));
+        let mk = |bucket, gate: Option<&str>, resolved, reason: Option<&str>| {
+            outcome_for(
+                &pair,
+                bucket,
+                gate.map(str::to_string),
+                None,
+                resolved,
+                reason.map(str::to_string),
+                Vec::new(),
+            )
+        };
+        let head = "Pair verdict: POST /p response (src/client.ts:8 in web against api)";
+
+        // Unresolved side: the check named it, the outcome does not carry it.
+        let unresolved = mk(
+            VerdictBucket::Unverifiable,
+            Some("capture:consumer:any"),
+            false,
+            Some("the consumer type is 'unknown'"),
+        );
+        assert_eq!(
+            pair_verdict_line(&unresolved, Some(VerdictSide::Consumer), false),
+            format!(
+                "{head}: unverifiable resolved=false judged=true gate=capture:consumer:any reason_kind=unresolved-side:consumer: the consumer type is 'unknown'"
+            )
+        );
+
+        // Abstain: a held-back same-service mismatch.
+        let mut held = vec![same_service_outcome(
+            VerdictBucket::Incompatible,
+            Some("Property 'y' is missing"),
+            Vec::new(),
+        )];
+        hold_back_same_service_mismatches(&mut held);
+        let line = pair_verdict_line(&held[0], None, false);
+        assert!(line.contains("unverifiable resolved=false judged=true gate=same_service reason_kind=abstain: a mismatch between"), "{line}");
+
+        // The run did not judge it: no verdict returned.
+        let not_judged = not_judged(mk(
+            VerdictBucket::Unverifiable,
+            None,
+            false,
+            Some("the check returned no verdict for this pair"),
+        ));
+        let line = pair_verdict_line(&not_judged, None, false);
+        assert!(
+            line.contains(
+                "judged=false gate=none reason_kind=not-judged: the check returned no verdict"
+            ),
+            "{line}"
+        );
+
+        // Unresolved with no side: a pre-verdicted pair.
+        let pre = pre_verdict_outcome(
+            &pair,
+            &PreVerdict::NotCompared {
+                reason: "no capture surface".to_string(),
+            },
+        );
+        let line = pair_verdict_line(&pre, None, true);
+        assert!(
+            line.contains("reason_kind=unresolved source=main: no capture surface"),
+            "{line}"
+        );
+
+        // Stored unverifiable, nothing unresolved and no reason: the record
+        // says so (the "Types not verified" line stayed silent for it).
+        let silent = mk(VerdictBucket::Unverifiable, None, true, None);
+        assert_eq!(unresolved_pair_line(&silent), None);
+        let line = pair_verdict_line(&silent, None, false);
+        assert!(
+            line.contains(
+                "unverifiable resolved=true judged=true gate=none reason_kind=unrecorded"
+            ),
+            "{line}"
+        );
+
+        // A fact.
+        let fact = mk(VerdictBucket::Compatible, None, true, None);
+        assert!(
+            pair_verdict_line(&fact, None, false)
+                .contains("compatible resolved=true judged=true gate=none reason_kind=fact")
+        );
     }
 
     /// The CI log states each unverified pair and why (carrick#1491): the
