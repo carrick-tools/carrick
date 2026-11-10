@@ -169,7 +169,7 @@ pub struct SiteEnd {
     pub procedure: Option<ProcedureAt>,
 }
 
-/// The procedure a client call names (READY-trpc-client K1, K2): its key
+/// The procedure a client call names (carrick#3186): its key
 /// path, and the router's repo-relative file and binding, as
 /// [`super::decided_sites::router_holder`] names it. The repository is the
 /// blob's, added where the row is written.
@@ -993,7 +993,7 @@ fn path_op<'e>(
                         _ => return None,
                     };
                     (held == type_name && specifier_keys(module).iter().any(|key| key == package))
-                        .then(|| (export, join))
+                        .then_some((export, join))
                 }
                 _ => None,
             })
@@ -1592,7 +1592,7 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// A client procedure call (READY-trpc-client T3-S): `P.m1….mk.t(…)`,
+    /// A client procedure call (carrick#3186): `P.m1….mk.t(…)`,
     /// where `P`'s type is a proxy the store labels with a call-form op on
     /// member `t` named by the path walked on it (`name: { bound: "path" }`,
     /// claimed on the proxy's type, `of: "type:<package>#<Type>"`). The
@@ -1686,8 +1686,9 @@ impl<'a> Walker<'a> {
                 .lookup(file, ir.swc_start(lo), ir.swc_start(hi), Kind::Member)
                 .ok()
         };
-        // A computed key (`client[k]`) is no name the path can be read from.
-        if proxy == 0 || call.callee_text.contains('[') {
+        // The proxy itself is called: no key is read on it. A key the
+        // compiler names no symbol for (`client[k]`) is no name either.
+        if proxy == 0 {
             return Err(Stop::ProcedurePathUnread);
         }
         let keys: Vec<&str> = (0..proxy)

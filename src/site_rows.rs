@@ -175,7 +175,7 @@ pub struct SiteRow {
     /// looked up here. `None` on a row that is not an HTTP request, and where
     /// the answered name is not the one the code writes.
     pub base: Option<crate::call_base::CallBaseResolution>,
-    /// The procedure a client procedure call names (READY-trpc-client K3):
+    /// The procedure a client procedure call names (carrick#3186):
     /// its key is an HTTP key with the RPC word as its method and an empty
     /// path, and this is its identity. The repository is added where the
     /// row is written ([`fold`]).
@@ -782,7 +782,7 @@ pub(crate) fn agrees(reader: &OperationKey, site: &OperationKey) -> bool {
 }
 
 /// [`agrees`], for a site row whose procedure has the key path
-/// `procedure` (READY-trpc-client T3-S): its key's path is empty, so it
+/// `procedure` (carrick#3186): its key's path is empty, so it
 /// agrees with an HTTP reader row at its call whose path is an unknown call
 /// path, or whose last segment is the key path (`/api/rpc/shelf.list`). Any
 /// method: the reader spells the transport's, the site the RPC word.
@@ -975,7 +975,7 @@ pub fn of(
             {
                 continue;
             }
-            // A client procedure call (READY-trpc-client K3): its name is the
+            // A client procedure call (carrick#3186): its name is the
             // procedure's key path, which is identity, never a path. The row
             // is an HTTP call with the RPC word as its method, an empty path
             // and the procedure; it states no base.
@@ -1350,7 +1350,7 @@ pub fn fold_rows(
                     .is_some_and(|(file, line)| file == row.file && line == row.line)
                     && !siblings.contains(&&existing.key)
                     // Two procedure calls on one line are two operations,
-                    // whose keys are alike (READY-trpc-client K3): a row
+                    // whose keys are alike (carrick#3186): a row
                     // naming another procedure is not this site's.
                     && !(row.procedure.is_some()
                         && existing.procedure.is_some()

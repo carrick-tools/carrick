@@ -1798,7 +1798,7 @@ fn agreement_reads_written_values_as_parameters() {
     ));
 }
 
-/// A procedure row's key has an empty path (READY-trpc-client T3-S): it
+/// A procedure row's key has an empty path (carrick#3186): it
 /// agrees with an HTTP reader row at its call whose path ends in its key
 /// path or names no literal segment, whatever the method, and with nothing
 /// else. A row with no procedure agrees as [`agrees`] says.

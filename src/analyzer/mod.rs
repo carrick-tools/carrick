@@ -2642,7 +2642,7 @@ impl Analyzer {
             // flood the report as "missing endpoints" / env-var suggestions.
             // Non-HTTP operations (GraphQL/Socket) are keyed exactly and handled
             // by their own matchers, so this route-shape gate only applies to HTTP.
-            // A procedure call (READY-trpc-client K3) states no path: its
+            // A procedure call (carrick#3186) states no path: its
             // procedure is what it calls, paired below by that key.
             if let Some((_, target)) = call.key.as_http()
                 && call.procedure.is_none()

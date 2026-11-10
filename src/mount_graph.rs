@@ -407,7 +407,7 @@ pub struct MountGraph {
     pub data_calls: Vec<DataFetchingCall>,
 }
 
-/// The procedure a call names, as a key suffix (READY-trpc-client K3): two
+/// The procedure a call names, as a key suffix (carrick#3186): two
 /// procedure calls share their HTTP key (`QUERY` and an empty path), so every
 /// map keyed on a call's key alone keys on this too. Empty for a call with no
 /// procedure, so no other key moves.
@@ -730,7 +730,7 @@ impl MountGraph {
                     // The dispatch value is on the key too (carrick#831): two
                     // calls at one site sending different values are two
                     // consumers, and `file_location` alone folds them.
-                    // So is the procedure (READY-trpc-client K3): every
+                    // So is the procedure (carrick#3186): every
                     // query call on one line shares `QUERY::<line>`.
                     let key = format!(
                         "{}:{}:{}{}{}",
@@ -1817,6 +1817,56 @@ mod tests {
         assert_eq!(merged.data_calls.len(), 1);
         assert_eq!(merged.data_calls[0].repo_name.as_deref(), Some("platform"));
         assert_eq!(merged.data_calls[0].service_name.as_deref(), Some("web"));
+    }
+
+    /// Two procedure calls on one line share their method, empty target and
+    /// location (carrick#3186): the merge keeps both, told apart by their
+    /// procedures, and still folds a call stated twice.
+    #[test]
+    fn the_merge_keeps_two_procedure_calls_on_one_line() {
+        let mut repo = cloud_repo_with_health("platform", Some("web"));
+        let call = |path: &str| DataFetchingCall {
+            procedure: Some(carrick_match::ProcedureKey {
+                path: path.to_string(),
+                router: carrick_match::RouterId {
+                    repo: "platform".to_string(),
+                    file: "src/router.ts".to_string(),
+                    binding: "appRouter".to_string(),
+                },
+            }),
+            method: "QUERY".to_string(),
+            target_url: String::new(),
+            canonical_path: String::new(),
+            client: String::new(),
+            file_location: "src/web/shelf.ts:4".to_string(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(4),
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: None,
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+            own_route: false,
+            static_asset: None,
+        };
+        repo.mount_graph.as_mut().unwrap().data_calls.extend([
+            call("shelf.list"),
+            call("count"),
+            call("count"),
+        ]);
+        let merged = MountGraph::merge_from_repos(&[repo]);
+        let mut paths: Vec<&str> = merged
+            .data_calls
+            .iter()
+            .filter_map(|call| call.procedure.as_ref().map(|key| key.path.as_str()))
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["count", "shelf.list"]);
     }
 
     /// A blob row written before `procedure` existed reads as no procedure,

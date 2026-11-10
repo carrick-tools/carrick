@@ -2415,8 +2415,8 @@ fn matched_producers(name: &str) -> Vec<String> {
     out
 }
 
-/// The rows `procedure-client` states at its client calls (READY-trpc-client
-/// T3-S). Each client form is a proxy whose members are the router's keys: a
+/// The rows `procedure-client` states at its client calls (carrick#3186).
+/// Each client form is a proxy whose members are the router's keys: a
 /// vanilla client (`query`/`mutate`), hooks (`useQuery`/`useMutation`), and
 /// an options proxy a hook returns (`queryOptions`). Each call through one is
 /// an HTTP call row with the label's RPC word as its method, an empty path,
@@ -2488,7 +2488,7 @@ fn a_client_typed_by_a_router_outside_the_repo_is_saved_unread() {
     );
 }
 
-/// A procedure call's types are not compared yet (READY-trpc-client K7): it
+/// A procedure call's types are not compared yet (carrick#3186): it
 /// writes no consumer type-manifest entry, which would key every query
 /// call of a service alike.
 #[test]

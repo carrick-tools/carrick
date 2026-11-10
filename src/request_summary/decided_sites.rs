@@ -3060,7 +3060,7 @@ fn decide(
             }
             continue;
         }
-        // A client procedure call (READY-trpc-client T3-S): the name is the
+        // A client procedure call (carrick#3186): the name is the
         // key path discovery read on the proxy, written by the code at the
         // labelled call, which is the site.
         if let Some(procedure) = &end.procedure {

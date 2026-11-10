@@ -2149,7 +2149,7 @@ fn record(
                 .map(|default| BTreeSet::from([default])),
         };
         // A procedure call's method is the label's RPC word, in its long
-        // form (READY-trpc-client K3): `MUTATE` is `MUTATION`, `SUBSCRIBE`
+        // form (carrick#3186): `MUTATE` is `MUTATION`, `SUBSCRIBE`
         // is `SUBSCRIPTION`.
         let procedure = site.end.procedure.is_some();
         let methods: Vec<String> = methods
