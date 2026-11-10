@@ -69,6 +69,13 @@ pub struct UnreadSite {
     pub stop_at: Option<String>,
     /// Functions the walk entered from the call.
     pub depth: u32,
+    /// Why the package this site rests on has no answer, when the store said:
+    /// its failure reason (`lister_out_of_memory`, `lister_answer_too_large`,
+    /// ...). Only on a site whose `reason` or `also` is `unanswered_package`,
+    /// and only for a package the store answered `build_failed` with a
+    /// `failed_reason` (carrick#3739). An older blob has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
     /// The labelled library call the walk reached, when it reached one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labelled_end: Option<LabelledEndRef>,
@@ -103,6 +110,7 @@ impl UnreadSite {
             callee: None,
             stop_at: None,
             depth: call.trace_depth,
+            cause: None,
             labelled_end: call.labelled_end.clone(),
             kind: call.kind.clone(),
             role: call.role.clone(),
@@ -144,6 +152,7 @@ impl UnreadSite {
                 .last()
                 .map(|hop| format!("{}:{}", hop.file, hop.line)),
             depth: site.chain.len() as u32,
+            cause: None,
             labelled_end: None,
             kind: None,
             role: None,
@@ -164,6 +173,7 @@ impl UnreadSite {
             callee: stop.callee.as_deref().and_then(callee),
             stop_at: None,
             depth: stop.depth,
+            cause: None,
             labelled_end: Some(labelled_end(&stop.end)),
             kind: kind_of(&stop.end.role).map(str::to_string),
             role: role_of(&stop.end.role, stop.end.op.as_deref()).map(str::to_string),
@@ -185,7 +195,16 @@ fn callee(text: &str) -> Option<String> {
 /// GraphQL calls ([`crate::possible_calls::class_only_graphql`]), which
 /// [`crate::site_rows::fold_rows`] keeps only where no row stands at their
 /// line. Unordered and uncapped; [`attach`] orders and bounds them.
-pub fn from_scan(discovery: &Discovery, decided: &Decided) -> Vec<UnreadSite> {
+///
+/// `causes` is the store's failure reason by package name
+/// ([`crate::library_store::Settled::failed_reasons`]): a row that rests on
+/// an unanswered package states the cause of the first package (by name) that
+/// has one (carrick#3739).
+pub fn from_scan(
+    discovery: &Discovery,
+    decided: &Decided,
+    causes: &BTreeMap<String, String>,
+) -> Vec<UnreadSite> {
     let mut out: Vec<UnreadSite> = Vec::new();
     for site in &discovery.unfollowed {
         if let Some(reason) = site.stop {
@@ -212,6 +231,7 @@ pub fn from_scan(discovery: &Discovery, decided: &Decided) -> Vec<UnreadSite> {
             callee: callee(text),
             stop_at: None,
             depth: 0,
+            cause: None,
             labelled_end: None,
             kind: None,
             role: None,
@@ -233,6 +253,19 @@ pub fn from_scan(discovery: &Discovery, decided: &Decided) -> Vec<UnreadSite> {
         {
             row.also.push(Stop::UnansweredPackage);
         }
+    }
+    for row in &mut out {
+        if row.reason != Stop::UnansweredPackage && !row.also.contains(&Stop::UnansweredPackage) {
+            continue;
+        }
+        let at = (row.file.clone(), row.span_start, row.span_end);
+        row.cause = [&discovery.unanswered_at, &discovery.unanswered_direct]
+            .into_iter()
+            .filter_map(|keys| keys.get(&at))
+            .flatten()
+            .filter_map(|key| causes.get(key))
+            .min()
+            .cloned();
     }
     out.extend(decided.stops.iter().map(UnreadSite::of_decided));
     out.extend(
@@ -354,6 +387,7 @@ mod tests {
             callee: Some("this.handlers[type]".to_string()),
             stop_at: None,
             depth: 0,
+            cause: None,
             labelled_end: None,
             kind: None,
             role: None,
@@ -553,11 +587,77 @@ mod tests {
         discovery
             .unanswered_at
             .insert(at, ["fixture-pending".to_string()].into());
-        let rows = from_scan(&discovery, &Decided::default());
+        let rows = from_scan(&discovery, &Decided::default(), &BTreeMap::new());
         let by_file = |file: &str| rows.iter().find(|row| row.file == file).unwrap();
         assert_eq!(by_file("src/o.ts").reason, Stop::MissedInside);
         assert_eq!(by_file("src/o.ts").also, vec![Stop::UnansweredPackage]);
         assert!(by_file("src/p.ts").also.is_empty());
+    }
+
+    /// carrick#3739: a site that rests on a build-failed package states the
+    /// store's failure reason, a direct one and a walk's `also` alike; a
+    /// package with no reason, and a site that rests on none, state none.
+    #[test]
+    fn a_site_resting_on_a_failed_package_states_the_cause() {
+        let mut discovery = Discovery::default();
+        let direct = ("src/d.ts".to_string(), 10, 20);
+        discovery.unfollowed.push(DiscoverySite {
+            file: direct.0.clone(),
+            line: 1,
+            span_start: 10,
+            span_end: 20,
+            callee: "emit".to_string(),
+            end: None,
+            chain: Vec::new(),
+            stop: Some(Stop::UnansweredPackage),
+            receiver: None,
+            reached: None,
+            bound: Vec::new(),
+        });
+        discovery
+            .unanswered_direct
+            .insert(direct, ["fixture-failed".to_string()].into());
+        let walk = ("src/w.ts".to_string(), 30, 40);
+        discovery.missed_inside.push(walk.clone());
+        discovery
+            .missed_at
+            .insert(walk.clone(), (4, "announce(b)".to_string()));
+        discovery.unanswered_at.insert(
+            walk,
+            ["fixture-failed".to_string(), "fixture-zz".to_string()].into(),
+        );
+        let bare = ("src/n.ts".to_string(), 50, 60);
+        discovery.missed_inside.push(bare.clone());
+        discovery
+            .missed_at
+            .insert(bare.clone(), (5, "plain(b)".to_string()));
+        discovery
+            .unanswered_at
+            .insert(bare, ["fixture-nameless".to_string()].into());
+        let causes: BTreeMap<String, String> = [
+            (
+                "fixture-failed".to_string(),
+                "lister_out_of_memory".to_string(),
+            ),
+            ("fixture-zz".to_string(), "http_504".to_string()),
+        ]
+        .into();
+        let rows = from_scan(&discovery, &Decided::default(), &causes);
+        let by_file = |file: &str| rows.iter().find(|row| row.file == file).unwrap();
+        assert_eq!(
+            by_file("src/d.ts").cause.as_deref(),
+            Some("lister_out_of_memory")
+        );
+        assert_eq!(
+            by_file("src/w.ts").cause.as_deref(),
+            Some("lister_out_of_memory"),
+            "the first package by name that has a reason"
+        );
+        assert_eq!(by_file("src/n.ts").cause, None);
+        let none = from_scan(&discovery, &Decided::default(), &BTreeMap::new());
+        assert!(none.iter().all(|row| row.cause.is_none()));
+        let wire = serde_json::to_value(by_file("src/n.ts")).unwrap();
+        assert!(wire.get("cause").is_none(), "left out when absent: {wire}");
     }
 
     /// A walk that stopped with no labelled end keeps the last function it
@@ -615,7 +715,7 @@ mod tests {
             }],
             ..Decided::default()
         };
-        let rows = from_scan(&discovery, &decided);
+        let rows = from_scan(&discovery, &decided, &BTreeMap::new());
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].reason, Stop::NoBody);
         assert_eq!(rows[0].stop_at.as_deref(), Some("src/b.ts:40"));
