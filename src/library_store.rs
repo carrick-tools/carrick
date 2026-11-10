@@ -4309,7 +4309,7 @@ mod tests {
             "{:?}",
             settled.unanswered
         );
-        assert!(settled.pending_reasons.get("lib").is_none());
+        assert!(!settled.pending_reasons.contains_key("lib"));
     }
 
     #[tokio::test(start_paused = true)]

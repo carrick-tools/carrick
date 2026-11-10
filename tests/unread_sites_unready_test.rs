@@ -11,7 +11,6 @@
 //! Protocols: the test is on the call's declaring package, not on a role; the
 //! fixture's calls are a pub/sub-shaped publish and an event emit.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -119,20 +118,6 @@ fn scan_once() -> serde_json::Value {
 fn key() -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(fixture_dir().join("expected.json")).unwrap())
         .unwrap()
-}
-
-/// The reasons the blob's unread sites hold, by file.
-fn reasons(blob: &serde_json::Value) -> BTreeMap<String, BTreeSet<String>> {
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for site in blob["unread_sites"]
-        .as_array()
-        .expect("unread_sites written")
-    {
-        out.entry(site["file"].as_str().unwrap().to_string())
-            .or_default()
-            .insert(site["reason"].as_str().unwrap().to_string());
-    }
-    out
 }
 
 fn sites_of(blob: &serde_json::Value, file: &str) -> Vec<serde_json::Value> {
