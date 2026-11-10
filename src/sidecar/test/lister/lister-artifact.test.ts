@@ -22,6 +22,7 @@ import * as readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SIDECAR_PATH } from '../helpers.js';
 import { writeDeepPrintProject } from '../deep-print-fixture.js';
+import { writeSchemaValuesProject } from '../schema-values-fixture.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // dist/test/lister/ -> the sidecar root.
@@ -246,6 +247,18 @@ describe('the surface lister artifact (carrick#1660)', () => {
     const flat = run.listed.surfaces[0].exports.find(e => e.export === 'flat')!;
     const call = (flat.receivers.find(r => r.receiver === 'export') as unknown as { call: Array<{ returns: string }> }).call;
     assert.strictEqual(call[0].returns, '<not printed: too large>');
+  });
+
+  it('lists values typed by another package past the estimate by their export receiver, at the builder heap (carrick#3745)', async () => {
+    const valuesDir = temp('carrick-lister-values-');
+    writeSchemaValuesProject(valuesDir, 200, 40);
+    const run = await runLister(entry, valuesDir, ['--max-old-space-size=1630'], {}, ['fixture-schema-values']);
+    assert.strictEqual(run.listed.status, 'success', run.stderr);
+    const value = run.listed.surfaces[0].exports.find(e => e.export === 'Value0')!;
+    assert.deepStrictEqual(
+      value.receivers.map(r => r.receiver),
+      ['export']
+    );
   });
 
   it('lists exactly what the unbundled sidecar lists', async () => {
