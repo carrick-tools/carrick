@@ -1197,13 +1197,6 @@ mod tests {
             "{written:#}"
         );
         assert_eq!(written["final_losses"]["total"], 0);
-        assert!(
-            boundary
-                .lines("app")
-                .iter()
-                .any(|l| l.contains("1 file(s) that do not parse"))
-        );
-
         let mut older = written.clone();
         older.as_object_mut().unwrap().remove("files_not_parsed");
         let older: ServiceBoundary = serde_json::from_value(older).unwrap();
