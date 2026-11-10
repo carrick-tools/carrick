@@ -2094,7 +2094,7 @@ impl Reader<'_> {
                 // A value past the cap is unread for every reader but the
                 // procedures walk, which reads on to its own cap (M3).
                 let deep = |value: &Expr| {
-                    if cap < MAX_PROCEDURE_DEPTH {
+                    if cap > MAX_PROCEDURE_DEPTH {
                         self.values_in(value, scope, bound, depth + 1, MAX_PROCEDURE_DEPTH)
                     } else {
                         vec![ValueAt::Unread]

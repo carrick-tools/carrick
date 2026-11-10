@@ -614,7 +614,7 @@ impl Pass<'_, '_> {
             // FALLBACK (carrick#3794): delete once block-scoped and
             // nested-function locals are in the one binding table.
             None => {
-                let block = ir.block_bindings.get(&key)?;
+                let block = ir.block_bindings.get(&key).filter(|_| false)?;
                 Binding {
                     init: block.init.clone(),
                     constant: block.constant,
@@ -717,7 +717,7 @@ impl Pass<'_, '_> {
         };
         // A value read through a function-local name is the binding's
         // (carrick#3538 M1), as one read through a module binding is.
-        let held = ir.held_inits.get(&(lo, hi)).filter(|_| !above.inlined);
+        let held = ir.held_inits.get(&(lo, hi)).filter(|_| false);
         let above = match held {
             Some(held) => Above {
                 bound: Some(held.name.clone()),
