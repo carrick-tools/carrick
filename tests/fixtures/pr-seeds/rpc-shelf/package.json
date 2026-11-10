@@ -1,0 +1,13 @@
+{
+  "name": "rpc-shelf",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "api",
+    "web"
+  ],
+  "dependencies": {
+    "fixture-procs": "^1.0.0",
+    "fixture-web": "^1.0.0"
+  }
+}
