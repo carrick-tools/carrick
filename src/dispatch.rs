@@ -214,6 +214,14 @@ pub fn apply_declared_operations(
     for block in &config.declared_operations {
         // Validated at config load; a bad route cannot reach here.
         let declared_route = block.parsed_route().ok().flatten();
+        // A generated block states what a model read, accepted by nobody, so
+        // its rows are candidates; a written block's rows are facts. Nothing
+        // else about the rows differs (docs/reference/generated-operations.md).
+        let source = if block.is_generated() {
+            ResolutionSource::Model
+        } else {
+            ResolutionSource::DeclaredOperation
+        };
         let routes: Vec<(String, String)> = match &declared_route {
             Some(route) => vec![route.clone()],
             None => {
@@ -283,7 +291,7 @@ pub fn apply_declared_operations(
                     // never call-site evidence, whatever the row it replaced
                     // was: the repo is not describing a request it makes.
                     evidence: carrick_match::MatchEvidence::RouteDefinition,
-                    resolution_source: Some(ResolutionSource::DeclaredOperation),
+                    resolution_source: Some(source),
                     view_module: carried.as_ref().is_some_and(|row| row.view_module),
                     dispatch: Some(Dispatch {
                         location: block.dispatch.location,
@@ -403,6 +411,39 @@ impl DeclaredHandlers {
     }
 }
 
+/// Whether `endpoint` is a row [`apply_declared_operations`] wrote from one of
+/// `config`'s blocks: the source that block writes, the block's dispatch
+/// field and one of its values, and its route when it names one. A model row
+/// the file analyzer produced for the same handler fails the source or the
+/// route.
+fn written_by_a_block(
+    endpoint: &crate::mount_graph::ResolvedEndpoint,
+    config: &crate::config::Config,
+) -> bool {
+    use crate::agents::file_analyzer_agent::ResolutionSource;
+
+    let Some(dispatch) = endpoint.dispatch.as_ref() else {
+        return false;
+    };
+    config.declared_operations.iter().any(|block| {
+        let source = if block.is_generated() {
+            ResolutionSource::Model
+        } else {
+            ResolutionSource::DeclaredOperation
+        };
+        endpoint.resolution_source == Some(source)
+            && dispatch.location == block.dispatch.location
+            && dispatch.field == block.dispatch.field
+            && block.operations.iter().any(|op| op.value == dispatch.value)
+            && match block.parsed_route().ok().flatten() {
+                Some((method, path)) => {
+                    endpoint.method.eq_ignore_ascii_case(&method) && endpoint.full_path == path
+                }
+                None => true,
+            }
+    })
+}
+
 /// The type requests for every declared operation placed at its handler
 /// (carrick#2076). A declared row has no file-analysis row, so the producer
 /// loop of `collect_type_requests` never asks for it; this asks what that
@@ -424,7 +465,6 @@ pub fn declared_infer_requests(
     handlers: &DeclaredHandlers,
     repo_path: &str,
 ) -> Vec<crate::services::type_sidecar::InferRequestItem> {
-    use crate::agents::file_analyzer_agent::ResolutionSource;
     use crate::cloud_storage::{ManifestRole, ManifestTypeKind};
     use crate::services::type_sidecar::{InferKind, InferRequestItem};
     use crate::type_manifest::{
@@ -469,7 +509,10 @@ pub fn declared_infer_requests(
     let mut requests = Vec::new();
     let mut asked: std::collections::HashSet<(String, &'static str)> = Default::default();
     for endpoint in &graph.endpoints {
-        if endpoint.resolution_source != Some(ResolutionSource::DeclaredOperation) {
+        // Only a row a declared block wrote is asked. A generated block's
+        // rows are `Model`, as are the file analyzer's own, and `placed`
+        // alone cannot tell them apart.
+        if !written_by_a_block(endpoint, config) {
             continue;
         }
         // The raw line: `parse_file_location` reads line 0 as 1, and an
@@ -1001,7 +1044,63 @@ mod tests {
                     handler: Some(format!("lambdas/check-or-upload/index.ts:handle-{value}")),
                 })
                 .collect(),
+            source: None,
         }
+    }
+
+    /// The fixture's `carrick.json`, loaded the way a scan loads it.
+    fn generated_fixture_config() -> crate::config::Config {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dispatch-generated/carrick.json");
+        crate::config::Config::load_services(vec![path])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    fn fixture_rows(config: &crate::config::Config) -> Vec<crate::mount_graph::ResolvedEndpoint> {
+        let mut graph = crate::mount_graph::MountGraph::new();
+        let written = apply_declared_operations(&mut graph, config, &DeclaredHandlers::default());
+        assert_eq!(written, 4);
+        graph.endpoints
+    }
+
+    /// C16 T3: a block marked `"source": "generated"` writes the same four
+    /// rows, as candidates.
+    #[test]
+    fn a_generated_block_writes_candidate_rows() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+
+        let config = generated_fixture_config();
+        assert!(config.declared_operations[0].is_generated());
+        let rows = fixture_rows(&config);
+        assert_eq!(rows.len(), 4);
+        for row in &rows {
+            assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
+            assert_eq!(
+                (row.method.as_str(), row.full_path.as_str()),
+                ("POST", "/rpc")
+            );
+        }
+    }
+
+    /// The same block without the marker is the repo's own statement: facts.
+    #[test]
+    fn an_unmarked_block_still_writes_fact_rows() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+
+        let mut config = generated_fixture_config();
+        config.declared_operations[0].source = None;
+        let rows = fixture_rows(&config);
+        assert!(
+            rows.iter()
+                .all(|row| row.resolution_source == Some(ResolutionSource::DeclaredOperation))
+        );
+
+        // Any other value is a written block too.
+        config.declared_operations[0].source = Some("hand".to_string());
+        assert!(!config.declared_operations[0].is_generated());
     }
 
     fn config_with(blocks: Vec<crate::config::DeclaredOperations>) -> crate::config::Config {
@@ -1197,6 +1296,38 @@ mod tests {
             requests
                 .iter()
                 .all(|r| r.file_path == format!("/repo/{FILE}"))
+        );
+    }
+
+    /// A model row the file analyzer produced is not a generated block's row,
+    /// even at a placed handler's location: it gets no type ask.
+    #[test]
+    fn a_model_row_outside_a_declared_block_gets_no_type_ask() {
+        let mut config = config_with(vec![block(
+            Some("POST /types/check-or-upload"),
+            &["search-by-intent"],
+        )]);
+        config.declared_operations[0].source = Some("generated".to_string());
+        let handlers = handlers(&[(
+            FILE,
+            "handle-search-by-intent",
+            40,
+            &[("payload", Some("SearchInput"))],
+        )]);
+        let mut graph = crate::mount_graph::MountGraph::new();
+        apply_declared_operations(&mut graph, &config, &handlers);
+        let mut other = graph.endpoints[0].clone();
+        other.method = "POST".into();
+        other.path = "/other".into();
+        other.full_path = "/other".into();
+        graph.endpoints.push(other);
+
+        let requests = declared_infer_requests(&graph, &config, &handlers, "/repo");
+
+        assert_eq!(
+            requests.len(),
+            1,
+            "the block's row only: one handler, no param"
         );
     }
 
@@ -1770,6 +1901,7 @@ mod tests {
                         value: "upload-logs".to_string(),
                         handler: None,
                     }],
+                    source: None,
                 }],
                 ..Default::default()
             })

@@ -1,0 +1,17 @@
+{
+  "services": [{ "name": "rpc-fn", "directory": "." }],
+  "operations": [
+    {
+      "service": "rpc-fn",
+      "route": "POST /rpc",
+      "dispatch": { "location": "body", "field": "kind" },
+      "operations": [
+        { "value": "a" },
+        { "value": "b" },
+        { "value": "c" },
+        { "value": "d" }
+      ],
+      "source": "generated"
+    }
+  ]
+}
