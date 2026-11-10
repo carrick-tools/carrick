@@ -2563,7 +2563,15 @@ pub fn extract_file_ir(
             file.kept_imports,
             file.written_through_at,
             file.placed_writes,
-        ) = resolve::module_bindings(module, source_map, &reader, &scope, &file.functions);
+        ) = resolve::module_bindings(
+            module,
+            source_map,
+            &reader,
+            &scope,
+            &file.functions,
+            &file.module_level,
+            &file.constructor_defaults,
+        );
         file.param_bindings = resolve::param_bindings(
             &file.functions,
             &file.module_level,
@@ -5002,6 +5010,15 @@ fn redeclared_names(module: &Module) -> Declarations {
     names
 }
 
+/// What a body says of its names ([`Scope::body_names`]).
+#[derive(Debug, Clone, Default)]
+struct BodyNames {
+    /// Declared once ([`Reassigned::declared_once`]).
+    once: HashSet<String>,
+    /// Assigned again anywhere in the body.
+    written: HashSet<String>,
+}
+
 /// What an expression can read: the function's parameters and constants, the
 /// enclosing class's fields, and the module's constants, each by the binding
 /// an identifier resolves to (carrick#1648).
@@ -5083,6 +5100,11 @@ struct Scope<'a> {
     /// each node starts, for what a `return` of the name hands back
     /// (carrick#2432 slice A2).
     declared_fns: HashMap<BindingKey, u32>,
+    /// The names the body declares once, and those it assigns again, for the
+    /// call walker's block declarators (carrick#3794): the same rule
+    /// [`Reader::body`] reads its own top-level locals by. `None` at module
+    /// scope, whose bindings the write census keys by binding.
+    body_names: Option<BodyNames>,
     /// The names the function writes a member of (`url.pathname = …`),
     /// anywhere in it: a guard reads no such binding as what it was declared
     /// with (carrick#2386). The send side never reads it.
@@ -5113,6 +5135,7 @@ impl<'a> Scope<'a> {
             subjects: HashMap::new(),
             held: HashMap::new(),
             declared_fns: HashMap::new(),
+            body_names: None,
             fields: None,
             module,
         }
@@ -6172,6 +6195,7 @@ impl Reader<'_> {
             subjects: captured.subjects.clone(),
             held: captured.held.clone(),
             declared_fns: HashMap::new(),
+            body_names: None,
             fields,
             module,
         };
@@ -6254,6 +6278,7 @@ impl Reader<'_> {
             subjects: captured.subjects.clone(),
             held: captured.held.clone(),
             declared_fns: HashMap::new(),
+            body_names: None,
             fields,
             module,
         };
@@ -6317,6 +6342,14 @@ impl Reader<'_> {
         scope
             .fetches
             .retain(|(name, _)| !reassigned.names.contains(name));
+        scope.body_names = Some(BodyNames {
+            once: declared
+                .names()
+                .filter(|name| reassigned.declared_once(&declared, name))
+                .map(str::to_string)
+                .collect(),
+            written: reassigned.names.clone(),
+        });
         // A function declared in the body, once and never assigned again, is
         // the function a `return` of its name hands back, wherever the
         // declaration sits: it is hoisted (carrick#2432 slice A2). Only a
@@ -6381,61 +6414,21 @@ impl Reader<'_> {
                     // the text reader (S2): the scope holds it for the value
                     // readers (`values_in` returns `held` first, and a local
                     // not held has an initialiser that is all `Unread`), so
-                    // they do not read this entry (`text_only`). A local
-                    // written inside a function written in this body, or in
-                    // a block at module scope, is not pushed. Read only
+                    // they do not read this entry (`text_only`). A local in a
+                    // block of this body is the call walker's
+                    // ([`CallWalker::visit_var_decl`]), and one in a function
+                    // written inside it is that function's own. Read only
                     // where the body declares the name once: the census keys
                     // writes by binding, the table by line and name; never
                     // `binding_count`, which counts assignment targets too.
-                    if let Pat::Ident(ident) = &declarator.name
-                        && reassigned.declared_once(&declared, ident.id.sym.as_ref())
-                    {
-                        ir.local_bindings.push(resolve::LocalBinding {
-                            key: ident_key(&ident.id),
-                            line: self.source_map.lookup_char_pos(ident.id.span.lo).line as u32,
-                            init: declarator
-                                .init
-                                .as_deref()
-                                .map(|init| self.value_of(init, scope, &guards::Bound::default()))
-                                .unwrap_or_default(),
-                            kind: var.kind.into(),
-                            text: declarator
-                                .init
-                                .as_deref()
-                                .map(|init| resolve::text_of(init, &|lo| lo)),
-                            reassigned: reassigned.names.contains(ident.id.sym.as_ref()),
-                            plain: declarator.init.is_some(),
-                        });
-                    }
-                    // `const { a, b: name } = init`: each plain key is a local
-                    // of its own for the text reader (carrick#3504 S2b-3),
-                    // under the same once-declared rule.
-                    if let (Pat::Object(pattern), Some(init)) =
-                        (&declarator.name, declarator.init.as_deref())
-                    {
-                        for member in resolve::pattern_members(pattern) {
-                            let name = member.bound.id.sym.as_ref();
-                            if !reassigned.declared_once(&declared, name) {
-                                continue;
-                            }
-                            ir.local_bindings.push(resolve::LocalBinding {
-                                key: ident_key(&member.bound.id),
-                                line: self
-                                    .source_map
-                                    .lookup_char_pos(member.bound.id.span.lo)
-                                    .line as u32,
-                                init: self.value_of(
-                                    &member.read(init),
-                                    scope,
-                                    &guards::Bound::default(),
-                                ),
-                                kind: var.kind.into(),
-                                text: Some(member.text(init, &|lo| lo)),
-                                reassigned: reassigned.names.contains(name),
-                                plain: false,
-                            });
-                        }
-                    }
+                    ir.local_bindings.extend(self.local_entries(
+                        var,
+                        declarator,
+                        scope,
+                        |name| reassigned.declared_once(&declared, name),
+                        |name| reassigned.names.contains(name),
+                        false,
+                    ));
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).
                     // One never set again is a local receiver, below. Its
@@ -6562,6 +6555,71 @@ impl Reader<'_> {
         }
     }
 
+    /// The binding table entries one declarator states, read in `scope`:
+    /// a plain name, and each plain key of an object pattern
+    /// (`const { a, b: name } = init`, carrick#3504 S2b-3). Only a name the
+    /// body declares once has one (`once`); `written` says the body assigns
+    /// it again. `block` marks a declarator written in a block of the body,
+    /// which [`Self::body`] never reads (carrick#3794).
+    fn local_entries(
+        &self,
+        var: &VarDecl,
+        declarator: &VarDeclarator,
+        scope: &Scope<'_>,
+        once: impl Fn(&str) -> bool,
+        written: impl Fn(&str) -> bool,
+        block: bool,
+    ) -> Vec<resolve::LocalBinding> {
+        let mut out = Vec::new();
+        if let Pat::Ident(ident) = &declarator.name
+            && once(ident.id.sym.as_ref())
+        {
+            out.push(resolve::LocalBinding {
+                key: ident_key(&ident.id),
+                line: self.source_map.lookup_char_pos(ident.id.span.lo).line as u32,
+                init: declarator
+                    .init
+                    .as_deref()
+                    .map(|init| self.value_of(init, scope, &guards::Bound::default()))
+                    .unwrap_or_default(),
+                kind: var.kind.into(),
+                text: declarator
+                    .init
+                    .as_deref()
+                    .map(|init| resolve::text_of(init, &|lo| lo)),
+                reassigned: written(ident.id.sym.as_ref()),
+                plain: declarator.init.is_some(),
+                block,
+                defaulted: false,
+            });
+        }
+        // `const { a, b: name } = init`: each plain key is a local of its own
+        // for the text reader, under the same once-declared rule.
+        if let (Pat::Object(pattern), Some(init)) = (&declarator.name, declarator.init.as_deref()) {
+            for member in resolve::pattern_members(pattern) {
+                let name = member.bound.id.sym.as_ref();
+                if !once(name) {
+                    continue;
+                }
+                out.push(resolve::LocalBinding {
+                    key: ident_key(&member.bound.id),
+                    line: self
+                        .source_map
+                        .lookup_char_pos(member.bound.id.span.lo)
+                        .line as u32,
+                    init: self.value_of(&member.read(init), scope, &guards::Bound::default()),
+                    kind: var.kind.into(),
+                    text: Some(member.text(init, &|lo| lo)),
+                    reassigned: written(name),
+                    plain: false,
+                    block,
+                    defaulted: false,
+                });
+            }
+        }
+        out
+    }
+
     /// Every call under `node`, stopping at nested functions: a function
     /// expression passed to a call is read as that call's callback, and any
     /// other nested function belongs to whoever calls it.
@@ -6575,6 +6633,8 @@ impl Reader<'_> {
             ir,
             waited: HashSet::new(),
             guard: guards::WalkState::default(),
+            in_head: false,
+            depth: 0,
         };
         node.visit_with(&mut walker);
     }
@@ -6588,6 +6648,8 @@ impl Reader<'_> {
             ir,
             waited: HashSet::new(),
             guard: guards::WalkState::returned(),
+            in_head: false,
+            depth: 0,
         };
         expr.visit_with(&mut walker);
     }
@@ -7995,6 +8057,13 @@ struct CallWalker<'r, 's, 'i> {
     /// The test being read and where functions written in an argument sit,
     /// for the guards (carrick#2386).
     guard: guards::WalkState,
+    /// Reading a `for` loop's head: its declarators are bound again by each
+    /// iteration and state no initialiser, so they are no binding table
+    /// entry (carrick#3794).
+    in_head: bool,
+    /// How many blocks deep the walk is, a `switch` case included: a
+    /// function declared at depth 0 is the body's own.
+    depth: u32,
 }
 
 impl CallWalker<'_, '_, '_> {
@@ -8432,10 +8501,22 @@ impl Visit for CallWalker<'_, '_, '_> {
         member.visit_children_with(self);
     }
 
-    // FALLBACK (carrick#3794): a declarator a nested block writes, which no
-    // binding table row holds, for the procedures walk alone. A body's own
-    // top-level declarators are read by `body`, never visited here.
+    // A declarator a block of the body writes (carrick#3794): a binding
+    // table entry, with its initialiser read in the body's scope as a
+    // top-level local's is ([`Reader::local_entries`]). A body's own
+    // top-level declarators are read by `body`, never visited here, and a
+    // module's by `module_bindings`; a `for` head's are no entry.
+    //
+    // FALLBACK (carrick#3794): also the declarator the procedures walk reads
+    // while the table's entries are refused, which no binding table row
+    // held. Delete the fallback once block-scoped and nested-function locals
+    // are read through the table.
     fn visit_var_decl(&mut self, var: &VarDecl) {
+        if !self.in_head {
+            for declarator in &var.decls {
+                self.push_block_entries(var, declarator);
+            }
+        }
         for declarator in &var.decls {
             if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
                 let line = self
@@ -8456,6 +8537,69 @@ impl Visit for CallWalker<'_, '_, '_> {
             }
         }
         var.visit_children_with(self);
+    }
+
+    // A function declared in a body (carrick#3794): an entry holding the
+    // function, which a reader reaches through where its node starts.
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        let name = decl.ident.sym.as_ref();
+        let names = self.scope.body_names.as_ref();
+        if names.is_none_or(|names| names.once.contains(name)) {
+            let entry = resolve::LocalBinding {
+                key: ident_key(&decl.ident),
+                line: self
+                    .reader
+                    .source_map
+                    .lookup_char_pos(decl.ident.span.lo)
+                    .line as u32,
+                init: vec![ValueAt::Function(decl.function.span.lo.0)],
+                kind: resolve::BindingKind::Function,
+                text: None,
+                reassigned: names.is_some_and(|names| names.written.contains(name)),
+                plain: false,
+                block: self.depth > 0,
+                defaulted: false,
+            };
+            self.push_entry(entry);
+        }
+        decl.visit_children_with(self);
+    }
+
+    fn visit_block_stmt(&mut self, block: &BlockStmt) {
+        self.depth += 1;
+        block.visit_children_with(self);
+        self.depth -= 1;
+    }
+
+    fn visit_switch_case(&mut self, case: &SwitchCase) {
+        self.depth += 1;
+        case.visit_children_with(self);
+        self.depth -= 1;
+    }
+
+    fn visit_for_stmt(&mut self, stmt: &ForStmt) {
+        let in_head = std::mem::replace(&mut self.in_head, true);
+        stmt.init.visit_with(self);
+        self.in_head = in_head;
+        stmt.test.visit_with(self);
+        stmt.update.visit_with(self);
+        stmt.body.visit_with(self);
+    }
+
+    fn visit_for_in_stmt(&mut self, stmt: &ForInStmt) {
+        let in_head = std::mem::replace(&mut self.in_head, true);
+        stmt.left.visit_with(self);
+        self.in_head = in_head;
+        stmt.right.visit_with(self);
+        stmt.body.visit_with(self);
+    }
+
+    fn visit_for_of_stmt(&mut self, stmt: &ForOfStmt) {
+        let in_head = std::mem::replace(&mut self.in_head, true);
+        stmt.left.visit_with(self);
+        self.in_head = in_head;
+        stmt.right.visit_with(self);
+        stmt.body.visit_with(self);
     }
 
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
@@ -8572,6 +8716,38 @@ impl Visit for CallWalker<'_, '_, '_> {
 }
 
 impl CallWalker<'_, '_, '_> {
+    /// The binding table entries of a declarator written in a block here: a
+    /// name the body declares once, as [`Reader::body`] reads its own. At
+    /// module scope, which has no body, the write census keys every entry
+    /// by binding and none is refused here.
+    fn push_block_entries(&mut self, var: &VarDecl, declarator: &VarDeclarator) {
+        let names = self.scope.body_names.as_ref();
+        let entries = self.reader.local_entries(
+            var,
+            declarator,
+            self.scope,
+            |name| names.is_none_or(|names| names.once.contains(name)),
+            |name| names.is_some_and(|names| names.written.contains(name)),
+            true,
+        );
+        for entry in entries {
+            self.push_entry(entry);
+        }
+    }
+
+    /// Adds an entry to the walked body, once: a declaration the walk reaches
+    /// twice would otherwise read as two on one line.
+    fn push_entry(&mut self, entry: resolve::LocalBinding) {
+        if !self
+            .ir
+            .local_bindings
+            .iter()
+            .any(|held| held.key == entry.key && held.line == entry.line)
+        {
+            self.ir.local_bindings.push(entry);
+        }
+    }
+
     /// What each argument of a call written here holds. A function written
     /// as an argument is read as a function of its own (nested), the rest as
     /// values; both a call (`send(…)`) and an optional call (`sock?.on(…)`,

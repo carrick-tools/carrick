@@ -2110,7 +2110,7 @@ impl<'a> Walk<'a, '_> {
         let binding = ir
             .module_bindings
             .get(&(row.decl_line()?, row.symbol()?.to_string()))?;
-        if binding.declared_in.is_some()
+        if !binding.declared.module_scope()
             || binding.kind != BindingKind::Const
             || binding.unplaceable
             || !binding.writes.is_empty()
