@@ -3320,14 +3320,59 @@ async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
             let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
             for line in text.lines() {
                 let l = line.to_lowercase();
-                if l.contains("position rows")
-                    || l.contains("untraced")
-                    || l.contains("walk")
-                    || l.contains("sidecar")
-                    || l.contains("procedure")
-                    || l.contains("claims")
+                if !l.contains("type_sidecar")
+                    && !l.contains("position_rows")
+                    && !l.contains("file_orchestrator")
+                    && !l.contains("rows_join")
                 {
-                    eprintln!("DIAGBINLOG {}", &line[..line.len().min(300)]);
+                    eprintln!("DIAGIN {}", line.chars().take(230).collect::<String>());
+                }
+            }
+        }
+    }
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let src =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr-seeds/rpc-shelf");
+        let repo = unlinked(tmp.path()).join("rpc-shelf");
+        copy_dir(&src, &repo);
+        git(&repo, &["init", "-q"]);
+        commit(&repo, "init");
+        let storage = tmp.path().join("storage");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+            .arg(".")
+            .current_dir(&repo)
+            .env("CARRICK_LOCAL_STORAGE_DIR", &storage)
+            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
+            .env("HOME", &home)
+            .env("CARRICK_MOCK_ALL", "1")
+            .env(
+                "CARRICK_MOCK_FIXTURE_DIR",
+                format!("{}/", repo.join("__llm__").display()),
+            )
+            .env(
+                "CARRICK_SIDECAR_DIR",
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
+            )
+            .output()
+            .unwrap();
+        for entry in std::fs::read_dir(home.join(".carrick/logs/runs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            for line in text.lines() {
+                let l = line.to_lowercase();
+                if !l.contains("type_sidecar")
+                    && !l.contains("position_rows")
+                    && !l.contains("file_orchestrator")
+                    && !l.contains("rows_join")
+                {
+                    eprintln!("DIAGOUT {}", line.chars().take(230).collect::<String>());
                 }
             }
         }
