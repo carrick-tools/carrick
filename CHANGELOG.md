@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.153](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.152...carrick-v0.3.153) (2026-11-10)
+
+
+### Features
+
+* **call-graph:** write the in-repo definitions discovery's walk entered ([#3714](https://github.com/carrick-tools/carrick/issues/3714)) ([a055773](https://github.com/carrick-tools/carrick/commit/a055773088865c19b99289c82eb5d9e7c751b350))
+* **findings:** one break answer, Finding::break_status ([#3731](https://github.com/carrick-tools/carrick/issues/3731)) ([be95c8f](https://github.com/carrick-tools/carrick/commit/be95c8f1bf03c62b5f6f711bf55a55314ee82b78))
+* **npm:** post-edit speaks only with a finding (T4) ([#3687](https://github.com/carrick-tools/carrick/issues/3687)) ([3041924](https://github.com/carrick-tools/carrick/commit/3041924adc50c801f569e28eef0720cd12bc5b43))
+* **npm:** the post-edit hook names the indexed function a new one looks like ([#3249](https://github.com/carrick-tools/carrick/issues/3249) T-B) ([#3720](https://github.com/carrick-tools/carrick/issues/3720)) ([245823f](https://github.com/carrick-tools/carrick/commit/245823fe51acf962d48517ce8c84855f0151763e))
+
+
+### Bug Fixes
+
+* **sidecar:** the position rows read an unbuilt workspace package from its source ([#1910](https://github.com/carrick-tools/carrick/issues/1910)) ([#3699](https://github.com/carrick-tools/carrick/issues/3699)) ([95011c4](https://github.com/carrick-tools/carrick/commit/95011c43d6e9efef730c6d53d10a30ec1ba04894))
+
+
+### Refactoring
+
+* delete the config-object request candidate gate (blueprint row N22) ([#3704](https://github.com/carrick-tools/carrick/issues/3704)) ([997880c](https://github.com/carrick-tools/carrick/commit/997880c1d0863c203d678b6bf20a4647d027b787))
+* delete the fact-file off arms (blueprint row SW4) ([#3707](https://github.com/carrick-tools/carrick/issues/3707)) ([338929e](https://github.com/carrick-tools/carrick/commit/338929e2f859d8f26b33343968fadecd93aad88c))
+* delete the messaging-import constructor anchor (blueprint row N20) ([#3703](https://github.com/carrick-tools/carrick/issues/3703)) ([85b4bf4](https://github.com/carrick-tools/carrick/commit/85b4bf48f3e608b28f5ab8ba3f45febec7342194))
+* **scanner:** one Stop enum replaces the stop vocabularies ([#3688](https://github.com/carrick-tools/carrick/issues/3688) U1) ([#3715](https://github.com/carrick-tools/carrick/issues/3715)) ([ad3e400](https://github.com/carrick-tools/carrick/commit/ad3e40092c79e14c229f8a290a45bf5bf2fdffbb))
+
 ## [0.3.152](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.151...carrick-v0.3.152) (2026-11-09)
 
 

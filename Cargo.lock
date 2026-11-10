@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "carrick"
-version = "0.3.152"
+version = "0.3.153"
 dependencies = [
  "async-trait",
  "base64",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "carrick-match"
-version = "0.3.152"
+version = "0.3.153"
 dependencies = [
  "serde",
  "serde_json",
