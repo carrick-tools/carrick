@@ -5612,7 +5612,13 @@ async fn analyze_current_repo_incremental(
                     }
                     None => crate::agents::asked_ahead::AheadRole::None,
                 });
-            let (analysis, (settled, placements, fallbacks), library_answer, (), entered) = tokio::join!(
+            let (
+                analysis,
+                (settled, placements, fallbacks, caller_stops),
+                library_answer,
+                (),
+                entered,
+            ) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -5753,6 +5759,7 @@ async fn analyze_current_repo_incremental(
                 &claims,
                 SiteContext {
                     placements: Some(&placements),
+                    caller_stops: &caller_stops,
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
@@ -5768,6 +5775,7 @@ async fn analyze_current_repo_incremental(
                 &claims,
                 SiteContext {
                     placements: Some(&placements),
+                    caller_stops: &caller_stops,
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
@@ -7119,6 +7127,9 @@ fn site_payloads_of(
 #[derive(Debug, Default, Clone, Copy)]
 struct SiteContext<'a> {
     placements: Option<&'a crate::request_summary::decided_sites::SummaryPlacements>,
+    /// The callers whose request the send side could not compose
+    /// (carrick#3688 F), saved as unread sites.
+    caller_stops: &'a [crate::request_summary::CallerStop],
     library: Option<&'a crate::request_summary::LibrarySites>,
     /// For the receiver trace (carrick#2474 R1): the member declarations
     /// verified op claims resolve to ([`member_declarations`]). `None` only
@@ -7464,7 +7475,7 @@ fn site_records_of(
     SiteRecordsOf {
         discovered: discovery.sites.len(),
         reached_label,
-        unread: crate::unread_sites::from_scan(&discovery, &decided),
+        unread: crate::unread_sites::from_scan(&discovery, &decided, context.caller_stops, root),
         decided,
         records,
         labels,
@@ -12112,10 +12123,12 @@ async fn compose_summaries(
     Option<Vec<crate::client_semantics::ClientSemanticsEntry>>,
     crate::request_summary::decided_sites::SummaryPlacements,
     crate::fallback_tally::ServiceFallbacks,
+    Vec<crate::request_summary::CallerStop>,
 ) {
     let settled = settling.settled().await;
     let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
     let placements = index.placements();
+    let caller_stops = index.caller_stops();
     // Stated once the analysis is done ([`analysis_fallbacks`]), with what the
     // reader's file selection fell back on.
     let fallbacks =
@@ -12123,7 +12136,7 @@ async fn compose_summaries(
     if summaries.send(index).is_err() {
         debug!("The analysis ended before its request summaries were composed");
     }
-    (settled, placements, fallbacks)
+    (settled, placements, fallbacks, caller_stops)
 }
 
 /// The library semantics one in-scan re-ask gives: what `ask` answered, when
@@ -13664,7 +13677,13 @@ async fn analyze_current_repo(
     );
     let (early_answer, first_answer) = tokio::sync::oneshot::channel();
     let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
-    let (analysis_result, (settled, placements, fallbacks), library_answer, (), entered) = tokio::join!(
+    let (
+        analysis_result,
+        (settled, placements, fallbacks, caller_stops),
+        library_answer,
+        (),
+        entered,
+    ) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -13786,6 +13805,7 @@ async fn analyze_current_repo(
         &claims,
         SiteContext {
             placements: Some(&placements),
+            caller_stops: &caller_stops,
             library: library_ask.as_ref().map(|ask| &ask.sites),
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
@@ -13801,6 +13821,7 @@ async fn analyze_current_repo(
         &claims,
         SiteContext {
             placements: Some(&placements),
+            caller_stops: &caller_stops,
             library: library_ask.as_ref().map(|ask| &ask.sites),
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),

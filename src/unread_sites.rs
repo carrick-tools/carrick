@@ -25,6 +25,7 @@
 //! index field" section.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -32,9 +33,9 @@ use crate::cloud_storage::CloudRepoData;
 use crate::possible_calls::{
     LabelledEndRef, PossibleCall, Unread, kind_of, labelled_end, role_of, slot_of,
 };
-use crate::request_summary::Stop;
 use crate::request_summary::decided_sites::{Decided, DecidedStop};
 use crate::request_summary::discovery::{Discovery, DiscoverySite};
+use crate::request_summary::{CallerStop, Stop};
 
 /// The most unread sites one service's blob carries.
 pub const MAX_PER_SERVICE: usize = 2000;
@@ -172,6 +173,47 @@ impl UnreadSite {
     }
 }
 
+impl UnreadSite {
+    /// A call of a function of the service whose request the send side could
+    /// not write as a row (carrick#3688 F). The request is an HTTP one, sent
+    /// by the call; the labelled end is the one discovery found at the
+    /// request, when it found one.
+    fn of_caller(caller: &CallerStop, root: &Path, discovery: &Discovery) -> Self {
+        let request = (
+            crate::site_rows::relative(root, &caller.request_at.0.to_string_lossy()),
+            caller.request_at.1,
+        );
+        let end = discovery
+            .sites
+            .iter()
+            .filter_map(|site| site.end.as_ref())
+            .find(|end| {
+                end.role == crate::services::type_sidecar::LibraryRole::HttpClient
+                    && (end.file.as_str(), end.span_start) == (request.0.as_str(), request.1)
+            });
+        UnreadSite {
+            file: crate::site_rows::relative(root, &caller.file.to_string_lossy()),
+            line: caller.line,
+            span_start: caller.span_start,
+            span_end: caller.span_end,
+            reason: caller.reason,
+            also: caller.also.clone(),
+            slot: "path".to_string(),
+            callee: callee(&caller.callee),
+            stop_at: None,
+            depth: 0,
+            labelled_end: end.map(|end| LabelledEndRef {
+                package: end.package.clone(),
+                export: end.export.clone(),
+                member: end.member.clone(),
+            }),
+            kind: Some("http".to_string()),
+            role: Some("consumer".to_string()),
+            listed: false,
+        }
+    }
+}
+
 /// The callee text as the blob carries it; none when the call writes none.
 fn callee(text: &str) -> Option<String> {
     let cut = crate::unfollowed_calls::cut_receiver(text);
@@ -185,7 +227,12 @@ fn callee(text: &str) -> Option<String> {
 /// GraphQL calls ([`crate::possible_calls::class_only_graphql`]), which
 /// [`crate::site_rows::fold_rows`] keeps only where no row stands at their
 /// line. Unordered and uncapped; [`attach`] orders and bounds them.
-pub fn from_scan(discovery: &Discovery, decided: &Decided) -> Vec<UnreadSite> {
+pub fn from_scan(
+    discovery: &Discovery,
+    decided: &Decided,
+    callers: &[CallerStop],
+    root: &Path,
+) -> Vec<UnreadSite> {
     let mut out: Vec<UnreadSite> = Vec::new();
     for site in &discovery.unfollowed {
         if let Some(reason) = site.stop {
@@ -235,6 +282,11 @@ pub fn from_scan(discovery: &Discovery, decided: &Decided) -> Vec<UnreadSite> {
         }
     }
     out.extend(decided.stops.iter().map(UnreadSite::of_decided));
+    out.extend(
+        callers
+            .iter()
+            .map(|caller| UnreadSite::of_caller(caller, root, discovery)),
+    );
     out.extend(
         decided
             .leads
@@ -553,7 +605,7 @@ mod tests {
         discovery
             .unanswered_at
             .insert(at, ["fixture-pending".to_string()].into());
-        let rows = from_scan(&discovery, &Decided::default());
+        let rows = from_scan(&discovery, &Decided::default(), &[], Path::new("/repo"));
         let by_file = |file: &str| rows.iter().find(|row| row.file == file).unwrap();
         assert_eq!(by_file("src/o.ts").reason, Stop::MissedInside);
         assert_eq!(by_file("src/o.ts").also, vec![Stop::UnansweredPackage]);
@@ -615,7 +667,7 @@ mod tests {
             }],
             ..Decided::default()
         };
-        let rows = from_scan(&discovery, &decided);
+        let rows = from_scan(&discovery, &decided, &[], Path::new("/repo"));
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].reason, Stop::NoBody);
         assert_eq!(rows[0].stop_at.as_deref(), Some("src/b.ts:40"));
@@ -631,6 +683,37 @@ mod tests {
                 rows[1].slot.as_str()
             ),
             (Some("pubsub"), Some("producer"), "name")
+        );
+    }
+
+    /// A caller the send side could not compose is one unread site at the
+    /// call, with the reason and the HTTP consumer role the request has.
+    #[test]
+    fn a_caller_stop_is_an_unread_site_at_the_call() {
+        let caller = CallerStop {
+            file: "/repo/src/use.ts".into(),
+            line: 6,
+            span_start: 60,
+            span_end: 72,
+            callee: "items.list".to_string(),
+            request_at: ("/repo/src/store.ts".into(), 20),
+            reason: Stop::Reassigned,
+            also: vec![Stop::UnreadExpression],
+        };
+        let rows = from_scan(
+            &Discovery::default(),
+            &Decided::default(),
+            &[caller],
+            Path::new("/repo"),
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!((row.file.as_str(), row.line), ("src/use.ts", 6));
+        assert_eq!(row.reason, Stop::Reassigned);
+        assert_eq!(row.also, vec![Stop::UnreadExpression]);
+        assert_eq!(
+            (row.slot.as_str(), row.kind.as_deref(), row.role.as_deref()),
+            ("path", Some("http"), Some("consumer"))
         );
     }
 }
