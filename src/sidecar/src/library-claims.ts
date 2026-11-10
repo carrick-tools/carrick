@@ -3241,7 +3241,7 @@ class DeclarationReader {
     const declared = this.keyParameterAt(signature, slot.arg);
     if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
     if (slot.key === undefined) {
-      const read = this.throughConditional(declared);
+      const read = this.throughDefault(this.throughConditional(declared));
       return this.acceptsString(read) ? undefined : { rank: 1, outcome: this.slotFailure(read, 'name_not_string') };
     }
     const view = this.viewFor(declared, new Map([[slot.key, 'name']]), given => this.runsFailure(given));
@@ -3891,7 +3891,7 @@ class DeclarationReader {
       if (part !== 'name' && part !== 'base' && part !== 'prefix') continue;
       const declared = this.keyParameterAt(signature, arg);
       if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
-      const slot = this.throughConditional(declared);
+      const slot = this.throughDefault(this.throughConditional(declared));
       if (!this.acceptsString(slot)) {
         return { rank: 1, outcome: this.slotFailure(slot, part === 'name' ? 'name_not_string' : 'slot_not_string') };
       }
@@ -6056,6 +6056,23 @@ class DeclarationReader {
       this.checker.isTypeAssignableTo(this.checker.getStringType(), slot) &&
       this.parts(slot).some(part => isStringLike(part))
     );
+  }
+
+  /**
+   * A type parameter that `throughConstraint` left as it is (no constraint,
+   * or `any` or `unknown`) and whose default takes a string reads as that
+   * default.
+   * Only a name, base or prefix slot reads it (T2b): the default is what a
+   * call that infers nothing names, never a promise about a body or payload.
+   */
+  private throughDefault(slot: Slot): Slot {
+    const bare = this.throughConstraint(slot);
+    if (bare === VARIADIC) return slot;
+    const parts = this.parts(bare);
+    if (parts.length !== 1 || !(parts[0].flags & ts.TypeFlags.TypeParameter)) return slot;
+    const fallback = this.checker.getDefaultFromTypeParameter(parts[0]);
+    // A default that takes no string leaves the slot as it was: it says nothing.
+    return fallback !== undefined && this.acceptsString(fallback) ? fallback : slot;
   }
 
   /** Accepts string, or names an HTTP method as a literal in either case. */

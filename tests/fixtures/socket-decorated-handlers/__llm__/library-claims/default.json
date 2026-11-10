@@ -20,7 +20,57 @@
               "member": null,
               "on": "export",
               "form": "decorate",
-              "name": { "arg": 0 },
+              "name": {
+                "arg": 0
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/gateway",
+          "export": "OnNothing",
+          "role": "socket",
+          "side": "server",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": null,
+              "on": "export",
+              "form": "decorate",
+              "name": {
+                "arg": 0
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/gateway",
+          "export": "OnEvent",
+          "role": "socket",
+          "side": "server",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": null,
+              "on": "export",
+              "form": "decorate",
+              "name": {
+                "arg": 0
+              },
               "picker": "fixture-picker"
             }
           ],
@@ -35,7 +85,11 @@
           "side": "client",
           "classifier": "fixture-classifier",
           "makes": [
-            { "form": "new", "member": null, "picker": "fixture-picker" }
+            {
+              "form": "new",
+              "member": null,
+              "picker": "fixture-picker"
+            }
           ],
           "scopes": [],
           "ops": [
@@ -43,8 +97,12 @@
               "op": "send",
               "member": "send",
               "on": "instance",
-              "name": { "arg": 0 },
-              "payload": { "arg": 1 },
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
               "picker": "fixture-picker"
             }
           ],
