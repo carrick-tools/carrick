@@ -32,7 +32,8 @@ use std::collections::{BTreeMap, HashSet};
 use super::{BAND, InferenceBy, RowSide, SiteInference, SiteRow};
 use crate::agents::file_analyzer_agent::ResolutionSource;
 use crate::operation::OperationKey;
-use crate::possible_calls::{LabelledEndRef, PossibleCall, Unread, UnreadReason};
+use crate::possible_calls::{LabelledEndRef, PossibleCall, Unread};
+use crate::request_summary::Stop;
 use crate::request_summary::dispatch::{ComparisonPlace, HandlerRecords};
 use crate::request_summary::site_record::{AnchorAt, TypeAnchors};
 use crate::site_questions::{
@@ -101,7 +102,7 @@ fn count(counts: &mut BTreeMap<String, usize>, what: &str) {
 }
 
 /// The possible call a comparison is when it states no row.
-fn lead(place: &ComparisonPlace, reason: UnreadReason) -> PossibleCall {
+fn lead(place: &ComparisonPlace, reason: Stop) -> PossibleCall {
     PossibleCall {
         file_path: place.file.clone(),
         line_number: place.line,
@@ -126,7 +127,7 @@ fn lead(place: &ComparisonPlace, reason: UnreadReason) -> PossibleCall {
 type Stated<T> = Result<T, Box<PossibleCall>>;
 
 /// [`lead`] as what a comparison states instead of a row.
-fn instead(place: &ComparisonPlace, reason: UnreadReason) -> Box<PossibleCall> {
+fn instead(place: &ComparisonPlace, reason: Stop) -> Box<PossibleCall> {
     Box::new(lead(place, reason))
 }
 
@@ -167,7 +168,7 @@ fn row(
             handler: None,
             key: None,
         },
-        lead: lead(place, UnreadReason::BelowBand),
+        lead: lead(place, Stop::BelowBand),
         needs_reader: false,
         through: false,
         within: place.within.clone(),
@@ -221,8 +222,8 @@ pub fn dispatch_rows(records: &HandlerRecords, answers: &HandlerAnswers) -> Disp
                 let forced = settled.get(&id).cloned().unwrap_or_default();
                 let path = forced.path.as_deref().unwrap_or(path);
                 match (place.served, forced.method.as_deref()) {
-                    (false, _) => Err(instead(place, UnreadReason::OwnerUnknown)),
-                    (true, None) => Err(instead(place, UnreadReason::NoMethod)),
+                    (false, _) => Err(instead(place, Stop::OwnerUnknown)),
+                    (true, None) => Err(instead(place, Stop::NoMethod)),
                     (true, Some(method)) => Ok(Some(row(place, method, path, None))),
                 }
             };
@@ -259,7 +260,7 @@ fn asked(
     out: &mut DispatchRows,
 ) -> Stated<Option<SiteRow>> {
     let Some(answer) = answer else {
-        return Err(instead(place, UnreadReason::Unanswered));
+        return Err(instead(place, Stop::Unanswered));
     };
     let in_band = answer.confidence >= BAND && answer.orders_agree;
     match answer.choice {
@@ -267,7 +268,7 @@ fn asked(
             count(&mut out.counts, "not_a_route");
             Ok(None)
         }
-        RouteChoice::None | RouteChoice::CantTell => Err(instead(place, UnreadReason::BelowBand)),
+        RouteChoice::None | RouteChoice::CantTell => Err(instead(place, Stop::BelowBand)),
         RouteChoice::Route => match (place.served, method) {
             (true, Some(method)) => Ok(Some(row(
                 place,
@@ -280,9 +281,9 @@ fn asked(
                     orders_agree: answer.orders_agree,
                 }),
             ))),
-            _ if !in_band => Err(instead(place, UnreadReason::BelowBand)),
-            (false, _) => Err(instead(place, UnreadReason::OwnerUnknown)),
-            (true, None) => Err(instead(place, UnreadReason::NoMethod)),
+            _ if !in_band => Err(instead(place, Stop::BelowBand)),
+            (false, _) => Err(instead(place, Stop::OwnerUnknown)),
+            (true, None) => Err(instead(place, Stop::NoMethod)),
         },
     }
 }
@@ -405,7 +406,7 @@ mod tests {
         answers
     }
 
-    fn reasons(rows: &DispatchRows) -> Vec<(u32, UnreadReason)> {
+    fn reasons(rows: &DispatchRows) -> Vec<(u32, Stop)> {
         rows.leads
             .iter()
             .map(|lead| (lead.line_number, lead.unread.reason))
@@ -468,9 +469,9 @@ mod tests {
         assert_eq!(
             reasons(&rows),
             vec![
-                (16, UnreadReason::BelowBand),
-                (18, UnreadReason::NoMethod),
-                (22, UnreadReason::BelowBand),
+                (16, Stop::BelowBand),
+                (18, Stop::NoMethod),
+                (22, Stop::BelowBand),
             ]
         );
         assert_eq!(rows.counts.get("not_a_route"), Some(&1));
@@ -486,7 +487,7 @@ mod tests {
         assert!(
             rows.leads
                 .iter()
-                .all(|lead| lead.unread.reason == UnreadReason::Unanswered)
+                .all(|lead| lead.unread.reason == Stop::Unanswered)
         );
         assert_eq!(rows.leads.len(), 6);
     }
@@ -510,7 +511,7 @@ mod tests {
             keys(&rows),
             vec![(12, OperationKey::http("GET", "/one"), true)]
         );
-        assert_eq!(reasons(&rows), vec![(14, UnreadReason::NoMethod)]);
+        assert_eq!(reasons(&rows), vec![(14, Stop::NoMethod)]);
     }
 
     /// A route whose compared path is not the path served (a handler
@@ -522,13 +523,13 @@ mod tests {
         let answers = answered(&records, vec![answer(0, RouteChoice::Route, None, 0.99)]);
         let rows = dispatch_rows(&records, &answers);
         assert!(rows.rows.is_empty());
-        assert_eq!(reasons(&rows), vec![(12, UnreadReason::OwnerUnknown)]);
+        assert_eq!(reasons(&rows), vec![(12, Stop::OwnerUnknown)]);
         // Settled by the code (path and method forced, nothing asked): the
         // same.
         let mut settled = records.clone_settled();
         let rows = dispatch_rows(&settled, &HandlerAnswers::default());
         assert!(rows.rows.is_empty());
-        assert_eq!(reasons(&rows), vec![(12, UnreadReason::OwnerUnknown)]);
+        assert_eq!(reasons(&rows), vec![(12, Stop::OwnerUnknown)]);
         settled.places[0][0].served = true;
         let rows = dispatch_rows(&settled, &HandlerAnswers::default());
         assert_eq!(

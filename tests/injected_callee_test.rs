@@ -192,7 +192,7 @@ fn a_callee_that_is_a_value_is_followed_to_its_request() {
     assert!(
         leads
             .iter()
-            .any(|lead| lead == "src/load.ts:4 injected_callee"),
+            .any(|lead| lead == "src/load.ts:4 several_values"),
         "case 6: values that disagree are a possible call\n{leads:#?}"
     );
     assert!(

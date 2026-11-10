@@ -205,6 +205,9 @@ use guards::{GuardIr, Subject, Tested, WrittenIn};
 pub mod decided_sites;
 // The files the fact layer would send the file reader (carrick#2613): record-only.
 pub mod fact_files;
+// The one list of reasons a site was not read (carrick#3688).
+pub mod stop;
+pub use stop::Stop;
 #[cfg(test)]
 mod site_census;
 #[allow(dead_code)]
@@ -10666,7 +10669,7 @@ fn emit(
                 {
                     *index
                         .unfollowed
-                        .entry(row_calls::hole_key(reason))
+                        .entry(Stop::from(reason).as_str().to_string())
                         .or_default() += 1;
                 }
                 if let Some(mut request) = request {

@@ -24,13 +24,9 @@ use std::path::Path;
 use super::LibrarySites;
 use super::decided_sites::Decided;
 use super::discovery::Discovery;
+use super::stop::Stop;
 use crate::library_store::FirstAnswer;
 use crate::services::type_sidecar::LibraryRole;
-
-/// The reason a call is not followed to the end when the walk found no site
-/// and passed a call it could not follow inside
-/// ([`Discovery::missed_inside`]).
-pub const MISSED_INSIDE: &str = "missed_inside";
 
 /// What discovery recorded for one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,10 +34,10 @@ pub enum Followed {
     /// The walk reached a labelled export.
     Site,
     /// The walk entered code and stopped, for this reason.
-    Stopped(String),
+    Stopped(Stop),
     /// The walk entered no code and missed something, for this reason
     /// ([`Discovery::unfollowed`]).
-    Unfollowed(String),
+    Unfollowed(Stop),
     /// The walk ended with nothing missed and no site.
     Finished,
 }
@@ -124,7 +120,7 @@ impl FactFiles {
         for site in &discovery.sites {
             let followed = match (&site.end, &site.stop) {
                 (Some(_), _) => Followed::Site,
-                (None, Some(stop)) => Followed::Stopped(stop.clone()),
+                (None, Some(stop)) => Followed::Stopped(*stop),
                 (None, None) => continue,
             };
             facts.record(&site.file, (site.span_start, site.span_end), followed);
@@ -144,7 +140,9 @@ impl FactFiles {
             }
         }
         for site in &discovery.unfollowed {
-            let reason = site.stop.clone().unwrap_or_default();
+            let Some(reason) = site.stop else {
+                continue;
+            };
             facts.record(
                 &site.file,
                 (site.span_start, site.span_end),
@@ -155,7 +153,7 @@ impl FactFiles {
             facts.record(
                 file,
                 (*start, *end),
-                Followed::Unfollowed(MISSED_INSIDE.to_string()),
+                Followed::Unfollowed(Stop::MissedInside),
             );
         }
         for (file, start, end) in &discovery.finished {
@@ -318,7 +316,7 @@ mod tests {
         file: &str,
         span: (u32, u32),
         end: Option<SiteEnd>,
-        stop: Option<&str>,
+        stop: Option<Stop>,
     ) -> DiscoverySite {
         DiscoverySite {
             file: file.to_string(),
@@ -328,7 +326,7 @@ mod tests {
             callee: "send".to_string(),
             end,
             chain: Vec::new(),
-            stop: stop.map(str::to_string),
+            stop,
             receiver: None,
             reached: None,
             bound: Vec::new(),
@@ -403,8 +401,8 @@ mod tests {
                     Some(end("b.ts", LibraryRole::HttpClient)),
                     None,
                 ),
-                site("c.ts", (1, 4), None, Some("no_body")),
-                site("d.ts", (1, 4), None, Some("no_body")),
+                site("c.ts", (1, 4), None, Some(Stop::NoBody)),
+                site("d.ts", (1, 4), None, Some(Stop::NoBody)),
                 site("d.ts", (1, 4), Some(end("e.ts", LibraryRole::Broker)), None),
             ],
             ..Discovery::default()
@@ -420,7 +418,7 @@ mod tests {
         assert_eq!(files, ["a.ts", "b.ts", "d.ts", "e.ts"]);
         assert_eq!(
             facts.followed("c.ts", (1, 4)),
-            Some(&Followed::Stopped("no_body".to_string()))
+            Some(&Followed::Stopped(Stop::NoBody))
         );
         assert_eq!(facts.followed("d.ts", (1, 4)), Some(&Followed::Site));
         assert_eq!(facts.followed("a.ts", (9, 9)), None);
@@ -513,7 +511,7 @@ mod tests {
         for span in &spans {
             assert_eq!(
                 facts.followed("services/api/src/routes.ts", *span),
-                Some(&Followed::Unfollowed("unanswered_package".to_string())),
+                Some(&Followed::Unfollowed(Stop::UnansweredPackage)),
                 "{span:?}"
             );
         }
@@ -544,7 +542,7 @@ mod tests {
             ..FirstAnswer::default()
         };
         let discovery = Discovery {
-            sites: vec![site("a.ts", (1, 4), None, Some("several_values"))],
+            sites: vec![site("a.ts", (1, 4), None, Some(Stop::SeveralValues))],
             missed_inside: vec![("b.ts".to_string(), 2, 6)],
             finished: vec![("c.ts".to_string(), 3, 8)],
             unanswered_at: BTreeMap::from([
@@ -590,7 +588,7 @@ mod tests {
     #[test]
     fn unfollowed_and_finished_calls_are_recorded_and_select_nothing() {
         let discovery = Discovery {
-            unfollowed: vec![site("f.ts", (1, 4), None, Some("value_callee"))],
+            unfollowed: vec![site("f.ts", (1, 4), None, Some(Stop::ValueCallee))],
             finished: vec![("f.ts".to_string(), 1, 4), ("g.ts".to_string(), 2, 6)],
             ..Discovery::default()
         };
@@ -604,7 +602,7 @@ mod tests {
         assert!(facts.files.is_empty());
         assert_eq!(
             facts.followed("f.ts", (1, 4)),
-            Some(&Followed::Unfollowed("value_callee".to_string()))
+            Some(&Followed::Unfollowed(Stop::ValueCallee))
         );
         assert_eq!(facts.followed("g.ts", (2, 6)), Some(&Followed::Finished));
         assert!(facts.followed("f.ts", (1, 4)).unwrap().short());

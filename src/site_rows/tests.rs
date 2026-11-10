@@ -7,7 +7,7 @@ use std::path::Path;
 use serde_json::json;
 
 use super::*;
-use crate::possible_calls::UnreadReason;
+use crate::request_summary::Stop;
 use crate::request_summary::decided_sites::{
     Decided, DecidedSite, HandlerAt, LabelledEnd, PayloadBinding, SiteLabel,
 };
@@ -261,7 +261,7 @@ pub(crate) fn a_socket_fact_row() -> SiteRow {
         .expect("the server socket's row")
 }
 
-fn lead_reason(rows: &[PossibleCall], file: &str) -> Option<UnreadReason> {
+fn lead_reason(rows: &[PossibleCall], file: &str) -> Option<Stop> {
     rows.iter()
         .find(|lead| lead.file_path == file)
         .map(|lead| lead.unread.reason)
@@ -705,12 +705,12 @@ fn sites_that_state_no_row() {
     assert!(row(&rows, "src/no-name.ts").is_none());
     assert_eq!(
         lead_reason(&rows.leads, "src/no-name.ts"),
-        Some(UnreadReason::BelowBand)
+        Some(Stop::BelowBand)
     );
     assert!(row(&rows, "src/failed.ts").is_none());
     assert_eq!(
         lead_reason(&rows.leads, "src/failed.ts"),
-        Some(UnreadReason::Unanswered)
+        Some(Stop::Unanswered)
     );
     assert!(row(&rows, "src/neither.ts").is_none());
     assert_eq!(lead_reason(&rows.leads, "src/neither.ts"), None);
@@ -987,7 +987,7 @@ fn with_no_reader_row_the_band_decides_row_or_lead() {
         assert!(calls.is_empty(), "{file}");
         assert_eq!(
             lead_reason(&fold.leads, file),
-            Some(UnreadReason::BelowBand),
+            Some(Stop::BelowBand),
             "{file}"
         );
     }
@@ -1022,7 +1022,7 @@ fn lead_at(file: &str, line: u32, role: Option<&str>) -> PossibleCall {
         labelled_end: None,
         unread: crate::possible_calls::Unread {
             slot: "path".to_string(),
-            reason: UnreadReason::NoOpClaim,
+            reason: Stop::NoOpClaim,
         },
         trace_depth: 0,
     }
@@ -1605,7 +1605,7 @@ fn a_route_site_with_no_reader_row_is_one_owner_unknown_lead() {
         assert!(endpoints.is_empty());
         assert_eq!(fold.leads.len(), 1, "{method:?}: {:?}", fold.leads);
         let lead = &fold.leads[0];
-        assert_eq!(lead.unread.reason, UnreadReason::OwnerUnknown);
+        assert_eq!(lead.unread.reason, Stop::OwnerUnknown);
         assert_eq!(lead.kind.as_deref(), Some("http"));
         assert_eq!(lead.role.as_deref(), Some("producer"));
         assert_eq!(fold.route_kept_reader, 0);
@@ -1643,7 +1643,7 @@ fn an_asked_route_answer_with_no_method_writes_no_endpoint() {
         assert!(endpoints.is_empty(), "{method:?}");
         assert_eq!(
             lead_reason(&fold.leads, file),
-            Some(UnreadReason::NoMethod),
+            Some(Stop::NoMethod),
             "{method:?}"
         );
         let mut endpoints = vec![reader_route(file)];
@@ -1705,7 +1705,7 @@ fn a_label_only_row_with_a_model_name_and_no_reader_is_uncorroborated() {
     assert!(fold.stated.is_empty());
     assert_eq!(
         lead_reason(&fold.leads, "src/http.ts"),
-        Some(UnreadReason::Uncorroborated)
+        Some(Stop::Uncorroborated)
     );
 }
 
@@ -1758,10 +1758,7 @@ fn an_agreeing_reader_row_corroborates() {
             None
         )]
     );
-    assert_eq!(
-        lead_reason(&fold.leads, file),
-        Some(UnreadReason::Uncorroborated)
-    );
+    assert_eq!(lead_reason(&fold.leads, file), Some(Stop::Uncorroborated));
 }
 
 /// Agreement reads a base written as a value and a segment written as a

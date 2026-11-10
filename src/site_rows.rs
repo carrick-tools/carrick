@@ -73,7 +73,8 @@ use crate::analyzer::ApiEndpointDetails;
 use crate::cloud_storage::CloudRepoData;
 use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::{OperationKey, SocketDirection};
-use crate::possible_calls::{PossibleCall, UnreadReason};
+use crate::possible_calls::PossibleCall;
+use crate::request_summary::Stop;
 use crate::request_summary::decided_sites::{
     Decided, DecidedSite, SiteLabel, Through, origin_side,
 };
@@ -706,14 +707,14 @@ fn key_of(
 ///   would replace the reader's prefixed row at the same line. Until a site
 ///   can name its router it goes to [`SiteRows::routes`]: a possible call
 ///   only where no row stands at its line ([`fold_rows`]).
-fn unwritable_route(kind: &str, side: RowSide, method: Option<&str>) -> Option<UnreadReason> {
+fn unwritable_route(kind: &str, side: RowSide, method: Option<&str>) -> Option<Stop> {
     if kind != "http" || side != RowSide::Endpoint {
         return None;
     }
     if !method.is_some_and(crate::type_manifest::is_producer_method) {
-        return Some(UnreadReason::NoMethod);
+        return Some(Stop::NoMethod);
     }
-    Some(UnreadReason::OwnerUnknown)
+    Some(Stop::OwnerUnknown)
 }
 
 /// Whether `record`'s row rests on a slot only the label forced, with a
@@ -856,12 +857,12 @@ pub fn of(
         };
         let lead = |reason| crate::possible_calls::from_site(site, reason);
         if label_states_a_route(record) {
-            out.routes.push(lead(UnreadReason::OwnerUnknown));
+            out.routes.push(lead(Stop::OwnerUnknown));
             continue;
         }
         let answered = answers.answered.get(&site_id(&record.anchors));
         if record.bucket == Bucket::Asked && answered.is_none() {
-            out.leads.push(lead(UnreadReason::Unanswered));
+            out.leads.push(lead(Stop::Unanswered));
             continue;
         }
         let slot = |slot| filled(record, answered, slot);
@@ -879,7 +880,7 @@ pub fn of(
         let (Some(kind), Some(role), false) =
             (slot(Slot::Kind), slot(Slot::Role), names.is_empty())
         else {
-            out.leads.push(lead(UnreadReason::BelowBand));
+            out.leads.push(lead(Stop::BelowBand));
             continue;
         };
         let name_texts: Option<Vec<String>> = names.iter().map(|name| name.text.clone()).collect();
@@ -887,7 +888,7 @@ pub fn of(
             (kind.text.clone(), role.text.clone(), name_texts)
         else {
             // The model chose none of the options for a slot the key needs.
-            out.leads.push(lead(UnreadReason::BelowBand));
+            out.leads.push(lead(Stop::BelowBand));
             continue;
         };
         let side = match role_text.as_str() {
@@ -934,7 +935,7 @@ pub fn of(
                     .map(crate::library_claims::wire_scope_of),
                 site.end.role == "in_process_bus",
             ) else {
-                out.leads.push(lead(UnreadReason::BelowBand));
+                out.leads.push(lead(Stop::BelowBand));
                 continue;
             };
             // Two names one key reads alike are one row.
@@ -969,7 +970,7 @@ pub fn of(
                 in_band: fact || (confidence >= BAND && orders_agree),
                 name_scope,
                 anchors: record.anchors.clone(),
-                lead: lead(UnreadReason::BelowBand),
+                lead: lead(Stop::BelowBand),
                 needs_reader: needs_reader(record),
                 through: is_through(site),
                 within: Vec::new(),
@@ -1022,7 +1023,7 @@ pub fn descriptor_rows(decided: &Decided) -> Vec<SiteRow> {
                     labelled_end: None,
                     unread: crate::possible_calls::Unread {
                         slot: "path".to_string(),
-                        reason: UnreadReason::NameNeverBound,
+                        reason: Stop::NameNeverBound,
                     },
                     trace_depth: 0,
                 },
@@ -1351,7 +1352,7 @@ pub fn fold_rows(
                 .any(|&index| agrees(&rows[index].key, &row.key))
         {
             let mut lead = row.lead.clone();
-            lead.unread.reason = UnreadReason::Uncorroborated;
+            lead.unread.reason = Stop::Uncorroborated;
             out.leads.push(lead);
             continue;
         }

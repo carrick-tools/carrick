@@ -6962,14 +6962,12 @@ async fn site_rows_of(
     let no_op_claim = decided
         .leads
         .iter()
-        .filter(|lead| lead.reason == crate::request_summary::decided_sites::Undecided::NoOpClaim)
+        .filter(|lead| lead.reason == crate::request_summary::Stop::NoOpClaim)
         .count();
     let several_operations = decided
         .leads
         .iter()
-        .filter(|lead| {
-            lead.reason == crate::request_summary::decided_sites::Undecided::SeveralOperations
-        })
+        .filter(|lead| lead.reason == crate::request_summary::Stop::SeveralOperations)
         .count();
     debug!(
         discovered,
@@ -25806,7 +25804,7 @@ unfollowed_member_calls_total: 0,
                 labelled_end: None,
                 unread: crate::possible_calls::Unread {
                     slot: "name".to_string(),
-                    reason: crate::possible_calls::UnreadReason::BelowBand,
+                    reason: crate::request_summary::Stop::BelowBand,
                 },
                 trace_depth: 0,
             },

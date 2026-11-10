@@ -16,9 +16,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::Stop;
 use crate::position_rows::Kind;
 use crate::services::type_sidecar::{ImplementationsAnswer, ImplementationsQuery};
-use crate::unfollowed_calls::INTERFACE_MEMBER;
 
 use super::RequestSummaryInputs;
 use super::row_calls::every_call;
@@ -133,7 +133,7 @@ impl RequestSummaryInputs {
             .filter(|(_, call, construction)| !construction && !call.jsx)
             .filter(|(file, call, _)| {
                 self.unfollowed_at(file, call.site.lo, call.site.hi)
-                    .is_some_and(|stop| stop.reason == INTERFACE_MEMBER)
+                    .is_some_and(|stop| stop.reason == Stop::InterfaceMember)
             })
             .filter_map(|(file, call, _)| {
                 let ir = self.files.get(file)?;

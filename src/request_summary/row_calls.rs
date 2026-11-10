@@ -361,8 +361,8 @@ impl Reach {
 /// Why a member call is left without a target ([`RequestSummaryInputs::unfollowed_at`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unfollowed {
-    /// `interface_member`, or the hole the rows left ([`hole_key`]).
-    pub reason: String,
+    /// `interface_member`, or the hole the rows left ([`Stop`]).
+    pub reason: Stop,
     /// The declaration's file as walked and line, for `interface_member`.
     pub declared_at: Option<(PathBuf, u32)>,
 }
@@ -443,8 +443,12 @@ impl RequestSummaryInputs {
             }
             let reach = self.row_reach(file, call.site.lo, call.site.hi);
             let key = match (&reach, graph) {
-                (Reach::Unknown(reason), Some(_)) => format!("graph_only/{}", hole_key(*reason)),
-                (Reach::Unknown(reason), None) => format!("neither/{}", hole_key(*reason)),
+                (Reach::Unknown(reason), Some(_)) => {
+                    format!("graph_only/{}", Stop::from(*reason).as_str())
+                }
+                (Reach::Unknown(reason), None) => {
+                    format!("neither/{}", Stop::from(*reason).as_str())
+                }
                 (reach, graph) => match (reach.target(), graph) {
                     (Some(rows), Some(graph)) if rows == *graph => "agree".to_string(),
                     (Some(_), Some(_)) => "differ".to_string(),
@@ -733,13 +737,13 @@ impl RequestSummaryInputs {
         }
         match self.reach(file, lo, hi) {
             Reach::Unknown(reason) => Some(Unfollowed {
-                reason: hole_key(reason),
+                reason: Stop::from(reason),
                 declared_at: None,
             }),
             Reach::NoFunction => {
                 self.declared_non_definition(file, lo, hi)
                     .map(|declared| Unfollowed {
-                        reason: crate::unfollowed_calls::INTERFACE_MEMBER.to_string(),
+                        reason: Stop::InterfaceMember,
                         declared_at: Some(declared),
                     })
             }
@@ -867,13 +871,6 @@ fn join(declared: &FileIr, line: Option<u32>, symbol: &str) -> Join {
     }
 }
 
-pub(crate) fn hole_key(reason: HoleReason) -> String {
-    serde_json::to_value(reason)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::fixture_walk::{NODENEXT, Walked, walked};
@@ -936,7 +933,7 @@ mod tests {
                     target.file_name().unwrap().to_string_lossy()
                 ),
                 Reach::NoFunction => "no_function".to_string(),
-                Reach::Unknown(reason) => format!("unknown {}", hole_key(reason)),
+                Reach::Unknown(reason) => format!("unknown {}", Stop::from(reason).as_str()),
             };
             out.entry(call.site.line).or_default().push(text);
         }

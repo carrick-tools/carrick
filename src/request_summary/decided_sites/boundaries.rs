@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::RequestSummaryInputs;
 use super::super::resolve::ValueAt;
+use super::super::stop::Stop;
 use super::composed::Mounts;
 use super::instances::{
     InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,
@@ -83,17 +84,50 @@ pub enum Part {
 
 /// Where a chain read upwards ends.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "end", rename_all = "snake_case")]
+#[serde(tag = "end", rename_all = "snake_case", try_from = "EndWire")]
 pub enum End {
     /// An instance served at no mount.
     Top,
     /// A boundary another service's facts continue.
     Boundary { boundary: Boundary },
-    /// Any other hole, by its reason (`cycle` included).
-    Hole { reason: String },
+    /// Any other hole, by its stop (`recursion` included).
+    Hole { reason: Stop },
+    /// An instance a socket library's call hands in: nothing mounts it
+    /// under a prefix (carrick#1670). An answer, not a stop.
+    Handed,
     /// An instance handed to a call no verified mount reads (carrick#2474
     /// R3 S0).
     MountUnverified,
+}
+
+/// [`End`] as a blob holds it. An older scanner wrote the handed end as a
+/// hole whose reason was `handed`, and a recursion as `cycle`.
+#[derive(Deserialize)]
+#[serde(tag = "end", rename_all = "snake_case")]
+enum EndWire {
+    Top,
+    Boundary { boundary: Boundary },
+    Hole { reason: String },
+    Handed,
+    MountUnverified,
+}
+
+impl TryFrom<EndWire> for End {
+    type Error = String;
+
+    fn try_from(wire: EndWire) -> Result<End, String> {
+        Ok(match wire {
+            EndWire::Top => End::Top,
+            EndWire::Boundary { boundary } => End::Boundary { boundary },
+            EndWire::Handed => End::Handed,
+            EndWire::MountUnverified => End::MountUnverified,
+            EndWire::Hole { reason } if reason == "handed" => End::Handed,
+            EndWire::Hole { reason } => End::Hole {
+                reason: serde_json::from_value(serde_json::Value::String(reason.clone()))
+                    .map_err(|_| format!("no stop is spelled `{reason}`"))?,
+            },
+        })
+    }
 }
 
 /// One chain above a value: its parts from where it ends down.
@@ -243,7 +277,7 @@ fn forced_route_method(site: &super::DecidedSite, labels: &[SiteLabel]) -> Optio
 fn unread(aboves: &[Above]) -> bool {
     aboves
         .iter()
-        .all(|above| matches!(&above.end, End::Hole { reason } if reason == "unread"))
+        .all(|above| matches!(&above.end, End::Hole { reason } if *reason == Stop::Unread))
 }
 
 impl<'c, 'a> Collect<'c, 'a> {
@@ -311,7 +345,10 @@ impl<'c, 'a> Collect<'c, 'a> {
                 match (composed.end.as_str(), &composed.path) {
                     ("top", Some(full_path)) => in_service.paths.push(full_path.clone()),
                     ("top", None) => in_service.unread.push("unread_prefix".to_string()),
-                    (end @ ("cycle" | "mount_unverified"), _) => {
+                    (end, _)
+                        if end == Stop::Recursion.as_str()
+                            || end == Stop::MountUnverified.as_str() =>
+                    {
                         in_service.unread.push(end.to_string())
                     }
                     (reason, _) => in_service.unread.push(format!("hole_{reason}")),
@@ -621,7 +658,7 @@ impl<'b> Across<'b> {
     /// cycle.
     fn up(&self, at: &Boundary, only_at: Option<&str>, seen: &mut Vec<Boundary>) -> Ways {
         if seen.contains(at) {
-            return vec![Err("cycle".to_string())];
+            return vec![Err(Stop::Recursion.as_str().to_string())];
         }
         seen.push(at.clone());
         let ways = match at {
@@ -689,9 +726,12 @@ impl<'b> Across<'b> {
         let tops = match &above.end {
             End::Top => vec![Ok(Vec::new())],
             End::Boundary { boundary } => self.up(boundary, only_at, seen),
-            End::Hole { reason } if reason == "cycle" => vec![Err("cycle".to_string())],
-            End::Hole { reason } => vec![Err(format!("hole_{reason}"))],
-            End::MountUnverified => vec![Err("mount_unverified".to_string())],
+            End::Hole {
+                reason: Stop::Recursion,
+            } => vec![Err(Stop::Recursion.as_str().to_string())],
+            End::Hole { reason } => vec![Err(format!("hole_{}", reason.as_str()))],
+            End::Handed => vec![Err("hole_handed".to_string())],
+            End::MountUnverified => vec![Err(Stop::MountUnverified.as_str().to_string())],
         };
         tops.into_iter()
             .map(|top| {
@@ -1147,7 +1187,7 @@ mod tests {
             hand_outs: Vec::new(),
         };
         let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
-        assert_eq!(resolved[0].untraced.as_deref(), Some("cycle"));
+        assert_eq!(resolved[0].untraced.as_deref(), Some("recursion"));
     }
 
     /// carrick#2474 R5b: the ways one host resolves are capped at
@@ -1277,5 +1317,34 @@ mod tests {
         assert_eq!(alone[0].unread_hosts, 2);
         let every = resolve(&[("r", &r), ("s", &s)], FanOut::EveryHost);
         assert_eq!(every[0].untraced.as_deref(), Some("unread_host"));
+    }
+
+    /// A blob an older scanner wrote reads: its `cycle` hole is a
+    /// recursion, and its `handed` hole is the handed end (carrick#3688).
+    #[test]
+    fn an_old_route_boundary_cycle_reads_as_recursion() {
+        let old: End =
+            serde_json::from_value(serde_json::json!({"end": "hole", "reason": "cycle"})).unwrap();
+        assert_eq!(
+            old,
+            End::Hole {
+                reason: Stop::Recursion
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::json!({"end": "hole", "reason": "recursion"})
+        );
+        let handed: End =
+            serde_json::from_value(serde_json::json!({"end": "hole", "reason": "handed"})).unwrap();
+        assert_eq!(handed, End::Handed);
+        let other: End =
+            serde_json::from_value(serde_json::json!({"end": "hole", "reason": "unread"})).unwrap();
+        assert_eq!(
+            other,
+            End::Hole {
+                reason: Stop::Unread
+            }
+        );
     }
 }
