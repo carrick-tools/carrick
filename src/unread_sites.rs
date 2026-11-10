@@ -667,7 +667,7 @@ mod tests {
             }],
             ..Decided::default()
         };
-        let rows = from_scan(&discovery, &decided);
+        let rows = from_scan(&discovery, &decided, &[], Path::new("/repo"));
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].reason, Stop::NoBody);
         assert_eq!(rows[0].stop_at.as_deref(), Some("src/b.ts:40"));
@@ -683,6 +683,37 @@ mod tests {
                 rows[1].slot.as_str()
             ),
             (Some("pubsub"), Some("producer"), "name")
+        );
+    }
+
+    /// A caller the send side could not compose is one unread site at the
+    /// call, with the reason and the HTTP consumer role the request has.
+    #[test]
+    fn a_caller_stop_is_an_unread_site_at_the_call() {
+        let caller = CallerStop {
+            file: "/repo/src/use.ts".into(),
+            line: 6,
+            span_start: 60,
+            span_end: 72,
+            callee: "items.list".to_string(),
+            request_at: ("/repo/src/store.ts".into(), 20),
+            reason: Stop::Reassigned,
+            also: vec![Stop::UnreadExpression],
+        };
+        let rows = from_scan(
+            &Discovery::default(),
+            &Decided::default(),
+            &[caller],
+            Path::new("/repo"),
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!((row.file.as_str(), row.line), ("src/use.ts", 6));
+        assert_eq!(row.reason, Stop::Reassigned);
+        assert_eq!(row.also, vec![Stop::UnreadExpression]);
+        assert_eq!(
+            (row.slot.as_str(), row.kind.as_deref(), row.role.as_deref()),
+            ("path", Some("http"), Some("consumer"))
         );
     }
 }
