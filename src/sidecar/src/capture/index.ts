@@ -74,6 +74,7 @@ export { findServiceTsconfig, GoverningConfigs } from './service-config.js';
 export { WriteGuard } from './guarded-fs.js';
 export { installedPackageDirectory } from './installed-package-directory.js';
 export { isDeclarationFileName, packageNameOf } from './specifiers.js';
+export type { InternalTypeChecker } from './node-builder.js';
 export { toPosix } from './installed-package.js';
 export { constituentsOf } from './result-label.js';
 export { moduleExport } from './anchors.js';

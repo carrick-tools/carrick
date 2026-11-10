@@ -74,7 +74,7 @@ import type {
   SurfaceTypeExport,
 } from './types.js';
 import { memberDeclaration } from './declaration-attribution.js';
-import type { InternalTypeChecker } from './capture/node-builder.js';
+import type { InternalTypeChecker } from './capture/index.js';
 
 /** The methods a `verb` claim may name, and a method key may accept. */
 const HTTP_METHODS: ReadonlySet<string> = new Set([

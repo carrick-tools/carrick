@@ -102,7 +102,8 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           base === 'position-rows.ts' ||
           base === 'infer-cache.ts' ||
           base === 'retype.ts' ||
-          base === 'default-library.ts'
+          base === 'default-library.ts' ||
+          base === 'library-claims.ts'
         ) {
           // Shared Deno resolution, the options every program carries
           // (`sidecarCompilerOptions`, carrick#2019), and the response-table
@@ -113,7 +114,9 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           // The retype reads a declared no-body return
           // with the same `statesNoBody` (carrick#2743). The default
           // library's file system builds its base project with the same
-          // options (carrick#3509).
+          // options (carrick#3509). The lister's bounded print types the
+          // compiler's 5-argument node builder with the capture's own
+          // `InternalTypeChecker` (carrick#3744).
           assert.strictEqual(
             spec,
             './capture/index.js',
