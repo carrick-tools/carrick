@@ -2490,7 +2490,7 @@ mod tests {
         let service = "graphql-unread-3758".to_string();
         crate::scan_health::forget_service_losses(Some(&service));
         let extraction = crate::current_service::sync_scope(Some(service.clone()), || {
-            scan_repo(&[src.clone()], &[], &[])
+            scan_repo(std::slice::from_ref(&src), &[], &[])
         });
         let unread = crate::scan_health::unread_sources_for(Some(&service));
         crate::scan_health::forget_service_losses(Some(&service));
