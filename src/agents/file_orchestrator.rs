@@ -2847,11 +2847,6 @@ impl FileOrchestrator {
             file_results.insert(path_str, FileAnalysisResult::default());
         }
 
-        // Whether the fact layer chooses the reader's files (carrick#2613,
-        // ticket T3): the engine sends the fact layer's files. Without them
-        // the gate below is the hand-written signals'.
-        let choosing_files = !matches!(self.fact_files, FactFileSource::None);
-
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
@@ -3019,23 +3014,19 @@ impl FileOrchestrator {
             // The candidates the register signals alone raised (carrick#2613,
             // D4), decided once the fact layer's files are in.
             let held: BTreeMap<(u32, u32), BTreeSet<crate::swc_scanner::RegisterSignal>> =
-                if choosing_files {
-                    scan_result
-                        .candidates
-                        .iter()
-                        .filter(|candidate| candidate.protocol == Protocol::Http)
-                        .map(|candidate| (candidate.span_start, candidate.span_end))
-                        .filter(|span| !scan_result.kept_spans.contains(span))
-                        .filter_map(|span| {
-                            scan_result
-                                .register_signals
-                                .get(&span)
-                                .map(|signals| (span, signals.clone()))
-                        })
-                        .collect()
-                } else {
-                    BTreeMap::new()
-                };
+                scan_result
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.protocol == Protocol::Http)
+                    .map(|candidate| (candidate.span_start, candidate.span_end))
+                    .filter(|span| !scan_result.kept_spans.contains(span))
+                    .filter_map(|span| {
+                        scan_result
+                            .register_signals
+                            .get(&span)
+                            .map(|signals| (span, signals.clone()))
+                    })
+                    .collect();
             if !scan_result.register_signals.is_empty() {
                 register_tagged.push((
                     crate::utils::repo_relative_source_path(&path_str, &repo_root_str).to_string(),
@@ -3380,7 +3371,7 @@ impl FileOrchestrator {
         // has run beside the ask, and before the passes below read the
         // candidates. When the engine sent none, nothing is chosen here.
         let fact_files = self.fact_files.take().await;
-        if let Some(facts) = fact_files.as_ref().filter(|_| choosing_files) {
+        if let Some(facts) = fact_files.as_ref() {
             use crate::request_summary::fact_files::Followed;
             // D4: a candidate only the register signals raised is kept where
             // discovery could not follow its call, listed for the reader
@@ -3610,7 +3601,7 @@ impl FileOrchestrator {
         // With the fact layer choosing the reader's files, a member whose
         // request is a call through a server-framework export is a route
         // registration, not a request (carrick#2745): it never enters the cache.
-        let server_facts = fact_files.as_ref().filter(|_| choosing_files);
+        let server_facts = fact_files.as_ref();
         let mut member_cache: HashMap<PathBuf, RequestMemberIndex> = HashMap::new();
         for pf in &pending {
             if let Ok(canonical) = Path::new(&pf.path_str).canonicalize() {
@@ -4475,7 +4466,6 @@ impl FileOrchestrator {
         }
         let store_registrations = fact_files
             .as_ref()
-            .filter(|_| choosing_files)
             .map(|facts| facts.server_framework_start_pairs())
             .unwrap_or_default();
         let withdrawn = summaries.withdraw_registrations(&registered, &store_registrations);
@@ -4845,7 +4835,7 @@ impl FileOrchestrator {
         // answer for the file (replayed from the cache or not) can hold a row
         // that joined none and has no span, which 5c does not parse a file
         // for.
-        if let Some(facts) = fact_files.as_ref().filter(|_| choosing_files) {
+        if let Some(facts) = fact_files.as_ref() {
             stats.graphql_client_site_drops =
                 Self::withdraw_graphql_client_rows(&mut file_results, facts);
             if stats.graphql_client_site_drops > 0 {
