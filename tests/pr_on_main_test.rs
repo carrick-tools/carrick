@@ -3290,24 +3290,30 @@ async fn seed_trpc_output_field_removed() {
 async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
     let _serial = SERIAL.lock().await;
     let main = main_snapshot().await;
-    if let Some(home) = std::env::var_os("HOME") {
-        let dir = PathBuf::from(home).join(".carrick/logs/runs");
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
-            if !text.contains("rpc-shelf") {
-                continue;
-            }
-            for line in text.lines() {
-                let lower = line.to_lowercase();
-                if lower.contains("procedure")
-                    || lower.contains("walk")
-                    || lower.contains("untraced")
-                    || lower.contains("claims")
-                {
-                    eprintln!("DIAGLOG {}", &line[..line.len().min(300)]);
-                }
-            }
-            break;
+    seed_env();
+    for (label, dirname, cache) in [
+        ("A", "rpc-shelf", false),
+        ("B", "shelfrepo", false),
+        ("C", "rpc-shelf", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let src =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr-seeds/rpc-shelf");
+        let repo = unlinked(tmp.path()).join(dirname);
+        copy_dir(&src, &repo);
+        git(&repo, &["init", "-q"]);
+        commit(&repo, "init");
+        let cache_dir = tmp.path().join("cache");
+        let _cache = cache.then(|| EnvVar::set("CARRICK_CACHE_DIR", cache_dir.to_str().unwrap()));
+        let store = Store::default();
+        scan_seed_repo(&store, &repo).await;
+        for row in store.repos.lock().unwrap().iter() {
+            eprintln!(
+                "DIAGVAR {label} {:?} endpoints={} calls={}",
+                row.service_name,
+                row.endpoints.len(),
+                row.calls.len()
+            );
         }
     }
     for row in &main.shelf_rows {
