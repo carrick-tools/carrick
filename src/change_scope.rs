@@ -397,7 +397,7 @@ fn gitignore_moves(
     untracked.iter().any(|entry| {
         let is_dir = entry.ends_with('/');
         let path = entry.trim_end_matches('/');
-        if !under(path, governed) && !(is_dir && under(governed, path)) {
+        if !(under(path, governed) || is_dir && under(governed, path)) {
             return false;
         }
         // An untracked folder that holds something the service reads whole
@@ -2203,6 +2203,19 @@ pub fn stamp_carried(payload: &mut CloudRepoData, head: &str, dirty: bool) {
 
 #[cfg(test)]
 mod tests {
+    /// The untracked-entry gate in the gitignore check was rewritten for
+    /// clippy::nonminimal_bool; every input combination keeps its result.
+    #[test]
+    fn untracked_entry_gate_rewrite_keeps_every_case() {
+        for bits in 0..8u8 {
+            let (path_under_governed, is_dir, governed_under_path) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            let old = !path_under_governed && !(is_dir && governed_under_path);
+            let new = !(path_under_governed || is_dir && governed_under_path);
+            assert_eq!(old, new, "inputs {bits:03b}");
+        }
+    }
+
     use super::*;
 
     const THIS: ThisRun<'static> = ThisRun {
