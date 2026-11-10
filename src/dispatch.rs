@@ -411,6 +411,39 @@ impl DeclaredHandlers {
     }
 }
 
+/// Whether `endpoint` is a row [`apply_declared_operations`] wrote from one of
+/// `config`'s blocks: the source that block writes, the block's dispatch
+/// field and one of its values, and its route when it names one. A model row
+/// the file analyzer produced for the same handler fails the source or the
+/// route.
+fn written_by_a_block(
+    endpoint: &crate::mount_graph::ResolvedEndpoint,
+    config: &crate::config::Config,
+) -> bool {
+    use crate::agents::file_analyzer_agent::ResolutionSource;
+
+    let Some(dispatch) = endpoint.dispatch.as_ref() else {
+        return false;
+    };
+    config.declared_operations.iter().any(|block| {
+        let source = if block.is_generated() {
+            ResolutionSource::Model
+        } else {
+            ResolutionSource::DeclaredOperation
+        };
+        endpoint.resolution_source == Some(source)
+            && dispatch.location == block.dispatch.location
+            && dispatch.field == block.dispatch.field
+            && block.operations.iter().any(|op| op.value == dispatch.value)
+            && match block.parsed_route().ok().flatten() {
+                Some((method, path)) => {
+                    endpoint.method.eq_ignore_ascii_case(&method) && endpoint.full_path == path
+                }
+                None => true,
+            }
+    })
+}
+
 /// The type requests for every declared operation placed at its handler
 /// (carrick#2076). A declared row has no file-analysis row, so the producer
 /// loop of `collect_type_requests` never asks for it; this asks what that
@@ -432,7 +465,6 @@ pub fn declared_infer_requests(
     handlers: &DeclaredHandlers,
     repo_path: &str,
 ) -> Vec<crate::services::type_sidecar::InferRequestItem> {
-    use crate::agents::file_analyzer_agent::ResolutionSource;
     use crate::cloud_storage::{ManifestRole, ManifestTypeKind};
     use crate::services::type_sidecar::{InferKind, InferRequestItem};
     use crate::type_manifest::{
@@ -477,12 +509,10 @@ pub fn declared_infer_requests(
     let mut requests = Vec::new();
     let mut asked: std::collections::HashSet<(String, &'static str)> = Default::default();
     for endpoint in &graph.endpoints {
-        // A generated block's rows are `Model`; `placed` holds only the
-        // locations a block's handlers resolved to, so the row must sit there.
-        if !matches!(
-            endpoint.resolution_source,
-            Some(ResolutionSource::DeclaredOperation | ResolutionSource::Model)
-        ) {
+        // Only a row a declared block wrote is asked. A generated block's
+        // rows are `Model`, as are the file analyzer's own, and `placed`
+        // alone cannot tell them apart.
+        if !written_by_a_block(endpoint, config) {
             continue;
         }
         // The raw line: `parse_file_location` reads line 0 as 1, and an
@@ -1266,6 +1296,38 @@ mod tests {
             requests
                 .iter()
                 .all(|r| r.file_path == format!("/repo/{FILE}"))
+        );
+    }
+
+    /// A model row the file analyzer produced is not a generated block's row,
+    /// even at a placed handler's location: it gets no type ask.
+    #[test]
+    fn a_model_row_outside_a_declared_block_gets_no_type_ask() {
+        let mut config = config_with(vec![block(
+            Some("POST /types/check-or-upload"),
+            &["search-by-intent"],
+        )]);
+        config.declared_operations[0].source = Some("generated".to_string());
+        let handlers = handlers(&[(
+            FILE,
+            "handle-search-by-intent",
+            40,
+            &[("payload", Some("SearchInput"))],
+        )]);
+        let mut graph = crate::mount_graph::MountGraph::new();
+        apply_declared_operations(&mut graph, &config, &handlers);
+        let mut other = graph.endpoints[0].clone();
+        other.method = "POST".into();
+        other.path = "/other".into();
+        other.full_path = "/other".into();
+        graph.endpoints.push(other);
+
+        let requests = declared_infer_requests(&graph, &config, &handlers, "/repo");
+
+        assert_eq!(
+            requests.len(),
+            1,
+            "the block's row only: one handler, no param"
         );
     }
 
