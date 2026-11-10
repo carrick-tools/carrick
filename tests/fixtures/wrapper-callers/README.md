@@ -22,13 +22,15 @@ fills it with; under any other test (`if (data)`) every write is kept.
 
 Answer key (the row at each call line in `use-branches.ts`):
 
-- 16, set in both branches of a prefix test, called with a path: `POST
+- 18, set in both branches of a prefix test, called with a path: `POST
   /api/items.list` only.
-- 17, initialised then set again under a prefix test: `POST /api/items.list`.
-- 18, a query set under a truthiness test, or the path: every row keys `POST
+- 19, initialised then set again under a prefix test: `POST /api/items.list`.
+- 20, a query set under a truthiness test, or the path: every row keys `POST
   /api/items.list`.
-- 19, line 16's client called with an absolute URL: `POST
-  https://other.test/x` only.
-- 20, set again inside a callback: no row.
-- 21, the branching client (a method test filled one hop away, then an
+- 21, line 18's client called with an absolute URL: only that URL is sent,
+  an outside host the scan states no call row for (as an inline `fetch` of
+  one), so no row; never a based `/api/https://…`.
+- 22, set again inside a callback: no row.
+- 23, the branching client (a method test filled one hop away, then an
   anchored pattern on the path): `POST /api/items.list` only.
+- 24, the URL set from a query the same statement sets: no row.

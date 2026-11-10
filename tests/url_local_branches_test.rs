@@ -71,17 +71,17 @@ fn rows_at(line: i64) -> Vec<String> {
 
 #[test]
 fn a_url_local_set_in_both_branches_is_read_at_every_caller() {
-    assert_eq!(rows_at(16), ["POST /api/items.list"]);
+    assert_eq!(rows_at(18), ["POST /api/items.list"]);
 }
 
 #[test]
 fn a_url_local_reassigned_after_its_initialiser_is_read_at_every_caller() {
-    assert_eq!(rows_at(17), ["POST /api/items.list"]);
+    assert_eq!(rows_at(19), ["POST /api/items.list"]);
 }
 
 #[test]
 fn a_url_reading_a_branch_set_local_or_the_path_is_read() {
-    let rows = rows_at(18);
+    let rows = rows_at(20);
     assert!(!rows.is_empty(), "no row at the caller");
     for row in &rows {
         assert!(
@@ -95,21 +95,29 @@ fn a_url_reading_a_branch_set_local_or_the_path_is_read() {
 fn a_way_the_callers_literal_rules_out_states_no_row() {
     // The prefix test is false for a path: the absolute way is dropped, so
     // no bare `/items.list` is stated.
-    assert_eq!(rows_at(16), ["POST /api/items.list"]);
+    assert_eq!(rows_at(18), ["POST /api/items.list"]);
     // It is true for an absolute URL: only the URL itself is sent, an
     // outside host this projection holds no call for, so the based way
     // (`/api/https://…`) states nothing here.
-    assert_eq!(rows_at(19), Vec::<String>::new());
+    assert_eq!(rows_at(21), Vec::<String>::new());
 }
 
 #[test]
 fn a_local_written_inside_a_callback_stays_unread() {
-    assert_eq!(rows_at(20), Vec::<String>::new());
+    assert_eq!(rows_at(22), Vec::<String>::new());
 }
 
 #[test]
 fn the_branching_client_states_one_row_at_its_caller() {
     // `verb === "GET"` is filled `"POST"` by `post`, a hop away, and
     // `path.match(/^http/)` is false for `/items.list`.
-    assert_eq!(rows_at(21), ["POST /api/items.list"]);
+    assert_eq!(rows_at(23), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_local_written_from_another_the_same_statement_writes_stays_unread() {
+    // `target` is set from `query` in the branch that sets `query` too:
+    // nothing says what `query` holds there, so `target` states nothing,
+    // whichever order the two locals are read in.
+    assert_eq!(rows_at(24), Vec::<String>::new());
 }

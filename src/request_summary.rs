@@ -6454,12 +6454,24 @@ impl Reader<'_> {
             }
             // A local this statement writes reads as nothing inside it, and
             // as each way the statement leaves it after it (carrick#3679).
-            let before: Vec<(BindingKey, Alternatives)> = written
+            // Every local's ways are read before any is put back, so one the
+            // statement writes from another reads it as nothing, whichever
+            // order the locals are taken in.
+            let mut keys: Vec<BindingKey> = written
                 .keys()
                 .filter(|key| alternatives::writes_local(stmt, key))
-                .filter_map(|key| Some((key.clone(), scope.alts.remove(key)?)))
+                .cloned()
+                .collect();
+            keys.sort();
+            let before: Vec<(BindingKey, Alternatives)> = keys
+                .into_iter()
+                .filter_map(|key| {
+                    let state = scope.alts.remove(&key)?;
+                    Some((key, state))
+                })
                 .collect();
             self.walk(stmt, scope, ir);
+            let mut after = Vec::new();
             for (key, state) in before {
                 let placed = written.get_mut(&key).expect("a written local");
                 let mut flow = alternatives::WriteFlow {
@@ -6472,13 +6484,14 @@ impl Reader<'_> {
                 match self.written_ways(stmt, state, &mut flow) {
                     Some(state) => {
                         let state = state.of_local(&key, placed);
-                        scope.alts.insert(key, state);
+                        after.push((key, state));
                     }
                     None => {
                         written.remove(&key);
                     }
                 }
             }
+            scope.alts.extend(after);
         }
     }
 

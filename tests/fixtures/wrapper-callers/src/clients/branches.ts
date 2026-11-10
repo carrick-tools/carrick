@@ -76,3 +76,18 @@ export class BranchClient {
   };
   post = <T = unknown>(path: string, data?: object): Promise<T> => this.send<T>(path, "POST", data);
 }
+
+// a8: one statement sets two locals, the URL from the query it also sets.
+export class TwoLocals {
+  base = "/api";
+  post = async (path: string, data?: object): Promise<unknown> => {
+    let query = "";
+    let target = this.base + path;
+    if (data) {
+      query = "?q=1";
+      target = this.base + path + query;
+    }
+    const res = await fetch(target, { method: "POST" });
+    return res.json();
+  };
+}

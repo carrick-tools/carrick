@@ -59,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 
+use super::guards::{HoleReason, Root};
 use super::resolve::PlacedWrites;
 use super::{MethodValue, Piece, Reader, Scope, Value, concat, ident_key, render_target};
 use crate::binding_scope::BindingKey;
@@ -902,6 +903,22 @@ impl Reader<'_> {
                 }
                 flow.placed.insert(assign.span.lo.0);
                 let mut written = self.reading_of(&assign.right, flow.scope)?;
+                // A value read from a local this pass holds no ways for (one
+                // the same statement writes too) says nothing of this one.
+                let unread = written.readings.iter().any(|reading| {
+                    reading.pieces.iter().any(|piece| {
+                        matches!(
+                            piece,
+                            Piece::Opaque {
+                                end: Root::Hole(HoleReason::Reassigned),
+                                ..
+                            }
+                        )
+                    })
+                });
+                if unread {
+                    return None;
+                }
                 for (guard, holds) in &flow.path {
                     written = written.under(guard.as_ref(), *holds);
                 }
