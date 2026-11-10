@@ -866,10 +866,15 @@ mod tests {
             "p_catch",
         ] {
             let got = resolver.text_values(&path, &argument(callee));
-            assert_eq!(
-                got,
-                vec![TextValue::Hole(guards::HoleReason::OutsideService)],
-                "{callee}"
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [TextValue::Hole {
+                        reason: guards::HoleReason::OutsideService,
+                        ..
+                    }]
+                ),
+                "{callee}: {got:?}"
             );
         }
     }
