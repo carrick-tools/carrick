@@ -109,7 +109,8 @@ fn at_site(finding: &Value, site: Option<&str>) -> bool {
 /// What makes a correct check not clean: an introduced (or not compared)
 /// type or method risk, a break row the PR introduced, or a file whose
 /// operation changes the delta could not list (`delta.files_not_read`,
-/// carrick#3233).
+/// carrick#3233). A file read but with `operations_missing` is not a raiser:
+/// the renderer does not treat it as one either.
 fn raisers(payload: &Value) -> Vec<&Value> {
     array(&payload["findings"])
         .iter()
@@ -118,7 +119,11 @@ fn raisers(payload: &Value) -> Vec<&Value> {
             Some("missing_endpoint" | "orphaned_endpoint") => truthy(&f["removed"]) && marked(f),
             _ => false,
         })
-        .chain(array(&payload["delta"]["files_not_read"]))
+        .chain(
+            array(&payload["delta"]["files_not_read"])
+                .iter()
+                .filter(|f| f["reason"] != "operations_missing"),
+        )
         .collect()
 }
 
