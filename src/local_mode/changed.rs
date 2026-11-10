@@ -936,6 +936,15 @@ fn outside_before(
     }
 }
 
+/// The join's wire string back to the shared type; absent stays absent.
+fn edge_source_stated(wire: Option<&str>) -> Option<EdgeSource> {
+    match wire {
+        Some("fact") => Some(EdgeSource::Fact),
+        Some(_) => Some(EdgeSource::Candidate),
+        None => None,
+    }
+}
+
 /// The problems in the changed files, read off the rebuilt index and the join
 /// it came from.
 ///
@@ -1065,7 +1074,7 @@ pub(super) fn judge(
         // source, so it is reported and does not fail the run.
         let fact_inputs = finding.map(|finding| {
             (
-                finding.edge_source.as_deref() == Some("fact"),
+                edge_source_stated(finding.edge_source.as_deref()),
                 finding.verdict_state.as_deref() == Some("unresolved"),
             )
         });
@@ -1094,10 +1103,10 @@ pub(super) fn judge(
         let already_here = already && in_change;
         // The one break answer, with this run's own "before" as main's side:
         // the index held the mismatch (on main), or held the pair agreeing
-        // (this change broke it), or said nothing about it (not placed). The
-        // check never enforces a source the join did not state, so anything
-        // but a `fact` edge is passed as a candidate.
-        let certain = fact_inputs.is_some_and(|(is_fact, unresolved)| {
+        // (this change broke it), or said nothing about it (not placed). A source
+        // is passed as stated: no source (an SDK-mediated edge) stays `None`
+        // and the shared function enforces it, as the PR comment does.
+        let certain = fact_inputs.is_some_and(|(edge_source, unresolved)| {
             let on_main = if already_here {
                 Some(true)
             } else if in_change || moved_here {
@@ -1106,11 +1115,7 @@ pub(super) fn judge(
                 None
             };
             mismatch_break_status(
-                Some(if is_fact {
-                    EdgeSource::Fact
-                } else {
-                    EdgeSource::Candidate
-                }),
+                edge_source,
                 unresolved.then_some(VerdictState::Unresolved),
                 on_main,
                 None,
@@ -2484,6 +2489,73 @@ mod tests {
             .filter(|p| p.not_judged_before)
             .count();
         assert_eq!(unjudged, 1, "{:?}", judged.problems);
+    }
+
+    /// One consumer call at `client.ts:10`, edited in this change and now a
+    /// type mismatch, whose finding states `edge_source` (`None`: the
+    /// SDK-mediated case, which states none). Whether the run fails on it.
+    fn mismatch_fails(edge_source: Option<&str>) -> bool {
+        let row = |verdict: serde_json::Value| {
+            serde_json::json!({
+                "kind": "call", "service": "web", "key": "http|GET|/a", "dispatch": null,
+                "method": "GET", "path": "/a", "line": 10, "col": null, "source": "fact",
+                "resolution_source": null, "evidence": null,
+                "counterparts": [{"role": "producer", "service": "api", "file": "h.ts", "line": 1}],
+                "verdict": verdict
+            })
+        };
+        let before = index_of(vec![row(
+            serde_json::json!({"state": "resolved", "result": "compatible", "detail": ""}),
+        )]);
+        let rebuilt = index_of(vec![row(
+            serde_json::json!({"state": "resolved", "result": "type_mismatch", "detail": "differs"}),
+        )]);
+        let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
+            "scanner_version": "0",
+            "operations": [{
+                "role": "consumer", "service": "web", "key": "http|GET|/a",
+                "method": "GET", "path": "/a", "file": "client.ts", "line": 10,
+                "resolution_source": null, "handler": null, "dispatch": null
+            }],
+            "matches": [], "unmatched": [],
+            "findings": [{
+                "kind": "type_mismatch", "service": "web", "method": "GET", "path": "/a",
+                "call_sites": ["client.ts:10"], "detail": "differs",
+                "verdict_state": null, "direction": null, "expected_type": null,
+                "actual_type": null, "edge_source": edge_source
+            }],
+            "type_check": {"state": "ran"}
+        }))
+        .expect("a join");
+        let edited: BTreeSet<String> = ["client.ts".to_string()].into();
+        let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();
+        let judged = judge(
+            Path::new("/w"),
+            &before,
+            true,
+            &rebuilt,
+            &join,
+            &changed,
+            &Touched::new(),
+        );
+        assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
+        judged.problems[0].fails
+    }
+
+    /// An SDK-mediated mismatch states no source by design: the PR comment
+    /// reads it as a break, so the local check fails on it too (one answer,
+    /// `mismatch_break_status`).
+    #[test]
+    fn a_mismatch_stating_no_source_broken_by_the_change_fails() {
+        assert!(mismatch_fails(None));
+    }
+
+    /// A source the model stated is a candidate and is reported, not enforced;
+    /// a fact fails.
+    #[test]
+    fn a_model_stated_mismatch_does_not_fail_and_a_fact_does() {
+        assert!(!mismatch_fails(Some("candidate")));
+        assert!(mismatch_fails(Some("fact")));
     }
 
     /// A dispatch case renamed in the handler and the config leaves the call
