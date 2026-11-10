@@ -296,7 +296,45 @@ pub struct CheckOutput {
     /// both print. Always present, and empty when there is nothing to say.
     #[serde(default)]
     pub uses_lines: Vec<String>,
+    /// Calls in this file the scan considered and did not state as a row
+    /// (carrick#3688 U4), at the lines they have in the file on disk now.
+    /// Absent when there are none, and absent when the file moved past the
+    /// index and no re-check answered, because no line is then known: absent
+    /// is "not stated", never "none unread".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<UnreadItem>,
 }
+
+/// One call the scan did not read, as a check answer and `check --changed`
+/// state it. `phrase` is the table's words for `reason`
+/// (`npm/carrick/src/unread-reasons.json`), so no reader holds a table.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct UnreadItem {
+    /// Repo-relative.
+    pub file: String,
+    pub line: u32,
+    /// The [`crate::request_summary::Stop`] word.
+    pub reason: String,
+    pub phrase: String,
+    /// The line is one this working tree added or changed since the commit
+    /// the index was built at. Absent when it is not, and when git could not
+    /// say.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
+}
+
+impl UnreadItem {
+    /// The sentence both the terminal and the post-edit hook print for it.
+    pub fn line(&self) -> String {
+        format!(
+            "Carrick could not read the call at {}:{}: {}.",
+            self.file, self.line, self.phrase
+        )
+    }
+}
+
+/// Unread calls a human answer lists before it counts the rest.
+const MAX_UNREAD_LINES: usize = 8;
 
 /// What the type check did, as a check answer states it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -857,6 +895,20 @@ impl CheckOutput {
             out.push('\n');
         }
 
+        if !self.unread.is_empty() {
+            for item in self.unread.iter().take(MAX_UNREAD_LINES) {
+                out.push_str(&item.line());
+                out.push('\n');
+            }
+            if self.unread.len() > MAX_UNREAD_LINES {
+                out.push_str(&format!(
+                    "and {} more calls Carrick could not read in this file.\n",
+                    self.unread.len() - MAX_UNREAD_LINES
+                ));
+            }
+            out.push('\n');
+        }
+
         out.push_str(&format!(
             "changed since index: {} file(s){}\n",
             self.changed_since_index,
@@ -1194,6 +1246,7 @@ mod tests {
             type_check: None,
             uses: None,
             uses_lines: Vec::new(),
+            unread: Vec::new(),
         }
     }
 

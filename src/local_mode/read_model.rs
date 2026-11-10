@@ -231,12 +231,25 @@ pub struct IndexedRepo {
     /// `.carrick/index.json` still reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uses: Option<BTreeMap<String, FileUses>>,
+    /// Repo-relative path -> the call sites of that file the scan considered
+    /// and did not state as a row, in line order (carrick#3688 U4), folded
+    /// from the blobs' `unread_sites` by [`super::unread::fold`]. A file with
+    /// none has no entry; an index written before the field reads as none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unread: BTreeMap<String, Vec<IndexedUnread>>,
     /// Whether this repo's services were read in from the hosted index, whose
     /// types were captured with dependencies installed, rather than scanned on
     /// this machine (carrick#2839). Absent on an index written before the
     /// field existed, which reads as scanned here.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_from_hosted: bool,
+}
+
+/// One call site the scan did not read: where, and the one reason it stopped.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IndexedUnread {
+    pub line: u32,
+    pub reason: crate::request_summary::Stop,
 }
 
 /// What other files of the same repo use from one file.
@@ -593,6 +606,7 @@ mod tests {
             services: Vec::new(),
             files: BTreeMap::new(),
             uses: None,
+            unread: BTreeMap::new(),
             read_from_hosted: false,
         }
     }

@@ -1766,6 +1766,7 @@ pub(super) fn build(
             services,
             files: BTreeMap::new(),
             uses: None,
+            unread: BTreeMap::new(),
             read_from_hosted: false,
         });
     }
@@ -1848,6 +1849,7 @@ pub(super) fn build(
             .filter(|blob| blob.repo_name == repo.name && !remotes.contains_key(&service_id(blob)))
             .collect();
         repo.uses = Some(super::uses::fold(&local, &repo.files));
+        repo.unread = super::unread::fold(&local);
     }
 
     Ok(LocalIndex {

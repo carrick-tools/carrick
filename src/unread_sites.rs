@@ -42,6 +42,12 @@ pub const MAX_PER_SERVICE: usize = 2000;
 /// The slot of a call whose callee the walk did not read.
 const CALLEE: &str = "callee";
 
+/// What a reader says for a site: the phrase of its one reason
+/// (`npm/carrick/src/unread-reasons.json`, via [`Stop::phrase`]).
+pub fn phrase_of(site: &UnreadSite) -> &'static str {
+    site.reason.phrase()
+}
+
 /// One unread site, as the blob carries it (`unread_sites[]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnreadSite {

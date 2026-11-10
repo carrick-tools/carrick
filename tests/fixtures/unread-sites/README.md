@@ -20,6 +20,12 @@ as `unread_sites`, with its reason.
   `unread_sites_total` and `unread_sites_by_reason`. The cloud's readers pin
   this file by sha256, so a change here moves their pin too.
 
+- `boundary.expected.json` (U4): a boundary with unread sites and the lines
+  `ServiceBoundary::lines` prints for it. The Rust test
+  `an_unread_site_count_is_a_boundary_line` writes it (set
+  `CARRICK_WRITE_FIXTURES=1`); `npm/carrick/test/render.test.ts` reads it and
+  the port must print the same lines.
+
 Not here yet: route-side stops (U6), the model-answer reasons (unit tests in
 `src/site_rows/tests.rs`), and the reasons no source file can cause (unit
 tests in `src/unread_sites.rs`).

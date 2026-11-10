@@ -125,6 +125,7 @@ pub fn answer(
     // tell apart.
     let mut reads_same = false;
     let mut moved_items: Option<Vec<IndexedItem>> = None;
+    let mut moved_unread: Option<Vec<super::read_model::IndexedUnread>> = None;
     let recheck = match (freshness, mode) {
         (Freshness::Recheck { rescan }, Mode::Check) if stale && !deleted => {
             // An edit the scan reads the same (comments, layout) has nothing
@@ -158,6 +159,17 @@ pub fn answer(
                                     None => line,
                                 }),
                                 ..item.clone()
+                            })
+                            .collect(),
+                    );
+                    moved_unread = Some(
+                        repo.unread
+                            .get(&relative)
+                            .into_iter()
+                            .flatten()
+                            .map(|site| super::read_model::IndexedUnread {
+                                line: lines.map(site.line),
+                                reason: site.reason,
                             })
                             .collect(),
                     );
@@ -197,13 +209,32 @@ pub fn answer(
         _ => None,
     };
     let items = match &recheck {
-        Some((Some((fresh, _)), _)) => fresh.clone(),
+        Some((Some((fresh, _, _)), _)) => fresh.clone(),
         _ => moved_items.unwrap_or(items),
     };
+    // The calls the scan did not read, at lines that are true of the file on
+    // disk: the re-check's own, the index's mapped through an edit the scan
+    // reads the same, or the index's when the file has not moved. A file the
+    // tree moved past with no re-check answer has no lines to state.
+    let unread_sites: Option<Vec<super::read_model::IndexedUnread>> = match &recheck {
+        Some((Some((_, _, fresh)), _)) => Some(fresh.clone()),
+        _ if moved_unread.is_some() => moved_unread,
+        _ if !stale && !deleted => Some(repo.unread.get(&relative).cloned().unwrap_or_default()),
+        _ => None,
+    };
+    let unread = unread_sites
+        .map(|sites| {
+            let hunks = match &recheck {
+                Some((Some(_), _)) => super::unread::edited_hunks(&repo_root, &commit, &relative),
+                _ => Vec::new(),
+            };
+            super::unread::items(&relative, &sites, &hunks)
+        })
+        .unwrap_or_default();
     // The type check the rows above came from: this run's own when a re-check
     // answered, else the index's (carrick#3204).
     let type_check = match &recheck {
-        Some((Some((_, stated)), _)) => Some(stated),
+        Some((Some((_, stated, _)), _)) => Some(stated),
         _ => index.type_check.as_ref(),
     }
     .map(TypeCheckState::from);
@@ -285,6 +316,7 @@ pub fn answer(
         boundary_lines,
         uses,
         uses_lines,
+        unread,
     })
 }
 
@@ -434,6 +466,14 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
     }
 }
 
+/// What a finished re-check hands back: the file's rows, the type check that
+/// judged them, and the calls the scan did not read, all from the working tree.
+type Rechecked = (
+    Vec<IndexedItem>,
+    TypeCheckSummary,
+    Vec<super::read_model::IndexedUnread>,
+);
+
 /// Said when an edit changed nothing the scan reads, or when no service reads
 /// the edited file. Agent-facing.
 const UNREAD_EDIT_REASON: &str = "the edit changed nothing the scan reads (comments or layout), or no service reads the file; verdicts are the index's";
@@ -453,7 +493,7 @@ fn rechecked(
     reach: &super::recheck::Reach,
     before: &LocalIndex,
     rescan: bool,
-) -> (Option<(Vec<IndexedItem>, TypeCheckSummary)>, Recheck) {
+) -> (Option<Rechecked>, Recheck) {
     let started = std::time::Instant::now();
     let workspace = match super::workspace::Workspace::load(workspace_root) {
         Ok(workspace) => workspace,
@@ -484,7 +524,7 @@ fn rechecked(
         rescan,
     ) {
         Ok(fresh) => (
-            Some((fresh.items, fresh.type_check)),
+            Some((fresh.items, fresh.type_check, fresh.unread)),
             Recheck {
                 ran: fresh.ran.as_str().to_string(),
                 elapsed_ms: fresh.elapsed.as_millis() as u64,
@@ -1552,6 +1592,7 @@ mod drift_tests {
                 name: "service-repo".to_string(),
                 files: Default::default(),
                 uses: None,
+                unread: Default::default(),
                 read_from_hosted: false,
             }],
             type_check: None,
@@ -1597,6 +1638,7 @@ mod drift_tests {
                 name: "service-repo".to_string(),
                 files: Default::default(),
                 uses: None,
+                unread: Default::default(),
                 read_from_hosted: true,
             }],
             type_check: None,
@@ -1654,6 +1696,7 @@ mod drift_tests {
                 services: vec![service(Some("apps/gateway"), &commit)],
                 files: Default::default(),
                 uses: None,
+                unread: Default::default(),
                 read_from_hosted: false,
             }],
             type_check: None,
@@ -1710,6 +1753,7 @@ mod drift_tests {
             services: vec![service(None, "")],
             files: Default::default(),
             uses: None,
+            unread: Default::default(),
             read_from_hosted: false,
         };
         let index = LocalIndex {
@@ -1784,6 +1828,7 @@ mod drift_tests {
                     services: vec![service(None, "")],
                     files: Default::default(),
                     uses,
+                    unread: Default::default(),
                     read_from_hosted: false,
                 }],
                 type_check: None,

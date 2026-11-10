@@ -18,8 +18,10 @@ import {
   shortHash,
   typedMismatchClause,
 } from "../src/render.ts";
-import type { CheckItem, CheckResult } from "../src/contract.ts";
-import { fixture, statusFixture } from "./helpers.ts";
+import fs from "node:fs";
+import path from "node:path";
+import type { Boundary, CheckItem, CheckResult } from "../src/contract.ts";
+import { fixture, statusFixture, testDir } from "./helpers.ts";
 
 // What an edit is told (the post-edit hook): only what this edit changed or
 // what needs action, a few lines at most. Never the index's stored verdict
@@ -1039,4 +1041,42 @@ test("operations whose types were not checked are named with the reason", () => 
   result.type_check = { ran: false, reason: "no tsconfig found", pairs: 1, judged: 0 };
   const { text } = sessionCheckedLines([{ result, where: "api/users.ts" }], []);
   assert.match(text, /^Carrick found the 1 operation this session changed \(GET \/api\/users at api\/users\.ts:10\) but did not check their types \(no tsconfig found\), so there is no contract verdict\.$/);
+});
+
+// A call the scan did not read (carrick#3688 U4). The CLI marks the lines the
+// working tree wrote as `edited`; the hook prints the CLI's own sentence for
+// those and nothing for the rest of the file's unread calls.
+function withUnread(): CheckResult {
+  const result: CheckResult = { ...fixture("check-clean.json"), recheck: { ran: "extraction", elapsed_ms: 900 } };
+  result.unread = [
+    { file: "src/util/format.ts", line: 12, reason: "value_callee", phrase: "the function called is a value in this code, and Carrick found no function behind it", edited: true },
+    { file: "src/util/format.ts", line: 40, reason: "recursion", phrase: "the calls loop back to a function already passed" },
+  ];
+  return result;
+}
+
+test("an edit on an unread call names it", () => {
+  assert.equal(
+    renderPostToolUse(withUnread(), "util/format.ts"),
+    "Carrick could not read the call at util/format.ts:12: the function called is a value in this code, and Carrick found no function behind it.",
+  );
+});
+
+test("an edit elsewhere says nothing", () => {
+  const result = withUnread();
+  result.unread = result.unread!.map((item) => ({ ...item, edited: false }));
+  assert.equal(renderPostToolUse(result, "util/format.ts"), null);
+  delete result.unread;
+  assert.equal(renderPostToolUse(result, "util/format.ts"), null);
+});
+
+// `tests/fixtures/unread-sites/boundary.expected.json` is written by the Rust
+// test `an_unread_site_count_is_a_boundary_line` from the boundary the scanner
+// collects, with the lines `ServiceBoundary::lines` prints for it.
+test("the port and the cli say the same boundary lines", () => {
+  const expected = JSON.parse(
+    fs.readFileSync(path.join(testDir, "..", "..", "..", "tests", "fixtures", "unread-sites", "boundary.expected.json"), "utf8"),
+  ) as { service: string; boundary: Boundary; lines: string[] };
+  assert.deepEqual(boundaryLines(expected.boundary, expected.service), expected.lines);
+  assert.ok(expected.lines.some((line) => line.includes("call site(s) Carrick could not read")));
 });

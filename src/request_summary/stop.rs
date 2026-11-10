@@ -241,7 +241,22 @@ impl Stop {
     pub fn parse(word: &str) -> Option<Stop> {
         Stop::ALL.into_iter().find(|stop| stop.as_str() == word)
     }
+
+    /// What a reader says for this stop: the one phrase table every surface
+    /// reads (R7, `npm/carrick/src/unread-reasons.json`). The CLI renders
+    /// the phrase and sends it as text, so the npm port never opens the table.
+    pub fn phrase(self) -> &'static str {
+        static TABLE: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+            std::sync::OnceLock::new();
+        TABLE
+            .get_or_init(|| serde_json::from_str(PHRASES).unwrap_or_default())
+            .get(self.as_str())
+            .map_or(self.as_str(), String::as_str)
+    }
 }
+
+/// The phrase table every surface reads (R7).
+const PHRASES: &str = include_str!("../../npm/carrick/src/unread-reasons.json");
 
 impl From<HoleReason> for Stop {
     fn from(reason: HoleReason) -> Stop {
@@ -299,9 +314,6 @@ impl Serialize for InstanceHole {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The phrase table every surface reads (R7).
-    const PHRASES: &str = include_str!("../../npm/carrick/src/unread-reasons.json");
 
     #[test]
     fn every_stop_word_round_trips_and_has_a_phrase() {

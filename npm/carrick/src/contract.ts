@@ -38,7 +38,14 @@ export type Boundary = {
   /** Model endpoints whose echoed id names no listed site and whose file states no such route. */
   model_endpoints_dropped_unanchored?: Counted;
   routes_without_response_type?: Counted;
+  /** Routes that send no response body (`routes_without_body`). */
+  routes_without_body?: Counted;
   calls_without_expected_type?: Counted;
+  /**
+   * Call sites the scan did not read: the exact total, and the first 200 as
+   * `file:line: <phrase>`. The CLI resolves the phrase; this port holds no table.
+   */
+  unread_sites?: Counted;
   types_degraded?: { stage?: string; detail?: string };
   bare_checkout?: boolean;
 };
@@ -105,6 +112,19 @@ export type CheckItem = {
   actual_type?: string;
 };
 
+/** `UnreadItem` from src/local_mode/contract.rs: one call the scan did not read. */
+export type UnreadItem = {
+  /** Relative to the repo owning the queried file. */
+  file: string;
+  line: number;
+  /** The stop word (`value_callee`, `recursion`, ...). */
+  reason: string;
+  /** The words for `reason`, from the CLI's table. */
+  phrase: string;
+  /** The line is one the working tree added or changed since the index commit. */
+  edited?: boolean;
+};
+
 export type CheckResult = {
   schema: string;
   /** Set instead of the payload, e.g. `not_indexed`. */
@@ -129,6 +149,12 @@ export type CheckResult = {
   /** The index holds this file and it is no longer on disk. */
   deleted?: boolean;
   items?: CheckItem[];
+  /**
+   * Calls in this file the scan did not read, at the lines they have on disk.
+   * Absent when there are none, and when the file moved past the index with no
+   * re-check answer: absent is "not stated", never "none unread".
+   */
+  unread?: UnreadItem[];
   boundary?: Boundary;
   /**
    * One sentence about what a local index cannot hold at all. Always sent, so a
@@ -563,6 +589,16 @@ function checkResultOf(parsed: unknown): CheckResult | null {
       (line): line is string => typeof line === "string",
     );
     if (lines.length) result.boundary_lines = lines;
+  }
+  if (Array.isArray(parsed["unread"])) {
+    const unread = (parsed["unread"] as unknown[]).filter(
+      (item): item is UnreadItem =>
+        isRecord(item) &&
+        typeof item["file"] === "string" &&
+        typeof item["line"] === "number" &&
+        typeof item["phrase"] === "string",
+    );
+    if (unread.length) result.unread = unread;
   }
   if (Array.isArray(parsed["uses_lines"])) {
     const lines = (parsed["uses_lines"] as unknown[]).filter(
