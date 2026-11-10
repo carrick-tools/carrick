@@ -1,0 +1,25 @@
+{
+  "library_claims": [
+    {
+      "package": "lib.dom",
+      "version": "0.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "lib.dom",
+          "export": "fetch",
+          "role": "http_client",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "request", "member": null, "on": "export", "name": { "arg": 0 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

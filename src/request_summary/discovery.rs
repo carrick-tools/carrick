@@ -102,7 +102,7 @@ const OF_IMPLEMENTATIONS: Plural = Plural {
 };
 
 /// The hop a walk records where it enters a function through a value.
-use super::decided_sites::{BoundCall, HopMaker, VALUE_HOP};
+use super::decided_sites::{BoundCall, CALLBACK_HOP, HopMaker, VALUE_HOP};
 use super::stop::Stop;
 
 /// One discovered site, or one walk that entered code and stopped.
@@ -2463,7 +2463,7 @@ impl<'a> Walker<'a> {
                 && let Some(callback) = body.nested.get(*nested)
             {
                 let written = ChainHop {
-                    function: "<callback>".to_string(),
+                    function: CALLBACK_HOP.to_string(),
                     file: self.rel(file),
                     line: callback
                         .site
