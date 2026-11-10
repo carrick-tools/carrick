@@ -31,8 +31,13 @@
  * nothing read them. Implementations are asked for where discovery stops
  * (carrick#2432).
  *
- * A row's key is `(start, end, kind)`, except that several `decl` rows share
- * one: TypeScript `getStart()`/`getEnd()` of the
+ * Version 6 added `receiver_type` rows: beside a `member` row,
+ * at the span of the object it is read on, the declaration of each named class
+ * or interface that object's type holds, when the member is declared in
+ * another package than the class. Several share one key, ordered as `decl`.
+ *
+ * A row's key is `(start, end, kind)`, except that several `decl` and
+ * `receiver_type` rows share one: TypeScript `getStart()`/`getEnd()` of the
  * node, in UTF-16 code units from the start of the file, which is what the scanner's `sidecar_position`
  * gives for an SWC span. Every path written is relative to the scanned repo's
  * root, with `/` separators.
@@ -60,7 +65,7 @@ import type { ProjectLoader } from './project-loader.js';
 import type { PositionRowsCounts } from './types.js';
 
 /** The format's version, written in the header. */
-export const POSITION_ROWS_VERSION = 5;
+export const POSITION_ROWS_VERSION = 6;
 
 /** The type is `any`, declared or inferred. Never set with the error type. */
 export const FLAG_ANY = 1;
@@ -98,7 +103,7 @@ export const DECL_CAP = 16;
 
 /** The kinds {@link kindOf} gives a node; `decl` and `jsx` rows are written beside them. */
 export type NodeKind = 'call' | 'member' | 'compare' | 'ident';
-export type PositionKind = NodeKind | 'decl' | 'jsx' | 'typed_decl';
+export type PositionKind = NodeKind | 'decl' | 'jsx' | 'typed_decl' | 'receiver_type';
 
 /** `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]` */
 export type PositionRow = [
@@ -495,6 +500,9 @@ export class PositionWalker {
         if ((kind === 'call' || kind === 'member') && !(row[8] & FLAG_CHECKER_THREW)) {
           for (const decl of this.declRows(kind, node)) rows.push(['decl', row[1], row[2], ...tail(decl)]);
         }
+        if (kind === 'member' && !(row[8] & FLAG_CHECKER_THREW)) {
+          rows.push(...this.receiverTypeRows(node, row));
+        }
         if (kind === 'call' && !(row[8] & FLAG_CHECKER_THREW)) {
           const typed = this.typedDeclRow(node, row[1], row[2]);
           if (typed) rows.push(typed);
@@ -509,7 +517,7 @@ export class PositionWalker {
     return rows;
   }
 
-  private row(kind: Exclude<PositionKind, 'decl' | 'typed_decl'>, node: ts.Node, sourceFile: ts.SourceFile): PositionRow {
+  private row(kind: Exclude<PositionKind, 'decl' | 'typed_decl' | 'receiver_type'>, node: ts.Node, sourceFile: ts.SourceFile): PositionRow {
     const start = node.getStart(sourceFile);
     const end = node.getEnd();
     try {
@@ -797,6 +805,103 @@ export class PositionWalker {
   }
 
   /**
+   * The `receiver_type` rows of a `member` row, at the
+   * span of the object the member is read on: the declaration of each named
+   * class the receiver's type holds, written only where the
+   * member is declared in another package than that class (an `on` the class
+   * inherits from a base package). The checker's type after
+   * `getNonNullableType` is read, so an alias of a class is already the
+   * class, and an intersection or union gives one row per named constituent
+   * (an anonymous object type has no name). The class's package is the one
+   * it is declared in, a workspace package or the checkout's own included;
+   * one with no package gives none. Sorted by file, then position; past
+   * {@link DECL_CAP} one row with {@link FLAG_TOO_MANY} and nothing else. No
+   * type text. A throw writes none: the `member` row carries the flag.
+   */
+  private receiverTypeRows(node: ts.Node, member: PositionRow): PositionRow[] {
+    if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return [];
+    const memberPackage = member[6];
+    if (member[4] === null) return [];
+    try {
+      const receiver = node.expression;
+      const start = receiver.getStart(node.getSourceFile());
+      const end = receiver.getEnd();
+      const type = this.checker.getNonNullableType(this.checker.getTypeAtLocation(receiver));
+      const constituents = type.isUnionOrIntersection() ? type.types : [type];
+      const found = new Map<ts.Declaration, ts.Symbol>();
+      for (const constituent of constituents) {
+        const held = this.checker.getNonNullableType(constituent);
+        const symbol = held.getSymbol();
+        if (!symbol || symbol.name.startsWith('__')) continue;
+        // Classes only: interface rows (a framework's request and response types) were most of the rows' growth.
+        if (!(symbol.flags & ts.SymbolFlags.Class)) continue;
+        const declaration = this.typeDeclaration(held);
+        if (declaration) found.set(declaration, symbol);
+      }
+      const rows: { start: number; row: PositionRow }[] = [];
+      for (const [declaration, symbol] of found) {
+        const file = declaration.getSourceFile();
+        const at = declaration.getStart(file);
+        const { declFile, declLine, declPackage } = this.located(file, at);
+        if (declPackage === null || declPackage === memberPackage) continue;
+        const name = this.publishedClassName(symbol, declaration, declPackage);
+        if (name === undefined) continue;
+        let flags = this.publication(symbol, declaration);
+        if (declFile === null) flags |= FLAG_DECLARATION_UNNAMED;
+        rows.push({
+          start: at,
+          row: ['receiver_type', start, end, name, declFile, declLine, declPackage, null, flags],
+        });
+      }
+      if (rows.length > DECL_CAP) {
+        return [['receiver_type', start, end, null, null, null, null, null, FLAG_TOO_MANY]];
+      }
+      rows.sort((a, b) => compareNames(a.row[4], b.row[4]) || a.start - b.start);
+      return rows.map(({ row }) => row);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The name a `receiver_type` row gives a class. A class written
+   * `export default class Cursor` has the symbol name `default`, which is
+   * its package's `default` only where it is declared in the file the
+   * package's name resolves to; in an inner module it is named as written
+   * (`Cursor`), the name a package re-exports it under by convention. An
+   * anonymous default class of an inner module has no name: no row.
+   */
+  private publishedClassName(symbol: ts.Symbol, declaration: ts.Declaration, declPackage: string): string | undefined {
+    const name = ts.symbolName(symbol);
+    if (name !== ts.InternalSymbolName.Default) return name;
+    const file = declaration.getSourceFile();
+    if (this.packageEntry(declPackage, file) === file.fileName) return name;
+    const own = ts.getNameOfDeclaration(declaration);
+    return own && ts.isIdentifier(own) ? own.text : undefined;
+  }
+
+  private entries = new Map<string, string | undefined>();
+
+  /**
+   * The file `pkg` resolves to from `from`, a file of that package, so the
+   * installed copy `from` is in answers (two versions of one package resolve
+   * apart). Cached by package and directory.
+   */
+  private packageEntry(pkg: string, from: ts.SourceFile): string | undefined {
+    const key = `${pkg}\0${from.fileName.slice(0, from.fileName.lastIndexOf('/'))}`;
+    if (!this.entries.has(key)) {
+      const resolved = ts.resolveModuleName(
+        pkg,
+        from.fileName,
+        this.program.getCompilerOptions(),
+        this.resolutionHost()
+      ).resolvedModule;
+      this.entries.set(key, resolved?.resolvedFileName);
+    }
+    return this.entries.get(key);
+  }
+
+  /**
    * The `typed_decl` row of a call (carrick#2448): the callee is a value
    * (a parameter, a property, a local) whose type is a named function's own
    * (`send: typeof fetch`), so the compiler gives the type a symbol whose
@@ -1041,6 +1146,7 @@ function nameNodeOf(kind: PositionKind, node: ts.Node): ts.Node | undefined {
       return node;
     case 'decl':
     case 'typed_decl':
+    case 'receiver_type':
       return undefined;
     case 'jsx':
       // The tag: `<Badge>`, `<ui.Button>`, `<this.Panel>`; a namespaced
