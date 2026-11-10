@@ -10,7 +10,7 @@
  * Writes two flat files into `--out` (default `dist/lister`):
  * - `carrick-lister.mjs`: every dependency inlined, the TypeScript default
  *   library declarations included: the compiler's own `lib.*.d.ts`, inlined
- *   as `__CARRICK_DEFAULT_LIBRARY__` (src/default-library.ts, carrick#3509). It reads
+ *   as `globalThis.__CARRICK_DEFAULT_LIBRARY__` (src/default-library.ts, carrick#3509). It reads
  *   nothing but itself and the package directory it is given. It speaks the
  *   sidecar's stdio protocol unchanged: `init` answers `ready`,
  *   `list_library_surface` answers `success` with `surfaces` and
@@ -83,7 +83,7 @@ export async function buildLister({ tag, sourceSha, outDir }) {
     target: 'node22',
     outfile,
     banner: { js: BANNER },
-    define: { __CARRICK_DEFAULT_LIBRARY__: JSON.stringify(defaultLibraryTexts()) },
+    define: { 'globalThis.__CARRICK_DEFAULT_LIBRARY__': JSON.stringify(defaultLibraryTexts()) },
     charset: 'utf8',
     legalComments: 'eof',
     logLevel: 'warning',

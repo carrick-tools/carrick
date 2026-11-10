@@ -17,6 +17,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import ts from 'typescript';
+import { ts as tsMorphTs } from 'ts-morph';
+import { defaultLibraryTexts } from '../src/default-library.js';
 import { SidecarClient } from './helpers.js';
 
 type Row = [string, number, number, string | null, string | null, number | null, string | null, string | null, number];
@@ -44,6 +46,17 @@ function declares(line: number | null | undefined, member: string): void {
   assert.ok(typeof line === 'number' && line > 3, `${member} at line ${line}`);
   assert.match(DOM_LINES[line - 1], new RegExp(`\\b${member}[?]?[<(:]`), `line ${line}: ${DOM_LINES[line - 1]}`);
 }
+
+describe('the default library the projects read (carrick#3509)', () => {
+  it('comes from the compiler ts-morph checks with, and holds every file a program can name', () => {
+    // The texts are the `typescript` package's; the checker is ts-morph's own copy.
+    assert.strictEqual(ts.version, tsMorphTs.version);
+    // `lib.d.ts` (the ES5 default an empty tsconfig loads) has no middle segment.
+    for (const name of ['lib.d.ts', 'lib.es5.d.ts', 'lib.dom.d.ts', 'lib.esnext.full.d.ts']) {
+      assert.ok(defaultLibraryTexts().has(name), name);
+    }
+  });
+});
 
 describe('default-library members keep their own declaration lines (carrick#3509)', () => {
   let root: string;

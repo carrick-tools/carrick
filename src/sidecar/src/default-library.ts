@@ -28,17 +28,20 @@ export const DEFAULT_LIBRARY_FOLDER = '/node_modules/typescript/lib';
 
 /**
  * The bundle's inlined texts, by file name. `lister/build.mjs` defines this
- * name; the unbundled sidecar has no such name and reads the files from disk.
+ * one reference (an esbuild define is inlined at every reference, so there is
+ * exactly one); the unbundled sidecar has no such global and reads the files
+ * from disk.
  */
-declare const __CARRICK_DEFAULT_LIBRARY__: Record<string, string> | undefined;
+const BUNDLED: Record<string, string> | undefined = (globalThis as { __CARRICK_DEFAULT_LIBRARY__?: Record<string, string> })
+  .__CARRICK_DEFAULT_LIBRARY__;
 
 let texts: Map<string, string> | undefined;
 
 /** Every `lib.*.d.ts` the compiler ships, by file name. */
 export function defaultLibraryTexts(): ReadonlyMap<string, string> {
   if (texts) return texts;
-  if (typeof __CARRICK_DEFAULT_LIBRARY__ !== 'undefined') {
-    texts = new Map(Object.entries(__CARRICK_DEFAULT_LIBRARY__));
+  if (BUNDLED !== undefined) {
+    texts = new Map(Object.entries(BUNDLED));
     return texts;
   }
   const folder = path.dirname(ts.getDefaultLibFilePath({}));
