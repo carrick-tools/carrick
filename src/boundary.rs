@@ -138,6 +138,15 @@ pub struct ServiceBoundary {
     /// parts). `None` on a blob from a scanner that did not count them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_losses: Option<Counted>,
+    /// Files the parser refused. The scan never read them and
+    /// never asked the analyzer about them, so they state no rows. Kept out of
+    /// `files_lost` and `final_losses`: those mean "asked and never answered",
+    /// and the owed and answered-file sums subtract them. Reasons are
+    /// `path: does_not_parse`, the code a PR scan's `files_not_read` uses.
+    /// `None` on a blob from a scanner that did not count them; readers treat
+    /// absent as 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_not_parsed: Option<Counted>,
     /// Offered HTTP candidates carrying a route-shaped literal (a readable
     /// verb is not required) that no layer produced a row for and no mount
     /// answers. A bare `x.verb("/lit", arg)` states no producer/consumer role,
@@ -280,6 +289,19 @@ fn unprepared_not_stated(rows: &Option<Vec<crate::preflight::UnpreparedRow>>) ->
 /// This service's final losses (carrick#2488), as `path: code` with the path
 /// relative to the scan root: the run's record of them is kept in the form
 /// the walk named the file, absolute or `./`-led.
+/// The files the scan's one unread-source list holds as `does_not_parse` for
+/// this service (`scan_health::record_unread_source`, the list the PR delta
+/// reads too), as `path: does_not_parse`.
+fn files_not_parsed(data: &CloudRepoData, prefix: &str) -> Counted {
+    Counted::from_reasons(
+        crate::scan_health::unread_sources_for(data.service_name.as_deref())
+            .into_iter()
+            .filter(|(_, reason)| *reason == crate::findings::FileNotReadReason::DoesNotParse)
+            .map(|(path, reason)| format!("{}: {}", path.replace(prefix, ""), reason.code()))
+            .collect(),
+    )
+}
+
 fn final_losses(data: &CloudRepoData, repo_path: &str) -> Counted {
     Counted::from_reasons(
         crate::scan_health::final_losses_for(data.service_name.as_deref())
@@ -344,6 +366,7 @@ impl ServiceBoundary {
             files_attempted: stats.files_model_dispatched,
             files_lost: Counted::new(stats.files_analysis_failed, lost),
             final_losses: Some(final_losses(data, repo_path)),
+            files_not_parsed: Some(files_not_parsed(data, &prefix)),
             unemitted_literal_candidates: stats.unemitted_literal_candidates,
             unemitted_literal_sites: sites,
             candidates_awaiting_model: Some(stats.candidates_awaiting_model),
@@ -1135,6 +1158,56 @@ mod tests {
                 vec!["src/worker.ts:14 GET /metrics".to_string()]
             ))
         );
+    }
+
+    /// A file the parser refused is counted in `files_not_parsed`,
+    /// by its repo-relative path and `does_not_parse`, and is in neither
+    /// `files_lost` nor `final_losses`. A blob without the field reads as None.
+    #[test]
+    fn a_file_that_does_not_parse_is_counted_apart_on_the_blob() {
+        let blob: crate::cloud_storage::CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "acme/app", "service_name": "parse-count-boundary",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-01-01T00:00:00Z", "commit_hash": "abc1234"
+        }))
+        .unwrap();
+        crate::scan_health::forget_service_losses(Some("parse-count-boundary"));
+        crate::current_service::sync_scope(Some("parse-count-boundary".to_string()), || {
+            crate::scan_health::record_unread_source(
+                "/work/app/types/broken.d.ts",
+                crate::findings::FileNotReadReason::DoesNotParse,
+            );
+            crate::scan_health::record_unread_source(
+                "/work/app/data.ts",
+                crate::findings::FileNotReadReason::NotUtf8Text,
+            );
+        });
+        let stats = ProcessingStats::default();
+        let boundary = ServiceBoundary::collect(&blob, &stats, &HashMap::new(), "/work/app");
+        crate::scan_health::forget_service_losses(Some("parse-count-boundary"));
+        let written = serde_json::to_value(&boundary).unwrap();
+        assert_eq!(
+            written["files_not_parsed"],
+            serde_json::json!({"total": 1, "reasons": ["types/broken.d.ts: does_not_parse"]})
+        );
+        assert_eq!(written["files_lost"]["total"], 0);
+        assert!(
+            written["files_lost"].get("reasons").is_none(),
+            "{written:#}"
+        );
+        assert_eq!(written["final_losses"]["total"], 0);
+        assert!(
+            boundary
+                .lines("app")
+                .iter()
+                .any(|l| l.contains("1 file(s) that do not parse"))
+        );
+
+        let mut older = written.clone();
+        older.as_object_mut().unwrap().remove("files_not_parsed");
+        let older: ServiceBoundary = serde_json::from_value(older).unwrap();
+        assert_eq!(older.files_not_parsed, None);
     }
 
     /// carrick#2488: a file lost for good is named apart on the blob, by its

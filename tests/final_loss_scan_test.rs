@@ -178,3 +178,50 @@ fn a_file_too_large_to_analyse_is_lost_for_good_and_the_scan_succeeds() {
     );
     assert_eq!(blob["boundary"]["files_lost"]["total"], 1);
 }
+
+/// A source file the parser refuses (a closing brace with no
+/// opener) is counted in `boundary.files_not_parsed` with its path and
+/// `does_not_parse`, and in neither `files_lost` nor `final_losses`.
+#[test]
+fn a_file_that_does_not_parse_is_counted_on_the_blob_and_not_as_a_loss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("parse-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    write(
+        &repo,
+        "carrick.json",
+        r#"{ "services": [ { "name": "routes", "directory": "." } ] }"#,
+    );
+    write(
+        &repo,
+        "package.json",
+        r#"{ "name": "routes", "private": true, "dependencies": { "express": "^4.18.0" } }"#,
+    );
+    write(
+        &repo,
+        "src/app.ts",
+        "import express from \"express\";\nconst app = express();\n\
+         app.get(\"/health\", (_req, res) => {\n  res.json({ ok: true });\n});\n\
+         export default app;\n",
+    );
+    write(
+        &repo,
+        "types/broken.d.ts",
+        "declare namespace Shapes {\n  interface A { x: number }\n}\n  interface B { y: string }\n}\n",
+    );
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let run = scan(&repo, &tmp.path().join("action"));
+    let blob = run
+        .blob
+        .unwrap_or_else(|| panic!("no index was written:\n{}", run.output));
+    assert_eq!(
+        blob["boundary"]["files_not_parsed"],
+        serde_json::json!({"total": 1, "reasons": ["types/broken.d.ts: does_not_parse"]}),
+        "{:#}",
+        blob["boundary"]
+    );
+    assert_eq!(blob["boundary"]["files_lost"]["total"], 0);
+    assert_eq!(blob["boundary"]["final_losses"]["total"], 0);
+}
