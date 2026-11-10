@@ -774,6 +774,67 @@ fn readers_of_the_edit(
     readers
 }
 
+/// Whether no service of the repo reads any of `paths`, by the rule that
+/// carries a service under `--changed-only`
+/// ([`crate::change_scope::untouched_since`]): an edited test file that still
+/// loads what it loaded, a file outside every service's roots and import
+/// closure. Such an edit changes no row, so the index's answer stands and no
+/// re-scan is owed (the scan decides what it reads, not a second classifier).
+///
+/// `false` whenever that rule cannot say: the repo's services are not all at
+/// one commit and clean, a service's config is not on this machine, or the
+/// workspace cannot be read. Then the caller takes the path it always took.
+pub(super) fn no_service_reads(
+    workspace_root: &Path,
+    tree: &Tree,
+    indexed: &IndexedRepo,
+    paths: &HashSet<String>,
+) -> bool {
+    let Some(commit) = indexed.services.first().map(|service| &service.commit) else {
+        return false;
+    };
+    if commit.is_empty()
+        || indexed
+            .services
+            .iter()
+            .any(|service| &service.commit != commit || service.dirty)
+    {
+        return false;
+    }
+    let Ok(workspace) = Workspace::load(workspace_root) else {
+        return false;
+    };
+    let Ok(local) = read_blobs(&workspace.blobs_dir()) else {
+        return false;
+    };
+    let name = repo_label(&tree.repo);
+    let hosted = super::hosted::cached(&workspace).local_blobs(&tree.repo);
+    let blobs: Vec<&crate::cloud_storage::CloudRepoData> = local
+        .iter()
+        .filter(|blob| blob.repo_name == name)
+        .chain(hosted.iter())
+        .collect();
+    let mut configs = Vec::new();
+    for service in &indexed.services {
+        let config = blobs
+            .iter()
+            .find(|blob| service_id(blob) == service.name)
+            .and_then(|blob| blob.config_json.as_deref())
+            .and_then(|json| serde_json::from_str::<crate::config::Config>(json).ok());
+        let Some(config) = config else {
+            return false;
+        };
+        configs.push(config);
+    }
+    let repo_path = tree.checkout.to_string_lossy().to_string();
+    let listing = crate::change_scope::ChangedSince::new(&repo_path, &[], &[]);
+    let kept = paths.clone();
+    let only = listing.view(move |path| !kept.contains(path));
+    crate::change_scope::untouched_since(&repo_path, &configs, &only, commit)
+        .iter()
+        .all(Option::is_none)
+}
+
 /// What the working tree holds, since the index, of the files `service` reads:
 /// a hash of each changed file's path and bytes. A change no service covers is
 /// in every service's digest only when it is a repo input

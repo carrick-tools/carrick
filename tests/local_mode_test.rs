@@ -5195,6 +5195,149 @@ fn a_no_rescan_recheck_answers_at_once_and_starts_nothing() {
     );
 }
 
+const SHOP_TEST: &str = "shop/inventory/src/__tests__/client.test.ts";
+const SHOP_MOCK: &str = "shop/inventory/src/__mocks__/client.ts";
+
+/// [`shop`] with a test file and a mock beside the client, committed with the
+/// rest. Each loads the client and nothing a test did not already load.
+fn shop_with_tests() -> tempfile::TempDir {
+    workspace_prepared(SHOP, &["shop"], |repo| {
+        let src = repo.join("inventory/src");
+        for (dir, name) in [("__tests__", "client.test.ts"), ("__mocks__", "client.ts")] {
+            std::fs::create_dir_all(src.join(dir)).expect("create the folder");
+            std::fs::write(
+                src.join(dir).join(name),
+                "import { CatalogClient } from \"../client.js\";\n\nexport const made = new CatalogClient(\"http://catalog.test\");\n",
+            )
+            .expect("write the test file");
+        }
+    })
+}
+
+/// Append a statement to a test file that keeps what it imports.
+fn add_a_case(file: &Path) {
+    let existing = std::fs::read_to_string(file).expect("read the file");
+    std::fs::write(file, format!("{existing}\nexport const again = made;\n"))
+        .expect("write the case");
+}
+
+/// An edit to a test file that still loads what it loaded is read by no
+/// service (the carry rule `--changed-only` uses), so the probe answers from
+/// the index and starts nothing. An edit that adds an import is read, so it
+/// is deferred, as every other edit that needs a re-scan is.
+#[test]
+#[serial]
+fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
+    let workspace = shop_with_tests();
+    let root = workspace.path();
+    index(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    let probe = |file: &str| -> serde_json::Value {
+        let text = run_with_env(
+            root,
+            &[
+                "check",
+                file,
+                "--workspace",
+                ".",
+                "--recheck",
+                "--no-rescan",
+                "--json",
+            ],
+            &[AMPLE[0], ("TMPDIR", tmpdir)],
+        );
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
+    };
+    let before = recheck_temp_dirs(temp.path());
+
+    // (1) a case added to the test, imports kept: answered at once.
+    add_a_case(&root.join(SHOP_TEST));
+    let kept = probe(SHOP_TEST);
+    assert_eq!(
+        kept["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{kept:#}"
+    );
+    assert!(kept["recheck"].get("deferred").is_none(), "{kept:#}");
+    assert!(
+        kept["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no service reads the file")),
+        "{kept:#}"
+    );
+    assert_eq!(recheck_temp_dirs(temp.path()), before, "nothing was staged");
+
+    // (3) the same edit to a file under `__mocks__`: answered at once.
+    add_a_case(&root.join(SHOP_MOCK));
+    let mock = probe(SHOP_MOCK);
+    assert_eq!(
+        mock["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{mock:#}"
+    );
+    assert!(mock["recheck"].get("deferred").is_none(), "{mock:#}");
+
+    // (2) an import added to the test: the edit changes what is loaded, so it
+    // needs a re-scan the probe does not start.
+    edit(
+        &root.join(SHOP_TEST),
+        "export const made",
+        "import { send } from \"../send.js\";\nexport const sent = send;\nexport const made",
+    );
+    let imports = probe(SHOP_TEST);
+    assert_eq!(
+        imports["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{imports:#}"
+    );
+}
+
+/// A test edit no service reads, beside a source edit the scan reads the same
+/// (a comment), starts no re-scan in `check --changed`, and the answer is the
+/// forced re-scan's. The test file is no changed file of its own (the scan
+/// skips test sources), but it used to take the whole repo to a re-scan.
+#[test]
+#[serial]
+fn check_changed_answers_a_test_edit_without_a_re_scan() {
+    let workspace = shop_with_tests();
+    let root = workspace.path();
+    index(root);
+    edit(&root.join(SHOP_HEALTH), "export", "// a note\nexport");
+    add_a_case(&root.join(SHOP_TEST));
+
+    let (code, json, stderr) = check_changed_json_with(root, &[]);
+    assert_eq!(
+        rescan_of(&json, "shop").as_deref(),
+        Some("not_needed"),
+        "{json:#}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("re-reading"),
+        "no re-scan started:\n{stderr}"
+    );
+
+    let (_, always, stderr) = check_changed_json_with(root, &[("CARRICK_CHECK_RESCAN", "always")]);
+    assert_eq!(
+        rescan_of(&always, "shop").as_deref(),
+        Some("ran"),
+        "{always:#}"
+    );
+    assert!(
+        stderr.contains("re-reading"),
+        "the switch re-scans:\n{stderr}"
+    );
+    // This machine is not signed in (carrick#3249): the forced run says so and
+    // the answer from the index has no such line.
+    let mut always = without_how(&always);
+    always
+        .as_object_mut()
+        .expect("an object")
+        .remove("not_checked");
+    assert_eq!(without_how(&json), always, "the same answer, no re-scan");
+    assert_eq!(code, Some(0), "{json:#}");
+}
+
 /// A re-check says how long each phase before, around and after its re-scan
 /// took, when asked to, and says nothing more when not. The lines are what
 /// names the cut that makes the pre-scan cost small, so each phase the cost
