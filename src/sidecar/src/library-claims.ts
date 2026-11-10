@@ -1175,9 +1175,13 @@ export class LibraryClaimsVerifier {
           };
     };
 
-    const read = this.readProbe(fromDir, imports, (_checker, reader, file) =>
-      packages.map((pkg, i) => reader.makersOf(pkg, probeOf(file, i), only[pkg]))
-    );
+    const read = this.readProbe(fromDir, imports, (_checker, reader, file) => {
+      const made = packages.map((pkg, i) => reader.exportMakers(pkg, probeOf(file, i), only[pkg]));
+      // One decision for the whole call: the checker's cost is the sum over its specifiers.
+      const estimate = made.reduce((sum, each) => sum + each.foreignMakerMembers, 0);
+      const gated = estimate > (options.foreignMakerBudget ?? FOREIGN_MAKER_BUDGET);
+      return made.map(each => reader.makersOf(each, gated));
+    });
 
     const importLines: string[] = [];
     const buildLines: string[] = [];
@@ -1229,7 +1233,8 @@ export class LibraryClaimsVerifier {
             if (built) typeExports.push({ ...built, name });
           }
         }
-        return reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], options, typeExports, (name, receiver) => {
+        const gate = { gated: read[i].gated, leftOut: read[i].makersLeftOut };
+        return reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], options, typeExports, gate, (name, receiver) => {
           const index = builtIndex.get(builtKey({ package: pkg, export: name }, receiver));
           return index === undefined ? undefined : resolvedBuild(checker, file.statements[firstBuild + index]);
         });
@@ -4556,6 +4561,7 @@ class DeclarationReader {
     only: readonly string[] | undefined,
     options: SurfaceOptions,
     typeExports: readonly BuiltType[],
+    gate: { gated: boolean; leftOut: number },
     built: (exportName: string, receiver: string) => ts.Signature | undefined
   ): LibrarySurface {
     this.setPackage(pkg);
@@ -4636,7 +4642,9 @@ class DeclarationReader {
         }
       };
       receiverOf('export', type);
-      for (const maker of this.makers(pkg, target, type)) {
+      const all = this.makers(pkg, target, type);
+      const listed = gate.gated && this.typedByAnotherPackage(target, type) ? all.filter(maker => !maker.member) : all;
+      for (const maker of listed) {
         const made = this.madeBy(maker.signatures, built(name, maker.receiver), target === defaultTarget);
         if (!made) continue;
         // One level below the export, what the member builds must declare a callable member.
@@ -4661,6 +4669,7 @@ class DeclarationReader {
       surface.receiver_types = receiverTypes;
     }
     if (propertiesLeftOut > 0) surface.properties_left_out = propertiesLeftOut;
+    if (gate.leftOut > 0) surface.makers_left_out = gate.leftOut;
     return surface;
   }
 
@@ -5026,32 +5035,75 @@ class DeclarationReader {
   }
 
   /**
-   * The receivers each export of a specifier can make, by receiver id, for
-   * the probe statements that build them (see `LibraryClaimsVerifier.listSurface`).
+   * Every listed export of a specifier with the receivers it can make, and
+   * what the foreign ones (`typedByAnotherPackage`) are estimated to cost: their
+   * member makers times their member count (carrick#3745).
    */
-  makersOf(
-    pkg: string,
-    probe: SurfaceProbe,
-    only: readonly string[] | undefined
-  ): { makers: { export: string; receivers: string[]; scopes: string[] }[]; types: string[]; classes: string[] } {
+  exportMakers(pkg: string, probe: SurfaceProbe, only: readonly string[] | undefined): ExportMakers {
     this.setPackage(pkg);
     const moduleRead = 'namespace' in probe ? this.readModule(pkg, probe.namespace, true) : undefined;
-    if (moduleRead?.reason) return { makers: [], types: [], classes: [] };
+    if (moduleRead?.reason) return { pkg, exports: [], types: [], classes: [], foreignMakerMembers: 0 };
     const readable = 'namespace' in probe && !moduleRead?.globalFile;
     const types = readable ? this.typeExportCandidates(probe.namespace, false) : [];
     const classes = readable ? this.typeExportCandidates(probe.namespace, true) : [];
-    const makers = (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
+    let foreignMakerMembers = 0;
+    const exports = (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
       .filter(({ type }) => !this.isOpenTop(type))
       .map(({ name, target, type }) => {
         const makers = this.makers(pkg, target, type);
+        const foreign = this.typedByAnotherPackage(target, type);
+        if (foreign) foreignMakerMembers += makers.filter(maker => maker.member).length * this.namedProperties(type).length;
+        return { name, target, foreign, makers };
+      });
+    return { pkg, exports, types, classes, foreignMakerMembers };
+  }
+
+  /**
+   * The receivers each export of a specifier can make, by receiver id, for
+   * the probe statements that build them (see `LibraryClaimsVerifier.listSurface`).
+   * `gated`: a foreign export makes no member receivers, and its scope
+   * candidates are not asked for (carrick#3745).
+   */
+  makersOf(
+    read: ExportMakers,
+    gated: boolean
+  ): {
+    makers: { export: string; receivers: string[]; scopes: string[] }[];
+    types: string[];
+    classes: string[];
+    gated: boolean;
+    makersLeftOut: number;
+  } {
+    this.setPackage(read.pkg);
+    let makersLeftOut = 0;
+    const makers = read.exports
+      .map(({ name, target, foreign, makers: all }) => {
+        const kept = gated && foreign ? all.filter(maker => !maker.member) : all;
+        makersLeftOut += all.length - kept.length;
         return {
           export: name,
-          receivers: makers.map(maker => maker.receiver),
-          scopes: this.scopeCandidates(pkg, target, makers),
+          receivers: kept.map(maker => maker.receiver),
+          scopes: this.scopeCandidates(read.pkg, target, kept),
         };
       })
       .filter(({ receivers }) => receivers.length > 0);
-    return { makers, types, classes };
+    return { makers, types: read.types, classes: read.classes, gated, makersLeftOut };
+  }
+
+  /**
+   * A variable whose type's own declaration only other installed packages
+   * write. Re-exports are judged where they are declared; a value outside
+   * every installed package, or typed by the default library, never is.
+   */
+  private typedByAnotherPackage(target: ts.Symbol, type: ts.Type): boolean {
+    if ((target.flags & ts.SymbolFlags.Variable) === 0) return false;
+    const owners = (target.declarations ?? []).map(declaration => this.packageOf(declaration.getSourceFile()));
+    if (owners.length === 0 || owners.some(owner => owner === undefined)) return false;
+    const valueOwners = new Set(owners);
+    return this.isDeclaredOnlyIn(type.getSymbol() ?? type.aliasSymbol, file => {
+      const owner = this.packageOf(file);
+      return owner !== undefined && !valueOwners.has(owner);
+    });
   }
 
   /**
@@ -6264,6 +6316,28 @@ const HANDLER_MEMBER_CAP = 500;
  */
 const HANDLER_LISTING_BUDGET = 500_000;
 
+/**
+ * The most members the receivers a request's foreign values' members make may
+ * be estimated at before none of them is listed (carrick#3745). A value typed
+ * by another package's class (a package of schema values typed by a schema
+ * library) makes that class's whole fluent surface again at every value's
+ * type arguments: the checker keeps every instantiation, and a package of
+ * about 170 such values passes the builder's heap in pass 1. Measured at the
+ * builder's heap: an estimate of 144,016 listed in 63 s, 181,636 ran out of
+ * heap. Over it, the listing stays whole otherwise.
+ */
+const FOREIGN_MAKER_BUDGET = 160_000;
+
+/** One specifier's exports and the receivers each can make, read before the gate is decided (carrick#3745). */
+interface ExportMakers {
+  pkg: string;
+  exports: { name: string; target: ts.Symbol; foreign: boolean; makers: Maker[] }[];
+  types: string[];
+  classes: string[];
+  /** Member makers times member count, summed over the foreign exports. */
+  foreignMakerMembers: number;
+}
+
 /** What a surface listing adds beyond the hashed surface, each only when asked (carrick#2966). */
 export interface SurfaceOptions {
   /** Each member's `handlers` (carrick#2674 S3). */
@@ -6274,6 +6348,8 @@ export interface SurfaceOptions {
   resultCandidates?: boolean;
   /** Handler-parameter members the whole call may list (default `HANDLER_LISTING_BUDGET`, carrick#3016). */
   maxHandlerMembers?: number;
+  /** Estimated member makers of foreign values past which they list none (default `FOREIGN_MAKER_BUDGET`, carrick#3745). */
+  foreignMakerBudget?: number;
 }
 
 const PRINT_FLAGS =

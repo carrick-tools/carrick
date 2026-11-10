@@ -941,6 +941,8 @@ export interface ListLibrarySurfaceRequest extends BaseRequest {
   types?: boolean;
   /** The most handler-parameter members the whole listing lists; default 500000 (carrick#3016). */
   max_handler_members?: number;
+  /** Estimated member makers of values typed by another package past which they list only `export`; default 160000 (carrick#3745). */
+  foreign_maker_budget?: number;
   /** List each signature's `result_candidates` (carrick#2817); default false (carrick#2966). */
   result_candidates?: boolean;
 }
@@ -1573,6 +1575,13 @@ export interface LibrarySurface {
    * `truncated` does not count them, and it is outside `surface_sha256`.
    */
   properties_left_out?: number;
+  /**
+   * Member makers (`instance:<member>`, `instance:new:<member>`) left out on
+   * values typed by another package, because the request's estimate passed
+   * `foreign_maker_budget` (carrick#3745); absent when none. `truncated` does
+   * not count them, and it is outside `surface_sha256`.
+   */
+  makers_left_out?: number;
   /**
    * With `types: true`: per export, per receiver the surface lists, the
    * `types` receiver ids its built type and base types are declared by
