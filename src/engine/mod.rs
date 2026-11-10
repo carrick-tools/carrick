@@ -6943,12 +6943,15 @@ fn library_rows(
     let Some(ask) = ask else {
         return Default::default();
     };
+    // Every ask path records a failed ask here, the one writer (carrick#3792):
+    // a scan whose ask got no answer has no library facts, which the boundary
+    // says whatever the ask's mode.
+    if let Some(failure) = settled.failure {
+        crate::scan_health::record_library_ask_failed(failure);
+    }
     // A read-only pass (carrick#2907) started no build, so a package it ends
     // without is unknown, as it was before the pass asked: nothing is
     // pending on its account.
-    if let Some(failure) = settled.failure.filter(|_| ask.read_only) {
-        crate::scan_health::record_library_ask_failed(failure);
-    }
     if !ask.read_only {
         crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
             pending: settled.pending,
@@ -14551,6 +14554,73 @@ mod tests {
                 "1 library was not ready in time, so calls through it may be missing from this index: hand-off-a. The next scan adds it.",
                 "Carrick could not read 1 library yet, so calls through it are missing from this index: hand-off-b.",
             ]
+        );
+    }
+
+    /// carrick#3792. A failed ask is recorded for the service on every ask
+    /// path, so the boundary says the scan has no library facts: a 5xx and a
+    /// timeout on an index ask, a refusal on a read-only ask. A clean answer
+    /// records nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_library_ask_is_recorded_on_every_path_and_a_clean_one_is_not() {
+        use crate::library_store::AskFailure;
+        let ask = |read_only| super::LibraryAsk {
+            sites: Default::default(),
+            asked: crate::library_store::Asked::naming(&["ask-failed-pkg"]),
+            read_only,
+            turns: Default::default(),
+        };
+        async fn run(
+            service: &str,
+            ask: super::LibraryAsk,
+            reply: fn() -> Result<String, crate::agent_service::AgentCallError>,
+            hang: bool,
+        ) -> Option<AskFailure> {
+            let name = Some(service.to_string());
+            crate::current_service::scope(name.clone(), async {
+                let settled = crate::library_store::ask_until_settled(
+                    &ask.asked,
+                    |_| async {},
+                    move |_| async move {
+                        if hang {
+                            std::future::pending::<()>().await;
+                        }
+                        reply()
+                    },
+                    None,
+                )
+                .await;
+                super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
+            })
+            .await;
+            crate::scan_health::library_ask_failed_for(name.as_deref())
+        }
+        let fivexx = || {
+            Err(crate::agent_service::AgentCallError::permanent(
+                "internal_error",
+                "502".to_string(),
+            ))
+        };
+        let clean = || Ok(r#"{"library_claims":[]}"#.to_string());
+        assert_eq!(
+            run("ask-failed-5xx", ask(false), fivexx, false).await,
+            Some(AskFailure::Unreachable)
+        );
+        assert_eq!(
+            run("ask-failed-timeout", ask(false), clean, true).await,
+            Some(AskFailure::Unreachable)
+        );
+        assert_eq!(
+            run("ask-failed-read-only", ask(true), fivexx, false).await,
+            Some(AskFailure::Unreachable)
+        );
+        assert_eq!(
+            run("ask-failed-clean", ask(false), clean, false).await,
+            None
+        );
+        assert_eq!(
+            run("ask-failed-clean-ro", ask(true), clean, false).await,
+            None
         );
     }
 
