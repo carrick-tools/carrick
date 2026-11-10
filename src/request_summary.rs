@@ -9953,6 +9953,9 @@ pub struct RequestSummaryIndex {
     passes_body: HashSet<(PathBuf, String)>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
+    /// The callers among them whose request is closed and does not render
+    /// ([`CallerStop`]).
+    caller_stops: Vec<CallerStop>,
     /// The call sites the call graph follows into a function of the
     /// repository that the compiler's rows cannot say the callee of, by the
     /// rows' reason (carrick#2557). Each is read as no request: neither a
@@ -10147,6 +10150,12 @@ impl RequestSummaryIndex {
     /// reason (carrick#2557).
     pub fn unfollowed(&self) -> &BTreeMap<String, usize> {
         &self.unfollowed
+    }
+
+    /// The callers of a function of the service whose request the send side
+    /// could not compose, in the order the pass met them (carrick#3688 F).
+    pub fn caller_stops(&self) -> Vec<CallerStop> {
+        self.caller_stops.clone()
     }
 
     pub fn unfollowed_count(&self) -> usize {
@@ -10705,6 +10714,27 @@ fn emit(
                         Some(row) => rows.push(row),
                         None => {
                             index.undetermined += 1;
+                            // The request is closed at this caller and does
+                            // not render: the caller is a site the send side
+                            // could not compose (carrick#3688 F).
+                            if let Some((reason, also)) = unrendered(&instantiated, file) {
+                                let stop = CallerStop {
+                                    file: file.to_path_buf(),
+                                    line: call.site.line,
+                                    span_start: call.site.span_start,
+                                    span_end: call.site.span_end,
+                                    callee: call.callee.clone(),
+                                    request_at: (
+                                        instantiated.site.file.clone(),
+                                        instantiated.site.span_start,
+                                    ),
+                                    reason,
+                                    also,
+                                };
+                                if !index.caller_stops.contains(&stop) {
+                                    index.caller_stops.push(stop);
+                                }
+                            }
                         }
                     }
                 }
@@ -10806,6 +10836,62 @@ fn emit(
         emit(composer, file, nested, index, false);
     }
 }
+
+/// A call of a function the service declares whose request is closed at the
+/// call and does not render as a route (carrick#3688 F): the send side could
+/// not compose it into a row. Saved as an unread site
+/// ([`crate::unread_sites::from_scan`]); never a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerStop {
+    pub file: PathBuf,
+    pub line: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// The call as written.
+    pub callee: String,
+    /// The file and span start of the request the callee sends: the labelled
+    /// call the callee's request reaches stands there.
+    pub request_at: (PathBuf, u32),
+    /// The first hole in the request's URL, or `unread` when it holds none.
+    pub reason: Stop,
+    /// The URL's other holes, distinct, in order.
+    pub also: Vec<Stop>,
+}
+
+/// Why `effect`, closed at its caller, states no row for want of a URL that
+/// renders: the first hole its URL holds ([`Stop`]), and the others. A URL
+/// that holds no hole and still does not render (a piece the source does
+/// not write, a parameter that is not a whole segment) is `unread`.
+/// `None` where the effect is not closed on a literal method, or the row is
+/// refused for another reason ([`row`]).
+fn unrendered(effect: &Effect, file: &Path) -> Option<(Stop, Vec<Stop>)> {
+    if !matches!(effect.method, MethodValue::Lit(_)) || !base_reads_the_same_in(effect, file) {
+        return None;
+    }
+    let joined = join_base(&effect.base, &effect.url);
+    if render_target(&joined).is_some() {
+        return None;
+    }
+    let mut holes: Vec<Stop> = Vec::new();
+    for piece in &joined {
+        if let Piece::Opaque {
+            end: Root::Hole(reason),
+            ..
+        } = piece
+        {
+            let stop = Stop::from(*reason);
+            if !holes.contains(&stop) {
+                holes.push(stop);
+            }
+        }
+    }
+    let mut holes = holes.into_iter();
+    let first = holes.next().unwrap_or(Stop::Unread);
+    Some((first, holes.take(MAX_ALSO).collect()))
+}
+
+/// The most "also" words a [`CallerStop`] carries, as an unread site does.
+const MAX_ALSO: usize = 4;
 
 /// Where a row's call expression sits relative to the request it states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
