@@ -139,7 +139,20 @@ impl CloudStorage for Store {
     fn supports_multi_service(&self) -> bool {
         true
     }
-    async fn upload_logs(&self, _repo: &str, _log_content: &str) -> Result<(), StorageError> {
+    async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError> {
+        if repo == "rpc-shelf" {
+            for line in log_content.lines() {
+                let lower = line.to_lowercase();
+                if lower.contains("walk")
+                    || lower.contains("fail")
+                    || lower.contains("budget")
+                    || lower.contains("sidecar")
+                    || lower.contains("procedure")
+                {
+                    eprintln!("DIAGLOG {line}");
+                }
+            }
+        }
         Ok(())
     }
     async fn post_pr_result(&self, payload: &PrResultPayload) -> Result<(), StorageError> {
