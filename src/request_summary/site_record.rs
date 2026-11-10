@@ -552,27 +552,42 @@ impl Choices<'_, '_> {
     /// out. `None` when no branch states one, or when any branch is unread:
     /// the choice stays asked.
     fn values(&self, expr: &Expr) -> Option<Whole> {
-        let mut values = BTreeSet::new();
-        let mut from_type = false;
-        for value in self.resolver.text_set(self.root, self.file, expr) {
-            match value {
-                TextValue::Text {
-                    text,
-                    from_type: typed,
-                    ..
-                } if !text.is_empty() => {
-                    values.insert(text);
-                    from_type |= typed;
-                }
-                TextValue::Text { .. } => {}
-                TextValue::Hole(reason) => {
-                    note_hole(self.hole, Stop::from(reason));
-                    return None;
-                }
+        whole_of(
+            self.resolver.text_set(self.root, self.file, expr),
+            self.hole,
+        )
+    }
+}
+
+/// The texts a choice's branches state ([`Choices::values`]), noting in
+/// `hole` why a branch is unread. A text a caller decides (one read through
+/// callers, carrick#3504 B10-1b) is no text the choice always states: it is
+/// refused as unread.
+fn whole_of(set: Vec<TextValue>, hole: &Cell<Option<Stop>>) -> Option<Whole> {
+    let mut values = BTreeSet::new();
+    let mut from_type = false;
+    for value in set {
+        match value {
+            TextValue::Text { callers, .. } if !callers.is_empty() => {
+                note_hole(hole, Stop::UnreadExpression);
+                return None;
+            }
+            TextValue::Text {
+                text,
+                from_type: typed,
+                ..
+            } if !text.is_empty() => {
+                values.insert(text);
+                from_type |= typed;
+            }
+            TextValue::Text { .. } => {}
+            TextValue::Hole { reason, .. } => {
+                note_hole(hole, Stop::from(reason));
+                return None;
             }
         }
-        (!values.is_empty()).then_some(Whole { values, from_type })
     }
+    (!values.is_empty()).then_some(Whole { values, from_type })
 }
 
 /// Notes `reason` as why a name is unread, unless one is noted already.
@@ -1034,17 +1049,17 @@ impl<'r> NameFold<'r> {
             return Some(ArgTexts::Unread(Stop::UnreadExpression));
         }
         if may_overwrite {
-            return Some(ArgTexts::Values(vec![TextValue::Hole(
+            return Some(ArgTexts::Values(vec![TextValue::hole(
                 HoleReason::UnreadExpression,
             )]));
         }
         Some(ArgTexts::Values(match last {
             None => Vec::new(),
-            Some(None) => vec![TextValue::Hole(HoleReason::UnreadExpression)],
+            Some(None) => vec![TextValue::hole(HoleReason::UnreadExpression)],
             Some(Some(value)) => {
                 let set = self.resolver.text_set(root, file, &value);
                 if set.is_empty() {
-                    vec![TextValue::Hole(HoleReason::OutsideService)]
+                    vec![TextValue::hole(HoleReason::OutsideService)]
                 } else {
                     set
                 }
@@ -3798,5 +3813,53 @@ mod tests {
             listen.state.forced.get(&Slot::Name).map(String::as_str),
             Some("user.joined")
         );
+    }
+
+    /// carrick#3504 B10-1b: a choice's texts never take a text a caller
+    /// decides; the same text read through no caller is the choice's.
+    /// Fixture `resolve-text` (`callers.ts`); `walked` is `None` without the
+    /// built compiler engine, which CI refuses.
+    #[test]
+    fn a_choice_refuses_a_text_a_caller_decides() {
+        let Some(on) =
+            super::super::fixture_walk::walked("resolve-text", "services/web", "web", &[], true)
+        else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let path = on.path("services/web/src/callers.ts");
+        let term = super::super::row_calls::every_call(&on.inputs.files)
+            .into_iter()
+            .find(|(file, call, _)| *file == path && call.callee == "p_one")
+            .and_then(|(_, call, _)| call.arg_texts.first().cloned().flatten())
+            .expect("p_one's argument");
+        let tagged = resolver.texts_through_callers(&path, &term);
+        assert!(
+            !tagged.is_empty() && tagged.iter().all(|value| !value.callers().is_empty()),
+            "{tagged:?}"
+        );
+        let hole = Cell::new(None);
+        assert_eq!(whole_of(tagged.clone(), &hole), None);
+        assert_eq!(hole.get(), Some(Stop::UnreadExpression));
+        let untagged: Vec<TextValue> = tagged
+            .into_iter()
+            .map(|value| match value {
+                TextValue::Text {
+                    text,
+                    read_from,
+                    from_type,
+                    ..
+                } => TextValue::Text {
+                    text,
+                    read_from,
+                    from_type,
+                    callers: Vec::new(),
+                },
+                other => other,
+            })
+            .collect();
+        let hole = Cell::new(None);
+        let whole = whole_of(untagged, &hole).expect("the text with no caller");
+        assert!(whole.values.contains("order.created"), "{whole:?}");
     }
 }

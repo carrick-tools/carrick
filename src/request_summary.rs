@@ -978,7 +978,6 @@ struct CallIr {
     /// position through [`Self::passed_texts`]. `None` at the first spread,
     /// which ends the list; empty for a JSX element, whose props are no
     /// positional argument. Read by the text reader's caller mode (B10-1b).
-    #[allow(dead_code)]
     arg_texts: Vec<Option<ValueAt>>,
     /// The call is what an `if`, a ternary or a `&&` tests: the branch its
     /// result guards.
@@ -1053,7 +1052,6 @@ struct Applied {
     arg_values: Vec<Vec<ValueAt>>,
     /// What each element states as text; `None` at `open_from`, where the
     /// list ends, and for an array literal that is no literal.
-    #[allow(dead_code)]
     arg_texts: Vec<Option<ValueAt>>,
 }
 
@@ -1138,7 +1136,6 @@ impl CallIr {
     /// text, by position, as [`CallIr::arg_texts`] states a call's own and
     /// shifted as [`Self::passed_values`] shifts them (carrick#3504 B10-1a).
     /// `None` is a spread, which ends the list.
-    #[allow(dead_code)]
     fn passed_texts(&self) -> &[Option<ValueAt>] {
         self.passed_by_position(
             &self.arg_texts,
@@ -1682,7 +1679,6 @@ pub struct FileIr {
     /// [`Self::module_bindings`] is keyed: its function, position and keys
     /// (carrick#3504 B10-1a). A table of its own, never read by a value
     /// reader; the text reader reads a parameter through its callers from it.
-    #[allow(dead_code)]
     param_bindings: HashMap<(u32, String), resolve::ParamAt>,
     /// Each import (by its local name) this module only reads a member of
     /// and never changes ([`resolve::module_bindings`], carrick#2448).
