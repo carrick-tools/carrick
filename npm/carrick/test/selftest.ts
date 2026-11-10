@@ -14,8 +14,10 @@
 //
 // Run: npm run selftest
 
+import fs from "node:fs";
+import path from "node:path";
 import { LspClient } from "./lsp-client.ts";
-import { editPayload, fakeEnv, makeWorkspace, runHook } from "./helpers.ts";
+import { editPayload, fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
 
 export type Shape = {
   name: string;
@@ -68,7 +70,14 @@ export type Counts = { hookContexts: number; diagnosticAttachments: number };
 
 export async function measure(shape: Shape): Promise<Counts> {
   const workspace = makeWorkspace();
-  const env = fakeEnv(shape.env);
+  // The post-edit hook speaks only with a finding, and only when a re-check
+  // answered for the edit: the mismatch fixture carries its problems, and this
+  // marks the re-check as having run so the hook has something to say.
+  const answered = path.join(workspace.root, "check-answered.json");
+  const body = JSON.parse(fs.readFileSync(fixturePath("check-mismatch.json"), "utf8")) as Record<string, unknown>;
+  body["recheck"] = { ran: "extraction", elapsed_ms: 40 };
+  fs.writeFileSync(answered, JSON.stringify(body));
+  const env = fakeEnv({ CARRICK_FAKE_FIXTURE: answered, ...shape.env });
   let hookContexts = 0;
   const client = new LspClient({ args: shape.serverArgs, env });
   try {

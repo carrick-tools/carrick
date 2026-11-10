@@ -25,7 +25,7 @@ for (const item of decoded.items) {
 for (const target of toDiagnostics(decoded, root, file, { exists: () => true }).keys()) {
   assert.equal(target, file, 'a hosted counterpart became a local diagnostic target');
 }
-assert.ok(!renderPostToolUse(decoded).includes(check.boundary_lines[0]), 'an edit carries the service-wide boundary');
+assert.ok(!(renderPostToolUse(decoded) ?? '').includes(check.boundary_lines[0]), 'an edit carries the service-wide boundary');
 const decodedStatus = parseStatusResult(JSON.stringify(status));
 assert.ok(decodedStatus);
 assert.equal(decodedStatus.services.length, status.services.length);
