@@ -2267,6 +2267,22 @@ fn a_malformed_seed_entry_is_refused() {
     assert!(seed_stages::seed_shape_problem(&unlisted).is_some());
 }
 
+/// A `files_not_read` entry with reason `operations_missing` is not a raiser,
+/// so a clean title stays right; any other reason still raises.
+#[test]
+fn an_operations_missing_file_does_not_raise_a_clean_title() {
+    let entry = serde_json::json!({"expect": {
+        "title": "no_contract_changes", "conclusion": "success", "rows": []}});
+    let payload = |reason: &str| {
+        serde_json::json!({"delta": {"files_not_read": [
+            {"file": "a.ts", "reason": reason, "operations": []}]}})
+    };
+    assert!(seed_stages::wrong_scanner_stages(&entry, &payload("operations_missing")).is_empty());
+    let wrong = seed_stages::wrong_scanner_stages(&entry, &payload("does_not_parse"));
+    assert_eq!(wrong.len(), 1);
+    assert_eq!(wrong[0].0, 3);
+}
+
 /// Every seed that takes part in runs has its stage asserted by a test that
 /// runs: a seed whose only test is `#[ignore]`d would carry a declaration
 /// nothing holds it to (carrick-cloud#2880).
