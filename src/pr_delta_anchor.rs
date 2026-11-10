@@ -89,6 +89,11 @@ pub struct MainRow {
     /// another commit may be one main removed itself since, by an edit to
     /// another file, so its absence is never read as this scan's loss.
     pub stored_at_base: bool,
+    /// Whether main itself edited the row's file between the commit it
+    /// stored the row at and the merge base. Main's index lags there: this
+    /// scan read the file afresh (its stored answer no longer describes it)
+    /// though the PR may not have touched it (carrick#3697, D5).
+    pub main_edited_file: bool,
 }
 
 /// Why a candidate was left out.
@@ -99,6 +104,10 @@ enum Reason {
     MainMoved,
     PlacedByFile,
     ReadingMoved,
+    /// A same-place pair in a file main edited after its index and the PR
+    /// left alone: this scan read the file afresh, so its row's key may move
+    /// with main's edit or the new reading, never with the PR.
+    MainEditedFile,
 }
 
 impl Reason {
@@ -109,6 +118,7 @@ impl Reason {
             Reason::MainMoved => "main_moved",
             Reason::PlacedByFile => "placed_by_file",
             Reason::ReadingMoved => "reading_moved",
+            Reason::MainEditedFile => "main_edited_file",
         }
     }
 }
@@ -121,6 +131,7 @@ pub struct LeftOut {
     pub main_moved: usize,
     pub placed_by_file: usize,
     pub reading_moved: usize,
+    pub main_edited_file: usize,
 }
 
 impl LeftOut {
@@ -130,6 +141,7 @@ impl LeftOut {
             + self.main_moved
             + self.placed_by_file
             + self.reading_moved
+            + self.main_edited_file
     }
 
     fn count(&mut self, reason: Reason) {
@@ -139,6 +151,7 @@ impl LeftOut {
             Reason::MainMoved => self.main_moved += 1,
             Reason::PlacedByFile => self.placed_by_file += 1,
             Reason::ReadingMoved => self.reading_moved += 1,
+            Reason::MainEditedFile => self.main_edited_file += 1,
         }
     }
 }
@@ -190,6 +203,10 @@ impl<T> Anchored<T> {
                 out.reading_moved,
                 "in a service whose dependencies or config this PR changes",
             ),
+            (
+                out.main_edited_file,
+                "in files main edited after its index and this PR leaves alone",
+            ),
         ]
         .into_iter()
         .filter(|(count, _)| *count > 0)
@@ -225,8 +242,8 @@ impl Context<'_> {
     /// Whether main's index holds a row of `place`'s service in the same
     /// file, at the line `place.line` once main's line is moved through the
     /// PR's diff. Its key differs, or the candidate would not be one.
-    fn main_holds_same_place(&self, place: &Place) -> bool {
-        self.main.iter().any(|row| {
+    fn main_holds_same_place(&self, place: &Place) -> Option<&MainRow> {
+        self.main.iter().find(|row| {
             row.place.service == place.service
                 && row.place.file == place.file
                 && match row.at_base {
@@ -262,10 +279,14 @@ impl Context<'_> {
         }
     }
 
-    /// Whether the same-place pass lists a row of `place`'s service.
-    fn same_place_allowed(&self, place: &Place) -> Result<(), Reason> {
-        if self.reading_moved.contains(&place.service) {
+    /// Whether the same-place pass lists a pair at main's `row`: closed for a
+    /// service whose reading moved, and for a file main edited after its
+    /// index that the PR leaves alone (carrick#3697, D5).
+    fn same_place_allowed(&self, row: &MainRow) -> Result<(), Reason> {
+        if self.reading_moved.contains(&row.place.service) {
             Err(Reason::ReadingMoved)
+        } else if row.main_edited_file && !self.diff.0.contains_key(&row.place.file) {
+            Err(Reason::MainEditedFile)
         } else {
             Ok(())
         }
@@ -279,8 +300,10 @@ impl Context<'_> {
             Some(FileDiff::Modified(hunks)) if on_changed_line(hunks, place.line) => return Ok(()),
             _ => {}
         }
-        if place.line > 0 && self.main_holds_same_place(place) {
-            return self.same_place_allowed(place);
+        if place.line > 0
+            && let Some(row) = self.main_holds_same_place(place)
+        {
+            return self.same_place_allowed(row);
         }
         Err(match change {
             None => Reason::UntouchedFile,
@@ -315,11 +338,11 @@ impl Context<'_> {
                         ..at_base.clone()
                     }) =>
                 {
-                    self.same_place_allowed(place)
+                    self.same_place_allowed(row)
                 }
                 Some(_) => Err(Reason::EditedFile),
             },
-            None if self.scan_holds(&at_base) => self.same_place_allowed(place),
+            None if self.scan_holds(&at_base) => self.same_place_allowed(row),
             None => Err(Reason::UntouchedFile),
         }
     }
@@ -340,7 +363,10 @@ impl Context<'_> {
 /// states and `main` every row of main's index in a file that holds a
 /// candidate. Those same-place passes are closed for a service in
 /// `reading_moved`: a PR that changes an input of the service other than
-/// source files (carrick#1712).
+/// source files (carrick#1712). They are closed too for a file main edited
+/// after the commit it stored the row at, when the PR leaves that file alone:
+/// this scan read it afresh, so a key there moves with main or the new
+/// reading, never with the PR (carrick#3697).
 /// candidate. Of `unread`, the route sites this scan could not read a path
 /// for, the result keeps those the PR wrote (`unread_written`). Of
 /// `unread_sources`, the source files this scan could not read, it keeps
@@ -408,6 +434,7 @@ pub fn anchor<T>(
                         at_base: AtBase::At(place.line),
                         // Main's commit for it is unknown: never lost.
                         stored_at_base: false,
+                        main_edited_file: false,
                     })
             })
             .collect();
@@ -557,6 +584,7 @@ fn place_main_rows(
     let mut differing: BTreeMap<String, Option<BTreeMap<String, char>>> = BTreeMap::new();
     rows.into_iter()
         .map(|MainSource { place, commit }| {
+            let mut main_edited_file = false;
             let at_base = if commit == base || place.line == 0 {
                 AtBase::At(place.line)
             } else {
@@ -576,13 +604,16 @@ fn place_main_rows(
                         None => AtBase::At(place.line),
                         Some('D') => AtBase::Moved,
                         Some('A') => AtBase::Unreadable,
-                        Some(_) => match changes.hunks(&commit, Some(base), &place.file).ok() {
-                            None => AtBase::Unreadable,
-                            Some(read) => match map_line(&read, place.line) {
-                                Some(line) => AtBase::At(line),
-                                None => AtBase::Moved,
-                            },
-                        },
+                        Some(_) => {
+                            main_edited_file = true;
+                            match changes.hunks(&commit, Some(base), &place.file).ok() {
+                                None => AtBase::Unreadable,
+                                Some(read) => match map_line(&read, place.line) {
+                                    Some(line) => AtBase::At(line),
+                                    None => AtBase::Moved,
+                                },
+                            }
+                        }
                     },
                 }
             };
@@ -590,6 +621,7 @@ fn place_main_rows(
                 place,
                 at_base,
                 stored_at_base: commit == base,
+                main_edited_file,
             }
         })
         .collect()
@@ -714,6 +746,7 @@ mod tests {
             place: place(file, line),
             at_base,
             stored_at_base: true,
+            main_edited_file: false,
         }
     }
 
@@ -1159,6 +1192,7 @@ mod tests {
                 main_moved: 1,
                 placed_by_file: 0,
                 reading_moved: 0,
+                main_edited_file: 3,
             },
             unread_written: Vec::new(),
             lost: Vec::new(),
@@ -1166,9 +1200,10 @@ mod tests {
         };
         assert_eq!(
             anchored.summary(),
-            "PR delta: 3 new and 1 removed operation(s) placed by this PR's diff; 9 left out \
+            "PR delta: 3 new and 1 removed operation(s) placed by this PR's diff; 12 left out \
              because the diff does not place them (6 in files this PR edits, 2 in files it does \
-             not touch, 1 main's index holds at another commit)"
+             not touch, 1 main's index holds at another commit, 3 in files main edited after its \
+             index and this PR leaves alone)"
         );
     }
 
@@ -1413,6 +1448,104 @@ mod tests {
             );
             assert_eq!((new, removed), (vec!["/new"], vec!["/old"]), "{d:?}");
         }
+    }
+
+    /// carrick#3697 (D5): main's index lags, main edited the file after it,
+    /// and the PR left the file alone. This scan read the file afresh, so a
+    /// same-place pair there is main's edit or a new reading, never the PR's:
+    /// left out, never lost. A file main left alone keeps the pass (#3080).
+    #[test]
+    fn a_row_in_a_file_asked_again_is_not_listed_by_place() {
+        let pair = || {
+            (
+                vec![candidate("/new", &[(ROUTES, 10)])],
+                vec![Candidate {
+                    item: "/old",
+                    places: vec![place(ROUTES, 10)],
+                }],
+            )
+        };
+        let scan = [place(ROUTES, 10)];
+        let edited_on_main = [MainRow {
+            main_edited_file: true,
+            stored_at_base: false,
+            ..main_row(ROUTES, 10, AtBase::At(10))
+        }];
+        let (new, removed) = pair();
+        let anchored = anchor(
+            new,
+            removed,
+            &scan,
+            &edited_on_main,
+            &Diff::default(),
+            &BTreeSet::new(),
+            &[],
+            &[],
+        );
+        assert!(anchored.new.is_empty() && anchored.removed.is_empty());
+        assert_eq!(anchored.left_out.main_edited_file, 2);
+        assert_eq!(anchored.left_out.total(), 2);
+        assert!(anchored.lost.is_empty());
+
+        // Main left the file alone: the pair is the PR's edit elsewhere.
+        let untouched_on_main = [MainRow {
+            main_edited_file: false,
+            ..edited_on_main[0].clone()
+        }];
+        let (new, removed) = pair();
+        let (new, removed, _) = listed(new, removed, &scan, &untouched_on_main, &Diff::default());
+        assert_eq!((new, removed), (vec!["/new"], vec!["/old"]));
+
+        // The PR edits the file too: the pass stays open, as before.
+        let d = diff(vec![(ROUTES, FileDiff::Modified(vec![hunk(40, 1, 40, 1)]))]);
+        let (new, removed) = pair();
+        let (new, removed, _) = listed(new, removed, &scan, &edited_on_main, &d);
+        assert_eq!((new, removed), (vec!["/new"], vec!["/old"]));
+    }
+
+    /// carrick#3697 (D5) through git: main stored `f.ts` at M and edited it
+    /// before the PR's fork point B; the PR edits only `g.ts`. This scan's
+    /// reading of `f.ts` keys the route anew at the same place, so the pair
+    /// is left out. A PR that writes the route line still lists it.
+    #[test]
+    fn pr_delta_lists_nothing_for_a_file_main_changed_after_its_index() {
+        let (repo, stored) = committed_repo(&[("f.ts", "a\nroute\nc\n"), ("g.ts", "g\n")]);
+        let dir = repo.path();
+        std::fs::write(dir.join("f.ts"), "top\na\nroute\nc\n").unwrap();
+        git_in(dir, &["commit", "-qam", "main edits f"]);
+        let base = git_in(dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("g.ts"), "g\nmore\n").unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let delta = || {
+            run(
+                &path,
+                None,
+                &base,
+                vec![candidate("/new", &[("f.ts", 3)])],
+                vec![candidate("/old", &[("f.ts", 2)])],
+                &[place("f.ts", 3)],
+                vec![MainSource {
+                    place: place("f.ts", 2),
+                    commit: stored.clone(),
+                }],
+                |_| BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .unwrap()
+        };
+        let anchored = delta();
+        assert!(anchored.new.is_empty() && anchored.removed.is_empty());
+        assert_eq!(anchored.left_out.main_edited_file, 2);
+        assert!(anchored.lost.is_empty());
+
+        // The PR rewrites the route line itself: its written rows list.
+        std::fs::write(dir.join("f.ts"), "top\na\nROUTE\nc\n").unwrap();
+        let anchored = delta();
+        assert_eq!(
+            (anchored.new, anchored.removed),
+            (vec!["/new"], vec!["/old"])
+        );
     }
 
     #[test]
