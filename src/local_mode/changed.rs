@@ -473,7 +473,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
                 .repos
                 .iter()
                 .find(|indexed| &indexed.name == name)
-                .and_then(|indexed| reads_the_same(&tree.checkout, indexed))
+                .and_then(|indexed| reads_the_same(&root, tree, indexed))
         };
         match lines {
             Some(lines) => {
@@ -799,9 +799,16 @@ pub(super) fn answers_lost<'a>(
 /// to the scan. A path it reads must be a source file whose copy at that
 /// commit and whose copy on disk both parse, are equal ignoring positions,
 /// and hold the same type-bearing comments in the same places; a manifest, a
-/// lockfile, a config, a test file, an added or deleted file, or a commit this
-/// clone lacks takes the re-scan (carrick#3245).
-fn reads_the_same(repo: &Path, indexed: &IndexedRepo) -> Option<BTreeMap<String, LineMap>> {
+/// lockfile, a config, an added or deleted file, or a commit this clone lacks
+/// takes the re-scan (carrick#3245), unless no service reads the file
+/// ([`super::recheck::no_service_reads`]: a test file that loads what it
+/// loaded).
+fn reads_the_same(
+    workspace_root: &Path,
+    tree: &Tree,
+    indexed: &IndexedRepo,
+) -> Option<BTreeMap<String, LineMap>> {
+    let repo = tree.checkout.as_path();
     // A repo the hosted index stood in for (`read_from_hosted`) is covered
     // too: its blobs were written beside the scanned ones, so the join below
     // retains them, and they describe the hosted commit from a clean tree.
@@ -815,11 +822,26 @@ fn reads_the_same(repo: &Path, indexed: &IndexedRepo) -> Option<BTreeMap<String,
         return None;
     }
     let mut lines = BTreeMap::new();
+    let mut unmapped = std::collections::HashSet::new();
     for file in super::query::changed_since(repo, commit)? {
         if !crate::change_scope::read_by_input_rule(&file) {
             continue;
         }
-        lines.insert(file.clone(), reads_same_since(repo, commit, &file)?);
+        match reads_same_since(repo, commit, &file) {
+            Some(map) => {
+                lines.insert(file, map);
+            }
+            None => {
+                unmapped.insert(file);
+            }
+        }
+    }
+    // A change the scan reads differently is still no change when no service
+    // reads the file (the carry rule `--changed-only` uses, one walk for all).
+    if !unmapped.is_empty()
+        && !super::recheck::no_service_reads(workspace_root, tree, indexed, &unmapped)
+    {
+        return None;
     }
     Some(lines)
 }

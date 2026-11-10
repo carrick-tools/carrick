@@ -129,11 +129,20 @@ pub fn answer(
         (Freshness::Recheck { rescan }, Mode::Check) if stale && !deleted => {
             // An edit the scan reads the same (comments, layout) has nothing
             // to re-scan: the indexed rows stand, each at the line its node
-            // moved to. Every other edit takes the re-scan below.
+            // moved to. So has an edit no service reads (a test file that
+            // loads what it loaded, a file outside every service's closure):
+            // the rows stand where they were. Every other edit takes the
+            // re-scan below.
             let unchanged = service_row
                 .filter(|service| !service.dirty && !service.commit.is_empty())
                 .and_then(|service| {
                     super::reads_same::reads_same_since(&repo_root, &service.commit, &relative)
+                        .map(Some)
+                })
+                .or_else(|| {
+                    let only = HashSet::from([relative.clone()]);
+                    super::recheck::no_service_reads(workspace_root, &tree, repo, &only)
+                        .then_some(None)
                 });
             reads_same = unchanged.is_some();
             Some(match unchanged {
@@ -144,7 +153,10 @@ pub fn answer(
                         items
                             .iter()
                             .map(|item| IndexedItem {
-                                line: item.line.map(|line| lines.map(line)),
+                                line: item.line.map(|line| match &lines {
+                                    Some(lines) => lines.map(line),
+                                    None => line,
+                                }),
                                 ..item.clone()
                             })
                             .collect(),
@@ -422,9 +434,9 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
     }
 }
 
-/// Said when an edit changed nothing the scan reads. Agent-facing.
-const UNREAD_EDIT_REASON: &str =
-    "the edit changed nothing the scan reads (comments or layout); verdicts are the index's";
+/// Said when an edit changed nothing the scan reads, or when no service reads
+/// the edited file. Agent-facing.
+const UNREAD_EDIT_REASON: &str = "the edit changed nothing the scan reads (comments or layout), or no service reads the file; verdicts are the index's";
 
 /// One indexed row, in the contract's shape.
 /// Re-judge one file from the working tree, and say what happened either way.
