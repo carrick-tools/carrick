@@ -786,24 +786,23 @@ fn replay_refusal(enrichment: &super::hosted::ServiceEnrichment) -> Option<Strin
     }
 }
 
+/// Every path under `repo` changed since `commit` (edited, deleted, or
+/// untracked), relative to `repo`, listed as every other reader lists
+/// changes ([`crate::git_state::changed_paths`]) and in one path form
+/// whether `repo` is its repository's top level or a folder inside it
+/// (carrick#3697). A change outside `repo` is not one of its paths. `None`
+/// when git could not compare.
 pub(crate) fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>> {
-    if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let diff = git(
-        repo,
-        &["diff", "--name-only", "--no-renames", "-z", commit, "--"],
-    )?;
-    let untracked = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
-    let mut changed = HashSet::new();
-    for text in [diff, untracked] {
-        changed.extend(
-            text.split('\0')
-                .filter(|l| !l.is_empty() && !crate::change_scope::is_surface_entry(l))
-                .map(str::to_string),
-        );
-    }
-    Some(changed)
+    let repo_path = repo.to_str()?;
+    let listed = crate::git_state::changed_paths(repo_path, commit, None).ok()?;
+    let paths = crate::git_state::RootPaths::of(repo_path).ok()?;
+    Some(
+        listed
+            .into_iter()
+            .filter_map(|change| paths.scan_relative(&change.path))
+            .filter(|path| !path.is_empty() && !crate::change_scope::is_surface_entry(path))
+            .collect(),
+    )
 }
 
 /// Whether the file itself has been written since the index was built.
@@ -1220,6 +1219,24 @@ mod hosted_change_tests {
             ])
         );
         assert!(changed_since(repo, "--output=elsewhere").is_none());
+    }
+
+    /// carrick#3697: a workspace repo that is a folder inside its git top
+    /// level names an edited file and an untracked one in the same form,
+    /// relative to itself, and leaves out a change outside it.
+    #[test]
+    fn a_subfolder_repo_names_untracked_and_edited_files_alike() {
+        let (dir, commit) = committed_repo(&[
+            ("svc/src/a.ts", "export const value = 1;"),
+            ("other/b.ts", "export const value = 1;"),
+        ]);
+        std::fs::write(dir.path().join("svc/src/a.ts"), "export const value = 2;").unwrap();
+        std::fs::write(dir.path().join("svc/src/new.ts"), "new").unwrap();
+        std::fs::write(dir.path().join("other/b.ts"), "changed").unwrap();
+        assert_eq!(
+            changed_since(&dir.path().join("svc"), commit.trim()).unwrap(),
+            HashSet::from(["src/a.ts".into(), "src/new.ts".into()])
+        );
     }
 
     /// A capture running beside the check leaves its surface entry inside the

@@ -568,6 +568,15 @@ impl ChangedPath {
 /// Against the working tree, a file git does not track yet is listed as
 /// added. `Err` means git could not compare: a commit this clone does not
 /// hold, or no answer.
+///
+/// Renames are never paired (`--no-renames`): a renamed file is a deletion
+/// and an addition. This is the rename policy of every reader that decides
+/// something from a change (scope, answer reuse, the delta anchor, removals,
+/// the local check), because the scope rule reads an add and a delete
+/// ([`ChangedPath::adds_or_deletes`]) and pairing reads file contents a
+/// partial clone may lack. Only [`changed_files`] pairs renames, for a reader
+/// that names a file's two copies (carrick#3697). Read it through
+/// `change_scope::ChangedSince`, the one listing a run shares.
 pub fn changed_paths(
     repo_path: &str,
     from: &str,
@@ -621,6 +630,30 @@ pub fn changed_paths(
         );
     }
     Ok(changed)
+}
+
+/// The paths git names (relative to the repository's top level, as
+/// [`changed_paths`] lists them) as paths relative to the scan root, the form
+/// a row carries and a local query reads: one path form for every reader of
+/// a listing (carrick#3697).
+pub struct RootPaths {
+    top: std::path::PathBuf,
+    root: std::path::PathBuf,
+}
+
+impl RootPaths {
+    pub fn of(repo_path: &str) -> Result<Self, String> {
+        let canonical = |path: std::path::PathBuf| path.canonicalize().unwrap_or(path);
+        Ok(RootPaths {
+            top: canonical(toplevel(repo_path)?),
+            root: canonical(std::path::PathBuf::from(repo_path)),
+        })
+    }
+
+    /// `git_path` relative to the scan root; `None` for one outside it.
+    pub fn scan_relative(&self, git_path: &str) -> Option<String> {
+        crate::pr_functions::blob_path(&self.top.join(git_path), &self.root)
+    }
 }
 
 /// Every path under `repo_path` that git does not track, ignored or not,
@@ -723,6 +756,15 @@ pub struct FileChange {
     pub path: String,
     /// The path in `from`, for a renamed file.
     pub previous: Option<String>,
+}
+
+/// Where a pull request's branch left its base: the merge base of `pr_base`
+/// and HEAD. Every reader of what a pull request changed diffs from here
+/// (carrick#3697). On a merge checkout it is `pr_base` itself; on a checkout
+/// of the PR's own head it is the fork point, so commits the base branch
+/// gained after the branch left it are never read as the PR's.
+pub fn pr_fork_point(repo_path: &str, pr_base: &str) -> Result<String, String> {
+    merge_base(repo_path, pr_base, &head_commit(repo_path)?)
 }
 
 /// The best common ancestor of commits `a` and `b`: where the history of one
@@ -830,7 +872,8 @@ fn no_base_message(repo_path: &str, branch: &str) -> String {
 /// path (carrick#2285), for a reader that compares a file's two copies. Kept
 /// apart because the scope rule reads an addition and a deletion where this
 /// names a rename. Two commits and never the working tree: what a build step
-/// wrote there is no part of either.
+/// wrote there is no part of either. This is the only lister that pairs
+/// renames (the policy is at [`changed_paths`]; carrick#3697).
 ///
 /// Pairing renames reads file contents. A partial clone (the cloud runner's)
 /// is read from the copies it holds and never fetches one (carrick#2285): the

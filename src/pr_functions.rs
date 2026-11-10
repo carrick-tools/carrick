@@ -464,7 +464,7 @@ pub fn block_for_run(
     // against it would read each of those backwards as the PR's: a function
     // main removed since would read as one the PR added.
     let named = crate::git_state::head_commit(repo_path).and_then(|head| {
-        let from = crate::git_state::merge_base(repo_path, base, &head)?;
+        let from = crate::git_state::pr_fork_point(repo_path, base)?;
         name_changes(repo_path, &from, &head, &scope)
     });
     match named {

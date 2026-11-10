@@ -29,7 +29,7 @@ use tracing::{debug, info};
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
 use crate::dependency_move::{DependencyMove, DependencyReach, dependency_move, loaded_packages};
-use crate::git_state::ChangedPath;
+use crate::git_state::{ChangedPath, Hunk};
 
 /// What `--changed-only` together with `--no-cache` is told: a usage error.
 pub const NO_CACHE_CONFLICT: &str =
@@ -883,11 +883,21 @@ fn short(commit: &str) -> &str {
 /// Whether a changed path is left out of a [`ChangedSince`] listing.
 /// The paths changed since each commit, or why git could not list them.
 type ListedByCommit = HashMap<String, Result<Vec<ChangedPath>, String>>;
+/// The paths changed between two commits, by (from, to).
+type ListedByPair = HashMap<(String, String), Result<Vec<ChangedPath>, String>>;
+/// One file's hunks, by (from, to or the working tree, file).
+type HunksByFile = HashMap<(String, Option<String>, String), Result<Vec<Hunk>, String>>;
 type DroppedPaths = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// The paths changed since each stored commit, listed once per commit for the
 /// whole run: [`plan`] reads them, and so does a pull request scan's type-reach
 /// decision (carrick#3102), so git is asked once.
+///
+/// It is the one lister of what changed on a run (carrick#3697): the PR
+/// delta's diff and main's row places ([`crate::pr_delta_anchor::run`]), the
+/// copy judge ([`CopyJudge`]) and the pull request's fork point all read it,
+/// each listing and each file's hunks asked of git once per commit pair. The
+/// rename policy is [`crate::git_state::changed_paths`]'s.
 ///
 /// An untracked `carrick.json` the runner wrote is no changed path when it
 /// names exactly the services this repository has a stored index for
@@ -900,7 +910,15 @@ pub struct ChangedSince {
     /// The listing per commit before `dropped` applies, shared by every
     /// [`ChangedSince::view`] of this one.
     listed: std::sync::Arc<std::sync::Mutex<ListedByCommit>>,
-    /// How many times git was asked for a listing, across every view.
+    /// The listing per commit pair ([`ChangedSince::between`]), shared as
+    /// `listed` is.
+    pairs: std::sync::Arc<std::sync::Mutex<ListedByPair>>,
+    /// Each file's hunks per commit pair ([`ChangedSince::hunks`]).
+    hunks: std::sync::Arc<std::sync::Mutex<HunksByFile>>,
+    /// The pull request's fork point per base ([`ChangedSince::fork_point`]).
+    forks: std::sync::Arc<std::sync::Mutex<HashMap<String, Result<String, String>>>>,
+    /// How many times git was asked for a listing, a file's hunks or a fork
+    /// point, across every view.
     listings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     moved: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<DependencyMove>>>>,
 }
@@ -916,6 +934,9 @@ impl ChangedSince {
                 .flatten(),
             dropped: None,
             listed: Default::default(),
+            pairs: Default::default(),
+            hunks: Default::default(),
+            forks: Default::default(),
             listings: Default::default(),
             moved: Default::default(),
         }
@@ -931,6 +952,9 @@ impl ChangedSince {
             scaffold_config: self.scaffold_config.clone(),
             dropped: Some(std::sync::Arc::new(Box::new(dropped))),
             listed: self.listed.clone(),
+            pairs: self.pairs.clone(),
+            hunks: self.hunks.clone(),
+            forks: self.forks.clone(),
             listings: self.listings.clone(),
             moved: Default::default(),
         }
@@ -985,6 +1009,59 @@ impl ChangedSince {
             paths.retain(|change| !dropped(&change.path));
         }
         paths
+    }
+
+    /// Every path that differs between commits `from` and `to`, relative to
+    /// the repository's top level, listed once per pair. `Err` when git could
+    /// not compare.
+    pub fn between(&self, from: &str, to: &str) -> Result<Vec<ChangedPath>, String> {
+        let mut paths = self
+            .pairs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry((from.to_string(), to.to_string()))
+            .or_insert_with(|| {
+                self.listings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::git_state::changed_paths(&self.repo_path, from, Some(to))
+            })
+            .clone();
+        if let (Ok(paths), Some(dropped)) = (&mut paths, &self.dropped) {
+            paths.retain(|change| !dropped(&change.path));
+        }
+        paths
+    }
+
+    /// The hunks that turn `file` (relative to the scan root) as `from` holds
+    /// it into the copy `to` holds, or the working tree's when `None`
+    /// ([`crate::git_state::changed_hunks`]), read once per pair and file.
+    pub fn hunks(&self, from: &str, to: Option<&str>, file: &str) -> Result<Vec<Hunk>, String> {
+        self.hunks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry((from.to_string(), to.map(str::to_string), file.to_string()))
+            .or_insert_with(|| {
+                self.listings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::git_state::changed_hunks(&self.repo_path, from, file, to)
+            })
+            .clone()
+    }
+
+    /// Where the pull request's branch left `pr_base`
+    /// ([`crate::git_state::pr_fork_point`]), read once per base: the commit
+    /// every reader of what the pull request changed diffs from.
+    pub fn fork_point(&self, pr_base: &str) -> Result<String, String> {
+        self.forks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(pr_base.to_string())
+            .or_insert_with(|| {
+                self.listings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::git_state::pr_fork_point(&self.repo_path, pr_base)
+            })
+            .clone()
     }
 }
 
@@ -1898,8 +1975,8 @@ pub struct CopyJudge<'a> {
     /// Main's copy sits at more than one commit.
     scoped: bool,
     top: Option<PathBuf>,
-    /// The pull request's own changes, base to the scanned tree.
-    pr_changes: std::cell::OnceCell<Result<Vec<ChangedPath>, String>>,
+    /// The run's one listing of what changed (carrick#3697).
+    changes: &'a ChangedSince,
     /// What the services' closure walks read, shared between the copies.
     reads: ClosureReads,
     /// What each (copy commit, base) pair's dependency-only move moved.
@@ -1909,7 +1986,12 @@ pub struct CopyJudge<'a> {
 type MovedByPair = HashMap<(String, String), Option<std::rc::Rc<DependencyMove>>>;
 
 impl<'a> CopyJudge<'a> {
-    pub fn new(repo_path: &'a str, services: &'a [Config], main_self: &[CloudRepoData]) -> Self {
+    pub fn new(
+        repo_path: &'a str,
+        services: &'a [Config],
+        main_self: &[CloudRepoData],
+        changes: &'a ChangedSince,
+    ) -> Self {
         let commits: BTreeSet<&str> = main_self
             .iter()
             .map(|copy| copy.commit_hash.as_str())
@@ -1919,7 +2001,7 @@ impl<'a> CopyJudge<'a> {
             services,
             scoped: commits.len() > 1,
             top: crate::git_state::toplevel(repo_path).ok(),
-            pr_changes: std::cell::OnceCell::new(),
+            changes,
             reads: ClosureReads::default(),
             moved: Default::default(),
         }
@@ -1939,8 +2021,7 @@ impl<'a> CopyJudge<'a> {
         if copy.commit_hash == base {
             return Some(false);
         }
-        let changed =
-            crate::git_state::changed_paths(self.repo_path, &copy.commit_hash, Some(base)).ok()?;
+        let changed = self.changes.between(&copy.commit_hash, base).ok()?;
         let whole_tree =
             || crate::git_state::differs_under(self.repo_path, &copy.commit_hash, base).ok();
         if !self.scoped {
@@ -1958,9 +2039,13 @@ impl<'a> CopyJudge<'a> {
         if !inputs.unresolved.is_empty() || !inputs.unfollowed_extends.is_empty() {
             return whole_tree();
         }
-        let pr_changes = self
-            .pr_changes
-            .get_or_init(|| crate::git_state::changed_paths(self.repo_path, base, None));
+        // The pull request's own changes: from where its branch left `base`
+        // to the scanned tree. On a checkout of the PR's head, `base` holds
+        // main's later commits, which are no edit of the PR's (carrick#3697).
+        let pr_changes = &self
+            .changes
+            .fork_point(base)
+            .and_then(|fork| self.changes.since(&fork));
         let pr_edits_an_outside_input = match pr_changes {
             Ok(pr_changes) => pr_changes
                 .iter()
@@ -2889,7 +2974,8 @@ mod tests {
         base: &str,
     ) -> MainCopy {
         let repo_path = repo.to_string_lossy();
-        let judge = CopyJudge::new(&repo_path, services, main_self);
+        let changes = ChangedSince::new(&repo_path, &[], &[]);
+        let judge = CopyJudge::new(&repo_path, services, main_self, &changes);
         main_copy(
             main_self,
             Some(base),
@@ -2987,6 +3073,32 @@ mod tests {
             judged(repo.path(), &services, &main_self, &b),
             MainCopy::Stale
         );
+    }
+
+    /// carrick#3697: on a checkout of the PR's own head, what main changed
+    /// after the PR branched is no edit of the PR's. Main edited `worker`'s
+    /// outside input after the fork and re-stored `worker` there; a later
+    /// main commit touches only `api`. The PR edits `worker`'s own file, so
+    /// `worker`'s copy is main's at the base. Read from the raw base, main's
+    /// edit read as the PR's and sent the judge to the whole tree.
+    #[test]
+    fn copy_judge_reads_the_fork_point_on_a_head_checkout() {
+        let (repo, fork, services) = workspace();
+        let dir = repo.path();
+        let stored = commit_edit(dir, "packages/shared/src/x.ts", "export const x = 2;\n");
+        let base = commit_edit(dir, "apps/api/src/server.ts", "export const server = 2;\n");
+        git_in(dir, &["checkout", "-q", "-b", "pr", &fork]);
+        commit_edit(
+            dir,
+            "apps/worker/src/job.ts",
+            "import { x } from \"@fixture/shared\";\nexport const job = x + 1;\n",
+        );
+        let main_self = [
+            copy_at("api", &base),
+            copy_at("web", &base),
+            copy_at("worker", &stored),
+        ];
+        assert_eq!(judged(dir, &services, &main_self, &base), MainCopy::Current);
     }
 
     /// A base this clone does not hold, and a copy whose services all sit at
@@ -4948,7 +5060,8 @@ mod tests {
             copy_at("worker", &b),
         ];
         let repo_path = repo.path().to_string_lossy();
-        let judge = CopyJudge::new(&repo_path, &services, &main_self);
+        let changes = ChangedSince::new(&repo_path, &[], &[]);
+        let judge = CopyJudge::new(&repo_path, &services, &main_self, &changes);
         assert_eq!(judge.differs(&main_self[0], &b), Some(false));
         assert_eq!(judge.differs(&copy_at("worker", &a), &b), Some(true));
     }
@@ -4970,7 +5083,8 @@ mod tests {
             copy_at("worker", &b),
         ];
         let repo_path = repo.path().to_string_lossy();
-        let judge = CopyJudge::new(&repo_path, &services, &main_self);
+        let changes = ChangedSince::new(&repo_path, &[], &[]);
+        let judge = CopyJudge::new(&repo_path, &services, &main_self, &changes);
         assert_eq!(judge.differs(&main_self[0], &b), Some(false));
     }
 
@@ -4989,7 +5103,8 @@ mod tests {
             copy_at("worker", &b),
         ];
         let repo_path = repo.path().to_string_lossy();
-        let judge = CopyJudge::new(&repo_path, &services, &main_self);
+        let changes = ChangedSince::new(&repo_path, &[], &[]);
+        let judge = CopyJudge::new(&repo_path, &services, &main_self, &changes);
         assert_eq!(judge.differs(&main_self[0], &b), Some(true));
     }
 }

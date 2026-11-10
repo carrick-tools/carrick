@@ -201,6 +201,7 @@ fn place<R: Placeable>(
     };
     match crate::pr_delta_anchor::run(
         repo_path,
+        changes,
         base,
         Vec::new(),
         candidates,

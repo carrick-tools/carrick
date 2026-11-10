@@ -904,6 +904,7 @@ fn anchored_delta(
     removed.extend(documented);
     match crate::pr_delta_anchor::run(
         repo_path,
+        changes,
         base,
         new,
         removed,
@@ -953,12 +954,21 @@ fn main_copy_against_base(
     services: &[Config],
     main_self: &[CloudRepoData],
     as_uploaded: &[CloudRepoData],
+    changes: Option<&crate::change_scope::ChangedSince>,
 ) -> crate::pr_baseline::MainCopy {
     let mut reading = None;
+    let own;
+    let changes = match changes {
+        Some(changes) => changes,
+        None => {
+            own = crate::change_scope::ChangedSince::new(repo_path, &[], &[]);
+            &own
+        }
+    };
     // Each stored service by what it reads, so one stored at an older commit
     // than its siblings is not stale for a change it never reads
     // (carrick#2228).
-    let judge = crate::change_scope::CopyJudge::new(repo_path, services, main_self);
+    let judge = crate::change_scope::CopyJudge::new(repo_path, services, main_self, changes);
     let copy = crate::pr_baseline::main_copy(
         main_self,
         base.as_deref(),
@@ -968,6 +978,11 @@ fn main_copy_against_base(
                 None => crate::pr_baseline::UntouchedReading::Unknown(
                     "this run does not know the PR's base commit".to_string(),
                 ),
+                // The raw base, not the fork point (carrick#3697): the files
+                // read here must hold the bytes main's copy, stored at the
+                // base, read. On a checkout of the PR's head a file main
+                // changed after the fork is untouched by the PR but differs
+                // from main's copy, and would read as a scanner difference.
                 Some(base) => match crate::git_state::unchanged_since(repo_path, base) {
                     Ok(untouched) => {
                         crate::pr_baseline::untouched_reading(as_uploaded, main_self, &untouched)
@@ -2339,6 +2354,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 &services,
                 &main_self_data,
                 &as_uploaded,
+                pr_changes.as_deref(),
             );
             let removals = if surface_unchanged {
                 pr_removals::Removals::default()
@@ -18103,6 +18119,62 @@ unfollowed_member_calls_total: 0,
         std::fs::write(root.join("src/app.ts"), "const x = 1;").unwrap();
         let unchanged = reusable_paths(root.to_str().unwrap(), &base).unwrap();
         assert!(unchanged.contains("src/app.ts"), "{unchanged:?}");
+    }
+
+    /// carrick#3697: the untouched files that vouch for another scanner's
+    /// copy are those holding the bytes main's copy read, so on a checkout of
+    /// the PR's own head a file main changed after the fork is not one of
+    /// them, though the PR never touched it. Read from the fork point, that
+    /// file's two readings of different bytes would part, and the PR would
+    /// not be compared with main.
+    #[test]
+    fn the_untouched_reading_reads_files_alike_with_mains_copy_not_the_fork() {
+        use crate::git_state::tests::git_in;
+        let (repo, fork) = committed_repo(&[("f.ts", "one\n"), ("g.ts", "g\n")]);
+        let dir = repo.path();
+        std::fs::write(dir.join("f.ts"), "two\n").unwrap();
+        git_in(dir, &["commit", "-qam", "main moves f"]);
+        let base = git_in(dir, &["rev-parse", "HEAD"]);
+        git_in(dir, &["checkout", "-q", "-b", "pr", &fork]);
+        std::fs::write(dir.join("h.ts"), "h\n").unwrap();
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-qm", "pr adds h"]);
+        let call = |file: &str, path: &str| {
+            serde_json::json!({
+                "owner": null,
+                "key": { "protocol": "http", "method": "GET", "path": path },
+                "params": [], "request_body": null, "response_body": null,
+                "handler_name": null, "request_type": null, "response_type": null,
+                "file_path": format!("{file}:1")
+            })
+        };
+        let copy = |scanner: &str, f_path: &str| -> CloudRepoData {
+            serde_json::from_value(serde_json::json!({
+                "repo_name": "web", "service_name": "web",
+                "endpoints": [], "calls": [call("f.ts", f_path), call("g.ts", "/orders")],
+                "mounts": [], "apps": {}, "imported_handlers": [],
+                "function_definitions": {},
+                "last_updated": "2026-11-10T00:00:00Z",
+                "commit_hash": base,
+                "scanner_version": scanner,
+            }))
+            .expect("a stored service deserializes")
+        };
+        let main_self = [copy("0.0.1", "/v2")];
+        let ours = [copy(env!("CARGO_PKG_VERSION"), "/v1")];
+        let path = dir.to_string_lossy().to_string();
+        let changes = crate::change_scope::ChangedSince::new(&path, &[], &[]);
+        assert_eq!(
+            main_copy_against_base(
+                &path,
+                Some(base.clone()),
+                &[],
+                &main_self,
+                &ours,
+                Some(&changes)
+            ),
+            crate::pr_baseline::MainCopy::Current
+        );
     }
 
     /// A scan rooted below the repository's top level reads paths relative to
