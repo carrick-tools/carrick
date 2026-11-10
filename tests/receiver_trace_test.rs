@@ -2311,6 +2311,172 @@ fn merged_routers_serve_each_routers_procedures_at_one_level() {
     );
 }
 
+/// The procedure forms the walk reads through the binding table
+/// (carrick#3538), each in a file of its own written into the holder
+/// fixture, each served by an adapter that states its endpoint.
+const PROCEDURE_FORMS: &[(&str, &str)] = &[
+    (
+        "src/local.ts",
+        r#"import { serveRpc } from "fixture-procs";
+import { t } from "./kit";
+
+// Routers held in a function's own names, handed to the adapter there.
+export function serveLocal(request: unknown) {
+  const localRouter = t.router({
+    gamma: t.procedure.query(() => "g"),
+  });
+  let looseRouter = t.router({
+    delta: t.procedure.query(() => "d"),
+  });
+  void serveRpc({ router: localRouter, endpoint: "/local", request });
+  void serveRpc({ router: looseRouter, endpoint: "/loose", request });
+}
+"#,
+    ),
+    (
+        "src/deep.ts",
+        r#"import { serveRpc } from "fixture-procs";
+import { t } from "./kit";
+
+// A procedure five plain objects below the router's own.
+export const deepRouter = t.router({
+  a: {
+    b: {
+      c: {
+        d: {
+          e: t.procedure.query(() => "e"),
+        },
+      },
+    },
+  },
+});
+
+export function serveDeep(request: unknown) {
+  void serveRpc({ router: deepRouter, endpoint: "/deep", request });
+}
+"#,
+    ),
+    (
+        "src/returns.ts",
+        r#"import { serveRpc } from "fixture-procs";
+import { t } from "./kit";
+
+// A router a function returns after a statement that declares nothing.
+export function buildRouter() {
+  console.info("building");
+  return t.router({
+    eta: t.procedure.query(() => "h"),
+  });
+}
+
+export function serveBuilt(request: unknown) {
+  void serveRpc({ router: buildRouter(), endpoint: "/built", request });
+}
+"#,
+    ),
+    (
+        "src/either.ts",
+        r#"import { serveRpc, type Router } from "fixture-procs";
+import { t } from "./kit";
+
+// A router written as the fallback for one the caller may pass.
+export function serveEither(request: unknown, given?: Router) {
+  void serveRpc({
+    router: given ?? t.router({ theta: t.procedure.query(() => "t") }),
+    endpoint: "/either",
+    request,
+  });
+}
+"#,
+    ),
+    (
+        "src/block.ts",
+        r#"import { serveRpc } from "fixture-procs";
+import { t } from "./kit";
+
+// A router declared inside a block.
+export function serveBlock(request: unknown, ready: boolean) {
+  if (ready) {
+    const blockRouter = t.router({
+      iota: t.procedure.query(() => "i"),
+    });
+    void serveRpc({ router: blockRouter, endpoint: "/block", request });
+  }
+}
+"#,
+    ),
+];
+
+/// The mount-graph rows of the holder fixture with [`PROCEDURE_FORMS`]
+/// written in, scanned once for every test that reads them.
+fn procedure_form_rows() -> &'static [String] {
+    static ROWS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| {
+        let blobs = scan_runs("procedure-router-holder", PROCEDURE_FORMS, 1).remove(0);
+        endpoint_rows(&blobs).0
+    })
+}
+
+/// The rows [`procedure_form_rows`] states in `file`.
+fn procedure_form_rows_in(file: &str) -> Vec<String> {
+    procedure_form_rows()
+        .iter()
+        .filter(|row| row.starts_with(&format!("{file}:")))
+        .cloned()
+        .collect()
+}
+
+/// carrick#3538 M1: a router held in a function's own `const` is owned by
+/// that name, as when the walk read the declaration itself; one held in a
+/// `let` may be set again, so its procedure is counted and never named.
+#[test]
+fn a_router_in_a_function_s_own_name_keeps_its_owner() {
+    assert_eq!(
+        procedure_form_rows_in("src/local.ts"),
+        vec!["src/local.ts:7 GET /local/gamma library_claim localRouter"]
+    );
+}
+
+/// carrick#3538 M3: a procedure five plain objects below its router keeps
+/// its row; the walk's own depth holds past every other reader's.
+#[test]
+fn a_procedure_five_plain_objects_deep_keeps_its_row() {
+    assert_eq!(
+        procedure_form_rows_in("src/deep.ts"),
+        vec!["src/deep.ts:10 GET /deep/a.b.c.d.e library_claim deepRouter"]
+    );
+}
+
+/// carrick#3538 M2: a function that returns a router after a statement that
+/// declares nothing serves the router's procedures (each `return` is read).
+#[test]
+fn a_router_a_function_returns_after_any_statement_is_served() {
+    assert_eq!(
+        procedure_form_rows_in("src/returns.ts"),
+        vec!["src/returns.ts:8 GET /built/eta library_claim "]
+    );
+}
+
+/// carrick#3538 M4: a router written as the fallback of `??` is served; the
+/// parameter on the other side names nothing.
+#[test]
+fn a_router_written_as_a_fallback_is_served() {
+    assert_eq!(
+        procedure_form_rows_in("src/either.ts"),
+        vec!["src/either.ts:7 GET /either/theta library_claim "]
+    );
+}
+
+/// carrick#3794: a router declared inside a block keeps its named rows and
+/// its owner while the binding table holds no block's names.
+#[test]
+fn a_router_declared_in_a_block_keeps_its_rows() {
+    assert_eq!(
+        procedure_form_rows_in("src/block.ts"),
+        vec!["src/block.ts:8 GET /block/iota library_claim blockRouter"]
+    );
+}
+
 /// The procedure a row names, as `<repo>:<file>#<binding> <path>`; empty
 /// for a row that names none.
 fn procedure_of(row: &serde_json::Value) -> String {
