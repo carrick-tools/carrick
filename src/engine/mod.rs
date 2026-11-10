@@ -8524,6 +8524,11 @@ fn append_deterministic_protocol_operations(
             socket_disagrees = site.socket_disagrees,
             "site questions: fold"
         );
+        crate::name_census::log(
+            Path::new(repo_path),
+            &extractions.library,
+            &extractions.site,
+        );
     }
     site
 }
@@ -8791,6 +8796,7 @@ fn stated_library_rows(
             .filter(|row| !protocol_producer_provenance(&row.file, repo_path, service).is_mock())
             .cloned()
             .collect(),
+        names: library.names.clone(),
     }
 }
 
@@ -27493,6 +27499,7 @@ unfollowed_member_calls_total: 0,
                         LibraryRowKind::Pubsub(PubsubRole::Subscriber),
                     ),
                 ],
+                ..LibraryRows::default()
             },
             ..ProtocolExtractions::default()
         };
@@ -27614,6 +27621,7 @@ unfollowed_member_calls_total: 0,
                     "ready",
                     LibraryRowKind::Pubsub(PubsubRole::Subscriber),
                 )],
+                ..LibraryRows::default()
             },
             ..ProtocolExtractions::default()
         };
@@ -27727,6 +27735,7 @@ unfollowed_member_calls_total: 0,
                 definition(8, "stated", (120, 150), true),
                 definition(11, "not-a-definition", (170, 200), false),
             ],
+            ..LibraryRows::default()
         };
         let withdrawn =
             withdraw_model_routes_at_definitions(&mut mount_graph, &file_results, &library, ".");
@@ -27758,6 +27767,7 @@ unfollowed_member_calls_total: 0,
                 file: PathBuf::from("/repo/svc/src/tasks.ts"),
                 ..definition(2, "send-email", (10, 40), true)
             }],
+            ..LibraryRows::default()
         };
         assert_eq!(
             withdraw_model_routes_at_definitions(
@@ -28661,6 +28671,7 @@ unfollowed_member_calls_total: 0,
                         },
                     ),
                 ],
+                ..LibraryRows::default()
             },
             sockets: crate::socket_io::SocketExtraction {
                 listeners: vec![
@@ -30558,7 +30569,13 @@ io.on("bare:in", (event) => {});
             file_results,
             &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
-            &LibrarySiteIndex::of(&crate::library_claims::LibraryRows { rows }, "/repo"),
+            &LibrarySiteIndex::of(
+                &crate::library_claims::LibraryRows {
+                    rows,
+                    ..Default::default()
+                },
+                "/repo",
+            ),
             "/repo",
         );
         entries

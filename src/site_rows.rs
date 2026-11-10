@@ -221,6 +221,9 @@ pub struct SiteRows {
     /// it (carrick#2474 R5a): settled across services at the engine's join
     /// point (carrick#2474 R5b, [`crate::route_boundaries`]).
     pub boundaries: crate::request_summary::decided_sites::RouteBoundaries,
+    /// How the site path came by the name of each message site it decided
+    /// (carrick#3504 B10-0). Log-only: no row reads it.
+    pub names: crate::name_census::SiteNames,
 }
 
 /// A route the receiver trace serves at a full path it composed from the
@@ -858,6 +861,47 @@ fn is_through(site: &DecidedSite) -> bool {
         || site.span_end != site.end.span_end
 }
 
+/// How the site path came by the name of each message site in `records`
+/// (carrick#3504 B10-0, [`crate::name_census`]): a broker, an in-process bus
+/// or a socket. A name written whole at the labelled call is a literal; one
+/// whole at a caller of the function the labelled call is in was filled by
+/// the walk; any other name a record holds rests on a value the resolver read
+/// or on several. A name the model is asked, and one nothing states, are
+/// counted as such.
+pub fn site_names(decided: &Decided, records: &[SiteRecord]) -> crate::name_census::SiteNames {
+    use crate::name_census::NameSource;
+    use crate::request_summary::Piece;
+    let mut out = crate::name_census::SiteNames::default();
+    for record in records {
+        let Some(site) = site_of(decided, &record.anchors) else {
+            continue;
+        };
+        if !matches!(
+            site.end.role.as_str(),
+            "broker" | "in_process_bus" | "socket"
+        ) {
+            continue;
+        }
+        let written_whole = site.key.is_some()
+            || (!site.name.is_empty()
+                && site.name.iter().all(|piece| matches!(piece, Piece::Lit(_))));
+        out.note(if record.bucket == Bucket::Lead {
+            NameSource::Unstated
+        } else if record.state.asked.contains(&Slot::Name) {
+            NameSource::Asked
+        } else if !record.names.is_empty() {
+            NameSource::ResolverFold
+        } else if written_whole && site.via.is_empty() {
+            NameSource::LiteralPiece
+        } else if written_whole {
+            NameSource::FilledParam
+        } else {
+            NameSource::ResolverFold
+        });
+    }
+    out
+}
+
 /// The rows and possible calls a service's records come to, read with the
 /// labels the store answered and the cloud's answers. The lead-bucket
 /// records and the undecided calls are [`crate::possible_calls::from_sites`]'s.
@@ -875,6 +919,7 @@ pub fn of(
         through: decided.through.clone(),
         traced: TracedRoutes::default(),
         boundaries: Default::default(),
+        names: site_names(decided, records),
     };
     for record in records {
         if record.bucket == Bucket::Lead {
