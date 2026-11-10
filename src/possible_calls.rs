@@ -402,6 +402,7 @@ mod tests {
             span_start: 10,
             new: false,
             scope: None,
+            procedure: None,
             span_end: 20,
         };
         let lead = |end: LabelledEnd| DecidedLead {
@@ -449,6 +450,7 @@ mod tests {
                 span_start: 10,
                 new: false,
                 scope: None,
+                procedure: None,
                 span_end: 20,
             },
             reason,

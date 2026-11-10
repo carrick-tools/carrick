@@ -2148,11 +2148,27 @@ fn record(
                 .clone()
                 .map(|default| BTreeSet::from([default])),
         };
+        // A procedure call's method is the label's RPC word, in its long
+        // form (READY-trpc-client K3): `MUTATE` is `MUTATION`, `SUBSCRIBE`
+        // is `SUBSCRIPTION`.
+        let procedure = site.end.procedure.is_some();
         let methods: Vec<String> = methods
             .unwrap_or_default()
             .into_iter()
             .map(|method| method.to_ascii_uppercase())
+            .map(|method| match method.as_str() {
+                "MUTATE" if procedure => "MUTATION".to_string(),
+                "SUBSCRIBE" if procedure => "SUBSCRIPTION".to_string(),
+                _ => method,
+            })
             .collect();
+        let stated_word = |method: &str| {
+            if procedure {
+                matches!(method, "QUERY" | "MUTATION" | "SUBSCRIPTION")
+            } else {
+                is_http_method(method)
+            }
+        };
         // A method the code writes at the slot is the code's; the one the
         // member always sends, or its default, is the label's.
         let method_basis = match (&method_label.literal, &site.method) {
@@ -2160,9 +2176,7 @@ fn record(
             _ => Basis::Label,
         };
         match methods.as_slice() {
-            [one] if is_http_method(one) => {
-                decide(Slot::Method, methods.clone(), true, method_basis)
-            }
+            [one] if stated_word(one) => decide(Slot::Method, methods.clone(), true, method_basis),
             _ => decide(Slot::Method, Vec::new(), true, method_basis),
         }
     }

@@ -407,6 +407,20 @@ pub struct MountGraph {
     pub data_calls: Vec<DataFetchingCall>,
 }
 
+/// The procedure a call names, as a key suffix (READY-trpc-client K3): two
+/// procedure calls share their HTTP key (`QUERY` and an empty path), so every
+/// map keyed on a call's key alone keys on this too. Empty for a call with no
+/// procedure, so no other key moves.
+pub fn procedure_suffix(procedure: Option<&carrick_match::ProcedureKey>) -> String {
+    match procedure {
+        Some(procedure) => format!(
+            "@{}:{}#{}:{}",
+            procedure.router.repo, procedure.router.file, procedure.router.binding, procedure.path
+        ),
+        None => String::new(),
+    }
+}
+
 impl MountGraph {
     pub fn new() -> Self {
         Self {
@@ -716,12 +730,15 @@ impl MountGraph {
                     // The dispatch value is on the key too (carrick#831): two
                     // calls at one site sending different values are two
                     // consumers, and `file_location` alone folds them.
+                    // So is the procedure (READY-trpc-client K3): every
+                    // query call on one line shares `QUERY::<line>`.
                     let key = format!(
-                        "{}:{}:{}{}",
+                        "{}:{}:{}{}{}",
                         call.method,
                         call.target_url,
                         call.file_location,
-                        crate::dispatch::Dispatch::key_suffix(call.dispatch.as_ref())
+                        crate::dispatch::Dispatch::key_suffix(call.dispatch.as_ref()),
+                        procedure_suffix(call.procedure.as_ref())
                     );
                     if seen_data_calls.insert(key) {
                         let mut tagged_call = call.clone();

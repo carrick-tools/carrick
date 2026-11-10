@@ -63,6 +63,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
             span_start: 100,
             new: false,
             scope: None,
+            procedure: None,
             span_end: 130,
         },
         name: Vec::new(),
@@ -645,7 +646,7 @@ fn a_record_with_several_names_writes_a_row_each() {
         Some(ResolutionSource::Model),
     )];
     let mut endpoints = Vec::new();
-    fold_rows(&mut calls, &mut endpoints, &rows, Path::new("."), make);
+    fold_rows(&mut calls, &mut endpoints, &rows, Path::new("."), "", make);
     let stood: Vec<(OperationKey, Option<ResolutionSource>)> =
         at_site(&calls, "src/several-http.ts")
             .into_iter()
@@ -791,7 +792,7 @@ fn fold_one(
             .collect(),
         ..SiteRows::default()
     };
-    fold_rows(calls, endpoints, &one, Path::new("."), make)
+    fold_rows(calls, endpoints, &one, Path::new("."), "", make)
 }
 
 /// A fact site row folds the reader's row at its site, as library rows do.
@@ -1056,7 +1057,7 @@ fn a_lead_on_a_line_with_a_row_is_dropped() {
         ],
         ..SiteRows::default()
     };
-    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
+    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), "", make);
     let kept: Vec<(&str, u32, Option<&str>)> = fold
         .leads
         .iter()
@@ -1102,7 +1103,7 @@ fn a_pubsub_producer_lead_on_a_publisher_row_is_dropped() {
         ],
         ..SiteRows::default()
     };
-    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
+    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), "", make);
     let kept: Vec<(&str, u32, Option<&str>)> = fold
         .leads
         .iter()
@@ -1132,7 +1133,7 @@ fn off_the_fold_changes_nothing() {
     let before = serde_json::to_vec(&calls).unwrap();
     let mut off = rows();
     off.enabled = false;
-    let fold = fold_rows(&mut calls, &mut Vec::new(), &off, Path::new("."), make);
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &off, Path::new("."), "", make);
     assert_eq!(serde_json::to_vec(&calls).unwrap(), before);
     assert!(fold.stated.is_empty() && fold.leads.is_empty() && fold.withdrawn.is_empty());
 }
@@ -1561,7 +1562,7 @@ fn fold_route(
     };
     let rows = of(&decided, &[record], &[], answers);
     assert!(rows.rows.is_empty(), "{:?}", rows.rows);
-    fold_rows(&mut Vec::new(), endpoints, &rows, Path::new("."), make)
+    fold_rows(&mut Vec::new(), endpoints, &rows, Path::new("."), "", make)
 }
 
 /// A route site the label states (kind `http`, role `handles`) is never
@@ -1683,7 +1684,14 @@ fn off_a_route_site_leaves_the_route_table_byte_identical() {
         rows.enabled = false;
         let mut endpoints = endpoints;
         let before = serde_json::to_string(&endpoints).unwrap();
-        let fold = fold_rows(&mut Vec::new(), &mut endpoints, &rows, Path::new("."), make);
+        let fold = fold_rows(
+            &mut Vec::new(),
+            &mut endpoints,
+            &rows,
+            Path::new("."),
+            "",
+            make,
+        );
         assert_eq!(serde_json::to_string(&endpoints).unwrap(), before);
         assert!(fold.leads.is_empty());
         assert_eq!(fold.route_kept_reader, 0);
@@ -1790,6 +1798,37 @@ fn agreement_reads_written_values_as_parameters() {
     ));
 }
 
+/// A procedure row's key has an empty path (READY-trpc-client T3-S): it
+/// agrees with an HTTP reader row at its call whose path ends in its key
+/// path or names no literal segment, whatever the method, and with nothing
+/// else. A row with no procedure agrees as [`agrees`] says.
+#[test]
+fn a_procedure_row_agrees_with_a_reader_row_ending_in_its_key_path() {
+    let site = OperationKey::http("QUERY", "");
+    let reader = |method: &str, path: &str| OperationKey::http(method, path);
+    for agreeing in ["/api/rpc/shelf.list", "shelf.list", "/*"] {
+        assert!(
+            agrees_at(&reader("GET", agreeing), &site, Some("shelf.list")),
+            "{agreeing}"
+        );
+    }
+    assert!(!agrees_at(
+        &reader("GET", "/api/rpc/shelf.add"),
+        &site,
+        Some("shelf.list")
+    ));
+    assert!(!agrees_at(
+        &OperationKey::pubsub("shelf.list"),
+        &site,
+        Some("shelf.list")
+    ));
+    assert!(!agrees_at(
+        &reader("GET", "/api/rpc/shelf.list"),
+        &site,
+        None
+    ));
+}
+
 /// carrick#2704: where the caller's line holds a second call, a disagreeing
 /// reader row there may be that call's, so only the agreeing row folds.
 #[test]
@@ -1826,7 +1865,7 @@ fn a_second_call_on_the_callers_line_keeps_its_row() {
         }],
         ..SiteRows::default()
     };
-    fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), make);
+    fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), "", make);
     let left: Vec<String> = calls.iter().map(|row| format!("{:?}", row.key)).collect();
     assert_eq!(left.len(), 2, "{left:?}");
     assert!(left[1].contains("/api/user"));
@@ -1924,7 +1963,7 @@ fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
         ],
         ..SiteRows::default()
     };
-    let fold = fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), make);
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), "", make);
     let left: Vec<String> = calls
         .iter()
         .map(|row| row.file_path.to_string_lossy().to_string())
@@ -1978,7 +2017,7 @@ fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
         enabled: false,
         ..site
     };
-    fold_rows(&mut after, &mut Vec::new(), &off, Path::new("."), make);
+    fold_rows(&mut after, &mut Vec::new(), &off, Path::new("."), "", make);
     assert_eq!(after.len(), before.len());
 }
 
@@ -2132,7 +2171,7 @@ fn a_socket_producer_lead_on_a_call_row_is_dropped() {
         ],
         ..SiteRows::default()
     };
-    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
+    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), "", make);
     assert_eq!(fold.lead_on_row_line, 2);
     assert_eq!(fold.leads.len(), 1);
 }
@@ -2199,7 +2238,7 @@ fn fold_socket(row: SiteRow, old: OperationKey) -> (Vec<ApiEndpointDetails>, Sit
         rows: vec![row],
         ..SiteRows::default()
     };
-    let fold = fold_rows(&mut calls, &mut Vec::new(), &one, Path::new("."), make);
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &one, Path::new("."), "", make);
     (calls, fold)
 }
 

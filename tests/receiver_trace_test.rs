@@ -2310,3 +2310,256 @@ fn merged_routers_serve_each_routers_procedures_at_one_level() {
         ]
     );
 }
+
+/// The procedure a row names, as `<repo>:<file>#<binding> <path>`; empty
+/// for a row that names none.
+fn procedure_of(row: &serde_json::Value) -> String {
+    let procedure = &row["procedure"];
+    if procedure.is_null() {
+        return String::new();
+    }
+    format!(
+        "{}:{}#{} {}",
+        procedure["router"]["repo"].as_str().unwrap_or_default(),
+        procedure["router"]["file"].as_str().unwrap_or_default(),
+        procedure["router"]["binding"].as_str().unwrap_or_default(),
+        procedure["path"].as_str().unwrap_or_default(),
+    )
+}
+
+/// Every HTTP call row in the blobs' `calls` and in their mount graph's
+/// data calls under `src/web/`, as `<where> <method> "<path>" <procedure>
+/// <source>`, sorted, each list on its own.
+fn client_rows(blobs: &Blobs) -> (Vec<String>, Vec<String>) {
+    let mut flat = Vec::new();
+    let mut graph = Vec::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for row in blob["calls"].as_array().cloned().unwrap_or_default() {
+            let at = row["file_path"].as_str().unwrap_or_default().to_string();
+            if row["key"]["protocol"] != "http" || !at.starts_with("src/web/") {
+                continue;
+            }
+            flat.push(format!(
+                "{at} {} {:?} {} {}",
+                row["key"]["method"].as_str().unwrap_or_default(),
+                row["key"]["path"].as_str().unwrap_or_default(),
+                procedure_of(&row),
+                row["resolution_source"].as_str().unwrap_or_default(),
+            ));
+        }
+        for row in blob["mount_graph"]["data_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let at = row["file_location"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !at.starts_with("src/web/") {
+                continue;
+            }
+            graph.push(format!(
+                "{at} {} {:?} {} {}",
+                row["method"].as_str().unwrap_or_default(),
+                row["target_url"].as_str().unwrap_or_default(),
+                procedure_of(&row),
+                row["resolution_source"].as_str().unwrap_or_default(),
+            ));
+        }
+    }
+    flat.sort();
+    graph.sort();
+    (flat, graph)
+}
+
+/// The producer key of every producer->consumer edge the scan states, one
+/// per edge, sorted.
+fn matched_producers(name: &str) -> Vec<String> {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let repo = tmp.path().join("workspace");
+    copy_dir(&fixture_dir(name).join("repo"), &repo);
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+    let storage = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let home = tmp.path().join("home");
+    let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home);
+    cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env("CARRICK_OUTPUT_JSON", "1")
+        .env_remove("CARRICK_PROGRESS");
+    let output = cmd.output().expect("spawn carrick");
+    assert!(
+        output.status.success(),
+        "scan exited non-zero:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let projection: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the scan prints its projection");
+    let mut out: Vec<String> = projection["cross_repo_matches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|edge| {
+            format!(
+                "{} <- {}",
+                edge["producer_key"].as_str().unwrap_or_default(),
+                edge["consumer_key"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The rows `procedure-client` states at its client calls (READY-trpc-client
+/// T3-S). Each client form is a proxy whose members are the router's keys: a
+/// vanilla client (`query`/`mutate`), hooks (`useQuery`/`useMutation`), and
+/// an options proxy a hook returns (`queryOptions`). Each call through one is
+/// an HTTP call row with the label's RPC word as its method, an empty path,
+/// and the procedure it names: the key path read on the proxy and the router
+/// its first key is declared in, wherever the proxy is held. Two calls on
+/// one line are two rows.
+fn procedure_client_rows() -> Vec<String> {
+    let router = "workspace:src/router.ts#appRouter";
+    let mut rows = vec![
+        format!("src/web/hooks.ts:7 QUERY \"\" {router} shelf.list request_summary"),
+        format!("src/web/hooks.ts:8 MUTATION \"\" {router} shelf.add request_summary"),
+        format!("src/web/hooks.ts:16 QUERY \"\" {router} count request_summary"),
+        format!("src/web/vanilla.ts:11 MUTATION \"\" {router} shelf.add request_summary"),
+        format!("src/web/vanilla.ts:15 QUERY \"\" {router} shelf.inner.get request_summary"),
+        format!("src/web/vanilla.ts:16 QUERY \"\" {router} count request_summary"),
+        format!("src/web/vanilla.ts:16 QUERY \"\" {router} shelf.list request_summary"),
+        format!("src/web/vanilla.ts:7 QUERY \"\" {router} shelf.list request_summary"),
+    ];
+    rows.sort();
+    rows
+}
+
+#[test]
+fn a_client_procedure_call_states_its_router_and_key_path() {
+    let (flat, graph) = client_rows(&scan_fixture("procedure-client"));
+    assert_eq!(flat, procedure_client_rows());
+    assert_eq!(graph, procedure_client_rows());
+}
+
+/// A procedure call pairs by its procedure, never by its path: the
+/// `shelf.list` calls reach the app router's row only, never the admin
+/// router's `shelf.list` that another adapter serves, and every call of the
+/// app router's procedures is an edge of its own.
+#[test]
+fn a_client_procedure_call_pairs_only_its_own_router() {
+    let edges = matched_producers("procedure-client");
+    let call = "http|QUERY|";
+    assert_eq!(
+        edges,
+        vec![
+            format!("http|GET|/api/rpc/count <- {call}"),
+            format!("http|GET|/api/rpc/count <- {call}"),
+            format!("http|GET|/api/rpc/shelf.inner.get <- {call}"),
+            format!("http|GET|/api/rpc/shelf.list <- {call}"),
+            format!("http|GET|/api/rpc/shelf.list <- {call}"),
+            format!("http|GET|/api/rpc/shelf.list <- {call}"),
+            "http|POST|/api/rpc/shelf.add <- http|MUTATION|".to_string(),
+            "http|POST|/api/rpc/shelf.add <- http|MUTATION|".to_string(),
+        ]
+    );
+}
+
+/// A client typed by a router another package ships built names a router
+/// outside the repository: no row, and the call is saved unread with its
+/// reason.
+#[test]
+fn a_client_typed_by_a_router_outside_the_repo_is_saved_unread() {
+    let blobs = scan_fixture("procedure-client");
+    let (flat, _) = client_rows(&blobs);
+    assert!(
+        !flat.iter().any(|row| row.starts_with("src/web/remote.ts")),
+        "{flat:?}"
+    );
+    assert_eq!(
+        unread_reasons(&blobs)
+            .get("src/web/remote.ts:7")
+            .map(String::as_str),
+        Some("procedure_router_outside_repo")
+    );
+}
+
+/// A procedure call's types are not compared yet (READY-trpc-client K7): it
+/// writes no consumer type-manifest entry, which would key every query
+/// call of a service alike.
+#[test]
+fn a_procedure_call_writes_no_consumer_manifest_entry() {
+    let blobs = scan_fixture("procedure-client");
+    let consumers: Vec<String> = blobs
+        .values()
+        .flat_map(|text| {
+            let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+            blob["type_manifest"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter(|entry| entry["role"] == "consumer")
+        .map(|entry| entry["file_path"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(consumers, Vec::<String>::new());
+}
+
+/// Two procedure queries in one file, and two on one line, share their key
+/// (`QUERY` and an empty path): each is a row of its own on the blob, and
+/// each pairs its own server row.
+#[test]
+fn two_procedure_queries_in_one_file_and_on_one_line_are_two_rows() {
+    let (flat, graph) = client_rows(&scan_fixture("procedure-client"));
+    let vanilla = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.starts_with("src/web/vanilla.ts") && row.contains(" QUERY "))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(vanilla(&flat).len(), 4, "{flat:?}");
+    assert_eq!(vanilla(&graph).len(), 4, "{graph:?}");
+    // One edge per call: `count` is called at `vanilla.ts:16` and
+    // `hooks.ts:16`, `shelf.list` at `vanilla.ts:7`, `vanilla.ts:16` and
+    // `hooks.ts:7`.
+    let edges = matched_producers("procedure-client");
+    let calls_of = |producer: &str| {
+        edges
+            .iter()
+            .filter(|edge| edge.starts_with(&format!("http|GET|/api/rpc/{producer} ")))
+            .count()
+    };
+    assert_eq!(
+        [
+            calls_of("count"),
+            calls_of("shelf.inner.get"),
+            calls_of("shelf.list")
+        ],
+        [2, 1, 3],
+        "{edges:?}"
+    );
+}
+
+/// The file reader's mocked answer states `GET /api/rpc/shelf.list` at the
+/// vanilla client's first call: the procedure row replaces it, and the call
+/// is one row.
+#[test]
+fn a_model_row_at_a_procedure_call_folds_into_it() {
+    let (flat, graph) = client_rows(&scan_fixture("procedure-client"));
+    for rows in [&flat, &graph] {
+        let at: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.starts_with("src/web/vanilla.ts:7 "))
+            .collect();
+        assert_eq!(
+            at,
+            vec![
+                "src/web/vanilla.ts:7 QUERY \"\" workspace:src/router.ts#appRouter shelf.list request_summary"
+            ],
+        );
+    }
+}

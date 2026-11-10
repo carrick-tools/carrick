@@ -2642,13 +2642,23 @@ impl Analyzer {
             // flood the report as "missing endpoints" / env-var suggestions.
             // Non-HTTP operations (GraphQL/Socket) are keyed exactly and handled
             // by their own matchers, so this route-shape gate only applies to HTTP.
+            // A procedure call (READY-trpc-client K3) states no path: its
+            // procedure is what it calls, paired below by that key.
             if let Some((_, target)) = call.key.as_http()
+                && call.procedure.is_none()
                 && !is_valid_route_shape(target)
             {
                 debug!("Skipping call with non-route value: {}", call.key);
                 continue;
             }
-            let key = format!("{}:{}", call.key.canonical(), call.file_path.display());
+            // Every query call of a file shares the key `http|QUERY|`: the
+            // procedure is part of what tells two calls apart.
+            let key = format!(
+                "{}:{}{}",
+                call.key.canonical(),
+                call.file_path.display(),
+                crate::mount_graph::procedure_suffix(call.procedure.as_ref())
+            );
             if seen_calls.insert(key) {
                 unique_calls.push(call);
             }
@@ -2668,6 +2678,47 @@ impl Analyzer {
             let Some((method, target)) = call.key.as_http() else {
                 continue;
             };
+            // A procedure call pairs by its procedure alone (carrick-match's
+            // procedure arm), before any reading of its empty target: a
+            // matched procedure is an edge, and one no row serves is no
+            // missing endpoint.
+            if let Some(procedure) = &call.procedure {
+                let pairing = pool.pair(&carrick_match::Call {
+                    service: consumer_repo_by_call
+                        .get(&(
+                            method.to_uppercase(),
+                            target.to_string(),
+                            call.file_path.display().to_string(),
+                        ))
+                        .cloned()
+                        .unwrap_or_default(),
+                    protocol: "http".to_string(),
+                    method: Some(method.to_string()),
+                    path: Some(target.to_string()),
+                    procedure: Some(procedure.clone()),
+                    ..Default::default()
+                });
+                for winner in &pairing.winners {
+                    let endpoint = &pool_endpoints[winner.producer];
+                    matched_endpoints.insert(format!(
+                        "{}:{}{}",
+                        endpoint.method,
+                        endpoint.full_path,
+                        crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
+                    ));
+                    if let Some(edge) = Self::build_cross_repo_match(
+                        call,
+                        method,
+                        target,
+                        target,
+                        endpoint,
+                        &consumer_repo_by_call,
+                    ) {
+                        cross_repo_matches.push(edge);
+                    }
+                }
+                continue;
+            }
             // Rendered, not joined: `call_site` feeds the missing-endpoint,
             // wrong-verb, shared-contract and env-var rows. Blobs uploaded
             // before paths were relativized at the source carry the runner
@@ -2834,8 +2885,8 @@ impl Analyzer {
                 //
                 // `ProcedureUnserved`: the call names a procedure no row
                 // serves. A reading gap or an unindexed service, never a
-                // missing endpoint (no call reaches here with a procedure
-                // until the client reader states one).
+                // missing endpoint. A procedure call pairs above and never
+                // reaches here.
                 carrick_match::PairOutcome::NoLiteralAgreement
                 | carrick_match::PairOutcome::ProcedureUnserved => {}
                 carrick_match::PairOutcome::Matched
