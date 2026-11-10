@@ -140,7 +140,8 @@ impl CloudStorage for Store {
         true
     }
     async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError> {
-        if repo == "rpc-shelf" {
+        eprintln!("DIAGREPO {repo} {}", log_content.len());
+        if true {
             for line in log_content.lines() {
                 let lower = line.to_lowercase();
                 if lower.contains("walk")
