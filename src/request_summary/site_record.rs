@@ -52,7 +52,8 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::RequestSummaryInputs;
 use super::decided_sites::{
-    Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel, SlotBinding,
+    Decided, DecidedSite, HandlerAt, MethodLabel, MethodValue, PayloadBinding, SiteLabel,
+    SlotBinding,
 };
 use super::resolve::{ArgTexts, Resolver, TextValue};
 use crate::position_rows::{Kind, PositionIndex};
@@ -1736,6 +1737,33 @@ impl StatedBuilder {
     }
 }
 
+/// A procedure call's method label in the wire method tRPC's HTTP adapter
+/// serves it on (carrick#3186): the server's procedure rows are HTTP rows on
+/// that method (query GET, mutation POST, subscription GET, which the adapter
+/// streams over SSE), so the client row states it too. The label's own word
+/// is read first (`QUERY`, `MUTATE`, `SUBSCRIBE` or an HTTP method word);
+/// where the label states none, the member's name decides (`useMutation` and
+/// `mutationOptions` are POST, `useQuery` and `queryOptions` GET). A slot the
+/// code writes (`from`) is left alone.
+fn procedure_wire_label(mut label: MethodLabel, member: Option<&str>) -> MethodLabel {
+    let wire = |word: &str| -> String {
+        let word = word.to_ascii_lowercase();
+        if word.contains("mutat") {
+            "POST".to_string()
+        } else if word.contains("query") || word.contains("subscri") {
+            "GET".to_string()
+        } else {
+            word.to_ascii_uppercase()
+        }
+    };
+    label.literal = label.literal.as_deref().map(wire);
+    label.default = label.default.as_deref().map(wire);
+    if label.literal.is_none() && label.default.is_none() && label.from.is_none() {
+        label.default = member.map(wire).filter(|word| is_http_method(word));
+    }
+    label
+}
+
 fn place(from: PlaceFrom, at: &str) -> Place {
     Place {
         from,
@@ -2015,7 +2043,11 @@ fn record(
         }
     }
     let http = matches!(label.role.as_str(), "http_client" | "server_framework");
-    let method_label = label.method.clone().unwrap_or_default();
+    let procedure = site.end.procedure.is_some();
+    let mut method_label = label.method.clone().unwrap_or_default();
+    if procedure {
+        method_label = procedure_wire_label(method_label, label.member.as_deref());
+    }
     let label_place = |from: PlaceFrom| Place {
         from,
         at: label.package.clone(),
@@ -2148,11 +2180,14 @@ fn record(
                 .clone()
                 .map(|default| BTreeSet::from([default])),
         };
+        // A procedure call's method is already a wire method here
+        // ([`procedure_wire_label`], carrick#3186), like any HTTP call's.
         let methods: Vec<String> = methods
             .unwrap_or_default()
             .into_iter()
             .map(|method| method.to_ascii_uppercase())
             .collect();
+        let stated_word = is_http_method;
         // A method the code writes at the slot is the code's; the one the
         // member always sends, or its default, is the label's.
         let method_basis = match (&method_label.literal, &site.method) {
@@ -2160,9 +2195,7 @@ fn record(
             _ => Basis::Label,
         };
         match methods.as_slice() {
-            [one] if is_http_method(one) => {
-                decide(Slot::Method, methods.clone(), true, method_basis)
-            }
+            [one] if stated_word(one) => decide(Slot::Method, methods.clone(), true, method_basis),
             _ => decide(Slot::Method, Vec::new(), true, method_basis),
         }
     }
@@ -2460,6 +2493,47 @@ mod tests {
     use crate::position_rows::{FLAG_ANY, FileRows, Header, Row, RowsFile, content_hash};
 
     const WEB: &str = "services/web/src/";
+
+    /// A procedure call states its wire method: the label's HTTP word, a
+    /// legacy RPC word as its wire method, or, where the label states none,
+    /// the op name's (tRPC's HTTP adapter: query GET, mutation POST).
+    #[test]
+    fn a_procedure_label_states_the_wire_method() {
+        let label = |literal: Option<&str>, default: Option<&str>| MethodLabel {
+            from: None,
+            default: default.map(str::to_string),
+            literal: literal.map(str::to_string),
+        };
+        let stated = |label: MethodLabel, member: &str| {
+            let label = procedure_wire_label(label, Some(member));
+            label.literal.or(label.default)
+        };
+        assert_eq!(
+            stated(label(Some("POST"), None), "mutate"),
+            Some("POST".into())
+        );
+        assert_eq!(
+            stated(label(None, Some("MUTATION")), "useMutation"),
+            Some("POST".into())
+        );
+        assert_eq!(
+            stated(label(None, Some("QUERY")), "useQuery"),
+            Some("GET".into())
+        );
+        assert_eq!(
+            stated(label(None, None), "useMutation"),
+            Some("POST".into())
+        );
+        assert_eq!(
+            stated(label(None, None), "queryOptions"),
+            Some("GET".into())
+        );
+        assert_eq!(
+            stated(label(None, None), "useSubscription"),
+            Some("GET".into())
+        );
+        assert_eq!(stated(label(None, None), "invalidate"), None);
+    }
 
     /// carrick#3213: a name written as a template folds only where every
     /// value it names is typed as one string and the rest is literal. A

@@ -45,5 +45,8 @@
   "checker_threw": "the type checker failed at this position",
   "unresolved_name": "the compiler engine could not find what this name refers to",
   "untyped_receiver": "Carrick can't tell what kind of object this is",
-  "several_paths": "the value reads as more than one path, so it has no single path"
+  "several_paths": "the value reads as more than one path, so it has no single path",
+  "procedure_router_outside_repo": "the procedure's router is declared outside this repository's source, so Carrick can't name it",
+  "procedure_router_ambiguous": "the procedure's first key is declared in more than one place, so Carrick can't name its router",
+  "procedure_path_unread": "part of the procedure's key path is not written as a name Carrick can read"
 }

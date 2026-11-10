@@ -175,6 +175,11 @@ pub struct SiteRow {
     /// looked up here. `None` on a row that is not an HTTP request, and where
     /// the answered name is not the one the code writes.
     pub base: Option<crate::call_base::CallBaseResolution>,
+    /// The procedure a client procedure call names (carrick#3186):
+    /// its key is an HTTP key with the RPC word as its method and an empty
+    /// path, and this is its identity. The repository is added where the
+    /// row is written ([`fold`]).
+    pub procedure: Option<crate::request_summary::discovery::ProcedureAt>,
 }
 
 impl SiteRow {
@@ -776,6 +781,23 @@ pub(crate) fn agrees(reader: &OperationKey, site: &OperationKey) -> bool {
     }
 }
 
+/// [`agrees`], for a site row whose procedure has the key path
+/// `procedure` (carrick#3186): its key's path is empty, so it
+/// agrees with an HTTP reader row at its call whose path is an unknown call
+/// path, or whose last segment is the key path (`/api/rpc/shelf.list`). Any
+/// method: the reader spells the transport's, the site the RPC word.
+fn agrees_at(reader: &OperationKey, site: &OperationKey, procedure: Option<&str>) -> bool {
+    let Some(procedure) = procedure else {
+        return agrees(reader, site);
+    };
+    match reader.as_http() {
+        Some((_, path)) => {
+            carrick_match::is_unknown_call_path(path) || path.rsplit('/').next() == Some(procedure)
+        }
+        None => false,
+    }
+}
+
 /// Whether a reader row's key is a dispatch row's: for HTTP the same method
 /// and the same path, as written.
 fn same_route(reader: &OperationKey, site: &OperationKey) -> bool {
@@ -953,7 +975,21 @@ pub fn of(
             {
                 continue;
             }
-            let base = request_base(site, &name_written, &key, side);
+            // A client procedure call (carrick#3186): its name is the
+            // procedure's key path, which is identity, never a path. The row
+            // is an HTTP call with the RPC word as its method, an empty path
+            // and the procedure; it states no base.
+            let procedure = site.end.procedure.clone().filter(|_| side == RowSide::Call);
+            let key = match (&procedure, key) {
+                (Some(_), OperationKey::Http { method, .. }) => {
+                    OperationKey::http(&method, String::new())
+                }
+                (_, key) => key,
+            };
+            let base = match procedure {
+                Some(_) => None,
+                None => request_base(site, &name_written, &key, side),
+            };
             let source = match (fact, &key) {
                 (true, OperationKey::Http { .. }) if side == RowSide::Call => {
                     ResolutionSource::RequestSummary
@@ -981,6 +1017,7 @@ pub fn of(
                 through: is_through(site),
                 within: Vec::new(),
                 base,
+                procedure,
             });
         }
     }
@@ -1042,6 +1079,7 @@ pub fn descriptor_rows(decided: &Decided) -> Vec<SiteRow> {
                     &Default::default(),
                     &Default::default(),
                 ),
+                procedure: None,
             }
         })
         .collect()
@@ -1118,7 +1156,15 @@ pub fn fold(
     root: &Path,
     make: impl Fn(OperationKey, &Path, u32, RowSide) -> ApiEndpointDetails,
 ) -> SiteFold {
-    let fold = fold_rows(&mut data.calls, &mut data.endpoints, site, root, make);
+    let repo = data.repo_name.clone();
+    let fold = fold_rows(
+        &mut data.calls,
+        &mut data.endpoints,
+        site,
+        root,
+        &repo,
+        make,
+    );
     // A folded caller's row leaves the graph's calls too: the cross-service
     // pass reads them (`call_through::settle`), and would read the folded
     // row as a call of its own (carrick#2704).
@@ -1204,7 +1250,6 @@ pub fn fold(
             };
             let host = host.or_else(|| read.and_then(|call| call.host.clone()));
             graph.data_calls.push(DataFetchingCall {
-                procedure: None,
                 method: method.to_string(),
                 target_url: path.to_string(),
                 canonical_path: path.to_string(),
@@ -1224,6 +1269,7 @@ pub fn fold(
                 library_semantics: Vec::new(),
                 own_route,
                 static_asset: None,
+                procedure: row.procedure.as_ref().map(|procedure| procedure.key(&repo)),
             });
         }
     }
@@ -1236,6 +1282,7 @@ pub fn fold_rows(
     endpoints: &mut Vec<ApiEndpointDetails>,
     site: &SiteRows,
     root: &Path,
+    repo: &str,
     make: impl Fn(OperationKey, &Path, u32, RowSide) -> ApiEndpointDetails,
 ) -> SiteFold {
     let mut out = SiteFold::default();
@@ -1282,6 +1329,7 @@ pub fn fold_rows(
             RowSide::Call => &mut *calls,
             RowSide::Endpoint => &mut *endpoints,
         };
+        let procedure = row.procedure.as_ref().map(|procedure| procedure.key(repo));
         // The rows one record states for a name the code gives several
         // values (carrick#3504 S2b-8) stand side by side: a row with a
         // sibling's key is that sibling's, and neither keeps the site from
@@ -1301,6 +1349,12 @@ pub fn fold_rows(
                 place(root, existing)
                     .is_some_and(|(file, line)| file == row.file && line == row.line)
                     && !siblings.contains(&&existing.key)
+                    // Two procedure calls on one line are two operations,
+                    // whose keys are alike (carrick#3186): a row
+                    // naming another procedure is not this site's.
+                    && !(row.procedure.is_some()
+                        && existing.procedure.is_some()
+                        && existing.procedure != procedure)
             })
             .map(|(index, _)| index)
             .collect();
@@ -1354,9 +1408,13 @@ pub fn fold_rows(
         // A row on a label-only slot stands only with a reader row that
         // agrees (carrick#2520).
         if row.needs_reader
-            && !readers
-                .iter()
-                .any(|&index| agrees(&rows[index].key, &row.key))
+            && !readers.iter().any(|&index| {
+                let path = row
+                    .procedure
+                    .as_ref()
+                    .map(|procedure| procedure.path.as_str());
+                agrees_at(&rows[index].key, &row.key, path)
+            })
         {
             let mut lead = row.lead.clone();
             lead.unread.reason = Stop::Uncorroborated;
@@ -1422,6 +1480,7 @@ pub fn fold_rows(
         let mut stated = make(row.key.clone(), Path::new(&row.file), row.line, row.side);
         stated.resolution_source = Some(row.source);
         stated.name_scope = row.name_scope.clone();
+        stated.procedure = procedure;
         stated.inference = row.inference.clone().map(|answer| Inference {
             answer: Some(answer),
             alternative: None,
@@ -1459,15 +1518,25 @@ pub fn fold_rows(
             })
             .collect();
         let keys: Vec<OperationKey> = stated.iter().map(|row| row.key.clone()).collect();
+        // A procedure row's key is identity only with its procedure.
+        let procedures: Vec<Option<carrick_match::ProcedureKey>> =
+            stated.iter().map(|row| row.procedure.clone()).collect();
         // A second call on the caller's line may be the reader row's own.
         let one_fact = !stated.is_empty()
             && !throughs.iter().any(|through| through.other_call)
             && stated.iter().all(|row| is_fact(row))
-            && keys.iter().all(|key| *key == keys[0]);
+            && keys.iter().all(|key| *key == keys[0])
+            && procedures
+                .iter()
+                .all(|procedure| *procedure == procedures[0]);
         let folds = |row: &ApiEndpointDetails| {
             is_reader(row)
                 && at(row, file, line)
-                && (one_fact || keys.iter().any(|key| agrees(&row.key, key)))
+                && (one_fact
+                    || keys.iter().zip(&procedures).any(|(key, procedure)| {
+                        let path = procedure.as_ref().map(|key| key.path.as_str());
+                        agrees_at(&row.key, key, path)
+                    }))
         };
         let mut index = 0;
         while index < calls.len() {

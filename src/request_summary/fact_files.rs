@@ -346,6 +346,7 @@ mod tests {
             span_end: 9,
             new: false,
             scope: None,
+            procedure: None,
         }
     }
 

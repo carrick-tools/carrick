@@ -117,11 +117,18 @@ pub enum Stop {
     UntypedReceiver,
     /// A value reads as more than one written path.
     SeveralPaths,
+    /// A procedure call's first key is declared outside the repository's
+    /// source (a built declaration file, a package, another repository).
+    ProcedureRouterOutsideRepo,
+    /// A procedure call's first key is declared at more than one place.
+    ProcedureRouterAmbiguous,
+    /// A procedure call's key path holds a member the code does not name.
+    ProcedurePathUnread,
 }
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 47] = [
+    pub const ALL: [Stop; 50] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -169,6 +176,9 @@ impl Stop {
         Stop::UnresolvedName,
         Stop::UntypedReceiver,
         Stop::SeveralPaths,
+        Stop::ProcedureRouterOutsideRepo,
+        Stop::ProcedureRouterAmbiguous,
+        Stop::ProcedurePathUnread,
     ];
 
     /// The word as it is written on the wire.
@@ -221,6 +231,9 @@ impl Stop {
             Stop::UnresolvedName => "unresolved_name",
             Stop::UntypedReceiver => "untyped_receiver",
             Stop::SeveralPaths => "several_paths",
+            Stop::ProcedureRouterOutsideRepo => "procedure_router_outside_repo",
+            Stop::ProcedureRouterAmbiguous => "procedure_router_ambiguous",
+            Stop::ProcedurePathUnread => "procedure_path_unread",
         }
     }
 

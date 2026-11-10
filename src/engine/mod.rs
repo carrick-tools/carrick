@@ -26160,6 +26160,7 @@ unfollowed_member_calls_total: 0,
             through: false,
             within: Vec::new(),
             base: None,
+            procedure: None,
         }
     }
 

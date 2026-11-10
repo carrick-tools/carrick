@@ -162,6 +162,36 @@ pub struct SiteEnd {
     /// declaration states one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// The procedure a client call names when its op is named by the path
+    /// walked on a proxy (`client.shelf.list.query()`, name `bound: path`):
+    /// the key path and the router its first key belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure: Option<ProcedureAt>,
+}
+
+/// The procedure a client call names (carrick#3186): its key
+/// path, and the router's repo-relative file and binding, as
+/// [`super::decided_sites::router_holder`] names it. The repository is the
+/// blob's, added where the row is written.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProcedureAt {
+    pub path: String,
+    pub file: String,
+    pub binding: String,
+}
+
+impl ProcedureAt {
+    /// The pairing key in `repo`.
+    pub fn key(&self, repo: &str) -> carrick_match::ProcedureKey {
+        carrick_match::ProcedureKey {
+            path: self.path.clone(),
+            router: carrick_match::RouterId {
+                repo: repo.to_string(),
+                file: self.file.clone(),
+                binding: self.binding.clone(),
+            },
+        }
+    }
 }
 
 /// One function a walk entered.
@@ -931,6 +961,45 @@ pub(super) fn in_repo(row: &Row) -> bool {
         })
 }
 
+/// The export of the store's `package` that claims a call-form op on
+/// `member` of the type `type_name` the package declares (`of:
+/// "type:<package>#<type_name>"`), named by the path walked on that type
+/// (`name: { bound: "path" }`), and the op's join.
+fn path_op<'e>(
+    exports: &'e [ExportClaims],
+    package: &str,
+    type_name: &str,
+    member: &str,
+) -> Option<(&'e ExportClaims, Option<String>)> {
+    use crate::services::type_sidecar::{BoundName, OpName};
+    exports
+        .iter()
+        .filter(|export| export.package == package && export.role != LibraryRole::None)
+        .find_map(|export| {
+            export.claims.iter().find_map(|claim| match claim {
+                LibraryClaim::Op {
+                    member: Some(claimed),
+                    of: Some(of),
+                    name,
+                    ..
+                } if claim.is_call_form() && claimed == member => {
+                    let (module, held) = of.strip_prefix("type:")?.split_once('#')?;
+                    let join = match name.as_deref()? {
+                        OpName::Bound {
+                            bound: BoundName::Path,
+                            join,
+                            ..
+                        } => join.clone(),
+                        _ => return None,
+                    };
+                    (held == type_name && specifier_keys(module).iter().any(|key| key == package))
+                        .then_some((export, join))
+                }
+                _ => None,
+            })
+        })
+}
+
 /// Whether `claims` state `member` as a call-form op of the export.
 fn claims_member(claims: &ExportClaims, member: &str) -> bool {
     claims.claims.iter().any(|claim| {
@@ -1443,6 +1512,7 @@ impl<'a> Walker<'a> {
             span_end: invoke.call.site.span_end,
             new: invoke.construction,
             scope: None,
+            procedure: None,
         }
     }
 
@@ -1520,6 +1590,131 @@ impl<'a> Walker<'a> {
             }
             _ => None,
         }
+    }
+
+    /// A client procedure call (carrick#3186): `P.m1….mk.t(…)`,
+    /// where `P`'s type is a proxy the store labels with a call-form op on
+    /// member `t` named by the path walked on it (`name: { bound: "path" }`,
+    /// claimed on the proxy's type, `of: "type:<package>#<Type>"`). The
+    /// compiler's printed type of each object on the callee's chain says
+    /// which ones are the proxy: the outermost is `P`, and every member read
+    /// on one of them is a key of the path. The site's end is that op, and it
+    /// names the procedure: the key path joined by the op's `join`, and the
+    /// router [`super::decided_sites::router_holder`] finds at the first
+    /// key's declaration.
+    ///
+    /// A proxy call whose key cannot be made is no site: its end is kept
+    /// with the reason (K5), so the call is a lead that says why. The first
+    /// key is declared outside the repository's source
+    /// (`procedure_router_outside_repo`) or at more than one place
+    /// (`procedure_router_ambiguous`), or a key is one the code does not
+    /// name (`procedure_path_unread`). `None` for any other call.
+    fn procedure_end(&self, file: &Path, call: &CallIr) -> Option<(SiteEnd, Option<Stop>)> {
+        let row = self.row(file, call)?;
+        let member = row.symbol()?;
+        if in_repo(row) {
+            return None;
+        }
+        let packages = store_keys(row, self.labels.exports);
+        let inputs = self.inputs_for(file);
+        let ir = inputs.files.get(file)?;
+        let positions = inputs.positions.as_ref()?;
+        let at = |index: usize| {
+            let (lo, hi, member) = call.receiver_spans[index];
+            let kind = if member { Kind::Member } else { Kind::Ident };
+            positions
+                .lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind)
+                .ok()
+        };
+        let proxy_type = |index: usize| at(index)?.type_text().and_then(type_root);
+        // The innermost object on the chain whose type the store labels
+        // with a path-named op on this member.
+        let (inner, export, join) = (0..call.receiver_spans.len()).find_map(|index| {
+            let root = proxy_type(index)?;
+            packages.iter().find_map(|package| {
+                let (export, join) = path_op(self.labels.exports, package, root, member)?;
+                Some((index, export, join))
+            })
+        })?;
+        let root = proxy_type(inner)?;
+        let proxy = (inner..call.receiver_spans.len())
+            .take_while(|index| proxy_type(*index) == Some(root))
+            .last()
+            .unwrap_or(inner);
+        let invoke = Invoke {
+            file,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        let claims = self.labels.get(&export.package, &export.export)?;
+        let end = self.end_at(
+            invoke,
+            &export.package,
+            &export.export,
+            Some(member),
+            claims,
+        );
+        match self.procedure_at(file, call, ir, positions, proxy, join.as_deref()) {
+            Ok(procedure) => Some((
+                SiteEnd {
+                    procedure: Some(procedure),
+                    ..end
+                },
+                None,
+            )),
+            Err(reason) => Some((end, Some(reason))),
+        }
+    }
+
+    /// The procedure `call` names through the proxy at `proxy` on its chain
+    /// ([`Self::procedure_end`]): the keys read on the proxy, outermost
+    /// first, joined by `join`, and the router its first key's declaration
+    /// is held by.
+    fn procedure_at(
+        &self,
+        file: &Path,
+        call: &CallIr,
+        ir: &FileIr,
+        positions: &crate::position_rows::PositionIndex,
+        proxy: usize,
+        join: Option<&str>,
+    ) -> Result<ProcedureAt, Stop> {
+        let at = |index: usize| {
+            let (lo, hi, _) = call.receiver_spans[index];
+            positions
+                .lookup(file, ir.swc_start(lo), ir.swc_start(hi), Kind::Member)
+                .ok()
+        };
+        // The proxy itself is called: no key is read on it. A key the
+        // compiler names no symbol for (`client[k]`) is no name either.
+        if proxy == 0 {
+            return Err(Stop::ProcedurePathUnread);
+        }
+        let keys: Vec<&str> = (0..proxy)
+            .rev()
+            .map(|index| at(index).and_then(Row::symbol))
+            .collect::<Option<_>>()
+            .ok_or(Stop::ProcedurePathUnread)?;
+        let first = at(proxy - 1).ok_or(Stop::ProcedurePathUnread)?;
+        let (lo, hi, _) = call.receiver_spans[proxy - 1];
+        if positions
+            .union_declarations(file, ir.swc_start(lo), ir.swc_start(hi))
+            .is_ok_and(|declared| declared.len() > 1)
+        {
+            return Err(Stop::ProcedureRouterAmbiguous);
+        }
+        let (router_file, line) = in_repo(first)
+            .then(|| first.decl_file().zip(first.decl_line()))
+            .flatten()
+            .ok_or(Stop::ProcedureRouterOutsideRepo)?;
+        let binding = super::decided_sites::router_holder(self.root, router_file, line)
+            .ok_or(Stop::ProcedureRouterOutsideRepo)?;
+        Ok(ProcedureAt {
+            path: keys.join(join.unwrap_or(".")),
+            file: router_file.to_string(),
+            binding,
+        })
     }
 
     /// The labelled export `call` is made on, when it is one, and how it
@@ -1754,6 +1949,7 @@ impl<'a> Walker<'a> {
         Some(SiteEnd {
             op: Some(one.op),
             scope: one.scope.clone(),
+            procedure: None,
             ..self.end_at(invoke, &one.package, &one.export, Some(&one.member), claims)
         })
     }
@@ -2047,7 +2243,14 @@ impl<'a> Walker<'a> {
             }
             return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
-        if let Some((end, reached)) = self.library_end(file, call, construction) {
+        let procedure = (!construction)
+            .then(|| self.procedure_end(file, call))
+            .flatten();
+        let several = procedure.as_ref().and_then(|(_, stop)| *stop);
+        if let Some((end, reached)) = procedure
+            .map(|(end, _)| (end, ReachedBy::Type))
+            .or_else(|| self.library_end(file, call, construction))
+        {
             let traced = self.labels.declarations.is_some();
             return Outcome {
                 ends: vec![Found {
@@ -2055,7 +2258,7 @@ impl<'a> Walker<'a> {
                     end,
                     receiver: traced.then(|| self.receiver_of(file, call)).flatten(),
                     reached: traced.then_some(reached),
-                    several: None,
+                    several,
                     bound: Vec::new(),
                 }],
                 ..Outcome::default()

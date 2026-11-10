@@ -274,6 +274,7 @@ mod tests {
             span_end: span.1,
             new: false,
             scope: None,
+            procedure: None,
         }
     }
 

@@ -102,6 +102,10 @@ pub struct LabelledEnd {
     /// on the scope's receiver, never the base receiver's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// The procedure a client call names, when its op is named by the path
+    /// walked on a proxy ([`super::discovery::ProcedureAt`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure: Option<super::discovery::ProcedureAt>,
 }
 
 impl LabelledEnd {
@@ -563,7 +567,9 @@ impl SiteLabel {
     /// A maker-bound site the walk named nothing for is read as a label with
     /// no name slot is: the name is asked.
     pub fn reads_name_of(&self, site: &DecidedSite) -> bool {
-        self.reads_name() || (self.name_at_maker && !site.name.is_empty())
+        self.reads_name()
+            || (self.name_at_maker && !site.name.is_empty())
+            || (site.end.procedure.is_some() && !site.name.is_empty())
     }
 
     /// The slot the call `end` names is handed a function in, when the store
@@ -3054,6 +3060,17 @@ fn decide(
             }
             continue;
         }
+        // A client procedure call (carrick#3186): the name is the
+        // key path discovery read on the proxy, written by the code at the
+        // labelled call, which is the site.
+        if let Some(procedure) = &end.procedure {
+            if last_is_own {
+                let name = vec![Piece::Lit(procedure.path.clone())];
+                walk.site(&[last], end, name, BTreeSet::new());
+                through_to_last(&mut walk);
+            }
+            continue;
+        }
         let Some(slot) = &label.name else {
             // The label names no slot: the labelled call is the site, or for
             // a sibling's call the call of this service that enters it.
@@ -4310,6 +4327,7 @@ pub(crate) mod tests {
             span_start: line * 100,
             new: false,
             scope: None,
+            procedure: None,
             span_end: line * 100 + 20,
         };
         let sites = [
@@ -4368,6 +4386,7 @@ pub(crate) mod tests {
             span_end,
             new: false,
             scope: None,
+            procedure: None,
         }
     }
 
@@ -4862,6 +4881,7 @@ pub(crate) mod tests {
             span_start: start,
             new: false,
             scope: None,
+            procedure: None,
             span_end: start + call.len() as u32,
         };
         let bottom = DiscoverySite {
@@ -5085,6 +5105,7 @@ pub(crate) mod tests {
             span_start,
             new: false,
             scope: None,
+            procedure: None,
             span_end,
         }
     }
@@ -5797,6 +5818,7 @@ pub(crate) mod tests {
             span_end: 1,
             new: true,
             scope: None,
+            procedure: None,
         };
         assert_eq!(SiteLabel::find(&labels, &built), Some(&labels[0]));
         let called = LabelledEnd {

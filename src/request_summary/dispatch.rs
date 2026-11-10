@@ -535,6 +535,7 @@ mod tests {
             span_end: 1,
             new: false,
             scope: scope.map(str::to_string),
+            procedure: None,
         };
         (
             label(None, 1, true, 0),

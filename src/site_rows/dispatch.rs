@@ -174,6 +174,7 @@ fn row(
         within: place.within.clone(),
         // A handler is no request: it states no base.
         base: None,
+        procedure: None,
     }
 }
 
@@ -628,7 +629,14 @@ mod tests {
             reader(OperationKey::http("GET", "/api/other"), 10),
             reader(OperationKey::http("GET", "/api/one"), 40),
         ];
-        let fold = fold_rows(&mut Vec::new(), &mut endpoints, &site, Path::new("."), make);
+        let fold = fold_rows(
+            &mut Vec::new(),
+            &mut endpoints,
+            &site,
+            Path::new("."),
+            "",
+            make,
+        );
         let mut left: Vec<(String, OperationKey)> = endpoints
             .iter()
             .map(|row| {
@@ -682,7 +690,14 @@ mod tests {
             reader(OperationKey::http("GET", "/api/one"), 10),
             reader(OperationKey::http("POST", "/api/two"), 10),
         ];
-        let fold = fold_rows(&mut Vec::new(), &mut endpoints, &site, Path::new("."), make);
+        let fold = fold_rows(
+            &mut Vec::new(),
+            &mut endpoints,
+            &site,
+            Path::new("."),
+            "",
+            make,
+        );
         assert_eq!(endpoints.len(), 2);
         assert!(fold.withdrawn.is_empty());
     }
@@ -705,7 +720,14 @@ mod tests {
             reader(OperationKey::http("GET", "/api/:id"), 10),
             reader(OperationKey::http("GET", "/api/*"), 11),
         ];
-        let fold = fold_rows(&mut Vec::new(), &mut endpoints, &site, Path::new("."), make);
+        let fold = fold_rows(
+            &mut Vec::new(),
+            &mut endpoints,
+            &site,
+            Path::new("."),
+            "",
+            make,
+        );
         let mut left: Vec<(String, OperationKey)> = endpoints
             .iter()
             .map(|row| {
