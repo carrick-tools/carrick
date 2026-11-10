@@ -668,6 +668,7 @@ mod tests {
             receiver: None,
             reached: None,
             bound: Vec::new(),
+            also: Vec::new(),
         });
         discovery
             .unanswered_direct
