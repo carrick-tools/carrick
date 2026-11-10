@@ -11556,6 +11556,8 @@ mod tests {
             base: Vec::new(),
             base_scope: None,
             semantics: BTreeSet::new(),
+            guards: Vec::new(),
+            ruled_out: false,
         }
     }
 
