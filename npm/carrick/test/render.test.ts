@@ -408,6 +408,30 @@ test("a local index dispatches nothing, so the header drops the analyzer count",
   assert.deepEqual(lines, ["webapp at abc1234"]);
 });
 
+test("files the parser refused are named, two at most, with the rest counted", () => {
+  const lines = boundaryLines(
+    {
+      commit_hash: "abc1234def",
+      files_attempted: 0,
+      files_not_parsed: { total: 3, reasons: ["a.d.ts: does_not_parse", "b.d.ts: does_not_parse"] },
+    },
+    "webapp",
+  );
+  assert.ok(
+    lines.includes(
+      "  3 file(s) did not parse (a.d.ts, b.d.ts and 1 more): the index states nothing from them, so treat a route or call missing there as a gap in the index, not a finding.",
+    ),
+    lines.join("\n"),
+  );
+});
+
+test("an absent or zero parse count prints nothing", () => {
+  for (const files_not_parsed of [undefined, { total: 0 }]) {
+    const lines = boundaryLines({ commit_hash: "abc1234def", files_attempted: 0, files_not_parsed }, "webapp");
+    assert.deepEqual(lines, ["webapp at abc1234"]);
+  }
+});
+
 test("an old blob that still carries the removed literal count reads without a line for it", () => {
   const old = {
     commit_hash: "abc1234def",

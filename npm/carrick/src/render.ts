@@ -60,6 +60,16 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
     out.push(`  ${count.total} ${what}${firstReason(count)}`);
   };
   push(boundary.files_lost, "file(s) the analyzer never answered for");
+  const unparsed = boundary.files_not_parsed;
+  if (unparsed && unparsed.total > 0) {
+    const paths = (unparsed.reasons ?? []).map((reason) => reason.replace(/: does_not_parse$/, ""));
+    const named = paths.slice(0, 2).join(", ");
+    const rest = unparsed.total - Math.min(2, paths.length);
+    const where = named ? ` (${named}${rest > 0 ? ` and ${rest} more` : ""})` : "";
+    out.push(
+      `  ${unparsed.total} file(s) did not parse${where}: the index states nothing from ${unparsed.total === 1 ? "it" : "them"}, so treat a route or call missing there as a gap in the index, not a finding.`,
+    );
+  }
   push(
     boundary.consumers_not_resolved,
     "call site(s) that named a client member and did not resolve to it",

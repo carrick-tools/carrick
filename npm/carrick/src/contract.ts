@@ -22,6 +22,8 @@ export type Boundary = {
   commit_hash?: string;
   files_attempted?: number;
   files_lost?: Counted;
+  /** Files the parser refused (`path: does_not_parse`); written by the scanner since carrick#3760. Absent reads as 0. */
+  files_not_parsed?: Counted;
   /** Candidates no model has been asked about: what `carrick index` classifies. */
   candidates_awaiting_model?: number;
   /** Why this service's types are thin, when the scan recorded a reason. */
