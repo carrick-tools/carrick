@@ -6754,7 +6754,17 @@ impl Reader<'_> {
             // carries.
             [path, _base] => {
                 let path = self.eval(&path.expr, scope).pieces();
-                if !matches!(path.first(), Some(Piece::Lit(text)) if text.starts_with('/')) {
+                // The path is a literal starting with `/`, or the function's
+                // own parameter (or a key of one): the caller fills it in, and
+                // `render_target` refuses there a path that does not start
+                // with a literal `/` (an absolute URL replaces the base, so it
+                // is that URL).
+                let readable = match path.first() {
+                    Some(Piece::Lit(text)) => text.starts_with('/'),
+                    Some(first) => first.is_parameter(),
+                    None => false,
+                };
+                if !readable {
                     return Value::hole(self.text(new.span), HoleReason::UnreadExpression);
                 }
                 Value::Str(path)
