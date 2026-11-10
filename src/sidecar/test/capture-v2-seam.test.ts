@@ -40,6 +40,24 @@ function importsOf(file: string): string[] {
   return specs.filter((s) => !s.includes('${'));
 }
 
+/**
+ * Import statements in `source` that reach capture/ other than as
+ * `import type { ... } from '<capture>/index.js'`. Comments are stripped; a
+ * value import, a mixed import, a side-effect import and a dynamic
+ * import() all count.
+ */
+function nonTypeCaptureImports(source: string): string[] {
+  const text = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const found: string[] = [];
+  const statements = /(?:^|[;\n])\s*(import\b[^;]*?['"][^'"]*capture\/[^'"]*['"])|(import\(\s*['"][^'"]*capture\/[^'"]*['"]\s*\))/g;
+  let m: RegExpExecArray | null;
+  while ((m = statements.exec(text)) !== null) {
+    const statement = (m[1] ?? m[2]).trim();
+    if (!/^import\s+type\s*\{[^}]*\}\s*from\s*['"]\.\/capture\/index\.js['"]$/.test(statement)) found.push(statement);
+  }
+  return found;
+}
+
 function tsFiles(dir: string): string[] {
   return fs
     .readdirSync(dir, { withFileTypes: true })
@@ -102,8 +120,7 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           base === 'position-rows.ts' ||
           base === 'infer-cache.ts' ||
           base === 'retype.ts' ||
-          base === 'default-library.ts' ||
-          base === 'library-claims.ts'
+          base === 'default-library.ts'
         ) {
           // Shared Deno resolution, the options every program carries
           // (`sidecarCompilerOptions`, carrick#2019), and the response-table
@@ -114,14 +131,17 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           // The retype reads a declared no-body return
           // with the same `statesNoBody` (carrick#2743). The default
           // library's file system builds its base project with the same
-          // options (carrick#3509). The lister's bounded print types the
-          // compiler's 5-argument node builder with the capture's own
-          // `InternalTypeChecker` (carrick#3744).
+          // options (carrick#3509).
           assert.strictEqual(
             spec,
             './capture/index.js',
             `${base} must use only the capture entry point, saw '${spec}'`
           );
+        } else if (base === 'library-claims.ts') {
+          // Type-only: the lister's bounded print types the compiler's
+          // 5-argument node builder with the capture's `InternalTypeChecker`
+          // (carrick#3744); a runtime import would drag the bundle in.
+          assert.deepStrictEqual(nonTypeCaptureImports(fs.readFileSync(file, 'utf8')), [], `${base} may import only types from the capture entry point`);
         } else if (base === 'types.ts') {
           assert.strictEqual(
             spec,
@@ -133,5 +153,16 @@ describe('capture bundle seam (pinned decision 11a)', () => {
         }
       }
     }
+  });
+
+  it('library-claims.ts may import only types from the capture entry point (carrick#3744)', () => {
+    const allowed = "import type { InternalTypeChecker } from './capture/index.js';\n";
+    assert.deepStrictEqual(nonTypeCaptureImports(allowed), []);
+    const value = "import { captureStub } from './capture/index.js';\n";
+    assert.deepStrictEqual(nonTypeCaptureImports(value), [value.trim().replace(/;$/, '')]);
+    const mixed = "import { type InternalTypeChecker, captureStub } from './capture/index.js';\n";
+    assert.strictEqual(nonTypeCaptureImports(mixed).length, 1);
+    assert.strictEqual(nonTypeCaptureImports("import './capture/index.js';\n").length, 1);
+    assert.strictEqual(nonTypeCaptureImports("import type { X } from './capture/node-builder.js';\n").length, 1);
   });
 });
