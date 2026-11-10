@@ -427,6 +427,26 @@ print_failed_log() {
   fi
 }
 
+# npm's first error line in a failed attempt's log, on one line for the
+# warning: the root's path made relative, URL credentials and npm token forms
+# (`_authToken=`, `_auth=`, `Authorization: Bearer|token`) redacted, capped.
+# Prints nothing when the log has none (another manager, or a timeout).
+first_npm_error() {
+  local log="$1" root="$2" line literal_root delim
+  [ -f "$log" ] || return 0
+  # The root matches as text: a `.` or `+` in the path is not a pattern. The
+  # expression's delimiter is a control byte, which no path carries.
+  literal_root=$(printf '%s' "$root" | sed -e 's/[][\.*^$|+?(){}]/\\&/g')
+  delim=$(printf '\001')
+  line=$(grep -m1 -E '^npm (error|ERR!)' "$log" | tr -d '\000-\037' | sed -E \
+    -e "s${delim}${literal_root}${delim}.${delim}g" \
+    -e 's|//[^/@ ]*@|//|g' \
+    -e 's|(_authToken=)[^[:space:]]+|\1<redacted>|g' \
+    -e 's|(_auth=)[^[:space:]]+|\1<redacted>|g' \
+    -e 's#([Aa]uthorization: *([Bb]earer|[Tt]oken) +)[^[:space:]]+#\1<redacted>#g')
+  printf '%.200s' "$line"
+}
+
 # The files a lockfile-tolerant retry may rewrite, per manager.
 retry_guarded_files() {
   case "$1" in
@@ -474,7 +494,7 @@ yarn_is_berry() {
 }
 
 cmd_install_one() {
-  local root="$1" manager="$2" log status refusal strict_cmd="" no_retry="" snap="" before=""
+  local root="$1" manager="$2" log status refusal strict_cmd="" no_retry="" snap="" before="" npm_error="" retry_error=""
   if [ "$manager" != "deno" ] && { [ -f "$root/deno.json" ] || [ -f "$root/deno.jsonc" ]; }; then
     # Mixed roots need the global Deno cache AND the Node compiler's local
     # install. Neither preparation executes authorized project lifecycle code.
@@ -581,6 +601,7 @@ cmd_install_one() {
   fi
 
   print_failed_log "$log"
+  npm_error=$(first_npm_error "$log" "$root")
 
   # One lockfile-tolerant retry (CARRICK_INSTALL_LOCKFILE_RETRY=1). A timeout
   # is not retried: a second attempt would only spend the limit again.
@@ -611,6 +632,8 @@ cmd_install_one() {
       return 0
     fi
     print_failed_log "$log"
+    retry_error=$(first_npm_error "$log" "$root")
+    [ -n "$retry_error" ] && npm_error="$retry_error"
   fi
 
   # A root that ends uninstalled keeps no node_modules the attempts created:
@@ -625,7 +648,7 @@ cmd_install_one() {
   if [ $status -eq 124 ] || [ $status -eq 137 ]; then
     warn "Carrick's dependency install ($manager) in $root hit the ${INSTALL_TIMEOUT_SECONDS}s limit; the scan will refuse that service rather than index \`any\` through its packages."
   else
-    warn "Carrick's dependency install ($manager) in $root failed (exit $status); the scan will refuse that service rather than index \`any\` through its packages."
+    warn "Carrick's dependency install ($manager) in $root failed (exit $status)${npm_error:+: $npm_error}; the scan will refuse that service rather than index \`any\` through its packages."
   fi
   return 0
 }

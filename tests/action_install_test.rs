@@ -1876,7 +1876,8 @@ impl StubManager {
         let scratch = tempfile::tempdir().expect("scratch dir");
         let base = scratch.path().canonicalize().expect("canonical scratch");
         let bin = base.join("bin");
-        let root = base.join("root");
+        // A dot in the path: the scrub must match the root as text, not as a pattern.
+        let root = base.join("root.d");
         fs::create_dir_all(&bin).expect("bin dir");
         fs::create_dir_all(&root).expect("root dir");
         fs::write(root.join("package.json"), r#"{"name":"s","private":true}"#).expect("manifest");
@@ -1887,6 +1888,7 @@ impl StubManager {
              echo call >> \"$STUB_COUNTER\"\n\
              if [ -n \"$STUB_SLEEP\" ]; then exec sleep \"$STUB_SLEEP\"; fi\n\
              i=1; while [ \"$i\" -le \"${STUB_LINES:-0}\" ]; do echo \"line $i\"; i=$((i+1)); done\n\
+             if [ -n \"$STUB_ERROR\" ]; then printf '%s\\n' \"$STUB_ERROR\"; fi\n\
              for d in $STUB_MKDIRS; do mkdir -p \"$d\"; done\n\
              exit 1\n",
         )
@@ -2008,6 +2010,79 @@ fn a_failed_install_prints_the_head_of_its_log() {
         run.text()
     );
     assert!(!run.text().contains("lines omitted"), "{}", run.text());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failed_npm_install_warns_with_npms_first_error_line() {
+    let stub = StubManager::new("npm");
+    let root = stub.root.to_str().expect("utf-8").to_string();
+    let error = format!("npm error code EUSAGE {root}/package-lock.json is out of sync");
+    let run = stub.run("npm", true, &[("STUB_ERROR", error.as_str())]);
+    assert_eq!(stub.calls(), 2, "strict, then one retry: {}", run.text());
+    let warning = run
+        .err
+        .lines()
+        .find(|l| l.starts_with("::warning::"))
+        .unwrap_or_else(|| panic!("a warning: {}", run.text()));
+    assert!(
+        warning
+            .contains("failed (exit 1): npm error code EUSAGE ./package-lock.json is out of sync;"),
+        "the first npm error line, path made relative: {warning}"
+    );
+    let reason = warning
+        .split("failed (exit 1): ")
+        .nth(1)
+        .unwrap_or_default();
+    assert!(
+        !reason.contains(&root),
+        "no absolute root in the error line: {warning}"
+    );
+
+    let silent = StubManager::new("npm");
+    let run = silent.run("npm", false, &[]);
+    assert!(
+        run.err.contains("failed (exit 1); the scan will refuse"),
+        "no npm line, no suffix: {}",
+        run.text()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failed_npm_install_warning_carries_no_credentials() {
+    let stub = StubManager::new("npm");
+    let root = stub.root.to_str().expect("utf-8").to_string();
+    // The root with its `.` swapped: a regex root would match and rewrite it.
+    let lookalike = root.replace("root.d", "rootXd");
+    let error = format!(
+        "npm error fetch https://alice:s3cret@registry.example.test/pkg \
+         //registry.example.test/:_authToken=npm_abc123 _auth=basic456 \
+         Authorization: Bearer xyz789 {root}/package.json {lookalike}/package.json"
+    );
+    let run = stub.run("npm", true, &[("STUB_ERROR", error.as_str())]);
+    let warning = run
+        .err
+        .lines()
+        .find(|l| l.starts_with("::warning::"))
+        .unwrap_or_else(|| panic!("a warning: {}", run.text()));
+    for secret in ["s3cret", "npm_abc123", "basic456", "xyz789"] {
+        assert!(!warning.contains(secret), "{secret} leaked: {warning}");
+    }
+    assert!(
+        warning.contains("//registry.example.test/pkg"),
+        "URL kept without its credentials: {warning}"
+    );
+    assert!(
+        warning.contains("_authToken=<redacted>")
+            && warning.contains("_auth=<redacted>")
+            && warning.contains("Authorization: Bearer <redacted>"),
+        "tokens redacted: {warning}"
+    );
+    assert!(
+        warning.contains(&format!("./package.json {lookalike}/package.json")),
+        "the real root is made relative, a lookalike path is left alone: {warning}"
+    );
 }
 
 #[test]
