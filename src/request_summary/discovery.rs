@@ -102,7 +102,7 @@ const OF_IMPLEMENTATIONS: Plural = Plural {
 };
 
 /// The hop a walk records where it enters a function through a value.
-use super::decided_sites::{BoundCall, HopMaker, VALUE_HOP};
+use super::decided_sites::{BoundCall, CALLBACK_HOP, HopMaker, VALUE_HOP};
 use super::stop::Stop;
 
 /// One discovered site, or one walk that entered code and stopped.
@@ -1471,6 +1471,20 @@ impl<'a> Walker<'a> {
     }
 
     fn hop(&self, file: &Path, key: &str) -> ChainHop {
+        // A function written inside another is entered as a value is, at
+        // the line its node starts on (carrick#2448 T3c): what decided
+        // sites places a `<value>` hop by.
+        if self.values.function(file, key).is_none()
+            && let Some((_, written)) = self.written_inside(file, key)
+            && let Some(site) = &written.site
+        {
+            return ChainHop {
+                function: VALUE_HOP.to_string(),
+                file: self.rel(file),
+                line: site.line,
+                made: None,
+            };
+        }
         let line = self
             .inputs_for(file)
             .files
@@ -2496,7 +2510,7 @@ impl<'a> Walker<'a> {
                 && let Some(callback) = body.nested.get(*nested)
             {
                 let written = ChainHop {
-                    function: "<callback>".to_string(),
+                    function: CALLBACK_HOP.to_string(),
                     file: self.rel(file),
                     line: callback
                         .site
@@ -2521,8 +2535,9 @@ impl<'a> Walker<'a> {
             return known.clone();
         }
         // A definition the extractor keys whose body this pass did not read
-        // (an object's method, a function written inside another): what it
-        // calls is not known, so the walk stops there and says so.
+        // (no keyed body and no function written where the key's node
+        // starts): what it calls is not known, so the walk stops there and
+        // says so.
         let Some((file, ir)) = self.function(&id.0, &id.1) else {
             return Outcome::stopped(Stop::NoBody);
         };
@@ -2803,9 +2818,26 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// The definition `key` of `file`, the file as `inputs` keys it.
+    /// The definition `key` of `file`, the file as `inputs` keys it: its
+    /// keyed body, else the function written inside another body that the
+    /// key names ([`Self::written_inside`]).
     fn function(&self, file: &Path, key: &str) -> Option<(&'a Path, &'a FnIr)> {
-        self.values.function(file, key)
+        self.values
+            .function(file, key)
+            .or_else(|| self.written_inside(file, key))
+    }
+
+    /// The function the extractor keys as `key` of `file` when it is written
+    /// inside another body, which keys no body of its own (carrick#2448
+    /// T3c): `const request = async (o) => …` in a factory, a function
+    /// declared in a function, an object's method written there. Found by
+    /// where the key's function node starts, never by its name.
+    fn written_inside(&self, file: &Path, key: &str) -> Option<(&'a Path, &'a FnIr)> {
+        let (path, ir) = self.inputs_for(file).files.get_key_value(file)?;
+        let (Some(start), _) = *ir.definitions.get(key)? else {
+            return None;
+        };
+        Some((path.as_path(), self.values.written_function(file, start)?))
     }
 
     /// The labelled call `invoke` is when the name or member read at
@@ -3813,6 +3845,139 @@ mod tests {
         );
         assert!(end.file.ends_with("r3/client/client.ts"), "{end:?}");
         assert_eq!(end.line, 38, "{end:?}");
+    }
+
+    /// carrick#2448 T3c: a function the extractor keys that is written
+    /// inside another (`const request = async (options) => …` inside
+    /// `createClient`) has no keyed body; the walk enters the function
+    /// written there, under a `<value>` hop at its line, and reaches the send
+    /// at `client.ts:38` rather than stopping `no_body`. The send keeps its
+    /// own site. The answer key is `tests/fixtures/generated-client/README.md`.
+    #[test]
+    fn a_call_into_a_function_written_inside_another_enters_it() {
+        let Some(on) = walked("generated-client", "", "", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        for (file, line) in [
+            ("r3/sdk.ts", 11),
+            ("r3/sdk.ts", 18),
+            ("r3/sdk.ts", 25),
+            ("r3/client/client.ts", 43),
+        ] {
+            let [site] = at(file, line)[..] else {
+                panic!(
+                    "a site at {file}:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            assert_eq!(site.stop, None, "{file}:{line}: {site:?}");
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("lib:lib.dom.d.ts", "fetch"),
+                "{file}:{line}"
+            );
+            assert!(end.file.ends_with("r3/client/client.ts"), "{end:?}");
+            assert_eq!(end.line, 38, "{file}:{line}: {end:?}");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert_eq!(
+                hops.last(),
+                Some(&(VALUE_HOP, 31)),
+                "{file}:{line}: the walk enters `request` as a value"
+            );
+        }
+        // The send keeps its own site, with no chain.
+        let [send] = at("r3/client/client.ts", 38)[..] else {
+            panic!("one site at the send: {:?}", discovery.sites);
+        };
+        assert!(send.chain.is_empty(), "{send:?}");
+    }
+
+    /// carrick#2448 T3c, the other forms: a function declared inside a
+    /// factory, and a method of an object literal the factory holds, each
+    /// sending through `fetch`. A call through what the factory returns
+    /// enters the inner function as a value and reaches the send.
+    #[test]
+    fn a_function_declared_or_held_inside_a_factory_is_entered() {
+        let client = "export const make = (base: string) => {\n\
+            \x20 async function send(path: string) {\n\
+            \x20   return fetch(base + path);\n\
+            \x20 }\n\
+            \x20 const api = {\n\
+            \x20   async load(path: string) {\n\
+            \x20     return fetch(base + path);\n\
+            \x20   },\n\
+            \x20 };\n\
+            \x20 const list = () => send('/a');\n\
+            \x20 const read = () => api.load('/b');\n\
+            \x20 return { list, read };\n\
+            };\n";
+        let use_ = "import { make } from './inner';\n\
+            const c = make('http://localhost');\n\
+            export const a = () => c.list();\n\
+            export const b = () => c.read();\n";
+        let Some(on) = walked(
+            "generated-client",
+            "",
+            "",
+            &[("src/t3c/inner.ts", client), ("src/t3c/use.ts", use_)],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        for (line, send, entered) in [(10, 3, 2), (11, 7, 6)] {
+            let at: Vec<&DiscoverySite> = discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("t3c/inner.ts") && site.line == line)
+                .collect();
+            let [site] = at[..] else {
+                panic!(
+                    "a site at t3c/inner.ts:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            assert_eq!(site.stop, None, "t3c/inner.ts:{line}: {site:?}");
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(end.export, "fetch", "t3c/inner.ts:{line}");
+            assert_eq!(end.line, send, "t3c/inner.ts:{line}: {end:?}");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert_eq!(
+                hops.last(),
+                Some(&(VALUE_HOP, entered)),
+                "t3c/inner.ts:{line}: {hops:?}"
+            );
+        }
     }
 
     /// carrick#2448 T1, soundness rule 2.3.3 across modules: the object a
@@ -5297,12 +5462,14 @@ export function listen(): void {
         );
     }
 
-    /// carrick#2431: a walk that reaches a definition whose body this pass
-    /// did not read stops there and says so; an optional call is a call. A
-    /// constant object's member is a function of the module, read like any
-    /// other, so the walk follows it (carrick#3356).
+    /// carrick#2431: an optional call is a call. A function declared inside
+    /// another (`loadInner`) keys no body of its own, and the walk enters
+    /// the function written there as a value (carrick#2448 T3c), where it
+    /// stopped `no_body` before. A constant object's member is a function of
+    /// the module, read like any other, so the walk follows it
+    /// (carrick#3356).
     #[test]
-    fn an_unread_body_is_a_stop_and_an_optional_call_is_a_site() {
+    fn a_function_declared_inside_another_is_entered_and_an_optional_call_is_a_site() {
         let edit = [
             (
                 "src/table.ts",
@@ -5322,7 +5489,7 @@ export function listen(): void {
             records_in(&discovery, "services/web/src/table.ts"),
             texts(&[
                 "3 fetch -> lib.dom fetch -",
-                "5 loadInner stop no_body",
+                "5 loadInner -> lib.dom fetch -",
                 "10 fetch -> lib.dom fetch -",
                 "15 table.load -> lib.dom fetch -",
             ])
