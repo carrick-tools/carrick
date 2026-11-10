@@ -251,7 +251,7 @@ test("a changed entry runs after every per-file entry, one per session and root,
     const changed = answers.find((a) => a.seq === newer.seq)!;
     assert.equal(changed.kind, "changed");
     assert.equal(changed.changed?.exit, 0);
-    const line = lateContext(changed, false, checkedSinceLastEdit("s1", s.root, s.home));
+    const line = lateContext(changed, false);
     assert.equal(line, null, "a finished check --changed with exit 0 delivers nothing");
     // Exit 2 (could not check) and a run that gave no answer are silent too; exit 1 speaks.
     const exit = (code: number) => ({ ...changed, changed: { ...changed.changed!, exit: code, not_checked: "no usable type" } });

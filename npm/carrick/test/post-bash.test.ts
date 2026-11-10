@@ -206,6 +206,19 @@ test("a heredoc that creates a TS file runs the post-edit flow for it", async (t
   assert.match(contextOf(run.stdout), /^Carrick re-checked .* after this edit: 1 contract problem\./);
 });
 
+test("a heredoc write of a TS file whose check is clean prints nothing", async (t) => {
+  const w = repoWithWorktree(t);
+  fs.writeFileSync(path.join(w.worktree, "src", "argv.ts"), "export const flag = 1;\n");
+  const command = "cat > src/argv.ts <<'EOF'\nexport const flag = 1;\nEOF";
+  const run = await runHook("post-bash.ts", {
+    payload: bashPayload(w.worktree, command, "sess-w-clean"),
+    env: writeEnv(w, { CARRICK_FAKE_FIXTURE: fixturePath("check-clean.json") }),
+  });
+  assert.equal(run.code, 0);
+  assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), [".claude/worktrees/wt/src/argv.ts"]);
+  assert.equal(run.stdout, "");
+});
+
 test("a python heredoc rewrite of a TS file runs the post-edit flow once for it", async (t) => {
   const w = repoWithWorktree(t);
   const command = "python3 - <<'EOF'\nimport pathlib\np = pathlib.Path('src/capture/backfill.ts')\np.write_text('export const b = 2;\\n')\nEOF";

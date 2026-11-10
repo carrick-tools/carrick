@@ -8,7 +8,7 @@
 import path from "node:path";
 import type { Channel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { notRecheckedLine, pendingLine, renderPostToolUse } from "../render.ts";
+import { renderPostToolUse } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
@@ -100,15 +100,9 @@ export async function editFlow(
     const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt);
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
-    for (const index of toQueue) {
-      const result = answers.results[index] ?? null;
-      if (queued.has(edited[index]!)) {
-        rendered.set(index, pendingLine(relatives[index]!, result?.service));
-      } else {
-        // The queue refused it: say what is true rather than nothing.
-        rendered.set(index, notRecheckedLine(relatives[index]!, result?.recheck?.reason));
-      }
-    }
+    // A queued file says nothing now: its answer is delivered with the next
+    // Carrick line only when it holds a finding, and a refused queue entry is a
+    // gap the Stop hook names (hook-wording audit T4).
   }
   // What the Stop hook states the session's check from (carrick#3466): each
   // file, at the time its entry or in-hand answer carries, and every answer

@@ -107,7 +107,7 @@ function hasFindings(answer: Answer): boolean {
 }
 
 /** One answer's lines, for a reader who was not told this edit was being re-checked. */
-function render(answer: Answer, settled: boolean): string {
+function render(answer: Answer): string {
   if (isChanged(answer)) return answer.changed?.exit === 1 ? (lateContext(answer, false) ?? "") : "";
   const where = answer.relative;
   const result: CheckResult | undefined = answer.result;
@@ -122,7 +122,7 @@ function render(answer: Answer, settled: boolean): string {
       ? `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.`
       : `Carrick: ${where} was not re-checked here.`;
   }
-  return renderPostToolUse(result, where, { uses: false, late: true, settled }) ?? "";
+  return renderPostToolUse(result, where, { uses: false, late: true }) ?? "";
 }
 
 export type StopOptions = {
@@ -338,17 +338,11 @@ export async function stopAnswers(session: string, options: StopOptions): Promis
     }
   }
 
-  // No clause where Stop stated the change, now or at an earlier Stop: it
-  // either checked it or queued the check itself.
-  const after = readSession(session, home);
-  const settledAt = (root: string): boolean =>
-    (after.stated[root] ?? -1) >= (after.edited[root] ?? 0) || checkedSinceLastEdit(session, root, home);
-
   const lines: string[] = [...stated.values()];
   const rest = delivered.filter((answer) => !folded.has(answer.seq));
   if (rest.some(actionable)) {
     for (const answer of rest) {
-      const text = render(answer, settledAt(answer.root));
+      const text = render(answer);
       if (text) lines.push(text);
     }
   }
