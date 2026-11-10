@@ -1107,8 +1107,7 @@ pub(super) fn module_bindings(
             };
             taken(local, declared);
         }
-        let mut inner: Vec<&FnIr> = Vec::new();
-        collect_written(ir, &mut inner);
+        let inner: Vec<&FnIr> = Vec::new();
         for ir in inner {
             for local in ir.local_bindings.iter().filter(|local| !local.defaulted) {
                 taken(local, Declared::Nested);
