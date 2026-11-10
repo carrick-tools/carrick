@@ -1128,15 +1128,7 @@ impl<'a> Resolver<'a> {
             .files
             .get(path)?
             .module_bindings
-            .get(&(line, symbol.clone()))
-            // A block-scoped or nested local is in the table, and no text
-            // read opens it yet (carrick#3794): it reads as no entry. A loop
-            // head is the one the text reader reads (carrick#2093): the
-            // compiler row's declaration line and name key it, so the
-            // compiler settles any shadowing.
-            .filter(|binding| {
-                !binding.scoped_entry() || binding.kind == BindingKind::LoopElement
-            })?;
+            .get(&(line, symbol.clone()))?;
         let declared = super::super::site_record::declaration_path(row.decl_file()?);
         Some(((path, line, symbol), binding, declared))
     }
