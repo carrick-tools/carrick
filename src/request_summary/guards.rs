@@ -117,6 +117,13 @@ pub enum HoleReason {
     OwnFunction,
     /// A named function nothing calls, hands on or exports.
     NoCallerNotExported,
+    /// A parameter of a definition nothing calls: no caller names what it
+    /// holds (the text reader's caller mode, carrick#3504 B10-1b).
+    NameNeverBound,
+    /// A parameter of a function written inside a body (a callback, or a
+    /// lambda held in a local): what runs it fills it, and no caller index
+    /// keys it (carrick#3504 B10-1b).
+    CallbackParameter,
     /// A function written in a body that is held in a local, returned or
     /// assigned rather than handed to a call.
     DetachedUnplaced,
@@ -151,6 +158,10 @@ pub enum HoleReason {
     /// (carrick#2541). No one path is its, so a URL holding it states no
     /// row. It serialises only into guard chain ends and never into a row.
     SeveralPaths,
+    /// A parameter of a function of the run, read by a reader that does not
+    /// read through callers: its value is in the function's callers, inside
+    /// the service (carrick#3795).
+    ParameterUnread,
 }
 
 /// Where a compared value comes from, before any access is applied to it.

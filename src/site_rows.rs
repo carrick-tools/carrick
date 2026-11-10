@@ -210,6 +210,10 @@ pub struct SiteRows {
     /// only where no row stands at its line: elsewhere the index already
     /// holds the route, and the site is counted, not listed.
     pub routes: Vec<PossibleCall>,
+    /// The other calls the site pass considered and stopped at
+    /// ([`crate::unread_sites::from_scan`], carrick#3688 U3). The fold keeps
+    /// one only where no row stands at its line.
+    pub unread: Vec<crate::unread_sites::UnreadSite>,
     /// Calls above a decided site on its chain (carrick#2614), whose reader
     /// rows fold onto the row the site holds.
     pub through: Vec<Through>,
@@ -916,6 +920,7 @@ pub fn of(
         rows: Vec::new(),
         leads: crate::possible_calls::from_sites(decided, records),
         routes: Vec::new(),
+        unread: Vec::new(),
         through: decided.through.clone(),
         traced: TracedRoutes::default(),
         boundaries: Default::default(),
@@ -1148,6 +1153,11 @@ pub struct SiteFold {
     /// Leads dropped because the blob already holds a row at their line
     /// (carrick#2539): the index states that site, so it is no possible call.
     pub lead_on_row_line: usize,
+    /// The unread sites ([`SiteRows::unread`]) at a line no row stands at.
+    pub unread: Vec<crate::unread_sites::UnreadSite>,
+    /// The unread sites dropped because the blob already holds a row at
+    /// their line: the index states that call.
+    pub unread_on_row_line: usize,
     /// Reader rows at a call above a decided site folded onto the row the
     /// site holds (carrick#2614), as `(file, line, key)`. Each is in
     /// `withdrawn` as well.
@@ -1594,6 +1604,22 @@ pub fn fold_rows(
             } else {
                 index += 1;
             }
+        }
+    }
+    // An unread site at a line a row stands at once the fold is done, of
+    // either side, is that row's call (a class-only GraphQL call is its
+    // document's row).
+    let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
+        rows.iter()
+            .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
+    };
+    for unread in &site.unread {
+        if held_at(calls, &unread.file, unread.line)
+            || held_at(endpoints, &unread.file, unread.line)
+        {
+            out.unread_on_row_line += 1;
+        } else {
+            out.unread.push(unread.clone());
         }
     }
     out
