@@ -33,8 +33,11 @@ new="${old%.*}.$(( ${old##*.} + 1 ))"
 
 # 1. A release commit: version values move, nothing else.
 sed -i.bak "s/\"$old\"/\"$new\"/g" Cargo.toml Cargo.lock crates/carrick-match/Cargo.toml \
-  npm/carrick/package.json npm/carrick/package-lock.json plugin/vscode/package.json \
+  npm/carrick/package.json plugin/vscode/package.json \
   plugin/vscode/package-lock.json plugin/.claude-plugin/plugin.json .claude-plugin/marketplace.json .release-please-manifest.json
+# The npm lockfile's platform entries carry hashes release-please cannot move
+# (#3676): bump only the lines above them (own version, root optionalDependencies).
+sed -i.bak "1,/\"node_modules\/@carrick-tools/ s/\"$old\"/\"$new\"/g" npm/carrick/package-lock.json
 find . -name '*.bak' -not -path './.git/*' -delete
 printf '\n## %s\n- a change\n' "$new" >>CHANGELOG.md
 git add -A && git commit -qm release
