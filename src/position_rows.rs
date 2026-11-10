@@ -1357,7 +1357,7 @@ mod tests {
         assert_eq!(index.union_declarations(&file, base, base + 3), Ok(&[][..]));
     }
 
-    /// : the `receiver_type` rows of a receiver share its span
+    /// The `receiver_type` rows of a receiver share its span
     /// and are all kept, in the order written, beside an `ident` row there.
     #[test]
     fn every_receiver_type_row_at_a_span_is_kept() {
