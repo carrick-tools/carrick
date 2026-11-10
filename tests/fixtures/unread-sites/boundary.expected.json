@@ -16,6 +16,9 @@
       ],
       "total": 1
     },
+    "files_not_parsed": {
+      "total": 0
+    },
     "final_losses": {
       "total": 0
     },
@@ -41,7 +44,6 @@
       ],
       "total": 2
     },
-    "unemitted_literal_candidates": 0,
     "unknown_call_paths": {
       "total": 0
     },
