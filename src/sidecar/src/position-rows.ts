@@ -844,11 +844,13 @@ export class PositionWalker {
         const at = declaration.getStart(file);
         const { declFile, declLine, declPackage } = this.located(file, at);
         if (declPackage === null || declPackage === memberPackage) continue;
+        const name = this.publishedClassName(symbol, declaration, declPackage);
+        if (name === undefined) continue;
         let flags = this.publication(symbol, declaration);
         if (declFile === null) flags |= FLAG_DECLARATION_UNNAMED;
         rows.push({
           start: at,
-          row: ['receiver_type', start, end, ts.symbolName(symbol), declFile, declLine, declPackage, null, flags],
+          row: ['receiver_type', start, end, name, declFile, declLine, declPackage, null, flags],
         });
       }
       if (rows.length > DECL_CAP) {
@@ -859,6 +861,44 @@ export class PositionWalker {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * The name a `receiver_type` row gives a class. A class written
+   * `export default class Cursor` has the symbol name `default`, which is
+   * its package's `default` only where it is declared in the file the
+   * package's name resolves to; in an inner module it is named as written
+   * (`Cursor`), the name a package re-exports it under by convention. An
+   * anonymous default class of an inner module has no name: no row.
+   */
+  private publishedClassName(symbol: ts.Symbol, declaration: ts.Declaration, declPackage: string): string | undefined {
+    const name = ts.symbolName(symbol);
+    if (name !== ts.InternalSymbolName.Default) return name;
+    const file = declaration.getSourceFile();
+    if (this.packageEntry(declPackage, file) === file.fileName) return name;
+    const own = ts.getNameOfDeclaration(declaration);
+    return own && ts.isIdentifier(own) ? own.text : undefined;
+  }
+
+  private entries = new Map<string, string | undefined>();
+
+  /**
+   * The file `pkg` resolves to from `from`, a file of that package, so the
+   * installed copy `from` is in answers (two versions of one package resolve
+   * apart). Cached by package and directory.
+   */
+  private packageEntry(pkg: string, from: ts.SourceFile): string | undefined {
+    const key = `${pkg}\0${from.fileName.slice(0, from.fileName.lastIndexOf('/'))}`;
+    if (!this.entries.has(key)) {
+      const resolved = ts.resolveModuleName(
+        pkg,
+        from.fileName,
+        this.program.getCompilerOptions(),
+        this.resolutionHost()
+      ).resolvedModule;
+      this.entries.set(key, resolved?.resolvedFileName);
+    }
+    return this.entries.get(key);
   }
 
   /**

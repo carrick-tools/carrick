@@ -114,6 +114,23 @@ describe('position_rows: the class a receiver of an inherited member holds', () 
     assert.deepStrictEqual(found.map((r) => [r[3], r[4], r[6]]), [['LocalSocket', 'src/main.ts', 'receiver-type']]);
   });
 
+  it('names a default-exported class of an inner module by its own name, as the package publishes it', () => {
+    const found = at('cursor.on', 'cursor');
+    assert.deepStrictEqual(
+      found.map((r) => [r[3], r[6]]),
+      [['Cursor', 'wire-pkg']]
+    );
+    assert.match(found[0][4] ?? '', /node_modules\/wire-pkg\/cursor\.d\.ts$/);
+  });
+
+  it('names the default class of a package entry as its default', () => {
+    const found = at('hub.on', 'hub');
+    assert.deepStrictEqual(
+      found.map((r) => [r[3], r[6]]),
+      [['default', 'entry-pkg']]
+    );
+  });
+
   it('bumps the format version', () => {
     assert.strictEqual(version, POSITION_ROWS_VERSION);
     assert.strictEqual(POSITION_ROWS_VERSION, 6);

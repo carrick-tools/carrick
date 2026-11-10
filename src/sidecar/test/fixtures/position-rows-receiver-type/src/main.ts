@@ -19,3 +19,10 @@ maybe?.on("e", () => {});
 local.on("f", () => {});
 holder.inner.on("g", () => {});
 iface.on("h", () => {});
+
+import type { Cursor } from "wire-pkg";
+import type Hub from "entry-pkg";
+declare const cursor: Cursor;
+declare const hub: Hub;
+cursor.on("i", () => {});
+hub.on("j", () => {});
