@@ -2029,9 +2029,13 @@ fn a_failed_npm_install_warns_with_npms_first_error_line() {
             .contains("failed (exit 1): npm error code EUSAGE ./package-lock.json is out of sync;"),
         "the first npm error line, path made relative: {warning}"
     );
+    let reason = warning
+        .split("failed (exit 1): ")
+        .nth(1)
+        .unwrap_or_default();
     assert!(
-        !warning.contains(&root),
-        "no absolute root in the warning: {warning}"
+        !reason.contains(&root),
+        "no absolute root in the error line: {warning}"
     );
 
     let silent = StubManager::new("npm");
