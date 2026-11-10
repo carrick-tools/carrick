@@ -3290,30 +3290,70 @@ async fn seed_trpc_output_field_removed() {
 async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
     let _serial = SERIAL.lock().await;
     let main = main_snapshot().await;
-    seed_env();
-    for (label, dirname, cache) in [
-        ("A", "rpc-shelf", false),
-        ("B", "shelfrepo", false),
-        ("C", "rpc-shelf", true),
-    ] {
+    {
         let tmp = tempfile::tempdir().unwrap();
         let src =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr-seeds/rpc-shelf");
-        let repo = unlinked(tmp.path()).join(dirname);
+        let repo = unlinked(tmp.path()).join("rpc-shelf");
         copy_dir(&src, &repo);
         git(&repo, &["init", "-q"]);
         commit(&repo, "init");
-        let cache_dir = tmp.path().join("cache");
-        let _cache = cache.then(|| EnvVar::set("CARRICK_CACHE_DIR", cache_dir.to_str().unwrap()));
-        let store = Store::default();
-        scan_seed_repo(&store, &repo).await;
-        for row in store.repos.lock().unwrap().iter() {
-            eprintln!(
-                "DIAGVAR {label} {:?} endpoints={} calls={}",
-                row.service_name,
-                row.endpoints.len(),
-                row.calls.len()
-            );
+        let storage = tmp.path().join("storage");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+            .arg(".")
+            .current_dir(&repo)
+            .env("CARRICK_LOCAL_STORAGE_DIR", &storage)
+            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
+            .env("HOME", &home)
+            .env("CARRICK_MOCK_ALL", "1")
+            .env(
+                "CARRICK_MOCK_FIXTURE_DIR",
+                format!("{}/", repo.join("__llm__").display()),
+            )
+            .env(
+                "CARRICK_SIDECAR_DIR",
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
+            )
+            .env("CARRICK_PROGRESS", "1")
+            .output()
+            .unwrap();
+        for line in String::from_utf8_lossy(&out.stderr).lines() {
+            if line.contains("carrick-fallbacks")
+                || line.contains("Sidecar")
+                || line.contains("sidecar")
+            {
+                eprintln!("DIAGBIN {}", &line[..line.len().min(300)]);
+            }
+        }
+        for f in std::fs::read_dir(&storage).unwrap().flatten() {
+            let text = std::fs::read_to_string(f.path()).unwrap_or_default();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                eprintln!(
+                    "DIAGBIN blob {:?} endpoints={}",
+                    f.file_name(),
+                    v["endpoints"].as_array().map_or(0, Vec::len)
+                );
+            }
+        }
+        for entry in std::fs::read_dir(home.join(".carrick/logs/runs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            for line in text.lines() {
+                let l = line.to_lowercase();
+                if l.contains("position rows")
+                    || l.contains("procedure")
+                    || l.contains("untraced")
+                    || l.contains("walk")
+                {
+                    eprintln!("DIAGBINLOG {}", &line[..line.len().min(300)]);
+                }
+            }
         }
     }
     for row in &main.shelf_rows {
