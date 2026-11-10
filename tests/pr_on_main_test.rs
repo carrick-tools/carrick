@@ -969,6 +969,110 @@ async fn an_action_run_names_the_functions_of_a_service_at_the_repo_root() {
     );
 }
 
+/// A file this scan could not read states none of its functions as changed,
+/// whichever way it was unread: a head that does not parse, a file that is
+/// not UTF-8 text (git's lossy copy of it parses), and a file whose committed
+/// copy parses while the working tree's does not. Run as the Action runs it,
+/// so the file the scan names and the file git names are joined for a service
+/// at the root (`.`) and for a nested one.
+#[tokio::test]
+async fn an_action_run_states_no_function_change_in_a_file_it_could_not_read() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let repo = written_repo(
+        tmp.path(),
+        "portal",
+        &[
+            (
+                "carrick.json",
+                r#"{ "services": [
+                    { "name": "web", "directory": "." },
+                    { "name": "edge", "directory": "workers/edge" }
+                ] }"#,
+            ),
+            ("package.json", r#"{ "name": "portal", "private": true }"#),
+            (
+                "src/label.ts",
+                "export function title(name: string): string {\n  return name.trim();\n}\n",
+            ),
+            (
+                "src/latin.ts",
+                "export function greet(): string {\n  return \"hi\";\n}\n",
+            ),
+            (
+                "workers/edge/package.json",
+                r#"{ "name": "edge", "private": true }"#,
+            ),
+            (
+                "workers/edge/src/index.ts",
+                "export function route(path: string): string {\n  return path;\n}\n",
+            ),
+            (
+                "workers/edge/src/legacy.ts",
+                "export function shim(): number {\n  return 1;\n}\n",
+            ),
+        ],
+    );
+    git(&repo, &["branch", "-M", "main"]);
+
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    // Does not parse: a conflict block left in the file.
+    std::fs::write(
+        repo.join("src/label.ts"),
+        "export function title(name: string): string {\n  return name.trim();\n}\n\
+         <<<<<<< ours\nexport function minutes(words: number): number {\n  return words;\n}\n\
+         =======\nexport function minutes(words: number): number {\n  return words +;\n}\n>>>>>>> theirs\n",
+    )
+    .unwrap();
+    // Not UTF-8 text: git's lossy copy still parses.
+    let mut latin = b"// caf\xe9\n".to_vec();
+    latin.extend_from_slice(b"export function greet(): string {\n  return \"hello\";\n}\n");
+    std::fs::write(repo.join("src/latin.ts"), latin).unwrap();
+    std::fs::write(
+        repo.join("workers/edge/src/index.ts"),
+        "export function route(path: string): string {\n  return path.toLowerCase();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("workers/edge/src/legacy.ts"),
+        "export function shim(): number {\n  return 2;\n}\n",
+    )
+    .unwrap();
+    commit(&repo, "pr");
+
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("NOTES.md"), "main moved\n").unwrap();
+    commit(&repo, "main moves");
+    git(&repo, &["merge", "-q", "--no-ff", "-m", "merge", "feature"]);
+    // Uncommitted: the scan reads the tree, the block reads the commit.
+    std::fs::write(
+        repo.join("workers/edge/src/legacy.ts"),
+        "<<<<<<< ours\nexport function shim(): number {\n  return 2;\n}\n=======\nexport function shim( {\n>>>>>>> theirs\n",
+    )
+    .unwrap();
+
+    let scratch = tmp.path().join("action");
+    let relative = action_pr_result(&repo, ".", &scratch);
+    let block = &relative["functions"];
+    assert_eq!(
+        changed_functions(&relative),
+        vec!["workers/edge/src/index.ts:route:edited".to_string()],
+        "{block:#}"
+    );
+    assert_eq!(block["removed"], serde_json::json!([]), "{block:#}");
+    assert_eq!(
+        block["counts"]["removed"],
+        serde_json::json!(0),
+        "{block:#}"
+    );
+
+    let absolute = action_pr_result(&repo, repo.to_str().unwrap(), &scratch);
+    assert_eq!(
+        absolute["functions"], relative["functions"],
+        "the path the scan is given does not change what the PR changed"
+    );
+}
+
 /// Main's side failing in any way costs the run nothing but the comparison:
 /// the findings it posts are byte for byte the ones a run with no prior index
 /// posts, apart from why neither could compare. (The payload's `delta`
@@ -3581,6 +3685,22 @@ async fn seed_route_added_in_unparseable_file() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("route-added-in-unparseable-file").await;
     assert_delta(&payload, &[], &[]);
+    assert_eq!(
+        payload["functions"]["removed"],
+        serde_json::json!([]),
+        "{payload:#}"
+    );
+    assert_eq!(
+        payload["functions"]["counts"]["removed"],
+        serde_json::json!(0),
+        "{payload:#}"
+    );
+    assert!(
+        !changed_functions(&payload)
+            .iter()
+            .any(|entry| entry.starts_with("src/admin.ts:")),
+        "a file the scan could not read lists no function: {payload:#}"
+    );
     let files = payload["delta"]["files_not_read"]
         .as_array()
         .unwrap_or_else(|| panic!("no files_not_read: {payload:#}"));
@@ -3624,6 +3744,22 @@ async fn seed_route_line_replaced_by_conflict() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("route-line-replaced-by-conflict").await;
     assert_delta(&payload, &[], &[]);
+    assert_eq!(
+        payload["functions"]["removed"],
+        serde_json::json!([]),
+        "{payload:#}"
+    );
+    assert_eq!(
+        payload["functions"]["counts"]["removed"],
+        serde_json::json!(0),
+        "{payload:#}"
+    );
+    assert!(
+        !changed_functions(&payload)
+            .iter()
+            .any(|entry| entry.starts_with("src/admin.ts:")),
+        "a file the scan could not read lists no function: {payload:#}"
+    );
     let files = payload["delta"]["files_not_read"]
         .as_array()
         .unwrap_or_else(|| panic!("no files_not_read: {payload:#}"));

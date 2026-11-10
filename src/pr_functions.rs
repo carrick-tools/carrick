@@ -14,9 +14,13 @@
 //! - in both, same text: not listed, wherever its lines now sit;
 //! - in the base copy only: removed.
 //!
-//! The text is compared as written, so a reformat reads as an edit. A copy
-//! that does not parse states no definitions, as it states no rows in the
-//! index. The module-scope row is not a function and is never listed.
+//! The text is compared as written, so a reformat reads as an edit. A file
+//! this scan could not read (the scan-health list), or one whose base or PR
+//! copy does not parse, states none of its functions as added, edited or
+//! removed: the scan holds no row for it, so a list of its functions would be
+//! a list of what Carrick could not read. The result names the file once, in
+//! `delta.files_not_read`. The module-scope row is not a function and is
+//! never listed.
 //!
 //! Each listed function is then joined to the row this run holds for it, by
 //! the file path the uploaded blob carries and the name the index spells it
@@ -54,12 +58,12 @@ pub struct Stated {
 }
 
 /// The definitions one copy of `path` states, by name. `label` names the copy
-/// for the source map. Empty when the copy does not parse.
+/// for the source map. `None` when the copy does not parse.
 ///
 /// The extractor keys a file's definitions by name, so a name stated twice in
 /// one file is one definition here, the one the index holds.
-pub fn stated_in(path: &Path, label: String, source: String) -> BTreeMap<String, Stated> {
-    extracted_in(path, label, source).map_or_else(BTreeMap::new, |extracted| extracted.stated())
+pub fn stated_in(path: &Path, label: String, source: String) -> Option<BTreeMap<String, Stated>> {
+    extracted_in(path, label, source).map(|extracted| extracted.stated())
 }
 
 /// One parse of one copy of a file, through the extractor discovery runs: the
@@ -177,6 +181,9 @@ pub struct Scope<'a> {
     /// A path only the base commit holds: a deleted file, or the old path of
     /// a renamed one.
     pub base: &'a dyn Fn(&str) -> bool,
+    /// A path in the PR's tree this scan could not read: its file states
+    /// nothing.
+    pub unread: &'a dyn Fn(&str) -> bool,
 }
 
 /// `path` under `root`, in the form a row's `file_path` uploads in: the
@@ -220,7 +227,8 @@ pub fn name_changes(
     // A path git names, in the form the blob carries. `None` for one outside
     // the scan root, which no row is at.
     let as_blob = |path: &str| blob_path(&top.join(path), &root);
-    let copy_at = |commit: &str, path: &str| -> Result<BTreeMap<String, Stated>, String> {
+    // `None` when the copy does not parse.
+    let copy_at = |commit: &str, path: &str| -> Result<Option<BTreeMap<String, Stated>>, String> {
         let source = crate::git_state::file_at(repo_path, commit, path)?;
         Ok(stated_in(
             Path::new(path),
@@ -257,13 +265,22 @@ pub fn name_changes(
         if new.is_none() && matches!(change.status, 'M' | 'T') {
             continue;
         }
+        // A file this scan could not read states nothing, and neither does a
+        // change one of whose copies does not parse; that skips the old path
+        // of a rename too.
+        if matches!(&new, Some((_, file)) if (scope.unread)(file)) {
+            continue;
+        }
         let before = match &old {
             Some((path, _)) => base_copy(path)?,
-            None => BTreeMap::new(),
+            None => Some(BTreeMap::new()),
         };
         let after = match &new {
             Some((path, _)) => head_copy(path)?,
-            None => BTreeMap::new(),
+            None => Some(BTreeMap::new()),
+        };
+        let (Some(before), Some(after)) = (before, after) else {
+            continue;
         };
         let diff = diff_definitions(&before, &after);
         if let Some((_, file)) = &new {
@@ -421,6 +438,7 @@ pub fn block_for_run(
     base: Option<&str>,
     services: &[Config],
     data: &[CloudRepoData],
+    unread: &BTreeSet<String>,
 ) -> FunctionsBlock {
     let Some(base) = base else {
         return FunctionsBlock::Unknown {
@@ -456,6 +474,7 @@ pub fn block_for_run(
     let scope = Scope {
         head: &|file| source(file) && in_head(file),
         base: &|file| source(file) && in_base(file),
+        unread: &|file| unread.contains(file),
     };
     // What the PR changed is what its commits changed since they left the
     // base branch: the checked-out commit against its merge base with `base`.
@@ -581,6 +600,7 @@ export function n(): number {
         Scope {
             head: &|_| true,
             base: &|_| true,
+            unread: &|_| false,
         }
     }
 
@@ -672,19 +692,37 @@ export function n(): number {
             Vec::new(),
         );
         assert_eq!(
-            listed(&block_for_run(root, Some(&main_tip), &services, &[])),
+            listed(&block_for_run(
+                root,
+                Some(&main_tip),
+                &services,
+                &[],
+                &BTreeSet::new()
+            )),
             own
         );
 
         // A merge checkout descends from the base, so the base is the merge
         // base and the same changes are named.
         assert_eq!(
-            listed(&block_for_run(root, Some(&branch_point), &services, &[])),
+            listed(&block_for_run(
+                root,
+                Some(&branch_point),
+                &services,
+                &[],
+                &BTreeSet::new()
+            )),
             own
         );
         git_in(path, &["merge", "-q", "--no-edit", "main"]);
         assert_eq!(
-            listed(&block_for_run(root, Some(&main_tip), &services, &[])),
+            listed(&block_for_run(
+                root,
+                Some(&main_tip),
+                &services,
+                &[],
+                &BTreeSet::new()
+            )),
             own
         );
     }
@@ -697,7 +735,13 @@ export function n(): number {
         pr_tree(repo.path());
         let root = repo.path().to_str().unwrap();
         let services = [Config::default()];
-        let committed = listed(&block_for_run(root, Some(&base), &services, &[]));
+        let committed = listed(&block_for_run(
+            root,
+            Some(&base),
+            &services,
+            &[],
+            &BTreeSet::new(),
+        ));
         assert_eq!(committed.0.len(), 3, "{committed:?}");
 
         std::fs::write(
@@ -707,7 +751,13 @@ export function n(): number {
         .unwrap();
         std::fs::write(repo.path().join("d.ts"), D.replace("f(1)", "f(2)")).unwrap();
         assert_eq!(
-            listed(&block_for_run(root, Some(&base), &services, &[])),
+            listed(&block_for_run(
+                root,
+                Some(&base),
+                &services,
+                &[],
+                &BTreeSet::new()
+            )),
             committed
         );
     }
@@ -747,6 +797,7 @@ export function n(): number {
         let moved_out = Scope {
             head: &outside,
             base: &outside,
+            unread: &|_| false,
         };
         let named = name_changes(root, &base, &head, &moved_out).unwrap();
         assert!(named.changed.is_empty(), "{named:?}");
@@ -759,6 +810,7 @@ export function n(): number {
         let moved_in = Scope {
             head: &inside,
             base: &inside,
+            unread: &|_| false,
         };
         let named = name_changes(root, &base, &head, &moved_in).unwrap();
         assert_eq!(
@@ -818,7 +870,8 @@ export function n(): number {
         assert_eq!(named.removed, vec![at("src/a.ts", "h")]);
     }
 
-    /// A copy that does not parse states no definitions, as it states no rows.
+    /// A change one of whose copies does not parse states no function, added or
+    /// removed: the scan holds no row for it either way.
     #[test]
     fn a_copy_that_does_not_parse_states_nothing() {
         let (repo, base) = committed_repo(&[("a.ts", "export function f( {\n")]);
@@ -826,13 +879,47 @@ export function n(): number {
         let head = commit_all(repo.path());
         let root = repo.path().to_str().unwrap();
         let named = name_changes(root, &base, &head, &everything()).unwrap();
-        assert_eq!(named.changed.len(), 3, "{named:?}");
-        assert!(
-            named
-                .changed
-                .iter()
-                .all(|c| c.change == FunctionChange::Added)
-        );
+        assert!(named.changed.is_empty(), "{named:?}");
+        assert!(named.removed.is_empty(), "{named:?}");
+    }
+
+    #[test]
+    fn a_pr_copy_that_does_not_parse_states_none_of_its_functions() {
+        let (repo, base) = committed_repo(&[("a.ts", A_BASE)]);
+        // A conflict block that leaves a syntax error behind, as the half-merged
+        // file of a PR does (the parser skips bare markers).
+        let broken =
+            format!("{A_BASE}<<<<<<< ours\nfunction broken( {{{{\n=======\n>>>>>>> theirs\n");
+        std::fs::write(repo.path().join("a.ts"), broken).unwrap();
+        let head = commit_all(repo.path());
+        let root = repo.path().to_str().unwrap();
+        let named = name_changes(root, &base, &head, &everything()).unwrap();
+        assert!(named.changed.is_empty(), "{named:?}");
+        assert!(named.removed.is_empty(), "{named:?}");
+    }
+
+    #[test]
+    fn a_file_this_scan_could_not_read_states_none_of_its_functions() {
+        let (repo, base) = committed_repo(&[("a.ts", A_BASE)]);
+        // Not UTF-8: git's copy decodes lossily and still parses.
+        let mut bytes = b"// caf\xe9\n".to_vec();
+        bytes.extend_from_slice(A_HEAD.as_bytes());
+        std::fs::write(repo.path().join("a.ts"), bytes).unwrap();
+        std::fs::write(repo.path().join("e.ts"), E).unwrap();
+        let head = commit_all(repo.path());
+        let root = repo.path().to_str().unwrap();
+        let unread = |file: &str| file == "a.ts";
+        let scope = Scope {
+            unread: &unread,
+            ..everything()
+        };
+        let named = name_changes(root, &base, &head, &scope).unwrap();
+        assert!(named.changed.iter().all(|c| c.file == "e.ts"), "{named:?}");
+        assert!(!named.changed.is_empty(), "{named:?}");
+        assert!(named.removed.is_empty(), "{named:?}");
+        // The list is the key, not the parse.
+        let named = name_changes(root, &base, &head, &everything()).unwrap();
+        assert!(named.changed.iter().any(|c| c.file == "a.ts"), "{named:?}");
     }
 
     fn block_json(block: &FunctionsBlock) -> serde_json::Value {
@@ -846,13 +933,19 @@ export function n(): number {
         let root = repo.path().to_str().unwrap();
         let services = [Config::default()];
         assert_eq!(
-            block_json(&block_for_run(root, None, &services, &[])),
+            block_json(&block_for_run(root, None, &services, &[], &BTreeSet::new())),
             json!({ "unknown": "no_base_commit" })
         );
         // A well-formed commit id this clone does not hold.
         let absent = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
-            block_json(&block_for_run(root, Some(absent), &services, &[])),
+            block_json(&block_for_run(
+                root,
+                Some(absent),
+                &services,
+                &[],
+                &BTreeSet::new()
+            )),
             json!({ "unknown": "base_unavailable" })
         );
     }
@@ -968,7 +1061,13 @@ export function n(): number {
             ],
         );
         let root = clone.path().to_str().unwrap();
-        let block = block_for_run(root, Some(&base), &[Config::default()], &[]);
+        let block = block_for_run(
+            root,
+            Some(&base),
+            &[Config::default()],
+            &[],
+            &BTreeSet::new(),
+        );
         if !git_reads_offline() {
             assert_eq!(block_json(&block), json!({ "unknown": "base_unavailable" }));
             return;
@@ -1006,7 +1105,13 @@ export function n(): number {
             "the base's copies of the changed files are absent"
         );
         assert_eq!(
-            block_json(&block_for_run(root, Some(&base), &[Config::default()], &[])),
+            block_json(&block_for_run(
+                root,
+                Some(&base),
+                &[Config::default()],
+                &[],
+                &BTreeSet::new()
+            )),
             json!({ "unknown": "base_unavailable" })
         );
         assert_eq!(missing_objects(clone.path(), &base), before);
@@ -1039,7 +1144,13 @@ export function n(): number {
         std::fs::remove_file(repo.path().join("old.test.ts")).unwrap();
         commit_all(repo.path());
         let root = repo.path().to_str().unwrap();
-        let block = block_for_run(root, Some(&base), &[Config::default()], &[]);
+        let block = block_for_run(
+            root,
+            Some(&base),
+            &[Config::default()],
+            &[],
+            &BTreeSet::new(),
+        );
         let FunctionsBlock::Named(named) = &block else {
             panic!("{block:?}")
         };
@@ -1092,7 +1203,13 @@ export function n(): number {
             directory: Some("./pkg/.".to_string()),
             ..Config::default()
         };
-        let block = block_for_run(repo.path().to_str().unwrap(), Some(&base), &[service], &[]);
+        let block = block_for_run(
+            repo.path().to_str().unwrap(),
+            Some(&base),
+            &[service],
+            &[],
+            &BTreeSet::new(),
+        );
         let FunctionsBlock::Named(named) = &block else {
             panic!("{block:?}")
         };
@@ -1272,6 +1389,7 @@ export function n(): number {
         let scope = Scope {
             head: &read,
             base: &read,
+            unread: &|_| false,
         };
         let log = git_in(
             Path::new(&repo),

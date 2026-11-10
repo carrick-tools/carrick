@@ -2414,6 +2414,42 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             }
         });
 
+    // And the source files each of those services could not read
+    // (carrick#3233), relative to the scan root as a row's place is. The one
+    // list: the PR delta names these files, and the functions block states
+    // none of their functions (carrick#3747).
+    //
+    // The walk names a file by an absolute path when the scan is given `.`
+    // (the Action's form), so the path is reduced against the root as given
+    // and against its canonical form, or the file is never found by the name
+    // git uses.
+    let canonical_root = std::fs::canonicalize(repo_path)
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| repo_path.to_string());
+    let canonical_root = canonical_root.as_str();
+    let unread_sources: Vec<UnreadSource> = runs
+        .iter()
+        .filter(|run| !run.held_back && !run.carried)
+        .flat_map(|run| {
+            let service = run.data.service_name.clone();
+            crate::scan_health::unread_sources_for(service.as_deref())
+                .into_iter()
+                .map(move |(path, reason)| UnreadSource {
+                    place: crate::pr_delta_anchor::Place::parse(
+                        &service,
+                        crate::utils::repo_relative_source_path(
+                            crate::utils::repo_relative_source_path(
+                                crate::utils::repo_relative_source_path(&path, repo_path),
+                                canonical_root,
+                            ),
+                            repo_path,
+                        ),
+                    ),
+                    reason,
+                })
+        })
+        .collect();
+
     // The functions this PR added, edited or removed (carrick#2285), named
     // from the base commit's tree and joined to the rows this run holds,
     // which carry this run's intents and call edges by now. Read here because
@@ -2425,6 +2461,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             pr_base.as_deref(),
             &services,
             &current_services_data,
+            &unread_sources
+                .iter()
+                .map(|source| source.place.file.clone())
+                .collect(),
         )
     });
 
@@ -2491,24 +2531,6 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     run.unread_routes
                         .iter()
                         .map(|site| UnreadRoute::of(&run.data.service_name, site))
-                })
-                .collect();
-            // And the source files each of those services could not read
-            // (carrick#3233), relative to the scan root as a row's place is.
-            let unread_sources: Vec<UnreadSource> = runs
-                .iter()
-                .filter(|run| !run.held_back && !run.carried)
-                .flat_map(|run| {
-                    let service = run.data.service_name.clone();
-                    crate::scan_health::unread_sources_for(service.as_deref())
-                        .into_iter()
-                        .map(move |(path, reason)| UnreadSource {
-                            place: crate::pr_delta_anchor::Place::parse(
-                                &service,
-                                crate::utils::repo_relative_source_path(&path, repo_path),
-                            ),
-                            reason,
-                        })
                 })
                 .collect();
             anchored_delta(
