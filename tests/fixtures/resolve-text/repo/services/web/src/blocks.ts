@@ -38,7 +38,7 @@ export function blocks(): void {
     p_if(inIf);
   }
   try {
-    const inTry = `${BASE}/try`;
+    const inTry: string = `${BASE}/try`;
     p_try(inTry);
   } catch (err: any) {
     p_catch(err);
@@ -92,14 +92,6 @@ export function blocks(): void {
     p_shadow(same);
   }
   p_shadow_outer(same);
-  {
-    const pair: string = "x";
-    p_pair_a(pair);
-  }
-  {
-    const pair: string = "y";
-    p_pair_b(pair);
-  }
   [1].map((n = 2) => n);
 }
 
@@ -107,6 +99,11 @@ if (process.env.X) {
   const atModule: string = "module.block";
   p_module_block(atModule);
 }
+
+// Two blocks, one line, one name: no row says which a use means. At module
+// scope the write census keys by binding, so both are entries. (Inside a body
+// the second declaration would be a shadow and neither would be.)
+{ const pair: string = "x"; p_pair_a(pair); } { const pair: string = "y"; p_pair_b(pair); }
 
 handler("/x", () => {
   const inHandler: string = "handler.top";
