@@ -428,12 +428,22 @@ print_failed_log() {
 }
 
 # npm's first error line in a failed attempt's log, on one line for the
-# warning: the root's path made relative, credentials dropped, capped.
+# warning: the root's path made relative, URL credentials and npm token forms
+# (`_authToken=`, `_auth=`, `Authorization: Bearer|token`) redacted, capped.
 # Prints nothing when the log has none (another manager, or a timeout).
 first_npm_error() {
-  local log="$1" root="$2" line
+  local log="$1" root="$2" line literal_root delim
   [ -f "$log" ] || return 0
-  line=$(grep -m1 -E '^npm (error|ERR!)' "$log" | tr -d '\000-\037' | sed -e "s|$root|.|g" -e 's|//[^/@ ]*@|//|g')
+  # The root matches as text: a `.` or `+` in the path is not a pattern. The
+  # expression's delimiter is a control byte, which no path carries.
+  literal_root=$(printf '%s' "$root" | sed -e 's/[][\.*^$|+?(){}]/\\&/g')
+  delim=$(printf '\001')
+  line=$(grep -m1 -E '^npm (error|ERR!)' "$log" | tr -d '\000-\037' | sed -E \
+    -e "s${delim}${literal_root}${delim}.${delim}g" \
+    -e 's|//[^/@ ]*@|//|g' \
+    -e 's|(_authToken=)[^[:space:]]+|\1<redacted>|g' \
+    -e 's|(_auth=)[^[:space:]]+|\1<redacted>|g' \
+    -e 's#([Aa]uthorization: *([Bb]earer|[Tt]oken) +)[^[:space:]]+#\1<redacted>#g')
   printf '%.200s' "$line"
 }
 

@@ -1876,7 +1876,8 @@ impl StubManager {
         let scratch = tempfile::tempdir().expect("scratch dir");
         let base = scratch.path().canonicalize().expect("canonical scratch");
         let bin = base.join("bin");
-        let root = base.join("root");
+        // A dot in the path: the scrub must match the root as text, not as a pattern.
+        let root = base.join("root.d");
         fs::create_dir_all(&bin).expect("bin dir");
         fs::create_dir_all(&root).expect("root dir");
         fs::write(root.join("package.json"), r#"{"name":"s","private":true}"#).expect("manifest");
@@ -2044,6 +2045,43 @@ fn a_failed_npm_install_warns_with_npms_first_error_line() {
         run.err.contains("failed (exit 1); the scan will refuse"),
         "no npm line, no suffix: {}",
         run.text()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failed_npm_install_warning_carries_no_credentials() {
+    let stub = StubManager::new("npm");
+    let root = stub.root.to_str().expect("utf-8").to_string();
+    // The root with its `.` swapped: a regex root would match and rewrite it.
+    let lookalike = root.replace("root.d", "rootXd");
+    let error = format!(
+        "npm error fetch https://alice:s3cret@registry.example.test/pkg \
+         //registry.example.test/:_authToken=npm_abc123 _auth=basic456 \
+         Authorization: Bearer xyz789 {root}/package.json {lookalike}/package.json"
+    );
+    let run = stub.run("npm", true, &[("STUB_ERROR", error.as_str())]);
+    let warning = run
+        .err
+        .lines()
+        .find(|l| l.starts_with("::warning::"))
+        .unwrap_or_else(|| panic!("a warning: {}", run.text()));
+    for secret in ["s3cret", "npm_abc123", "basic456", "xyz789"] {
+        assert!(!warning.contains(secret), "{secret} leaked: {warning}");
+    }
+    assert!(
+        warning.contains("//registry.example.test/pkg"),
+        "URL kept without its credentials: {warning}"
+    );
+    assert!(
+        warning.contains("_authToken=<redacted>")
+            && warning.contains("_auth=<redacted>")
+            && warning.contains("Authorization: Bearer <redacted>"),
+        "tokens redacted: {warning}"
+    );
+    assert!(
+        warning.contains(&format!("./package.json {lookalike}/package.json")),
+        "the real root is made relative, a lookalike path is left alone: {warning}"
     );
 }
 
