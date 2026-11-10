@@ -21,6 +21,7 @@ import { Project, type FileSystemHost, type RuntimeDirEntry } from 'ts-morph';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import ts from 'typescript';
+import { sidecarCompilerOptions } from './capture/index.js';
 
 /** Where every project reads the default library from: ts-morph's own folder name for it. */
 export const DEFAULT_LIBRARY_FOLDER = '/node_modules/typescript/lib';
@@ -44,7 +45,7 @@ export function defaultLibraryTexts(): ReadonlyMap<string, string> {
   texts = new Map(
     fs
       .readdirSync(folder)
-      .filter((name) => /^lib\..*\.d\.ts$/.test(name))
+      .filter((name) => /^lib(\..+)?\.d\.ts$/.test(name))
       .sort()
       .map((name) => [name, fs.readFileSync(path.join(folder, name), 'utf8')] as const)
   );
@@ -69,7 +70,12 @@ function isLibraryFolder(p: string): boolean {
 export function withDefaultLibrary(inner?: FileSystemHost): FileSystemHost {
   const base =
     inner ??
-    new Project({ skipAddingFilesFromTsConfig: true, skipFileDependencyResolution: true, skipLoadingLibFiles: true }).getFileSystem();
+    new Project({
+      compilerOptions: sidecarCompilerOptions({}),
+      skipAddingFilesFromTsConfig: true,
+      skipFileDependencyResolution: true,
+      skipLoadingLibFiles: true,
+    }).getFileSystem();
   const missing = (p: string): Error =>
     Object.assign(new Error(`ENOENT: no such file or directory, open '${p}'`), { code: 'ENOENT' });
   const read = (p: string): string | undefined => {

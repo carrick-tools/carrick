@@ -59,7 +59,7 @@ const sha256 = (buffer) => createHash('sha256').update(buffer).digest('hex');
 function defaultLibraryTexts() {
   const folder = join(sidecarRoot, 'node_modules', 'typescript', 'lib');
   const texts = {};
-  for (const name of readdirSync(folder).filter((n) => /^lib\..*\.d\.ts$/.test(n)).sort()) {
+  for (const name of readdirSync(folder).filter((n) => /^lib(\..+)?\.d\.ts$/.test(n)).sort()) {
     texts[name] = readFileSync(join(folder, name), 'utf8');
   }
   return texts;
