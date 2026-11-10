@@ -117,6 +117,12 @@ fn endpoint_rows() -> BTreeSet<String> {
         let blob: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         for row in blob["endpoints"].as_array().into_iter().flatten() {
+            if row["key"]["protocol"].as_str() == Some("pubsub") {
+                rows.insert(format!(
+                    "pubsub-at {service} {}",
+                    row["file_path"].as_str().unwrap_or_default()
+                ));
+            }
             rows.insert(format!(
                 "{service} {} {} {} {}",
                 row["file_path"].as_str().unwrap_or_default(),
@@ -145,4 +151,87 @@ fn a_listener_inherited_from_a_base_package_is_a_library_row() {
             "missing `{wanted}`; scan holds:\n{listing}"
         );
     }
+}
+
+/// The line of the first line of `file` (under the client service) holding
+/// `needle`.
+fn line_of(file: &str, needle: &str) -> usize {
+    let path = fixture_dir(FIXTURE)
+        .join("repo/services/client/src")
+        .join(file);
+    std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("`{needle}` not in {file}"))
+        + 1
+}
+
+fn library_row(file: &str, needle: &str, event: &str) -> String {
+    format!(
+        "client services/client/src/{file}:{} server_to_client {event} library_claim",
+        line_of(file, needle)
+    )
+}
+
+/// A receiver typed by an alias of the generic class holds that class.
+#[test]
+fn a_listener_on_an_aliased_receiver_reads_under_its_class() {
+    let rows = endpoint_rows();
+    let listing = rows.iter().cloned().collect::<Vec<_>>().join("\n");
+    let wanted = library_row("typed.ts", "\"w:alias\"", "w:alias");
+    assert!(
+        rows.contains(&wanted),
+        "missing `{wanted}`; scan holds:\n{listing}"
+    );
+}
+
+/// A receiver typed by an intersection holds the class it names; the line
+/// states no pub/sub row.
+#[test]
+fn a_listener_on_an_intersection_typed_parameter_reads_under_its_class() {
+    let rows = endpoint_rows();
+    let listing = rows.iter().cloned().collect::<Vec<_>>().join("\n");
+    for (file, needle, event) in [
+        ("typed.ts", "\"w:tagged\"", "w:tagged"),
+        ("hooks.tsx", "\"h:joined\"", "h:joined"),
+    ] {
+        let wanted = library_row(file, needle, event);
+        assert!(
+            rows.contains(&wanted),
+            "missing `{wanted}`; scan holds:\n{listing}"
+        );
+        let at = format!(
+            "pubsub-at client services/client/src/{file}:{}",
+            line_of(file, needle)
+        );
+        assert!(
+            !rows.contains(&at),
+            "a pub/sub row stands at {at}; scan holds:\n{listing}"
+        );
+    }
+}
+
+/// A receiver whose class is imported by `import { type X as T }` holds it.
+#[test]
+fn a_listener_on_a_type_only_import_reads_under_its_class() {
+    let rows = endpoint_rows();
+    let listing = rows.iter().cloned().collect::<Vec<_>>().join("\n");
+    let wanted = library_row("typed.ts", "\"w:type-import\"", "w:type-import");
+    assert!(
+        rows.contains(&wanted),
+        "missing `{wanted}`; scan holds:\n{listing}"
+    );
+}
+
+/// A property named like a package export is not that export: `socket.io`
+/// is a `Manager`, and the package's `io` function is not its class.
+#[test]
+fn a_property_named_like_an_export_is_not_that_export() {
+    let rows = endpoint_rows();
+    let listing = rows.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert!(
+        !rows.iter().any(|row| row.contains(" w:lifecycle ")),
+        "a row states w:lifecycle; scan holds:\n{listing}"
+    );
 }
