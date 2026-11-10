@@ -3749,7 +3749,7 @@ mod tests {
         let resolver = Resolver::new(&on.inputs, &[]);
         assert_eq!(
             callee(&resolver, &on.inputs, "h-passed-const.ts", 5),
-            [Got::End(End::Nothing)]
+            [Got::Stop(Stop::UnreadExpression)]
         );
     }
 
@@ -3763,7 +3763,7 @@ mod tests {
         let resolver = Resolver::new(&on.inputs, &[]);
         assert_eq!(
             callee(&resolver, &on.inputs, "k-closed.ts", 7),
-            [Got::End(End::Nothing)]
+            [Got::Stop(Stop::ValueNeverBound)]
         );
     }
 
