@@ -5014,9 +5014,12 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             named_callee(&resolver, &on.inputs, "scoped.ts", 32),
             Some(vec![written(29)])
         );
+        // A call of such a function is not read yet: its returned value is
+        // the factory reader's, which keys definitions only. Pinned so a
+        // later step names the move.
         assert_eq!(
             callee(&resolver, &on.inputs, "scoped.ts", 25),
-            [definition("sendPicked")]
+            [Got::Stop(Stop::UnreadExpression)]
         );
     }
 
