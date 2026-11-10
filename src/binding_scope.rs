@@ -68,6 +68,11 @@ impl Declarations {
         self.names.get(name).copied().unwrap_or(0)
     }
 
+    /// Every name declared, in any scope.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.names.keys().map(String::as_str)
+    }
+
     /// Whether `name` is declared at all.
     pub(crate) fn declares_name(&self, name: &str) -> bool {
         self.names.contains_key(name)

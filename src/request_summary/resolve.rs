@@ -69,10 +69,8 @@ const MAX_QUERY_STEPS: usize = 2048;
 /// and the name, as a compiler row names a declaration.
 #[derive(Debug, Clone, Default)]
 pub(super) struct ModuleBinding {
-    /// The function whose body declares it, by its key in
-    /// [`FileIr::functions`]; `None` for a module binding. A parameter its
-    /// initialiser reads is that function's, read at its callers.
-    pub(super) declared_in: Option<String>,
+    /// Where it is declared (carrick#3794): the scope that owns it.
+    pub(super) declared: Declared,
     /// What the initialiser may hold, read in module scope. Empty when the
     /// declaration has none.
     pub(super) init: Vec<ValueAt>,
@@ -127,12 +125,60 @@ pub(super) struct ModuleBinding {
 impl ModuleBinding {
     /// Whether the value readers (discovery's callee walk, the receiver
     /// walk) read this entry: an enum holds no value, and a text-only local
-    /// is held by its scope.
+    /// is held by its scope. No reader opens a [`Self::scoped_entry`] yet.
     pub(super) fn values_read(&self) -> bool {
         !matches!(
             self.kind,
             BindingKind::Enum | BindingKind::StaticField | BindingKind::Getter
         ) && !self.text_only
+            && !self.scoped_entry()
+    }
+
+    /// An entry of the carrick#3794 class: a declaration in a block, in a
+    /// function written inside a body, or a function declared in a body.
+    /// The table holds them, and every reader refuses them at its choke
+    /// point (the text reader's `declared_entry`, [`Self::values_read`], the
+    /// procedures walk's `binding`) until its own step opens them, so no
+    /// reader answers differently for having them.
+    pub(super) fn scoped_entry(&self) -> bool {
+        !matches!(self.declared, Declared::Module | Declared::Body(_))
+            || self.kind == BindingKind::Function
+    }
+}
+
+/// The scope that owns a binding table entry (carrick#3794).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum Declared {
+    /// Declared at module scope.
+    #[default]
+    Module,
+    /// Declared in a block at module scope (`if (…) { const x = … }`).
+    ModuleBlock,
+    /// A top-level local of the definition keyed in [`FileIr::functions`].
+    /// A parameter its initialiser reads is that definition's, read at its
+    /// callers.
+    Body(String),
+    /// Declared in a block inside the definition keyed in
+    /// [`FileIr::functions`].
+    Block(String),
+    /// A local of a function no definition key names: a callback, a nested
+    /// function, a constructor default. A parameter its initialiser reads is
+    /// that function's, which no caller index keys.
+    Nested,
+}
+
+impl Declared {
+    /// The definition whose body holds the declaration, at any block depth.
+    pub(super) fn function(&self) -> Option<&str> {
+        match self {
+            Self::Body(key) | Self::Block(key) => Some(key),
+            Self::Module | Self::ModuleBlock | Self::Nested => None,
+        }
+    }
+
+    /// Declared at module scope, outside every block and function.
+    pub(super) fn module_scope(&self) -> bool {
+        matches!(self, Self::Module)
     }
 }
 
@@ -155,6 +201,9 @@ pub(super) enum BindingKind {
     /// returns, `None` where the body is anything else or a subclass, a
     /// write or an escape may change what the member reads.
     Getter,
+    /// A function declared in a body (carrick#3794): `init` is the function
+    /// itself, [`ValueAt::Function`] at where its node starts.
+    Function,
 }
 
 impl From<VarDeclKind> for BindingKind {
@@ -185,6 +234,15 @@ pub(super) struct LocalBinding {
     pub(super) reassigned: bool,
     /// As [`ModuleBinding::plain`].
     pub(super) plain: bool,
+    /// Declared in a block of the body, not at its top level: the call
+    /// walker's declarator visit pushes it, [`Reader::body`] never does.
+    pub(super) block: bool,
+    /// A parameter's default, kept as a binding for the text reader
+    /// ([`ParamValues::defaulted_names`]). Only a definition's is in the
+    /// table: a nested function's parameter has no function of its own, and
+    /// [`param_bindings`] would mark every defaulted callback parameter as
+    /// colliding with it.
+    pub(super) defaulted: bool,
 }
 
 /// A placed assignment `name = value`, `name ??= value` or `name ||= value`
@@ -885,8 +943,10 @@ pub(super) type ModuleBindings = (
 /// each function's own `let` its body writes again, under the function's key
 /// (S1b), and what each states as text (S2): every plain-name local a top
 /// level definition's own body declares once, and every enum at any depth.
-/// A local in a function written inside that body, and a declaration in a
-/// block at module scope, are unread. Two bindings declared on one line with
+/// A declaration in a block, a local of a function written inside a body
+/// and a function declared in a body are in the table too ([`Declared`],
+/// carrick#3794), refused by every reader until its own step opens them
+/// ([`ModuleBinding::scoped_entry`]). Two bindings declared on one line with
 /// one name are each unplaceable: no row says which one a use means. The
 /// census's own verdict comes back beside the table ([`PlacedWrites`]).
 pub(super) fn module_bindings(
@@ -895,6 +955,8 @@ pub(super) fn module_bindings(
     reader: &Reader<'_>,
     scope: &Scope<'_>,
     functions: &HashMap<String, FnIr>,
+    module_level: &FnIr,
+    constructor_defaults: &[FnIr],
 ) -> ModuleBindings {
     let mut census = WriteCensus::default();
     module.visit_with(&mut census);
@@ -941,7 +1003,7 @@ pub(super) fn module_bindings(
                     let line = source_map.lookup_char_pos(member.bound.id.span.lo).line as u32;
                     let read = member.read(init);
                     let binding = ModuleBinding {
-                        declared_in: None,
+                        declared: Declared::Module,
                         init: reader.value_of(&read, scope, &guards::Bound::default()),
                         writes: census.writes.get(&key).cloned().unwrap_or_default(),
                         unplaceable: census.is_unplaceable(&key),
@@ -966,7 +1028,7 @@ pub(super) fn module_bindings(
             let line = source_map.lookup_char_pos(ident.id.span.lo).line as u32;
             let init = declarator.init.as_deref();
             let binding = ModuleBinding {
-                declared_in: None,
+                declared: Declared::Module,
                 init: init
                     .map(|init| reader.value_of(init, scope, &guards::Bound::default()))
                     .unwrap_or_default(),
@@ -997,12 +1059,22 @@ pub(super) fn module_bindings(
             ..ModuleBinding::default()
         });
     }
+    // Every function the file writes, each under the scope that owns its
+    // locals (carrick#3794): a definition's own, then every function written
+    // inside it, a module's blocks and the functions written there, and the
+    // constructors' defaults.
     let mut keys: Vec<&String> = functions.keys().collect();
     keys.sort();
-    for function in keys {
-        for local in &functions[function].local_bindings {
+    let mut scoped: Vec<(&FnIr, Owner<'_>)> = keys
+        .into_iter()
+        .map(|key| (&functions[key], Owner::Definition(key.as_str())))
+        .collect();
+    scoped.push((module_level, Owner::Module));
+    scoped.extend(constructor_defaults.iter().map(|ir| (ir, Owner::Detached)));
+    for (ir, owner) in scoped {
+        let mut taken = |local: &LocalBinding, declared: Declared| {
             let binding = ModuleBinding {
-                declared_in: Some(function.clone()),
+                declared,
                 init: local.init.clone(),
                 writes: census.writes.get(&local.key).cloned().unwrap_or_default(),
                 unplaceable: census.is_unplaceable(&local.key),
@@ -1012,17 +1084,36 @@ pub(super) fn module_bindings(
                 entries_handed: census.entries_handed(&local.key, false),
                 handed: census.handed.get(&local.key).cloned().unwrap_or_default(),
                 exported: false,
-                text_only: !local.reassigned,
+                text_only: !local.block && !local.reassigned,
                 object_kept: false,
                 plain: local.plain,
             };
             match out.entry((local.line, local.key.0.clone())) {
-                std::collections::hash_map::Entry::Occupied(mut taken) => {
-                    taken.get_mut().unplaceable = true;
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    held.get_mut().unplaceable = true;
                 }
                 std::collections::hash_map::Entry::Vacant(free) => {
                     free.insert(binding);
                 }
+            }
+        };
+        for local in &ir.local_bindings {
+            let declared = match (owner, local.block) {
+                (Owner::Definition(key), false) => Declared::Body(key.to_string()),
+                (Owner::Definition(key), true) => Declared::Block(key.to_string()),
+                (Owner::Module, true) => Declared::ModuleBlock,
+                // A module has no top-level body of its own.
+                (Owner::Module, false) => continue,
+                (Owner::Detached, _) if local.defaulted => continue,
+                (Owner::Detached, _) => Declared::Nested,
+            };
+            taken(local, declared);
+        }
+        let mut inner: Vec<&FnIr> = Vec::new();
+        collect_written(ir, &mut inner);
+        for ir in inner {
+            for local in ir.local_bindings.iter().filter(|local| !local.defaulted) {
+                taken(local, Declared::Nested);
             }
         }
     }
@@ -1032,6 +1123,32 @@ pub(super) fn module_bindings(
         written_through_at(module, &census),
         census.placed_writes(),
     )
+}
+
+/// Whose locals a [`FnIr`] of [`module_bindings`]' walk holds.
+#[derive(Clone, Copy)]
+enum Owner<'a> {
+    /// The definition keyed in [`FileIr::functions`].
+    Definition(&'a str),
+    /// The module's own statements.
+    Module,
+    /// A function no definition key names.
+    Detached,
+}
+
+/// Every function written inside `ir`, at any depth: handed to a call, held
+/// in a local, an object's method or a parameter's default
+/// ([`param_bindings`]' walk).
+fn collect_written<'f>(ir: &'f FnIr, out: &mut Vec<&'f FnIr>) {
+    for inner in ir
+        .nested
+        .iter()
+        .chain(&ir.detached)
+        .chain(&ir.param_functions)
+    {
+        out.push(inner);
+        collect_written(inner, out);
+    }
 }
 
 /// The parameter table (carrick#3504 B10-1a): every plain name any function
@@ -1115,7 +1232,7 @@ pub(super) fn param_bindings(
         let at = (name.line, name.key.0.clone());
         let own = function.is_some_and(|function| {
             bindings.get(&at).is_some_and(|binding| {
-                binding.declared_in.as_deref() == Some(function)
+                binding.declared.function() == Some(function)
                     && !binding.unplaceable
                     && functions[function]
                         .local_bindings
@@ -2483,6 +2600,8 @@ impl Reader<'_> {
                 }),
                 reassigned: false,
                 plain: false,
+                block: false,
+                defaulted: true,
             })
         };
         let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {
@@ -3801,7 +3920,7 @@ impl<'a> Resolver<'a> {
             (other, _) => out.extend(self.read_value(follow, file, other, invoke, false)),
         };
         for value in &binding.init {
-            written(&mut out, value, binding.declared_in.as_deref());
+            written(&mut out, value, binding.declared.function());
         }
         for at in &binding.writes {
             let Some((key, write)) = placed_write(ir, *at) else {
@@ -4804,6 +4923,117 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             .get(&picked_at)
             .expect("the const is in the binding table");
         assert!(!binding.unplaceable);
+    }
+
+    /// The binding table entries of `file` named `name`.
+    fn entries_named<'f>(file: &'f FileIr, name: &str) -> Vec<&'f ModuleBinding> {
+        file.module_bindings
+            .iter()
+            .filter(|((_, symbol), _)| symbol == name)
+            .map(|(_, binding)| binding)
+            .collect()
+    }
+
+    /// carrick#3794 T1: a declaration in a block, in a function written
+    /// inside a body and a function declared in a body each has an entry of
+    /// its scope's class; a loop head, a `catch` binding, a shadowed name and
+    /// a nested parameter's default have none.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn block_and_nested_locals_are_in_the_table_under_their_scope() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let path = on.path("services/web/src/blocks.ts");
+        let file = &on.inputs.files[&path];
+        let one = |name: &str| -> &ModuleBinding {
+            let found = entries_named(file, name);
+            assert_eq!(found.len(), 1, "{name}: {found:?}");
+            found[0]
+        };
+        let block = Declared::Block("blocks".to_string());
+        for name in ["inIf", "inTry", "inCase", "bare", "inLoop", "moved"] {
+            let entry = one(name);
+            assert_eq!(entry.declared, block, "{name}");
+            assert!(!entry.text_only && !entry.unplaceable, "{name}: {entry:?}");
+        }
+        assert_eq!(one("atModule").declared, Declared::ModuleBlock);
+        for name in ["inCallback", "deeper", "inHandler", "nestedMoved"] {
+            assert_eq!(one(name).declared, Declared::Nested, "{name}");
+        }
+        // A nested function's own top-level local keeps today's rule
+        // (`text_only` unless written again); a block's never does.
+        assert!(one("inCallback").text_only);
+        assert!(!one("deeper").text_only);
+        assert!(!one("nestedMoved").text_only);
+
+        // A function declared in a body, at its top level and in a callback.
+        let inner = one("inner");
+        assert_eq!(inner.kind, BindingKind::Function);
+        assert_eq!(inner.declared, Declared::Body("blocks".to_string()));
+        assert!(matches!(inner.init.as_slice(), [ValueAt::Function(_)]));
+        let in_callback = one("innerInCallback");
+        assert_eq!(in_callback.kind, BindingKind::Function);
+        assert_eq!(in_callback.declared, Declared::Nested);
+
+        // A write inside a definition's block is placed; one inside a
+        // nested function never is.
+        let moved = one("moved");
+        assert_eq!(moved.writes.len(), 1, "{moved:?}");
+        assert!(placed_write(file, moved.writes[0]).is_some());
+        let nested_moved = one("nestedMoved");
+        assert_eq!(nested_moved.writes.len(), 1, "{nested_moved:?}");
+        assert!(placed_write(file, nested_moved.writes[0]).is_none());
+
+        // Declared twice on one line: no row says which one a use means.
+        let pair = one("pair");
+        assert!(pair.unplaceable, "{pair:?}");
+
+        // No entry: a loop head, a `catch` binding, a name the body declares
+        // twice (a shadow, decision D3) and a nested parameter's default.
+        for name in ["item", "err", "same", "n"] {
+            assert!(entries_named(file, name).is_empty(), "{name}");
+        }
+        let default = file
+            .param_bindings
+            .iter()
+            .find(|((_, symbol), _)| symbol == "n")
+            .expect("the defaulted parameter has a parameter entry")
+            .1;
+        assert_eq!(default.function, None);
+        assert!(!default.written, "{default:?}");
+    }
+
+    /// carrick#3794 T1: an entry the table held before is unchanged beside
+    /// the new ones, and every old entry keeps an old class.
+    #[test]
+    fn an_existing_entry_is_unchanged_beside_a_block_entry() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let path = on.path("services/web/src/callers.ts");
+        let file = &on.inputs.files[&path];
+        let (picked_at, picked) = param_entry(file, None, "picked");
+        assert!(picked.collides, "{picked:?}");
+        let binding = &file.module_bindings[&picked_at];
+        assert!(!binding.unplaceable);
+        assert_eq!(binding.declared, Declared::Module);
+        let (_, one) = param_entry(file, Some("one"), "name");
+        assert!(!one.written && !one.collides, "{one:?}");
+        // A definition's own local, and a callback's: the table read the
+        // first before, and only the second is new.
+        let local = on.path("services/web/src/forms.ts");
+        let forms = &on.inputs.files[&local];
+        let local_join = entries_named(forms, "p_local_join");
+        assert!(
+            local_join
+                .iter()
+                .all(|entry| matches!(entry.declared, Declared::Body(_))),
+            "{local_join:?}"
+        );
+        assert!(!local_join.is_empty());
     }
 
     /// carrick#3504 B10-1a: a call keeps each argument as the text it

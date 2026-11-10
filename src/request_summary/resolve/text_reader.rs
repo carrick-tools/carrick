@@ -883,7 +883,10 @@ impl<'a> Resolver<'a> {
             .files
             .get(path)?
             .module_bindings
-            .get(&(line, symbol.clone()))?;
+            .get(&(line, symbol.clone()))
+            // A block-scoped or nested local is in the table, and no text
+            // read opens it yet (carrick#3794): it reads as no entry.
+            .filter(|binding| !binding.scoped_entry())?;
         let declared = super::super::site_record::declaration_path(row.decl_file()?);
         Some(((path, line, symbol), binding, declared))
     }
@@ -1104,7 +1107,9 @@ impl<'a> Resolver<'a> {
         // the key, where the module only ever reads the object's entries.
         let last = match binding.kind {
             BindingKind::Enum => false,
-            BindingKind::StaticField | BindingKind::Getter => return hole(UnreadExpression),
+            BindingKind::StaticField | BindingKind::Getter | BindingKind::Function => {
+                return hole(UnreadExpression);
+            }
             BindingKind::Var => return hole(Reassigned),
             BindingKind::Let if !binding.writes.is_empty() || binding.unplaceable => {
                 return hole(Reassigned);
@@ -1510,7 +1515,8 @@ impl Resolver<'_> {
             BindingKind::Var
             | BindingKind::Enum
             | BindingKind::StaticField
-            | BindingKind::Getter => false,
+            | BindingKind::Getter
+            | BindingKind::Function => false,
         };
         // The entries are the literal's where the module only reads them, or
         // hands the object on to the one call this entry is read for.
@@ -1643,6 +1649,54 @@ mod tests {
             .and_then(|(_, binding)| binding.text.clone())
             .unwrap_or_else(|| panic!("{name} is declared with an initialiser in {file}"));
         resolver.text_values(&path, &text)
+    }
+
+    /// carrick#3794 T1: the binding table holds an entry for every block or
+    /// nested local, and the text reader reads none of them yet: each name
+    /// answers as it did before the entry existed. Step T2 replaces this pin
+    /// with the answers.
+    #[test]
+    fn no_reader_reads_a_block_or_nested_entry_yet() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let path = on.path("services/web/src/blocks.ts");
+        let argument = |callee: &str| -> ValueAt {
+            let found: Vec<ValueAt> = super::super::row_calls::every_call(&on.inputs.files)
+                .into_iter()
+                .filter(|(file, call, _)| *file == path && call.callee == callee)
+                .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
+                .collect();
+            assert_eq!(found.len(), 1, "{callee}: {found:?}");
+            found[0].clone()
+        };
+        for callee in [
+            "p_if",
+            "p_try",
+            "p_case",
+            "p_bare",
+            "p_loop_body",
+            "p_module_block",
+            "p_callback",
+            "p_callback_block",
+            "p_handler",
+            "p_moved",
+            "p_nested_moved",
+            "p_shadow",
+            "p_shadow_outer",
+            "p_pair_a",
+            "p_pair_b",
+            "p_loop",
+            "p_catch",
+        ] {
+            let got = resolver.text_values(&path, &argument(callee));
+            assert_eq!(
+                got,
+                vec![TextValue::Hole(guards::HoleReason::OutsideService)],
+                "{callee}"
+            );
+        }
     }
 
     /// A choice reads every branch, never collapsed: a branch the code does
