@@ -132,7 +132,6 @@ impl ModuleBinding {
             self.kind,
             BindingKind::Enum | BindingKind::StaticField | BindingKind::Getter
         ) && !self.text_only
-            && !self.scoped_entry()
     }
 
     /// An entry of the carrick#3794 class: a declaration in a block, in a
