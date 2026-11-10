@@ -68,6 +68,19 @@ export declare function serveUnknown<TC extends Collection>(
   opts: { collection: TC; endpoint: string } & UnknownWhen<object extends TC["_context"] ? true : false>
 ): void;
 export declare function serveInfer<TC extends Collection>(opts: { collection: TC; endpoint: string } & InferWhen<TC>): void;
+type SelfLoop<C> = C extends string ? SelfLoop<C> : { strict: string };
+type SelfFlat<C> = C extends Array<infer U> ? SelfFlat<U> : C;
+type PingWhen<C> = C extends string ? PongWhen<C> : { strict: string };
+type PongWhen<C> = C extends number ? PingWhen<C> : { strict: number };
+export declare function serveSelf<TC extends Collection>(
+  opts: { collection: TC; endpoint: string } & SelfLoop<TC["_context"]>
+): void;
+export declare function serveFlat<TC extends Collection>(
+  opts: { collection: TC; endpoint: string } & SelfFlat<TC["_context"]>
+): void;
+export declare function serveMutual<TC extends Collection>(
+  opts: { collection: TC; endpoint: string } & PingWhen<TC["_context"]>
+): void;
 `;
 
 // What the lister of origin/main 3041924a listed for the two adapters with no
@@ -176,6 +189,18 @@ describe('list_library_surface: options intersected with a deferred conditional'
     for (const exported of ['serveOpen', 'serveUnknown', 'serveInfer']) {
       assert.strictEqual(firstParam(listed, exported).keys, undefined, exported);
     }
+  });
+
+  // A conditional whose branch is the conditional again (itself, or through a
+  // second alias) must end the read, not recurse. The checker's constraint
+  // already ends these chains, so the listing is what it resolves; the guard
+  // (`MAX_CONDITIONAL_DEPTH`) is the backstop, and this pins that such options
+  // finish and list the keys the terminating branch gives.
+  it('finishes where the conditional recurses into itself or a sibling', { timeout: 30_000 }, async () => {
+    const listed = await surface();
+    assert.deepStrictEqual(keyNames(firstParam(listed, 'serveSelf')), ['collection', 'endpoint', 'strict']);
+    assert.strictEqual(firstParam(listed, 'serveFlat').keys, undefined);
+    assert.deepStrictEqual(keyNames(firstParam(listed, 'serveMutual')), ['collection', 'endpoint', 'strict']);
   });
 
   it('a maker that runs the collection at the listed key verifies', async () => {

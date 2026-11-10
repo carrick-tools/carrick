@@ -1835,8 +1835,13 @@ interface ClaimLayout {
  * Every predicate is the contract's (carrick#1564, section 3), stated on the
  * checker's public API, with the definitions the review amended.
  */
+/** How many deferred conditionals one object read follows into one another. */
+const MAX_CONDITIONAL_DEPTH = 8;
+
 class DeclarationReader {
   private readonly checker: ts.TypeChecker;
+  /** Nesting of `isObjectConditional` reads in progress. */
+  private conditionalDepth = 0;
   /** Names declaring files as position rows do: from the scan root, else the service root. */
   private readonly pathNames: PathNames;
   /** The service root, as a realpath. */
@@ -6112,6 +6117,20 @@ class DeclarationReader {
    * constraint drops the branch the inferred parameter stands in.
    */
   private isObjectConditional(type: ts.ConditionalType): boolean {
+    // A branch that names the conditional again (itself, or through a second
+    // alias) is a fresh instantiation each time round, so identity does not end
+    // the chain: a depth cap does. Past it, as for an unreadable branch, it is
+    // not an object.
+    if (this.conditionalDepth >= MAX_CONDITIONAL_DEPTH) return false;
+    this.conditionalDepth++;
+    try {
+      return this.readObjectConditional(type);
+    } finally {
+      this.conditionalDepth--;
+    }
+  }
+
+  private readObjectConditional(type: ts.ConditionalType): boolean {
     if ((type.root.inferTypeParameters?.length ?? 0) > 0) {
       const node = type.root.node;
       const branchSaysNothing = [node.trueType, node.falseType].some(branch => {
