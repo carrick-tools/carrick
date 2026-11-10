@@ -2524,6 +2524,7 @@ fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> b
     };
     let own_route = serves_own_route(graph, &reached.method, &reached.canonical_path);
     let call = DataFetchingCall {
+        procedure: None,
         method: reached.method.clone(),
         target_url: reached.target_url.clone(),
         canonical_path: reached.canonical_path.clone(),
@@ -4027,6 +4028,7 @@ mod tests {
     /// A request written by a fact (`request_summary`) at `file:line`.
     fn request_at(file: &str, line: u32) -> DataFetchingCall {
         DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: "/things".to_string(),
             canonical_path: "/things".to_string(),

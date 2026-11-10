@@ -1,0 +1,84 @@
+{
+  "library_claims": [
+    {
+      "package": "fixture-procs",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-procs",
+          "export": "init",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": "create" }],
+          "scopes": [
+            { "member": "router", "of": "instance:create", "collects": { "arg": 0, "join": "." } }
+          ],
+          "ops": [
+            { "op": "receive", "member": "query", "path": ["procedure"], "of": "instance:create", "name": { "bound": "key" }, "handler": { "arg": 0 }, "method": "GET" },
+            { "op": "receive", "member": "mutation", "path": ["procedure"], "of": "instance:create", "name": { "bound": "key" }, "handler": { "arg": 0 }, "method": "POST" },
+            { "op": "receive", "member": "stream", "path": ["procedure"], "of": "instance:create", "name": { "bound": "key" }, "handler": { "arg": 0 } }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "fixture-procs",
+          "export": "serveRpc",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null, "runs": { "arg": 0, "key": "router" }, "prefix": { "arg": 0, "key": "endpoint" } }],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "fixture-procs-mw",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-procs-mw",
+          "export": "rpcMiddleware",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null, "runs": { "arg": 0, "key": "router" } }],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "fixture-web",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-web",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null }],
+          "scopes": [
+            { "member": "use", "of": "instance:()", "name": { "arg": 0 }, "mounts": { "arg": 1 } }
+          ],
+          "ops": [
+            { "op": "receive", "member": "get", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "GET" },
+            { "op": "receive", "member": "all", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 } }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

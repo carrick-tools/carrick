@@ -262,6 +262,7 @@ pub fn apply_declared_operations(
                 let (file_location, handler) =
                     declared_location(operation, carried.as_ref(), handlers);
                 graph.endpoints.push(crate::mount_graph::ResolvedEndpoint {
+                    procedure: None,
                     method: method.clone(),
                     path: path.clone(),
                     full_path: path.clone(),
@@ -1206,6 +1207,7 @@ mod tests {
     fn a_declaration_replaces_the_inferred_rows_for_its_route() {
         let mut graph = crate::mount_graph::MountGraph::new();
         graph.endpoints.push(crate::mount_graph::ResolvedEndpoint {
+            procedure: None,
             method: "POST".to_string(),
             path: "/types/check-or-upload".to_string(),
             full_path: "/types/check-or-upload".to_string(),
@@ -1252,6 +1254,7 @@ mod tests {
 
         let mut graph = crate::mount_graph::MountGraph::new();
         let inferred = |value: &str| crate::mount_graph::ResolvedEndpoint {
+            procedure: None,
             method: "POST".to_string(),
             path: "/types/check-or-upload".to_string(),
             full_path: "/types/check-or-upload".to_string(),
@@ -1352,6 +1355,7 @@ mod tests {
         );
         let mut consumer = blob("mcp-server", None);
         consumer.calls.push(crate::analyzer::ApiEndpointDetails {
+            procedure: None,
             owner: None,
             key: crate::operation::OperationKey::http("POST", "/types/check-or-upload"),
             params: vec![],
@@ -1445,6 +1449,7 @@ mod tests {
         dispatch: Option<Dispatch>,
     ) -> crate::analyzer::ApiEndpointDetails {
         crate::analyzer::ApiEndpointDetails {
+            procedure: None,
             owner: None,
             key: crate::operation::OperationKey::http("POST", "/notices"),
             params: vec![],

@@ -1216,6 +1216,7 @@ mod tests {
 
         let repo_path = "/work/acme";
         let endpoint = |method: &str, path: &str, site: &str| ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http(method, path.to_string()),
@@ -1299,6 +1300,7 @@ mod tests {
         use crate::operation::OperationKey;
 
         let call = |method: &str, path: &str, site: &str| ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http(method, path.to_string()),
@@ -1323,6 +1325,7 @@ mod tests {
         };
         let mut graph = MountGraph::new();
         graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: "/api/items".to_string(),
             canonical_path: "/api/items".to_string(),

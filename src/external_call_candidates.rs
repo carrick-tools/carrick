@@ -3871,6 +3871,7 @@ mod tests {
         /// extraction.
         fn call(target: &str, host: Option<&str>, line: Option<u32>) -> DataFetchingCall {
             DataFetchingCall {
+                procedure: None,
                 method: "get".to_string(),
                 target_url: target.to_string(),
                 canonical_path: target.to_string(),

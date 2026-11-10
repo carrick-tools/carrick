@@ -2154,6 +2154,121 @@ fn a_let_receiver_route_takes_its_full_path() {
     );
 }
 
+/// Each HTTP endpoint row's procedure, mount-graph and flat rows both:
+/// `<file:line> <method> <full path> => <key path> @ <router file>#<binding>`
+/// (`-` where the row states none). The repo is checked apart.
+fn procedure_rows(blobs: &Blobs) -> (Vec<String>, Vec<String>) {
+    let show = |row: &serde_json::Value| match row.get("procedure") {
+        Some(procedure) => format!(
+            "{} @ {}#{}",
+            procedure["path"].as_str().unwrap_or_default(),
+            procedure["router"]["file"].as_str().unwrap_or_default(),
+            procedure["router"]["binding"].as_str().unwrap_or_default(),
+        ),
+        None => "-".to_string(),
+    };
+    let mut graph = Vec::new();
+    let mut flat = Vec::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for row in blob["mount_graph"]["endpoints"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            if let Some(procedure) = row.get("procedure") {
+                assert!(
+                    !procedure["router"]["repo"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .is_empty(),
+                    "a procedure names the repo of its router: {row}"
+                );
+            }
+            graph.push(format!(
+                "{} {} {} => {}",
+                row["file_location"].as_str().unwrap_or_default(),
+                row["method"].as_str().unwrap_or_default(),
+                row["full_path"].as_str().unwrap_or_default(),
+                show(&row),
+            ));
+        }
+        for row in blob["endpoints"].as_array().cloned().unwrap_or_default() {
+            if row["key"]["protocol"] != "http" {
+                continue;
+            }
+            flat.push(format!(
+                "{} {} {} => {}",
+                row["file_path"].as_str().unwrap_or_default(),
+                row["key"]["method"].as_str().unwrap_or_default(),
+                row["key"]["path"].as_str().unwrap_or_default(),
+                show(&row),
+            ));
+        }
+    }
+    graph.sort();
+    flat.sort();
+    (graph, flat)
+}
+
+/// A procedure route states its key path and the router that declares it,
+/// at every full path it is served at, on the mount graph and on the
+/// index's flat rows alike: the key a call to it pairs by.
+#[test]
+fn procedure_rows_state_their_router_and_key_path() {
+    let (on, _) = scan_fixture_reading("procedure-router");
+    let (graph, flat) = procedure_rows(&on);
+    let at = |site: &str, method: &str, key_path: &str| -> Vec<String> {
+        ["/api/rpc", "", "/rpc", "/x"]
+            .iter()
+            .map(|mount| {
+                format!(
+                    "{site} {method} {mount}/{key_path} => {key_path} @ src/router.ts#appRouter"
+                )
+            })
+            .collect()
+    };
+    // Every procedure is under a key of `appRouter`'s own object: the router
+    // is the declaration holding the property of the first key, wherever
+    // the nested router is declared.
+    let mut expected: Vec<String> = [
+        at("src/accounts.ts:5", "GET", "accounts.show"),
+        at("src/computed.ts:10", "GET", "computed.last"),
+        at("src/health.ts:5", "GET", "health"),
+        at("src/loose.ts:14", "GET", "loose.after"),
+        at("src/orders.ts:7", "GET", "orders.list"),
+        at("src/orders.ts:8", "POST", "orders.create"),
+        at("src/router.ts:11", "GET", "ping"),
+        at("src/users.ts:5", "GET", "users.me"),
+    ]
+    .concat();
+    expected.sort();
+    assert_eq!(graph, expected);
+    // The index's flat rows carry the same procedures.
+    assert_eq!(flat.len(), expected.len());
+    assert!(flat.iter().all(|row| !row.ends_with("=> -")), "{flat:?}");
+}
+
+/// The router a procedure row names is the innermost declaration holding the
+/// property of the first key: the binding the router call is assigned to, a
+/// table another binding hands it, and two routers in one file that share a
+/// first key stay two (the function and `default` shapes are the unit tests of
+/// `router_holder`). Answer key: the fixture's README.
+#[test]
+fn router_holders_follow_the_declaration_rule() {
+    let (on, _) = scan_fixture_reading("procedure-router-holder");
+    let (graph, _) = procedure_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            "src/direct.ts:5 GET /direct/alpha => alpha @ src/direct.ts#directRouter",
+            "src/pair.ts:5 GET /first/shared => shared @ src/pair.ts#firstRouter",
+            "src/pair.ts:9 GET /second/shared => shared @ src/pair.ts#secondRouter",
+            "src/table.ts:5 GET /table/beta => beta @ src/table.ts#routes",
+        ]
+    );
+}
+
 /// A router member called through a `const` alias (`const mk = t.router`,
 /// or one exported from another module) collects its procedures like the
 /// member called directly: the call's row names the in-repo alias, and one
