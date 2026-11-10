@@ -5721,7 +5721,7 @@ async fn analyze_current_repo_incremental(
                 graphql_schemas,
                 analysis.builds_graphql_schema_in_code,
             );
-            let (library, claims) = library_rows(
+            let (library, claims, unready) = library_rows(
                 library_ask.as_ref(),
                 library_answer,
                 sidecar,
@@ -5739,6 +5739,7 @@ async fn analyze_current_repo_incremental(
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
+                    unready: unready.as_ref(),
                     ..SiteContext::default()
                 },
                 sidecar,
@@ -5756,6 +5757,7 @@ async fn analyze_current_repo_incremental(
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
+                    unready: unready.as_ref(),
                 },
             )
             .await;
@@ -5770,6 +5772,7 @@ async fn analyze_current_repo_incremental(
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
+                    unready: unready.as_ref(),
                 },
             );
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -6939,6 +6942,7 @@ fn library_rows(
 ) -> (
     crate::library_claims::LibraryRows,
     Vec<crate::library_claims::ExportClaims>,
+    Option<BTreeSet<String>>,
 ) {
     let Some(ask) = ask else {
         return Default::default();
@@ -6951,7 +6955,8 @@ fn library_rows(
     }
     // A read-only pass (carrick#2907) started no build, so a package it ends
     // without is unknown, as it was before the pass asked: nothing is
-    // pending on its account.
+    // pending on its account, and no site rests on one.
+    let unready = (!ask.read_only).then(|| settled.unanswered.clone());
     if !ask.read_only {
         crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
             pending: settled.pending,
@@ -6961,6 +6966,7 @@ fn library_rows(
     (
         read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
         settled.exports,
+        unready,
     )
 }
 
@@ -7125,6 +7131,10 @@ struct SiteContext<'a> {
     /// What the sidecar found for the calls through an interface member
     /// (carrick#2432 slice B, [`implementations_for`]).
     implementations: Option<&'a crate::request_summary::implementations::Implementations>,
+    /// The packages the scan ended without an answer for
+    /// ([`crate::library_store::Settled::unanswered`]); `None` for no ask or a
+    /// read-only ask, where no call reads unready (carrick#3684).
+    unready: Option<&'a BTreeSet<String>>,
 }
 
 /// What the analysis sidecar finds for each call of the service through an
@@ -7310,6 +7320,10 @@ fn discovery_of(
     };
     let labels = match context.implementations {
         Some(implementations) => labels.following(implementations),
+        None => labels,
+    };
+    let labels = match context.unready {
+        Some(unready) => labels.ended_without(unready),
         None => labels,
     };
     crate::request_summary::discovery::discover_with(inputs, context.siblings, &labels, root)
@@ -13746,7 +13760,7 @@ async fn analyze_current_repo(
         graphql_schemas,
         analysis_result.builds_graphql_schema_in_code,
     );
-    let (library, claims) =
+    let (library, claims, unready) =
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
     protocol_extractions.library = library;
     let server_claims = server_claims_of(&claims, &service_root);
@@ -13759,6 +13773,7 @@ async fn analyze_current_repo(
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
+            unready: unready.as_ref(),
             ..SiteContext::default()
         },
         sidecar,
@@ -13775,6 +13790,7 @@ async fn analyze_current_repo(
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
+            unready: unready.as_ref(),
         },
     )
     .await;
@@ -13789,6 +13805,7 @@ async fn analyze_current_repo(
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
+            unready: unready.as_ref(),
         },
     );
     let withdrawn = withdraw_model_routes_at_definitions(
@@ -14559,7 +14576,7 @@ mod tests {
                 None,
             )
             .await;
-            super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
+            let _ = super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
         })
         .await;
         assert_eq!(
@@ -14643,6 +14660,50 @@ mod tests {
         assert_eq!(
             run("ask-failed-clean-ro", ask(true), clean, false).await,
             None
+        );
+    }
+
+    /// carrick#3684. A failed store ask on a full scan (the model on) is
+    /// recorded through `library_rows`, the one writer; the counts stay 0 and
+    /// 0, and the packages asked are the set the settled pass reads as unready.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_ask_on_a_full_scan_is_recorded() {
+        let asked = crate::library_store::Asked::naming(&["failed-ask-a"]);
+        let ask = super::LibraryAsk {
+            sites: Default::default(),
+            asked,
+            read_only: false,
+            turns: Default::default(),
+        };
+        let service = Some("failed-ask-service".to_string());
+        let mut unready = None;
+        crate::current_service::scope(service.clone(), async {
+            let settled = crate::library_store::ask_until_settled(
+                &ask.asked,
+                |_| async {},
+                |_| async {
+                    Err(crate::agent_service::AgentCallError::permanent(
+                        "scan_not_started",
+                        "no scan is running".to_string(),
+                    ))
+                },
+                None,
+            )
+            .await;
+            unready = super::library_rows(Some(&ask), settled, None, std::path::Path::new(".")).2;
+        })
+        .await;
+        assert_eq!(
+            crate::scan_health::library_ask_failed_for(service.as_deref()),
+            Some(crate::library_store::AskFailure::Unreachable)
+        );
+        assert_eq!(
+            crate::scan_health::library_packages_for(service.as_deref()),
+            Some((0, 0))
+        );
+        assert_eq!(
+            unready,
+            Some(["failed-ask-a".to_string()].into_iter().collect())
         );
     }
 

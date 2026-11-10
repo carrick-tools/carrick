@@ -305,6 +305,9 @@ pub struct Labels<'a> {
     /// when only the exports are known ([`Labels::of`]), where no package
     /// can be told unanswered.
     answered: Option<HashSet<&'a str>>,
+    /// The packages the scan ended without an answer for ([`crate::library_store::Settled::unanswered`]),
+    /// for the settled pass; `None` leaves [`Self::answered`] to decide.
+    unready: Option<HashSet<&'a str>>,
     /// The packages with an export of a network role.
     networked: HashSet<&'a str>,
     /// The exports the store labelled with no network role.
@@ -327,6 +330,7 @@ impl<'a> Labels<'a> {
             declarations: None,
             implementations: None,
             answered: None,
+            unready: None,
             networked: exports
                 .iter()
                 .filter(|export| export.role != LibraryRole::None)
@@ -377,10 +381,27 @@ impl<'a> Labels<'a> {
         if !is_language_key(key) && self.networked.contains(key) {
             return Some(Stop::PackageUnmatched);
         }
+        if let Some(unready) = &self.unready {
+            // One language key is one whole default-library file: never unready.
+            return (!is_language_key(key) && unready.contains(key))
+                .then_some(Stop::UnansweredPackage);
+        }
         self.answered
             .as_ref()
             .is_some_and(unanswered)
             .then_some(Stop::UnansweredPackage)
+    }
+
+    /// These labels for the settled pass, with the packages the scan ended
+    /// without an answer for: a call into one is not followed, for
+    /// [`Stop::UnansweredPackage`]. For labels built by [`Self::of`] or
+    /// [`Self::traced`], which know no answered set.
+    pub fn ended_without(self, unready: &'a BTreeSet<String>) -> Self {
+        debug_assert!(self.answered.is_none());
+        Labels {
+            unready: Some(unready.iter().map(String::as_str).collect()),
+            ..self
+        }
     }
 
     /// These labels, following a call through an interface member into the
@@ -4134,6 +4155,167 @@ mod tests {
                 .unanswered_at
                 .contains_key(&span("client.ts", "transmit(path, body)")),
             "a direct call records no passed package"
+        );
+    }
+
+    /// What a pass over `discovery-pending-package` reads, as one string per
+    /// field the settled pass could move.
+    fn pending_package_record(discovery: &Discovery) -> Vec<String> {
+        vec![
+            format!("{:?}", discovery.sites),
+            format!("{:?}", discovery.unfollowed),
+            format!("{:?}", discovery.finished),
+            format!("{:?}", discovery.missed_inside),
+            format!("{:?}", discovery.unanswered_at),
+            format!("{:?}", discovery.entered),
+            format!("{:?}", discovery.counts),
+        ]
+    }
+
+    /// carrick#3684: the settled pass reads the packages the scan ended
+    /// without (`Labels::ended_without`), as the first pass reads the ones
+    /// the answer does not hold. The answer key is
+    /// `tests/fixtures/discovery-pending-package/README.md`.
+    #[test]
+    fn the_settled_pass_reads_a_package_the_scan_ended_without() {
+        let Some(on) = walked(
+            "discovery-pending-package",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-pending-package");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        let unready: BTreeSet<String> = ["fixture-pending".to_string()].into();
+        let plain = discover(&on.inputs, &Labels::of(&answer.exports), &on.repo);
+        let settled = discover(
+            &on.inputs,
+            &Labels::of(&answer.exports).ended_without(&unready),
+            &on.repo,
+        );
+        let span = |file: &str, needle: &str| -> (String, u32, u32) {
+            let text =
+                std::fs::read_to_string(fixture.join("repo/services/web/src").join(file)).unwrap();
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (
+                format!("services/web/src/{file}"),
+                lo,
+                lo + needle.len() as u32,
+            )
+        };
+        let pending: BTreeSet<String> = ["fixture-pending".to_string()].into();
+        for (file, needle) in [
+            ("events.ts", "send(\"/events\", body)"),
+            ("inject.ts", "doSend(\"/notify\", body)"),
+        ] {
+            let at = span(file, needle);
+            assert!(settled.missed_inside.contains(&at), "{file} missed_inside");
+            assert_eq!(settled.unanswered_at.get(&at), Some(&pending), "{file}");
+            assert!(
+                !plain.missed_inside.contains(&at),
+                "{file} on the plain pass"
+            );
+        }
+        let direct = span("client.ts", "transmit(path, body)");
+        assert!(
+            settled.unfollowed.iter().any(|site| (
+                site.file.clone(),
+                site.span_start,
+                site.span_end
+            ) == direct
+                && site.stop == Some(Stop::UnansweredPackage)),
+            "{:?}",
+            settled.unfollowed
+        );
+        assert!(
+            settled
+                .finished
+                .contains(&span("answered.ts", "render(body)"))
+        );
+        assert!(
+            settled
+                .sites
+                .iter()
+                .any(|site| site.file == "services/web/src/global.ts" && site.end.is_some())
+        );
+        let with_end = |discovery: &Discovery| -> Vec<String> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.end.is_some())
+                .map(|site| format!("{site:?}"))
+                .collect()
+        };
+        assert_eq!(with_end(&settled), with_end(&plain));
+        assert_eq!(
+            format!("{:?}", settled.entered),
+            format!("{:?}", plain.entered)
+        );
+    }
+
+    /// carrick#3684: with nothing unready the settled pass is the plain one.
+    #[test]
+    fn with_nothing_unready_the_settled_pass_is_unchanged() {
+        let Some(on) = walked(
+            "discovery-pending-package",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-pending-package");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        let none = BTreeSet::new();
+        assert_eq!(
+            pending_package_record(&discover(
+                &on.inputs,
+                &Labels::of(&answer.exports),
+                &on.repo
+            )),
+            pending_package_record(&discover(
+                &on.inputs,
+                &Labels::of(&answer.exports).ended_without(&none),
+                &on.repo
+            )),
+        );
+    }
+
+    /// carrick#3684: a default-library key is one whole file, so it is never
+    /// unready in the settled pass, whatever the set holds.
+    #[test]
+    fn a_language_key_is_never_unready() {
+        let Some(on) = walked("discovery", "services/web", "web", &[], true) else {
+            return;
+        };
+        let keys: BTreeSet<String> = on
+            .inputs
+            .positions
+            .as_ref()
+            .map(|positions| {
+                positions
+                    .call_rows()
+                    .flat_map(|row| store_keys(row, &[]))
+                    .filter(|key| is_language_key(key))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(!keys.is_empty(), "the fixture's rows name a language key");
+        let plain = discover(&on.inputs, &Labels::of(&[]), &on.repo);
+        let settled = discover(&on.inputs, &Labels::of(&[]).ended_without(&keys), &on.repo);
+        assert_eq!(
+            pending_package_record(&plain),
+            pending_package_record(&settled)
         );
     }
 
