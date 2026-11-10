@@ -832,8 +832,12 @@ impl<'a> Resolver<'a> {
                 fills: fills.clone(),
             };
             let args = caller.call.passed_texts();
-            // A spread at or before the position moves it.
-            let values = if args.iter().take(param.index + 1).any(Option::is_none) {
+            // A spread at or before the position moves it; a JSX element
+            // passes its props as no positional argument, so it is never an
+            // omitted one that takes the default (P2, P6).
+            let values = if caller.call.jsx
+                || args.iter().take(param.index + 1).any(Option::is_none)
+            {
                 hole(CallerArgMissing)
             } else {
                 let written = args.get(param.index).and_then(Option::as_ref);
