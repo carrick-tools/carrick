@@ -13,7 +13,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::contract::{
     Caller, CheckOutput, Counterpart, FunctionUse, Item, MAX_STALE_FILES, ReadError, ReadFailure,
@@ -825,22 +824,6 @@ fn newer_than_index(repo: &Path, relative: &str, indexed_at: &str) -> bool {
     chrono::DateTime::<chrono::Utc>::from(modified) > indexed_at
 }
 
-fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-
 /// The sentence a local answer ends on. It names what is absent, with the
 /// count the scan kept, so a thin index never reads as "there is no API here".
 pub fn boundary_note(boundary: Option<&crate::boundary::ServiceBoundary>) -> String {
@@ -1205,7 +1188,7 @@ mod hosted_change_tests {
         ]);
         let repo = dir.path();
         std::fs::write(repo.join("staged.ts"), "export const value = 2;").unwrap();
-        git(repo, &["add", "staged.ts"]).unwrap();
+        crate::git_state::tests::git_in(repo, &["add", "staged.ts"]);
         std::fs::remove_file(repo.join("deleted.ts")).unwrap();
         std::fs::write(repo.join("odd\nname.ts"), "changed").unwrap();
         std::fs::write(repo.join("new.ts"), "new").unwrap();
