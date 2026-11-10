@@ -108,6 +108,9 @@ pub fn directory_segments(directory: Option<&str>) -> Vec<&str> {
         .collect()
 }
 
+/// The `source` value that marks a generated `operations` block.
+const GENERATED_SOURCE: &str = "generated";
+
 /// One handler's operations, declared rather than inferred (carrick#831).
 ///
 /// The promotion half of body dispatch. Inference can see that a handler
@@ -137,6 +140,11 @@ pub struct DeclaredOperations {
     pub dispatch: DeclaredDispatch,
     /// The values the handler answers, one operation each.
     pub operations: Vec<DeclaredOperation>,
+    /// `"generated"` on a block Carrick Cloud wrote. Optional, and kept as
+    /// written so the blob's `config_json` carries the marker; see
+    /// [`DeclaredOperations::is_generated`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// The `{ location, field }` half of a declaration: the same two fields a
@@ -160,6 +168,12 @@ pub struct DeclaredOperation {
 }
 
 impl DeclaredOperations {
+    /// Whether Carrick Cloud generated this block, so its rows are candidates
+    /// rather than the repo's own facts. Any other `source` is a written block.
+    pub fn is_generated(&self) -> bool {
+        self.source.as_deref() == Some(GENERATED_SOURCE)
+    }
+
     /// `(METHOD, path)` when the block declares a route, parsed from
     /// `"POST /types/check-or-upload"`. `None` when it declares none, and an
     /// error when what it declares is not a verb and a path.
@@ -959,6 +973,35 @@ mod tests {
             named("mcp-server").declared_operations.is_empty(),
             "a block reaches only the service it names"
         );
+    }
+
+    /// C16 T3: the `source` marker survives into the blob's `config_json`
+    /// (the struct is what is re-serialised), and a block without it
+    /// serialises with no `source` key at all.
+    #[test]
+    fn the_generated_marker_round_trips_through_config_json() {
+        let marked: DeclaredOperations = serde_json::from_str(
+            r#"{ "service": "s", "route": "POST /rpc",
+                 "dispatch": { "location": "body", "field": "kind" },
+                 "operations": [{ "value": "a" }], "source": "generated" }"#,
+        )
+        .unwrap();
+        assert!(marked.is_generated());
+        let config = Config {
+            declared_operations: vec![marked.clone()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""source":"generated""#), "{json}");
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.declared_operations[0].is_generated());
+
+        let unmarked = DeclaredOperations {
+            source: None,
+            ..marked
+        };
+        let json = serde_json::to_string(&unmarked).unwrap();
+        assert!(!json.contains("source"), "{json}");
     }
 
     /// A block naming a service the file does not declare is dead config that

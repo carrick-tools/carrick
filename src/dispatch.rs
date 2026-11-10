@@ -214,6 +214,14 @@ pub fn apply_declared_operations(
     for block in &config.declared_operations {
         // Validated at config load; a bad route cannot reach here.
         let declared_route = block.parsed_route().ok().flatten();
+        // A generated block states what a model read, accepted by nobody, so
+        // its rows are candidates; a written block's rows are facts. Nothing
+        // else about the rows differs (docs/reference/generated-operations.md).
+        let source = if block.is_generated() {
+            ResolutionSource::Model
+        } else {
+            ResolutionSource::DeclaredOperation
+        };
         let routes: Vec<(String, String)> = match &declared_route {
             Some(route) => vec![route.clone()],
             None => {
@@ -283,7 +291,7 @@ pub fn apply_declared_operations(
                     // never call-site evidence, whatever the row it replaced
                     // was: the repo is not describing a request it makes.
                     evidence: carrick_match::MatchEvidence::RouteDefinition,
-                    resolution_source: Some(ResolutionSource::DeclaredOperation),
+                    resolution_source: Some(source),
                     view_module: carried.as_ref().is_some_and(|row| row.view_module),
                     dispatch: Some(Dispatch {
                         location: block.dispatch.location,
@@ -469,7 +477,12 @@ pub fn declared_infer_requests(
     let mut requests = Vec::new();
     let mut asked: std::collections::HashSet<(String, &'static str)> = Default::default();
     for endpoint in &graph.endpoints {
-        if endpoint.resolution_source != Some(ResolutionSource::DeclaredOperation) {
+        // A generated block's rows are `Model`; `placed` holds only the
+        // locations a block's handlers resolved to, so the row must sit there.
+        if !matches!(
+            endpoint.resolution_source,
+            Some(ResolutionSource::DeclaredOperation | ResolutionSource::Model)
+        ) {
             continue;
         }
         // The raw line: `parse_file_location` reads line 0 as 1, and an
@@ -1001,7 +1014,63 @@ mod tests {
                     handler: Some(format!("lambdas/check-or-upload/index.ts:handle-{value}")),
                 })
                 .collect(),
+            source: None,
         }
+    }
+
+    /// The fixture's `carrick.json`, loaded the way a scan loads it.
+    fn generated_fixture_config() -> crate::config::Config {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dispatch-generated/carrick.json");
+        crate::config::Config::load_services(vec![path])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    fn fixture_rows(config: &crate::config::Config) -> Vec<crate::mount_graph::ResolvedEndpoint> {
+        let mut graph = crate::mount_graph::MountGraph::new();
+        let written = apply_declared_operations(&mut graph, config, &DeclaredHandlers::default());
+        assert_eq!(written, 4);
+        graph.endpoints
+    }
+
+    /// C16 T3: a block marked `"source": "generated"` writes the same four
+    /// rows, as candidates.
+    #[test]
+    fn a_generated_block_writes_candidate_rows() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+
+        let config = generated_fixture_config();
+        assert!(config.declared_operations[0].is_generated());
+        let rows = fixture_rows(&config);
+        assert_eq!(rows.len(), 4);
+        for row in &rows {
+            assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
+            assert_eq!(
+                (row.method.as_str(), row.full_path.as_str()),
+                ("POST", "/rpc")
+            );
+        }
+    }
+
+    /// The same block without the marker is the repo's own statement: facts.
+    #[test]
+    fn an_unmarked_block_still_writes_fact_rows() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+
+        let mut config = generated_fixture_config();
+        config.declared_operations[0].source = None;
+        let rows = fixture_rows(&config);
+        assert!(
+            rows.iter()
+                .all(|row| row.resolution_source == Some(ResolutionSource::DeclaredOperation))
+        );
+
+        // Any other value is a written block too.
+        config.declared_operations[0].source = Some("hand".to_string());
+        assert!(!config.declared_operations[0].is_generated());
     }
 
     fn config_with(blocks: Vec<crate::config::DeclaredOperations>) -> crate::config::Config {
@@ -1770,6 +1839,7 @@ mod tests {
                         value: "upload-logs".to_string(),
                         handler: None,
                     }],
+                    source: None,
                 }],
                 ..Default::default()
             })

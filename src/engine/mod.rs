@@ -32834,6 +32834,7 @@ mod declared_alias_tests {
                         handler: Some(format!("notes/src/index.ts:{value}Note")),
                     })
                     .collect(),
+                source: None,
             }],
             ..Default::default()
         };
