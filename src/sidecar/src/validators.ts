@@ -187,6 +187,7 @@ export const InitRequestSchema = BaseRequestSchema.extend({
   scan_root: z.string().min(1).optional(),
   tsconfig_snapshot: TsconfigSnapshotSchema.optional(),
   pinned_dependencies: PinnedDependencySnapshotSchema.optional(),
+  workspace_source: z.boolean().optional(),
 });
 
 export const BundleRequestSchema = BaseRequestSchema.extend({

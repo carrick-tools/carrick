@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "rootDir": "src", "outDir": "build/main", "declaration": true, "module": "commonjs", "target": "es2019", "strict": true },
+  "include": ["src"]
+}

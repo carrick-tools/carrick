@@ -7,13 +7,19 @@
 //!
 //! Scanned as the Action scans it; the real sidecar walks the rows. `src/api-client.ts` declares the class, the
 //! other files call it. See `tests/fixtures/row-call-edges/`.
+//!
+//! carrick#1910: the same edge where the receiver's class comes from a
+//! workspace package whose declared types were never built
+//! (`tests/fixtures/unbuilt-workspace/`).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/row-call-edges")
+fn fixture_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 /// Whether the live sidecar can run. CI builds it before the Rust tests, so
@@ -33,11 +39,16 @@ fn sidecar_available() -> bool {
 }
 
 /// Every edge of the scan's blob: (caller, callee, callee file, call line).
-fn scan_edges() -> BTreeSet<(String, String, String, u64)> {
+fn scan_edges(fixture: &str) -> BTreeSet<(String, String, String, u64)> {
+    edges_of(&scan(fixture))
+}
+
+/// Scan `fixture` as the Action scans it, into a store of its own.
+fn scan(fixture: &str) -> tempfile::TempDir {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
-    cmd.arg(fixture_dir())
+    cmd.arg(fixture_dir(fixture))
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
@@ -65,6 +76,11 @@ fn scan_edges() -> BTreeSet<(String, String, String, u64)> {
         "fixture scan exited non-zero:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    storage
+}
+
+/// Every edge of the blob in `storage`.
+fn edges_of(storage: &tempfile::TempDir) -> BTreeSet<(String, String, String, u64)> {
     let blob = std::fs::read_dir(storage.path())
         .expect("storage dir")
         .map(|entry| entry.expect("dir entry").path())
@@ -104,7 +120,7 @@ fn a_member_call_on_a_call_bound_receiver_takes_its_edge_from_the_call_row() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
     }
-    let edges = scan_edges();
+    let edges = scan_edges("row-call-edges");
     for wanted in [
         // `make: (projectId: string) => ApiClient`, inline.
         edge("listInline", "ApiClient.list", 5),
@@ -129,4 +145,47 @@ fn a_member_call_on_a_call_bound_receiver_takes_its_edge_from_the_call_row() {
         !edges.iter().any(|(caller, ..)| caller == "listUnawaited"),
         "a promise of the client is not the client until it is awaited: {edges:#?}"
     );
+}
+
+/// carrick#1910: `tests/fixtures/unbuilt-workspace/` is a checkout an install
+/// linked and nothing built. `@acme/ledger`'s `typings` names
+/// `build/main/index.d.ts`, which does not exist, and the service's config
+/// references no project. The scan's rows process is the one told to read
+/// workspace packages from source (`SidecarRecipe::spawn_position_rows`), so
+/// the call on the receiver `openLedger()` returns names the package's source
+/// declaration instead of the error type. (The blob's edge for this call is
+/// also read without the compiler, so the rows are what this test reads.)
+#[test]
+fn the_rows_process_reads_an_unbuilt_workspace_package_from_its_source() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let fixture = fixture_dir("unbuilt-workspace");
+    assert!(
+        !fixture.join("packages/ledger/build").exists(),
+        "the package must stay unbuilt"
+    );
+    let storage = scan("unbuilt-workspace");
+    let rows = std::fs::File::open(storage.path().join("positions/unbuilt-workspace.jsonl.gz"))
+        .expect("the scan wrote the service's rows");
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(rows), &mut text)
+        .expect("rows decompress");
+    let handler = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["f"] == "src/handler.ts")
+        .expect("rows for src/handler.ts");
+    let source = std::fs::read_to_string(fixture.join("src/handler.ts")).expect("handler source");
+    let start = source.find("ledger.total(account)").expect("the call") as u64;
+    let end = start + "ledger.total(account)".len() as u64;
+    let call = handler["r"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row[0] == "call" && row[1] == start && row[2] == end)
+        .unwrap_or_else(|| panic!("no call row at {start}-{end}: {handler}"));
+    assert_eq!(call[3], "total", "{call}");
+    assert_eq!(call[4], "packages/ledger/src/index.ts", "{call}");
 }

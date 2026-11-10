@@ -67,7 +67,7 @@ export { DenoProject, findDenoConfig } from './deno-project.js';
 export { sidecarCompilerOptions } from './compiler-options.js';
 export { isInsideCheckout, untrustedReadBound, UNTRUSTED_TREE_ENV, type ReadBound } from './checkout.js';
 export { serviceConfigPath } from './project-references.js';
-export { referenceRedirectOf } from './reference-redirect.js';
+export { referenceRedirectOf, workspaceSourceRedirectOf } from './reference-redirect.js';
 export { findServiceTsconfig, GoverningConfigs } from './service-config.js';
 // carrick#2405: the per-position rows write through the guard, and name an
 // installed declaring file the way the capture's resolution walk does.

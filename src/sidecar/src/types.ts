@@ -169,6 +169,13 @@ export interface InitRequest extends BaseRequest {
   tsconfig_snapshot?: TsconfigSnapshot;
   /** Optional pinned dependencies for this repo */
   pinned_dependencies?: PinnedDependencySnapshot;
+  /**
+   * Set only on the position rows' process (carrick#1910): its programs read
+   * the workspace packages the install links into the checkout from their
+   * source. Every other process leaves it unset, so infer's text, which the
+   * compat judge anchors on, never moves with it.
+   */
+  workspace_source?: boolean;
 }
 
 /**

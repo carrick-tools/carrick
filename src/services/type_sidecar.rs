@@ -1758,6 +1758,12 @@ enum SidecarRequest {
         tsconfig_path: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         scan_root: Option<String>,
+        /// Set only on the position rows' process (carrick#1910): its
+        /// programs read the workspace packages the install links into the
+        /// checkout from their source. Never on a process whose types the
+        /// compat judge reads.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        workspace_source: bool,
     },
     #[serde(rename = "bundle")]
     Bundle {
@@ -3130,6 +3136,10 @@ pub struct TypeSidecar {
     /// Nothing is recorded for the run and nothing is restarted
     /// ([`Self::record_only`]).
     record_only: bool,
+    /// The position rows' process (carrick#1910): its `init` asks the
+    /// sidecar to read unbuilt workspace packages from their source
+    /// ([`SidecarRecipe::spawn_position_rows`]).
+    workspace_source: bool,
     /// The V8 old-space cap this sidecar's processes start with, in MB:
     /// [`heap_cap_mb`] unless its recipe set another
     /// ([`SidecarRecipe::with_heap_cap_mb`]). A restart keeps it, and a
@@ -3223,10 +3233,13 @@ impl SidecarRecipe {
         self.spawn_ready(repo_root, tsconfig_path, false)
     }
 
-    /// [`Self::spawn_scoped`], record-only from the start
-    /// ([`TypeSidecar::record_only`]): a death while it gets ready is not
-    /// recorded either (carrick#2405).
-    pub fn spawn_scoped_record_only(
+    /// [`Self::spawn_scoped`] for the position rows: record-only from the
+    /// start ([`TypeSidecar::record_only`]), so a death while it gets ready
+    /// is not recorded either (carrick#2405), and initialised to read the
+    /// workspace packages the install links into the checkout from their
+    /// source (carrick#1910). Only the rows read this process, so that
+    /// reading moves no type the compat judge reads.
+    pub fn spawn_position_rows(
         &self,
         repo_root: &Path,
         tsconfig_path: Option<&str>,
@@ -3238,13 +3251,14 @@ impl SidecarRecipe {
         &self,
         repo_root: &Path,
         tsconfig_path: Option<&str>,
-        record_only: bool,
+        position_rows: bool,
     ) -> Result<TypeSidecar, SidecarError> {
         let mut sidecar = TypeSidecar::spawn_with_heap_cap(&self.sidecar_path, self.heap_cap_mb)?
             .with_operation_timeout(self.operation_timeout);
         sidecar.memory_death_note = self.memory_death_note.clone();
-        if record_only {
+        if position_rows {
             sidecar = sidecar.record_only();
+            sidecar.workspace_source = true;
         }
         if let Some(scan_root) = &self.scan_root {
             sidecar.set_scan_root(scan_root);
@@ -3311,6 +3325,7 @@ impl TypeSidecar {
             death_noted: AtomicBool::new(false),
             replaced_peak: AtomicU64::new(0),
             record_only: false,
+            workspace_source: false,
             heap_cap_mb,
             memory_death_note: None,
         })
@@ -3532,6 +3547,7 @@ impl TypeSidecar {
             repo_root: repo_root_str,
             tsconfig_path: tsconfig,
             scan_root: self.scan_root_arg(),
+            workspace_source: self.workspace_source,
         };
 
         if let Err(e) = self.send_request(&request) {
@@ -4295,7 +4311,7 @@ impl TypeSidecar {
 
     /// Write the compiler's rows for each call, member access, comparison
     /// and identifier in `files` to `out_path` (carrick#2405). Asked of a
-    /// record-only process of its own ([`SidecarRecipe::spawn_scoped_record_only`]):
+    /// record-only process of its own ([`SidecarRecipe::spawn_position_rows`]):
     /// the walk releases each owner's program as it goes, so it inherits
     /// nothing from the service's analysis.
     pub fn position_rows(
@@ -5914,12 +5930,28 @@ mod tests {
             repo_root: "/path/to/repo/apps/web".to_string(),
             tsconfig_path: Some("tsconfig.json".to_string()),
             scan_root: Some("/path/to/repo".to_string()),
+            workspace_source: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""action":"init""#));
         assert!(json.contains(r#""request_id":"req-1""#));
         assert!(json.contains(r#""repo_root":"/path/to/repo/apps/web""#));
         assert!(json.contains(r#""scan_root":"/path/to/repo""#));
+        // Only the position rows' process asks for workspace sources.
+        assert!(!json.contains("workspace_source"));
+    }
+
+    #[test]
+    fn test_sidecar_request_init_asks_for_workspace_source_only_when_set() {
+        let request = SidecarRequest::Init {
+            request_id: "req-1".to_string(),
+            repo_root: "/path/to/repo/apps/web".to_string(),
+            tsconfig_path: None,
+            scan_root: None,
+            workspace_source: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""workspace_source":true"#));
     }
 
     #[test]
@@ -6109,6 +6141,7 @@ mod tests {
                 repo_root: "/repo/apps/web".into(),
                 tsconfig_path: Some("tsconfig.json".into()),
                 scan_root: Some("/repo".into()),
+                workspace_source: true,
             },
             SidecarRequest::Bundle {
                 request_id: id(),

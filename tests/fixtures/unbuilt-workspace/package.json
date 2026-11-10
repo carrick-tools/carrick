@@ -1,0 +1,6 @@
+{
+  "name": "unbuilt-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@acme/ledger": "file:packages/ledger" }
+}

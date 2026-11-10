@@ -38,9 +38,10 @@
  * Nothing here writes, and every read goes through the host it wraps.
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import ts from 'typescript';
-import { boundedSys, isInsideCheckout, realOf, untrustedReadBound } from './checkout.js';
+import { boundedSys, checkoutRootOf, isInsideCheckout, realOf, untrustedReadBound } from './checkout.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import { ProjectGraph, type ServiceProject } from './project-references.js';
 
@@ -126,16 +127,22 @@ function declarationLayout(parsed: ts.ParsedCommandLine, ignoreCase: boolean): t
 /**
  * The redirect for a program whose owner reaches `references` (its reference
  * closure, from `ProjectGraph.closureOf`), or `undefined` when there are none.
+ * An output two of the projects write from different sources goes to the
+ * first one, or, with `ambiguousUnresolved`, to neither: nothing says which
+ * the entry is, so the import stays unresolved (carrick#1910).
  */
 export function referenceRedirect(
   references: readonly ServiceProject[],
-  repoRoot: string
+  repoRoot: string,
+  { ambiguousUnresolved = false }: { ambiguousUnresolved?: boolean } = {}
 ): ReferenceRedirect | undefined {
   if (references.length === 0) return undefined;
   const realOf = realPaths();
   const ignoreCase = !ts.sys.useCaseSensitiveFileNames;
   /** Real path of an output -> its source. */
   const outputs = new Map<string, string>();
+  /** Outputs two projects write from different sources (`ambiguousUnresolved`). */
+  const ambiguous = new Set<string>();
   /** Real paths of the directories outputs sit in, up to their project's. */
   const outputDirs = new Set<string>();
   /** Base names of outputs and of their directories: the cheap test first. */
@@ -156,7 +163,11 @@ export function referenceRedirect(
       const declaration = ts.getOutputFileNames(layout, file, ignoreCase).find((out) => DECLARATION.test(out));
       if (!declaration) continue;
       const output = realOf(declaration);
-      if (outputs.has(output)) continue;
+      const known = outputs.get(output);
+      if (known !== undefined) {
+        if (ambiguousUnresolved && known !== key) ambiguous.add(output);
+        continue;
+      }
       outputs.set(output, key);
       names.add(path.basename(output));
       for (let dir = path.dirname(output); !outputDirs.has(dir); dir = path.dirname(dir)) {
@@ -166,6 +177,7 @@ export function referenceRedirect(
       }
     }
   }
+  for (const output of ambiguous) outputs.delete(output);
   const sourceOf = (file: string): string | undefined =>
     DECLARATION.test(file) && names.has(path.basename(file)) ? outputs.get(realOf(file)) : undefined;
   const isOutputDir = (dir: string): boolean => names.has(path.basename(dir)) && outputDirs.has(realOf(dir));
@@ -220,6 +232,118 @@ export function referenceRedirectOf(configPath: string, repoRoot: string): Refer
     return undefined;
   }
   return referenceRedirect(graph.closureOf(graph.named), repoRoot);
+}
+
+/**
+ * The directories of the packages an install links into the checkout, as
+ * seen from `fromDir`: every `node_modules/<name>` and
+ * `node_modules/@scope/<name>` from `fromDir` up to the checkout root whose
+ * real path is inside the checkout, under no `node_modules`, and holds a
+ * `package.json`. A link that resolves to `fromDir` or above it is the
+ * service itself and is left out.
+ */
+function linkedWorkspacePackages(fromDir: string, checkoutRoot: string): string[] {
+  const root = realOf(checkoutRoot);
+  const from = realOf(fromDir);
+  const found = new Set<string>();
+  const consider = (link: string): void => {
+    let real: string;
+    try {
+      if (!fs.lstatSync(link).isSymbolicLink()) return;
+      real = fs.realpathSync(link);
+    } catch {
+      return;
+    }
+    const rel = path.relative(root, real);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return;
+    if (rel.split(path.sep).includes('node_modules')) return;
+    const toFrom = path.relative(real, from);
+    if (toFrom === '' || (!toFrom.startsWith('..') && !path.isAbsolute(toFrom))) return;
+    if (fs.existsSync(path.join(real, 'package.json'))) found.add(real);
+  };
+  const entries = (dir: string): fs.Dirent[] => {
+    try {
+      return fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+  };
+  for (let dir = path.resolve(fromDir); ; dir = path.dirname(dir)) {
+    const modules = path.join(dir, 'node_modules');
+    for (const entry of entries(modules)) {
+      if (entry.name.startsWith('.')) continue;
+      const link = path.join(modules, entry.name);
+      if (entry.name.startsWith('@')) {
+        for (const scoped of entries(link)) consider(path.join(link, scoped.name));
+      } else {
+        consider(link);
+      }
+    }
+    if (realOf(dir) === root || path.dirname(dir) === dir) break;
+  }
+  return [...found].sort();
+}
+
+const TSCONFIG_NAME = /^tsconfig(\..+)?\.json$/;
+
+const projectsByPackage = new Map<string, ServiceProject[]>();
+
+/** Every `tsconfig*.json` in `packageDir`, parsed, with the projects each references. */
+function packageProjects(packageDir: string): ServiceProject[] {
+  const cached = projectsByPackage.get(packageDir);
+  if (cached) return cached;
+  const projects = readPackageProjects(packageDir);
+  projectsByPackage.set(packageDir, projects);
+  return projects;
+}
+
+function readPackageProjects(packageDir: string): ServiceProject[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(packageDir).filter((name) => TSCONFIG_NAME.test(name)).sort();
+  } catch {
+    return [];
+  }
+  const projects: ServiceProject[] = [];
+  for (const name of names) {
+    try {
+      const graph = new ProjectGraph(path.join(packageDir, name));
+      projects.push(graph.named, ...graph.closureOf(graph.named));
+    } catch {
+      // A config that cannot be read writes nothing anyone can follow.
+    }
+  }
+  return projects;
+}
+
+/**
+ * For the position rows' process only (carrick#1910): `referenceRedirectOf`,
+ * with the projects of every workspace package the install links into the
+ * checkout added to the reference closure, whether or not the config
+ * references them. A package's projects are every `tsconfig*.json` in its
+ * root. An output two of them write from different sources is followed to
+ * neither. Every other program keeps `referenceRedirectOf`: infer's text is
+ * the compat judge's anchor, so widening it would move verdicts.
+ */
+export function workspaceSourceRedirectOf(configPath: string, repoRoot: string): ReferenceRedirect | undefined {
+  let references: ServiceProject[] = [];
+  try {
+    const graph = new ProjectGraph(configPath);
+    references = graph.closureOf(graph.named);
+  } catch {
+    // An unreadable owner config references nothing.
+  }
+  const seen = new Set<string>([path.resolve(configPath), ...references.map((p) => path.resolve(p.configPath))]);
+  const projects = [...references];
+  for (const packageDir of linkedWorkspacePackages(path.dirname(configPath), checkoutRootOf(repoRoot))) {
+    for (const project of packageProjects(packageDir)) {
+      const key = path.resolve(project.configPath);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      projects.push(project);
+    }
+  }
+  return referenceRedirect(projects, repoRoot, { ambiguousUnresolved: true });
 }
 
 /**

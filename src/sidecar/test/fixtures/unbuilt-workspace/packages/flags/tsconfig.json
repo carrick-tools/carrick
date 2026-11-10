@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "rootDir": "src", "outDir": "dist/esm", "declaration": true, "module": "es2020", "strict": true },
+  "include": ["src"]
+}
