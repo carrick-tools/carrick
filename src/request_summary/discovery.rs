@@ -198,6 +198,60 @@ pub struct Discovery {
     /// not final until the store answers it (carrick#2813): the fact layer
     /// lists the call for the reader when the key is still pending.
     pub unanswered_at: BTreeMap<(String, u32, u32), BTreeSet<String>>,
+    /// Each call of the service's own files and the functions of the
+    /// repository the walk entered from it, sorted by file and span: the
+    /// definition a call names, each implementation of an interface member
+    /// it follows, and each function a value callee may hold, at the call
+    /// that runs it, whichever phase read it (the walk, or the settle at a
+    /// definition's callers). Library ends are not among them. What the call
+    /// graph writes as edges where resolution and the rows state none
+    /// ([`crate::call_graph::plan_edges`]).
+    pub entered: Vec<Entered>,
+}
+
+/// One call and the functions of the repository the walk entered from it
+/// ([`Discovery::entered`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entered {
+    /// The file as the service's inputs key it (as walked).
+    pub file: PathBuf,
+    /// The call's span in the discovery source map: the key the call graph
+    /// reads a call site with.
+    pub lo: u32,
+    pub hi: u32,
+    pub line: u32,
+    pub targets: BTreeSet<EnteredTarget>,
+}
+
+/// A function of the repository a call entered, and how the walk reached it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EnteredTarget {
+    pub file: PathBuf,
+    pub function: EnteredFunction,
+    pub kind: EnteredKind,
+}
+
+/// Which function of its file a call entered.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EnteredFunction {
+    /// A definition, by the key the service's inputs hold it under.
+    Keyed(String),
+    /// A function written as a value (an arrow a factory returns, a
+    /// function in an object), by the line it opens on.
+    Written { line: u32 },
+}
+
+/// How the walk entered a function from a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EnteredKind {
+    /// The definition the call names.
+    Named,
+    /// The constructor a `new` runs.
+    Constructor,
+    /// An implementation of the interface member the call goes through.
+    Implementation,
+    /// A function the call's callee, a value, may hold.
+    Value,
 }
 
 /// The labelled exports of the store's answer, by the store's package key
@@ -1248,9 +1302,39 @@ struct Walker<'a> {
     /// Calls whose member declaration stands for more than one op
     /// (carrick#2474 R1, [`Self::one_op`]): no site.
     ambiguous: std::cell::Cell<usize>,
+    /// What each call of the service's own files entered, by file and span
+    /// ([`Discovery::entered`]).
+    entered: BTreeMap<(PathBuf, u32, u32), EnteredAt>,
 }
 
+/// A call's line and what it entered ([`Walker::entered`]).
+type EnteredAt = (u32, BTreeSet<EnteredTarget>);
+
 impl<'a> Walker<'a> {
+    /// Note that `call` in `file` entered `function` of `target`, when the
+    /// call is written in one of the service's own files.
+    fn enter(
+        &mut self,
+        file: &Path,
+        call: &CallIr,
+        target: &Path,
+        function: EnteredFunction,
+        kind: EnteredKind,
+    ) {
+        if !self.inputs.files.contains_key(file) {
+            return;
+        }
+        self.entered
+            .entry((file.to_path_buf(), call.site.lo, call.site.hi))
+            .or_insert_with(|| (call.site.line, BTreeSet::new()))
+            .1
+            .insert(EnteredTarget {
+                file: target.to_path_buf(),
+                function,
+                kind,
+            });
+    }
+
     /// The inputs that hold `file`: this service's, else the first sibling's
     /// that does. Every read keyed by a file goes through this, so a body the
     /// walk enters in a sibling is read with the sibling's own IR and rows.
@@ -1808,6 +1892,80 @@ impl<'a> Walker<'a> {
         })
     }
 
+    /// The definition each implementation in `found`, the sidecar's answer
+    /// for a call in `file`, is: `None` for one the walk cannot enter (no
+    /// symbol, or a declaration that is no function). One only tests import
+    /// (a double) is left out. `None` when `file` has no rows.
+    fn implementation_targets(
+        &self,
+        file: &Path,
+        found: &[crate::services::type_sidecar::NamedDeclaration],
+    ) -> Option<Vec<Option<(PathBuf, String)>>> {
+        let positions = self.inputs_for(file).positions.as_ref()?;
+        let mut targets = Vec::new();
+        for named in found {
+            let (Some(symbol), Some(decl_file)) =
+                (named.symbol.as_deref(), named.decl_file.as_deref())
+            else {
+                targets.push(None);
+                continue;
+            };
+            let declaring = positions.path_of(decl_file);
+            let holder = self.inputs_for(&declaring);
+            if holder.test_only.contains(&declaring) {
+                continue;
+            }
+            targets.push(
+                match holder.definition_at(&declaring, named.decl_line, symbol) {
+                    Reach::Function(target, key) => Some((target, key)),
+                    _ => None,
+                },
+            );
+        }
+        Some(targets)
+    }
+
+    /// The implementations the sidecar found for each call of the service
+    /// through an interface member that the walk entered nothing from
+    /// (carrick#2432 slice B), noted as entered without walking them: a
+    /// member call on a parameter reads its values first, and one no caller
+    /// fills stops there (`value_never_bound`) before its implementations
+    /// are read. Only what [`Discovery::entered`] holds moves; no site, stop
+    /// or end does.
+    fn note_unread_implementations(&mut self) {
+        let Some(implementations) = self.labels.implementations else {
+            return;
+        };
+        let inputs = self.inputs;
+        for (file, call, _) in super::row_calls::every_call(&inputs.files) {
+            if self
+                .entered
+                .contains_key(&(file.to_path_buf(), call.site.lo, call.site.hi))
+                || !self.interface_member(file, call)
+            {
+                continue;
+            }
+            let Some(Followed::Found(found)) = implementations.at(file, call.site.lo, call.site.hi)
+            else {
+                continue;
+            };
+            for (target, key) in self
+                .implementation_targets(file, found)
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                self.enter(
+                    file,
+                    call,
+                    &target,
+                    EnteredFunction::Keyed(key),
+                    EnteredKind::Implementation,
+                );
+            }
+        }
+    }
+
     /// What the call `call` through an interface member reaches, read through
     /// the implementations the sidecar found for it (carrick#2432 slice B):
     /// each is entered as the definition it is, and they agree on one
@@ -1829,7 +1987,7 @@ impl<'a> Walker<'a> {
             Followed::OverCap => return Some(Outcome::stopped(Stop::ImplementationsOverCap)),
             Followed::Found(found) => found,
         };
-        let positions = self.inputs_for(file).positions.as_ref()?;
+        let targets = self.implementation_targets(file, found)?;
         let mut values = Vec::new();
         // How many the walk entered. One it cannot enter (no symbol, or a
         // declaration that is no function: a `.d.ts` or a property) reaches
@@ -1838,24 +1996,20 @@ impl<'a> Walker<'a> {
         // that reaches none. When none can be entered the call keeps the
         // `interface_member` stop instead of reading as no site.
         let mut entered = 0;
-        for named in found {
-            let (Some(symbol), Some(decl_file)) =
-                (named.symbol.as_deref(), named.decl_file.as_deref())
-            else {
-                values.push(Held::Reached(Outcome::default()));
-                continue;
-            };
-            let declaring = positions.path_of(decl_file);
-            let holder = self.inputs_for(&declaring);
-            if holder.test_only.contains(&declaring) {
-                continue;
-            }
-            let reached = match holder.definition_at(&declaring, named.decl_line, symbol) {
-                Reach::Function(target, key) => {
+        for target in targets {
+            let reached = match target {
+                Some((target, key)) => {
                     entered += 1;
+                    self.enter(
+                        file,
+                        call,
+                        &target,
+                        EnteredFunction::Keyed(key.clone()),
+                        EnteredKind::Implementation,
+                    );
                     self.enter_value(target, key, invoke)
                 }
-                _ => Outcome::default(),
+                None => Outcome::default(),
             };
             values.push(Held::Reached(reached));
         }
@@ -1963,6 +2117,18 @@ impl<'a> Walker<'a> {
         match reach {
             Reach::Function(target, key) => {
                 let hop = self.hop(&target, &key);
+                let kind = if construction {
+                    EnteredKind::Constructor
+                } else {
+                    EnteredKind::Named
+                };
+                self.enter(
+                    file,
+                    call,
+                    &target,
+                    EnteredFunction::Keyed(key.clone()),
+                    kind,
+                );
                 let id = (target, key);
                 let callee = self.function(&id.0, &id.1);
                 let mut out = match self.reading.get(&id) {
@@ -2667,6 +2833,13 @@ impl<'a> Follow<'a> for Walker<'a> {
     }
 
     fn definition(&mut self, target: PathBuf, key: String, invoke: Invoke<'a>) -> Outcome<'a> {
+        self.enter(
+            invoke.file,
+            invoke.call,
+            &target,
+            EnteredFunction::Keyed(key.clone()),
+            EnteredKind::Value,
+        );
         Outcome {
             known: true,
             ..self.enter_value(target, key, invoke)
@@ -2681,6 +2854,15 @@ impl<'a> Follow<'a> for Walker<'a> {
         maker: Option<Maker<'a>>,
     ) -> Outcome<'a> {
         let line = function.site.as_ref().map_or(0, |site| site.line);
+        if function.site.is_some() {
+            self.enter(
+                invoke.file,
+                invoke.call,
+                file,
+                EnteredFunction::Written { line },
+                EnteredKind::Value,
+            );
+        }
         let hop = ChainHop {
             function: VALUE_HOP.to_string(),
             file: self.rel(file),
@@ -2706,6 +2888,24 @@ fn role_key(role: LibraryRole) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+/// The most functions a call's callee may hold for the call graph to write
+/// an edge to each: the walk's own cap on a value's values.
+pub const MAX_ENTERED_PER_CALL: usize = MAX_VALUES;
+
+/// What each call of the service `inputs` reads entered, read by a walk
+/// that labels nothing (no store answer, no siblings), following the
+/// interface members `implementations` answers: deterministic over the code
+/// and its rows, whatever the store holds. The call graph's edges
+/// ([`crate::call_graph::plan_edges`]). Empty without rows.
+pub fn entered_calls(
+    inputs: &RequestSummaryInputs,
+    implementations: &Implementations,
+    root: &Path,
+) -> Vec<Entered> {
+    let labels = Labels::of(&[]).following(implementations);
+    discover_with(inputs, &[], &labels, root).entered
 }
 
 /// Every site of the service `inputs` reads, with the store's answer
@@ -2746,6 +2946,7 @@ pub fn discover_with(
         memo: HashMap::new(),
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
+        entered: BTreeMap::new(),
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
     paths.sort();
@@ -2778,6 +2979,17 @@ pub fn discover_with(
             census.capped_queries
         );
     }
+    walker.note_unread_implementations();
+    discovery.entered = std::mem::take(&mut walker.entered)
+        .into_iter()
+        .map(|((file, lo, hi), (line, targets))| Entered {
+            file,
+            lo,
+            hi,
+            line,
+            targets,
+        })
+        .collect();
     let ambiguous = walker.ambiguous.get();
     if ambiguous > 0 {
         discovery

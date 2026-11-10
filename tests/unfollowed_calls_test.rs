@@ -93,21 +93,14 @@ fn an_interface_member_and_an_untyped_receiver_are_written_with_their_reason() {
     let blob = scan_blob();
     let rows = rows_of(&blob);
 
-    // `store.read()` with `store: Store`, an interface declared at line 2 of
-    // `src/store.ts`, implemented by a closure no definition names.
-    let interface = row_by_caller(&rows, "viaInterface");
-    assert_eq!(interface.len(), 1, "one row for viaInterface: {rows:#?}");
-    assert_eq!(
-        interface[0],
-        &serde_json::json!({
-            "file": "src/callers.ts",
-            "line": 49,
-            "caller": "viaInterface",
-            "member": "read",
-            "receiver": "store",
-            "reason": "interface_member",
-            "declared_at": "src/store.ts:2",
-        })
+    // `store.read()` with `store: Store`: an interface declared at line 2 of
+    // `src/store.ts`, whose one implementation is a closure the service
+    // defines. It takes that edge, so it writes no row
+    // (`row_call_implementations_test.rs` pins the `interface_member` row of
+    // an interface nothing implements).
+    assert!(
+        row_by_caller(&rows, "viaInterface").is_empty(),
+        "viaInterface took an edge, so no row: {rows:#?}"
     );
 
     // `c.getUser()` with `c: any`: the compiler names nothing.

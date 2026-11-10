@@ -131,6 +131,10 @@ struct FileDiscovery {
     /// graph (carrick#1555), once the service's library semantics are
     /// verified ([`summarize_requests`], carrick#1564).
     request_inputs: crate::request_summary::RequestSummaryInputs,
+    /// The call sites and merged keys the call graph was resolved over, for
+    /// the edges discovery's walk enters, written once the intents are in
+    /// ([`crate::call_graph::plan_edges`]).
+    call_index: crate::call_graph::CallIndex,
 }
 
 type FileDiscoveryResult = Result<FileDiscovery, Box<dyn std::error::Error>>;
@@ -2121,6 +2125,19 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .collect();
         crate::call_through::settle(&mut services);
     }
+    // The call edges each service's discovery walk entered, written now that
+    // the call-through above has read the edges resolution and the rows
+    // state, and only those: these change no row of this scan.
+    for run in &mut runs {
+        let written =
+            std::mem::take(&mut run.discovered_edges).write(&mut run.data.function_definitions);
+        if written > 0 {
+            debug!(
+                "Call edges discovery's walk wrote for {}: {written}",
+                run.label
+            );
+        }
+    }
     // A route whose chain leaves its service is served under what another
     // service hands it (carrick#2474 R5b): each service recorded its side
     // during its own analysis, and here, with every service in hand, the
@@ -3058,6 +3075,10 @@ struct ServiceRun {
     /// Its route sites whose path the receiver trace could not read, for a
     /// PR's endpoint delta (carrick#3222). Empty for a carried service.
     unread_routes: Vec<crate::site_rows::GuessedRoute>,
+    /// The call edges its discovery walk entered, written once every
+    /// service's call-through is settled. Empty for a carried service, whose
+    /// stored definitions hold them already.
+    discovered_edges: crate::call_graph::PlannedEdges,
 }
 
 impl ServiceRun {
@@ -3086,6 +3107,7 @@ impl ServiceRun {
             fallbacks: None,
             type_reach: None,
             unread_routes: Vec::new(),
+            discovered_edges: Default::default(),
         }
     }
 }
@@ -3623,6 +3645,7 @@ impl ServiceScan {
             fallbacks: analysis.fallbacks,
             type_reach: analysis.type_reach,
             unread_routes: analysis.unread_routes,
+            discovered_edges: analysis.discovered_edges,
         })
     }
 
@@ -5204,7 +5227,8 @@ async fn analyze_current_repo_incremental(
         import_facts: all_import_facts,
         function_definitions,
         repo_name,
-        request_inputs,
+        mut request_inputs,
+        call_index,
     } = discover_service(
         repo_path,
         config,
@@ -5272,6 +5296,11 @@ async fn analyze_current_repo_incremental(
                 function_definitions.values(),
                 repo_path,
             );
+            // Asked once, before the intents start, and read by every walk
+            // below: the fact layer's and the call graph's (carrick#2432
+            // slice B).
+            let implementations =
+                implementations_for(&request_inputs, sidecar, Path::new(repo_path));
             let intents = IntentsInFlight::start(
                 AgentService::new(),
                 function_definitions,
@@ -5474,8 +5503,6 @@ async fn analyze_current_repo_incremental(
             // asked (carrick#1564).
             let semantics_root = service_scan_root(repo_path, config);
             let sibling_inputs = siblings.inputs();
-            let implementations =
-                implementations_for(&request_inputs, sidecar, Path::new(repo_path));
             let library_ask = LibraryAsk::start(
                 &request_inputs,
                 &siblings,
@@ -5532,7 +5559,7 @@ async fn analyze_current_repo_incremental(
                     }
                     None => crate::agents::asked_ahead::AheadRole::None,
                 });
-            let (analysis, (settled, placements, fallbacks), library_answer, ()) = tokio::join!(
+            let (analysis, (settled, placements, fallbacks), library_answer, (), entered) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -5568,6 +5595,7 @@ async fn analyze_current_repo_incremental(
                     &implementations,
                     fact_sender,
                 ),
+                walk_entered(&request_inputs, &implementations, Path::new(repo_path)),
             );
             let mut fallbacks = analysis_fallbacks(fallbacks, &analysis, |done| &done.stats);
             fallbacks.counts().extend(library_ask_health(
@@ -5724,6 +5752,15 @@ async fn analyze_current_repo_incremental(
             enter_stage(crate::scan_stage::Stage::Intents)?;
             let mut function_definitions = intents.finish().await;
             crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
+            // As on a full scan: planned once every intent is in, written
+            // once every service's call-through is settled.
+            let discovered_edges = discovered_edges(
+                config,
+                &function_definitions,
+                &call_index,
+                &mut request_inputs,
+                entered,
+            );
 
             enter_stage(crate::scan_stage::Stage::Signatures)?;
             // Compose function signatures, inferring unannotated slots via sidecar.
@@ -6076,6 +6113,8 @@ async fn analyze_current_repo_incremental(
                 fallbacks: Some(fallbacks),
                 type_reach,
                 unread_routes,
+                discovered_edges: discovered_edges
+                    .relativized(|file| repo_relative(file, repo_path)),
             });
         } else {
             debug!("git could not compare the tree, falling back to full analysis");
@@ -6134,6 +6173,7 @@ async fn analyze_current_repo_incremental(
             function_definitions,
             repo_name,
             request_inputs,
+            call_index,
         },
         prev_intents,
         settled,
@@ -7040,15 +7080,79 @@ fn implementations_for(
     if inputs.positions.is_none() {
         return Implementations::default();
     }
+    let started = Instant::now();
     let found = implementations_of(inputs, |queries| {
         sidecar.implementations(queries, scan_root)
     });
     debug!(
         asked = found.asked,
         answered = found.answered(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
         "implementations: interface members read through the sidecar"
     );
     found
+}
+
+/// What [`walk_entered`] read, and how long it took.
+type WalkEntered = (
+    Vec<crate::request_summary::discovery::Entered>,
+    std::time::Duration,
+);
+
+/// What each call of the service entered, read by discovery's walk with no
+/// labels and no siblings ([`crate::request_summary::discovery::entered_calls`]),
+/// and how long the walk took. Run beside the model stage: it yields first,
+/// so the stages it is joined with have started before it reads.
+async fn walk_entered(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    implementations: &crate::request_summary::implementations::Implementations,
+    root: &Path,
+) -> WalkEntered {
+    tokio::task::yield_now().await;
+    let started = Instant::now();
+    let entered = crate::request_summary::discovery::entered_calls(inputs, implementations, root);
+    (entered, started.elapsed())
+}
+
+/// The call edges `entered` states where neither resolution by name nor the
+/// rows state one ([`crate::call_graph::plan_edges`]), over the definitions
+/// once their intents are in; each member call that takes one leaves the
+/// service's unfollowed calls. One log line says what the walk added.
+fn discovered_edges(
+    service: &Config,
+    function_definitions: &HashMap<String, FunctionDefinition>,
+    call_index: &crate::call_graph::CallIndex,
+    request_inputs: &mut crate::request_summary::RequestSummaryInputs,
+    (entered, walked): WalkEntered,
+) -> crate::call_graph::PlannedEdges {
+    let planned = crate::call_graph::plan_edges(
+        function_definitions,
+        call_index,
+        &request_inputs.sites,
+        |file, lo, hi| request_inputs.call_target(file, lo, hi).is_some(),
+        &entered,
+        crate::request_summary::discovery::MAX_ENTERED_PER_CALL,
+    );
+    request_inputs.unfollowed.retain(|row| {
+        !planned.took.contains(&(
+            row.file.clone(),
+            row.line,
+            row.caller.clone(),
+            row.member.clone(),
+        ))
+    });
+    debug!(
+        "Call edges discovery's walk entered for service {}: walk {} ms, {} calls entered, {} calls took {} edges ({:?}), {} entered functions held by no definition, {} calls over the cap",
+        service.service_name.as_deref().unwrap_or("(root)"),
+        walked.as_millis(),
+        entered.len(),
+        planned.calls,
+        planned.edges.len(),
+        planned.by_kind,
+        planned.dropped,
+        planned.over_cap
+    );
+    planned
 }
 
 /// The receiver trace's member declarations (carrick#2474 R1): one more
@@ -11503,6 +11607,10 @@ fn discover_with_positions(
         function_definitions: all_function_definitions,
         repo_name,
         request_inputs,
+        call_index: crate::call_graph::CallIndex {
+            per_file: per_file_calls,
+            keys,
+        },
     })
 }
 
@@ -13264,6 +13372,7 @@ struct Discovered {
     function_definitions: HashMap<String, FunctionDefinition>,
     repo_name: String,
     request_inputs: crate::request_summary::RequestSummaryInputs,
+    call_index: crate::call_graph::CallIndex,
 }
 
 /// The full analysis of one service over its discovery.
@@ -13295,7 +13404,8 @@ async fn analyze_current_repo(
         import_facts: all_import_facts,
         function_definitions,
         repo_name,
-        request_inputs,
+        mut request_inputs,
+        call_index,
     } = discovered;
     debug!(
         "Repository '{}': {} files, {} function definitions",
@@ -13317,6 +13427,9 @@ async fn analyze_current_repo(
         function_definitions.values(),
         repo_path,
     );
+    // Asked once, before the intents start, and read by every walk below:
+    // the fact layer's and the call graph's (carrick#2432 slice B).
+    let implementations = implementations_for(&request_inputs, sidecar, Path::new(repo_path));
     let intents = IntentsInFlight::start(
         AgentService::new(),
         function_definitions,
@@ -13390,7 +13503,6 @@ async fn analyze_current_repo(
     // (carrick#1564).
     let service_root_text = service_root.to_string_lossy().into_owned();
     let sibling_inputs = siblings.inputs();
-    let implementations = implementations_for(&request_inputs, sidecar, Path::new(repo_path));
     let library_ask = LibraryAsk::start(
         &request_inputs,
         siblings,
@@ -13409,7 +13521,7 @@ async fn analyze_current_repo(
     );
     let (early_answer, first_answer) = tokio::sync::oneshot::channel();
     let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
-    let (analysis_result, (settled, placements, fallbacks), library_answer, ()) = tokio::join!(
+    let (analysis_result, (settled, placements, fallbacks), library_answer, (), entered) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -13441,6 +13553,7 @@ async fn analyze_current_repo(
             &implementations,
             fact_sender,
         ),
+        walk_entered(&request_inputs, &implementations, Path::new(repo_path)),
     );
     let mut fallbacks = analysis_fallbacks(fallbacks, &analysis_result, |done| &done.stats);
     fallbacks.counts().extend(library_ask_health(
@@ -13458,6 +13571,17 @@ async fn analyze_current_repo(
     enter_stage(crate::scan_stage::Stage::Intents)?;
     let mut function_definitions = intents.finish().await;
     crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
+    // The edges discovery's walk entered, planned once every intent is in so
+    // none of them is hashed into one (no intent is asked again for them),
+    // and written once every service's call-through is settled, which reads
+    // none of them.
+    let discovered_edges = discovered_edges(
+        service,
+        &function_definitions,
+        &call_index,
+        &mut request_inputs,
+        entered,
+    );
 
     enter_stage(crate::scan_stage::Stage::Signatures)?;
     // 4c. Compose function signatures, inferring unannotated slots via sidecar.
@@ -13839,6 +13963,7 @@ async fn analyze_current_repo(
         fallbacks: Some(fallbacks),
         type_reach,
         unread_routes,
+        discovered_edges: discovered_edges.relativized(|file| repo_relative(file, repo_path)),
     })
 }
 

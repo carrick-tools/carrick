@@ -584,22 +584,16 @@ pub fn add_row_edges(
                     }
                     continue;
                 };
-                if file == index.path && key == *caller_key {
-                    continue;
-                }
-                let Some(definition) = function_definitions
-                    .get(keys.merged_key(&key, &file))
-                    .filter(|definition| definition.file_path == file)
-                else {
+                let Some(edge) = edge_to(
+                    function_definitions,
+                    keys,
+                    (index, caller_key.as_str(), callee),
+                    &file,
+                    key,
+                ) else {
                     continue;
                 };
-                edges.push(FunctionCallRef {
-                    name: key,
-                    file_path: file.to_string_lossy().to_string(),
-                    line_number: definition.line_number,
-                    call_site_line: callee.line,
-                    call_count: 1,
-                });
+                edges.push(edge);
                 if bare {
                     bare_edges += 1;
                 }
@@ -607,10 +601,8 @@ pub fn add_row_edges(
             if edges.is_empty() {
                 continue;
             }
-            let caller_row = keys.merged_key(caller_key, &index.path);
-            let Some(def) = function_definitions
-                .get_mut(caller_row)
-                .filter(|def| def.file_path == index.path)
+            let Some(def) = caller_row(function_definitions, keys, index, caller_key)
+                .and_then(|row| function_definitions.get_mut(&row))
             else {
                 continue;
             };
@@ -636,6 +628,258 @@ pub struct RowEdges {
     pub added_bare: usize,
     /// Member calls that took no edge and say why, paths as walked.
     pub unfollowed: Vec<crate::unfollowed_calls::UnfollowedMemberCall>,
+}
+
+/// The edge the call `callee`, written in `caller_key` of `index`, takes to
+/// the function `key` of `file`: none to the caller itself (recursion), and
+/// none to a function the merged definitions do not hold in that file (one
+/// outside the service).
+fn edge_to(
+    function_definitions: &HashMap<String, FunctionDefinition>,
+    keys: &RekeyIndex,
+    (index, caller_key, callee): (&FileCallIndex, &str, &CalleeRef),
+    file: &Path,
+    key: String,
+) -> Option<FunctionCallRef> {
+    if file == index.path && key == caller_key {
+        return None;
+    }
+    let definition = function_definitions
+        .get(keys.merged_key(&key, file))
+        .filter(|definition| definition.file_path == file)?;
+    Some(FunctionCallRef {
+        name: key,
+        file_path: file.to_string_lossy().to_string(),
+        line_number: definition.line_number,
+        call_site_line: callee.line,
+        call_count: 1,
+    })
+}
+
+/// The merged key of the definition `caller_key` of `index`, where the
+/// merged definitions hold it in that file.
+fn caller_row(
+    function_definitions: &HashMap<String, FunctionDefinition>,
+    keys: &RekeyIndex,
+    index: &FileCallIndex,
+    caller_key: &str,
+) -> Option<String> {
+    let row = keys.merged_key(caller_key, &index.path);
+    function_definitions
+        .get(row)
+        .filter(|def| def.file_path == index.path)
+        .map(|_| row.to_string())
+}
+
+/// What a scan keeps of discovery to write the edges its walk entered
+/// ([`plan_edges`]) once the intents are in: the per-file call sites and the
+/// merged keys, as [`add_row_edges`] read them.
+#[derive(Debug, Default)]
+pub struct CallIndex {
+    pub per_file: HashMap<PathBuf, FileCallIndex>,
+    pub keys: RekeyIndex,
+}
+
+/// The edges discovery's walk entered where neither resolution by name nor
+/// the rows state one ([`plan_edges`]), not yet written.
+#[derive(Debug, Default)]
+pub struct PlannedEdges {
+    /// Each edge, by the merged key of the caller it is written into.
+    pub edges: Vec<(String, FunctionCallRef)>,
+    /// The member calls that took one, as their unfollowed row would name
+    /// them: (file as walked, line, caller key, member).
+    pub took: HashSet<(String, u32, String, String)>,
+    /// Calls that took at least one edge.
+    pub calls: usize,
+    /// Edges by how the walk entered the function.
+    pub by_kind: BTreeMap<&'static str, usize>,
+    /// Functions entered that no definition holds (a constructor, a function
+    /// no definition opens at, one outside the service): no edge.
+    pub dropped: usize,
+    /// Calls whose callee may hold more functions than the walk follows:
+    /// no edge.
+    pub over_cap: usize,
+}
+
+impl PlannedEdges {
+    /// The edges with each callee's file as `relative` writes it: the payload
+    /// they are written into is repo-relative by then.
+    pub fn relativized(mut self, relative: impl Fn(&str) -> String) -> Self {
+        for (_, edge) in &mut self.edges {
+            edge.file_path = relative(&edge.file_path);
+        }
+        self
+    }
+
+    /// Write the edges into `function_definitions`, each only where its
+    /// caller holds no edge to that callee already: every edge written
+    /// before is kept as it was, its first call line included. Returns how
+    /// many were written.
+    pub fn write(&self, function_definitions: &mut HashMap<String, FunctionDefinition>) -> usize {
+        let mut written = 0;
+        let mut touched: BTreeSet<&str> = BTreeSet::new();
+        // The edges each caller held before: a callee one of them names
+        // takes nothing more.
+        let callers: BTreeSet<&str> = self
+            .edges
+            .iter()
+            .map(|(caller, _)| caller.as_str())
+            .collect();
+        let held: HashSet<(&str, String, String)> = callers
+            .into_iter()
+            .filter_map(|caller| Some((caller, function_definitions.get(caller)?)))
+            .flat_map(|(caller, def)| {
+                def.calls
+                    .iter()
+                    .map(move |kept| (caller, kept.file_path.clone(), kept.name.clone()))
+            })
+            .collect();
+        for (caller, edge) in &self.edges {
+            if held.contains(&(caller.as_str(), edge.file_path.clone(), edge.name.clone())) {
+                continue;
+            }
+            let Some(def) = function_definitions.get_mut(caller) else {
+                continue;
+            };
+            def.calls.push(edge.clone());
+            touched.insert(caller);
+            written += 1;
+        }
+        for caller in touched {
+            if let Some(def) = function_definitions.get_mut(caller) {
+                dedupe_edges(&mut def.calls);
+            }
+        }
+        written
+    }
+}
+
+/// A file's definition keys by the line each opens on; `None` where two do.
+type OpeningLines<'a> = HashMap<u32, Option<&'a String>>;
+
+/// The edges each call takes to the functions of the repository
+/// discovery's walk entered from it (`entered`, [`crate::request_summary`]'s
+/// `Discovery::entered`), where neither resolution by name (`sites`) nor
+/// the compiler's rows (`stated`) give the call a target: one edge per
+/// definition entered, so a call through a value that may hold two
+/// functions, or an interface member two classes implement, takes both. A
+/// call whose callee may hold more than `cap` functions takes none. A
+/// function written as a value takes the edge of the definition that opens
+/// at its line, when exactly one does. The same filters as
+/// [`add_row_edges`]: no edge to the caller itself, none to a function
+/// outside the service.
+pub fn plan_edges(
+    function_definitions: &HashMap<String, FunctionDefinition>,
+    index: &CallIndex,
+    sites: &CallSiteTargets,
+    stated: impl Fn(&Path, u32, u32) -> bool,
+    entered: &[crate::request_summary::discovery::Entered],
+    cap: usize,
+) -> PlannedEdges {
+    use crate::request_summary::discovery::{EnteredFunction, EnteredKind};
+    let mut planned = PlannedEdges::default();
+    if entered.is_empty() {
+        return planned;
+    }
+    let at: HashMap<(&Path, u32, u32), &crate::request_summary::discovery::Entered> = entered
+        .iter()
+        .map(|call| ((call.file.as_path(), call.lo, call.hi), call))
+        .collect();
+    // Each file's definitions by the line they open on; a line two open on
+    // names neither.
+    let mut opening: HashMap<&Path, OpeningLines<'_>> = HashMap::new();
+    for file in index.per_file.values() {
+        let lines = opening.entry(file.path.as_path()).or_default();
+        for (key, line) in &file.definitions {
+            lines
+                .entry(*line)
+                .and_modify(|held| *held = None)
+                .or_insert(Some(key));
+        }
+    }
+    let mut files: Vec<&PathBuf> = index.per_file.keys().collect();
+    files.sort();
+    for canonical in files {
+        let file_index = &index.per_file[canonical];
+        let mut callers: Vec<&String> = file_index.callees.keys().collect();
+        callers.sort();
+        for caller_key in callers {
+            let Some(caller) =
+                caller_row(function_definitions, &index.keys, file_index, caller_key)
+            else {
+                continue;
+            };
+            for callee in &file_index.callees[caller_key] {
+                let (lo, hi) = (callee.span.lo.0, callee.span.hi.0);
+                if callee.span.is_dummy()
+                    || sites.target_at(&file_index.path, lo, hi).is_some()
+                    || stated(&file_index.path, lo, hi)
+                {
+                    continue;
+                }
+                let Some(call) = at.get(&(file_index.path.as_path(), lo, hi)) else {
+                    continue;
+                };
+                let functions: BTreeSet<(&PathBuf, &EnteredFunction)> = call
+                    .targets
+                    .iter()
+                    .map(|target| (&target.file, &target.function))
+                    .collect();
+                if functions.len() > cap {
+                    planned.over_cap += 1;
+                    continue;
+                }
+                let mut took = 0;
+                let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+                for target in &call.targets {
+                    let key = match &target.function {
+                        EnteredFunction::Keyed(key) => Some(key.clone()),
+                        EnteredFunction::Written { line } => opening
+                            .get(target.file.as_path())
+                            .and_then(|lines| lines.get(line).copied().flatten())
+                            .cloned(),
+                    };
+                    let edge = key.and_then(|key| {
+                        edge_to(
+                            function_definitions,
+                            &index.keys,
+                            (file_index, caller_key.as_str(), callee),
+                            &target.file,
+                            key,
+                        )
+                    });
+                    let Some(edge) = edge else {
+                        planned.dropped += 1;
+                        continue;
+                    };
+                    // One function reached two ways (a value and the
+                    // implementation it is) is one edge.
+                    if !seen.insert((edge.file_path.clone(), edge.name.clone())) {
+                        continue;
+                    }
+                    let kind = match target.kind {
+                        EnteredKind::Named => "named",
+                        EnteredKind::Constructor => "constructor",
+                        EnteredKind::Implementation => "implementation",
+                        EnteredKind::Value => "value",
+                    };
+                    *planned.by_kind.entry(kind).or_default() += 1;
+                    planned.edges.push((caller.clone(), edge));
+                    took += 1;
+                }
+                if took > 0 {
+                    planned.calls += 1;
+                    planned.took.insert((
+                        file_index.path.to_string_lossy().to_string(),
+                        callee.line,
+                        caller_key.clone(),
+                        callee.name.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    planned
 }
 
 /// What [`resolve_call_edges`] produces besides the edges it writes into the

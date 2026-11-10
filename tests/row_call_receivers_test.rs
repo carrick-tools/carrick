@@ -2,7 +2,8 @@
 //! its call-graph edge from the compiler's `call` row, whatever the receiver
 //! is: the result of a method call (awaited or not), a property chain, a
 //! destructured or union-typed binding, an optional call. A receiver typed
-//! `any`, or by an interface no definition is declared on, states no edge.
+//! `any` states no edge. An interface member takes an edge to each
+//! implementation (`row_call_implementations_test.rs`).
 //!
 //! Scanned as the Action scans it; the real sidecar walks the rows. See `tests/fixtures/row-call-receivers/`. Each
 //! method of `Client` wraps a different protocol's stub transport (HTTP,
@@ -137,16 +138,25 @@ fn every_member_call_the_resolver_left_takes_its_edge_from_the_call_row() {
 }
 
 #[test]
-fn no_edge_without_a_definition() {
+fn an_untyped_receiver_states_no_edge_and_an_interface_member_takes_its_implementation() {
     if !sidecar_available() {
         eprintln!("Skipping: node or the built sidecar is missing");
         return;
     }
     let edges = scan_edges();
-    for caller in ["viaInterface", "viaAny"] {
-        assert!(
-            !edges.iter().any(|(from, ..)| from == caller),
-            "{caller} states no edge: {edges:#?}"
-        );
-    }
+    assert!(
+        !edges.iter().any(|(from, ..)| from == "viaAny"),
+        "viaAny states no edge: {edges:#?}"
+    );
+    // `store.read()` with `store: Store`: the closure the factory returns is
+    // the one implementation, so the call reaches it.
+    assert!(
+        edges
+            .iter()
+            .any(|(from, name, file, at)| from == "viaInterface"
+                && name == "read"
+                && file == "src/store.ts"
+                && *at == 49),
+        "viaInterface reaches the one implementation of Store.read: {edges:#?}"
+    );
 }
