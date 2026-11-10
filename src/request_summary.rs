@@ -1680,6 +1680,16 @@ pub struct FileIr {
     /// (carrick#3504 B10-1a). A table of its own, never read by a value
     /// reader; the text reader reads a parameter through its callers from it.
     param_bindings: HashMap<(u32, String), resolve::ParamAt>,
+    /// The pieces [`Reader::eval`] read each expression as while it read a
+    /// call's arguments (a call's, an optional call's, a construction's and
+    /// an `apply`'s elements) and the initialiser of each local a body
+    /// declares, by the expression's span (discovery numbering, as
+    /// [`CallIr::arg_texts`] spans its terms; carrick#3504 B10-2a1). An
+    /// expression read as no text has none. Linked as every other list of
+    /// pieces is ([`Self::visit_pieces`]). No reader reads it yet: it is how
+    /// a part of a name the resolver reads is spelled as the summaries spell
+    /// it.
+    arg_pieces: HashMap<(u32, u32), Vec<Piece>>,
     /// Each import (by its local name) this module only reads a member of
     /// and never changes ([`resolve::module_bindings`], carrick#2448).
     kept_imports: HashSet<String>,
@@ -2061,6 +2071,8 @@ pub fn extract_file_ir(
         source_map,
         builder_depth: std::cell::Cell::new(0),
         returned_objects: crate::return_flow::returned_objects(module),
+        recording_depth: std::cell::Cell::new(0),
+        arg_pieces: std::cell::RefCell::new(HashMap::new()),
     };
     module_scope.guards = guards::ModuleGuards::of(module, &imports, definition_keys, &reader);
 
@@ -2538,6 +2550,7 @@ pub fn extract_file_ir(
             &file.placed_writes,
         );
     }
+    file.arg_pieces = reader.arg_pieces.take();
     // What a row stated in another module needs to say about a client's
     // base the way this module's own rows say it (carrick#1568). Any file
     // that imports a package's client may build one.
@@ -5196,6 +5209,11 @@ struct Reader<'a> {
     /// The object literals some function of the module returns, by span
     /// ([`crate::return_flow::returned_objects`], carrick#3470).
     returned_objects: HashSet<(u32, u32)>,
+    /// While above 0, [`Reader::eval`] keeps the pieces it reads each
+    /// expression as in [`Self::arg_pieces`] ([`Reader::recording`]).
+    recording_depth: std::cell::Cell<usize>,
+    /// What [`FileIr::arg_pieces`] keeps, gathered as the file is read.
+    arg_pieces: std::cell::RefCell<HashMap<(u32, u32), Vec<Piece>>>,
 }
 
 impl Reader<'_> {
@@ -6366,7 +6384,7 @@ impl Reader<'_> {
                         } else {
                             bound(
                                 name.clone(),
-                                self.eval(init, scope),
+                                self.recording(|| self.eval(init, scope)),
                                 self.construction_text(init).as_deref(),
                             )
                         };
@@ -6445,8 +6463,44 @@ impl Reader<'_> {
         expr.visit_with(&mut walker);
     }
 
-    /// The value of an expression, as far as the source states it.
+    /// The value of an expression, as far as the source states it. While
+    /// [`Self::recording`], the pieces of a text value are kept by the
+    /// expression's span ([`FileIr::arg_pieces`]), once the whole value is
+    /// read (an environment read's fallback is set at the `??`).
     fn eval(&self, expr: &Expr, scope: &Scope<'_>) -> Value {
+        let value = self.eval_value(expr, scope);
+        if self.recording_depth.get() > 0
+            && let Value::Str(pieces) = &value
+        {
+            let span = expr.span();
+            self.arg_pieces
+                .borrow_mut()
+                .insert((span.lo.0, span.hi.0), pieces.clone());
+        }
+        value
+    }
+
+    /// `read` with [`Self::eval`] keeping the pieces it reads
+    /// (carrick#3504 B10-2a1): a call's arguments and a local's initialiser.
+    fn recording<T>(&self, read: impl FnOnce() -> T) -> T {
+        let depth = &self.recording_depth;
+        depth.set(depth.get() + 1);
+        let out = read();
+        depth.set(depth.get() - 1);
+        out
+    }
+
+    /// `read` with [`Self::eval`] keeping nothing: a builder's return read
+    /// with a caller's arguments in its parameters is no reading of the
+    /// expressions it is written as.
+    fn unrecorded<T>(&self, read: impl FnOnce() -> T) -> T {
+        let before = self.recording_depth.replace(0);
+        let out = read();
+        self.recording_depth.set(before);
+        out
+    }
+
+    fn eval_value(&self, expr: &Expr, scope: &Scope<'_>) -> Value {
         match expr {
             Expr::Lit(Lit::Str(s)) => {
                 Value::Str(vec![Piece::Lit(s.value.to_string_lossy().into_owned())])
@@ -6782,11 +6836,13 @@ impl Reader<'_> {
             inner.locals.insert(param.clone(), value);
         }
         self.builder_depth.set(depth + 1);
-        let values: Vec<Value> = builder
-            .returned
-            .iter()
-            .map(|returned| self.eval(returned, &inner))
-            .collect();
+        let values: Vec<Value> = self.unrecorded(|| {
+            builder
+                .returned
+                .iter()
+                .map(|returned| self.eval(returned, &inner))
+                .collect()
+        });
         self.builder_depth.set(depth);
         several_values(values, self.text(call.span))
     }
@@ -8437,7 +8493,7 @@ impl CallWalker<'_, '_, '_> {
                     // [{ configureServer() {} }] }`) sits at a key path in it.
                     self.guard.place_functions_in(expr, &written_in);
                     expr.visit_with(self);
-                    self.reader.eval(expr, self.scope)
+                    self.reader.recording(|| self.reader.eval(expr, self.scope))
                 }
             };
             values.push(value);
@@ -9637,6 +9693,9 @@ impl FileIr {
             .chain(self.field_receivers.values_mut())
         {
             visit_client_pieces(path, client, visit);
+        }
+        for pieces in self.arg_pieces.values_mut() {
+            visit(path, pieces);
         }
     }
 }

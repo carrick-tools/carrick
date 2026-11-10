@@ -120,3 +120,24 @@ carries the calls it was read through, innermost first:
 Read without callers (every other entry point), a parameter answers as
 before: `p_one` is `parameter_unread`, `p_defaulted` is `unread_expression`
 and `fallback`.
+
+## The parts of a name and their pieces (`pieces.ts`, carrick#3504 B10-2a1)
+
+Each `p_*` probe's argument is a name whose parts the text lowering spans;
+`FileIr::arg_pieces` keeps, at each part's span, the pieces the request
+summaries read it as. `base.ts` declares the imported base.
+
+| Probe | Part | Term | Pieces at its span |
+|---|---|---|---|
+| `p_url` (in `user(id)`) | `${id}` | a read | `Param(0, "id")` |
+| `p_env` | `${process.env.API_URL ?? "http://localhost"}` | a choice, spanning the `??` | one environment read of `API_URL`, its fallback `http://localhost` |
+| `p_built` (in `built(q)`) | `${encodeURIComponent(q)}` | unlowered, spanning the call | one hole, `unread_expression`, written `encodeURIComponent(q)` |
+| `p_base` | `${API_BASE}` | a read | `https://api.example.test`, once every module is linked |
+| `p_local` (in `local(id)`) | `url`, a `const` of the body | a read | `/orders/` then `Param(0, "id")`: the local read in place |
+| | its initialiser's `${id}` | a read | `Param(0, "id")` |
+
+`itemsApi` is an exported object the module writes through
+(`itemsApi.label = …`), so its member `replace` is a function the
+module-level code writes, no function of the file. Its parameter `id` is
+keyed by the definition `itemsApi.replace` (position 0, no keys, not
+colliding), as the caller index keys the function (carrick#2793).

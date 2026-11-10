@@ -1463,7 +1463,7 @@ impl CallWalker<'_, '_, '_> {
             .iter()
             .map(|arg| match unwrap_expression(&arg.expr) {
                 Expr::Arrow(_) | Expr::Fn(_) => Value::Str(vec![Piece::Unknown]),
-                expr => self.reader.eval(expr, self.scope),
+                expr => self.reader.recording(|| self.reader.eval(expr, self.scope)),
             })
             .collect();
         let construction = CallIr {
@@ -1814,6 +1814,33 @@ impl FileIr {
                 (key.clone(), (start, definition.is_exported))
             })
             .collect();
+        // A parameter of a function the module-level code writes outside
+        // any call is its definition's, as the caller index keys the
+        // function (carrick#2793, #3504 B10-2a1).
+        let by_start = self.definitions_by_start();
+        let owned: Vec<((u32, String), String)> = self
+            .param_bindings
+            .iter()
+            .filter_map(|(at, param)| {
+                let key = by_start.get(&param.owner_start?)?;
+                Some((at.clone(), key.to_string()))
+            })
+            .collect();
+        for (at, key) in owned {
+            if let Some(param) = self.param_bindings.get_mut(&at) {
+                param.function = Some(key);
+            }
+        }
+    }
+
+    /// Each definition placed in this file ([`Self::place_definitions`]) by
+    /// where its function node starts: the key a function the module-level
+    /// code writes outside any call is read under (carrick#2793).
+    pub(super) fn definitions_by_start(&self) -> HashMap<u32, &str> {
+        self.definitions
+            .iter()
+            .filter_map(|(key, (start, _))| Some(((*start)?, key.as_str())))
+            .collect()
     }
 }
 
