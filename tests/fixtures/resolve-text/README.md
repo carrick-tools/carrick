@@ -108,7 +108,7 @@ compiler's literal type does not answer before the table does.
 | `deeper` | a block of such a function |
 | `nestedMoved` | such a function's `let` written again: its write is never placed |
 | `inner`, `innerInCallback` | a function declared in a body, in `blocks` and in a callback |
-| `pair` (two blocks, one line) | one entry, unplaceable |
+| `pair` (two module blocks, one line) | one entry, unplaceable; the same two blocks in a body are a shadow and have none |
 | `item` (loop heads), `err` (`catch`), `same` (declared twice), `n` (a nested parameter's default) | no entry |
 
 No reader reads an entry of these classes yet: every probe above still reads
