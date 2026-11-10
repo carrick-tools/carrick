@@ -3390,16 +3390,24 @@ fn route_ways(
     };
     // A name written again may hold a value no reader states at the call:
     // its first value is no way the route is served.
-    if values
-        .iter()
-        .any(|value| matches!(value, TextValue::Hole(super::HoleReason::Reassigned)))
-    {
+    if values.iter().any(|value| {
+        matches!(
+            value,
+            TextValue::Hole {
+                reason: super::HoleReason::Reassigned,
+                ..
+            }
+        )
+    }) {
         return Vec::new();
     }
+    // A text a caller decides (carrick#3504 B10-1b) is read past as a hole.
     let texts: BTreeSet<String> = values
         .into_iter()
         .filter_map(|value| match value {
-            TextValue::Text { text, .. } if !text.is_empty() => Some(text),
+            TextValue::Text { text, callers, .. } if !text.is_empty() && callers.is_empty() => {
+                Some(text)
+            }
             _ => None,
         })
         .collect();
@@ -3503,10 +3511,12 @@ fn agreed_text(values: &[TextValue]) -> MadeBase {
     let mut texts: BTreeSet<&str> = BTreeSet::new();
     for value in values {
         match value {
-            TextValue::Text { text, .. } => {
+            // A text a caller decides (carrick#3504 B10-1b) is no base the
+            // maker always has.
+            TextValue::Text { text, callers, .. } if callers.is_empty() => {
                 texts.insert(text);
             }
-            TextValue::Hole(_) => return MadeBase::Unstated,
+            TextValue::Text { .. } | TextValue::Hole { .. } => return MadeBase::Unstated,
         }
     }
     let mut texts = texts.into_iter();

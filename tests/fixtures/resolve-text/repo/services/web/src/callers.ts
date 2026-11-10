@@ -26,6 +26,7 @@ declare function p_grow(name: string): void;
 declare function p_written(name: string): void;
 declare function p_send(name: string): void;
 declare function p_runtime(name: string): void;
+declare function p_shared(name: string): void;
 
 const TABLE: Record<string, string> = { a: "t.a" };
 const names: string[] = ["spread.a", "spread.b"];
@@ -138,3 +139,7 @@ runtime(String(now()));
 // A parameter and a `const` that share a line and a name.
 const list = [{ id: "i" }];
 const picked = list.find((picked) => picked.id === "i");
+
+// The same, with the parameter read by a probe.
+const tags: string[] = ["t"];
+const tag = tags.find((tag) => { p_shared(tag); return tag === "t"; });
