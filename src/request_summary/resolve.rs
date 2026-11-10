@@ -1102,7 +1102,9 @@ pub(super) fn module_bindings(
                 entries_handed: census.entries_handed(&local.key, false),
                 handed: census.handed.get(&local.key).cloned().unwrap_or_default(),
                 exported: false,
-                text_only: !local.block && !local.reassigned,
+                // The scope holds a body's own locals, not a function declared
+                // in it: the value readers read that one here (carrick#3794).
+                text_only: !local.block && !local.reassigned && local.kind != BindingKind::Function,
                 object_kept: false,
                 plain: local.plain,
                 reads: flow_checked(local, &census),
