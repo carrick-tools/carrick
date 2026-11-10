@@ -32,12 +32,14 @@
 //!
 //! The rules are in `docs/reference/client-semantics.md`, "Message roles".
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::name_census::{LibraryNames, NameOutcome};
 use crate::operation::{GraphqlOperationKind, PubsubRole, SocketDirection};
 use crate::request_summary::{
     LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, On, Selector, SiteMaker,
@@ -864,12 +866,44 @@ impl LibraryRow {
     pub fn wire_scope(&self) -> Option<carrick_match::NameScope> {
         self.name_scope.as_ref().map(wire_scope_of)
     }
+
+    /// The operation key and the side of the index the row is on, as the
+    /// engine writes it.
+    pub fn operation(&self) -> (crate::operation::OperationKey, RowSide) {
+        use crate::operation::OperationKey;
+        match self.kind {
+            LibraryRowKind::Pubsub(PubsubRole::Subscriber) => {
+                (OperationKey::pubsub(self.name.clone()), RowSide::Endpoint)
+            }
+            LibraryRowKind::Pubsub(PubsubRole::Publisher) => {
+                (OperationKey::pubsub(self.name.clone()), RowSide::Call)
+            }
+            LibraryRowKind::Socket {
+                direction,
+                listener,
+            } => (
+                OperationKey::socket(self.name.clone(), direction),
+                if listener {
+                    RowSide::Endpoint
+                } else {
+                    RowSide::Call
+                },
+            ),
+            LibraryRowKind::Graphql(kind) => (
+                OperationKey::graphql(kind, self.name.clone()),
+                RowSide::Endpoint,
+            ),
+        }
+    }
 }
 
 /// Every row a service's library sites state through verified claims.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LibraryRows {
     pub rows: Vec<LibraryRow>,
+    /// How the reader came by the name at each site it read a name slot of
+    /// (carrick#3504 B10-0). Log-only: no row reads it.
+    pub names: LibraryNames,
 }
 
 /// Read every library site through the claims that verify
@@ -905,6 +939,7 @@ pub fn read(
         .map(|(check, _)| (check.claim_id.clone(), check.receiver.clone()))
         .collect();
     let mut stated: Vec<(LibraryRow, ReceiverKey)> = Vec::new();
+    let mut names = LibraryNames::default();
     for export in exports.iter().filter(|export| is_read_export(export)) {
         let claims = export.claims_by_id();
         for site in sites
@@ -920,14 +955,20 @@ pub fn read(
                 export,
                 claims: &claims,
                 verified: &verified,
+                outcome: Cell::new(None),
             };
-            if let Some(row) = reading.row() {
+            let row = reading.row();
+            if let Some(outcome) = reading.outcome.get() {
+                names.note(outcome);
+            }
+            if let Some(row) = row {
                 stated.push((row, ReceiverKey::of(site)));
             }
         }
     }
     LibraryRows {
         rows: heard_in_process(stated, exports),
+        names,
     }
 }
 
@@ -995,12 +1036,21 @@ struct Reading<'a> {
     export: &'a ExportClaims,
     claims: &'a [(String, &'a LibraryClaim)],
     verified: &'a HashSet<(String, String)>,
+    /// How the first name slot the reading reached was read (B10-0).
+    outcome: Cell<Option<NameOutcome>>,
 }
 
 impl Reading<'_> {
     fn verified(&self, id: &str, receiver: &str) -> bool {
         self.verified
             .contains(&(id.to_string(), receiver.to_string()))
+    }
+
+    /// Notes how a name slot was read, unless one is noted already.
+    fn noted(&self, outcome: NameOutcome) {
+        if self.outcome.get().is_none() {
+            self.outcome.set(Some(outcome));
+        }
     }
 
     /// The row the site states, if any: a definition, or an op read the same
@@ -1067,6 +1117,11 @@ impl Reading<'_> {
         {
             return None;
         }
+        self.noted(site_outcome(
+            self.site,
+            slot_arg(name_slot),
+            slot_key(name_slot),
+        ));
         let name = self
             .site
             .literal(slot_arg(name_slot), slot_key(name_slot))?;
@@ -1142,10 +1197,13 @@ impl Reading<'_> {
             }
             let first_read: String;
             let (text, scope) = match name.as_deref()? {
-                OpName::Slot(slot) => (
-                    self.site.literal(slot_arg(slot), slot_key(slot))?,
-                    name_scope.clone(),
-                ),
+                OpName::Slot(slot) => {
+                    self.noted(site_outcome(self.site, slot_arg(slot), slot_key(slot)));
+                    (
+                        self.site.literal(slot_arg(slot), slot_key(slot))?,
+                        name_scope.clone(),
+                    )
+                }
                 OpName::Bound {
                     bound: BoundName::Maker,
                     ..
@@ -1159,6 +1217,13 @@ impl Reading<'_> {
                     else {
                         return None;
                     };
+                    self.noted(match maker.literal(slot_arg(slot), slot_key(slot)) {
+                        Some(_) => NameOutcome::Literal,
+                        None if maker.args.get(slot_arg(slot)).is_some_and(|arg| arg.spread) => {
+                            NameOutcome::StopSpread
+                        }
+                        None => NameOutcome::StopUnread,
+                    });
                     (
                         maker.literal(slot_arg(slot), slot_key(slot))?,
                         name_scope.clone(),
@@ -1169,9 +1234,16 @@ impl Reading<'_> {
                 OpName::Bound {
                     bound: BoundName::Decorated,
                     ..
-                } => (self.site.decorated.as_deref()?, None),
+                } => {
+                    self.noted(match self.site.decorated {
+                        Some(_) => NameOutcome::Literal,
+                        None => NameOutcome::StopUnread,
+                    });
+                    (self.site.decorated.as_deref()?, None)
+                }
                 // The first entry the call fills (amendment 8).
                 OpName::First(first) => {
+                    self.noted(first_outcome(self.site, &first.first));
                     first_read = first_name(self.site, &first.first)?;
                     (first_read.as_str(), None)
                 }
@@ -1305,6 +1377,43 @@ fn read_slot(site: &LibrarySite, arg: usize, key: Option<&str>) -> SlotRead {
             None => SlotRead::Stop,
         },
     }
+}
+
+/// How a site's own argument at `arg` (or its `key`) reads as a name
+/// (carrick#3504 B10-0): where the text came from when there is one, and
+/// why there is none when there is not.
+fn site_outcome(site: &LibrarySite, arg: usize, key: Option<&str>) -> NameOutcome {
+    match read_slot(site, arg, key) {
+        SlotRead::Named(_) if site.origin.is_some() => NameOutcome::Filled,
+        SlotRead::Named(_) if site.linked => NameOutcome::Linked,
+        SlotRead::Named(_) => NameOutcome::Literal,
+        SlotRead::Stop if site.args.get(arg).is_some_and(|arg| arg.spread) => {
+            NameOutcome::StopSpread
+        }
+        SlotRead::Next | SlotRead::Stop => NameOutcome::StopUnread,
+    }
+}
+
+/// [`site_outcome`] for a `first` list: the outcome of the entry that names,
+/// or of the one that stops the reading.
+fn first_outcome(site: &LibrarySite, first: &[NameEntry]) -> NameOutcome {
+    for entry in first {
+        match entry {
+            NameEntry::Decorated(_) => {
+                return match site.decorated {
+                    Some(_) => NameOutcome::Literal,
+                    None => NameOutcome::StopUnread,
+                };
+            }
+            NameEntry::Slot(slot) => {
+                let arg = slot.arg as usize;
+                if !matches!(read_slot(site, arg, slot.key.as_deref()), SlotRead::Next) {
+                    return site_outcome(site, arg, slot.key.as_deref());
+                }
+            }
+        }
+    }
+    NameOutcome::StopUnread
 }
 
 fn slot_arg(slot: &ClaimSlot) -> usize {
@@ -1967,6 +2076,35 @@ mod tests {
         \x20 bus.subscribe(\"$connected\", () => {});\n\
         \x20 await bus.publish(\"\", {});\n\
         }\n";
+
+    /// The name census (carrick#3504 B10-0) counts each site by how its name
+    /// slot read: a literal, a constant, a parameter a caller fills, a spread
+    /// and any other value the reader cannot read as text. It counts the
+    /// reading, not the rows, so a site that states no row is counted too.
+    #[test]
+    fn the_name_census_counts_each_name_outcome() {
+        let sites = sites_of(&[
+            ("src/topics.ts", "export const KIND = \"orders.kind\";\n"),
+            (
+                "src/names.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                import { KIND } from \"./topics\";\n\
+                export function literal() { bus.publish(\"orders.literal\", {}); }\n\
+                export function linked() { bus.publish(KIND, {}); }\n\
+                export function relay(topic: string) { bus.publish(topic, {}); }\n\
+                export function caller() { relay(\"orders.filled\"); }\n\
+                export function spread(...args: any[]) { bus.publish(...args, {}); }\n\
+                export function unread() { bus.publish(compute(), {}); }\n",
+            ),
+        ]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let names = read(&sites, &[bus()], verifier(&asked, all)).names;
+        assert_eq!(
+            names.line(),
+            "literal=1 linked=1 filled=1 stop_spread=1 stop_unread=2",
+            "{names:?}"
+        );
+    }
 
     /// Claim ids follow the HTTP convention, `<specifier>@<major>:<export>:…`,
     /// and a claim stated twice differently is dropped.
