@@ -32,6 +32,7 @@ mod read_model;
 mod reads_same;
 pub(crate) mod recheck;
 pub(crate) mod scan_state;
+mod unread;
 mod uses;
 mod workspace;
 

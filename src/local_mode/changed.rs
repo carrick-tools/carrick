@@ -67,6 +67,12 @@ pub struct ChangedOutput {
     pub services: usize,
     pub repos: Vec<ChangedRepo>,
     pub problems: Vec<Problem>,
+    /// Calls in the changed files the scan considered and did not state as a
+    /// row (carrick#3688 U4), at the lines the working tree has, files as
+    /// `problems` show them. Never a problem and never part of `failing`.
+    /// Absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<super::contract::UnreadItem>,
     /// How many of `problems` fail the run.
     pub failing: usize,
     /// Matched routes and calls in the changed files whose pair the type
@@ -404,6 +410,7 @@ fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
         services: 0,
         repos: Vec::new(),
         problems: Vec::new(),
+        unread: Vec::new(),
         failing: 0,
         type_checked: 0,
         not_type_checked: Vec::new(),
@@ -565,7 +572,45 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     output.not_type_checked = judged.not_type_checked;
     output.outside_moved = judged.outside_moved;
     output.problems = judged.problems;
+    output.unread = unread_in(&root, &rejoined.index, &wanted, &unmoved);
     output
+}
+
+/// The unread calls of the changed files, from the index the pass judged:
+/// the re-scan's own where the repo was re-read, the held one with its lines
+/// moved through the edit where the files read the same.
+fn unread_in(
+    root: &Path,
+    rebuilt: &LocalIndex,
+    wanted: &BTreeMap<String, &BTreeSet<String>>,
+    unmoved: &BTreeMap<String, BTreeMap<String, LineMap>>,
+) -> Vec<super::contract::UnreadItem> {
+    let mut out = Vec::new();
+    for repo in &rebuilt.repos {
+        for file in wanted
+            .get(&repo.name)
+            .into_iter()
+            .flat_map(|files| files.iter())
+        {
+            let map = unmoved.get(&repo.name).and_then(|maps| maps.get(file));
+            let sites: Vec<_> = repo
+                .unread
+                .get(file)
+                .into_iter()
+                .flatten()
+                .map(|site| super::read_model::IndexedUnread {
+                    line: map.map_or(site.line, |map| map.map(site.line)),
+                    reason: site.reason,
+                })
+                .collect();
+            out.extend(super::unread::items(
+                &shown(root, &repo.path, file),
+                &sites,
+                &[],
+            ));
+        }
+    }
+    out
 }
 
 /// The files each repo changed since the index was written, by repo label.
