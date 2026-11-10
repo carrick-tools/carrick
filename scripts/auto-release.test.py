@@ -49,5 +49,16 @@ class Decide(unittest.TestCase):
         self.assertEqual(ar.decide({"pr": None, "enabled": "true"})[0], "hold")
 
 
+class Workflow(unittest.TestCase):
+    def test_decide_step_uses_release_token(self):
+        # A readied or enqueued PR made with the default token fires no
+        # merge_group CI; the release token does.
+        text = pathlib.Path(__file__).with_name("..").joinpath(
+            ".github", "workflows", "auto-release.yml").resolve().read_text()
+        step = text.split("- name: Decide and enqueue", 1)[1]
+        line = next(l for l in step.splitlines() if l.strip().startswith("GH_TOKEN:"))
+        self.assertIn("secrets.RELEASE_PLEASE_TOKEN", line)
+
+
 if __name__ == "__main__":
     unittest.main()
