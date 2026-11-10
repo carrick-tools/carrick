@@ -3455,6 +3455,10 @@ export class TypeInferrer {
     // machinery. A wrapper rule that DID unwrap the envelope, or a type the
     // source itself states, is a contract and keeps its answer.
     //
+    // carrick#3741: a one-argument result envelope read only for its own
+    // members (`res.success`, `res.error`) is decided the same way. The site
+    // never reads the payload, and the envelope is not the wire body.
+    //
     // A single explicit call generic (`client.get<Order[]>(url)`) is the
     // caller's own payload claim and states the contract as plainly as an
     // `as` does — it is what the anchor below falls back to on a checkout
@@ -3467,7 +3471,8 @@ export class TypeInferrer {
     // row also reads as blind rather than as a sighted answer.
     if (
       use.projectionOnly &&
-      this.projectionReadsGenericPayload(callExpr, use.projections) &&
+      (this.projectionReadsGenericPayload(callExpr, use.projections) ||
+        this.isOneArgumentEnvelope(callExpr)) &&
       !unwrapResult.wasUnwrapped &&
       !explicitType &&
       !carrierPayload &&
@@ -4942,6 +4947,26 @@ export class TypeInferrer {
   }
 
   /**
+   * True when the call answers a ONE-ARGUMENT result envelope: a union whose
+   * branches say whether the call worked and one of which holds the single
+   * type argument as a member (`{ success: true; data: T } | { success: false;
+   * error: string }`), carrick#3741. carrick#1376 needs two arguments to tell
+   * the success side from the failure side; with one there is nothing to tell
+   * apart, and the envelope is the client's bookkeeping around `T`.
+   *
+   * A site that reads only such an envelope's own members (its status, its
+   * error) reads no payload, so the envelope is not a response contract. A
+   * union with no type argument (`{ ok: true } | { ok: false; reason: string }`)
+   * is not an envelope here and keeps its declared answer (carrick#1375).
+   */
+  private isOneArgumentEnvelope(callExpr: CallExpression): boolean {
+    const shape = this.resultCarrierArguments(callExpr.getType(), callExpr, [], 1);
+    if (!shape || shape.readOffCall) return false;
+    const own = [...shape.carrier.getAliasTypeArguments(), ...shape.carrier.getTypeArguments()];
+    return own.length === 1 && shape.carried.length === 1;
+  }
+
+  /**
    * The payload a RESULT CARRIER carries, or `undefined` when `type` is not
    * one or its success side cannot be told from its failure side
    * (carrick#1376).
@@ -5213,7 +5238,8 @@ export class TypeInferrer {
   private resultCarrierArguments(
     type: Type,
     at: Node,
-    callArgs: Type[] = []
+    callArgs: Type[] = [],
+    minArguments = 2
   ):
     | { carrier: Type; carried: Type[]; bodies: Map<Type, Type>; readOffCall: boolean }
     | undefined {
@@ -5222,7 +5248,7 @@ export class TypeInferrer {
     const deferredBranches = this.deferredConditionalBranches(type);
     if (deferredBranches) {
       for (const branch of deferredBranches) {
-        const shape = this.resultCarrierArguments(branch, at, callArgs);
+        const shape = this.resultCarrierArguments(branch, at, callArgs, minArguments);
         if (shape) return shape;
       }
       return undefined;
@@ -5240,7 +5266,7 @@ export class TypeInferrer {
     // arguments its call was built from (`callResultArguments`).
     const readOffCall = own.length === 0;
     const args = readOffCall ? callArgs : own;
-    if (args.length < 2) {
+    if (args.length < minArguments) {
       return undefined;
     }
     // carrick#1841: on a carrier read off the call, a member every branch

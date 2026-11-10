@@ -210,6 +210,10 @@ pub struct SiteRows {
     /// only where no row stands at its line: elsewhere the index already
     /// holds the route, and the site is counted, not listed.
     pub routes: Vec<PossibleCall>,
+    /// The other calls the site pass considered and stopped at
+    /// ([`crate::unread_sites::from_scan`], carrick#3688 U3). The fold keeps
+    /// one only where no row stands at its line.
+    pub unread: Vec<crate::unread_sites::UnreadSite>,
     /// Calls above a decided site on its chain (carrick#2614), whose reader
     /// rows fold onto the row the site holds.
     pub through: Vec<Through>,
@@ -221,6 +225,9 @@ pub struct SiteRows {
     /// it (carrick#2474 R5a): settled across services at the engine's join
     /// point (carrick#2474 R5b, [`crate::route_boundaries`]).
     pub boundaries: crate::request_summary::decided_sites::RouteBoundaries,
+    /// How the site path came by the name of each message site it decided
+    /// (carrick#3504 B10-0). Log-only: no row reads it.
+    pub names: crate::name_census::SiteNames,
 }
 
 /// A route the receiver trace serves at a full path it composed from the
@@ -858,6 +865,47 @@ fn is_through(site: &DecidedSite) -> bool {
         || site.span_end != site.end.span_end
 }
 
+/// How the site path came by the name of each message site in `records`
+/// (carrick#3504 B10-0, [`crate::name_census`]): a broker, an in-process bus
+/// or a socket. A name written whole at the labelled call is a literal; one
+/// whole at a caller of the function the labelled call is in was filled by
+/// the walk; any other name a record holds rests on a value the resolver read
+/// or on several. A name the model is asked, and one nothing states, are
+/// counted as such.
+pub fn site_names(decided: &Decided, records: &[SiteRecord]) -> crate::name_census::SiteNames {
+    use crate::name_census::NameSource;
+    use crate::request_summary::Piece;
+    let mut out = crate::name_census::SiteNames::default();
+    for record in records {
+        let Some(site) = site_of(decided, &record.anchors) else {
+            continue;
+        };
+        if !matches!(
+            site.end.role.as_str(),
+            "broker" | "in_process_bus" | "socket"
+        ) {
+            continue;
+        }
+        let written_whole = site.key.is_some()
+            || (!site.name.is_empty()
+                && site.name.iter().all(|piece| matches!(piece, Piece::Lit(_))));
+        out.note(if record.bucket == Bucket::Lead {
+            NameSource::Unstated
+        } else if record.state.asked.contains(&Slot::Name) {
+            NameSource::Asked
+        } else if !record.names.is_empty() {
+            NameSource::ResolverFold
+        } else if written_whole && site.via.is_empty() {
+            NameSource::LiteralPiece
+        } else if written_whole {
+            NameSource::FilledParam
+        } else {
+            NameSource::ResolverFold
+        });
+    }
+    out
+}
+
 /// The rows and possible calls a service's records come to, read with the
 /// labels the store answered and the cloud's answers. The lead-bucket
 /// records and the undecided calls are [`crate::possible_calls::from_sites`]'s.
@@ -872,9 +920,11 @@ pub fn of(
         rows: Vec::new(),
         leads: crate::possible_calls::from_sites(decided, records),
         routes: Vec::new(),
+        unread: Vec::new(),
         through: decided.through.clone(),
         traced: TracedRoutes::default(),
         boundaries: Default::default(),
+        names: site_names(decided, records),
     };
     for record in records {
         if record.bucket == Bucket::Lead {
@@ -1103,6 +1153,11 @@ pub struct SiteFold {
     /// Leads dropped because the blob already holds a row at their line
     /// (carrick#2539): the index states that site, so it is no possible call.
     pub lead_on_row_line: usize,
+    /// The unread sites ([`SiteRows::unread`]) at a line no row stands at.
+    pub unread: Vec<crate::unread_sites::UnreadSite>,
+    /// The unread sites dropped because the blob already holds a row at
+    /// their line: the index states that call.
+    pub unread_on_row_line: usize,
     /// Reader rows at a call above a decided site folded onto the row the
     /// site holds (carrick#2614), as `(file, line, key)`. Each is in
     /// `withdrawn` as well.
@@ -1549,6 +1604,22 @@ pub fn fold_rows(
             } else {
                 index += 1;
             }
+        }
+    }
+    // An unread site at a line a row stands at once the fold is done, of
+    // either side, is that row's call (a class-only GraphQL call is its
+    // document's row).
+    let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
+        rows.iter()
+            .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
+    };
+    for unread in &site.unread {
+        if held_at(calls, &unread.file, unread.line)
+            || held_at(endpoints, &unread.file, unread.line)
+        {
+            out.unread_on_row_line += 1;
+        } else {
+            out.unread.push(unread.clone());
         }
     }
     out

@@ -102,7 +102,7 @@ const OF_IMPLEMENTATIONS: Plural = Plural {
 };
 
 /// The hop a walk records where it enters a function through a value.
-use super::decided_sites::{BoundCall, HopMaker, VALUE_HOP};
+use super::decided_sites::{BoundCall, CALLBACK_HOP, HopMaker, VALUE_HOP};
 use super::stop::Stop;
 
 /// One discovered site, or one walk that entered code and stopped.
@@ -122,6 +122,10 @@ pub struct DiscoverySite {
     pub chain: Vec<ChainHop>,
     /// Why a walk that entered code reached no labelled export.
     pub stop: Option<Stop>,
+    /// The other ways the callee's values stopped, when `stop` is one of
+    /// several (carrick#3688 R3). Distinct, at most four.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<Stop>,
     /// The binding the labelled call is made on (carrick#2474 R1). Only
     /// with the receiver trace on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +225,10 @@ pub struct Discovery {
     /// The calls whose walk found no site and passed a call it could not
     /// follow on the way (`no_site` all the same): not followed to the end.
     pub missed_inside: Vec<(String, u32, u32)>,
+    /// The line and the callee as written of each `missed_inside` call, by
+    /// file and SWC span: what an unread site states of it
+    /// ([`crate::unread_sites`], carrick#3688 U3).
+    pub missed_at: BTreeMap<(String, u32, u32), (u32, String)>,
     pub counts: BTreeMap<String, usize>,
     /// For each call recorded with no end (a stopped site or `missed_inside`),
     /// by file and SWC span: the store keys of the packages the walk passed a
@@ -406,6 +414,29 @@ impl<'a> Labels<'a> {
             .filter(|((package, export), _)| *export == name && is_language_key(package))
             .min_by_key(|((package, _), _)| *package)
             .map(|(_, claims)| *claims)
+    }
+}
+
+/// How many other ways a site's values stopped it keeps beside its reason
+/// (carrick#3688 R3).
+const MAX_ALSO: usize = 4;
+
+/// The one stop a callee's values that all reached nothing agree on
+/// (carrick#3688 U2): the way every one stopped, when they all stopped the
+/// same way and say so; otherwise `several`, with the distinct ways named
+/// (at most [`MAX_ALSO`]). The resolver never collapses: this is
+/// discovery's policy.
+fn agreed_stop(reasons: &[Option<Stop>], several: Stop) -> (Stop, Vec<Stop>) {
+    let ways: BTreeSet<Stop> = reasons.iter().flatten().copied().collect();
+    match (ways.iter().next(), ways.len()) {
+        (Some(one), 1) if reasons.iter().all(Option::is_some) => (*one, Vec::new()),
+        _ => (
+            several,
+            ways.into_iter()
+                .filter(|way| *way != several)
+                .take(MAX_ALSO)
+                .collect(),
+        ),
     }
 }
 
@@ -1044,6 +1075,13 @@ struct Outcome<'a> {
     ends: Vec<Found>,
     /// The first stop, when the walk entered code and found nothing there.
     stop: Option<(Vec<ChainHop>, Stop)>,
+    /// With `stop`: the other ways the callee's values stopped, when they
+    /// stopped in several (carrick#3688 U2, R3). Distinct, at most
+    /// [`MAX_ALSO`].
+    also: Vec<Stop>,
+    /// With `stop`: it is what the callee's values agree on ([`Walker::agree`]),
+    /// so the walk read values even where it entered no function.
+    valued: bool,
     /// The shallowest definition still being read that the walk came back
     /// to: until it is done, this answer is not final.
     cycle_at: Option<usize>,
@@ -1136,6 +1174,8 @@ impl<'a> Outcome<'a> {
         }
         if self.stop.is_none() {
             self.stop = other.stop;
+            self.also = other.also;
+            self.valued = other.valued;
         }
         self.missed |= other.missed;
         self.unanswered.extend(other.unanswered);
@@ -1366,6 +1406,11 @@ struct Walker<'a> {
     /// the walk follows each end it reaches ([`Follow`]).
     values: &'a Resolver<'a>,
     memo: HashMap<(PathBuf, String), Outcome<'a>>,
+    /// What each function written at a call reaches, by the function, read
+    /// once final (carrick#3767): the walk of a call and the check for what
+    /// it passed ([`Self::misses`]) both read the same callback, and each
+    /// level of callbacks inside it would double the work again.
+    callbacks: HashMap<*const FnIr, Outcome<'a>>,
     /// The definitions being read, by how deep.
     reading: HashMap<(PathBuf, String), usize>,
     /// Calls whose member declaration stands for more than one op
@@ -1426,6 +1471,20 @@ impl<'a> Walker<'a> {
     }
 
     fn hop(&self, file: &Path, key: &str) -> ChainHop {
+        // A function written inside another is entered as a value is, at
+        // the line its node starts on (carrick#2448 T3c): what decided
+        // sites places a `<value>` hop by.
+        if self.values.function(file, key).is_none()
+            && let Some((_, written)) = self.written_inside(file, key)
+            && let Some(site) = &written.site
+        {
+            return ChainHop {
+                function: VALUE_HOP.to_string(),
+                file: self.rel(file),
+                line: site.line,
+                made: None,
+            };
+        }
         let line = self
             .inputs_for(file)
             .files
@@ -1529,9 +1588,11 @@ impl<'a> Walker<'a> {
     /// to a function or an export decides, whatever the callee is typed as.
     fn through_type(&self, invoke: Invoke<'_>, values: &[Held<'_>]) -> Option<Outcome<'a>> {
         let holes = !values.is_empty()
-            && values
-                .iter()
-                .all(|value| matches!(value, Held::Reached(outcome) if !outcome.known));
+            && values.iter().all(|value| match value {
+                Held::Reached(outcome) => !outcome.known,
+                Held::Stop(_) => true,
+                Held::Param(..) | Held::Callback => false,
+            });
         if !holes || invoke.construction {
             return None;
         }
@@ -2449,7 +2510,7 @@ impl<'a> Walker<'a> {
                 && let Some(callback) = body.nested.get(*nested)
             {
                 let written = ChainHop {
-                    function: "<callback>".to_string(),
+                    function: CALLBACK_HOP.to_string(),
                     file: self.rel(file),
                     line: callback
                         .site
@@ -2457,7 +2518,7 @@ impl<'a> Walker<'a> {
                         .map_or(call.site.line, |site| site.line),
                     made: None,
                 };
-                let inner = self.body(file, callback);
+                let inner = self.callback(file, callback);
                 let mut inner = self.lifted(inner).under(written);
                 if let Some(hop) = hop {
                     inner = inner.under(hop.clone());
@@ -2474,8 +2535,9 @@ impl<'a> Walker<'a> {
             return known.clone();
         }
         // A definition the extractor keys whose body this pass did not read
-        // (an object's method, a function written inside another): what it
-        // calls is not known, so the walk stops there and says so.
+        // (no keyed body and no function written where the key's node
+        // starts): what it calls is not known, so the walk stops there and
+        // says so.
         let Some((file, ir)) = self.function(&id.0, &id.1) else {
             return Outcome::stopped(Stop::NoBody);
         };
@@ -2500,6 +2562,29 @@ impl<'a> Walker<'a> {
             // is not all it reaches (carrick#3504 S1).
             if !cycle_stop && !self.values.capping() {
                 self.memo.insert(id.clone(), out.clone());
+            }
+        }
+        out
+    }
+
+    /// What the function written at a call, `callback`, reaches: [`Self::body`],
+    /// read once it is final, as [`Self::definition`] keeps a definition's.
+    fn callback(&mut self, file: &'a Path, callback: &'a FnIr) -> Outcome<'a> {
+        let at = std::ptr::from_ref(callback);
+        if let Some(known) = self.callbacks.get(&at) {
+            return known.clone();
+        }
+        let depth = self.reading.len();
+        let mut out = self.body(file, callback);
+        if out.cycle_at.is_none_or(|cycle| cycle >= depth) {
+            out.cycle_at = None;
+            let cycle_stop = out.ends.is_empty()
+                && out
+                    .stop
+                    .as_ref()
+                    .is_some_and(|(_, reason)| *reason == Stop::Recursion);
+            if !cycle_stop && !self.values.capping() {
+                self.callbacks.insert(at, out.clone());
             }
         }
         out
@@ -2565,7 +2650,7 @@ impl<'a> Walker<'a> {
             let Some(callback) = body.nested.get(*nested) else {
                 return false;
             };
-            let read = self.body(file, callback);
+            let read = self.callback(file, callback);
             !read.ends.is_empty() || read.stop.is_some() || read.missed
         })
     }
@@ -2599,6 +2684,7 @@ impl<'a> Walker<'a> {
                     end,
                     chain,
                     stop,
+                    also: Vec::new(),
                     receiver: None,
                     reached: None,
                     bound: Vec::new(),
@@ -2615,6 +2701,7 @@ impl<'a> Walker<'a> {
                 // the call's own row reads (carrick#2813): the row's hole
                 // would hide that the walk passed code it did not finish.
                 let entered_missed = outcome.missed && outcome.stop.is_none();
+                let (also, valued) = (outcome.also, outcome.valued);
                 let Some((chain, stop)) = outcome.stop else {
                     let own = if entered_missed {
                         None
@@ -2635,6 +2722,9 @@ impl<'a> Walker<'a> {
                             *discovery.counts.entry("no_site".to_string()).or_default() += 1;
                             let at = (self.rel(file), call.site.span_start, call.site.span_end);
                             if missed {
+                                discovery
+                                    .missed_at
+                                    .insert(at.clone(), (call.site.line, call.callee_text.clone()));
                                 discovery.missed_inside.push(at);
                             } else {
                                 discovery.finished.push(at);
@@ -2644,8 +2734,10 @@ impl<'a> Walker<'a> {
                     continue;
                 };
                 // A call whose own row says nothing: the walk never entered
-                // code. Listed with the hole the row names.
+                // code. Listed with the hole the row names. A stop the
+                // callee's values agree on is the walk's, whatever its word.
                 if chain.is_empty()
+                    && !valued
                     && ![
                         Stop::InjectedCallee,
                         Stop::InterfaceMember,
@@ -2668,7 +2760,10 @@ impl<'a> Walker<'a> {
                     .counts
                     .entry(format!("stop/{}", stop.as_str()))
                     .or_default() += 1;
-                discovery.sites.push(record(None, chain, Some(stop)));
+                discovery.sites.push(DiscoverySite {
+                    also,
+                    ..record(None, chain, Some(stop))
+                });
                 continue;
             }
             let mut sibling_routes = 0;
@@ -2711,6 +2806,9 @@ impl<'a> Walker<'a> {
                 if !discovery.sites.iter().any(|site| {
                     site.file == at.0 && site.span_start == at.1 && site.span_end == at.2
                 }) {
+                    discovery
+                        .missed_at
+                        .insert(at.clone(), (call.site.line, call.callee_text.clone()));
                     discovery.missed_inside.push(at);
                 }
             }
@@ -2720,9 +2818,26 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// The definition `key` of `file`, the file as `inputs` keys it.
+    /// The definition `key` of `file`, the file as `inputs` keys it: its
+    /// keyed body, else the function written inside another body that the
+    /// key names ([`Self::written_inside`]).
     fn function(&self, file: &Path, key: &str) -> Option<(&'a Path, &'a FnIr)> {
-        self.values.function(file, key)
+        self.values
+            .function(file, key)
+            .or_else(|| self.written_inside(file, key))
+    }
+
+    /// The function the extractor keys as `key` of `file` when it is written
+    /// inside another body, which keys no body of its own (carrick#2448
+    /// T3c): `const request = async (o) => …` in a factory, a function
+    /// declared in a function, an object's method written there. Found by
+    /// where the key's function node starts, never by its name.
+    fn written_inside(&self, file: &Path, key: &str) -> Option<(&'a Path, &'a FnIr)> {
+        let (path, ir) = self.inputs_for(file).files.get_key_value(file)?;
+        let (Some(start), _) = *ir.definitions.get(key)? else {
+            return None;
+        };
+        Some((path.as_path(), self.values.written_function(file, start)?))
     }
 
     /// The labelled call `invoke` is when the name or member read at
@@ -2924,11 +3039,28 @@ impl<'a> Walker<'a> {
         if known.iter().all(|value| matches!(value, Held::Callback)) {
             return Outcome::stopped(Stop::InjectedCallee).below(&chain);
         }
+        // Why each value reached nothing, where it says: the resolver's
+        // reason, a callback's, or the stop the walk met inside it. A value
+        // that reached nothing and says no reason is `None`.
+        let mut reasons: Vec<Option<Stop>> = Vec::new();
         let mut outcomes: Vec<Outcome<'a>> = known
             .into_iter()
             .map(|value| match value {
-                Held::Reached(outcome) => outcome,
-                _ => Outcome::default(),
+                Held::Reached(outcome) => {
+                    if outcome.ends.is_empty() {
+                        reasons.push(outcome.stop.as_ref().map(|(_, stop)| *stop));
+                    }
+                    outcome
+                }
+                Held::Stop(stop) => {
+                    reasons.push(Some(stop));
+                    Outcome::default()
+                }
+                Held::Callback => {
+                    reasons.push(Some(Stop::InjectedCallee));
+                    Outcome::default()
+                }
+                Held::Param(..) => Outcome::default(),
             })
             .collect();
         if outcomes.len() == 1 {
@@ -2947,7 +3079,13 @@ impl<'a> Walker<'a> {
             out.absorb(outcome);
         }
         if !agree && out.ends.is_empty() {
-            out.stop = Some((Vec::new(), plural.several));
+            // No value reached a labelled export: every one stopped one
+            // way is that way; several ways, or one that says none, are
+            // one of several, with the ways named (carrick#3688 U2, R3).
+            let (stop, also) = agreed_stop(&reasons, plural.several);
+            out.stop = Some((Vec::new(), stop));
+            out.also = also;
+            out.valued = true;
         }
         out.below(&chain)
     }
@@ -3147,6 +3285,7 @@ pub fn discover_with(
         instances,
         values: &values,
         memo: HashMap::new(),
+        callbacks: HashMap::new(),
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
         entered: BTreeMap::new(),
@@ -3256,6 +3395,47 @@ mod tests {
             store_keys(&row("lib:lib.es2015.promise.d.ts"), &[]),
             ["lib:lib.es2015.promise.d.ts"]
         );
+    }
+
+    /// `levels` callbacks, each handed to a promise's `then` inside the last,
+    /// the innermost reaching a call.
+    fn nested_callbacks(levels: usize) -> String {
+        let mut body = "return fetch(\"/api/leaf\");".to_string();
+        for level in 0..levels {
+            body = format!("return Promise.resolve({level}).then((v{level}) => {{ {body} }});");
+        }
+        format!("export function go() {{\n  {body}\n}}\n")
+    }
+
+    /// carrick#3767: a callback handed to a call is walked once, so the time
+    /// discovery takes grows with the nesting, not with two to its power.
+    #[test]
+    fn nested_callbacks_are_walked_once() {
+        let read = |levels: usize| {
+            let source = nested_callbacks(levels);
+            let on = walked(
+                "discovery-nested-callbacks",
+                ".",
+                "web",
+                &[("src/index.ts", &source)],
+                true,
+            )?;
+            let started = std::time::Instant::now();
+            let discovery = discover(&on.inputs, &Labels::of(&[]), &on.repo);
+            Some((discovery, started.elapsed()))
+        };
+        let (Some((small, _)), Some((deep, took))) = (read(3), read(24)) else {
+            return;
+        };
+        // Every call is read, to the end, at either depth: a call for each
+        // level's `resolve` and `then`, and the one inside.
+        for (found, levels) in [(&small, 3), (&deep, 24)] {
+            assert_eq!(found.finished.len(), 2 * levels + 1);
+            assert!(found.missed_inside.is_empty());
+            assert!(found.sites.is_empty());
+            assert_eq!(found.counts["no_site"], 2 * levels + 1);
+        }
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
     }
 
     fn fixture(name: &str) -> PathBuf {
@@ -3665,6 +3845,139 @@ mod tests {
         );
         assert!(end.file.ends_with("r3/client/client.ts"), "{end:?}");
         assert_eq!(end.line, 38, "{end:?}");
+    }
+
+    /// carrick#2448 T3c: a function the extractor keys that is written
+    /// inside another (`const request = async (options) => …` inside
+    /// `createClient`) has no keyed body; the walk enters the function
+    /// written there, under a `<value>` hop at its line, and reaches the send
+    /// at `client.ts:38` rather than stopping `no_body`. The send keeps its
+    /// own site. The answer key is `tests/fixtures/generated-client/README.md`.
+    #[test]
+    fn a_call_into_a_function_written_inside_another_enters_it() {
+        let Some(on) = walked("generated-client", "", "", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        for (file, line) in [
+            ("r3/sdk.ts", 11),
+            ("r3/sdk.ts", 18),
+            ("r3/sdk.ts", 25),
+            ("r3/client/client.ts", 43),
+        ] {
+            let [site] = at(file, line)[..] else {
+                panic!(
+                    "a site at {file}:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            assert_eq!(site.stop, None, "{file}:{line}: {site:?}");
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("lib:lib.dom.d.ts", "fetch"),
+                "{file}:{line}"
+            );
+            assert!(end.file.ends_with("r3/client/client.ts"), "{end:?}");
+            assert_eq!(end.line, 38, "{file}:{line}: {end:?}");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert_eq!(
+                hops.last(),
+                Some(&(VALUE_HOP, 31)),
+                "{file}:{line}: the walk enters `request` as a value"
+            );
+        }
+        // The send keeps its own site, with no chain.
+        let [send] = at("r3/client/client.ts", 38)[..] else {
+            panic!("one site at the send: {:?}", discovery.sites);
+        };
+        assert!(send.chain.is_empty(), "{send:?}");
+    }
+
+    /// carrick#2448 T3c, the other forms: a function declared inside a
+    /// factory, and a method of an object literal the factory holds, each
+    /// sending through `fetch`. A call through what the factory returns
+    /// enters the inner function as a value and reaches the send.
+    #[test]
+    fn a_function_declared_or_held_inside_a_factory_is_entered() {
+        let client = "export const make = (base: string) => {\n\
+            \x20 async function send(path: string) {\n\
+            \x20   return fetch(base + path);\n\
+            \x20 }\n\
+            \x20 const api = {\n\
+            \x20   async load(path: string) {\n\
+            \x20     return fetch(base + path);\n\
+            \x20   },\n\
+            \x20 };\n\
+            \x20 const list = () => send('/a');\n\
+            \x20 const read = () => api.load('/b');\n\
+            \x20 return { list, read };\n\
+            };\n";
+        let use_ = "import { make } from './inner';\n\
+            const c = make('http://localhost');\n\
+            export const a = () => c.list();\n\
+            export const b = () => c.read();\n";
+        let Some(on) = walked(
+            "generated-client",
+            "",
+            "",
+            &[("src/t3c/inner.ts", client), ("src/t3c/use.ts", use_)],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        for (line, send, entered) in [(10, 3, 2), (11, 7, 6)] {
+            let at: Vec<&DiscoverySite> = discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("t3c/inner.ts") && site.line == line)
+                .collect();
+            let [site] = at[..] else {
+                panic!(
+                    "a site at t3c/inner.ts:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            assert_eq!(site.stop, None, "t3c/inner.ts:{line}: {site:?}");
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(end.export, "fetch", "t3c/inner.ts:{line}");
+            assert_eq!(end.line, send, "t3c/inner.ts:{line}: {end:?}");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert_eq!(
+                hops.last(),
+                Some(&(VALUE_HOP, entered)),
+                "t3c/inner.ts:{line}: {hops:?}"
+            );
+        }
     }
 
     /// carrick#2448 T1, soundness rule 2.3.3 across modules: the object a
@@ -4722,6 +5035,51 @@ mod tests {
         );
     }
 
+    /// carrick#3688 U2: a callee whose every value the resolver reads to
+    /// nothing for one reason states that reason, not `several_values`
+    /// (`unread_twice.ts`: both callers spread). Values that stop in
+    /// different ways, or one that says no reason, stay `several_values`
+    /// and name the ways they stopped (`spread.ts`, R3). The answer key is
+    /// `tests/fixtures/resolve-values/README.md`.
+    #[test]
+    fn a_callee_every_value_of_which_stops_one_way_states_that_way() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let discovery = discover(&on.inputs, &Labels::of(&[]), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        let [twice] = at("unread_twice.ts", 4)[..] else {
+            panic!(
+                "a site at unread_twice.ts:4: {:?} {:?}",
+                discovery.sites, discovery.unfollowed
+            );
+        };
+        assert_eq!(
+            (twice.end.as_ref(), twice.stop, twice.also.as_slice()),
+            (None, Some(Stop::UnreadExpression), &[][..])
+        );
+        let [mixed] = at("spread.ts", 8)[..] else {
+            panic!(
+                "a site at spread.ts:8: {:?} {:?}",
+                discovery.sites, discovery.unfollowed
+            );
+        };
+        assert_eq!(
+            (mixed.end.as_ref(), mixed.stop, mixed.also.as_slice()),
+            (
+                None,
+                Some(Stop::SeveralValues),
+                &[Stop::UnreadExpression][..]
+            )
+        );
+    }
+
     /// The seven-hop site has seven hops, and no site sits at the store
     /// initialiser's call.
     #[test]
@@ -5044,7 +5402,7 @@ export function listen(): void {
     #[test]
     fn a_row_without_the_publication_bits_reads_and_names_nothing() {
         let text = concat!(
-            r#"{"v":5,"typescript":"5.9.3","service":"api","files":1}"#,
+            r#"{"v":6,"typescript":"5.9.3","service":"api","files":1}"#,
             "\n",
             r#"{"f":"src/a.ts","h":"00","r":[["call",0,7,"greet","node_modules/p/index.d.ts",1,"p","string",0],["call",9,16,"make","node_modules/p/index.d.ts",3,"p","App",96]]}"#,
             "\n"
@@ -5104,12 +5462,14 @@ export function listen(): void {
         );
     }
 
-    /// carrick#2431: a walk that reaches a definition whose body this pass
-    /// did not read stops there and says so; an optional call is a call. A
-    /// constant object's member is a function of the module, read like any
-    /// other, so the walk follows it (carrick#3356).
+    /// carrick#2431: an optional call is a call. A function declared inside
+    /// another (`loadInner`) keys no body of its own, and the walk enters
+    /// the function written there as a value (carrick#2448 T3c), where it
+    /// stopped `no_body` before. A constant object's member is a function of
+    /// the module, read like any other, so the walk follows it
+    /// (carrick#3356).
     #[test]
-    fn an_unread_body_is_a_stop_and_an_optional_call_is_a_site() {
+    fn a_function_declared_inside_another_is_entered_and_an_optional_call_is_a_site() {
         let edit = [
             (
                 "src/table.ts",
@@ -5129,7 +5489,7 @@ export function listen(): void {
             records_in(&discovery, "services/web/src/table.ts"),
             texts(&[
                 "3 fetch -> lib.dom fetch -",
-                "5 loadInner stop no_body",
+                "5 loadInner -> lib.dom fetch -",
                 "10 fetch -> lib.dom fetch -",
                 "15 table.load -> lib.dom fetch -",
             ])

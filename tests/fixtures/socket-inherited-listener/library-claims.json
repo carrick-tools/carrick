@@ -57,6 +57,27 @@
     },
     {
      "specifier": "@fixture/live-wire",
+     "role": "socket",
+     "label": "socket_client",
+     "side": "client",
+     "classifier": "fixture-classifier",
+     "makes": [],
+     "scopes": [],
+     "ops": [],
+     "reserved": [
+      {
+       "member": "on",
+       "name": "reconnect_attempt",
+       "of": "instance:new",
+       "picker": "fixture-picker"
+      }
+     ],
+     "calls": [],
+     "patterns": [],
+     "export": "Manager"
+    },
+    {
+     "specifier": "@fixture/live-wire",
      "export": "io",
      "role": "socket",
      "label": "socket_client",

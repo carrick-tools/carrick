@@ -3,12 +3,14 @@
   "stores": {
     "shared": ["orders-api", "storefront"],
     "admin": ["admin-api"],
-    "rpc": ["rpc-api"]
+    "rpc": ["rpc-api"],
+    "shelf": ["rpc-shelf"]
   },
   "main_scans": {
     "shared": ["orders-api", "storefront", "orders-api"],
     "admin": ["admin-api"],
-    "rpc": ["rpc-api"]
+    "rpc": ["rpc-api"],
+    "shelf": ["rpc-shelf"]
   },
   "seeds": [
     {
@@ -409,6 +411,140 @@
         ]
       },
       "known_miss": {"stage": "found", "issues": ["carrick#937"]}
+    },
+    {
+      "name": "trpc-called-procedure-removed",
+      "protocol": "trpc",
+      "change": "removed_while_used",
+      "repo": "rpc-shelf",
+      "edits": [
+        {"op": "replace", "file": "api/src/router.ts", "pairs": [["    get: t.procedure.query(() => ({ id: \"1\", title: \"Dune\" })),\n", ""]]}
+      ],
+      "expect": {
+        "title": "not_clean",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
+          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get"}
+        ]
+      },
+      "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
+    },
+    {
+      "name": "trpc-called-procedure-renamed",
+      "protocol": "trpc",
+      "change": "removed_while_used",
+      "repo": "rpc-shelf",
+      "edits": [
+        {"op": "replace", "file": "api/src/router.ts", "pairs": [["    get: t.procedure", "    fetch: t.procedure"]]}
+      ],
+      "expect": {
+        "title": "not_clean",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "delta_new", "label": "GET /api/rpc/shelf.fetch"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
+          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get"}
+        ]
+      },
+      "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
+    },
+    {
+      "name": "trpc-procedure-added-beside-calls",
+      "protocol": "trpc",
+      "change": "delta_only",
+      "repo": "rpc-shelf",
+      "edits": [
+        {"op": "replace", "file": "api/src/router.ts", "pairs": [["    add: t.procedure.input({ title: \"string\" }).mutation(() => ({ id: \"2\" })),\n", "    add: t.procedure.input({ title: \"string\" }).mutation(() => ({ id: \"2\" })),\n    put: t.procedure.input({ title: \"string\" }).mutation(() => ({ id: \"3\" })),\n"]]}
+      ],
+      "expect": {
+        "title": "no_contract_risks",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "delta_new", "label": "POST /api/rpc/shelf.put"}
+        ]
+      }
+    },
+    {
+      "name": "trpc-adapter-mount-moved-with-client",
+      "protocol": "trpc",
+      "change": "delta_only",
+      "repo": "rpc-shelf",
+      "edits": [
+        {"op": "replace", "file": "api/src/server.ts", "pairs": [["app.all(\"/api/rpc/*\"", "app.all(\"/rpc/*\""], ["endpoint: \"/api/rpc\"", "endpoint: \"/rpc\""]]},
+        {"op": "replace", "file": "web/src/shelf.ts", "pairs": [["url: \"/api/rpc\"", "url: \"/rpc\""]]}
+      ],
+      "expect": {
+        "title": "no_contract_risks",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "delta_new", "label": "GET /rpc/shelf.list"},
+          {"kind": "delta_new", "label": "GET /rpc/shelf.get"},
+          {"kind": "delta_new", "label": "POST /rpc/shelf.add"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.list"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
+          {"kind": "delta_removed", "label": "POST /api/rpc/shelf.add"}
+        ]
+      }
+    },
+    {
+      "name": "trpc-adapter-mount-moved-client-stale",
+      "protocol": "trpc",
+      "change": "removed_while_used",
+      "repo": "rpc-shelf",
+      "edits": [
+        {"op": "replace", "file": "api/src/server.ts", "pairs": [["app.all(\"/api/rpc/*\"", "app.all(\"/rpc/*\""], ["endpoint: \"/api/rpc\"", "endpoint: \"/rpc\""]]}
+      ],
+      "expect": {
+        "title": "not_clean",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "delta_new", "label": "GET /rpc/shelf.list"},
+          {"kind": "delta_new", "label": "GET /rpc/shelf.get"},
+          {"kind": "delta_new", "label": "POST /rpc/shelf.add"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.list"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
+          {"kind": "delta_removed", "label": "POST /api/rpc/shelf.add"},
+          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.list"},
+          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get"}
+        ]
+      },
+      "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
+    },
+    {
+      "name": "trpc-router-binding-renamed",
+      "protocol": "trpc",
+      "change": "quiet",
+      "repo": "rpc-shelf",
+      "edits": [
+        {"op": "replace", "file": "api/src/router.ts", "pairs": [["export const appRouter", "export const shopRouter"], ["export type AppRouter = typeof appRouter;", "export type ShopRouter = typeof shopRouter;"]]},
+        {"op": "replace", "file": "api/src/server.ts", "pairs": [["import { appRouter } from", "import { shopRouter } from"], ["router: appRouter", "router: shopRouter"]]},
+        {"op": "replace", "file": "web/src/shelf.ts", "pairs": [["import type { AppRouter }", "import type { ShopRouter }"], ["createClient<AppRouter>", "createClient<ShopRouter>"]]}
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": []
+      }
+    },
+    {
+      "name": "trpc-router-rewritten-unread",
+      "protocol": "trpc",
+      "change": "quiet",
+      "repo": "rpc-shelf",
+      "edits": [
+        {"op": "replace", "file": "api/src/router.ts", "pairs": [["import { t } from \"./kit\";\n", "import { t } from \"./kit\";\n\nfunction keyOf(name: string): string {\n  return name.trim();\n}\n"], ["    list: t.procedure", "    [keyOf(\"list\")]: t.procedure"], ["    get: t.procedure", "    [keyOf(\"get\")]: t.procedure"], ["    add: t.procedure", "    [keyOf(\"add\")]: t.procedure"]]}
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": []
+      },
+      "known_miss": {"stage": "finding", "issues": ["carrick#3778"]}
     },
     {
       "name": "graphql-field-rename",

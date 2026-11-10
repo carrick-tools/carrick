@@ -974,6 +974,12 @@ struct CallIr {
     /// parameter of the callee is handed. A spread is an empty entry, and
     /// the last ([`values`]). Read by discovery alone.
     arg_values: Vec<Vec<ValueAt>>,
+    /// Each argument as the text it states ([`resolve::args_text`],
+    /// carrick#3504 B10-1a): the terms a caller hands a parameter, read by
+    /// position through [`Self::passed_texts`]. `None` at the first spread,
+    /// which ends the list; empty for a JSX element, whose props are no
+    /// positional argument. Read by the text reader's caller mode (B10-1b).
+    arg_texts: Vec<Option<ValueAt>>,
     /// The call is what an `if`, a ternary or a `&&` tests: the branch its
     /// result guards.
     tested: Option<Tested>,
@@ -1045,6 +1051,9 @@ struct Applied {
     open_from: Option<usize>,
     /// What each element may hold; an empty entry from `open_from` on.
     arg_values: Vec<Vec<ValueAt>>,
+    /// What each element states as text; `None` at `open_from`, where the
+    /// list ends, and for an array literal that is no literal.
+    arg_texts: Vec<Option<ValueAt>>,
 }
 
 impl CallIr {
@@ -1117,22 +1126,51 @@ impl CallIr {
     /// by position, as [`CallIr::arg_values`] states a call's own, shifted
     /// as [`Self::passed_arg`] shifts them.
     fn passed_values(&self) -> &[Vec<ValueAt>] {
+        self.passed_by_position(
+            &self.arg_values,
+            |applied| applied.arg_values.as_slice(),
+            Vec::is_empty,
+        )
+    }
+
+    /// What each argument the function this call runs receives states as
+    /// text, by position, as [`CallIr::arg_texts`] states a call's own and
+    /// shifted as [`Self::passed_values`] shifts them (carrick#3504 B10-1a).
+    /// `None` is a spread, which ends the list.
+    fn passed_texts(&self) -> &[Option<ValueAt>] {
+        self.passed_by_position(
+            &self.arg_texts,
+            |applied| applied.arg_texts.as_slice(),
+            Option::is_none,
+        )
+    }
+
+    /// One per-argument list of this call, `own`, as the function a decided
+    /// `call` or `apply` runs receives it: an `apply`'s elements, or a
+    /// `call`'s own past `this`. `spread` says an entry is a spread, which
+    /// moves every position from it on.
+    fn passed_by_position<'s, T>(
+        &'s self,
+        own: &'s [T],
+        applied: impl Fn(&'s Applied) -> &'s [T],
+        spread: impl Fn(&T) -> bool,
+    ) -> &'s [T] {
         match self.language_call.as_deref() {
             Some(LanguageCall {
                 decided: true,
-                applied: Some(applied),
+                applied: Some(from_array),
                 ..
-            }) => &applied.arg_values,
+            }) => applied(from_array),
             Some(LanguageCall {
                 decided: true,
                 applied: None,
                 ..
-            }) => match self.arg_values.first() {
+            }) => match own.first() {
                 // `f.call(...args)`: the spread moves every position.
-                Some(this) if this.is_empty() => &self.arg_values[..1],
-                _ => self.arg_values.get(1..).unwrap_or_default(),
+                Some(this) if spread(this) => &own[..1],
+                _ => own.get(1..).unwrap_or_default(),
             },
-            _ => &self.arg_values,
+            _ => own,
         }
     }
 
@@ -1341,8 +1379,13 @@ struct FnIr {
     /// function's own scope (carrick#2432). Read by discovery alone.
     param_defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
     /// The same defaults as the text they state, for the caller walk to fill
-    /// an omitted argument with (carrick#3504 S2b-2).
-    param_default_texts: Vec<(usize, ValueAt)>,
+    /// an omitted argument with (carrick#3504 S2b-2), with the keys down to
+    /// each (empty for a whole parameter's).
+    param_default_texts: Vec<(usize, Vec<String>, ValueAt)>,
+    /// Every plain name the parameters bind, where each is declared
+    /// ([`resolve::param_bindings`] keys the file's parameter table from
+    /// these, carrick#3504 B10-1a).
+    param_names: Vec<resolve::ParamName>,
     /// Each function written as a parameter's default, read with this
     /// function's own captures (carrick#2813). A value that is one reaches it
     /// here, by where it starts. Discovery's value walk enters it; no site
@@ -1632,6 +1675,12 @@ pub struct FileIr {
     /// its initialiser and every write (the value resolver's binding table,
     /// carrick#3504 S1).
     module_bindings: HashMap<(u32, String), resolve::ModuleBinding>,
+    /// Each name a parameter of any function of the file binds, by the
+    /// 1-based line its name is declared on and the name, as
+    /// [`Self::module_bindings`] is keyed: its function, position and keys
+    /// (carrick#3504 B10-1a). A table of its own, never read by a value
+    /// reader; the text reader reads a parameter through its callers from it.
+    param_bindings: HashMap<(u32, String), resolve::ParamAt>,
     /// Each import (by its local name) this module only reads a member of
     /// and never changes ([`resolve::module_bindings`], carrick#2448).
     kept_imports: HashSet<String>,
@@ -2496,6 +2545,13 @@ pub fn extract_file_ir(
                 }
             });
         }
+        file.param_bindings = resolve::param_bindings(
+            &file.functions,
+            &file.module_level,
+            &file.constructor_defaults,
+            &file.module_bindings,
+            &file.placed_writes,
+        );
     }
     // What a row stated in another module needs to say about a client's
     // base the way this module's own rows say it (carrick#1568). Any file
@@ -6035,6 +6091,7 @@ impl Reader<'_> {
             site: Some(self.site(function.span)),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
+            param_names: values.names,
             local_bindings: values.defaulted_names,
             param_functions,
             ..FnIr::default()
@@ -6096,6 +6153,7 @@ impl Reader<'_> {
             site: Some(self.site(arrow.span)),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
+            param_names: values.names,
             local_bindings: values.defaulted_names,
             param_functions,
             ..FnIr::default()
@@ -6822,7 +6880,17 @@ impl Reader<'_> {
             // carries.
             [path, _base] => {
                 let path = self.eval(&path.expr, scope).pieces();
-                if !matches!(path.first(), Some(Piece::Lit(text)) if text.starts_with('/')) {
+                // The path is a literal starting with `/`, or the function's
+                // own parameter (or a key of one): the caller fills it in, and
+                // `render_target` refuses there a path that does not start
+                // with a literal `/` (an absolute URL replaces the base, so it
+                // is that URL).
+                let readable = match path.first() {
+                    Some(Piece::Lit(text)) => text.starts_with('/'),
+                    Some(first) => first.is_parameter(),
+                    None => false,
+                };
+                if !readable {
                     return Value::hole(self.text(new.span), HoleReason::UnreadExpression);
                 }
                 Value::Str(path)
@@ -8018,6 +8086,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             _ => None,
         };
         let arg_values = self.reader.arg_values(&call.args, self.scope, bound);
+        let arg_texts = resolve::args_text(&call.args, &|lo| lo);
         let language_call = match &call.callee {
             Callee::Expr(callee) => self
                 .reader
@@ -8043,6 +8112,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             callee_values,
             callee_key,
             arg_values,
+            arg_texts,
             tested: self.guard.tested(call.span),
             handed,
             names,
@@ -8129,6 +8199,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 callee_values: Vec::new(),
                 callee_key: None,
                 arg_values: Vec::new(),
+                arg_texts: Vec::new(),
                 tested: None,
                 handed: Vec::new(),
                 names: Vec::new(),

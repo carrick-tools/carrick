@@ -35,14 +35,16 @@
 //! `(start, end, kind)`: TypeScript `getStart()`/`getEnd()` of the node, in
 //! UTF-16 code units from the start of the file, which is what
 //! [`crate::utils::sidecar_position`] gives for an SWC span. [`Kind::Decl`]
-//! rows are the kind several rows share a key of
-//! ([`PositionIndex::union_declarations`]).
+//! rows are one kind several rows share a key of
+//! ([`PositionIndex::union_declarations`]); [`Kind::ReceiverType`] rows are
+//! the other ([`PositionIndex::receiver_declarations`]).
 //!
 //! Version 2 (carrick#2430) added `impl` rows and [`Kind::Jsx`]; version 3
 //! (carrick#2448) added [`Kind::Decl`]; version 4 (carrick#2561) dropped
 //! `impl` rows, whose go-to-implementation search was most of the walk and
 //! which nothing read (carrick#2432 asks for implementations where discovery
-//! stops); version 5 (carrick#2448) added [`Kind::TypedDecl`]. A file of any other version is not
+//! stops); version 5 (carrick#2448) added [`Kind::TypedDecl`]; version 6
+//! added [`Kind::ReceiverType`]. A file of any other version is not
 //! read: its service reads as [`HoleReason::RowsMissing`]. A walk removes any
 //! earlier rows file before it writes. The rows of a service a later laptop
 //! pass carries are used again instead of walked, only when [`kept_rows`]
@@ -73,7 +75,7 @@ use crate::services::type_sidecar::{PositionRowsCounts, SidecarRecipe};
 pub const POSITIONS_DIR: &str = "positions";
 
 /// The format version the header carries.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// The type is `any`, declared or inferred. Never set with [`FLAG_ERROR_TYPE`].
 pub const FLAG_ANY: u8 = 1;
@@ -169,6 +171,16 @@ pub enum Kind {
     /// [`FLAG_PUBLISHED`] / [`FLAG_MODULE_DEFAULT`] bits; no type. None where
     /// the callee symbol is that declaration, or the type is anonymous.
     TypedDecl,
+    /// A `member` row's RECEIVER type: written at the span of
+    /// the object the member is read on, only where the member is declared
+    /// in another package than the class that object's type holds (an `on`
+    /// a socket class inherits from a base package). One row per named class (an interface gets none)
+    /// of the receiver's type after the alias is resolved, so an
+    /// intersection gives several, ordered by declaring file, then position:
+    /// symbol, file, line, package and the [`FLAG_PUBLISHED`] /
+    /// [`FLAG_MODULE_DEFAULT`] bits of the class's declaration; no type.
+    /// Past the cap, one row with [`FLAG_TOO_MANY`] and nothing else.
+    ReceiverType,
 }
 
 /// `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]`.
@@ -535,6 +547,8 @@ struct IndexedFile {
     rows: HashMap<(u32, u32, Kind), Row>,
     /// The [`Kind::Decl`] rows by span, in the order written.
     decls: HashMap<(u32, u32), Vec<Row>>,
+    /// The [`Kind::ReceiverType`] rows by span, in the order written.
+    receivers: HashMap<(u32, u32), Vec<Row>>,
     bound: Bound,
 }
 
@@ -570,6 +584,7 @@ impl PositionIndex {
             .map(|file| {
                 let mut rows = HashMap::new();
                 let mut decls: HashMap<(u32, u32), Vec<Row>> = HashMap::new();
+                let mut receivers: HashMap<(u32, u32), Vec<Row>> = HashMap::new();
                 for row in file.r {
                     if row.kind() == Kind::Ident
                         && let (Some(symbol), Some(library)) = (
@@ -584,6 +599,10 @@ impl PositionIndex {
                     }
                     match row.kind() {
                         Kind::Decl => decls.entry((row.start(), row.end())).or_default().push(row),
+                        Kind::ReceiverType => receivers
+                            .entry((row.start(), row.end()))
+                            .or_default()
+                            .push(row),
                         kind => {
                             rows.insert((row.start(), row.end(), kind), row);
                         }
@@ -596,6 +615,7 @@ impl PositionIndex {
                         skip: file.skip,
                         rows,
                         decls,
+                        receivers,
                         bound: Bound::Unread,
                     },
                 )
@@ -763,6 +783,26 @@ impl PositionIndex {
         let (start, end) = rows_span(text, lo, hi);
         Ok(indexed
             .decls
+            .get(&(start, end))
+            .map(Vec::as_slice)
+            .unwrap_or_default())
+    }
+
+    /// The [`Kind::ReceiverType`] rows at the receiver span `lo..hi`, in the
+    /// order written (by declaring file, then position). None unless the
+    /// member read on that receiver is declared in another package than the
+    /// class the receiver holds; one with [`FLAG_TOO_MANY`] where it names
+    /// none.
+    pub fn receiver_declarations(
+        &self,
+        file: &Path,
+        lo: u32,
+        hi: u32,
+    ) -> Result<&[Row], HoleReason> {
+        let (indexed, text) = self.file(file)?;
+        let (start, end) = rows_span(text, lo, hi);
+        Ok(indexed
+            .receivers
             .get(&(start, end))
             .map(Vec::as_slice)
             .unwrap_or_default())
@@ -1317,6 +1357,77 @@ mod tests {
         assert_eq!(index.union_declarations(&file, base, base + 3), Ok(&[][..]));
     }
 
+    /// The `receiver_type` rows of a receiver share its span
+    /// and are all kept, in the order written, beside an `ident` row there.
+    #[test]
+    fn every_receiver_type_row_at_a_span_is_kept() {
+        let root = Path::new("/repo");
+        let text = "peer.on('a');\n";
+        let class = |symbol: &str, line: u32| {
+            Row(
+                Kind::ReceiverType,
+                0,
+                4,
+                Some(symbol.to_string()),
+                Some("node_modules/wire/index.d.ts".to_string()),
+                Some(line),
+                Some("wire".to_string()),
+                None,
+                FLAG_PUBLISHED,
+            )
+        };
+        assert!(
+            serde_json::to_string(&class("Socket", 2))
+                .unwrap()
+                .starts_with("[\"receiver_type\",")
+        );
+        let rows = RowsFile {
+            header: Header {
+                v: FORMAT_VERSION,
+                typescript: "6.0.2".to_string(),
+                service: "api".to_string(),
+                files: 1,
+            },
+            files: vec![file_rows(
+                "src/a.ts",
+                Some(text),
+                None,
+                vec![
+                    row(Kind::Ident, 0, 4, Some("peer"), 0),
+                    class("Socket", 2),
+                    class("Other", 7),
+                ],
+            )],
+        };
+        let mut index = PositionIndex::of(root, rows);
+        let file = root.join("src/a.ts");
+        index.bind(&file, text);
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        let held: Vec<_> = index
+            .receiver_declarations(&file, base, base + 4)
+            .expect("fresh rows")
+            .iter()
+            .map(|r| (r.symbol(), r.decl_package(), r.decl_line()))
+            .collect();
+        assert_eq!(
+            held,
+            vec![
+                (Some("Socket"), Some("wire"), Some(2)),
+                (Some("Other"), Some("wire"), Some(7))
+            ]
+        );
+        assert_eq!(
+            index
+                .lookup(&file, base, base + 4, Kind::Ident)
+                .map(Row::symbol),
+            Ok(Some("peer"))
+        );
+        assert_eq!(
+            index.receiver_declarations(&file, base, base + 2),
+            Ok(&[][..])
+        );
+    }
+
     /// carrick#2448: a `typed_decl` row shares its call row's span and is
     /// looked up by its own kind; it reads as `typed_decl` in the file.
     #[test]
@@ -1374,21 +1485,21 @@ mod tests {
 
     #[test]
     fn a_line_with_a_key_the_format_does_not_name_is_refused() {
-        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[],\"extra\":1}\n";
         assert!(read_rows(text.as_bytes()).is_err());
     }
 
     #[test]
     fn a_row_is_a_nine_element_array() {
-        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"call\",0,3,\"f\",\"a.ts\",1,null,\"void\",0]]}\n";
         let file = read_rows(text.as_bytes()).expect("a valid file");
         let row = &file.files[0].r[0];
         assert_eq!(row.kind(), Kind::Call);
         assert_eq!((row.start(), row.end()), (0, 3));
         assert_eq!(row.symbol(), Some("f"));
-        let short = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let short = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                      {\"f\":\"a.ts\",\"r\":[[\"call\",0,3]]}\n";
         assert!(read_rows(short.as_bytes()).is_err());
     }
@@ -1398,7 +1509,7 @@ mod tests {
     /// compiler version; a member row, and a declaration in a package, give none.
     #[test]
     fn the_index_names_the_default_library_globals_the_code_uses() {
-        let text = "{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[\
                     [\"ident\",0,5,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
                     [\"ident\",6,9,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
@@ -1434,7 +1545,7 @@ mod tests {
     ) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
         let mut lines = vec![format!(
-            "{{\"v\":5,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
+            "{{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
             files.len()
         )];
         let mut paths = Vec::new();

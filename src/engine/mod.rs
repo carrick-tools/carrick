@@ -2774,7 +2774,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
             &results.cross_repo_matches,
-            &analyzer.pair_directions(),
+            &analyzer.pair_directions_with_sources(),
         );
         // Each consumer's final pair outcomes, for a pull request run to
         // settle the pairs its change cannot reach (carrick#3104).
@@ -6943,12 +6943,15 @@ fn library_rows(
     let Some(ask) = ask else {
         return Default::default();
     };
+    // Every ask path records a failed ask here, the one writer (carrick#3792):
+    // a scan whose ask got no answer has no library facts, which the boundary
+    // says whatever the ask's mode.
+    if let Some(failure) = settled.failure {
+        crate::scan_health::record_library_ask_failed(failure);
+    }
     // A read-only pass (carrick#2907) started no build, so a package it ends
     // without is unknown, as it was before the pass asked: nothing is
     // pending on its account.
-    if let Some(failure) = settled.failure.filter(|_| ask.read_only) {
-        crate::scan_health::record_library_ask_failed(failure);
-    }
     if !ask.read_only {
         crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
             pending: settled.pending,
@@ -6997,6 +7000,7 @@ async fn site_rows_of(
         decided,
         records,
         labels: site_labels,
+        unread,
         handlers,
     } = site_records_of(inputs, root, claims, context);
     let answers = crate::site_questions::ask_service(
@@ -7021,6 +7025,14 @@ async fn site_rows_of(
     rows.rows.retain(|row| {
         !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
     });
+    // The calls the walks stopped at, but none in a mock or test tree: such
+    // a call is no call of the service (carrick#3688 U3).
+    rows.unread = unread
+        .into_iter()
+        .filter(|site| {
+            !protocol_producer_provenance(&root.join(&site.file), repo_path, service).is_mock()
+        })
+        .collect();
     // With the receiver trace on, the routes it serves at a full path
     // (carrick#2474 R3 S1), written into the mount graph by
     // [`apply_traced_routes`].
@@ -7257,6 +7269,9 @@ struct SiteRecordsOf {
     decided: crate::request_summary::decided_sites::Decided,
     records: Vec<crate::request_summary::site_record::SiteRecord>,
     labels: Vec<crate::request_summary::decided_sites::SiteLabel>,
+    /// The calls the walks considered and stopped at, besides the possible
+    /// calls ([`crate::unread_sites::from_scan`], carrick#3688 U3).
+    unread: Vec<crate::unread_sites::UnreadSite>,
     /// With the receiver trace on: the handler records (carrick#2474 R4b)
     /// and how long building them took.
     handlers: Option<(
@@ -7435,6 +7450,7 @@ fn site_records_of(
     SiteRecordsOf {
         discovered: discovery.sites.len(),
         reached_label,
+        unread: crate::unread_sites::from_scan(&discovery, &decided),
         decided,
         records,
         labels,
@@ -8508,9 +8524,15 @@ fn append_deterministic_protocol_operations(
             crate::site_rows::RowSide::Endpoint => to_producer(key, file, line),
         },
     );
-    // A service the site pass never read writes neither key.
+    // A service the site pass never read writes none of the keys.
     if extractions.site.enabled {
-        crate::possible_calls::attach(cloud_data, site.leads.clone());
+        crate::unread_sites::attach(cloud_data, site.unread.clone(), &site.leads);
+        debug!(
+            unread_sites = cloud_data.unread_sites_total.unwrap_or_default(),
+            unread_on_row_line = site.unread_on_row_line,
+            unread_by_reason = ?cloud_data.unread_sites_by_reason,
+            "site questions: unread sites"
+        );
         debug!(
             routes = extractions.site.routes.len(),
             route_kept_reader = site.route_kept_reader,
@@ -8523,6 +8545,11 @@ fn append_deterministic_protocol_operations(
             kept_out = ?site.kept_out,
             socket_disagrees = site.socket_disagrees,
             "site questions: fold"
+        );
+        crate::name_census::log(
+            Path::new(repo_path),
+            &extractions.library,
+            &extractions.site,
         );
     }
     site
@@ -8791,6 +8818,7 @@ fn stated_library_rows(
             .filter(|row| !protocol_producer_provenance(&row.file, repo_path, service).is_mock())
             .cloned()
             .collect(),
+        names: library.names.clone(),
     }
 }
 
@@ -10421,6 +10449,9 @@ fn build_cloud_data_from_mount_graph(
         dispatch_tables: None,
         possible_calls: None,
         possible_calls_omitted: None,
+        unread_sites: None,
+        unread_sites_total: None,
+        unread_sites_by_reason: None,
         call_through: None,
         route_boundaries: None,
         memory_peaks: None,
@@ -14548,6 +14579,73 @@ mod tests {
         );
     }
 
+    /// carrick#3792. A failed ask is recorded for the service on every ask
+    /// path, so the boundary says the scan has no library facts: a 5xx and a
+    /// timeout on an index ask, a refusal on a read-only ask. A clean answer
+    /// records nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_library_ask_is_recorded_on_every_path_and_a_clean_one_is_not() {
+        use crate::library_store::AskFailure;
+        let ask = |read_only| super::LibraryAsk {
+            sites: Default::default(),
+            asked: crate::library_store::Asked::naming(&["ask-failed-pkg"]),
+            read_only,
+            turns: Default::default(),
+        };
+        async fn run(
+            service: &str,
+            ask: super::LibraryAsk,
+            reply: fn() -> Result<String, crate::agent_service::AgentCallError>,
+            hang: bool,
+        ) -> Option<AskFailure> {
+            let name = Some(service.to_string());
+            crate::current_service::scope(name.clone(), async {
+                let settled = crate::library_store::ask_until_settled(
+                    &ask.asked,
+                    |_| async {},
+                    move |_| async move {
+                        if hang {
+                            std::future::pending::<()>().await;
+                        }
+                        reply()
+                    },
+                    None,
+                )
+                .await;
+                super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
+            })
+            .await;
+            crate::scan_health::library_ask_failed_for(name.as_deref())
+        }
+        let fivexx = || {
+            Err(crate::agent_service::AgentCallError::permanent(
+                "internal_error",
+                "502".to_string(),
+            ))
+        };
+        let clean = || Ok(r#"{"library_claims":[]}"#.to_string());
+        assert_eq!(
+            run("ask-failed-5xx", ask(false), fivexx, false).await,
+            Some(AskFailure::Unreachable)
+        );
+        assert_eq!(
+            run("ask-failed-timeout", ask(false), clean, true).await,
+            Some(AskFailure::Unreachable)
+        );
+        assert_eq!(
+            run("ask-failed-read-only", ask(true), fivexx, false).await,
+            Some(AskFailure::Unreachable)
+        );
+        assert_eq!(
+            run("ask-failed-clean", ask(false), clean, false).await,
+            None
+        );
+        assert_eq!(
+            run("ask-failed-clean-ro", ask(true), clean, false).await,
+            None
+        );
+    }
+
     /// carrick#1490: "ran" is what the check did. A check that panics is
     /// reported as not run, with its reason, and leaves no outcomes behind;
     /// one that returns is "ran" whatever it judged.
@@ -16272,6 +16370,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -17294,6 +17395,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -17521,6 +17625,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -17582,6 +17689,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -17690,6 +17800,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -18507,6 +18620,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -18573,6 +18689,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -18652,6 +18771,9 @@ unfollowed_member_calls_total: 0,
                 dispatch_tables: None,
                 possible_calls: None,
                 possible_calls_omitted: None,
+                unread_sites: None,
+                unread_sites_total: None,
+                unread_sites_by_reason: None,
                 call_through: None,
                 route_boundaries: None,
                 memory_peaks: None,
@@ -18740,6 +18862,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -18975,6 +19100,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -19210,6 +19338,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -19355,6 +19486,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -19483,6 +19617,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -27493,6 +27630,7 @@ unfollowed_member_calls_total: 0,
                         LibraryRowKind::Pubsub(PubsubRole::Subscriber),
                     ),
                 ],
+                ..LibraryRows::default()
             },
             ..ProtocolExtractions::default()
         };
@@ -27614,6 +27752,7 @@ unfollowed_member_calls_total: 0,
                     "ready",
                     LibraryRowKind::Pubsub(PubsubRole::Subscriber),
                 )],
+                ..LibraryRows::default()
             },
             ..ProtocolExtractions::default()
         };
@@ -27727,6 +27866,7 @@ unfollowed_member_calls_total: 0,
                 definition(8, "stated", (120, 150), true),
                 definition(11, "not-a-definition", (170, 200), false),
             ],
+            ..LibraryRows::default()
         };
         let withdrawn =
             withdraw_model_routes_at_definitions(&mut mount_graph, &file_results, &library, ".");
@@ -27758,6 +27898,7 @@ unfollowed_member_calls_total: 0,
                 file: PathBuf::from("/repo/svc/src/tasks.ts"),
                 ..definition(2, "send-email", (10, 40), true)
             }],
+            ..LibraryRows::default()
         };
         assert_eq!(
             withdraw_model_routes_at_definitions(
@@ -28661,6 +28802,7 @@ unfollowed_member_calls_total: 0,
                         },
                     ),
                 ],
+                ..LibraryRows::default()
             },
             sockets: crate::socket_io::SocketExtraction {
                 listeners: vec![
@@ -30558,7 +30700,13 @@ io.on("bare:in", (event) => {});
             file_results,
             &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
-            &LibrarySiteIndex::of(&crate::library_claims::LibraryRows { rows }, "/repo"),
+            &LibrarySiteIndex::of(
+                &crate::library_claims::LibraryRows {
+                    rows,
+                    ..Default::default()
+                },
+                "/repo",
+            ),
             "/repo",
         );
         entries
@@ -32433,6 +32581,9 @@ io.on("bare:in", (event) => {});
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,

@@ -364,7 +364,7 @@ fn read_call<'a>(
                 }
                 Held::Reached(Found::Unresolved) => unresolved_import = true,
                 Held::Param(depth, index, keys) => params.push((depth, index, keys)),
-                Held::Reached(Found::Other) | Held::Callback => {}
+                Held::Reached(Found::Other) | Held::Callback | Held::Stop(_) => {}
             }
         }
     }

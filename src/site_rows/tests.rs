@@ -148,6 +148,7 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
             .collect(),
         names: Vec::new(),
         lead: None,
+        unread: None,
         receiver: None,
     }
 }
@@ -2312,4 +2313,75 @@ fn a_socket_fact_of_unknown_direction_leaves_the_socket_pass_row() {
         vec![(key, Some(ResolutionSource::SocketCall), None)]
     );
     assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
+}
+
+/// The name census (carrick#3504 B10-0): each message site is counted by
+/// where the site path's name came from (an HTTP site is no message site), and
+/// each library-reader row by what the site path states at the same place.
+#[test]
+fn the_name_census_counts_each_reader_s_outcome() {
+    use crate::library_claims::{LibraryRow, LibraryRowKind};
+    use crate::request_summary::Piece;
+    use crate::request_summary::decided_sites::Via;
+    let placed = |line: u32, role: &str, name: Vec<Piece>, via: Vec<Via>| {
+        let mut placed = site("src/send.ts", role, "publish", "bus");
+        placed.line = line;
+        placed.span_start = line * 100;
+        placed.span_end = line * 100 + 30;
+        placed.name = name;
+        placed.via = via;
+        placed
+    };
+    let literal = || vec![Piece::Lit("orders".to_string())];
+    let relayed = vec![Via {
+        at: "src/send.ts:3".to_string(),
+        callee: "relay".to_string(),
+    }];
+    let sites = vec![
+        placed(1, "broker", literal(), Vec::new()),
+        placed(2, "broker", literal(), relayed),
+        placed(3, "in_process_bus", Vec::new(), Vec::new()),
+        placed(4, "socket", literal(), Vec::new()),
+        placed(5, "broker", Vec::new(), Vec::new()),
+        placed(6, "http_client", literal(), Vec::new()),
+    ];
+    let mut records: Vec<SiteRecord> = sites.iter().map(|s| record(s, &[], &[])).collect();
+    // Several names the code states: each is a row, none is asked.
+    records[2].names = vec!["a".to_string(), "b".to_string()];
+    records[3] = record(&sites[3], &[], &[Slot::Name]);
+    records[4].bucket = Bucket::Lead;
+    let decided = Decided {
+        sites,
+        ..Decided::default()
+    };
+    assert_eq!(
+        site_names(&decided, &records).line(),
+        "literal_piece=1 filled_param=1 resolver_fold=1 asked=1 unstated=1"
+    );
+
+    let held = a_socket_fact_row();
+    let library_row = |line: u32, name: &str| LibraryRow {
+        file: std::path::PathBuf::from("/repo/src/server-socket.ts"),
+        line,
+        span_start: 0,
+        span_end: 0,
+        kind: LibraryRowKind::Socket {
+            direction: SocketDirection::ServerToClient,
+            listener: false,
+        },
+        name: name.to_string(),
+        name_scope: None,
+        claim_ids: Vec::new(),
+        definition: false,
+    };
+    let parity = crate::name_census::parity(
+        Path::new("/repo"),
+        &[
+            library_row(7, "chat"),
+            library_row(7, "other"),
+            library_row(99, "chat"),
+        ],
+        &[held],
+    );
+    assert_eq!(parity.line(), "absent=1 agrees=1 disagrees=1");
 }

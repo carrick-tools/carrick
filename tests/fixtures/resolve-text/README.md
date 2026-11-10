@@ -52,3 +52,71 @@ Choices (`alt.ts`, carrick#3504 S2b-1): `?:`, `??` and `||` read every branch, n
 
 `selfread.ts`: `p_self` reads itself; the second read is a recursion hole, and
 reading it again gives the same answer (the mark is released).
+
+## Parameters and the calls that fill them (`callers.ts`, carrick#3504 B10-1)
+
+Each `p_*` probe is a call of a `declare function p_<case>(name: string)`;
+the function that makes it is written above and called at the bottom. A
+parameter is in the file's parameter table beside the binding table (never in
+it), by the line and name it is declared on; each call keeps every argument
+as the text it states.
+
+Parameter table (function, position, keys):
+
+| Parameter | Entry |
+|---|---|
+| `one`'s `name` | `one`, 0, no keys |
+| `keyed`'s `topic` | `keyed`, 0, `topic` |
+| `keyedDefault`'s `topic` | `keyedDefault`, 0, `topic`; its default `jobs.default` is kept as text at those keys |
+| `pair`'s `prefix`, `name` | `pair`, 0 and 1 |
+| `defaulted`'s `name` | `defaulted`, 0; not written, not colliding (its own default entry in the binding table is not another binding) |
+| `Bus.send`'s `topic` | `Bus.send`, 0 |
+| the `forEach` callback's `item` | no function (written inside a body), 0 |
+| `written`'s `name` | written: the body assigns it again |
+| `picked`, a callback's parameter on the line of a `const picked` | collides; the `const` stays placeable |
+
+Call arguments (`CallIr::arg_texts`):
+
+| Call | Texts |
+|---|---|
+| `two("order.created")` | `order.created` |
+| `two("order.updated")` | `order.updated` |
+| `two(...names)` | none: a spread ends the list |
+
+What a later reader answers for each probe is that ticket's (B10-1b) key.
+Expected, read through callers: `p_one` `order.created`; `p_two` `order.created`
+and `order.updated`; `p_keyed` `jobs.run`; `p_member` `member.topic`;
+`p_defaulted` `fallback` and `given`; `p_pair` `a:x` and `b:y` only; `p_outer`
+`deep` through two calls; `p_loop` `once`; `p_ping` `m`; `p_grow` `seed` and a
+recursion hole; `p_joined` and `p_lookup` a hole (a part of a larger text never
+takes a caller's text); `p_uncalled` no caller; `p_callback` a callback
+parameter; `p_written` reassigned; `p_runtime` two holes, one per caller;
+`p_send` `bus.sent`.
+
+Read through callers (`Resolver::texts_through_callers`, B10-1b), each value
+carries the calls it was read through, innermost first:
+
+| Probe | Values (text or hole word, then its calls) |
+|---|---|
+| `p_one` | `order.created` at `one("order.created")` |
+| `p_two` | `order.created` at `two("order.created")`; `order.updated` at `two("order.updated")`; `caller_arg_missing` at `two(...names)` |
+| `p_outer` | `deep` at `outer(name)`, then `middle("deep")` |
+| `p_pair` | `a:x` at `pair("a", "x")`; `b:y` at `pair("b", "y")` |
+| `p_keyed` | `jobs.run` at `keyed({ topic: "jobs.run" })` |
+| `p_keyed_default` | `jobs.default` (the key's default) at `keyedDefault({})` |
+| `p_member` | `member.topic` at `member({ topic: "member.topic" })` |
+| `p_defaulted` | `fallback` (the default) at `defaulted()`; `given` at `defaulted("given")` |
+| `p_uncalled` | `name_never_bound`, no call |
+| `p_callback` | `callback_parameter`, no call |
+| `p_written` | `reassigned`, no call |
+| `p_shared` (a parameter on the line of a `const` of its name) | `reassigned`, no call |
+| `p_loop` | `once` at `loop("once")`; the call `loop(name)` adds nothing |
+| `p_ping` | `m` at `ping("m")`; the `ping`/`pong` cycle adds nothing |
+| `p_grow` | `seed` at `grow("seed")`; `recursion` at `grow(name + "/x")` |
+| `p_joined`, `p_lookup` | `unread_expression`, no call: a part of one text never takes a caller's text |
+| `p_runtime` | two holes, one at each `runtime(...)` call |
+| `p_send` | `bus.sent` |
+
+Read without callers (every other entry point), a parameter answers as
+before: `p_one` is `parameter_unread`, `p_defaulted` is `unread_expression`
+and `fallback`.

@@ -467,6 +467,22 @@ pub struct CompatVerdictSite {
     /// This site's RESPONSE direction. See [`CompatVerdict::response`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<DirectionVerdict>,
+    /// Which layer the rows behind this site's pairing come from (plan B1,
+    /// cloud#1421): `fact` when the producer rows and this call are all
+    /// stated by the source, `candidate` when any is the model's or the scan
+    /// holds no row for the call. The same fold the site's `type_mismatch`
+    /// finding carries as `edge_source`, so a reader of the blob never
+    /// re-derives it from the routes' and calls' `resolution_source`.
+    ///
+    /// Absent when unstated (a row recorded no source), and on a blob written
+    /// before the field: readers take absence as "not stated", never
+    /// "candidate", as they do on the finding. Per site, not per pair: two
+    /// sites on one pair can rest on different rows.
+    ///
+    /// Whether the type side was reached is already per direction
+    /// (`resolved`), so no `verdict_state` is stored beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_source: Option<crate::findings::EdgeSource>,
 }
 
 /// A consumer call that reaches a producer endpoint through a published npm
@@ -876,16 +892,37 @@ pub struct CloudRepoData {
     /// whose path, event name or method the code does not state. Labelled
     /// leads for the agent, never rows; nothing in matching, the type check,
     /// the findings or the PR result reads them. At most
-    /// [`crate::possible_calls::MAX_PER_SERVICE`] per service.
+    /// [`crate::possible_calls::MAX_PER_SERVICE`] per service. The projection
+    /// of [`Self::unread_sites`]'s listed rows (carrick#3688 U3) until that
+    /// field's readers are deployed.
     ///
-    /// Written only when `CARRICK_SITE_QUESTIONS=1`. Additive and optional:
-    /// `None` is "this scan did not write the field" (the switch was off, or
-    /// the blob predates it), never "no possible calls".
+    /// Written wherever the site pass reads the service, on both scan
+    /// branches. Additive and optional: `None` is "this scan did not write
+    /// the field" (the site pass did not read the service, or the blob
+    /// predates it), never "no possible calls".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possible_calls: Option<Vec<crate::possible_calls::PossibleCall>>,
     /// How many possible calls were left out past the cap. Absent when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possible_calls_omitted: Option<u32>,
+    /// Every call site the fact layer considered and did not state as a row,
+    /// each with the one reason it stopped (carrick#3688 U3,
+    /// [`crate::unread_sites`]): the possible calls, and the calls whose walk
+    /// stopped with no labelled library call. At most
+    /// [`crate::unread_sites::MAX_PER_SERVICE`] per service, labelled rows
+    /// first. Never a row, never an input to matching, findings or the PR
+    /// result. Written wherever the site pass reads the service. Additive
+    /// and optional: `None` is "this scanner did not state it", never "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites: Option<Vec<crate::unread_sites::UnreadSite>>,
+    /// The exact count of unread sites, past the cap too. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_total: Option<u32>,
+    /// The exact count of unread sites per reason, past the cap too. Absent
+    /// when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_by_reason:
+        Option<std::collections::BTreeMap<crate::request_summary::Stop, u32>>,
     /// What the call-through pass reads of this service from another one
     /// (carrick#2378): its model rows at calls through its own code, its
     /// definitions that hand back a request's parsed body, and its calls
@@ -1178,6 +1215,9 @@ impl CloudRepoData {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -1915,6 +1955,8 @@ fn merge_site(sites: &mut Vec<CompatVerdictSite>, incoming: CompatVerdictSite) {
     {
         merge_direction(&mut existing.request, &incoming.request);
         merge_direction(&mut existing.response, &incoming.response);
+        existing.edge_source =
+            crate::findings::EdgeSource::combine(existing.edge_source, incoming.edge_source);
         return;
     }
     sites.push(incoming);
@@ -2000,6 +2042,7 @@ pub fn attach_compat_verdicts(
                 consumer_location: format!("{file}:{line}"),
                 request: dirs.request.as_ref().map(direction_verdict),
                 response: dirs.response.as_ref().map(direction_verdict),
+                edge_source: dirs.edge_source,
             };
             let row = CompatVerdict {
                 producer_repo: m.producer_repo.clone(),
@@ -2872,6 +2915,9 @@ mod tests {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -3954,6 +4000,7 @@ mod tests {
                 consumer_location: "src/a.ts:1".to_string(),
                 request: None,
                 response: Some(compatible_direction(false)),
+                edge_source: None,
             }],
             scanner_version: "0.3.93".to_string(),
         }]);
@@ -4195,6 +4242,58 @@ mod tests {
              the worst site's"
         );
         assert!(fine.reason.is_none());
+    }
+
+    /// Plan B1 (cloud#1421): each stored site carries the scanner's
+    /// `edge_source` fold, it survives the blob round trip, a site whose
+    /// source is unstated writes no key, and a site from a blob written
+    /// before the field reads as unstated.
+    #[test]
+    fn a_stored_site_carries_its_edge_source() {
+        use crate::findings::EdgeSource;
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let stated = edge_at(
+            "producer",
+            "http|POST|/x",
+            "consumer",
+            "http|POST|/x",
+            "src/a.ts:3",
+        );
+        let unstated = edge_at(
+            "producer",
+            "http|POST|/x",
+            "consumer",
+            "http|POST|/x",
+            "src/b.ts:9",
+        );
+        let dirs = directions(&[
+            incompatible_outcome(&stated, ManifestTypeKind::Request, "request mismatch"),
+            compatible_outcome(&unstated, ManifestTypeKind::Request),
+        ])
+        .with_edge_source(&stated, Some(EdgeSource::Fact))
+        .with_edge_source(&unstated, None);
+        attach_compat_verdicts(&mut payloads, &[stated, unstated], &dirs);
+
+        let raw = serde_json::to_value(&payloads[0]).unwrap();
+        let sites = raw["compat_verdicts"][0]["sites"].as_array().unwrap();
+        assert_eq!(sites[0]["consumer_location"], "src/a.ts:3");
+        assert_eq!(sites[0]["edge_source"], "fact");
+        assert!(
+            !sites[1].as_object().unwrap().contains_key("edge_source"),
+            "an unstated source writes no key: {}",
+            sites[1]
+        );
+
+        let back: CloudRepoData = serde_json::from_value(raw).unwrap();
+        let row = &back.compat_verdicts.unwrap()[0];
+        assert_eq!(row.sites[0].edge_source, Some(EdgeSource::Fact));
+        assert_eq!(row.sites[1].edge_source, None);
+
+        let old: CompatVerdictSite = serde_json::from_str(
+            r#"{"consumer_location":"src/a.ts:3","request":{"verdict":"compatible","resolved":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.edge_source, None);
     }
 
     /// THE PIN: the pair-level directions are the worst-wins fold of the sites

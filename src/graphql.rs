@@ -548,6 +548,25 @@ pub fn scan_repo(
     scan_walk_roots(&roots, declared_schemas, service_files)
 }
 
+/// A whole `.graphql` file's extraction. Text that is neither a schema nor a
+/// document is recorded on the scan's one unread-source list as
+/// `does_not_parse`, so the count, the PR delta and MCP name the file
+/// (carrick#3758). An empty file is no failure. A tagged template in a source
+/// file is a site, not a file, and stays with the unread-sites series (#3688).
+fn parse_graphql_file(content: &str, path: &Path) -> Option<GraphqlExtraction> {
+    if content.trim().is_empty() {
+        return Some(GraphqlExtraction::default());
+    }
+    let parsed = parse_document_text(content, path, 1);
+    if parsed.is_none() {
+        crate::scan_health::record_unread_source(
+            &path.to_string_lossy(),
+            crate::findings::FileNotReadReason::DoesNotParse,
+        );
+    }
+    parsed
+}
+
 /// [`scan_repo`] over a service's walk roots ([`service_walk_roots`]).
 pub fn scan_walk_roots(
     scan_roots: &[WalkRoot],
@@ -566,7 +585,9 @@ pub fn scan_walk_roots(
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        let declared = extract_from_document_text(&content, path, 1);
+        let Some(declared) = parse_graphql_file(&content, path) else {
+            continue;
+        };
         extraction.producers.extend(declared.producers);
         for (name, declaration) in declared.input_declarations {
             extraction
@@ -582,7 +603,9 @@ pub fn scan_walk_roots(
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        extraction.merge(extract_from_document_text(&content, &path, 1));
+        if let Some(parsed) = parse_graphql_file(&content, &path) {
+            extraction.merge(parsed);
+        }
     }
 
     for file in service_files {
@@ -1676,10 +1699,19 @@ pub fn extract_from_document_text(
     file_path: &Path,
     base_line: u32,
 ) -> GraphqlExtraction {
+    parse_document_text(text, file_path, base_line).unwrap_or_default()
+}
+
+/// [`extract_from_document_text`], with `None` when the text parses as neither
+/// a schema nor an executable document, so a caller that reads a whole file
+/// can record it as unread (carrick#3758).
+fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<GraphqlExtraction> {
     let mut extraction = GraphqlExtraction::default();
+    let mut parsed = false;
     let to_line = |pos_line: usize| base_line.saturating_add(pos_line.saturating_sub(1) as u32);
 
     if let Ok(schema) = graphql_parser::parse_schema::<String>(text) {
+        parsed = true;
         use graphql_parser::schema::{Definition, TypeDefinition, TypeExtension};
 
         // Root operation type names default to Query/Mutation/Subscription
@@ -1777,11 +1809,12 @@ pub fn extract_from_document_text(
         // schema, not an executable document — done, even if no root fields
         // were found (e.g. a file defining only `type User`).
         if has_type_system_definitions {
-            return extraction;
+            return Some(extraction);
         }
     }
 
     if let Ok(document) = graphql_parser::parse_query::<String>(text) {
+        parsed = true;
         use graphql_parser::query::Definition;
 
         let fragments = crate::graphql_selection::fragments_of(&document);
@@ -1838,7 +1871,7 @@ pub fn extract_from_document_text(
         }
     }
 
-    extraction
+    parsed.then_some(extraction)
 }
 
 /// A root field's argument list, or `None` when it declares no argument.
@@ -2443,6 +2476,38 @@ mod tests {
         let mut keys: Vec<String> = ops.iter().map(|op| op.key.canonical()).collect();
         keys.sort();
         keys
+    }
+
+    #[test]
+    fn a_graphql_file_that_does_not_parse_is_on_the_unread_list() {
+        let repo = tempfile::tempdir().unwrap();
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("good.graphql"), "type Query { item: String }").unwrap();
+        std::fs::write(src.join("broken_schema.graphql"), "type Query { item: ").unwrap();
+        std::fs::write(src.join("broken_document.graphql"), "query Q { item ").unwrap();
+        std::fs::write(src.join("empty.graphql"), "  \n").unwrap();
+        let service = "graphql-unread-3758".to_string();
+        crate::scan_health::forget_service_losses(Some(&service));
+        let extraction = crate::current_service::sync_scope(Some(service.clone()), || {
+            scan_repo(std::slice::from_ref(&src), &[], &[])
+        });
+        let unread = crate::scan_health::unread_sources_for(Some(&service));
+        crate::scan_health::forget_service_losses(Some(&service));
+        let mut named: Vec<String> = unread
+            .iter()
+            .map(|(path, reason)| {
+                assert_eq!(*reason, crate::findings::FileNotReadReason::DoesNotParse);
+                Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into()
+            })
+            .collect();
+        named.sort();
+        assert_eq!(named, ["broken_document.graphql", "broken_schema.graphql"]);
+        assert_eq!(keys(&extraction.producers), ["graphql|query|item"]);
     }
 
     #[test]

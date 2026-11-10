@@ -50,7 +50,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::decided_sites::Calls;
 use super::library_sites::{LinkedNames, TextPiece, text_pieces};
-use super::resolve::{Resolver, ValueAt, text_of};
+use super::resolve::{Resolver, ValueAt, args_text, text_of};
 use super::{
     CallIr, CallWalker, FileIr, FnIr, ImportBinding, Piece, Reader, Reassigned,
     RequestSummaryInputs, Scope, Site, Value, keyed_names, member_prop, prop_name,
@@ -117,6 +117,13 @@ pub enum HoleReason {
     OwnFunction,
     /// A named function nothing calls, hands on or exports.
     NoCallerNotExported,
+    /// A parameter of a definition nothing calls: no caller names what it
+    /// holds (the text reader's caller mode, carrick#3504 B10-1b).
+    NameNeverBound,
+    /// A parameter of a function written inside a body (a callback, or a
+    /// lambda held in a local): what runs it fills it, and no caller index
+    /// keys it (carrick#3504 B10-1b).
+    CallbackParameter,
     /// A function written in a body that is held in a local, returned or
     /// assigned rather than handed to a call.
     DetachedUnplaced,
@@ -151,6 +158,10 @@ pub enum HoleReason {
     /// (carrick#2541). No one path is its, so a URL holding it states no
     /// row. It serialises only into guard chain ends and never into a row.
     SeveralPaths,
+    /// A parameter of a function of the run, read by a reader that does not
+    /// read through callers: its value is in the function's callers, inside
+    /// the service (carrick#3795).
+    ParameterUnread,
 }
 
 /// Where a compared value comes from, before any access is applied to it.
@@ -1533,6 +1544,7 @@ impl CallWalker<'_, '_, '_> {
             callee_values: Vec::new(),
             callee_key: None,
             arg_values: self.reader.arg_values(args, self.scope, bound),
+            arg_texts: args_text(args, &|lo| lo),
             tested: None,
             handed: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),
@@ -1593,6 +1605,7 @@ impl CallWalker<'_, '_, '_> {
             callee_values: self.reader.callee_values(&call.callee, self.scope, bound),
             callee_key: None,
             arg_values: self.reader.arg_values(&call.args, self.scope, bound),
+            arg_texts: args_text(&call.args, &|lo| lo),
             tested: None,
             handed: self.reader.handed(&call.args, self.scope, bound),
             names: self.reader.arg_names(&call.args, self.scope),
@@ -2349,12 +2362,14 @@ impl<'a> Chains<'a> {
             // Exactly one text is the literal; several, or a hole, keep the
             // term as written (carrick#3504 S7c).
             GuardLiteral::Term { term, written } => {
+                // Why the term is no one text is the dispatch record's gap
+                // (carrick#3688 R10): the case stays unknown on the edge.
                 match self.resolver.text_of_value(self.nodes[node].file, term) {
-                    Some(text) => {
+                    Ok(text) => {
                         let shape = shape_of(&text);
                         (text, shape, None)
                     }
-                    None => (written.clone(), GuardShape::Unresolved, None),
+                    Err(_) => (written.clone(), GuardShape::Unresolved, None),
                 }
             }
         }

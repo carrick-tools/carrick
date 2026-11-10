@@ -1,0 +1,29 @@
+name: npm lockfile
+
+# npm/carrick/package-lock.json must agree with package.json, or `npm ci`
+# fails (carrick#3676, #3789). Deliberately not part of ci.yml's ci-result: the
+# platform entries' hashes exist only once a release is published, so between
+# the publish and the refresh PR (release.yml, job lock-refresh) merging,
+# main's lockfile lags by design, and a gating check would fail every PR and
+# stop the merge queue. It runs on the refresh PR, which must be right, and on
+# pushes to main, where a failure is a red run on that commit: the alert.
+# Skipped on every other PR and in the merge queue.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  npm-lock:
+    name: npm lockfile agrees with package.json
+    if: github.event_name == 'push' || startsWith(github.head_ref, 'lock-refresh-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Lockfile and package.json agree
+        run: python3 scripts/npm-lock-version.test.py

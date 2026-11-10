@@ -171,6 +171,22 @@ pub struct SiteObject {
 }
 
 impl SiteArg {
+    /// Whether the argument's text, or one of its keys', is written through
+    /// a module-scope binding ([`TextPiece::Named`]), as written and before
+    /// the binding is read.
+    pub(super) fn names_a_binding(&self) -> bool {
+        let named = |pieces: &Vec<TextPiece>| {
+            pieces
+                .iter()
+                .any(|piece| matches!(piece, TextPiece::Named(_)))
+        };
+        self.holes.as_ref().is_some_and(named)
+            || self
+                .object
+                .as_ref()
+                .is_some_and(|object| object.holes.values().any(named))
+    }
+
     /// Whether a parameter is in the argument's text, or in one of its
     /// keys' (carrick#1562).
     pub(super) fn has_holes(&self) -> bool {
@@ -549,6 +565,11 @@ pub struct LibrarySite {
     /// this call filled in, so what the library call states itself is never
     /// stated again here.
     pub origin: Option<SiteCall>,
+    /// An argument's name is written through a module-scope binding (a
+    /// constant, an entry of a constant object, a builder), before it is read
+    /// ([`SiteArg::names_a_binding`]). Read only by the name census
+    /// ([`crate::name_census`]); no row depends on it.
+    pub linked: bool,
 }
 
 impl LibrarySite {
@@ -1210,6 +1231,7 @@ impl SiteReader<'_> {
             // that returned it.
             let contested = client.contested_message || !client.returned.is_empty();
             let args = self.names.resolved_all(self.file, &site.args);
+            let linked = site.args.iter().any(SiteArg::names_a_binding);
             let library = match &client.instance {
                 None => LibrarySite {
                     file: self.file.to_path_buf(),
@@ -1228,6 +1250,7 @@ impl SiteReader<'_> {
                     uses: client.member_uses.clone(),
                     export_uses: client.export_uses.clone(),
                     origin: None,
+                    linked,
                 },
                 Some(_) => {
                     // What an own call holds is what the function returns,
@@ -1293,6 +1316,7 @@ impl SiteReader<'_> {
                         uses,
                         export_uses,
                         origin: None,
+                        linked,
                     }
                 }
             };

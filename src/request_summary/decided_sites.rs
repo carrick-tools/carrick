@@ -78,6 +78,10 @@ pub use router_holder::router_holder;
 /// the call runs (carrick#2432, [`super::discovery`]).
 pub(super) const VALUE_HOP: &str = "<value>";
 
+/// The hop discovery records where a walk enters a callback written at the
+/// call, which the callee runs ([`super::discovery`]).
+pub(super) const CALLBACK_HOP: &str = "<callback>";
+
 /// The labelled call a discovery site reaches: the store key of the package
 /// (`lib:lib.dom.d.ts` for the language's own library), the export and member, the
 /// store role and op, and where the call is.
@@ -904,11 +908,47 @@ pub struct DecidedLead {
     pub reason: Stop,
 }
 
+/// A discovered call this pass stopped at with a reason and listed as no
+/// lead (carrick#3688 U3): a labelled call it could not place, and a walk up
+/// the callers that reached a function it had already passed. Read only by
+/// [`crate::unread_sites`]; never a possible call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecidedStop {
+    pub file: String,
+    pub line: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// The callee as written, where the stop is at a discovered call.
+    pub callee: Option<String>,
+    /// Functions the walk entered from this call.
+    pub depth: u32,
+    pub end: LabelledEnd,
+    pub reason: Stop,
+}
+
+impl DecidedStop {
+    /// Discovery's site whose labelled call `end` this pass could not place.
+    fn unplaced(site: &DiscoverySite, end: &LabelledEnd) -> Self {
+        DecidedStop {
+            file: site.file.clone(),
+            line: site.line,
+            span_start: site.span_start,
+            span_end: site.span_end,
+            callee: Some(site.callee.clone()),
+            depth: site.chain.len() as u32,
+            end: end.clone(),
+            reason: Stop::Unplaced,
+        }
+    }
+}
+
 /// What [`decided_sites`] finds.
 #[derive(Debug, Default)]
 pub struct Decided {
     pub sites: Vec<DecidedSite>,
     pub leads: Vec<DecidedLead>,
+    /// The calls this pass stopped at and listed as no lead ([`DecidedStop`]).
+    pub stops: Vec<DecidedStop>,
     /// Discovery sites whose labelled call this pass could not place in the
     /// summaries' inputs, by `file:line`.
     pub unplaced: Vec<String>,
@@ -1996,11 +2036,11 @@ impl<'a> Walk<'a, '_> {
             return filled(pieces, call);
         };
         filled_with(pieces, call, &|index| {
-            let (_, text) = function
+            let (_, _, text) = function
                 .param_default_texts
                 .iter()
-                .find(|(position, _)| *position == index)?;
-            self.resolver.text_of_value(at, text)
+                .find(|(position, keys, _)| *position == index && keys.is_empty())?;
+            self.resolver.text_of_value(at, text).ok()
         })
     }
 
@@ -2274,6 +2314,27 @@ impl<'a> Walk<'a, '_> {
         }
     }
 
+    /// A call the walk stopped at for `why` and lists as no lead
+    /// ([`DecidedStop`]); a sibling's call is that sibling's.
+    fn stopped(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Stop) {
+        if !self.calls.is_own(placed.file) {
+            return;
+        }
+        let stop = DecidedStop {
+            file: relative(self.root, placed.file),
+            line: placed.call.site.line,
+            span_start: placed.call.site.span_start,
+            span_end: placed.call.site.span_end,
+            callee: Some(placed.call.callee_text.clone()),
+            depth: u32::from(placed.depth),
+            end: end.clone(),
+            reason: why,
+        };
+        if !self.out.stops.contains(&stop) {
+            self.out.stops.push(stop);
+        }
+    }
+
     /// Drops the sites two walks disagreed on ([`Walk::withdrawn`]).
     fn drop_withdrawn(&mut self) {
         let withdrawn = &self.withdrawn;
@@ -2365,6 +2426,7 @@ impl<'a> Walk<'a, '_> {
         }
         let here = (placed.file.to_path_buf(), key.to_string());
         if path.contains(&here) {
+            self.stopped(&placed, end, Stop::Recursion);
             return;
         }
         path.push(here);
@@ -3025,6 +3087,7 @@ fn decide(
         walk.label = Some(label);
         let Some(last) = calls.at_span(&root.join(&end.file), end.span_start, end.span_end) else {
             unplaced.push(format!("{}:{}", site.file, site.line));
+            walk.out.stops.push(DecidedStop::unplaced(site, end));
             continue;
         };
         // A call above the labelled call, when that call is the site.
@@ -3081,6 +3144,7 @@ fn decide(
                 walk.site(&chain, end, Vec::new(), BTreeSet::new());
             } else {
                 unplaced.push(format!("{}:{}", site.file, site.line));
+                walk.out.stops.push(DecidedStop::unplaced(site, end));
             }
             continue;
         };
@@ -3151,6 +3215,16 @@ fn decide(
                     && matches!(other.chain.as_slice(), [only] if only == hop)
             })
         {
+            continue;
+        }
+        // A call that reaches the labelled call through a callback written
+        // at a call of its own (`guard(key, () => verify(key))`): the call
+        // inside the callback is a site of its own, with the rest of this
+        // chain, and decides the request. Walking up from the labelled call
+        // here would reach that call again through every other caller of
+        // the functions below it, as a second request its own chain does
+        // not state (carrick#3712).
+        if inner_call_decides(discovered, site) {
             continue;
         }
         let Some(chain) = place_chain(&calls, root, site, &last) else {
@@ -3390,16 +3464,24 @@ fn route_ways(
     };
     // A name written again may hold a value no reader states at the call:
     // its first value is no way the route is served.
-    if values
-        .iter()
-        .any(|value| matches!(value, TextValue::Hole(super::HoleReason::Reassigned)))
-    {
+    if values.iter().any(|value| {
+        matches!(
+            value,
+            TextValue::Hole {
+                reason: super::HoleReason::Reassigned,
+                ..
+            }
+        )
+    }) {
         return Vec::new();
     }
+    // A text a caller decides (carrick#3504 B10-1b) is read past as a hole.
     let texts: BTreeSet<String> = values
         .into_iter()
         .filter_map(|value| match value {
-            TextValue::Text { text, .. } if !text.is_empty() => Some(text),
+            TextValue::Text { text, callers, .. } if !text.is_empty() && callers.is_empty() => {
+                Some(text)
+            }
             _ => None,
         })
         .collect();
@@ -3475,7 +3557,7 @@ fn maker_base(
             // An options object the resolver cannot read keeps today's
             // host-free reading, counted: ruled on once main's check
             // reports it (R3).
-            super::resolve::ArgTexts::Unread => {
+            super::resolve::ArgTexts::Unread(_) => {
                 reads.options_unread += 1;
                 MadeBase::None
             }
@@ -3503,10 +3585,12 @@ fn agreed_text(values: &[TextValue]) -> MadeBase {
     let mut texts: BTreeSet<&str> = BTreeSet::new();
     for value in values {
         match value {
-            TextValue::Text { text, .. } => {
+            // A text a caller decides (carrick#3504 B10-1b) is no base the
+            // maker always has.
+            TextValue::Text { text, callers, .. } if callers.is_empty() => {
                 texts.insert(text);
             }
-            TextValue::Hole(_) => return MadeBase::Unstated,
+            TextValue::Text { .. } | TextValue::Hole { .. } => return MadeBase::Unstated,
         }
     }
     let mut texts = texts.into_iter();
@@ -3890,6 +3974,23 @@ fn value_down<'a>(
     }
     down.push(*last);
     Some(down)
+}
+
+/// Whether `site`'s chain passes a callback written at a call that is
+/// itself a discovered site, which reaches the same labelled call with the
+/// hops after the callback (carrick#3712): that call decides the request,
+/// and `site` is the same request seen from the call that runs it.
+fn inner_call_decides(discovered: &[DiscoverySite], site: &DiscoverySite) -> bool {
+    site.chain.iter().enumerate().any(|(at, hop)| {
+        hop.function == CALLBACK_HOP
+            && discovered.iter().any(|other| {
+                other.end == site.end
+                    && other.stop.is_none()
+                    && other.file == hop.file
+                    && other.line == hop.line
+                    && other.chain[..] == site.chain[at + 1..]
+            })
+    })
 }
 
 fn place_chain<'a>(
@@ -6295,6 +6396,48 @@ pub(crate) mod tests {
                 several("services/app/src/main.ts", 8),
                 several("services/app/src/main.ts", 12),
             ],
+            "{:?}",
+            decided.leads
+        );
+    }
+
+    /// carrick#3712: a call that hands a callback to a function and reaches
+    /// the labelled call through it (`guarded(id, () => verify(id))`) is the
+    /// call inside the callback seen one level higher: that call is a site
+    /// of its own, and decides the request. The outer call is no site, and
+    /// its walk does not reach the inner call a second time with another
+    /// request the inner call's own chain does not state. The answer key is
+    /// `tests/fixtures/callback-wrapped-call/README.md`.
+    #[test]
+    fn a_call_through_a_callback_whose_inner_call_is_a_site_adds_no_site() {
+        let Some((on, sites, labels)) = sibling_sites("callback-wrapped-call") else {
+            return;
+        };
+        let [app, client] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let decided = decided_sites_with(app, &[client], &on.repo, &sites, &labels);
+        let found: Vec<(String, u32, Option<String>)> = decided
+            .sites
+            .iter()
+            .map(|site| (site.file.clone(), site.line, site.name_text()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![(
+                "services/app/src/main.ts".to_string(),
+                18,
+                Some("/auth/token".to_string())
+            )],
+            "{:?} leads {:?}",
+            decided.sites,
+            decided.leads
+        );
+        assert!(
+            decided
+                .leads
+                .iter()
+                .all(|lead| lead.reason != Stop::SeveralOperations),
             "{:?}",
             decided.leads
         );

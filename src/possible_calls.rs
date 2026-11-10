@@ -81,7 +81,7 @@ impl PossibleCall {
 }
 
 /// The protocol word for a store role.
-fn kind_of(role: &str) -> Option<&'static str> {
+pub(crate) fn kind_of(role: &str) -> Option<&'static str> {
     match role {
         "http_client" | "server_framework" => Some("http"),
         "graphql_client" => Some("graphql"),
@@ -95,7 +95,7 @@ fn kind_of(role: &str) -> Option<&'static str> {
 /// that requests or sends consumes a route; a server both receives and
 /// replies as part of the route it serves, so both produce; elsewhere a send
 /// produces and a receive consumes.
-fn role_of(role: &str, op: Option<&str>) -> Option<&'static str> {
+pub(crate) fn role_of(role: &str, op: Option<&str>) -> Option<&'static str> {
     if role == "server_framework" {
         return matches!(op?, "receive" | "send").then_some("producer");
     }
@@ -108,7 +108,7 @@ fn role_of(role: &str, op: Option<&str>) -> Option<&'static str> {
     }
 }
 
-fn labelled_end(end: &LabelledEnd) -> LabelledEndRef {
+pub(crate) fn labelled_end(end: &LabelledEnd) -> LabelledEndRef {
     LabelledEndRef {
         package: end.package.clone(),
         export: end.export.clone(),
@@ -116,7 +116,7 @@ fn labelled_end(end: &LabelledEnd) -> LabelledEndRef {
     }
 }
 
-fn slot_of(role: &str) -> &'static str {
+pub(crate) fn slot_of(role: &str) -> &'static str {
     if matches!(role, "http_client" | "server_framework") {
         "path"
     } else {
@@ -125,8 +125,11 @@ fn slot_of(role: &str) -> &'static str {
 }
 
 /// Why a decided site's name is unstated: an identifier the compiler reads
-/// as `any` with no declaration is an import the scan could not read.
-/// Otherwise nothing says, and the call was not checked on this scan.
+/// as `any` with no declaration is an import the scan could not read, the
+/// narrower fact; else the hole the resolver met reading the name
+/// (carrick#3688 U2), whose text reader reads every declaration it cannot
+/// enter as `outside_service`. Otherwise nothing says, and the call was not
+/// checked on this scan.
 fn reason_of(record: &SiteRecord) -> Stop {
     let unreadable = record.compiler().is_some_and(|compiler| {
         compiler.names.iter().any(|name| {
@@ -136,13 +139,12 @@ fn reason_of(record: &SiteRecord) -> Stop {
         })
     });
     if unreadable {
-        Stop::UnresolvedImport
-    } else {
-        Stop::Unanswered
+        return Stop::UnresolvedImport;
     }
+    record.unread.unwrap_or(Stop::Unanswered)
 }
 
-fn from_lead(lead: &DecidedLead) -> PossibleCall {
+pub(crate) fn from_lead(lead: &DecidedLead) -> PossibleCall {
     PossibleCall {
         file_path: lead.file.clone(),
         line_number: lead.line,
@@ -205,7 +207,7 @@ pub fn from_sites(decided: &Decided, records: &[SiteRecord]) -> Vec<PossibleCall
 /// operations are labelled by class only (the document names the operation,
 /// read by [`crate::graphql_document_sites`]), so such a call is not listed
 /// as a possible call. Every other export with no op is (carrick#2515).
-fn class_only_graphql(lead: &DecidedLead) -> bool {
+pub(crate) fn class_only_graphql(lead: &DecidedLead) -> bool {
     lead.reason == Stop::NoOpClaim && lead.end.role == "graphql_client"
 }
 
@@ -239,7 +241,9 @@ pub fn cap(mut rows: Vec<PossibleCall>) -> (Vec<PossibleCall>, usize) {
     (rows, omitted)
 }
 
-/// Write a service's possible calls on its blob.
+/// Write a service's possible calls on its blob. Its one caller is
+/// [`crate::unread_sites::attach`], which writes them from the unread
+/// sites' listed rows (carrick#3688 U3).
 pub fn attach(data: &mut CloudRepoData, rows: Vec<PossibleCall>) {
     let (rows, omitted) = cap(rows);
     data.possible_calls = Some(rows);
@@ -491,5 +495,58 @@ mod tests {
             written_reason(Stop::SeveralOperations),
             "several_operations"
         );
+    }
+
+    /// A lead record built from a name the resolver read to a hole
+    /// (`unread`, carrick#3688 U2), whose compiler names nothing typed
+    /// `any`: a reason chosen by the record's own names alone would say
+    /// `unanswered`. The row says the hole.
+    fn lead_record(unread: Option<Stop>) -> SiteRecord {
+        use crate::request_summary::site_record::{AnchorAt, TypeAnchors};
+        let state = serde_json::from_value(serde_json::json!({
+            "point": { "at": "src/emit.ts:4", "code": "" },
+            "compiler": { "names": [], "callees": [], "enclosing": null, "reached": [] },
+            "syntax": [],
+            "libraries": [],
+            "call": null,
+            "stated": { "names": [], "methods": [] },
+            "asked": [],
+            "forced": {},
+        }))
+        .unwrap();
+        SiteRecord {
+            state,
+            anchors: TypeAnchors {
+                call: AnchorAt {
+                    file: "src/emit.ts".to_string(),
+                    line: 4,
+                    span_start: 40,
+                    span_end: 60,
+                },
+                payload: None,
+                payload_at: None,
+                handler: None,
+                key: None,
+            },
+            payloads: Default::default(),
+            basis: Default::default(),
+            names: Vec::new(),
+            bucket: Bucket::Lead,
+            lead: Some("name_unstated"),
+            unread,
+            receiver: None,
+        }
+    }
+
+    #[test]
+    fn a_lead_record_names_its_hole() {
+        let reason = |unread| {
+            let found = from_sites(&Decided::default(), &[lead_record(unread)]);
+            assert_eq!(found.len(), 1, "{found:?}");
+            found[0].unread.reason
+        };
+        assert_eq!(reason(Some(Stop::Reassigned)), Stop::Reassigned);
+        // The control: a record whose name met no hole keeps today's word.
+        assert_eq!(reason(None), Stop::Unanswered);
     }
 }

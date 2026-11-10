@@ -38,6 +38,12 @@ miss moves the declaration in the same PR. A seed is removed only by
   mounted under `/api/v1`; `src/web/orders-view.ts` calls one procedure through
   a typed client. Its library answers are `procedure-router`'s. It has a store
   of its own for the same reason as `admin-api`.
+- `rpc-shelf` (carrick#3778) is two services in one repo, with a store of its
+  own: `api` serves a `shelf` procedure router (`shelf.list`, `shelf.get`,
+  `shelf.add`) under a fetch adapter at `/api/rpc`, and `web` calls it through
+  a typed client whose router type is imported from `api`. One call
+  (`shelf.gone`) is to a procedure nothing serves; it is no row. Its library
+  answers are the server labels of `rpc-api` plus the client's.
 
 This tree is an answer key. Do not edit it, or a seed's edit, to make a run
 pass. A seed that fails today is `#[ignore]` with the issue that fixes it; that
@@ -90,6 +96,13 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `trpc-resolver-body` (`rpc-api`) | a mutation's body | empty delta, no introduced risk | passes |
 | `trpc-adapter-prefix-moved` (`rpc-api`) | the adapter's endpoint `/api/trpc` to `/trpc` | every procedure new under `/trpc`, removed under `/api/trpc` | passes |
 | `trpc-output-field-removed` (`rpc-api`) | `orders.list` output loses `total`, which the client reads | `type_mismatch` at `src/web/orders-view.ts:7` | ignored, carrick#937 (no procedure client call is read) |
+| `trpc-called-procedure-removed` (`rpc-shelf`) | `shelf.get`, which `web` calls, is deleted from the router | delta removed `GET /api/rpc/shelf.get`; the correct check also carries `removed_still_called` and fails | stage test passes; `_marking` ignored, carrick#3778 |
+| `trpc-called-procedure-renamed` (`rpc-shelf`) | `get` to `fetch` in the router only | delta new `.../shelf.fetch`, removed `.../shelf.get`; correct check fails | as above |
+| `trpc-procedure-added-beside-calls` (`rpc-shelf`) | `shelf.put` mutation added | delta new `POST /api/rpc/shelf.put`, no risk | passes |
+| `trpc-adapter-mount-moved-with-client` (`rpc-shelf`) | adapter `/api/rpc` to `/rpc`, client `url` with it | three new under `/rpc`, three removed under `/api/rpc`, no risk | passes |
+| `trpc-adapter-mount-moved-client-stale` (`rpc-shelf`) | adapter moves, client `url` stays | the delta rows; the correct check fails (the client now misses the mount) | stage test passes; `_marking` ignored, carrick#3778 |
+| `trpc-router-binding-renamed` (`rpc-shelf`) | `appRouter` to `shopRouter`, alias and client import with it | empty delta, no risk | passes |
+| `trpc-router-rewritten-unread` (`rpc-shelf`) | the `shelf` keys written as computed keys the reader cannot read | the correct check sees no change; main posts three removed rows | stage test passes; `_marking` ignored, carrick#3778 |
 | `graphql-field-added` | `OrderView` gains nullable `note` (schema, resolver type, the answer's resolver line) | no introduced risk, no call left without a producer, empty delta | passes (carrick#3172) |
 | `graphql-root-added` | a root query `orders` no client calls | as above; delta new `QUERY orders` | passes (carrick#3172) |
 | `graphql-resolver-body` | the `order` resolver's body | as above, empty delta | passes (carrick#3172) |

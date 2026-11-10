@@ -29,6 +29,26 @@ pub(in crate::request_summary) fn text_of(expr: &Expr, shift: &dyn Fn(u32) -> u3
     lower(expr, shift, 0)
 }
 
+/// What each argument of a call states as text, by position, the way
+/// [`text_of`] reads one (carrick#3504 B10-1a): the terms a caller hands a
+/// parameter, kept for the text reader to read a parameter through its
+/// callers. A spread is `None` and ends the list: it moves every position
+/// from it on, as [`super::Resolver::arg_values`] ends its own.
+pub(in crate::request_summary) fn args_text(
+    args: &[ExprOrSpread],
+    shift: &dyn Fn(u32) -> u32,
+) -> Vec<Option<ValueAt>> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg.spread.is_some() {
+            out.push(None);
+            break;
+        }
+        out.push(Some(text_of(&arg.expr, shift)));
+    }
+    out
+}
+
 fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
     if depth > MAX_TEXT_DEPTH {
         return ValueAt::Unread;

@@ -2900,7 +2900,11 @@ mod evidence_tests {
                 producer_wider: false,
             })
         };
-        let edge = |request, response| EdgeDirections { request, response };
+        let edge = |request, response| EdgeDirections {
+            request,
+            response,
+            edge_source: None,
+        };
         assert!(edge(direction(true), direction(true)).resolved());
         assert!(edge(None, direction(true)).resolved());
         assert!(!edge(direction(true), direction(false)).resolved());

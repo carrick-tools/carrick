@@ -692,6 +692,59 @@ jobs:
           SOURCE_SHA: ${{ needs.target.outputs.sha }}
         run: bash scripts/release-artifacts.sh announce-cli "${{ needs.target.outputs.tag_name }}"
 
+  # release-please bumps the npm lockfile's versions, but the five
+  # @carrick-tools/cli-* entries carry a `resolved` URL and `integrity` hash
+  # that exist only once the version is published, so `npm ci` fails on main
+  # until they are refreshed (carrick#3789). Once publish has succeeded, this
+  # opens a mechanical PR doing exactly that (scripts/npm-lock-refresh.py,
+  # tests: scripts/npm-lock-refresh.test.py). It merges on green like the other
+  # pin PRs. Its own job so a failure here never touches a publish.
+  #
+  # The PR is opened with release-please's token when set: a PR opened with the
+  # default GITHUB_TOKEN starts no workflows, so its required check would never
+  # run (the same reason release-please takes that token above).
+  lock-refresh:
+    needs: [target, publish]
+    if: ${{ needs.target.outputs.publish == 'true' && needs.target.outputs.is_latest == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Refresh the platform entries and open the PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          LOCK=npm/carrick/package-lock.json
+          HAVE=$(node -p "require('./$LOCK').version")
+          if [ "$HAVE" != "$VERSION" ]; then
+            echo "::notice::main's lockfile is at $HAVE, not $VERSION; a newer release owns the refresh."
+            exit 0
+          fi
+          python3 scripts/npm-lock-refresh.py "$VERSION" "$LOCK"
+          if git diff --quiet -- "$LOCK"; then
+            echo "The lockfile already carries the $VERSION entries; nothing to open."
+            exit 0
+          fi
+          BRANCH="lock-refresh-$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add "$LOCK"
+          git commit -m "chore(npm): refresh lockfile platform entries to $VERSION" \
+            -m "Mechanical: the five @carrick-tools/cli-* entries take the published version's resolved URL and integrity (carrick#3789)."
+          git push --force origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "chore(npm): refresh lockfile platform entries to $VERSION" \
+            --body "Mechanical, opened by release.yml after $VERSION was published. Only the five \`node_modules/@carrick-tools/cli-*\` entries change (version, resolved, integrity), from \`npm view\`. Merges on green. Refs #3789."
+
   # The VS Code extension, packaged at the release version and published to the
   # galleries. Its own job on purpose: the extension is a manifest that starts
   # `carrick lsp --stdio`, so a gallery that is down, a token that expired or a

@@ -7,7 +7,9 @@ name: Auto release
 # wires it. Plan: speed-cleanup T15.
 #
 # Ships OFF: the job acts only when the repo variable AUTO_RELEASE_ENABLED is
-# 'true'. A workflow_dispatch with dry_run (the default) prints the decision
+# 'true'. The step readies and enqueues with secrets.RELEASE_PLEASE_TOKEN, as
+# release.yml does: a PR readied or enqueued with the default token starts no
+# merge_group CI. A workflow_dispatch with dry_run (the default) prints the decision
 # and enqueues nothing, whatever the variable says.
 
 on:
@@ -48,7 +50,7 @@ jobs:
           fetch-tags: true
       - name: Decide and enqueue
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           AUTO_RELEASE_ENABLED: ${{ vars.AUTO_RELEASE_ENABLED }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
