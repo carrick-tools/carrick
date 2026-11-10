@@ -2821,7 +2821,13 @@ impl Analyzer {
                 // or param-only producer absorbing an arbitrary call). The
                 // call is ROUTED, so it is not a missing endpoint, but not
                 // MATCHED: no verified mark, no cross-repo edge.
-                carrick_match::PairOutcome::NoLiteralAgreement => {}
+                //
+                // `ProcedureUnserved`: the call names a procedure no row
+                // serves. A reading gap or an unindexed service, never a
+                // missing endpoint (no call reaches here with a procedure
+                // until the client reader states one).
+                carrick_match::PairOutcome::NoLiteralAgreement
+                | carrick_match::PairOutcome::ProcedureUnserved => {}
                 carrick_match::PairOutcome::Matched
                 | carrick_match::PairOutcome::RouteCaseUnknown => {
                     // The dispatch case is part of an operation's identity,
@@ -9898,7 +9904,7 @@ mod tests {
         // The crate pins the same file (`crates/carrick-match/tests/
         // pairing_vectors.rs` `PINNED_SHA256`); re-pin both together.
         const PINNED_SHA256: &str =
-            "02c72f03cdc00bd538b6b3ee1f9d768d7b766698574032d32c7a6c7ad1b41868";
+            "07c1bc20d1274486c2183853a76fa3869d75eaf5ecad598eb37451a581638e5c";
         let digest: String = Sha256::digest(VECTORS)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -9915,6 +9921,16 @@ mod tests {
                     .unwrap_or_else(|err| panic!("{id}: producers: {err}"));
             let call: carrick_match::Call = serde_json::from_value(case["input"]["call"].clone())
                 .unwrap_or_else(|err| panic!("{id}: call: {err}"));
+            // A call that names a procedure is paired by the pool alone: the
+            // scanner states no procedure on a call or an endpoint yet, so
+            // its matchers cannot be driven by these cases. Its own test
+            // arrives with the rows that carry one. An empty call path is
+            // the same call as the scanner reads it: the route-shape gate
+            // drops an empty target before pairing, so it reports nothing
+            // (the pool still answers `unknown_call_path`).
+            if call.procedure.is_some() || call.path.as_deref() == Some("") {
+                continue;
+            }
             let expect = &case["expect"];
             let outcome = expect["outcome"].as_str().expect("outcome");
             let winners = expect["winners"].as_array().expect("winners");

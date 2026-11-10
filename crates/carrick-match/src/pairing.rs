@@ -9,6 +9,11 @@
 //! `tests/pairing_vectors.rs` natively and by the wasm smoke in
 //! `.github/workflows/ci.yml` over the wasm build the cloud pins.
 //!
+//! - A call that names a procedure (tRPC and other RPC routers) pairs first,
+//!   before any protocol rule: its winners are every producer whose
+//!   [`ProcedureKey`] equals the call's, in input order. Nothing equal is
+//!   [`PairOutcome::ProcedureUnserved`], never a missing endpoint. The call's
+//!   path and method are not read.
 //! - GraphQL, socket and pub/sub: a producer pairs when protocol, name and
 //!   (socket) direction are equal and [`names_pair`] holds. Every such
 //!   producer is a winner; there is no ranking.
@@ -32,6 +37,30 @@ use crate::{
 
 /// The protocol label of an HTTP row. Every other label pairs by exact key.
 const HTTP: &str = "http";
+
+/// Where a procedure router is declared: the repository, its repo-relative
+/// `/`-separated file, and the name the router is bound to (`default` for an
+/// `export default`). The scanner computes it with one function for both
+/// sides, so equal values name one router.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct RouterId {
+    pub repo: String,
+    pub file: String,
+    pub binding: String,
+}
+
+/// The identity of an RPC procedure: its key path inside a router and that
+/// router. The base, the mount and the HTTP method are transport, never part
+/// of it: two rows are the same operation when the whole key is equal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct ProcedureKey {
+    pub path: String,
+    pub router: RouterId,
+}
 
 /// One producer row in the pool: a route, an SDL root field, a socket
 /// listener or a pub/sub subscriber, as the index stores it.
@@ -71,6 +100,9 @@ pub struct Producer {
     /// route definition. An unknown string throws.
     pub evidence: MatchEvidence,
     pub name_scope: Option<NameScope>,
+    /// The procedure this row serves, when it is a procedure row. The row
+    /// keeps its HTTP key; a call that names a procedure pairs on this alone.
+    pub procedure: Option<ProcedureKey>,
 }
 
 /// One call: an HTTP request, a GraphQL operation, a socket emit or a
@@ -94,6 +126,9 @@ pub struct Call {
     /// on [`Producer::dispatch`].
     pub dispatch: Option<String>,
     pub name_scope: Option<NameScope>,
+    /// The procedure the call names. When set it decides the pairing and the
+    /// call's path and method are not read.
+    pub procedure: Option<ProcedureKey>,
 }
 
 /// What a call is to the pool as a whole.
@@ -118,6 +153,9 @@ pub enum PairOutcome {
     NoLiteralAgreement,
     /// No producer routes the call.
     NoRoute,
+    /// The call names a procedure no row serves under its router: a reading
+    /// gap or an unindexed service, never a missing endpoint. No winner.
+    ProcedureUnserved,
 }
 
 /// One producer the call pairs with.
@@ -183,6 +221,8 @@ pub struct PairingPool {
     http_by_method: HashMap<String, Vec<usize>>,
     /// Non-HTTP producers by (protocol, name, direction), in input order.
     by_key: HashMap<(String, String, Option<String>), Vec<usize>>,
+    /// Procedure producers by procedure key, in input order.
+    by_procedure: HashMap<ProcedureKey, Vec<usize>>,
 }
 
 fn method_key(method: &str) -> String {
@@ -193,7 +233,14 @@ impl PairingPool {
     pub fn new(producers: Vec<Producer>) -> Self {
         let mut http_by_method: HashMap<String, Vec<usize>> = HashMap::new();
         let mut by_key: HashMap<(String, String, Option<String>), Vec<usize>> = HashMap::new();
+        let mut by_procedure: HashMap<ProcedureKey, Vec<usize>> = HashMap::new();
         for (index, producer) in producers.iter().enumerate() {
+            if let Some(procedure) = &producer.procedure {
+                by_procedure
+                    .entry(procedure.clone())
+                    .or_default()
+                    .push(index);
+            }
             if producer.protocol == HTTP {
                 if let Some(method) = &producer.method {
                     http_by_method
@@ -216,6 +263,7 @@ impl PairingPool {
             producers,
             http_by_method,
             by_key,
+            by_procedure,
         }
     }
 
@@ -226,10 +274,33 @@ impl PairingPool {
 
     /// Which producers `call` reaches, and what the call is to the pool.
     pub fn pair(&self, call: &Call) -> Pairing {
+        if let Some(procedure) = &call.procedure {
+            return self.pair_procedure(call, procedure);
+        }
         if call.protocol == HTTP {
             self.pair_http(call)
         } else {
             self.pair_exact_key(call)
+        }
+    }
+
+    fn pair_procedure(&self, call: &Call, procedure: &ProcedureKey) -> Pairing {
+        let winners: Vec<Winner> = self
+            .by_procedure
+            .get(procedure)
+            .into_iter()
+            .flatten()
+            .map(|&index| self.winner(index, call, MatchVerdict::Matched, None))
+            .collect();
+        let outcome = if winners.is_empty() {
+            PairOutcome::ProcedureUnserved
+        } else {
+            PairOutcome::Matched
+        };
+        Pairing {
+            outcome,
+            winners,
+            routed: Vec::new(),
         }
     }
 
@@ -367,12 +438,13 @@ impl PairingPool {
         agreement: Option<u32>,
     ) -> Winner {
         let producer = &self.producers[index];
-        let call_param_over_route_literal = (producer.protocol == HTTP).then(|| {
-            call_param_over_route_literal(
-                producer.path.as_deref().unwrap_or(""),
-                call.path.as_deref().unwrap_or(""),
-            )
-        });
+        let call_param_over_route_literal = (call.procedure.is_none() && producer.protocol == HTTP)
+            .then(|| {
+                call_param_over_route_literal(
+                    producer.path.as_deref().unwrap_or(""),
+                    call.path.as_deref().unwrap_or(""),
+                )
+            });
         Winner {
             producer: index,
             verdict,
