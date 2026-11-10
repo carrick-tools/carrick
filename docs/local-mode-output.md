@@ -169,7 +169,6 @@ uploads the index it builds. No model runs on this machine.
     "commit_hash": "a1b2c3d4e5f6",
     "files_attempted": 0,
     "files_lost": { "total": 0 },
-    "unemitted_literal_candidates": 12,
     "consumers_not_resolved": { "total": 0 },
     "sdk_unresolved": { "total": 0 },
     "unknown_call_paths": { "total": 0 },
@@ -177,7 +176,7 @@ uploads the index it builds. No model runs on this machine.
     "model_rows_joined": 0,
     "model_contradictions_discarded": 0
   },
-  "boundary_note": "candidates: not classified locally (no model runs on this machine). A route registered on a typed receiver (`app.get(\"/x\", h)`) and a call whose URL is built at the call site are classified by the model in the hosted index and are absent here: 12 route-literal call site(s) counted and unclassified in this service."
+  "boundary_note": "candidates: not classified locally (no model runs on this machine). A route registered on a typed receiver (`app.get(\"/x\", h)`) and a call whose URL is built at the call site are classified by the model in the hosted index and are absent here."
 }
 ```
 
@@ -515,8 +514,7 @@ unresolved since your edit
 boundary (catalog-web): candidates: not classified locally (no model runs on
 this machine). A route registered on a typed receiver (`app.get("/x", h)`) and
 a call whose URL is built at the call site are classified by the model in the
-hosted index and are absent here: 0 route-literal call site(s) counted and
-unclassified in this service.
+hosted index and are absent here.
   catalog-web at 4b96017: 0 file(s) sent to the analyzer
 ```
 
