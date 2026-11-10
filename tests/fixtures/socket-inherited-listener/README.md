@@ -38,6 +38,23 @@ type is not the class's printed name. `Socket` is generic here, and
 | `w:lifecycle` | `typed.ts:28` | `socket.io.on`: a property named like the `io` export. No row |
 | `h:joined` | `hooks.tsx:12` | `.tsx` hook returning a closure over an alias intersection |
 
+## A class that inherits the member but is not the labelled export
+
+`@fixture/live-store` labels `on` under `default` and `Client`. Its `Client`
+extends `Emitter`; its `Cursor`, written `export default class Cursor` in an
+inner module and re-exported as `Cursor`, extends `Flow` from
+`@fixture/flow-base`, which the store does not label.
+
+| Event | Listener | Held as | Wanted |
+| --- | --- | --- | --- |
+| `s:message` | `store.ts:4` | parameter typed `Client` | `library_claim` row |
+| `data` | `store.ts:9` | local from `client.cursor()`, a `Cursor` | no row, no lead |
+| `s:bus` | `store.ts:15` | parameter typed by a repo class extending `Client` | `library_claim` row; a gap today: the class's `receiver_type` row names the repo class, not the labelled base, and the line reads as an in-process bus row (not asserted) |
+
+`shared` (`store.ts:18`) constructs a `Client`, so the scan asks the store
+about `@fixture/live-store`; a package imported only for its types is not
+asked.
+
 The compiler engine writes a `receiver_type` row at each receiver beside the
 member row (`src/sidecar/test/position-rows-receiver-type.test.ts`). Until the
 scanner reads those rows, `w:tagged` and `h:joined` read as in-process event

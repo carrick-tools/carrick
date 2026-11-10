@@ -131,6 +131,13 @@ fn endpoint_rows() -> BTreeSet<String> {
                 row["resolution_source"].as_str().unwrap_or_default()
             ));
         }
+        for lead in blob["possible_calls"].as_array().into_iter().flatten() {
+            rows.insert(format!(
+                "lead-at {service} {}:{}",
+                lead["file_path"].as_str().unwrap_or_default(),
+                lead["line_number"]
+            ));
+        }
     }
     rows
 }
@@ -221,6 +228,28 @@ fn a_listener_on_a_type_only_import_reads_under_its_class() {
     assert!(
         rows.contains(&wanted),
         "missing `{wanted}`; scan holds:\n{listing}"
+    );
+}
+
+/// `@fixture/live-store` labels `on` under its `default` and `Client`
+/// exports. `Cursor` is the `export default class` of an inner module that
+/// inherits `on` from an unlabelled base package: it is not the package's
+/// `default`, so its listener states no row and no lead. The labelled
+/// client's own listener, read in the same scan, keeps its row.
+#[test]
+fn a_library_class_inheriting_a_member_from_an_unlabelled_base_takes_no_label() {
+    let rows = endpoint_rows();
+    let listing = rows.iter().cloned().collect::<Vec<_>>().join("\n");
+    let kept = library_row("store.ts", "\"s:message\"", "s:message");
+    assert!(
+        rows.contains(&kept),
+        "missing `{kept}`; scan holds:\n{listing}"
+    );
+    let line = line_of("store.ts", "cursor.on(");
+    let at = format!("services/client/src/store.ts:{line}");
+    assert!(
+        !rows.iter().any(|row| row.contains(&at)),
+        "a row or lead stands at {at}; scan holds:\n{listing}"
     );
 }
 
