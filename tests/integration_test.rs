@@ -364,3 +364,53 @@ fn test_no_duplicate_processing_regression() {
         stdout
     );
 }
+
+#[test]
+fn a_scan_names_a_file_it_could_not_read_and_says_no_call_matches() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let root = temp_dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"unread-demo","private":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/ok.ts"),
+        "export function ok(): number {\n  return 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/broken.ts"),
+        "export function handler(req: any, res: any) {\n  res.send({ ok: true };\n}\n",
+    )
+    .unwrap();
+
+    // The Action's form: path ".", run from the checkout.
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .arg(".")
+        .current_dir(root)
+        .env("CARRICK_MOCK_ALL", "1")
+        .env(carrick::preflight::ALLOW_ENV, "1")
+        .output()
+        .expect("Failed to execute carrick");
+    let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8 in stdout");
+    if !output.status.success() {
+        eprintln!("STDOUT:\n{}", stdout);
+        eprintln!("STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
+    }
+    assert!(output.status.success(), "Carrick command failed");
+
+    assert!(
+        stdout.contains("Carrick could not read `src/broken.ts` because it does not parse."),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("All cross-service calls match"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(root.to_string_lossy().as_ref()),
+        "the block must not carry the temp dir's absolute path: {stdout}"
+    );
+}

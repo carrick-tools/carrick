@@ -506,6 +506,12 @@ pub struct ApiAnalysisResult {
     /// Why the remaining SDK calls produced no edge, aggregated per package
     /// and reason. Filled in alongside `sdk_edges`.
     pub sdk_unresolved: Vec<crate::cloud_storage::SdkUnresolved>,
+    /// Source files this scan could not read (carrick#3748), from the run's
+    /// one unread list (`scan_health`). Not produced by the analyzer: the
+    /// engine fills it before the report is rendered, so the result block
+    /// never says every call matches while a file went unread. Empty
+    /// everywhere else.
+    pub unread_files: Vec<crate::findings::FileNotRead>,
     /// GraphQL libraries detected across all scanned repos (subset of
     /// `detected_data_fetchers`). When libraries are present but no
     /// operations were extracted, the formatter suggests committing an
@@ -3684,6 +3690,7 @@ impl Analyzer {
             // reads the peer blobs, which the analyzer does not hold.
             sdk_edges: Vec::new(),
             sdk_unresolved: Vec::new(),
+            unread_files: Vec::new(),
             detected_graphql_libraries,
             graphql_operations_indexed,
             cross_repo_matches,

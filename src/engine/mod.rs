@@ -2687,6 +2687,21 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     }
     results.sdk_edges = sdk_join.edges().to_vec();
     results.sdk_unresolved = sdk_join.unresolved();
+    // The result block names the files this scan could not read, from the
+    // same list the PR delta and the functions block read (carrick#3748).
+    results.unread_files = {
+        let mut files: Vec<crate::findings::FileNotRead> = unread_sources
+            .iter()
+            .map(|source| crate::findings::FileNotRead {
+                file: source.place.file.clone(),
+                service: source.place.service.clone(),
+                reason: source.reason,
+                operations: Vec::new(),
+            })
+            .collect();
+        files.sort_by(|a, b| (&a.service, &a.file).cmp(&(&b.service, &b.file)));
+        files
+    };
     for (id, boundary) in &mut boundaries {
         boundary.fold_sdk_unresolved(&sdk_join.unresolved_for(id));
     }

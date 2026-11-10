@@ -1,5 +1,5 @@
 use crate::analyzer::ApiAnalysisResult;
-use crate::findings::{BreakStatus, Finding, PrDelta, Topology, tier};
+use crate::findings::{BreakStatus, FileNotRead, Finding, PrDelta, Topology, tier};
 use std::collections::{BTreeMap, BTreeSet};
 
 // Display helpers for the wire [`Topology`]. Defined here (not in
@@ -112,8 +112,10 @@ pub fn format_analysis_results(
         total_issues,
         has_baseline,
         topology,
+        shown_unread_count(&result.unread_files),
     ));
     output.push_str("\n\n");
+    output.push_str(&format_unread_files(&result.unread_files));
 
     output.push_str(&format_pr_delta(
         pr_delta,
@@ -290,6 +292,7 @@ fn format_verdict(
     total_issues: usize,
     has_baseline: bool,
     topology: &Topology,
+    unread_shown: usize,
 ) -> String {
     let kind = if !categorized.risks.is_empty() || !categorized.degraded_types.is_empty() {
         "CAUTION"
@@ -356,7 +359,9 @@ fn format_verdict(
         ));
     }
 
-    let summary = if parts.is_empty() {
+    let summary = if parts.is_empty() && unread_shown > 0 {
+        "Nothing to flag in the files Carrick read".to_string()
+    } else if parts.is_empty() {
         "Nothing to flag".to_string()
     } else {
         join_human(&parts)
@@ -378,6 +383,63 @@ fn format_verdict(
         topology.scope_phrase(),
         baseline_note
     )
+}
+
+/// At most this many unread files are named; the rest are counted.
+const UNREAD_FILES_SHOWN: usize = 5;
+
+/// The unread files whose reason is shown (see `FileNotReadReason::phrase`).
+fn shown_unread(unread: &[FileNotRead]) -> Vec<&FileNotRead> {
+    unread
+        .iter()
+        .filter(|file| file.reason.phrase().is_some())
+        .collect()
+}
+
+fn shown_unread_count(unread: &[FileNotRead]) -> usize {
+    shown_unread(unread).len()
+}
+
+/// The warning block that names the files this scan could not read, so the
+/// result never says every call matches while one went unread (carrick#3748).
+/// Empty when there are none to show. Words follow the PR check's.
+fn format_unread_files(unread: &[FileNotRead]) -> String {
+    let shown = shown_unread(unread);
+    let n = shown.len();
+    if n == 0 {
+        return String::new();
+    }
+    let mut out = format!(
+        "> [!WARNING]\n> Carrick could not read {} file{}, so nothing in {} is indexed or checked.\n>\n",
+        n,
+        plural(n),
+        if n == 1 { "it" } else { "them" }
+    );
+    let lines: Vec<String> = shown
+        .iter()
+        .take(UNREAD_FILES_SHOWN)
+        .filter_map(|file| {
+            file.reason.phrase().map(|phrase| {
+                format!(
+                    "> Carrick could not read `{}`{} because {}.",
+                    code_span(&file.file),
+                    service_suffix(file.service.as_deref()),
+                    phrase
+                )
+            })
+        })
+        .collect();
+    out.push_str(&lines.join("\n"));
+    if n > UNREAD_FILES_SHOWN {
+        let more = n - UNREAD_FILES_SHOWN;
+        out.push_str(&format!(
+            "\n>\n> Carrick could not read {} more file{}.",
+            more,
+            plural(more)
+        ));
+    }
+    out.push_str("\n\n");
+    out
 }
 
 fn plural(n: usize) -> &'static str {
@@ -405,10 +467,15 @@ fn format_no_issues(
     let mut output = String::new();
     output.push_str("<!-- CARRICK_OUTPUT_START -->\n<!-- CARRICK_ISSUE_COUNT:0 -->\n");
     output.push_str(&format!("## 🪢 Carrick{}\n\n", topology.header_suffix()));
-    output.push_str(&format!(
-        "> [!TIP]\n> All cross-service calls match the indexed contracts across {}.\n\n",
-        topology.scope_phrase()
-    ));
+    let unread = format_unread_files(&result.unread_files);
+    if unread.is_empty() {
+        output.push_str(&format!(
+            "> [!TIP]\n> All cross-service calls match the indexed contracts across {}.\n\n",
+            topology.scope_phrase()
+        ));
+    } else {
+        output.push_str(&unread);
+    }
     output.push_str(&format_pr_delta(pr_delta, &[], &result.sdk_edges));
     output.push_str(&format!(
         "Indexed **{} endpoints** and **{} cross-service calls**.\n\n",
@@ -1435,7 +1502,7 @@ fn group_env_var_suggestions(findings: &[&Finding]) -> Vec<EnvVarSuggestionGroup
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::findings::{EndpointRef, Finding, PackageVersionRef, tier};
+    use crate::findings::{EndpointRef, FileNotReadReason, Finding, PackageVersionRef, tier};
     use crate::operation::EndpointProvenance;
 
     /// A poly-repo topology with peers, so connectivity findings are
@@ -1759,6 +1826,7 @@ mod tests {
             verified_endpoints: vec![],
             sdk_edges: Vec::new(),
             sdk_unresolved: Vec::new(),
+            unread_files: Vec::new(),
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],
@@ -2846,5 +2914,121 @@ mod tests {
             assert!(!output.contains("{{CARRICK_LINK"));
             assert!(!output.contains("Carrick dashboard"));
         }
+    }
+
+    fn unread(file: &str, service: Option<&str>, reason: FileNotReadReason) -> FileNotRead {
+        FileNotRead {
+            file: file.to_string(),
+            service: service.map(str::to_string),
+            reason,
+            operations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_scan_that_could_not_read_a_file_names_it_instead_of_saying_every_call_matches() {
+        let mut result = result_with(vec![]);
+        result.unread_files = vec![unread(
+            "src/admin.ts",
+            None,
+            FileNotReadReason::DoesNotParse,
+        )];
+        let output = format_analysis_results(result, &topology_baseline(), None);
+        assert!(
+            output.contains(
+                "> Carrick could not read 1 file, so nothing in it is indexed or checked."
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("> Carrick could not read `src/admin.ts` because it does not parse."),
+            "{output}"
+        );
+        assert!(
+            !output.contains("All cross-service calls match"),
+            "{output}"
+        );
+        assert!(output.contains("CARRICK_ISSUE_COUNT:0"));
+        assert!(output.contains("Indexed **0 endpoints**"));
+    }
+
+    #[test]
+    fn an_unread_file_is_named_beside_findings_and_counts_no_issue() {
+        let without = format_analysis_results(
+            result_with(vec![type_mismatch_finding()]),
+            &topology_baseline(),
+            None,
+        );
+        let mut result = result_with(vec![type_mismatch_finding()]);
+        result.unread_files = vec![unread(
+            "lib/legacy.ts",
+            Some("billing"),
+            FileNotReadReason::NotUtf8Text,
+        )];
+        let with = format_analysis_results(result, &topology_baseline(), None);
+        let count = |s: &str| {
+            s.lines()
+                .find(|l| l.contains("CARRICK_ISSUE_COUNT"))
+                .map(str::to_string)
+        };
+        assert_eq!(count(&with), count(&without));
+        let line =
+            "> Carrick could not read `lib/legacy.ts` (`billing`) because it is not UTF-8 text.";
+        assert!(with.contains(line), "{with}");
+        assert!(with.find("[!WARNING]").unwrap() > with.find("[!CAUTION]").unwrap());
+    }
+
+    #[test]
+    fn at_most_five_unread_files_are_named() {
+        let mut result = result_with(vec![]);
+        result.unread_files = (0..7)
+            .map(|i| {
+                unread(
+                    &format!("src/f{i}.ts"),
+                    None,
+                    FileNotReadReason::DoesNotParse,
+                )
+            })
+            .collect();
+        let output = format_analysis_results(result, &topology_baseline(), None);
+        assert_eq!(
+            output.matches("> Carrick could not read `").count(),
+            5,
+            "{output}"
+        );
+        assert!(
+            output.contains("Carrick could not read 2 more files."),
+            "{output}"
+        );
+        assert!(output.contains("Carrick could not read 7 files, so nothing in them"));
+    }
+
+    #[test]
+    fn an_operations_missing_entry_is_never_shown() {
+        let mut result = result_with(vec![]);
+        result.unread_files = vec![unread("a.ts", None, FileNotReadReason::OperationsMissing)];
+        let output = format_analysis_results(result, &topology_baseline(), None);
+        assert!(!output.contains("[!WARNING]"), "{output}");
+        assert!(output.contains("All cross-service calls match"));
+    }
+
+    #[test]
+    fn nothing_to_flag_is_not_said_while_a_file_is_unread() {
+        let finding = Finding::DispatchOperations {
+            service: "api".to_string(),
+            route: None,
+            dispatch_location: "src/a.ts:1".to_string(),
+            dispatch_field: "type".to_string(),
+            values: vec!["a".to_string()],
+            call_sites: vec![],
+        };
+        let mut result = result_with(vec![finding]);
+        result.unread_files = vec![unread("a.ts", None, FileNotReadReason::DoesNotParse)];
+        let output = format_analysis_results(result, &topology_baseline(), None);
+        assert!(
+            output.contains("Nothing to flag in the files Carrick read across"),
+            "{output}"
+        );
+        assert!(!output.contains("Nothing to flag across"));
     }
 }
