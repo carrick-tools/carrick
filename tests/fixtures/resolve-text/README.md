@@ -118,5 +118,5 @@ carries the calls it was read through, innermost first:
 | `p_send` | `bus.sent` |
 
 Read without callers (every other entry point), a parameter answers as
-before: `p_one` is `outside_service`, `p_defaulted` is `unread_expression`
+before: `p_one` is `parameter_unread`, `p_defaulted` is `unread_expression`
 and `fallback`.

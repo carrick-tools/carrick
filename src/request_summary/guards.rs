@@ -158,6 +158,10 @@ pub enum HoleReason {
     /// (carrick#2541). No one path is its, so a URL holding it states no
     /// row. It serialises only into guard chain ends and never into a row.
     SeveralPaths,
+    /// A parameter of a function of the run, read by a reader that does not
+    /// read through callers: its value is in the function's callers, inside
+    /// the service (carrick#3795).
+    ParameterUnread,
 }
 
 /// Where a compared value comes from, before any access is applied to it.
