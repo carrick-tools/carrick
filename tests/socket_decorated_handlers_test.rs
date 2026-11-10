@@ -199,7 +199,7 @@ fn a_method_decorated_with_a_labelled_message_decorator_is_a_listener() {
 
 /// A decorator the store does not label states nothing, whatever its
 /// argument says: no socket row names the tracing decorator's labels, and
-/// the gateway service has no socket row but its two listeners.
+/// the gateway service has no socket row but its three listeners.
 #[test]
 fn a_decorator_with_no_label_states_nothing() {
     let lobby = &scanned()["lobby"];
@@ -209,5 +209,28 @@ fn a_decorator_with_no_label_states_nothing() {
             .all(|row| !row.key.ends_with("lobby.trace") && !row.key.ends_with("lobby.idle")),
         "{lobby:#?}"
     );
-    assert_eq!(lobby.len(), 2, "{lobby:#?}");
+    assert_eq!(lobby.len(), 3, "{lobby:#?}");
+}
+
+/// A decorator whose name slot is a type parameter with no constraint and a
+/// default of `string` takes a name string: its method is a listener.
+#[test]
+fn a_decorator_whose_name_is_a_defaulted_type_parameter_is_a_listener() {
+    let lobby = &scanned()["lobby"];
+    let listener = row(
+        "endpoints",
+        "socket|client_to_server|lobby.leave",
+        &format!("{GATEWAY}:20"),
+    );
+    assert!(lobby.contains(&listener), "{listener:?} in {lobby:#?}");
+}
+
+/// The same slot with no default says nothing about its argument: no row.
+#[test]
+fn a_decorator_whose_name_is_an_unbounded_type_parameter_states_nothing() {
+    let lobby = &scanned()["lobby"];
+    assert!(
+        lobby.iter().all(|row| !row.key.ends_with("lobby.nothing")),
+        "{lobby:#?}"
+    );
 }

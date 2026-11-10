@@ -1,4 +1,4 @@
-import { Connection, Gateway, OnMessage, Peer, Traced } from "@fixture/gateway";
+import { Connection, Gateway, OnEvent, OnMessage, OnNothing, Peer, Traced } from "@fixture/gateway";
 
 @Gateway()
 export class LobbyGateway {
@@ -15,4 +15,10 @@ export class LobbyGateway {
 
   @Traced("lobby.idle")
   idle(): void {}
+
+  @OnEvent("lobby.leave")
+  leave(): void {}
+
+  @OnNothing("lobby.nothing")
+  nothing(): void {}
 }
