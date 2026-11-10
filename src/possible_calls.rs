@@ -125,8 +125,11 @@ fn slot_of(role: &str) -> &'static str {
 }
 
 /// Why a decided site's name is unstated: an identifier the compiler reads
-/// as `any` with no declaration is an import the scan could not read.
-/// Otherwise nothing says, and the call was not checked on this scan.
+/// as `any` with no declaration is an import the scan could not read, the
+/// narrower fact; else the hole the resolver met reading the name
+/// (carrick#3688 U2), whose text reader reads every declaration it cannot
+/// enter as `outside_service`. Otherwise nothing says, and the call was not
+/// checked on this scan.
 fn reason_of(record: &SiteRecord) -> Stop {
     let unreadable = record.compiler().is_some_and(|compiler| {
         compiler.names.iter().any(|name| {
@@ -136,10 +139,9 @@ fn reason_of(record: &SiteRecord) -> Stop {
         })
     });
     if unreadable {
-        Stop::UnresolvedImport
-    } else {
-        Stop::Unanswered
+        return Stop::UnresolvedImport;
     }
+    record.unread.unwrap_or(Stop::Unanswered)
 }
 
 fn from_lead(lead: &DecidedLead) -> PossibleCall {
@@ -491,5 +493,58 @@ mod tests {
             written_reason(Stop::SeveralOperations),
             "several_operations"
         );
+    }
+
+    /// A lead record built from a name the resolver read to a hole
+    /// (`unread`, carrick#3688 U2), whose compiler names nothing typed
+    /// `any`: a reason chosen by the record's own names alone would say
+    /// `unanswered`. The row says the hole.
+    fn lead_record(unread: Option<Stop>) -> SiteRecord {
+        use crate::request_summary::site_record::{AnchorAt, TypeAnchors};
+        let state = serde_json::from_value(serde_json::json!({
+            "point": { "at": "src/emit.ts:4", "code": "" },
+            "compiler": { "names": [], "callees": [], "enclosing": null, "reached": [] },
+            "syntax": [],
+            "libraries": [],
+            "call": null,
+            "stated": { "names": [], "methods": [] },
+            "asked": [],
+            "forced": {},
+        }))
+        .unwrap();
+        SiteRecord {
+            state,
+            anchors: TypeAnchors {
+                call: AnchorAt {
+                    file: "src/emit.ts".to_string(),
+                    line: 4,
+                    span_start: 40,
+                    span_end: 60,
+                },
+                payload: None,
+                payload_at: None,
+                handler: None,
+                key: None,
+            },
+            payloads: Default::default(),
+            basis: Default::default(),
+            names: Vec::new(),
+            bucket: Bucket::Lead,
+            lead: Some("name_unstated"),
+            unread,
+            receiver: None,
+        }
+    }
+
+    #[test]
+    fn a_lead_record_names_its_hole() {
+        let reason = |unread| {
+            let found = from_sites(&Decided::default(), &[lead_record(unread)]);
+            assert_eq!(found.len(), 1, "{found:?}");
+            found[0].unread.reason
+        };
+        assert_eq!(reason(Some(Stop::Reassigned)), Stop::Reassigned);
+        // The control: a record whose name met no hole keeps today's word.
+        assert_eq!(reason(None), Stop::Unanswered);
     }
 }

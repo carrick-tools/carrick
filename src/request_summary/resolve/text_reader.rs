@@ -44,8 +44,8 @@ pub(in crate::request_summary) enum ArgTexts {
     /// An options object the resolver cannot read: a spread that may write
     /// the key with none written, an exported object, one handed to more than
     /// one call. It keeps today's host-free reading and is counted (carrick
-    /// #3504 S5a, R3).
-    Unread,
+    /// #3504 S5a, R3), with why it is unread (carrick#3688 U2).
+    Unread(Stop),
 }
 
 impl TextValue {
@@ -598,38 +598,35 @@ impl<'a> Resolver<'a> {
     }
 
     /// The one text `value`, written in `file` (as `inputs` keys it), always
-    /// is. `None` unless it is exactly one text.
+    /// is ([`Self::one_text`]); otherwise why it is none (carrick#3688 U2).
     pub(in crate::request_summary) fn text_of_value(
         &self,
         file: &Path,
         value: &ValueAt,
-    ) -> Option<String> {
-        match self.text_values(file, value).as_slice() {
-            [TextValue::Text { text, .. }] => Some(text.clone()),
-            _ => None,
-        }
+    ) -> Result<String, Stop> {
+        self.one_text(file, value)
+            .map(|(text, _)| text)
+            .map_err(Stop::from)
     }
 
     /// The one text `expr`, written in the repo file `file` (relative to
-    /// `root`), always is, with the files whose declarations it read.
-    /// `None` unless it is exactly one text.
+    /// `root`), always is, with the files whose declarations it read;
+    /// otherwise why it is none (carrick#3688 U2). A file that is none of
+    /// the run's is `outside_service`.
     pub(in crate::request_summary) fn text_read(
         &self,
         root: &Path,
         file: &str,
         expr: &Expr,
-    ) -> Option<(String, Vec<String>)> {
+    ) -> Result<(String, Vec<String>), Stop> {
         let absolute = root.join(file);
-        let (path, ir) = self.inputs_for(&absolute).files.get_key_value(&absolute)?;
+        let (path, ir) = self
+            .inputs_for(&absolute)
+            .files
+            .get_key_value(&absolute)
+            .ok_or(Stop::OutsideService)?;
         let value = text_of(expr, &|lo| ir.discovery_start(lo));
-        match self.text_values(path, &value).as_slice() {
-            [
-                TextValue::Text {
-                    text, read_from, ..
-                },
-            ] => Some((text.clone(), read_from.clone())),
-            _ => None,
-        }
+        self.one_text(path, &value).map_err(Stop::from)
     }
 }
 
@@ -702,7 +699,7 @@ impl Resolver<'_> {
         // more than one call, or written by the module) is an object the
         // resolver does not read (R3).
         if closed && !kept {
-            return Some(ArgTexts::Unread);
+            return Some(ArgTexts::Unread(Stop::UnreadExpression));
         }
         if closed && kept {
             return Some(ArgTexts::Values(

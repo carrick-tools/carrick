@@ -2281,12 +2281,14 @@ impl<'a> Chains<'a> {
             // Exactly one text is the literal; several, or a hole, keep the
             // term as written (carrick#3504 S7c).
             GuardLiteral::Term { term, written } => {
+                // Why the term is no one text is the dispatch record's gap
+                // (carrick#3688 R10): the case stays unknown on the edge.
                 match self.resolver.text_of_value(self.nodes[node].file, term) {
-                    Some(text) => {
+                    Ok(text) => {
                         let shape = shape_of(&text);
                         (text, shape, None)
                     }
-                    None => (written.clone(), GuardShape::Unresolved, None),
+                    Err(_) => (written.clone(), GuardShape::Unresolved, None),
                 }
             }
         }

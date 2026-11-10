@@ -31,6 +31,7 @@
 //! inside discovery.
 
 use super::row_calls::Reach;
+use super::stop::Stop;
 use super::*;
 use crate::position_rows::{Kind, Row};
 use std::cell::{Cell, RefCell};
@@ -2155,9 +2156,24 @@ pub(super) enum Held<R> {
     /// A function written at a caller, or a parameter of a function written
     /// in the body: what runs it decides, which no caller here states.
     Callback,
-    /// An end the consumer followed; `R::default()` when the value holds
-    /// nothing the resolver can read.
+    /// An end the consumer followed.
     Reached(R),
+    /// The value holds nothing the resolver can read, for this reason
+    /// (carrick#3688 U2): the consumer reads it as a hole and decides what
+    /// the reason means for the row.
+    Stop(Stop),
+}
+
+/// Why a name or member the compiler's row reaches no in-repo definition
+/// for holds nothing the resolver reads: the row's own hole, a declaration
+/// outside the service, else a form the resolver does not read (a package's
+/// or the language library's value no consumer labelled).
+fn reach_stop(reach: &Reach) -> Stop {
+    match reach {
+        Reach::Unknown(hole) => Stop::from(*hole),
+        Reach::OutsideService(..) => Stop::OutsideService,
+        Reach::Function(..) | Reach::NoFunction => Stop::UnreadExpression,
+    }
 }
 
 /// What a consumer makes of each end the resolver reaches, at the point it
@@ -2387,9 +2403,9 @@ impl<'a> Resolver<'a> {
 
     /// What a resolver call answers: what it read, or, when it is the
     /// outermost call of a query over the cap, one value nothing reads.
-    fn settle<R: Default>(&self, out: Vec<Held<R>>) -> Vec<Held<R>> {
+    fn settle<R>(&self, out: Vec<Held<R>>) -> Vec<Held<R>> {
         if self.open.get().0 == 1 && self.capped.get() {
-            return vec![Held::Reached(R::default())];
+            return vec![Held::Stop(Stop::FanOutCap)];
         }
         out
     }
@@ -2503,7 +2519,7 @@ impl<'a> Resolver<'a> {
         invoke: Invoke<'a>,
         at_caller: bool,
     ) -> Vec<Held<F::Reached>> {
-        let nothing = || vec![Held::Reached(F::Reached::default())];
+        let stop = |reason: Stop| vec![Held::Stop(reason)];
         match value {
             ValueAt::Param { depth, index, keys } => {
                 vec![Held::Param(*depth, *index, keys.clone())]
@@ -2534,16 +2550,17 @@ impl<'a> Resolver<'a> {
                     Reach::Function(target, key) => {
                         vec![Held::Reached(follow.definition(target, key, invoke))]
                     }
+                    // A member no definition answers: what the row says.
+                    reach if *member => stop(reach_stop(&reach)),
                     // A name the compiler declares as a module binding is
                     // every value written to it (carrick#3504 S1).
-                    _ if *member => nothing(),
-                    _ => self
+                    reach => self
                         .row_at(file, *lo, *hi, kind)
                         .and_then(|row| self.declared_binding(row))
                         .and_then(|(path, line, symbol)| {
                             self.binding_values(follow, path, line, &symbol, invoke)
                         })
-                        .unwrap_or_else(nothing),
+                        .unwrap_or_else(|| stop(reach_stop(&reach))),
                 }
             }
             ValueAt::Returned {
@@ -2597,11 +2614,12 @@ impl<'a> Resolver<'a> {
                         }
                     }
                 }
+                // A call result that is no in-repo factory's.
                 let Some((factory_file, factory)) = self.factory_of(file, *lo, *hi, local) else {
-                    return nothing();
+                    return stop(Stop::UnreadExpression);
                 };
                 if self.returns_depth.get() >= MAX_VALUES {
-                    return nothing();
+                    return stop(Stop::FanOutCap);
                 }
                 // The factory call itself fills the parameters of the
                 // factory a function it returns reads (carrick#3504 S0b).
@@ -2610,8 +2628,9 @@ impl<'a> Resolver<'a> {
                 let mut held = Vec::new();
                 for returned in &factory.returned_values {
                     match returned {
-                        // A parameter of the factory: its own call fills it.
-                        ValueAt::Param { .. } => held.extend(nothing()),
+                        // A parameter of the factory: its own call fills it,
+                        // and this reads nothing the call passes there.
+                        ValueAt::Param { .. } => held.push(Held::Stop(Stop::CallerArgMissing)),
                         // A function the factory's own body writes: one
                         // function in, so its parameters are the factory's.
                         ValueAt::Function(start) => {
@@ -2640,12 +2659,17 @@ impl<'a> Resolver<'a> {
                     }
                 }
                 self.returns_depth.set(self.returns_depth.get() - 1);
-                if held.is_empty() { nothing() } else { held }
+                // A factory that returns nothing.
+                if held.is_empty() {
+                    stop(Stop::ValueNeverBound)
+                } else {
+                    held
+                }
             }
             ValueAt::Function(_) if at_caller => vec![Held::Callback],
             ValueAt::Function(start) => match self.written_function(file, *start) {
                 Some(function) => vec![Held::Reached(follow.written(file, function, invoke, None))],
-                None => nothing(),
+                None => stop(Stop::NoBody),
             },
             // The value at a key of an object: what the member's own row
             // reaches, as `Read` with `member` reads it, else the key of
@@ -2658,9 +2682,10 @@ impl<'a> Resolver<'a> {
                     Reach::Function(target, key) => {
                         vec![Held::Reached(follow.definition(target, key, invoke))]
                     }
+                    // An object the resolver cannot read the key of.
                     _ => self
                         .key_values(follow, file, value, invoke)
-                        .unwrap_or_else(nothing),
+                        .unwrap_or_else(|| stop(Stop::UnreadExpression)),
                 }
             }
             // The text variants are the names lowering's: this walk reads
@@ -2677,7 +2702,7 @@ impl<'a> Resolver<'a> {
             // guards' (carrick#3504 S7b-2).
             | ValueAt::New { .. }
             | ValueAt::Constructed { .. }
-            | ValueAt::Unread => nothing(),
+            | ValueAt::Unread => stop(Stop::UnreadExpression),
         }
     }
 
@@ -2750,7 +2775,6 @@ impl<'a> Resolver<'a> {
         let (key, _) = self.one_text(file, key).ok()?;
         let key = &key;
         let _query = self.enter();
-        let nothing = || Held::Reached(F::Reached::default());
         let mut out: Vec<Held<F::Reached>> = Vec::new();
         let mut objects: Vec<ObjectAt<'a, 'v>> = Vec::new();
         for held in object {
@@ -2776,14 +2800,16 @@ impl<'a> Resolver<'a> {
         let mut seen: HashSet<*const BTreeMap<String, Vec<ValueAt>>> = HashSet::new();
         objects.retain(|object| object.maker.is_some() || seen.insert(object.fields));
         for object in objects {
+            // An object that writes no such key.
             let Some(values) = object.fields.get(key) else {
-                out.push(nothing());
+                out.push(Held::Stop(Stop::ValueNeverBound));
                 continue;
             };
             for value in values {
                 match value {
-                    // A parameter of the factory: its own call fills it.
-                    ValueAt::Param { .. } => out.push(nothing()),
+                    // A parameter of the factory: its own call fills it,
+                    // and this reads nothing the call passes there.
+                    ValueAt::Param { .. } => out.push(Held::Stop(Stop::CallerArgMissing)),
                     ValueAt::Function(start) => match self.written_function(object.file, *start) {
                         Some(function) => {
                             let maker = object
@@ -2796,7 +2822,7 @@ impl<'a> Resolver<'a> {
                                 maker,
                             )));
                         }
-                        None => out.push(nothing()),
+                        None => out.push(Held::Stop(Stop::NoBody)),
                     },
                     other => out.extend(self.read_value(follow, object.file, other, invoke, false)),
                 }
@@ -3071,7 +3097,7 @@ impl<'a> Resolver<'a> {
                     }
                 }
                 // A parameter of a function the constructor is written in.
-                ValueAt::Param { .. } => out.push(Held::Reached(F::Reached::default())),
+                ValueAt::Param { .. } => out.push(Held::Stop(Stop::CallerArgMissing)),
                 other => out.extend(self.read_value(follow, file, other, invoke, false)),
             }
         }
@@ -3146,7 +3172,7 @@ impl<'a> Resolver<'a> {
                     for value in value.at(&keys[path.len()..]).unwrap_or_default() {
                         match value {
                             // A default read from another parameter.
-                            ValueAt::Param { .. } => out.push(Held::Reached(F::Reached::default())),
+                            ValueAt::Param { .. } => out.push(Held::Stop(Stop::CallerArgMissing)),
                             other => {
                                 out.extend(self.read_value(follow, file, &other, invoke, false))
                             }
@@ -3180,8 +3206,10 @@ impl<'a> Resolver<'a> {
         if out < depth {
             return vec![Held::Callback];
         }
+        // A parameter of a body that is no definition (module level), or
+        // of one further out than the definition.
         let Some(key) = key.filter(|_| out == depth) else {
-            return vec![Held::Reached(F::Reached::default())];
+            return vec![Held::Stop(Stop::NoCallerNotExported)];
         };
         let id = (file.to_path_buf(), key.to_string());
         if passing.contains(&id) {
@@ -3270,7 +3298,6 @@ impl<'a> Resolver<'a> {
             .module_bindings
             .get(&(line, symbol.to_string()))
             .filter(|binding| binding.values_read())?;
-        let nothing = || Held::Reached(F::Reached::default());
         let reading = (file.to_path_buf(), line, symbol.to_string());
         if !self.bindings_reading.borrow_mut().insert(reading.clone()) {
             return Some(Vec::new());
@@ -3279,7 +3306,7 @@ impl<'a> Resolver<'a> {
         // A write no reader states: the binding may hold anything besides
         // the values below.
         if binding.unplaceable {
-            out.push(nothing());
+            out.push(Held::Stop(Stop::Reassigned));
         }
         // A value written in the body of the function `key` of `file`: a
         // parameter of it is what its callers pass there.
@@ -3301,12 +3328,13 @@ impl<'a> Resolver<'a> {
                     invoke,
                     &mut Vec::new(),
                 );
+                // A parameter no caller fills.
                 if filled.is_empty() {
-                    out.push(nothing());
+                    out.push(Held::Stop(Stop::NameNeverBound));
                 }
                 out.extend(filled);
             }
-            (ValueAt::Param { .. }, _) => out.push(nothing()),
+            (ValueAt::Param { .. }, _) => out.push(Held::Stop(Stop::CallerArgMissing)),
             (other, _) => out.extend(self.read_value(follow, file, other, invoke, false)),
         };
         for value in &binding.init {
@@ -3314,7 +3342,7 @@ impl<'a> Resolver<'a> {
         }
         for at in &binding.writes {
             let Some((key, write)) = placed_write(ir, *at) else {
-                out.push(nothing());
+                out.push(Held::Stop(Stop::Reassigned));
                 continue;
             };
             for value in &write.values {
@@ -3378,7 +3406,8 @@ mod tests {
     /// What the test follower makes of an end.
     #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
     enum End {
-        /// Nothing the resolver can read.
+        /// The follower's default, which [`Follow::Reached`] asks for; the
+        /// resolver says why it read nothing with [`Held::Stop`] instead.
         #[default]
         Nothing,
         /// An in-repo definition, by its key.
@@ -3418,6 +3447,7 @@ mod tests {
         Param(u8, usize, Vec<String>),
         Callback,
         End(End),
+        Stop(Stop),
     }
 
     fn got(held: Vec<Held<End>>) -> Vec<Got> {
@@ -3427,6 +3457,7 @@ mod tests {
                 Held::Param(depth, index, keys) => Got::Param(depth, index, keys),
                 Held::Callback => Got::Callback,
                 Held::Reached(end) => Got::End(end),
+                Held::Stop(reason) => Got::Stop(reason),
             })
             .collect();
         out.sort();
@@ -3578,7 +3609,7 @@ mod tests {
         );
         assert_eq!(
             read("control.ts", 4),
-            [Got::End(End::Nothing)],
+            [Got::Stop(Stop::UnreadExpression)],
             "the global itself"
         );
         // Five queries above opened from outside the resolver; each reads at
@@ -3718,7 +3749,7 @@ mod tests {
         let resolver = Resolver::new(&on.inputs, &[]);
         assert_eq!(
             callee(&resolver, &on.inputs, "h-passed-const.ts", 5),
-            [Got::End(End::Nothing)]
+            [Got::Stop(Stop::UnreadExpression)]
         );
     }
 
@@ -3732,7 +3763,7 @@ mod tests {
         let resolver = Resolver::new(&on.inputs, &[]);
         assert_eq!(
             callee(&resolver, &on.inputs, "k-closed.ts", 7),
-            [Got::End(End::Nothing)]
+            [Got::Stop(Stop::ValueNeverBound)]
         );
     }
 
@@ -3750,7 +3781,7 @@ mod tests {
         assert_eq!(read("cycle.ts", 12), [definition("sendItems")]);
         assert_eq!(
             read("spread.ts", 8),
-            [Got::End(End::Nothing), definition("sendGo")]
+            [definition("sendGo"), Got::Stop(Stop::UnreadExpression)]
         );
         assert_eq!(read("spread.ts", 20), [definition("sendGo")]);
     }
@@ -4186,18 +4217,42 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         );
     }
 
-    /// carrick#3504 S1: a query that reads more values than the step cap
-    /// answers one value nothing reads, never the part it read, and the
-    /// census counts it. The next query starts under the cap again.
+    /// carrick#3688 U2: a module binding written in a form no reader places
+    /// (a destructuring target) holds its initialiser and one value the
+    /// resolver says it cannot read, because the binding is written again.
     #[test]
-    fn a_query_over_the_step_cap_answers_that_it_cannot_say() {
+    fn a_reassigned_binding_says_reassigned() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            callee(&resolver, &on.inputs, "reassigned.ts", 11),
+            [definition("sendA"), Got::Stop(Stop::Reassigned)]
+        );
+        // Both callers spread: each value is unread for the same reason.
+        assert_eq!(
+            callee(&resolver, &on.inputs, "unread_twice.ts", 4),
+            [
+                Got::Stop(Stop::UnreadExpression),
+                Got::Stop(Stop::UnreadExpression)
+            ]
+        );
+    }
+
+    /// carrick#3504 S1, #3688 U2: a query that reads more values than the
+    /// step cap answers one value nothing reads, never the part it read,
+    /// and says why (`fan_out_cap`); the census counts it. The next query
+    /// starts under the cap again.
+    #[test]
+    fn a_value_over_the_step_cap_says_fan_out_cap() {
         let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
             return;
         };
         let resolver = Resolver::new(&on.inputs, &[]).with_cap(1);
         assert_eq!(
             callee(&resolver, &on.inputs, "cycle.ts", 12),
-            [Got::End(End::Nothing)]
+            [Got::Stop(Stop::FanOutCap)]
         );
         assert_eq!(resolver.census().capped_queries, 1);
         assert_eq!(

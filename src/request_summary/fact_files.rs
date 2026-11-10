@@ -327,6 +327,7 @@ mod tests {
             end,
             chain: Vec::new(),
             stop,
+            also: Vec::new(),
             receiver: None,
             reached: None,
             bound: Vec::new(),

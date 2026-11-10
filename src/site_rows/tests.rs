@@ -148,6 +148,7 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
             .collect(),
         names: Vec::new(),
         lead: None,
+        unread: None,
         receiver: None,
     }
 }

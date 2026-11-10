@@ -2000,7 +2000,7 @@ impl<'a> Walk<'a, '_> {
                 .param_default_texts
                 .iter()
                 .find(|(position, _)| *position == index)?;
-            self.resolver.text_of_value(at, text)
+            self.resolver.text_of_value(at, text).ok()
         })
     }
 
@@ -3475,7 +3475,7 @@ fn maker_base(
             // An options object the resolver cannot read keeps today's
             // host-free reading, counted: ruled on once main's check
             // reports it (R3).
-            super::resolve::ArgTexts::Unread => {
+            super::resolve::ArgTexts::Unread(_) => {
                 reads.options_unread += 1;
                 MadeBase::None
             }
