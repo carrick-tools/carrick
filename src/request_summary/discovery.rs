@@ -77,7 +77,8 @@ use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_st
 use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
-    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, FLAG_RUNS_HANDED, Kind, Row,
+    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, FLAG_RUNS_HANDED, FLAG_TOO_MANY,
+    Kind, Row,
 };
 use crate::services::type_sidecar::{
     ClaimOn, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm, SemanticsResult,
@@ -1946,41 +1947,45 @@ impl<'a> Walker<'a> {
                 }
                 // A member the class inherits is declared in its base's
                 // package, so `packages` is the base's. The class the
-                // receiver holds is declared elsewhere: in the package the
-                // receiver itself is declared in, or in the module the file
-                // imports the receiver's type from (carrick#3390). Read only
-                // where that export's claims state this member as an op.
-                let mut holders: Vec<(String, &str)> = Vec::new();
-                if !in_repo(receiver) {
-                    for package in store_keys(receiver, self.labels.exports) {
-                        holders.extend(
-                            [receiver.symbol(), root]
-                                .into_iter()
-                                .flatten()
-                                .map(|name| (package.clone(), name)),
-                        );
+                // receiver holds is declared elsewhere, and the compiler
+                // engine writes it at the receiver as `receiver_type` rows
+                // (one per class of an intersection or union; an alias is
+                // already resolved). Read only where that export's claims
+                // state this member as an op (carrick#3390). A class the
+                // store does not label states nothing; two that both claim
+                // the member state nothing, and are counted.
+                let held = positions
+                    .receiver_declarations(file, ir.swc_start(*lo), ir.swc_start(*hi))
+                    .unwrap_or_default();
+                if held.iter().any(|row| row.flags() & FLAG_TOO_MANY != 0) {
+                    continue;
+                }
+                let mut claiming: Vec<(String, &str)> = Vec::new();
+                for row in held {
+                    let Some(name) = row.symbol() else {
+                        continue;
+                    };
+                    for package in store_keys(row, self.labels.exports) {
+                        let stated = self
+                            .labels
+                            .get(&package, name)
+                            .is_some_and(|claims| claims_member(claims, symbol));
+                        if stated && !claiming.contains(&(package.clone(), name)) {
+                            claiming.push((package, name));
+                        }
                     }
                 }
-                if let Some(root) = root {
-                    let mut imported: Vec<_> = ir
-                        .bindings
-                        .values()
-                        .filter(|binding| !binding.namespace && binding.export == root)
-                        .map(|binding| binding.specifier.as_str())
-                        .collect();
-                    imported.sort_unstable();
-                    imported.dedup();
-                    for specifier in imported {
-                        holders
-                            .extend(specifier_keys(specifier).into_iter().map(|key| (key, root)));
+                match claiming.as_slice() {
+                    [] => {}
+                    [(package, name)] => {
+                        if let Some(claims) = self.labels.get(package, name) {
+                            return Some((
+                                end(package, name, Some(symbol), claims),
+                                ReachedBy::Name,
+                            ));
+                        }
                     }
-                }
-                for (package, name) in holders {
-                    if let Some(claims) = self.labels.get(&package, name)
-                        && claims_member(claims, symbol)
-                    {
-                        return Some((end(&package, name, Some(symbol), claims), ReachedBy::Name));
-                    }
+                    _ => self.ambiguous.set(self.ambiguous.get() + 1),
                 }
             }
         }
