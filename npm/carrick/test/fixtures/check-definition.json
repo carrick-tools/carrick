@@ -62,7 +62,6 @@
     "commit_hash": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
     "files_attempted": 12,
     "files_lost": { "total": 0 },
-    "unemitted_literal_candidates": 0,
     "consumers_not_resolved": { "total": 0 },
     "sdk_unresolved": { "total": 0 },
     "unknown_call_paths": { "total": 0 },

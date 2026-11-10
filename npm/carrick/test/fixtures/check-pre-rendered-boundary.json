@@ -147,7 +147,6 @@
         "src/legacy/other.ts: no answer"
       ]
     },
-    "unemitted_literal_candidates": 4,
     "consumers_not_resolved": {
       "total": 1,
       "reasons": [

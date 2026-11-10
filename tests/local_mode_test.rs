@@ -1779,10 +1779,6 @@ fn a_thin_index_says_what_it_could_not_classify() {
         map.contains("not classified locally"),
         "the map states why it is thin:\n{map}"
     );
-    assert!(
-        map.contains("2 route-literal call site(s) counted and unclassified"),
-        "and counts what it declined, rather than reporting nothing:\n{map}"
-    );
 
     let routes = check(root, "notifications-svc/src/http/routes.ts");
     assert!(
@@ -1790,8 +1786,8 @@ fn a_thin_index_says_what_it_could_not_classify() {
         "the file's rows, or the absence of them:\n{routes}"
     );
     assert!(
-        routes.contains("2 route-literal call site(s) counted and unclassified"),
-        "with the count beside it, in the answer a hook reads:\n{routes}"
+        routes.contains("not classified locally"),
+        "with the reason beside it, in the answer a hook reads:\n{routes}"
     );
 }
 

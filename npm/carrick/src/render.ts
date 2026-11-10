@@ -60,6 +60,16 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
     out.push(`  ${count.total} ${what}${firstReason(count)}`);
   };
   push(boundary.files_lost, "file(s) the analyzer never answered for");
+  const unparsed = boundary.files_not_parsed;
+  if (unparsed && unparsed.total > 0) {
+    const paths = (unparsed.reasons ?? []).map((reason) => reason.replace(/: does_not_parse$/, ""));
+    const named = paths.slice(0, 2).join(", ");
+    const rest = unparsed.total - Math.min(2, paths.length);
+    const where = named ? ` (${named}${rest > 0 ? ` and ${rest} more` : ""})` : "";
+    out.push(
+      `  ${unparsed.total} file(s) did not parse${where}: the index states nothing from ${unparsed.total === 1 ? "it" : "them"}, so treat a route or call missing there as a gap in the index, not a finding.`,
+    );
+  }
   push(
     boundary.consumers_not_resolved,
     "call site(s) that named a client member and did not resolve to it",
@@ -68,15 +78,6 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
   push(boundary.unknown_call_paths, "indexed call(s) whose path no producer may claim");
   push(boundary.routes_without_response_type, "route(s) with no resolved response type");
   push(boundary.calls_without_expected_type, "call(s) with no resolved expected type");
-  if ((boundary.unemitted_literal_candidates ?? 0) > 0) {
-    const sites = boundary.unemitted_literal_sites ?? [];
-    const where = sites.length
-      ? ` (${(boundary.unemitted_literal_candidates ?? 0) > 1 ? "e.g. " : ""}${sites[0]})`
-      : "";
-    out.push(
-      `  ${boundary.unemitted_literal_candidates} route-literal call site(s) left unclassified${where}`,
-    );
-  }
   if ((boundary.model_only_rows ?? 0) > 0) {
     out.push(
       `  ${boundary.model_only_rows} row(s) the model alone states (${boundary.model_rows_joined ?? 0} joined a deterministic row)`,

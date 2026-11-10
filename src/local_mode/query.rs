@@ -838,15 +838,11 @@ fn newer_than_index(repo: &Path, relative: &str, indexed_at: &str) -> bool {
 
 /// The sentence a local answer ends on. It names what is absent, with the
 /// count the scan kept, so a thin index never reads as "there is no API here".
-pub fn boundary_note(boundary: Option<&crate::boundary::ServiceBoundary>) -> String {
-    let unclassified = boundary
-        .map(|boundary| boundary.unemitted_literal_candidates)
-        .unwrap_or(0);
+pub fn boundary_note() -> String {
     format!(
         "{}. A route registered on a typed receiver (`app.get(\"/x\", h)`) and a call whose \
          URL is built at the call site are classified by the model in the hosted index and \
-         are absent here: {unclassified} route-literal call site(s) counted and unclassified \
-         in this service.",
+         are absent here.",
         super::NOT_CLASSIFIED_LOCALLY
     )
 }
@@ -1046,7 +1042,7 @@ pub fn enrichment_note(
         },
         (HostedState::NotSignedIn, _) => format!(
             "{}; not signed in, so the hosted index was not read.",
-            boundary_note(boundary)
+            boundary_note()
         ),
         // "No model runs on this machine" is `refresh`'s sentence. A paid scan
         // runs one here, and its hosted row can still be unreplayable
@@ -1059,7 +1055,7 @@ pub fn enrichment_note(
              this index."
                 .to_string()
         }
-        _ => boundary_note(boundary),
+        _ => boundary_note(),
     };
     // Not "install the version that wrote the blob": `CACHE_VERSION` moves
     // most weeks, so a hosted blob is behind the installed CLI far more often
@@ -1125,17 +1121,12 @@ pub fn enrichment_note(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boundary::ServiceBoundary;
 
     #[test]
-    fn the_boundary_note_names_what_is_absent_and_counts_it() {
-        let boundary = ServiceBoundary {
-            unemitted_literal_candidates: 7,
-            ..Default::default()
-        };
-        let note = boundary_note(Some(&boundary));
+    fn the_boundary_note_names_what_is_absent() {
+        let note = boundary_note();
         assert!(note.contains("not classified locally"), "{note}");
-        assert!(note.contains("7 route-literal call site(s)"), "{note}");
+        assert!(!note.contains("route-literal call site"), "{note}");
     }
 
     /// carrick#1012 item 1. `CACHE_VERSION` moves most weeks, so a hosted
@@ -1177,12 +1168,11 @@ mod tests {
     }
 
     #[test]
-    fn the_note_is_still_stated_when_the_scan_counted_none() {
-        // "Nothing counted" is not "nothing missing": the sentence has to be
-        // there either way, or a thin index reads as an empty service.
-        let note = boundary_note(None);
+    fn the_note_is_still_stated_without_a_count() {
+        // The sentence has to be there either way, or a thin index reads as
+        // an empty service.
+        let note = boundary_note();
         assert!(note.contains("not classified locally"), "{note}");
-        assert!(note.contains("0 route-literal call site(s)"), "{note}");
     }
 }
 

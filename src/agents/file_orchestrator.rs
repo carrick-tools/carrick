@@ -732,17 +732,6 @@ pub struct ProcessingStats {
     /// Model rows kept as rows of their own: the only record of a shape no
     /// deterministic source reads.
     pub model_only_rows: usize,
-    /// Offered HTTP candidates that carry a route-shaped literal (a request
-    /// verb is not required) and that neither the deterministic layer nor the
-    /// model produced a row for, or a mount on the same line. A bare
-    /// `x.verb("/lit", arg)` states no producer/consumer role, so emitting it
-    /// would need a classification rule the scanner does not have; this counts
-    /// the gap rather than guessing at it.
-    pub unemitted_literal_candidates: usize,
-    /// Where those sites are, `file:line`, in the order they were counted. A
-    /// count of something nobody can point at is a number to argue with, not a
-    /// fact to act on (carrick#997 item 7).
-    pub unemitted_literal_sites: Vec<String>,
     /// Candidates in files the model was never asked about — local mode, where
     /// no model runs — that no deterministic row covers. What the paid scan
     /// would classify, counted so a free pass is distinguishable from an empty
@@ -4643,12 +4632,6 @@ impl FileOrchestrator {
                         &mut unread_prefixes,
                         &mut unstated_registrations,
                     );
-                    Self::count_unemitted_literal_candidates(
-                        &deterministic,
-                        &pf.candidate_map,
-                        &pf.path_str,
-                        &mut stats,
-                    );
                     // Only the not-asked arm: a file the analyzer answered for
                     // and a file whose call failed have both been asked, and
                     // nothing about them is waiting for a later scan. A
@@ -4771,10 +4754,6 @@ impl FileOrchestrator {
             stats.model_endpoints_dropped_unanchored
         );
         debug!("  - Model-only rows: {}", stats.model_only_rows);
-        debug!(
-            "  - Literal candidates neither layer stated a row for: {}",
-            stats.unemitted_literal_candidates
-        );
 
         // PHASE 5 (carrick#656): state what the member join could not follow.
         // Cross-file, so it runs once every file's own result is in: the sites
@@ -9565,53 +9544,6 @@ impl FileOrchestrator {
                 Self::drop_reason(candidate_map.len())
             );
         }
-
-        Self::count_unemitted_literal_candidates(result, candidate_map, file_path, stats);
-    }
-
-    /// What the deterministic layer read a route literal and a verb off, and
-    /// no layer produced a row for (the plan's uniform "a literal segment plus
-    /// a stated method is a row" applied to a bare `x.verb("/lit", arg)`,
-    /// which carries no producer/consumer role). Counted so the gap can be
-    /// sized on real code; never emitted.
-    ///
-    /// Called on every path a file can leave phase 3 by, not just the joined
-    /// one: a file the analyzer never answered for, and a file local mode
-    /// never asked about, have exactly this gap and used to report it as
-    /// zero — which reads as "nothing here to classify" rather than "nobody
-    /// classified it".
-    fn count_unemitted_literal_candidates(
-        result: &FileAnalysisResult,
-        candidate_map: &HashMap<String, CandidateTarget>,
-        file_path: &str,
-        stats: &mut ProcessingStats,
-    ) {
-        let mut counted: Vec<&CandidateTarget> = candidate_map
-            .values()
-            .filter(|candidate| candidate.protocol == Protocol::Http)
-            .filter(|candidate| {
-                Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
-                    .is_some_and(|literal| Self::is_route_shaped(&literal))
-                    && !Self::row_at_span(result, candidate.span_start)
-                    // A mount (`app.use("/api", router)`) the model answered
-                    // has no span; its line is the only thing it shares with
-                    // the candidate.
-                    && !result
-                        .mounts
-                        .iter()
-                        .any(|mount| mount.line_number == candidate.line_number as i32)
-            })
-            .collect();
-        // `candidate_map` is a HashMap, so the sites are ordered here rather
-        // than left to whatever the iteration gave: the first one is what the
-        // printed line names, and it must be the same one on every run.
-        counted.sort_by_key(|candidate| candidate.span_start);
-        stats.unemitted_literal_candidates += counted.len();
-        stats.unemitted_literal_sites.extend(
-            counted
-                .iter()
-                .map(|candidate| format!("{file_path}:{}", candidate.line_number)),
-        );
     }
 
     /// Candidates in a file the model was never asked about that no row
@@ -9627,21 +9559,6 @@ impl FileOrchestrator {
             .values()
             .filter(|candidate| !Self::row_at_span(result, candidate.span_start))
             .count();
-    }
-
-    /// Whether a literal read off a candidate's first argument is a ROUTE
-    /// literal: a path, not a word.
-    ///
-    /// `route_literal_from_snippet` answers "is this an unambiguous string
-    /// literal", which is the right question where a literal OVERRIDES a path
-    /// the model stated — the caller there already knows the argument is a
-    /// path. The count of sites neither layer classified asked it a different
-    /// question and got `Deno.env.get("LEDGER_URL")` counted as an
-    /// unclassified route site, so the printed number named a file that holds
-    /// no such call (carrick#997 item 7). A route is written as a path; an
-    /// absolute URL states a consumer outright and is not this shape either.
-    fn is_route_shaped(literal: &str) -> bool {
-        literal.starts_with('/')
     }
 
     /// Whether this file's rows hold anything at a candidate's call span.
@@ -18419,7 +18336,6 @@ export default [
         assert_eq!(stats.total_data_calls, 0);
         assert!(stats.deterministic_rows_emitted.is_empty());
         assert_eq!(stats.model_only_rows, 0);
-        assert_eq!(stats.unemitted_literal_candidates, 0);
         assert!(stats.errors.is_empty());
     }
 
@@ -19442,7 +19358,7 @@ export { routes };
     #[test]
     fn an_unclassified_receiver_leaves_the_site_exactly_as_it_was() {
         let candidates = bare_literal_map("thing", "/widgets");
-        let (result, stats) = emit_and_join_with(
+        let (result, _) = emit_and_join_with(
             FileAnalysisResult::default(),
             &candidates,
             &HashMap::new(),
@@ -19456,37 +19372,6 @@ export { routes };
 
         assert_eq!(result.endpoints.len(), 0);
         assert_eq!(result.data_calls.len(), 0);
-        assert_eq!(stats.unemitted_literal_candidates, 1);
-        assert_eq!(
-            stats.unemitted_literal_sites,
-            vec!["src/thing.ts:12".to_string()],
-            "and the count says which site it counted"
-        );
-    }
-
-    /// A quoted word is not a route. `Deno.env.get("LEDGER_URL")` raised an
-    /// HTTP candidate with a readable shape and a string first argument, and
-    /// was counted as an unclassified route site — a number on the screen that
-    /// the file it pointed at does not contain (carrick#997 item 7).
-    #[test]
-    fn a_quoted_word_that_is_not_a_path_is_not_an_unclassified_route_site() {
-        let candidates = bare_literal_map("Deno.env", "LEDGER_URL");
-        let (result, stats) = emit_and_join_with(
-            FileAnalysisResult::default(),
-            &candidates,
-            &HashMap::new(),
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &[],
-            "src/config.ts",
-            false,
-        );
-
-        assert_eq!(result.endpoints.len(), 0);
-        assert_eq!(result.data_calls.len(), 0);
-        assert_eq!(stats.unemitted_literal_candidates, 0);
-        assert!(stats.unemitted_literal_sites.is_empty());
     }
 
     fn candidate_with_snippet(id: &str, snippet: Option<&str>) -> CandidateTarget {
@@ -20421,46 +20306,6 @@ export { routes };
         let (forced, stats) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
         assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
-    }
-
-    /// carrick#2382: a candidate that holds a route literal and states no
-    /// readable verb (a redirect, a bare call) is a gap the same as a verb
-    /// call is. A mount the model answered on its line is not a gap.
-    #[test]
-    fn a_route_literal_candidate_without_a_readable_verb_is_counted_unless_a_mount_answers_it() {
-        use crate::wrapper_request_shape::RequestShapeSignal;
-        for shape in [
-            RequestShapeSignal::NotARequest,
-            RequestShapeSignal::Unreadable,
-        ] {
-            let mut candidate = candidate_with_snippet("c1", Some("\"/login\""));
-            candidate.request_shape = shape;
-            let candidates = HashMap::from([("c1".to_string(), candidate)]);
-            let (_, stats) = emit_and_join(FileAnalysisResult::default(), &candidates, "src/a.ts");
-            assert_eq!(stats.unemitted_literal_candidates, 1);
-            assert_eq!(
-                stats.unemitted_literal_sites,
-                vec!["src/a.ts:12".to_string()]
-            );
-        }
-
-        let candidates = HashMap::from([(
-            "c1".to_string(),
-            candidate_with_snippet("c1", Some("\"/api\"")),
-        )]);
-        let mounted = FileAnalysisResult {
-            mounts: vec![crate::agents::file_analyzer_agent::MountResult {
-                line_number: 12,
-                parent_node: "app".to_string(),
-                child_node: "router".to_string(),
-                mount_path: "/api".to_string(),
-                import_source: None,
-                pattern_matched: "app.use".to_string(),
-            }],
-            ..Default::default()
-        };
-        let (_, stats) = emit_and_join(mounted, &candidates, "src/a.ts");
-        assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
     fn request_spec_candidate(id: &str, method: &str, url: &str) -> CandidateTarget {
