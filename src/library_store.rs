@@ -1468,6 +1468,9 @@ pub struct LibraryAnswer {
     /// The packages answered `skipped` with `build_failed`: named, never
     /// waited on (carrick#2496).
     pub build_failed: BTreeSet<String>,
+    /// The reason the store gave each `pending` package (an empty string when
+    /// it sent none), for the run log only.
+    pub pending_reasons: BTreeMap<String, String>,
     /// Entries answered, for the log.
     pub answered: usize,
     /// Entries skipped, for the log.
@@ -1507,6 +1510,9 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
                 if let Some(package) = package {
                     answer.pending.insert(package.to_string());
                     let reason = entry.get("reason").and_then(Value::as_str);
+                    answer
+                        .pending_reasons
+                        .insert(package.to_string(), reason.unwrap_or("").to_string());
                     if reason.is_some_and(|reason| WAITED_REASONS.contains(&reason)) {
                         answer.building.insert(package.to_string());
                     }
@@ -1783,6 +1789,17 @@ where
     }
 }
 
+/// Every package the request names: what a scan ends without when its ask
+/// got no answer.
+fn every_asked(asked: &Asked) -> BTreeSet<String> {
+    asked
+        .request
+        .packages
+        .iter()
+        .map(|package| package.package.clone())
+        .collect()
+}
+
 /// What the store gave a scan once it stopped asking.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settled {
@@ -1793,6 +1810,13 @@ pub struct Settled {
     pub pending: BTreeSet<String>,
     /// The packages the store answered `skipped` with `build_failed`.
     pub build_failed: BTreeSet<String>,
+    /// The packages the scan ends without, decided once here: `pending` and
+    /// `build_failed`, or every package asked when the first ask failed.
+    /// The same definition as [`FirstAnswer::unanswered`], read at scan end.
+    pub unanswered: BTreeSet<String>,
+    /// The last reason the store gave each package in `pending`, for the run
+    /// log only.
+    pub pending_reasons: BTreeMap<String, String>,
     /// Whether the store was asked at all.
     pub asked: bool,
     /// Why the first ask went unanswered (carrick#3249). `None` for an answer,
@@ -1886,17 +1910,13 @@ where
             if let Some(early) = early {
                 let _ = early.send(FirstAnswer {
                     exports: Vec::new(),
-                    unanswered: asked
-                        .request
-                        .packages
-                        .iter()
-                        .map(|package| package.package.clone())
-                        .collect(),
+                    unanswered: every_asked(asked),
                     answered: BTreeSet::new(),
                     ask_failed: true,
                 });
             }
             return Settled {
+                unanswered: every_asked(asked),
                 asked: true,
                 failure: Some(failed),
                 ..Settled::default()
@@ -1916,6 +1936,7 @@ where
         first.pending.difference(&first.building).cloned().collect();
     let mut building = first.building;
     let mut build_failed = first.build_failed;
+    let mut pending_reasons = first.pending_reasons;
     let mut polls = 0usize;
     while !building.is_empty() {
         let next = tokio::time::Instant::now() + POLL_INTERVAL;
@@ -1934,9 +1955,15 @@ where
         exports.extend(second.exports);
         pending.extend(second.pending.difference(&second.building).cloned());
         build_failed.extend(second.build_failed);
+        pending_reasons.extend(second.pending_reasons);
         building = second.building;
     }
     pending.extend(building);
+    pending_reasons.retain(|package, _| pending.contains(package));
+    let mut pending_by_reason: BTreeMap<&str, usize> = BTreeMap::new();
+    for reason in pending_reasons.values() {
+        *pending_by_reason.entry(reason.as_str()).or_default() += 1;
+    }
     debug!(
         answered = first.answered,
         skipped = first.skipped,
@@ -1944,12 +1971,16 @@ where
         polls,
         waited_s = started.elapsed().as_secs(),
         pending = pending.len(),
+        ?pending_by_reason,
         "library store: answered"
     );
+    let unanswered = pending.union(&build_failed).cloned().collect();
     Settled {
         exports: asked.claims(exports),
         pending,
         build_failed,
+        unanswered,
+        pending_reasons,
         asked: true,
         failure: None,
     }
@@ -4219,6 +4250,66 @@ mod tests {
         let invalid = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"skipped","reason":"invalid_package"}]}"#;
         let settled = FakeStore::new(vec![invalid.to_string()]).run(&asked).await;
         assert!(settled.build_failed.is_empty(), "no other skipped reason");
+    }
+
+    /// carrick#3684: the scan ends without its pending and its build-failed
+    /// packages, decided once, and keeps the store's pending reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_ends_without_its_pending_and_failed_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        install_package(dir.path(), "third", "1.0.0");
+        npm_lockfile(
+            dir.path(),
+            &[
+                ("lib", PUBLIC_TGZ),
+                ("other", PUBLIC_TGZ),
+                ("third", PUBLIC_TGZ),
+            ],
+        );
+        install_package(dir.path(), "lib", "1.0.0");
+        install_package(dir.path(), "other", "1.0.0");
+        let asked = request(
+            &specifiers(&["lib", "other", "third"]),
+            &install_at(dir.path()),
+        )
+        .unwrap();
+        let body = r#"{"library_claims":[
+            {"package":"lib","version":"1.0.0","status":"answered","exports":[]},
+            {"package":"other","version":"1.0.0","status":"pending","reason":"lister_unavailable"},
+            {"package":"third","version":"1.0.0","status":"skipped","reason":"build_failed"}]}"#;
+        let settled = FakeStore::new(vec![body.to_string()]).run(&asked).await;
+        assert_eq!(settled.unanswered, specifiers(&["other", "third"]));
+        assert_eq!(
+            settled.pending_reasons.get("other").map(String::as_str),
+            Some("lister_unavailable"),
+            "the last pending reason is kept"
+        );
+    }
+
+    /// carrick#3684: a failed first ask ends the scan without every package
+    /// it asked.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_ask_ends_without_every_package_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let settled = FakeStore::new(vec![String::new()]).run(&asked).await;
+        assert!(settled.failure.is_some());
+        assert_eq!(settled.unanswered, specifiers(&["lib", "other"]));
+    }
+
+    /// carrick#3684: a package built during the wait is not unanswered.
+    #[tokio::test(start_paused = true)]
+    async fn a_package_built_during_the_wait_is_not_unanswered() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![pending_for("building"), STORE_ANSWERED.to_string()]);
+        let settled = store.run(&asked).await;
+        assert!(
+            !settled.unanswered.contains("lib"),
+            "{:?}",
+            settled.unanswered
+        );
+        assert!(!settled.pending_reasons.contains_key("lib"));
     }
 
     #[tokio::test(start_paused = true)]
