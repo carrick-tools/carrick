@@ -523,15 +523,18 @@ pub fn workspace_root_dependency_names(repo_root: &Path, service_root: &Path) ->
 }
 
 /// Directories excluded when walking a repo tree for manifests: dependency
-/// installs and build output are not the project's own manifests. The walk
+/// installs and build output are not the project's own manifests, and nor is
+/// Yarn's own folder (`.yarn/`: its release, plugins, cache and SDK shims,
+/// carrick#3683). The walk
 /// root itself is always traversed, even when its basename matches (a repo
 /// legitimately named `build` is still a repo).
-pub const MANIFEST_SKIP_DIRS: [&str; 6] = [
+pub const MANIFEST_SKIP_DIRS: [&str; 7] = [
     "node_modules",
     "dist",
     "build",
     ".next",
     ".vite",
+    ".yarn",
     ".carrick",
 ];
 
@@ -972,8 +975,16 @@ mod tests {
         )
         .unwrap();
 
+        std::fs::create_dir_all(repo.path().join(".yarn/sdks/typescript")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarn/sdks/typescript/package.json"),
+            r#"{"name":"yarn-sdk-shim"}"#,
+        )
+        .unwrap();
+
         let names = collect_internal_package_names(repo.path());
         assert!(!names.contains("cached-vendor"));
+        assert!(!names.contains("yarn-sdk-shim"));
         assert!(names.contains("platform-monorepo"));
         assert!(names.contains("@meridian/contracts"));
         assert!(

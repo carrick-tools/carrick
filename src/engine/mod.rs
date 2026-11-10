@@ -18943,6 +18943,84 @@ unfollowed_member_calls_total: 0,
     }
 
     #[test]
+    fn the_yarn_folder_is_left_out_of_service_and_include_roots() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        for directory in ["apps/api", "shared"] {
+            for subtree in [
+                "src",
+                ".yarn/releases",
+                ".yarn/plugins/@scope",
+                ".yarn/sdks/typescript/lib",
+                "src/.yarn-tools",
+            ] {
+                let dir = root.join(directory).join(subtree);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("client.js"),
+                    "fetch('https://vendor.example/api');",
+                )
+                .unwrap();
+            }
+        }
+        let service = Config {
+            directory: Some("apps/api".to_string()),
+            include: vec!["shared".to_string()],
+            ..Default::default()
+        };
+        let (files, _) = crate::file_finder::find_service_files(
+            root.to_str().unwrap(),
+            &service,
+            &service_ignore_patterns(&service),
+        );
+        let mut relative: Vec<_> = files
+            .iter()
+            .map(|file| file.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        relative.sort();
+        assert_eq!(
+            relative,
+            vec![
+                PathBuf::from("apps/api/src/.yarn-tools/client.js"),
+                PathBuf::from("apps/api/src/client.js"),
+                PathBuf::from("shared/src/.yarn-tools/client.js"),
+                PathBuf::from("shared/src/client.js"),
+            ]
+        );
+
+        // The root service, with `.yarn/` at the repo root.
+        let root_repo = tempfile::tempdir().unwrap();
+        let root_dir = root_repo.path();
+        for subtree in ["src", ".yarn/releases", "src/.yarn-tools"] {
+            let dir = root_dir.join(subtree);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("client.js"),
+                "fetch('https://vendor.example/api');",
+            )
+            .unwrap();
+        }
+        let service = Config::default();
+        let (files, _) = crate::file_finder::find_service_files(
+            root_dir.to_str().unwrap(),
+            &service,
+            &service_ignore_patterns(&service),
+        );
+        let mut relative: Vec<_> = files
+            .iter()
+            .map(|file| file.strip_prefix(root_dir).unwrap().to_path_buf())
+            .collect();
+        relative.sort();
+        assert_eq!(
+            relative,
+            vec![
+                PathBuf::from("src/.yarn-tools/client.js"),
+                PathBuf::from("src/client.js"),
+            ]
+        );
+    }
+
+    #[test]
     fn vite_artifacts_are_excluded_from_service_and_include_roots() {
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path();
