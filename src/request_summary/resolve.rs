@@ -1031,7 +1031,10 @@ pub(super) fn module_bindings(
 ///
 /// `function` is the definition the parameter belongs to; a function written
 /// inside a body, handed to a call or held in a local, has none, and neither
-/// does a detached function: the caller index keys definitions only. `written`
+/// does a detached function: the caller index keys definitions only. A
+/// function the module-level code writes outside any call keeps where it
+/// starts (`owner_start`), and [`FileIr::place_definitions`] keys it by the
+/// definition starting there, as the caller index does (carrick#2793). `written`
 /// is the write census's verdict ([`PlacedWrites`]). A parameter collides with
 /// another parameter, or with a `bindings` entry that is not its own default's
 /// ([`ParamValues::defaulted_names`]) read as one binding.
@@ -1042,37 +1045,61 @@ pub(super) fn param_bindings(
     bindings: &HashMap<(u32, String), ModuleBinding>,
     writes: &PlacedWrites,
 ) -> HashMap<(u32, String), ParamAt> {
+    type Found<'f> = Vec<(&'f ParamName, Option<&'f str>, Option<u32>)>;
     fn visit<'f>(
         ir: &'f FnIr,
         function: Option<&'f str>,
-        out: &mut Vec<(&'f ParamName, Option<&'f str>)>,
+        owner_start: Option<u32>,
+        out: &mut Found<'f>,
     ) {
-        out.extend(ir.param_names.iter().map(|name| (name, function)));
+        out.extend(
+            ir.param_names
+                .iter()
+                .map(|name| (name, function, owner_start)),
+        );
         for inner in ir
             .nested
             .iter()
             .chain(&ir.detached)
             .chain(&ir.param_functions)
         {
-            visit(inner, None, out);
+            visit(inner, None, None, out);
         }
     }
-    let mut found: Vec<(&ParamName, Option<&str>)> = Vec::new();
+    let mut found: Found<'_> = Vec::new();
     let mut keys: Vec<&String> = functions.keys().collect();
     keys.sort();
     for key in keys {
-        visit(&functions[key], Some(key.as_str()), &mut found);
+        visit(&functions[key], Some(key.as_str()), None, &mut found);
     }
-    visit(module_level, None, &mut found);
+    // A function the module-level code writes outside any call keeps where
+    // it starts, the caller index's key for it (carrick#2793): what a
+    // definition starting there is keyed by once the file is placed.
+    found.extend(
+        module_level
+            .param_names
+            .iter()
+            .map(|name| (name, None, None)),
+    );
+    for inner in &module_level.nested {
+        visit(inner, None, None, &mut found);
+    }
+    for inner in &module_level.detached {
+        let start = inner.site.as_ref().map(|site| site.lo);
+        visit(inner, None, start, &mut found);
+    }
+    for inner in &module_level.param_functions {
+        visit(inner, None, None, &mut found);
+    }
     for ir in constructor_defaults {
-        visit(ir, None, &mut found);
+        visit(ir, None, None, &mut found);
     }
     let mut shared: HashMap<(u32, &str), usize> = HashMap::new();
-    for (name, _) in &found {
+    for (name, _, _) in &found {
         *shared.entry((name.line, name.key.0.as_str())).or_default() += 1;
     }
     let mut out: HashMap<(u32, String), ParamAt> = HashMap::new();
-    for (name, function) in found {
+    for (name, function, owner_start) in found {
         let at = (name.line, name.key.0.clone());
         let own = function.is_some_and(|function| {
             bindings.get(&at).is_some_and(|binding| {
@@ -1091,6 +1118,7 @@ pub(super) fn param_bindings(
             written: !matches!(writes.of(&name.key), Some([])),
             collides: shared[&(name.line, name.key.0.as_str())] > 1
                 || (bindings.contains_key(&at) && !own),
+            owner_start,
         };
         out.entry(at).or_insert(param);
     }
@@ -1429,13 +1457,26 @@ pub(super) enum ValueAt {
         object: Box<ValueAt>,
         args: Vec<ValueAt>,
     },
-    /// A choice the code writes in place (`c ? a : b`, `a ?? b`, `a || b`):
-    /// every branch is a value the name may take, never collapsed.
-    Alt { branches: Vec<ValueAt> },
+    /// A choice the code writes in place (`c ? a : b`, `a ?? b`, `a || b`),
+    /// spanning `lo..hi` (carrick#3504 B10-2a1): every branch is a value the
+    /// name may take, never collapsed. The span is where the request
+    /// summaries' reading of the whole choice is kept
+    /// ([`FileIr::arg_pieces`]); no reader of its value reads it.
+    Alt {
+        lo: u32,
+        hi: u32,
+        branches: Vec<ValueAt>,
+    },
     /// An object literal's entries in source order; a key may be computed.
     Entries(Vec<(ValueAt, ValueAt)>),
     /// An array literal's elements, the object of a `join`.
     Elements(Vec<ValueAt>),
+    /// An expression the names lowering does not read (a call of no
+    /// built-in, a tag other than `String.raw`, any other form), spanning
+    /// `lo..hi` (carrick#3504 B10-2a1): what the request summaries read
+    /// there is kept by that span ([`FileIr::arg_pieces`]). Every reader
+    /// reads it as [`Self::Unread`].
+    Unstated { lo: u32, hi: u32 },
     /// Anything else.
     Unread,
 }
@@ -1674,8 +1715,10 @@ pub(super) struct ParamName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ParamAt {
     /// The definition the parameter belongs to, by its key in
-    /// [`FileIr::functions`]; `None` for a function written inside a body (a
-    /// callback, or a lambda held in a local), which no caller index keys.
+    /// [`FileIr::functions`], or the definition a detached module-level
+    /// function is keyed as ([`Self::owner_start`]); `None` for a function
+    /// written inside a body (a callback, or a lambda held in a local),
+    /// which no caller index keys.
     pub(super) function: Option<String>,
     pub(super) index: usize,
     pub(super) keys: Vec<String>,
@@ -1686,6 +1729,14 @@ pub(super) struct ParamAt {
     /// declaration, shares its line and name: no row says which one a use
     /// means.
     pub(super) collides: bool,
+    /// Where a function the module-level code writes outside any call
+    /// starts (`site.lo`, discovery numbering), for a parameter of one
+    /// (carrick#3504 B10-2a1): a member of an exported object the module
+    /// writes through (`itemsApi.replace`, carrick#2793). The table is built
+    /// before the file knows its definitions; [`FileIr::place_definitions`]
+    /// then keys such a parameter by the definition starting there, as the
+    /// caller index keys the function.
+    pub(super) owner_start: Option<u32>,
 }
 
 /// Each key of a destructured parameter, with the parameter's position and
@@ -2078,7 +2129,7 @@ impl Reader<'_> {
                 match crate::graphql_document_sites::unwrap_expression(expr) {
                     // A function written in place is no text.
                     Expr::Arrow(_) | Expr::Fn(_) => Value::Str(vec![Piece::Unknown]),
-                    expr => self.eval(expr, scope),
+                    expr => self.recording(|| self.eval(expr, scope)),
                 },
             );
             out.arg_values.push(self.value_of(expr, scope, bound));
@@ -2182,7 +2233,11 @@ impl Reader<'_> {
                 line: self.source_map.lookup_char_pos(binding.span.lo).line as u32,
                 init: Vec::new(),
                 kind: BindingKind::Const,
+                // The choice spans the parameter and its default as written
+                // (`name = "/x"`).
                 text: Some(ValueAt::Alt {
+                    lo: binding.span.lo.0,
+                    hi: default.span().hi.0,
                     branches: vec![ValueAt::Unread, text_of(default, &identity)],
                 }),
                 reassigned: false,
@@ -2845,6 +2900,7 @@ impl<'a> Resolver<'a> {
             // guards' (carrick#3504 S7b-2).
             | ValueAt::New { .. }
             | ValueAt::Constructed { .. }
+            | ValueAt::Unstated { .. }
             | ValueAt::Unread => stop(Stop::UnreadExpression),
         }
     }
@@ -4565,5 +4621,157 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             [(0, Vec::new(), ValueAt::Lit("fallback".to_string()))]
         );
         assert!(file.functions["one"].param_default_texts.is_empty());
+    }
+
+    /// The first argument of the one call named `callee` in `pieces.ts`
+    /// (fixture `resolve-text`), as the text it states, with the file and
+    /// the source text a span of it names.
+    fn piece_probe(on: &super::super::fixture_walk::Walked, callee: &str) -> ValueAt {
+        let path = on.path("services/web/src/pieces.ts");
+        let calls: Vec<ValueAt> = super::super::row_calls::every_call(&on.inputs.files)
+            .into_iter()
+            .filter(|(file, call, _)| *file == path && call.callee == callee)
+            .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
+            .collect();
+        assert_eq!(calls.len(), 1, "{callee}: {calls:?}");
+        calls.into_iter().next().unwrap()
+    }
+
+    /// The parts a template term interpolates, in order: every part but
+    /// the quasis.
+    fn interpolated(term: ValueAt) -> Vec<ValueAt> {
+        let ValueAt::Concat(parts) = term else {
+            panic!("a template: {term:?}");
+        };
+        parts
+            .into_iter()
+            .filter(|part| !matches!(part, ValueAt::Lit(_)))
+            .collect()
+    }
+
+    /// The source text `pieces.ts` writes at `lo..hi` (discovery numbering).
+    fn written_at(on: &super::super::fixture_walk::Walked, lo: u32, hi: u32) -> String {
+        let path = on.path("services/web/src/pieces.ts");
+        let start = on.inputs.files[&path].source_start;
+        let source = std::fs::read_to_string(&path).unwrap();
+        source[(lo - start) as usize..(hi - start) as usize].to_string()
+    }
+
+    /// carrick#3504 B10-2a1: a choice (`??`, `?:`) and an expression the
+    /// names lowering does not read keep their spans in the text term, so a
+    /// part of a name is placed where it is written.
+    #[test]
+    fn text_terms_keep_the_span_of_a_choice_and_of_an_unlowered_expression() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let parts = interpolated(piece_probe(&on, "p_env"));
+        let [ValueAt::Alt { lo, hi, branches }] = parts.as_slice() else {
+            panic!("{parts:?}");
+        };
+        assert_eq!(
+            written_at(&on, *lo, *hi),
+            r#"process.env.API_URL ?? "http://localhost""#
+        );
+        assert_eq!(branches.len(), 2, "{branches:?}");
+        let parts = interpolated(piece_probe(&on, "p_built"));
+        let [ValueAt::Unstated { lo, hi }] = parts.as_slice() else {
+            panic!("{parts:?}");
+        };
+        assert_eq!(written_at(&on, *lo, *hi), "encodeURIComponent(q)");
+    }
+
+    /// carrick#3504 B10-2a1: each part of a call's argument keeps the pieces
+    /// the request summaries read it as, by the span its text term names: a
+    /// parameter, an environment read with its fallback, a call they do not
+    /// read, an imported constant as its text once every module is linked,
+    /// and the parts of a local's initialiser, which they read in place.
+    #[test]
+    fn each_argument_part_keeps_the_pieces_the_summaries_read_there() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let path = on.path("services/web/src/pieces.ts");
+        let file = &on.inputs.files[&path];
+        let span = |term: &ValueAt| match term {
+            ValueAt::Read { lo, hi, .. }
+            | ValueAt::Alt { lo, hi, .. }
+            | ValueAt::Unstated { lo, hi } => (*lo, *hi),
+            other => panic!("no span: {other:?}"),
+        };
+        let pieces = |term: &ValueAt| {
+            file.arg_pieces
+                .get(&span(term))
+                .cloned()
+                .unwrap_or_else(|| panic!("no pieces at {term:?}"))
+        };
+        // The one part a probe's template interpolates.
+        let part = |callee: &str| {
+            let parts = interpolated(piece_probe(&on, callee));
+            assert_eq!(parts.len(), 1, "{callee}: {parts:?}");
+            parts[0].clone()
+        };
+
+        assert_eq!(pieces(&part("p_url")), [Piece::Param(0, "id".to_string())]);
+        let env = pieces(&part("p_env"));
+        assert!(
+            matches!(env.as_slice(), [Piece::Opaque {
+                end: Root::Env { name, fallback: Some(fallback), .. },
+                ..
+            }] if name == "API_URL" && fallback == "http://localhost"),
+            "{env:?}"
+        );
+        let built = pieces(&part("p_built"));
+        assert!(
+            matches!(built.as_slice(), [Piece::Opaque {
+                text,
+                end: Root::Hole(guards::HoleReason::UnreadExpression),
+                ..
+            }] if text == "encodeURIComponent(q)"),
+            "{built:?}"
+        );
+        assert_eq!(
+            pieces(&part("p_base")),
+            [Piece::Lit("https://api.example.test".to_string())]
+        );
+        // The local is read in place at the call, and each part of its
+        // initialiser keeps its own pieces.
+        let local = piece_probe(&on, "p_local");
+        assert_eq!(
+            pieces(&local),
+            [
+                Piece::Lit("/orders/".to_string()),
+                Piece::Param(0, "id".to_string())
+            ]
+        );
+        let initialiser = file
+            .module_bindings
+            .iter()
+            .find(|((_, name), binding)| {
+                name == "url" && binding.declared_in.as_deref() == Some("local")
+            })
+            .and_then(|(_, binding)| binding.text.clone())
+            .expect("the local's initialiser");
+        let parts = interpolated(initialiser);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(pieces(&parts[0]), [Piece::Param(0, "id".to_string())]);
+    }
+
+    /// carrick#3504 B10-2a1, #2793: a member of an object the module-level
+    /// code writes (`pieces.ts`, fixture `resolve-text`), which the module
+    /// does not read as a function of its own, has its parameters keyed by
+    /// the definition the extractor keys it as, as the caller index keys it.
+    #[test]
+    fn a_module_level_object_member_s_parameter_is_keyed_by_its_definition() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let path = on.path("services/web/src/pieces.ts");
+        let file = &on.inputs.files[&path];
+        // Detached: no function of the file holds it.
+        assert!(!file.functions.contains_key("itemsApi.replace"));
+        let (_, id) = param_entry(file, Some("itemsApi.replace"), "id");
+        assert_eq!((id.index, id.keys.as_slice()), (0, &[][..]), "{id:?}");
+        assert!(!id.collides && !id.written, "{id:?}");
     }
 }

@@ -1336,11 +1336,7 @@ impl<'a> Calls<'a> {
             paths.sort();
             for path in paths {
                 let file = &source.files[path];
-                let by_start: HashMap<u32, &str> = file
-                    .definitions
-                    .iter()
-                    .filter_map(|(key, (start, _))| Some(((*start)?, key.as_str())))
-                    .collect();
+                let by_start = file.definitions_by_start();
                 let in_file = InFile {
                     source: &at,
                     file: path,

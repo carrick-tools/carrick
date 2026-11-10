@@ -239,7 +239,7 @@ impl<'a> Resolver<'a> {
                 member: false,
                 ..
             } => self.text_of_name(file, *lo, *hi),
-            ValueAt::Alt { branches } => branches
+            ValueAt::Alt { branches, .. } => branches
                 .iter()
                 .flat_map(|branch| self.text_of_branch(file, branch))
                 .collect(),

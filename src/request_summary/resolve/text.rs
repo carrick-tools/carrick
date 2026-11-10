@@ -67,11 +67,19 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
                 .and_then(|cooked| cooked.as_str())
                 .map(str::to_string)
         }),
-        Expr::Cond(cond) => ValueAt::Alt {
-            branches: vec![next(&cond.cons), next(&cond.alt)],
-        },
-        Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
+        Expr::Cond(cond) => {
+            let (lo, hi) = at(cond.span);
             ValueAt::Alt {
+                lo,
+                hi,
+                branches: vec![next(&cond.cons), next(&cond.alt)],
+            }
+        }
+        Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
+            let (lo, hi) = at(bin.span);
+            ValueAt::Alt {
+                lo,
+                hi,
                 branches: vec![next(&bin.left), next(&bin.right)],
             }
         }
@@ -102,18 +110,21 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
             }
         }
         Expr::Call(call) => {
+            // A call of no built-in: the expression stays unread, at its span.
+            let (lo, hi) = at(call.span);
+            let unstated = ValueAt::Unstated { lo, hi };
             let Callee::Expr(callee) = &call.callee else {
-                return ValueAt::Unread;
+                return unstated;
             };
             let Expr::Member(member) = &**callee else {
-                return ValueAt::Unread;
+                return unstated;
             };
             let MemberProp::Ident(method) = &member.prop else {
-                return ValueAt::Unread;
+                return unstated;
             };
             let method = method.sym.as_ref();
             if !BUILT_INS.contains(&method) || call.args.iter().any(|arg| arg.spread.is_some()) {
-                return ValueAt::Unread;
+                return unstated;
             }
             let object = if method == "join" {
                 // Only an array literal written in place: every element
@@ -136,7 +147,6 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
             } else {
                 next(&member.obj)
             };
-            let (lo, hi) = at(call.span);
             ValueAt::BuiltIn {
                 lo,
                 hi,
@@ -146,17 +156,19 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
             }
         }
         Expr::TaggedTpl(tagged) => {
-            // `String.raw`: the template's raw text.
+            // `String.raw`: the template's raw text. Any other tag stays
+            // unread, at its span.
+            let (lo, hi) = at(tagged.span);
+            let unstated = ValueAt::Unstated { lo, hi };
             let Expr::Member(tag) = &*tagged.tag else {
-                return ValueAt::Unread;
+                return unstated;
             };
             let (Expr::Ident(object), MemberProp::Ident(prop)) = (&*tag.obj, &tag.prop) else {
-                return ValueAt::Unread;
+                return unstated;
             };
             if object.sym != "String" || prop.sym != "raw" {
-                return ValueAt::Unread;
+                return unstated;
             }
-            let (lo, hi) = at(tagged.span);
             ValueAt::BuiltIn {
                 lo,
                 hi,
@@ -204,7 +216,10 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
             }
             ValueAt::Entries(entries)
         }
-        _ => ValueAt::Unread,
+        other => {
+            let (lo, hi) = at(other.span());
+            ValueAt::Unstated { lo, hi }
+        }
     }
 }
 
@@ -334,7 +349,10 @@ impl PatternMember<'_> {
             key: Box::new(ValueAt::Lit(self.key.clone())),
         };
         match self.default {
+            // The choice spans the property it is written as.
             Some(default) => ValueAt::Alt {
+                lo: shift(self.span.lo.0),
+                hi: shift(self.span.hi.0),
                 branches: vec![member, text_of(default, shift)],
             },
             None => member,
