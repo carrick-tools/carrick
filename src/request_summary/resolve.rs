@@ -2011,7 +2011,7 @@ pub(super) struct ParamValues {
 }
 
 /// The key a member read states: `.name` or `['name']`.
-fn static_key(member: &MemberExpr) -> Option<String> {
+pub(super) fn static_key(member: &MemberExpr) -> Option<String> {
     match &member.prop {
         MemberProp::Ident(prop) => Some(prop.sym.to_string()),
         MemberProp::Computed(computed) => match &*computed.expr {

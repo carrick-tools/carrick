@@ -1,0 +1,8 @@
+{
+  "name": "procedure-absent-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-procs": "^1.0.0"
+  }
+}

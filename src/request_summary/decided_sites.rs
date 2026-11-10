@@ -4090,7 +4090,7 @@ fn receiver_written(
     let Some(placed) = calls.at_span(&file, site.end.span_start, site.end.span_end) else {
         return false;
     };
-    let Some(&(lo, hi, false)) = placed.call.receiver_spans.last() else {
+    let Some(&(lo, hi, false, _)) = placed.call.receiver_spans.last() else {
         return false;
     };
     inputs

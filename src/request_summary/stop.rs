@@ -124,6 +124,9 @@ pub enum Stop {
     ProcedureRouterAmbiguous,
     /// A procedure call's key path holds a member the code does not name.
     ProcedurePathUnread,
+    /// A procedure call's first key is one the router's type lacks, so the
+    /// router it was removed from cannot be named (carrick#3778 S0).
+    ProcedureFirstKeyAbsent,
     /// A parameter whose callers fill it, read by a reader that does not read through callers.
     ParameterUnread,
     /// A message name the code builds over an environment read: the run decides it.
@@ -136,7 +139,7 @@ pub enum Stop {
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 54] = [
+    pub const ALL: [Stop; 55] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -187,6 +190,7 @@ impl Stop {
         Stop::ProcedureRouterOutsideRepo,
         Stop::ProcedureRouterAmbiguous,
         Stop::ProcedurePathUnread,
+        Stop::ProcedureFirstKeyAbsent,
         Stop::ParameterUnread,
         Stop::EnvValue,
         Stop::ProcedureUnmounted,
@@ -246,6 +250,7 @@ impl Stop {
             Stop::ProcedureRouterOutsideRepo => "procedure_router_outside_repo",
             Stop::ProcedureRouterAmbiguous => "procedure_router_ambiguous",
             Stop::ProcedurePathUnread => "procedure_path_unread",
+            Stop::ProcedureFirstKeyAbsent => "procedure_first_key_absent",
             Stop::ParameterUnread => "parameter_unread",
             Stop::EnvValue => "env_value",
             Stop::ProcedureUnmounted => "procedure_unmounted",

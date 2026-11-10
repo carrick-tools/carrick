@@ -1025,8 +1025,9 @@ struct CallIr {
     /// as its span (discovery numbering) and whether it is a member access
     /// rather than a name (`this.child` then nothing for
     /// `this.child.send()`): where a compiler row names the receiver's type
-    /// (carrick#2431). Read by discovery alone.
-    receiver_spans: Vec<(u32, u32, bool)>,
+    /// (carrick#2431), and the key a member access reads as written
+    /// ([`discovery::receiver_spans`]). Read by discovery alone.
+    receiver_spans: Vec<(u32, u32, bool, Option<String>)>,
     /// The object the callee's member is read on, whatever it is written
     /// as: its span (discovery numbering) and form. `None` when the callee
     /// is no member access. Read by the receiver trace alone (carrick#2474).
