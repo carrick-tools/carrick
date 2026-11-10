@@ -1914,9 +1914,8 @@ pub(super) struct ParamName {
 /// What a parameter table entry says about a declaration (carrick#3504
 /// B10-1a): the parameter a compiler row's declaration names, by line and
 /// name. Kept beside the binding table and never in it, so no value reader
-/// sees a parameter as a binding. Read by nothing yet: the text reader reads
-/// a parameter through its callers from it (B10-1b).
-#[allow(dead_code)]
+/// sees a parameter as a binding. The text reader reads a parameter through
+/// its callers from it ([`Resolver::texts_through_callers`], B10-1b).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ParamAt {
     /// The definition the parameter belongs to, by its key in
@@ -2802,6 +2801,10 @@ pub(super) struct Resolver<'a> {
     /// The declarations being read for their text (carrick#3504 S2): a
     /// value that reads itself holds no text.
     texts_reading: RefCell<HashSet<(PathBuf, u32, String)>>,
+    /// The open text query reads a parameter as the texts its callers pass
+    /// ([`Self::texts_through_callers`], carrick#3504 B10-1b). Off for every
+    /// other entry point, which answers a parameter as before.
+    callers_mode: Cell<bool>,
     /// The exported module bindings some importer may change or hand on,
     /// by declaring file and name; `None`: every one is contested
     /// (carrick#2448). Built on first use.
@@ -2859,6 +2862,7 @@ impl<'a> Resolver<'a> {
             cap: MAX_QUERY_STEPS,
             bindings_reading: RefCell::new(HashSet::new()),
             texts_reading: RefCell::new(HashSet::new()),
+            callers_mode: Cell::new(false),
             contested: std::cell::OnceCell::new(),
         }
     }
@@ -3761,6 +3765,28 @@ impl<'a> Resolver<'a> {
     /// of the run declares at module scope: the file as the inputs key it,
     /// the declaration's line and its name.
     pub(super) fn declared_binding(&self, row: &Row) -> Option<(&'a Path, u32, String)> {
+        let (path, ir, line, symbol) = self.declaration_of(row)?;
+        ir.module_bindings
+            .contains_key(&(line, symbol.clone()))
+            .then_some((path, line, symbol))
+    }
+
+    /// The parameter `row` names, when its declaration is one a file of the
+    /// run declares ([`FileIr::param_bindings`], carrick#3504 B10-1b): the
+    /// declaration as [`Self::declared_binding`] names one, and its entry.
+    pub(super) fn declared_param(
+        &self,
+        row: &Row,
+    ) -> Option<((&'a Path, u32, String), &'a ParamAt)> {
+        let (path, ir, line, symbol) = self.declaration_of(row)?;
+        let param = ir.param_bindings.get(&(line, symbol.clone()))?;
+        Some(((path, line, symbol), param))
+    }
+
+    /// The file of the run that declares what `row` names (as the inputs
+    /// key it), with what was read of it, the declaration's line and its
+    /// name; `None` for a declaration outside the repo or the run.
+    fn declaration_of(&self, row: &Row) -> Option<(&'a Path, &'a FileIr, u32, String)> {
         if !super::discovery::in_repo(row) {
             return None;
         }
@@ -3770,9 +3796,7 @@ impl<'a> Resolver<'a> {
             .inputs_for(&declaring)
             .files
             .get_key_value(&declaring)?;
-        ir.module_bindings
-            .contains_key(&(line, symbol.to_string()))
-            .then(|| (path.as_path(), line, symbol.to_string()))
+        Some((path.as_path(), ir, line, symbol.to_string()))
     }
 
     /// Every value the module binding `symbol`, declared on `line` of `file`,
