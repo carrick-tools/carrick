@@ -6306,7 +6306,7 @@ impl Reader<'_> {
                         let value = if unsettled {
                             Value::hole(name.clone(), HoleReason::Reassigned)
                         } else {
-                            bound(
+                            bound_local(
                                 name.clone(),
                                 self.eval(init, scope),
                                 self.construction_text(init).as_deref(),
@@ -7394,6 +7394,27 @@ fn bound(name: String, value: Value, construction: Option<&str>) -> Value {
             Value::opaque(name, end)
         }
     }
+}
+
+/// [`bound`] for a local variable. A URL written once into a local out of
+/// several pieces with no text and a parameter among them (`const target =
+/// (opts.base ?? this.base) + path`, `getBase() + path`) keeps its pieces,
+/// as the same expression written inline in the call does: the parameter is
+/// the caller's to fill in, and collapsing the value into one piece named by
+/// the local would drop it and the request with it. A class field is not
+/// read this way (its own call is `bound`, where a constructor parameter
+/// collapses and links through the field).
+fn bound_local(name: String, value: Value, construction: Option<&str>) -> Value {
+    if let Value::Str(pieces) = &value
+        && pieces.len() > 1
+        && !pieces.iter().any(|piece| matches!(piece, Piece::Lit(_)))
+        && pieces
+            .iter()
+            .any(|piece| matches!(piece, Piece::Param(..) | Piece::ParamKey(..)))
+    {
+        return value;
+    }
+    bound(name, value, construction)
 }
 
 /// The value a construction passes, bound to the names `pat` introduces: a
