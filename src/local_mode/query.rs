@@ -168,7 +168,10 @@ pub fn answer(
                             .into_iter()
                             .flatten()
                             .map(|site| super::read_model::IndexedUnread {
-                                line: lines.map(site.line),
+                                line: match &lines {
+                                    Some(lines) => lines.map(site.line),
+                                    None => site.line,
+                                },
                                 reason: site.reason,
                             })
                             .collect(),
