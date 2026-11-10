@@ -110,8 +110,9 @@ impl TextValue {
 /// Whether two chains agree on every definition both fill (carrick#3504
 /// B10-1b, P5): parts read at different calls of one function never join.
 fn chains_agree(head: &[CallAt], tail: &[CallAt]) -> bool {
-    head.iter()
-        .all(|a| tail.iter().filter(|b| b.fills == a.fills).all(|b| b == a))
+    // DELETE-CHECK M2: no chain-agreement filter.
+    let _ = (head, tail);
+    true
 }
 
 /// The union of two chains that agree: `head`'s calls, then `tail`'s it
@@ -316,7 +317,8 @@ impl<'a> Resolver<'a> {
                     .iter()
                     .all(|value| matches!(value, TextValue::Hole { .. }))
             {
-                if !through_callers {
+                // DELETE-CHECK M5: first hole only, flag or not.
+                if !through_callers || true {
                     return values.into_iter().take(1).collect();
                 }
                 let mut holes: Vec<TextValue> = Vec::new();
@@ -402,7 +404,8 @@ impl<'a> Resolver<'a> {
                     callers,
                     ..
                 },
-            ] if callers.is_empty() => Ok((text.clone(), read_from.clone())),
+                // DELETE-CHECK M4: one_text accepts a chain.
+            ] if callers.is_empty() || !callers.is_empty() => Ok((text.clone(), read_from.clone())),
             [TextValue::Hole { reason, .. }] => Err(*reason),
             _ => Err(guards::HoleReason::UnreadExpression),
         }
@@ -454,9 +457,8 @@ impl<'a> Resolver<'a> {
         // Read through callers, a parameter is what its callers pass: asked
         // before the binding table, which holds a defaulted parameter as the
         // choice of its default (carrick#3504 B10-1b).
-        if self.callers_mode.get()
-            && let Some((at, param)) = self.declared_param(row)
-        {
+        // DELETE-CHECK M1: the arm ignores the flag.
+        if let Some((at, param)) = self.declared_param(row) {
             return self.param_texts(at, param, &[]);
         }
         let Some((at, binding, declared)) = self.declared_entry(row) else {
@@ -900,8 +902,9 @@ impl<'a> Resolver<'a> {
     /// Whether `term`, written in `file`, is a parameter being read for its
     /// text: a caller that hands it on unchanged inside a cycle.
     fn passes_on(&self, file: &Path, term: &ValueAt) -> bool {
-        self.param_read(file, term)
-            .is_some_and(|id| self.texts_reading.borrow().contains(&id))
+        // DELETE-CHECK M3: no unchanged-cycle rule.
+        let _ = (file, term);
+        false
     }
 
     /// The parameter declaration `term`, written in `file`, reads where it
