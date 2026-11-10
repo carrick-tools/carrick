@@ -525,8 +525,9 @@ function elidedLocatorOpening(normalizedTarget: string): string | undefined {
  *
  * `null` when the text does not parse as one expression or one statement:
  * there is no structure to read, and the caller keeps its text rule.
+ * Exported for the reference walk in `infer-line-index.test.ts`.
  */
-function locatorNames(
+export function locatorNames(
   normalizedTarget: string
 ): { texts: Set<string>; rootKind: ts.SyntaxKind; rootStart: number } | null {
   const parsed = (source: string): ts.SourceFile | null => {
