@@ -144,9 +144,8 @@ impl ModuleBinding {
     /// An entry of the carrick#3794 class: a declaration in a block, in a
     /// function written inside a body, or a function declared in a body.
     /// The table holds them, and every reader refuses them at its choke
-    /// point (the text reader's `declared_entry`, [`Self::values_read`], the
-    /// procedures walk's `binding`) until its own step opens them, so no
-    /// reader answers differently for having them.
+    /// point ([`Self::values_read`], the procedures walk's `binding`) until
+    /// its own step opens them; the text reader reads them (T2).
     pub(super) fn scoped_entry(&self) -> bool {
         !matches!(self.declared, Declared::Module | Declared::Body(_))
             || self.kind == BindingKind::Function
