@@ -215,3 +215,95 @@ fn a_generated_style_client_call_is_a_site_at_its_own_line() {
         "{wrong:#?}\nrows: {rows:#?}\npossible calls: {leads:#?}\nunfollowed: {unfollowed:#?}"
     );
 }
+
+/// The rows the scan stores at `at` (`file:line`, under `src/`).
+fn rows_at<'a>(rows: &'a [String], at: &str) -> Vec<&'a String> {
+    rows.iter()
+        .filter(|row| row.starts_with(&format!("src/{at} ")))
+        .collect()
+}
+
+/// Whether the built sidecar is present; outside CI a missing one skips.
+fn sidecar_built() -> bool {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    if script.exists() {
+        return true;
+    }
+    assert!(
+        std::env::var("CI").is_err(),
+        "the built sidecar is missing in CI"
+    );
+    eprintln!("Skipping: the built sidecar is missing");
+    false
+}
+
+/// carrick#2448 T4: the faithful generated shape. Each SDK function hands
+/// `{ url: '…', ...options }` to a client method whose walk reaches the
+/// language library's `fetch`, and the URL the send is handed is built by
+/// string operations no composition reads. The carried request descriptor
+/// states the row at the SDK call: one row per call, from the fact layer,
+/// with the method and path the `request_spec` rule states today.
+#[test]
+fn the_generated_shape_states_one_fact_row_per_sdk_call() {
+    if !sidecar_built() {
+        return;
+    }
+    let blobs = scan();
+    let rows = call_rows(&blobs);
+    let mut wrong = Vec::new();
+    for (at, method, path) in [
+        ("r3/sdk.ts:11", "GET", "/api/v1/widgets"),
+        ("r3/sdk.ts:18", "GET", "/api/v1/widgets/:id"),
+        ("r3/sdk.ts:25", "POST", "/api/v1/widgets"),
+    ] {
+        let at_line = rows_at(&rows, at);
+        match at_line[..] {
+            [row]
+                if row.ends_with(" request_summary")
+                    && row.contains(&format!(" {method} {path} ")) => {}
+            _ => wrong.push(format!(
+                "want one {method} {path} fact row at {at}: {at_line:?}"
+            )),
+        }
+    }
+    // Callers reach these rows only while they are the request itself, not a
+    // call through a declaration (`call_through.rs` `is_request_row`).
+    let through: Vec<String> = blobs
+        .iter()
+        .flat_map(|blob| blob["calls"].as_array().into_iter().flatten())
+        .filter(|call| {
+            call["file_path"]
+                .as_str()
+                .is_some_and(|at| at.starts_with("src/r3/sdk.ts:"))
+                && call["role"] == "wrapper_call"
+        })
+        .map(|call| call["file_path"].to_string())
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}\nrows: {rows:#?}");
+    assert!(
+        through.is_empty(),
+        "SDK rows read as calls through: {through:?}"
+    );
+}
+
+/// carrick#2448 T4: the same `{ url }` call shape whose walk ends at a broker
+/// (`n2/jobs.ts:20`) or at no labelled call at all (`n1/cache.ts`) states no
+/// fact-layer HTTP row. Their `request_spec` rows go with that rule (#2413
+/// slice F), not here.
+#[test]
+fn a_descriptor_carried_to_a_non_http_end_states_no_http_row() {
+    if !sidecar_built() {
+        return;
+    }
+    let blobs = scan();
+    let rows = call_rows(&blobs);
+    let wrong: Vec<&String> = ["n2/jobs.ts:20", "n1/cache.ts:19", "n1/cache.ts:21"]
+        .iter()
+        .flat_map(|at| rows_at(&rows, at))
+        .filter(|row| row.ends_with(" request_summary"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "fact rows off a non-HTTP end: {wrong:#?}\nrows: {rows:#?}"
+    );
+}
