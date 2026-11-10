@@ -1086,7 +1086,7 @@ fn slot_values(call: &CallIr, slot: &(usize, Option<String>)) -> Option<Vec<Valu
         return None;
     }
     // The last write of the key is the value.
-    let last = matching.last().unwrap_or(first);
+    let last = matching.next_back().unwrap_or(first);
     Some(last.values(fields).to_vec())
 }
 
