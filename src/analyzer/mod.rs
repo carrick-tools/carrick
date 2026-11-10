@@ -2821,7 +2821,13 @@ impl Analyzer {
                 // or param-only producer absorbing an arbitrary call). The
                 // call is ROUTED, so it is not a missing endpoint, but not
                 // MATCHED: no verified mark, no cross-repo edge.
-                carrick_match::PairOutcome::NoLiteralAgreement => {}
+                //
+                // `ProcedureUnserved`: the call names a procedure no row
+                // serves. A reading gap or an unindexed service, never a
+                // missing endpoint (no call reaches here with a procedure
+                // until the client reader states one).
+                carrick_match::PairOutcome::NoLiteralAgreement
+                | carrick_match::PairOutcome::ProcedureUnserved => {}
                 carrick_match::PairOutcome::Matched
                 | carrick_match::PairOutcome::RouteCaseUnknown => {
                     // The dispatch case is part of an operation's identity,
