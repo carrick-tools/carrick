@@ -442,7 +442,7 @@ fn callee_key(resolver: &Resolver<'_>, file: &Path, call: &CallIr) -> Option<(St
     let row = match member {
         None => resolver.row_at(file, call.site.lo, call.site.hi, Kind::Call),
         Some(_) => match call.receiver_spans.as_slice() {
-            [(lo, hi, false)] => resolver.row_at(file, *lo, *hi, Kind::Ident),
+            [(lo, hi, false, _)] => resolver.row_at(file, *lo, *hi, Kind::Ident),
             _ => return None,
         },
     };

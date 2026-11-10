@@ -77,8 +77,8 @@ use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_st
 use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
-    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, FLAG_RUNS_HANDED, FLAG_TOO_MANY,
-    Kind, Row,
+    FLAG_DECLARATION_UNNAMED, FLAG_ERROR_TYPE, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED,
+    FLAG_RUNS_HANDED, FLAG_TOO_MANY, Kind, Row,
 };
 use crate::services::type_sidecar::{
     ClaimOn, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm, SemanticsResult,
@@ -567,10 +567,12 @@ fn specifier_keys(specifier: &str) -> Vec<String> {
 }
 
 /// Each object the callee's member chain is read on, innermost first: its
-/// span (discovery numbering) and whether it is a member access. An
-/// optional member (`socket?.emit`) is read as a member. The walk stops at
-/// anything but a name or a member access (`this`, a call).
-pub(crate) fn receiver_spans(callee: &Expr) -> Vec<(u32, u32, bool)> {
+/// span (discovery numbering), whether it is a member access, and the key
+/// that member reads as the code writes it (`.name`, `['name']`; `None` for
+/// the root name and any other computed key, carrick#3778 S0). An optional
+/// member (`socket?.emit`) is read as a member. The walk stops at anything
+/// but a name or a member access (`this`, a call).
+pub(crate) fn receiver_spans(callee: &Expr) -> Vec<(u32, u32, bool, Option<String>)> {
     fn member_of(expr: &Expr) -> Option<&MemberExpr> {
         match crate::graphql_document_sites::unwrap_expression(expr) {
             Expr::Member(member) => Some(member),
@@ -586,13 +588,18 @@ pub(crate) fn receiver_spans(callee: &Expr) -> Vec<(u32, u32, bool)> {
     while let Some(member) = at {
         let object = crate::graphql_document_sites::unwrap_expression(&member.obj);
         if let Expr::Ident(ident) = object {
-            out.push((ident.span.lo.0, ident.span.hi.0, false));
+            out.push((ident.span.lo.0, ident.span.hi.0, false, None));
             break;
         }
         at = member_of(object);
-        if at.is_some() {
+        if let Some(member) = at {
             let span = object.span();
-            out.push((span.lo.0, span.hi.0, true));
+            out.push((
+                span.lo.0,
+                span.hi.0,
+                true,
+                super::resolve::static_key(member),
+            ));
         }
     }
     out
@@ -603,7 +610,7 @@ pub(crate) fn receiver_spans(callee: &Expr) -> Vec<(u32, u32, bool)> {
 fn root_name(call: &CallIr) -> Option<&str> {
     match call.receiver_spans.last() {
         None => Some(call.callee_text.as_str()),
-        Some((_, _, false)) => call
+        Some((_, _, false, _)) => call
             .callee_text
             .split(['.', '?', '['])
             .next()
@@ -1024,33 +1031,65 @@ fn path_op<'e>(
     type_name: &str,
     member: &str,
 ) -> Option<(&'e ExportClaims, Option<String>)> {
-    use crate::services::type_sidecar::{BoundName, OpName};
     exports
         .iter()
-        .filter(|export| export.package == package && export.role != LibraryRole::None)
-        .find_map(|export| {
-            export.claims.iter().find_map(|claim| match claim {
-                LibraryClaim::Op {
-                    member: Some(claimed),
-                    of: Some(of),
-                    name,
+        .filter(|export| export.package == package)
+        .find_map(|export| path_op_of(export, type_name, member))
+}
+
+/// The one export, of any package in the store, that claims a path-named
+/// call-form op on `member` of the type `type_name` its own package declares
+/// ([`path_op`]), and the op's join: for a call the compiler gives no
+/// declaration to name a package by, a call of a key the client's type lacks
+/// (carrick#3778 S0). `None` when no export or more than one claims it.
+fn sole_path_op<'e>(
+    exports: &'e [ExportClaims],
+    type_name: &str,
+    member: &str,
+) -> Option<(&'e ExportClaims, Option<String>)> {
+    let mut claimed = exports
+        .iter()
+        .filter_map(|export| path_op_of(export, type_name, member));
+    let first = claimed.next()?;
+    claimed.next().is_none().then_some(first)
+}
+
+/// The join of the path-named call-form op `export` claims on `member` of
+/// the type `type_name` its own package declares (`of:
+/// "type:<package>#<type_name>"`), when it claims one.
+fn path_op_of<'e>(
+    export: &'e ExportClaims,
+    type_name: &str,
+    member: &str,
+) -> Option<(&'e ExportClaims, Option<String>)> {
+    use crate::services::type_sidecar::{BoundName, OpName};
+    if export.role == LibraryRole::None {
+        return None;
+    }
+    export.claims.iter().find_map(|claim| match claim {
+        LibraryClaim::Op {
+            member: Some(claimed),
+            of: Some(of),
+            name,
+            ..
+        } if claim.is_call_form() && claimed == member => {
+            let (module, held) = of.strip_prefix("type:")?.split_once('#')?;
+            let join = match name.as_deref()? {
+                OpName::Bound {
+                    bound: BoundName::Path,
+                    join,
                     ..
-                } if claim.is_call_form() && claimed == member => {
-                    let (module, held) = of.strip_prefix("type:")?.split_once('#')?;
-                    let join = match name.as_deref()? {
-                        OpName::Bound {
-                            bound: BoundName::Path,
-                            join,
-                            ..
-                        } => join.clone(),
-                        _ => return None,
-                    };
-                    (held == type_name && specifier_keys(module).iter().any(|key| key == package))
-                        .then_some((export, join))
-                }
-                _ => None,
-            })
-        })
+                } => join.clone(),
+                _ => return None,
+            };
+            (held == type_name
+                && specifier_keys(module)
+                    .iter()
+                    .any(|key| *key == export.package))
+            .then_some((export, join))
+        }
+        _ => None,
+    })
 }
 
 /// Whether `claims` state `member` as a call-form op of the export.
@@ -1692,9 +1731,22 @@ impl<'a> Walker<'a> {
     /// (`procedure_router_outside_repo`) or at more than one place
     /// (`procedure_router_ambiguous`), or a key is one the code does not
     /// name (`procedure_path_unread`). `None` for any other call.
+    ///
+    /// A call of a key the client's type lacks (carrick#3778 S0, a
+    /// procedure the router no longer has): the compiler gives the call row
+    /// no symbol and an error type, so the member is the callee's own name
+    /// and the op is the one export of the store that claims it on the
+    /// proxy's type ([`sole_path_op`]). Such a call is a procedure call only
+    /// where [`Self::procedure_at`] finds a key absent; a call whose keys
+    /// are all present (another op on a present procedure) is none.
     fn procedure_end(&self, file: &Path, call: &CallIr) -> Option<(SiteEnd, Option<Stop>)> {
         let row = self.row(file, call)?;
-        let member = row.symbol()?;
+        let absent = row.symbol().is_none() && row.flags() & FLAG_ERROR_TYPE != 0;
+        let member = match row.symbol() {
+            Some(symbol) => symbol,
+            None if absent => call.callee.as_str(),
+            None => return None,
+        };
         if in_repo(row) {
             return None;
         }
@@ -1703,7 +1755,7 @@ impl<'a> Walker<'a> {
         let ir = inputs.files.get(file)?;
         let positions = inputs.positions.as_ref()?;
         let at = |index: usize| {
-            let (lo, hi, member) = call.receiver_spans[index];
+            let (lo, hi, member, _) = call.receiver_spans[index];
             let kind = if member { Kind::Member } else { Kind::Ident };
             positions
                 .lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind)
@@ -1714,6 +1766,10 @@ impl<'a> Walker<'a> {
         // with a path-named op on this member.
         let (inner, export, join) = (0..call.receiver_spans.len()).find_map(|index| {
             let root = proxy_type(index)?;
+            if absent {
+                let (export, join) = sole_path_op(self.labels.exports, root, member)?;
+                return Some((index, export, join));
+            }
             packages.iter().find_map(|package| {
                 let (export, join) = path_op(self.labels.exports, package, root, member)?;
                 Some((index, export, join))
@@ -1738,10 +1794,10 @@ impl<'a> Walker<'a> {
             Some(member),
             claims,
         );
-        match self.procedure_at(file, call, ir, positions, proxy, join.as_deref()) {
+        match self.procedure_at(file, call, ir, positions, proxy, join.as_deref(), absent) {
             Ok(procedure) => Some((
                 SiteEnd {
-                    procedure: Some(procedure),
+                    procedure: Some(procedure?),
                     ..end
                 },
                 None,
@@ -1754,6 +1810,15 @@ impl<'a> Walker<'a> {
     /// ([`Self::procedure_end`]): the keys read on the proxy, outermost
     /// first, joined by `join`, and the router its first key's declaration
     /// is held by.
+    ///
+    /// With `absent` (the call row has no symbol and an error type), a key
+    /// whose row has no symbol and an error type is one the client's type
+    /// lacks: its text is the key the code writes, and every key read on it
+    /// is absent too. The first key absent names no router
+    /// (`procedure_first_key_absent`). `None` when no key is absent: the
+    /// call is no procedure call. Any other key with no symbol (an index
+    /// signature, a client typed `any`) is `procedure_path_unread`.
+    #[allow(clippy::too_many_arguments)]
     fn procedure_at(
         &self,
         file: &Path,
@@ -1762,9 +1827,10 @@ impl<'a> Walker<'a> {
         positions: &crate::position_rows::PositionIndex,
         proxy: usize,
         join: Option<&str>,
-    ) -> Result<ProcedureAt, Stop> {
+        absent: bool,
+    ) -> Result<Option<ProcedureAt>, Stop> {
         let at = |index: usize| {
-            let (lo, hi, _) = call.receiver_spans[index];
+            let (lo, hi, _, _) = call.receiver_spans[index];
             positions
                 .lookup(file, ir.swc_start(lo), ir.swc_start(hi), Kind::Member)
                 .ok()
@@ -1772,15 +1838,38 @@ impl<'a> Walker<'a> {
         // The proxy itself is called: no key is read on it. A key the
         // compiler names no symbol for (`client[k]`) is no name either.
         if proxy == 0 {
-            return Err(Stop::ProcedurePathUnread);
+            return if absent {
+                Ok(None)
+            } else {
+                Err(Stop::ProcedurePathUnread)
+            };
         }
-        let keys: Vec<&str> = (0..proxy)
-            .rev()
-            .map(|index| at(index).and_then(Row::symbol))
-            .collect::<Option<_>>()
-            .ok_or(Stop::ProcedurePathUnread)?;
+        let mut keys: Vec<String> = Vec::with_capacity(proxy);
+        let mut lacks = false;
+        for index in (0..proxy).rev() {
+            let row = at(index);
+            if let Some(symbol) = row.and_then(Row::symbol) {
+                keys.push(symbol.to_string());
+                continue;
+            }
+            let lacking = absent && row.is_some_and(|row| row.flags() & FLAG_ERROR_TYPE != 0);
+            match (lacking, &call.receiver_spans[index].3) {
+                (true, Some(_)) if index == proxy - 1 => {
+                    return Err(Stop::ProcedureFirstKeyAbsent);
+                }
+                (true, Some(key)) => {
+                    lacks = true;
+                    keys.push(key.clone());
+                }
+                _ => return Err(Stop::ProcedurePathUnread),
+            }
+        }
+        if absent && !lacks {
+            return Ok(None);
+        }
+        // The first key is present: an absent or unread one has stopped.
         let first = at(proxy - 1).ok_or(Stop::ProcedurePathUnread)?;
-        let (lo, hi, _) = call.receiver_spans[proxy - 1];
+        let (lo, hi, _, _) = call.receiver_spans[proxy - 1];
         if positions
             .union_declarations(file, ir.swc_start(lo), ir.swc_start(hi))
             .is_ok_and(|declared| declared.len() > 1)
@@ -1793,11 +1882,11 @@ impl<'a> Walker<'a> {
             .ok_or(Stop::ProcedureRouterOutsideRepo)?;
         let binding = super::decided_sites::router_holder(self.root, router_file, line)
             .ok_or(Stop::ProcedureRouterOutsideRepo)?;
-        Ok(ProcedureAt {
+        Ok(Some(ProcedureAt {
             path: keys.join(join.unwrap_or(".")),
             file: router_file.to_string(),
             binding,
-        })
+        }))
     }
 
     /// The labelled export `call` is made on, when it is one, and how it
@@ -1948,7 +2037,7 @@ impl<'a> Walker<'a> {
             }
         }
         if let Some(positions) = inputs.positions.as_ref() {
-            for (lo, hi, member) in &call.receiver_spans {
+            for (lo, hi, member, _) in &call.receiver_spans {
                 let kind = if *member { Kind::Member } else { Kind::Ident };
                 let Ok(receiver) =
                     positions.lookup(file, ir.swc_start(*lo), ir.swc_start(*hi), kind)
@@ -3479,6 +3568,35 @@ mod tests {
 
     fn claims() -> Vec<ExportClaims> {
         answer().exports
+    }
+
+    /// carrick#3778 S0: a call the compiler gives no declaration names its op
+    /// by the proxy's type alone, so only the one export of the store that
+    /// claims that op names it; two exports claiming it name none.
+    #[test]
+    fn a_path_op_two_exports_claim_names_no_op_by_type_alone() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/procedure-absent/library-claims.json");
+        let answer = crate::library_store::parse_answer(&std::fs::read_to_string(path).unwrap());
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let mut exports = answer.exports;
+        let (one, join) =
+            sole_path_op(&exports, "ClientOf", "query").expect("one export claims it");
+        assert_eq!(
+            (one.package.as_str(), one.export.as_str(), join.as_deref()),
+            ("fixture-procs", "createClient", Some("."))
+        );
+        assert!(sole_path_op(&exports, "ClientOf", "subscribe").is_none());
+        assert!(sole_path_op(&exports, "HooksOf", "query").is_none());
+        let mut twin = exports
+            .iter()
+            .find(|export| export.export == "createClient")
+            .unwrap()
+            .clone();
+        twin.export = "createTwin".to_string();
+        exports.push(twin);
+        assert!(sole_path_op(&exports, "ClientOf", "query").is_none());
+        assert!(path_op(&exports, "fixture-procs", "ClientOf", "query").is_some());
     }
 
     fn sites_of(discovery: &Discovery) -> serde_json::Value {
