@@ -12,9 +12,9 @@
 //! [`anchor`] is the pure rule: no git, and a diff already read. [`run`]
 //! reads that diff and main's rows' places from git, then calls it.
 
-use crate::git_state::{Hunk, changed_hunks, changed_paths, map_line};
+use crate::change_scope::ChangedSince;
+use crate::git_state::{Hunk, RootPaths, map_line};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use tracing::debug;
 
 /// Where one operation row sits: the service that states it, its file
@@ -510,34 +510,17 @@ fn judge<T>(
     Err(first.unwrap_or(Reason::UntouchedFile))
 }
 
-/// The paths git names (relative to the repository's top level) as paths
-/// relative to the scan root, the form a row carries; `None` for one outside
-/// the scan root.
-struct RootPaths {
-    top: PathBuf,
-    root: PathBuf,
-}
-
-impl RootPaths {
-    fn of(repo_path: &str) -> Result<Self, String> {
-        let canonical = |path: PathBuf| path.canonicalize().unwrap_or(path);
-        Ok(RootPaths {
-            top: canonical(crate::git_state::toplevel(repo_path)?),
-            root: canonical(PathBuf::from(repo_path)),
-        })
-    }
-
-    fn scan_relative(&self, git_path: &str) -> Option<String> {
-        crate::pr_functions::blob_path(&self.top.join(git_path), &self.root)
-    }
-}
-
 /// The PR's diff for `files`: from the merge base `base` to the working tree
 /// the scan read, untracked files counted as added.
-fn read_diff(repo_path: &str, base: &str, files: &BTreeSet<String>) -> Result<Diff, String> {
+fn read_diff(
+    repo_path: &str,
+    changes: &ChangedSince,
+    base: &str,
+    files: &BTreeSet<String>,
+) -> Result<Diff, String> {
     let paths = RootPaths::of(repo_path)?;
     let mut diff = BTreeMap::new();
-    for changed in changed_paths(repo_path, base, None)? {
+    for changed in changes.since(base)? {
         let Some(file) = paths.scan_relative(&changed.path) else {
             continue;
         };
@@ -547,7 +530,7 @@ fn read_diff(repo_path: &str, base: &str, files: &BTreeSet<String>) -> Result<Di
         let change = match changed.status {
             'A' => FileDiff::Added,
             'D' => FileDiff::Deleted,
-            _ => FileDiff::Modified(changed_hunks(repo_path, base, &file, None)?),
+            _ => FileDiff::Modified(changes.hunks(base, None, &file)?),
         };
         diff.insert(file, change);
     }
@@ -564,18 +547,22 @@ pub struct MainSource {
 /// Where each of `rows` sits at the merge base `base`. A row stored at
 /// `base` stays; one stored at another commit moves through the hunks from
 /// that commit to `base` when its file differs between them.
-fn place_main_rows(repo_path: &str, base: &str, rows: Vec<MainSource>) -> Vec<MainRow> {
+fn place_main_rows(
+    repo_path: &str,
+    changes: &ChangedSince,
+    base: &str,
+    rows: Vec<MainSource>,
+) -> Vec<MainRow> {
     let paths = RootPaths::of(repo_path).ok();
     let mut differing: BTreeMap<String, Option<BTreeMap<String, char>>> = BTreeMap::new();
-    let mut hunks: BTreeMap<(String, String), Option<Vec<Hunk>>> = BTreeMap::new();
     rows.into_iter()
         .map(|MainSource { place, commit }| {
             let at_base = if commit == base || place.line == 0 {
                 AtBase::At(place.line)
             } else {
-                let changes = differing.entry(commit.clone()).or_insert_with(|| {
+                let differs = differing.entry(commit.clone()).or_insert_with(|| {
                     let paths = paths.as_ref()?;
-                    let listed = changed_paths(repo_path, &commit, Some(base)).ok()?;
+                    let listed = changes.between(&commit, base).ok()?;
                     Some(
                         listed
                             .into_iter()
@@ -583,26 +570,19 @@ fn place_main_rows(repo_path: &str, base: &str, rows: Vec<MainSource>) -> Vec<Ma
                             .collect(),
                     )
                 });
-                match changes {
+                match differs {
                     None => AtBase::Unreadable,
-                    Some(changes) => match changes.get(&place.file) {
+                    Some(differs) => match differs.get(&place.file) {
                         None => AtBase::At(place.line),
                         Some('D') => AtBase::Moved,
                         Some('A') => AtBase::Unreadable,
-                        Some(_) => {
-                            let read = hunks
-                                .entry((commit.clone(), place.file.clone()))
-                                .or_insert_with(|| {
-                                    changed_hunks(repo_path, &commit, &place.file, Some(base)).ok()
-                                });
-                            match read {
-                                None => AtBase::Unreadable,
-                                Some(read) => match map_line(read, place.line) {
-                                    Some(line) => AtBase::At(line),
-                                    None => AtBase::Moved,
-                                },
-                            }
-                        }
+                        Some(_) => match changes.hunks(&commit, Some(base), &place.file).ok() {
+                            None => AtBase::Unreadable,
+                            Some(read) => match map_line(&read, place.line) {
+                                Some(line) => AtBase::At(line),
+                                None => AtBase::Moved,
+                            },
+                        },
                     },
                 }
             };
@@ -623,10 +603,13 @@ fn place_main_rows(repo_path: &str, base: &str, rows: Vec<MainSource>) -> Vec<Ma
 /// branched are never read as the PR's (as `pr_functions::block_for_run`
 /// reads it). Git is asked only about files that hold a candidate row or one
 /// of `unread` or `unread_sources`; a run with no candidate and no unread
-/// source makes no git call. `Err` means git could not read the diff.
+/// source makes no git call. Git is read through `changes`, the run's one
+/// listing ([`ChangedSince`]), or one of this call's own when the run holds
+/// none. `Err` means git could not read the diff.
 #[allow(clippy::too_many_arguments)]
 pub fn run<T>(
     repo_path: &str,
+    changes: Option<&ChangedSince>,
     pr_base: &str,
     new: Vec<Candidate<T>>,
     removed: Vec<Candidate<T>>,
@@ -660,14 +643,21 @@ pub fn run<T>(
             .chain(unread_sources)
             .map(|place| place.file.clone()),
     );
-    let head = crate::git_state::head_commit(repo_path)?;
-    let merge_base = crate::git_state::merge_base(repo_path, pr_base, &head)?;
-    let diff = read_diff(repo_path, &merge_base, &diff_files)?;
+    let own;
+    let changes = match changes {
+        Some(changes) => changes,
+        None => {
+            own = ChangedSince::new(repo_path, &[], &[]);
+            &own
+        }
+    };
+    let merge_base = changes.fork_point(pr_base)?;
+    let diff = read_diff(repo_path, changes, &merge_base, &diff_files)?;
     let in_files: Vec<MainSource> = main
         .into_iter()
         .filter(|row| files.contains(&row.place.file))
         .collect();
-    let main = place_main_rows(repo_path, &merge_base, in_files);
+    let main = place_main_rows(repo_path, changes, &merge_base, in_files);
     let moved = reading_moved(&merge_base);
     Ok(anchor(
         new,
@@ -1026,6 +1016,7 @@ mod tests {
         std::fs::write(dir.join("broken.ts"), "a\nfunction (\n").unwrap();
         let anchored: Anchored<&str> = run(
             &dir.to_string_lossy(),
+            None,
             &base,
             vec![],
             vec![],
@@ -1199,8 +1190,10 @@ mod tests {
         git_in(repo.path(), &["rm", "-q", "b.ts"]);
         git_in(repo.path(), &["mv", "c.ts", "e.ts"]);
         std::fs::write(repo.path().join("f.ts"), "new\n").unwrap();
+        let path = repo.path().to_string_lossy().to_string();
         let read = read_diff(
-            &repo.path().to_string_lossy(),
+            &path,
+            &ChangedSince::new(&path, &[], &[]),
             &head,
             &files_of(&["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts"]),
         )
@@ -1223,8 +1216,10 @@ mod tests {
         std::fs::write(repo.path().join("svc/src/a.ts"), "one\n2\n").unwrap();
         std::fs::write(repo.path().join("other/x.ts"), "y\n").unwrap();
         let root = repo.path().join("svc");
+        let path = root.to_string_lossy().to_string();
         let read = read_diff(
-            &root.to_string_lossy(),
+            &path,
+            &ChangedSince::new(&path, &[], &[]),
             &head,
             &files_of(&["src/a.ts", "x.ts"]),
         )
@@ -1256,6 +1251,7 @@ mod tests {
 
         let anchored = run(
             &dir.to_string_lossy(),
+            None,
             &base,
             vec![
                 candidate("in the pr", &[("routes.ts", 2)]),
@@ -1273,6 +1269,47 @@ mod tests {
         assert_eq!(anchored.left_out.untouched_file, 1);
     }
 
+    /// carrick#3697: the delta and each removals list read one listing. A
+    /// second run over the same files asks git nothing new, main's row placed
+    /// from its own commit included.
+    #[test]
+    fn a_pr_run_lists_each_commit_pair_once() {
+        let (repo, stored) = committed_repo(&[("routes.ts", "a\nb\nc\n"), ("k.ts", "k\n")]);
+        let dir = repo.path();
+        std::fs::write(dir.join("k.ts"), "k\nmore\n").unwrap();
+        git_in(dir, &["commit", "-qam", "main moves"]);
+        let base = git_in(dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("routes.ts"), "a\nB\nc\n").unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let changes = ChangedSince::new(&path, &[], &[]);
+        let once = || {
+            run(
+                &path,
+                Some(&changes),
+                &base,
+                vec![candidate("new", &[("routes.ts", 2)])],
+                vec![candidate("gone", &[("routes.ts", 2)])],
+                &[],
+                vec![MainSource {
+                    place: place("routes.ts", 2),
+                    commit: stored.clone(),
+                }],
+                |_| BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .unwrap()
+        };
+        let first = once();
+        let asked = changes.listings_run();
+        // The fork point, the PR's listing and its hunks, main's pair listing.
+        assert_eq!(asked, 4);
+        let second = once();
+        assert_eq!(changes.listings_run(), asked, "the second run asks nothing");
+        assert_eq!(first.new, second.new);
+        assert_eq!(first.removed, vec!["gone"]);
+    }
+
     /// carrick#3222: the diff is read for a file that holds only an unread
     /// route site, so a registration the PR moved into another file is seen
     /// as written.
@@ -1288,6 +1325,7 @@ mod tests {
         std::fs::write(dir.join("plugin.ts"), "p\nunread\n").unwrap();
         let anchored = run(
             &dir.to_string_lossy(),
+            None,
             &base,
             vec![],
             vec![candidate("gone", &[("routes.ts", 2)])],
@@ -1308,6 +1346,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let anchored: Anchored<&str> = run(
             &dir.path().to_string_lossy(),
+            None,
             &"a".repeat(40),
             vec![],
             vec![],
@@ -1323,6 +1362,7 @@ mod tests {
         assert!(
             run(
                 &dir.path().to_string_lossy(),
+                None,
                 &"a".repeat(40),
                 vec![candidate("x", &[("a.ts", 1)])],
                 vec![],
@@ -1470,6 +1510,7 @@ mod tests {
         };
         let placed = place_main_rows(
             &path,
+            &ChangedSince::new(&path, &[], &[]),
             &base,
             vec![
                 source("routes.ts", 5, &moved),
