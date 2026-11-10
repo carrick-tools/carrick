@@ -605,7 +605,7 @@ mod tests {
         discovery
             .unanswered_at
             .insert(at, ["fixture-pending".to_string()].into());
-        let rows = from_scan(&discovery, &Decided::default());
+        let rows = from_scan(&discovery, &Decided::default(), &[], Path::new("/repo"));
         let by_file = |file: &str| rows.iter().find(|row| row.file == file).unwrap();
         assert_eq!(by_file("src/o.ts").reason, Stop::MissedInside);
         assert_eq!(by_file("src/o.ts").also, vec![Stop::UnansweredPackage]);
