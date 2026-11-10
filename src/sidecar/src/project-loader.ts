@@ -29,6 +29,7 @@ import {
 import { moduleFormatResolutionHost } from './module-format.js';
 import { ExternalImports, registerExternalImports } from './origin.js';
 import { pinProgramRoots } from './program-files.js';
+import { defaultLibraryOptions } from './default-library.js';
 
 /**
  * Options for ProjectLoader construction
@@ -433,13 +434,13 @@ export class ProjectLoader {
   }
 
   /**
-   * Under CARRICK_UNTRUSTED_TREE, the file system every project reads
-   * through: nothing whose real path is outside the checkout (carrick#2230).
-   * Nothing at all otherwise, so a project is built as it always was.
+   * The file system every project reads through: the default library from
+   * the compiler's own files (carrick#3509) and, under CARRICK_UNTRUSTED_TREE,
+   * nothing whose real path is outside the checkout (carrick#2230).
    */
-  private fileSystemOption(): { fileSystem?: FileSystemHost } {
+  private fileSystemOption(): { libFolderPath: string; fileSystem: FileSystemHost } {
     const bound = untrustedReadBound(this.repoRoot);
-    return bound ? { fileSystem: boundedFileSystem(bound) } : {};
+    return defaultLibraryOptions(bound ? boundedFileSystem(bound) : undefined);
   }
 
   /**

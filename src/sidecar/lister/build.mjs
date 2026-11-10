@@ -9,7 +9,8 @@
  *
  * Writes two flat files into `--out` (default `dist/lister`):
  * - `carrick-lister.mjs`: every dependency inlined, the TypeScript default
- *   library declarations included (ts-morph carries them in memory). It reads
+ *   library declarations included: the compiler's own `lib.*.d.ts`, inlined
+ *   as `globalThis.__CARRICK_DEFAULT_LIBRARY__` (src/default-library.ts, carrick#3509). It reads
  *   nothing but itself and the package directory it is given. It speaks the
  *   sidecar's stdio protocol unchanged: `init` answers `ready`,
  *   `list_library_surface` answers `success` with `surfaces` and
@@ -25,7 +26,7 @@
  */
 import { build } from 'esbuild';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -54,6 +55,16 @@ const BANNER = [
 
 const sha256 = (buffer) => createHash('sha256').update(buffer).digest('hex');
 
+/** The compiler's `lib.*.d.ts` texts by file name, from the sidecar's own `typescript` install. */
+function defaultLibraryTexts() {
+  const folder = join(sidecarRoot, 'node_modules', 'typescript', 'lib');
+  const texts = {};
+  for (const name of readdirSync(folder).filter((n) => /^lib(\..+)?\.d\.ts$/.test(n)).sort()) {
+    texts[name] = readFileSync(join(folder, name), 'utf8');
+  }
+  return texts;
+}
+
 /** Build the artifact into `outDir`; returns the manifest. */
 export async function buildLister({ tag, sourceSha, outDir }) {
   if (!tag || !sourceSha) throw new Error('lister/build.mjs: --tag and --source-sha are required');
@@ -72,6 +83,7 @@ export async function buildLister({ tag, sourceSha, outDir }) {
     target: 'node22',
     outfile,
     banner: { js: BANNER },
+    define: { 'globalThis.__CARRICK_DEFAULT_LIBRARY__': JSON.stringify(defaultLibraryTexts()) },
     charset: 'utf8',
     legalComments: 'eof',
     logLevel: 'warning',
