@@ -3290,6 +3290,26 @@ async fn seed_trpc_output_field_removed() {
 async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
     let _serial = SERIAL.lock().await;
     let main = main_snapshot().await;
+    if let Some(home) = std::env::var_os("HOME") {
+        let dir = PathBuf::from(home).join(".carrick/logs/runs");
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            if !text.contains("rpc-shelf") {
+                continue;
+            }
+            for line in text.lines() {
+                let lower = line.to_lowercase();
+                if lower.contains("procedure")
+                    || lower.contains("walk")
+                    || lower.contains("untraced")
+                    || lower.contains("claims")
+                {
+                    eprintln!("DIAGLOG {}", &line[..line.len().min(300)]);
+                }
+            }
+            break;
+        }
+    }
     for row in &main.shelf_rows {
         let v = serde_json::to_value(row).unwrap();
         eprintln!(
