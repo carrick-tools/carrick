@@ -41,7 +41,7 @@ mod text;
 mod text_reader;
 
 pub(crate) use documents::{DocumentEnd, DocumentLookup, document_calls};
-pub(super) use text::{pattern_members, text_of};
+pub(super) use text::{args_text, pattern_members, text_of};
 pub(super) use text_reader::{ArgTexts, TextValue};
 
 /// How many object literals deep an argument's keys are read (the decision
@@ -1022,6 +1022,81 @@ pub(super) fn module_bindings(
     )
 }
 
+/// The parameter table (carrick#3504 B10-1a): every plain name any function
+/// of the file binds as a parameter, by the 1-based line the name is declared
+/// on and the name, as a compiler row names a declaration (the key
+/// [`module_bindings`] uses). A parameter is not a binding of that table:
+/// every value reader of it would need to refuse it, and a parameter that
+/// shares a line and name with a local would mark that local unplaceable.
+///
+/// `function` is the definition the parameter belongs to; a function written
+/// inside a body, handed to a call or held in a local, has none, and neither
+/// does a detached function: the caller index keys definitions only. `written`
+/// is the write census's verdict ([`PlacedWrites`]). A parameter collides with
+/// another parameter, or with a `bindings` entry that is not its own default's
+/// ([`ParamValues::defaulted_names`]) read as one binding.
+pub(super) fn param_bindings(
+    functions: &HashMap<String, FnIr>,
+    module_level: &FnIr,
+    constructor_defaults: &[FnIr],
+    bindings: &HashMap<(u32, String), ModuleBinding>,
+    writes: &PlacedWrites,
+) -> HashMap<(u32, String), ParamAt> {
+    fn visit<'f>(
+        ir: &'f FnIr,
+        function: Option<&'f str>,
+        out: &mut Vec<(&'f ParamName, Option<&'f str>)>,
+    ) {
+        out.extend(ir.param_names.iter().map(|name| (name, function)));
+        for inner in ir
+            .nested
+            .iter()
+            .chain(&ir.detached)
+            .chain(&ir.param_functions)
+        {
+            visit(inner, None, out);
+        }
+    }
+    let mut found: Vec<(&ParamName, Option<&str>)> = Vec::new();
+    let mut keys: Vec<&String> = functions.keys().collect();
+    keys.sort();
+    for key in keys {
+        visit(&functions[key], Some(key.as_str()), &mut found);
+    }
+    visit(module_level, None, &mut found);
+    for ir in constructor_defaults {
+        visit(ir, None, &mut found);
+    }
+    let mut shared: HashMap<(u32, &str), usize> = HashMap::new();
+    for (name, _) in &found {
+        *shared.entry((name.line, name.key.0.as_str())).or_default() += 1;
+    }
+    let mut out: HashMap<(u32, String), ParamAt> = HashMap::new();
+    for (name, function) in found {
+        let at = (name.line, name.key.0.clone());
+        let own = function.is_some_and(|function| {
+            bindings.get(&at).is_some_and(|binding| {
+                binding.declared_in.as_deref() == Some(function)
+                    && !binding.unplaceable
+                    && functions[function]
+                        .local_bindings
+                        .iter()
+                        .any(|local| local.key == name.key && local.line == name.line)
+            })
+        });
+        let param = ParamAt {
+            function: function.map(str::to_string),
+            index: name.index,
+            keys: name.keys.clone(),
+            written: !matches!(writes.of(&name.key), Some([])),
+            collides: shared[&(name.line, name.key.0.as_str())] > 1
+                || (bindings.contains_key(&at) && !own),
+        };
+        out.entry(at).or_insert(param);
+    }
+    out
+}
+
 /// Where every name of a binding the module writes through starts, as
 /// `(lo, hi)` in discovery numbering (carrick#3504 S5b): the census's
 /// `written_through`, read at a use by its span. A walk root's receiver is a
@@ -1576,6 +1651,44 @@ fn name_holds(ident: &Ident, scope: &Scope<'_>) -> Holds {
     }
 }
 
+/// One name a function's parameter binds, with where it is declared
+/// (carrick#3504 B10-1a): [`param_bindings`] keys the parameter table by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ParamName {
+    pub(super) key: BindingKey,
+    /// The 1-based line the name is declared on, as a compiler row names a
+    /// declaration.
+    pub(super) line: u32,
+    /// The parameter's position.
+    pub(super) index: usize,
+    /// The keys down a destructured parameter to the name; empty for a whole
+    /// parameter.
+    pub(super) keys: Vec<String>,
+}
+
+/// What a parameter table entry says about a declaration (carrick#3504
+/// B10-1a): the parameter a compiler row's declaration names, by line and
+/// name. Kept beside the binding table and never in it, so no value reader
+/// sees a parameter as a binding. Read by nothing yet: the text reader reads
+/// a parameter through its callers from it (B10-1b).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ParamAt {
+    /// The definition the parameter belongs to, by its key in
+    /// [`FileIr::functions`]; `None` for a function written inside a body (a
+    /// callback, or a lambda held in a local), which no caller index keys.
+    pub(super) function: Option<String>,
+    pub(super) index: usize,
+    pub(super) keys: Vec<String>,
+    /// The module writes the name again, in a form no reader places, or may
+    /// (`with`, a direct `eval`): it holds nothing it was handed.
+    pub(super) written: bool,
+    /// Another parameter, or a binding the table holds for another name
+    /// declaration, shares its line and name: no row says which one a use
+    /// means.
+    pub(super) collides: bool,
+}
+
 /// Each key of a destructured parameter, with the parameter's position and
 /// the key (`{ send = fetch }`, `{ fetch: fetchImpl }`), and each default a
 /// parameter or one of its keys is given, read in the function's own scope.
@@ -1584,10 +1697,15 @@ pub(super) struct ParamValues {
     pub(super) held: HashMap<BindingKey, Vec<ValueAt>>,
     /// `(position, keys, the default's values)`.
     pub(super) defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
-    /// `(position, the default's text)` of each whole parameter with a
-    /// default: what a call that omits the position states ([`text_of`],
-    /// carrick#3504 S2b-2).
-    pub(super) default_texts: Vec<(usize, ValueAt)>,
+    /// `(position, keys, the default's text)` of each parameter, or key of a
+    /// destructured one, with a default: what a call that omits the position
+    /// states ([`text_of`], carrick#3504 S2b-2). Empty `keys` is the whole
+    /// parameter's.
+    pub(super) default_texts: Vec<(usize, Vec<String>, ValueAt)>,
+    /// Every plain name the parameters bind, whether whole, defaulted, a
+    /// destructured plain key or a defaulted key (carrick#3504 B10-1a). A
+    /// rest, a nested pattern and a computed key bind none a reader names.
+    pub(super) names: Vec<ParamName>,
     /// Each name a parameter binds with a default (`at = "/x"`, `{ at =
     /// "/x" }`) that the body never writes, for the text reader
     /// (carrick#3191): a choice of what a caller hands in, which the reader
@@ -1946,6 +2064,7 @@ impl Reader<'_> {
                 args: Vec::new(),
                 open_from: Some(0),
                 arg_values: vec![Vec::new()],
+                arg_texts: vec![None],
             };
         };
         let mut out = super::Applied::default();
@@ -1953,6 +2072,7 @@ impl Reader<'_> {
             let Some(ExprOrSpread { spread: None, expr }) = element else {
                 out.open_from = Some(out.args.len());
                 out.arg_values.push(Vec::new());
+                out.arg_texts.push(None);
                 break;
             };
             out.args.push(
@@ -1963,6 +2083,7 @@ impl Reader<'_> {
                 },
             );
             out.arg_values.push(self.value_of(expr, scope, bound));
+            out.arg_texts.push(Some(text_of(expr, &|lo| lo)));
         }
         out
     }
@@ -2068,6 +2189,12 @@ impl Reader<'_> {
                 reassigned: false,
             })
         };
+        let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {
+            key: ident_key(binding),
+            line: self.source_map.lookup_char_pos(binding.span.lo).line as u32,
+            index,
+            keys,
+        };
         for (index, pat) in params.into_iter().enumerate() {
             let pattern = match pat {
                 Pat::Assign(assign) => {
@@ -2077,14 +2204,23 @@ impl Reader<'_> {
                             Vec::new(),
                             self.value_of(&assign.right, scope, &bound),
                         ));
-                        out.default_texts
-                            .push((index, text_of(&assign.right, &identity)));
+                        out.default_texts.push((
+                            index,
+                            Vec::new(),
+                            text_of(&assign.right, &identity),
+                        ));
                         out.defaulted_names
                             .extend(defaulted(&binding.id, &assign.right));
+                        out.names.push(named(&binding.id, index, Vec::new()));
                     }
                     &*assign.left
                 }
-                other => other,
+                other => {
+                    if let Pat::Ident(binding) = other {
+                        out.names.push(named(&binding.id, index, Vec::new()));
+                    }
+                    other
+                }
             };
             let Pat::Object(object) = pattern else {
                 continue;
@@ -2121,7 +2257,10 @@ impl Reader<'_> {
                     }]
                 };
                 out.held.insert(ident_key(binding), held);
+                out.names.push(named(binding, index, vec![key.clone()]));
                 if let Some(default) = default {
+                    out.default_texts
+                        .push((index, vec![key.clone()], text_of(default, &identity)));
                     out.defaults
                         .push((index, vec![key], self.value_of(default, scope, &bound)));
                     out.defaulted_names.extend(defaulted(binding, default));
@@ -4266,5 +4405,141 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             [definition("sendItems")]
         );
         assert_eq!(uncapped.census().capped_queries, 0);
+    }
+
+    /// One parameter of `callers.ts` (fixture `resolve-text`) by its
+    /// function (`None` for a function written inside a body) and name, with
+    /// the line and name its table entry is keyed by.
+    fn param_entry(file: &FileIr, function: Option<&str>, name: &str) -> ((u32, String), ParamAt) {
+        let mut found: Vec<((u32, String), ParamAt)> = file
+            .param_bindings
+            .iter()
+            .filter(|((_, symbol), at)| symbol == name && at.function.as_deref() == function)
+            .map(|(key, at)| (key.clone(), at.clone()))
+            .collect();
+        assert_eq!(found.len(), 1, "{function:?} {name}: {found:?}");
+        found.remove(0)
+    }
+
+    /// carrick#3504 B10-1a: each parameter has an entry of its own, by line
+    /// and name, naming its function, position and keys, and the binding
+    /// table is unchanged by it.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn the_parameter_table_names_each_parameter_s_function_position_and_keys() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let path = on.path("services/web/src/callers.ts");
+        let file = &on.inputs.files[&path];
+        let shape = |function: Option<&str>, name: &str| {
+            let (_, at) = param_entry(file, function, name);
+            (at.function, at.index, at.keys)
+        };
+        let owned = |function: &str, index: usize, keys: &[&str]| {
+            (
+                Some(function.to_string()),
+                index,
+                keys.iter().map(|key| key.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(shape(Some("one"), "name"), owned("one", 0, &[]));
+        assert_eq!(shape(Some("keyed"), "topic"), owned("keyed", 0, &["topic"]));
+        assert_eq!(
+            shape(Some("keyedDefault"), "topic"),
+            owned("keyedDefault", 0, &["topic"])
+        );
+        assert_eq!(shape(Some("pair"), "prefix"), owned("pair", 0, &[]));
+        assert_eq!(shape(Some("pair"), "name"), owned("pair", 1, &[]));
+        assert_eq!(shape(Some("Bus.send"), "topic"), owned("Bus.send", 0, &[]));
+        // A callback is written inside a body: no definition holds it.
+        assert_eq!(shape(None, "item"), (None, 0, Vec::new()));
+
+        let (_, written) = param_entry(file, Some("written"), "name");
+        assert!(written.written, "{written:?}");
+        let (_, one) = param_entry(file, Some("one"), "name");
+        assert!(!one.written && !one.collides, "{one:?}");
+        // A defaulted parameter has an entry in the binding table of its
+        // own: it is not another binding on its line.
+        let (defaulted_at, defaulted) = param_entry(file, Some("defaulted"), "name");
+        assert!(!defaulted.written && !defaulted.collides, "{defaulted:?}");
+        assert!(file.module_bindings.contains_key(&defaulted_at));
+
+        // A parameter is no entry of the binding table.
+        let (one_at, _) = param_entry(file, Some("one"), "name");
+        assert!(!file.module_bindings.contains_key(&one_at));
+
+        // A parameter and a `const` that share a line and a name collide,
+        // and the `const` stays placeable.
+        let (picked_at, picked) = param_entry(file, None, "picked");
+        assert!(picked.collides, "{picked:?}");
+        let binding = file
+            .module_bindings
+            .get(&picked_at)
+            .expect("the const is in the binding table");
+        assert!(!binding.unplaceable);
+    }
+
+    /// carrick#3504 B10-1a: a call keeps each argument as the text it
+    /// states, by position, and a spread ends the list.
+    #[test]
+    fn each_argument_is_lowered_as_text_where_it_is_written() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let path = on.path("services/web/src/callers.ts");
+        let texts = |callee: &str| -> Vec<Vec<Option<ValueAt>>> {
+            super::super::row_calls::every_call(&on.inputs.files)
+                .into_iter()
+                .filter(|(file, call, _)| *file == path && call.callee == callee)
+                .map(|(_, call, _)| call.arg_texts.clone())
+                .collect()
+        };
+        let lit = |text: &str| Some(ValueAt::Lit(text.to_string()));
+        let two = texts("two");
+        assert_eq!(two.len(), 3, "{two:?}");
+        assert!(two.contains(&vec![lit("order.created")]), "{two:?}");
+        assert!(two.contains(&vec![lit("order.updated")]), "{two:?}");
+        assert!(two.contains(&vec![None]), "{two:?}");
+        let pair = texts("pair");
+        assert!(pair.contains(&vec![lit("a"), lit("x")]), "{pair:?}");
+        assert!(pair.contains(&vec![lit("b"), lit("y")]), "{pair:?}");
+        let defaulted = texts("defaulted");
+        assert!(defaulted.contains(&Vec::new()), "{defaulted:?}");
+        assert!(defaulted.contains(&vec![lit("given")]), "{defaulted:?}");
+        assert_eq!(
+            texts("keyed"),
+            [vec![Some(ValueAt::Entries(vec![(
+                ValueAt::Lit("topic".to_string()),
+                ValueAt::Lit("jobs.run".to_string())
+            )]))]]
+        );
+    }
+
+    /// carrick#3504 B10-1a: the text a destructured key's default states is
+    /// kept beside the whole parameter's, with its keys, and the readers that
+    /// fill an omitted argument still read only the whole parameter's.
+    #[test]
+    fn a_destructured_key_s_default_is_kept_as_text() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let path = on.path("services/web/src/callers.ts");
+        let file = &on.inputs.files[&path];
+        assert_eq!(
+            file.functions["keyedDefault"].param_default_texts,
+            [(
+                0,
+                vec!["topic".to_string()],
+                ValueAt::Lit("jobs.default".to_string())
+            )]
+        );
+        assert_eq!(
+            file.functions["defaulted"].param_default_texts,
+            [(0, Vec::new(), ValueAt::Lit("fallback".to_string()))]
+        );
+        assert!(file.functions["one"].param_default_texts.is_empty());
     }
 }

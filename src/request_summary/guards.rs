@@ -50,7 +50,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::decided_sites::Calls;
 use super::library_sites::{LinkedNames, TextPiece, text_pieces};
-use super::resolve::{Resolver, ValueAt, text_of};
+use super::resolve::{Resolver, ValueAt, args_text, text_of};
 use super::{
     CallIr, CallWalker, FileIr, FnIr, ImportBinding, Piece, Reader, Reassigned,
     RequestSummaryInputs, Scope, Site, Value, keyed_names, member_prop, prop_name,
@@ -1478,6 +1478,7 @@ impl CallWalker<'_, '_, '_> {
             callee_values: Vec::new(),
             callee_key: None,
             arg_values: self.reader.arg_values(args, self.scope, bound),
+            arg_texts: args_text(args, &|lo| lo),
             tested: None,
             handed: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),
@@ -1538,6 +1539,7 @@ impl CallWalker<'_, '_, '_> {
             callee_values: self.reader.callee_values(&call.callee, self.scope, bound),
             callee_key: None,
             arg_values: self.reader.arg_values(&call.args, self.scope, bound),
+            arg_texts: args_text(&call.args, &|lo| lo),
             tested: None,
             handed: self.reader.handed(&call.args, self.scope, bound),
             names: self.reader.arg_names(&call.args, self.scope),

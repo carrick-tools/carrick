@@ -1996,10 +1996,10 @@ impl<'a> Walk<'a, '_> {
             return filled(pieces, call);
         };
         filled_with(pieces, call, &|index| {
-            let (_, text) = function
+            let (_, _, text) = function
                 .param_default_texts
                 .iter()
-                .find(|(position, _)| *position == index)?;
+                .find(|(position, keys, _)| *position == index && keys.is_empty())?;
             self.resolver.text_of_value(at, text).ok()
         })
     }
