@@ -1402,6 +1402,11 @@ struct Walker<'a> {
     /// the walk follows each end it reaches ([`Follow`]).
     values: &'a Resolver<'a>,
     memo: HashMap<(PathBuf, String), Outcome<'a>>,
+    /// What each function written at a call reaches, by the function, read
+    /// once final (carrick#3767): the walk of a call and the check for what
+    /// it passed ([`Self::misses`]) both read the same callback, and each
+    /// level of callbacks inside it would double the work again.
+    callbacks: HashMap<*const FnIr, Outcome<'a>>,
     /// The definitions being read, by how deep.
     reading: HashMap<(PathBuf, String), usize>,
     /// Calls whose member declaration stands for more than one op
@@ -2495,7 +2500,7 @@ impl<'a> Walker<'a> {
                         .map_or(call.site.line, |site| site.line),
                     made: None,
                 };
-                let inner = self.body(file, callback);
+                let inner = self.callback(file, callback);
                 let mut inner = self.lifted(inner).under(written);
                 if let Some(hop) = hop {
                     inner = inner.under(hop.clone());
@@ -2538,6 +2543,29 @@ impl<'a> Walker<'a> {
             // is not all it reaches (carrick#3504 S1).
             if !cycle_stop && !self.values.capping() {
                 self.memo.insert(id.clone(), out.clone());
+            }
+        }
+        out
+    }
+
+    /// What the function written at a call, `callback`, reaches: [`Self::body`],
+    /// read once it is final, as [`Self::definition`] keeps a definition's.
+    fn callback(&mut self, file: &'a Path, callback: &'a FnIr) -> Outcome<'a> {
+        let at = std::ptr::from_ref(callback);
+        if let Some(known) = self.callbacks.get(&at) {
+            return known.clone();
+        }
+        let depth = self.reading.len();
+        let mut out = self.body(file, callback);
+        if out.cycle_at.is_none_or(|cycle| cycle >= depth) {
+            out.cycle_at = None;
+            let cycle_stop = out.ends.is_empty()
+                && out
+                    .stop
+                    .as_ref()
+                    .is_some_and(|(_, reason)| *reason == Stop::Recursion);
+            if !cycle_stop && !self.values.capping() {
+                self.callbacks.insert(at, out.clone());
             }
         }
         out
@@ -2603,7 +2631,7 @@ impl<'a> Walker<'a> {
             let Some(callback) = body.nested.get(*nested) else {
                 return false;
             };
-            let read = self.body(file, callback);
+            let read = self.callback(file, callback);
             !read.ends.is_empty() || read.stop.is_some() || read.missed
         })
     }
@@ -3215,6 +3243,7 @@ pub fn discover_with(
         instances,
         values: &values,
         memo: HashMap::new(),
+        callbacks: HashMap::new(),
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
         entered: BTreeMap::new(),
@@ -3324,6 +3353,47 @@ mod tests {
             store_keys(&row("lib:lib.es2015.promise.d.ts"), &[]),
             ["lib:lib.es2015.promise.d.ts"]
         );
+    }
+
+    /// `levels` callbacks, each handed to a promise's `then` inside the last,
+    /// the innermost reaching a call.
+    fn nested_callbacks(levels: usize) -> String {
+        let mut body = "return fetch(\"/api/leaf\");".to_string();
+        for level in 0..levels {
+            body = format!("return Promise.resolve({level}).then((v{level}) => {{ {body} }});");
+        }
+        format!("export function go() {{\n  {body}\n}}\n")
+    }
+
+    /// carrick#3767: a callback handed to a call is walked once, so the time
+    /// discovery takes grows with the nesting, not with two to its power.
+    #[test]
+    fn nested_callbacks_are_walked_once() {
+        let read = |levels: usize| {
+            let source = nested_callbacks(levels);
+            let on = walked(
+                "discovery-nested-callbacks",
+                ".",
+                "web",
+                &[("src/index.ts", &source)],
+                true,
+            )?;
+            let started = std::time::Instant::now();
+            let discovery = discover(&on.inputs, &Labels::of(&[]), &on.repo);
+            Some((discovery, started.elapsed()))
+        };
+        let (Some((small, _)), Some((deep, took))) = (read(3), read(24)) else {
+            return;
+        };
+        // Every call is read, to the end, at either depth: a call for each
+        // level's `resolve` and `then`, and the one inside.
+        for (found, levels) in [(&small, 3), (&deep, 24)] {
+            assert_eq!(found.finished.len(), 2 * levels + 1);
+            assert!(found.missed_inside.is_empty());
+            assert!(found.sites.is_empty());
+            assert_eq!(found.counts["no_site"], 2 * levels + 1);
+        }
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
     }
 
     fn fixture(name: &str) -> PathBuf {
