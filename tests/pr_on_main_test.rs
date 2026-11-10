@@ -139,21 +139,7 @@ impl CloudStorage for Store {
     fn supports_multi_service(&self) -> bool {
         true
     }
-    async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError> {
-        eprintln!("DIAGREPO {repo} {}", log_content.len());
-        if true {
-            for line in log_content.lines() {
-                let lower = line.to_lowercase();
-                if lower.contains("walk")
-                    || lower.contains("fail")
-                    || lower.contains("budget")
-                    || lower.contains("sidecar")
-                    || lower.contains("procedure")
-                {
-                    eprintln!("DIAGLOG {line}");
-                }
-            }
-        }
+    async fn upload_logs(&self, _repo: &str, _log_content: &str) -> Result<(), StorageError> {
         Ok(())
     }
     async fn post_pr_result(&self, payload: &PrResultPayload) -> Result<(), StorageError> {
@@ -248,6 +234,13 @@ fn sidecar_for(repo: &Path) -> Option<TypeSidecar> {
         return None;
     }
     let sidecar = TypeSidecar::spawn(&path).ok()?;
+    // A seed repo of several services names its root to the compiler engine,
+    // as `main` does (`spawn_sidecar`): a service below the root finds the
+    // modules and the tsconfig above it through that root. Without it the
+    // `rpc-shelf` services read fewer rows than the shipped binary does.
+    if repo.join("__llm__").is_dir() && repo.join("carrick.json").is_file() {
+        sidecar.set_scan_root(repo);
+    }
     sidecar.start_init(repo, None);
     sidecar.wait_ready(Duration::from_secs(120)).ok()?;
     Some(sidecar)
@@ -3289,60 +3282,7 @@ async fn seed_trpc_output_field_removed() {
 #[tokio::test]
 async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
     let _serial = SERIAL.lock().await;
-    {
-        seed_env();
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let _home = EnvVar::set("HOME", home.to_str().unwrap());
-        carrick::logging::init(false, carrick::logging::LogSink::Run);
-        let src =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr-seeds/rpc-shelf");
-        let repo = unlinked(tmp.path()).join("rpc-shelf");
-        copy_dir(&src, &repo);
-        git(&repo, &["init", "-q"]);
-        commit(&repo, "init");
-        let store = Store::default();
-        scan_seed_repo(&store, &repo).await;
-        for row in store.repos.lock().unwrap().iter() {
-            eprintln!(
-                "DIAGVAR {:?} endpoints={}",
-                row.service_name,
-                row.endpoints.len()
-            );
-        }
-        for entry in std::fs::read_dir(home.join(".carrick/logs/runs"))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
-            for line in text.lines() {
-                let l = line.to_lowercase();
-                if !l.contains("type_sidecar")
-                    && !l.contains("position_rows")
-                    && !l.contains("file_orchestrator")
-                    && !l.contains("rows_join")
-                {
-                    eprintln!("DIAGIN {}", line.chars().take(230).collect::<String>());
-                }
-            }
-        }
-    }
     let main = main_snapshot().await;
-    for row in &main.shelf_rows {
-        let v = serde_json::to_value(row).unwrap();
-        eprintln!(
-            "DIAG {:?} endpoints={} calls={} boundary={} types_degraded={} status={} possible={}",
-            row.service_name,
-            row.endpoints.len(),
-            row.calls.len(),
-            v["boundary"],
-            v["types_degraded"],
-            v["type_extraction_status"],
-            v["possible_calls"]
-        );
-    }
     let procedures = |service: &str, side: &str| -> Vec<String> {
         let row = main
             .shelf_rows
