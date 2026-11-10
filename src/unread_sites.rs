@@ -218,6 +218,22 @@ pub fn from_scan(discovery: &Discovery, decided: &Decided) -> Vec<UnreadSite> {
             listed: false,
         });
     }
+    // A walk that passed a call into a package the scan ended without an
+    // answer for says so beside its own reason (carrick#3684).
+    for row in &mut out {
+        let at = (row.file.clone(), row.span_start, row.span_end);
+        let unanswered = discovery
+            .unanswered_at
+            .get(&at)
+            .is_some_and(|keys| !keys.is_empty());
+        if unanswered
+            && row.reason != Stop::UnansweredPackage
+            && !row.also.contains(&Stop::UnansweredPackage)
+            && row.also.len() < 4
+        {
+            row.also.push(Stop::UnansweredPackage);
+        }
+    }
     out.extend(decided.stops.iter().map(UnreadSite::of_decided));
     out.extend(
         decided
@@ -517,6 +533,31 @@ mod tests {
         let back: CloudRepoData = serde_json::from_value(wire).unwrap();
         assert_eq!(back.unread_sites.map(|rows| rows.len()), Some(2));
         assert_eq!(back.unread_sites_by_reason.map(|m| m.len()), Some(2));
+    }
+
+    /// carrick#3684: a walk that passed a call into a package the scan ended
+    /// without an answer for keeps its own reason and says so in `also`.
+    #[test]
+    fn a_walk_that_passed_an_unready_package_says_so_in_also() {
+        let mut discovery = Discovery::default();
+        let at = ("src/o.ts".to_string(), 10, 20);
+        discovery.missed_inside.push(at.clone());
+        discovery
+            .missed_at
+            .insert(at.clone(), (4, "announce(b)".to_string()));
+        let other = ("src/p.ts".to_string(), 30, 40);
+        discovery.missed_inside.push(other.clone());
+        discovery
+            .missed_at
+            .insert(other, (5, "plain(b)".to_string()));
+        discovery
+            .unanswered_at
+            .insert(at, ["fixture-pending".to_string()].into());
+        let rows = from_scan(&discovery, &Decided::default());
+        let by_file = |file: &str| rows.iter().find(|row| row.file == file).unwrap();
+        assert_eq!(by_file("src/o.ts").reason, Stop::MissedInside);
+        assert_eq!(by_file("src/o.ts").also, vec![Stop::UnansweredPackage]);
+        assert!(by_file("src/p.ts").also.is_empty());
     }
 
     /// A walk that stopped with no labelled end keeps the last function it
