@@ -2,7 +2,7 @@
  * A `receiver_type` row sits at a member read's receiver
  * when the member is declared in another package than the class the receiver
  * holds (an inherited `on`): it names that class's declaration, one row per
- * named class or interface of the receiver's type, so an alias is resolved
+ * named class of the receiver's type, so an alias is resolved
  * and an intersection gives two. The compiler records it; nothing is read
  * from a name. No row where the member is declared in the class's own package.
  */
@@ -103,6 +103,10 @@ describe('position_rows: the class a receiver of an inherited member holds', () 
 
   it('writes none where the member is declared in the class\'s own package', () => {
     assert.deepStrictEqual(at('plain.emit', 'plain'), []);
+  });
+
+  it('writes none for a receiver typed by an interface (widening is a deliberate change)', () => {
+    assert.deepStrictEqual(at('iface.on', 'iface'), []);
   });
 
   it('names a class of the checkout by its own package', () => {

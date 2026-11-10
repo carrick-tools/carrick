@@ -807,7 +807,7 @@ export class PositionWalker {
   /**
    * The `receiver_type` rows of a `member` row, at the
    * span of the object the member is read on: the declaration of each named
-   * class or interface the receiver's type holds, written only where the
+   * class the receiver's type holds, written only where the
    * member is declared in another package than that class (an `on` the class
    * inherits from a base package). The checker's type after
    * `getNonNullableType` is read, so an alias of a class is already the
@@ -833,7 +833,8 @@ export class PositionWalker {
         const held = this.checker.getNonNullableType(constituent);
         const symbol = held.getSymbol();
         if (!symbol || symbol.name.startsWith('__')) continue;
-        if (!(symbol.flags & (ts.SymbolFlags.Class | ts.SymbolFlags.Interface))) continue;
+        // Classes only: interface rows (a framework's request and response types) were most of the rows' growth.
+        if (!(symbol.flags & ts.SymbolFlags.Class)) continue;
         const declaration = this.typeDeclaration(held);
         if (declaration) found.set(declaration, symbol);
       }

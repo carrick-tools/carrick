@@ -174,8 +174,8 @@ pub enum Kind {
     /// A `member` row's RECEIVER type: written at the span of
     /// the object the member is read on, only where the member is declared
     /// in another package than the class that object's type holds (an `on`
-    /// a socket class inherits from a base package). One row per named class
-    /// or interface of the receiver's type after the alias is resolved, so an
+    /// a socket class inherits from a base package). One row per named class (an interface gets none)
+    /// of the receiver's type after the alias is resolved, so an
     /// intersection gives several, ordered by declaring file, then position:
     /// symbol, file, line, package and the [`FLAG_PUBLISHED`] /
     /// [`FLAG_MODULE_DEFAULT`] bits of the class's declaration; no type.
