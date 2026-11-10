@@ -307,6 +307,7 @@ jobs:
       - wasm-match
       - lister-artifact
       - release-artifact-steps
+      - npm-lock
     runs-on: ubuntu-latest
     steps:
       # Only this file, so the checkout adds a few seconds.
@@ -461,6 +462,43 @@ jobs:
       - name: The glibc floor check fails a binary above the floor
         run: bash scripts/glibc-floor.test.sh
 
+  # npm/carrick/package-lock.json must agree with package.json, or `npm ci`
+  # fails (carrick#3676, #3789). Not on release-please's release PR: it bumps
+  # versions, but the platform entries' hashes exist only once published, and
+  # the refresh PR (release.yml, job lock-refresh) repairs them after. The skip
+  # is a step, never the job: ci-result fails on a skipped job. A merge-queue
+  # run has no head branch, so it is read from the queued PR's number.
+  npm-lock:
+    name: npm lockfile agrees with package.json
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Is this the release PR
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HEAD_REF" ] && [ -n "$QUEUE_REF" ]; then
+            N=$(sed -n 's|.*/pr-\([0-9][0-9]*\)-.*|\1|p' <<<"$QUEUE_REF")
+            HEAD_REF=$(gh pr view "$N" --repo "$REPO" --json headRefName --jq .headRefName)
+          fi
+          if [ "$HEAD_REF" = "release-please--branches--main--components--carrick" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "release PR: the lockfile test runs on the refresh PR instead"
+          fi
+
+      - name: Lockfile and package.json agree
+        if: steps.release.outputs.skip != 'true'
+        run: python3 scripts/npm-lock-version.test.py
+
   wasm-match:
     name: carrick-match wasm smoke
     runs-on: ubuntu-latest
@@ -580,6 +618,9 @@ jobs:
 
       - name: Auto-release decision tests
         run: python3 scripts/auto-release.test.py
+
+      - name: Lockfile refresh tests and CI wiring
+        run: python3 scripts/npm-lock-refresh.test.py
 
       - name: Check formatting
         run: cargo fmt --all -- --check
