@@ -3276,6 +3276,19 @@ async fn seed_trpc_output_field_removed() {
 async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
     let _serial = SERIAL.lock().await;
     let main = main_snapshot().await;
+    for row in &main.shelf_rows {
+        let v = serde_json::to_value(row).unwrap();
+        eprintln!(
+            "DIAG {:?} endpoints={} calls={} boundary={} types_degraded={} status={} possible={}",
+            row.service_name,
+            row.endpoints.len(),
+            row.calls.len(),
+            v["boundary"],
+            v["types_degraded"],
+            v["type_extraction_status"],
+            v["possible_calls"]
+        );
+    }
     let procedures = |service: &str, side: &str| -> Vec<String> {
         let row = main
             .shelf_rows
