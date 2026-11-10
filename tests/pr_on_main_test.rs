@@ -234,6 +234,13 @@ fn sidecar_for(repo: &Path) -> Option<TypeSidecar> {
         return None;
     }
     let sidecar = TypeSidecar::spawn(&path).ok()?;
+    // A seed repo of several services names its root to the compiler engine,
+    // as `main` does (`spawn_sidecar`): a service below the root finds the
+    // modules and the tsconfig above it through that root. Without it the
+    // `rpc-shelf` services read fewer rows than the shipped binary does.
+    if repo.join("__llm__").is_dir() && repo.join("carrick.json").is_file() {
+        sidecar.set_scan_root(repo);
+    }
     sidecar.start_init(repo, None);
     sidecar.wait_ready(Duration::from_secs(120)).ok()?;
     Some(sidecar)
@@ -2429,6 +2436,8 @@ struct MainSnapshot {
     admin_reach: ReachObjects,
     rpc_rows: Vec<CloudRepoData>,
     rpc_reach: ReachObjects,
+    shelf_rows: Vec<CloudRepoData>,
+    shelf_reach: ReachObjects,
 }
 
 static MAIN: tokio::sync::OnceCell<MainSnapshot> = tokio::sync::OnceCell::const_new();
@@ -2463,6 +2472,8 @@ impl MainSnapshot {
             "admin_reach": reach(&self.admin_reach),
             "rpc_rows": self.rpc_rows,
             "rpc_reach": reach(&self.rpc_reach),
+            "shelf_rows": self.shelf_rows,
+            "shelf_reach": reach(&self.shelf_reach),
         })
     }
 }
@@ -2489,6 +2500,9 @@ async fn build_snapshot(trees: &Path) -> MainSnapshot {
     let rpc = seed_repo(trees, "rpc-api");
     let rpc_store = Store::default();
     scan_seed_repo(&rpc_store, &rpc).await;
+    let shelf = seed_repo(trees, "rpc-shelf");
+    let shelf_store = Store::default();
+    scan_seed_repo(&shelf_store, &shelf).await;
     MainSnapshot {
         trees: unlinked(trees),
         shared_rows: shared.repos.lock().unwrap().clone(),
@@ -2497,6 +2511,8 @@ async fn build_snapshot(trees: &Path) -> MainSnapshot {
         admin_reach: admin_store.type_reach.lock().unwrap().clone(),
         rpc_rows: rpc_store.repos.lock().unwrap().clone(),
         rpc_reach: rpc_store.type_reach.lock().unwrap().clone(),
+        shelf_rows: shelf_store.repos.lock().unwrap().clone(),
+        shelf_reach: shelf_store.type_reach.lock().unwrap().clone(),
     }
 }
 
@@ -2540,6 +2556,8 @@ fn read_snapshot(dir: &Path) -> MainSnapshot {
         admin_reach: reach("admin_reach"),
         rpc_rows: rows("rpc_rows"),
         rpc_reach: reach("rpc_reach"),
+        shelf_rows: rows("shelf_rows"),
+        shelf_reach: reach("shelf_reach"),
     }
 }
 
@@ -2648,6 +2666,7 @@ async fn snapshot_from_cache_equals_fresh_scan() {
         .iter()
         .chain(&cached.admin_rows)
         .chain(&cached.rpc_rows)
+        .chain(&cached.shelf_rows)
     {
         assert_eq!(
             head(&cached.trees.join(&row.repo_name)),
@@ -2772,6 +2791,7 @@ async fn seed_payload_from(
     let (rows, reach) = match repo_name {
         "admin-api" => (&main.admin_rows, &main.admin_reach),
         "rpc-api" => (&main.rpc_rows, &main.rpc_reach),
+        "rpc-shelf" => (&main.shelf_rows, &main.shelf_reach),
         _ => (&main.shared_rows, &main.shared_reach),
     };
     let store = Store {
@@ -3247,6 +3267,162 @@ async fn seed_trpc_output_field_removed() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-output-field-removed").await;
     seed_finding_at(&payload, "type_mismatch", "src/web/orders-view.ts:7");
+}
+
+// ---- A procedure router with a client of its own (rpc-shelf, carrick#3778) --
+//
+// Two services in one repo: `api` serves the `shelf` router, `web` calls it
+// through a typed client. One call (`shelf.gone`) is to a procedure nothing
+// serves; main has no row for it, and no seed's correct check carries one.
+
+/// What the base tree reads: the three `shelf` procedures as `api` rows, and
+/// `web`'s two calls of served procedures as rows that name their procedure.
+/// The call of the unserved `shelf.gone` is no row (its type does not hold
+/// the key). Without this the seeds below would test nothing.
+#[tokio::test]
+async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
+    let _serial = SERIAL.lock().await;
+    let main = main_snapshot().await;
+    let procedures = |service: &str, side: &str| -> Vec<String> {
+        let row = main
+            .shelf_rows
+            .iter()
+            .find(|row| row.service_name.as_deref() == Some(service))
+            .unwrap_or_else(|| panic!("no stored row for {service}"));
+        let rows = if side == "calls" {
+            serde_json::to_value(&row.calls).unwrap()
+        } else {
+            serde_json::to_value(&row.endpoints).unwrap()
+        };
+        let mut names: Vec<String> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["procedure"]["path"].as_str().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        procedures("api", "endpoints"),
+        ["shelf.add", "shelf.get", "shelf.list"]
+    );
+    assert_eq!(procedures("web", "calls"), ["shelf.get", "shelf.list"]);
+}
+
+/// The break row a PR posts for a removed procedure a client still calls: a
+/// lost pairing, carrying `removed` (carrick#3092), marked as the PR's.
+fn assert_called_procedure_break(payload: &serde_json::Value, removed: (&str, &str)) {
+    let (method, path) = removed;
+    let findings = findings_of(payload);
+    let row = findings
+        .iter()
+        .find(|f| f["removed"]["method"] == method && f["removed"]["path"] == path)
+        .unwrap_or_else(|| panic!("no break row for {method} {path}: {findings:#?}"));
+    assert_eq!(row["service"], "web", "{row:#}");
+    assert_marks(row, Some(false), Some("fact"), Some("not_checked"));
+}
+
+/// A procedure a client calls is deleted from the router.
+#[tokio::test]
+async fn seed_trpc_called_procedure_removed() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-called-procedure-removed").await;
+    assert_manifest_delta(&payload, "trpc-called-procedure-removed");
+    assert_removed_rows_are_facts(&payload);
+}
+
+#[tokio::test]
+#[ignore = "carrick#3778: a procedure call no row serves is never listed as unpaired, so no break row is marked"]
+async fn seed_trpc_called_procedure_removed_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-called-procedure-removed").await;
+    assert_called_procedure_break(&payload, ("GET", "/api/rpc/shelf.get"));
+}
+
+/// A procedure a client calls is renamed in the router only.
+#[tokio::test]
+async fn seed_trpc_called_procedure_renamed() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-called-procedure-renamed").await;
+    assert_manifest_delta(&payload, "trpc-called-procedure-renamed");
+    assert_removed_rows_are_facts(&payload);
+}
+
+#[tokio::test]
+#[ignore = "carrick#3778: a procedure call no row serves is never listed as unpaired, so no break row is marked"]
+async fn seed_trpc_called_procedure_renamed_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-called-procedure-renamed").await;
+    assert_called_procedure_break(&payload, ("GET", "/api/rpc/shelf.get"));
+}
+
+/// A procedure is added beside the called ones.
+#[tokio::test]
+async fn seed_trpc_procedure_added_beside_calls() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-procedure-added-beside-calls").await;
+    assert_manifest_delta(&payload, "trpc-procedure-added-beside-calls");
+    assert_quiet(&payload, &["shelf."]);
+}
+
+/// The adapter and the client's `url` move together: every procedure moves.
+#[tokio::test]
+async fn seed_trpc_adapter_mount_moved_with_client() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-adapter-mount-moved-with-client").await;
+    assert_manifest_delta(&payload, "trpc-adapter-mount-moved-with-client");
+    assert_removed_rows_are_facts(&payload);
+    assert_quiet(&payload, &["shelf."]);
+}
+
+/// The adapter moves and the client's `url` stays: a runtime break. The
+/// procedure key pairs the client with the moved row (carrick#3778).
+#[tokio::test]
+async fn seed_trpc_adapter_mount_moved_client_stale() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-adapter-mount-moved-client-stale").await;
+    assert_manifest_delta(&payload, "trpc-adapter-mount-moved-client-stale");
+}
+
+#[tokio::test]
+#[ignore = "carrick#3778: the client's stated base is not compared with the mount, so no break row is marked"]
+async fn seed_trpc_adapter_mount_moved_client_stale_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-adapter-mount-moved-client-stale").await;
+    assert_called_procedure_break(&payload, ("GET", "/api/rpc/shelf.list"));
+    assert_called_procedure_break(&payload, ("GET", "/api/rpc/shelf.get"));
+}
+
+/// The router binding and its type alias are renamed, and the client's
+/// import with them: no contract moved.
+#[tokio::test]
+async fn seed_trpc_router_binding_renamed() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-router-binding-renamed").await;
+    assert_manifest_delta(&payload, "trpc-router-binding-renamed");
+    assert_quiet(&payload, &["shelf."]);
+}
+
+/// The router's keys are written so the reader cannot read them: no contract
+/// change, but main's rows read as removed.
+#[tokio::test]
+async fn seed_trpc_router_rewritten_unread() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-router-rewritten-unread").await;
+    assert!(
+        !findings_of(&payload)
+            .iter()
+            .any(|f| f["removed"].is_object())
+    );
+}
+
+#[tokio::test]
+#[ignore = "carrick#3778: a removal under a router the PR rewrote so its keys are unread is posted as a fact"]
+async fn seed_trpc_router_rewritten_unread_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("trpc-router-rewritten-unread").await;
+    assert_manifest_delta(&payload, "trpc-router-rewritten-unread");
 }
 
 // ---- GraphQL -----------------------------------------------------------

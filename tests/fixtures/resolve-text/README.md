@@ -118,3 +118,31 @@ The text reader reads an entry of these classes as its initialiser's text:
 `moved` as `a` and `b`. `nestedMoved` reads `reassigned` (its write is never
 placed). `same`, `item` and `err` read `outside_service`. The value readers
 and the procedures walk still refuse every one of them.
+
+Read through callers (`Resolver::texts_through_callers`, B10-1b), each value
+carries the calls it was read through, innermost first:
+
+| Probe | Values (text or hole word, then its calls) |
+|---|---|
+| `p_one` | `order.created` at `one("order.created")` |
+| `p_two` | `order.created` at `two("order.created")`; `order.updated` at `two("order.updated")`; `caller_arg_missing` at `two(...names)` |
+| `p_outer` | `deep` at `outer(name)`, then `middle("deep")` |
+| `p_pair` | `a:x` at `pair("a", "x")`; `b:y` at `pair("b", "y")` |
+| `p_keyed` | `jobs.run` at `keyed({ topic: "jobs.run" })` |
+| `p_keyed_default` | `jobs.default` (the key's default) at `keyedDefault({})` |
+| `p_member` | `member.topic` at `member({ topic: "member.topic" })` |
+| `p_defaulted` | `fallback` (the default) at `defaulted()`; `given` at `defaulted("given")` |
+| `p_uncalled` | `name_never_bound`, no call |
+| `p_callback` | `callback_parameter`, no call |
+| `p_written` | `reassigned`, no call |
+| `p_shared` (a parameter on the line of a `const` of its name) | `reassigned`, no call |
+| `p_loop` | `once` at `loop("once")`; the call `loop(name)` adds nothing |
+| `p_ping` | `m` at `ping("m")`; the `ping`/`pong` cycle adds nothing |
+| `p_grow` | `seed` at `grow("seed")`; `recursion` at `grow(name + "/x")` |
+| `p_joined`, `p_lookup` | `unread_expression`, no call: a part of one text never takes a caller's text |
+| `p_runtime` | two holes, one at each `runtime(...)` call |
+| `p_send` | `bus.sent` |
+
+Read without callers (every other entry point), a parameter answers as
+before: `p_one` is `parameter_unread`, `p_defaulted` is `unread_expression`
+and `fallback`.

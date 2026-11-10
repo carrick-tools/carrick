@@ -1,0 +1,27 @@
+{
+  "reasons": {
+    "src/pending.ts": "unanswered_package",
+    "src/failed.ts": "unanswered_package",
+    "src/outer.ts": "missed_inside"
+  },
+  "also": {
+    "src/outer.ts": [
+      "unanswered_package"
+    ]
+  },
+  "none": [
+    "src/stated.ts"
+  ],
+  "by_reason": {
+    "unanswered_package": {
+      "eq": 2
+    },
+    "missed_inside": {
+      "min": 1
+    }
+  },
+  "boundary": {
+    "library_packages_pending": 1,
+    "library_packages_failed": 1
+  }
+}

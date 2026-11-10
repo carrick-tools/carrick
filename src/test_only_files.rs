@@ -143,6 +143,78 @@ pub fn of(
         .collect()
 }
 
+/// Who imports each file below a repo, and which files are tests.
+struct Graph {
+    importers: HashMap<PathBuf, HashSet<PathBuf>>,
+    tests: HashSet<PathBuf>,
+}
+
+impl Graph {
+    fn read(
+        cache: &Cache,
+        repo_root: &Path,
+        workspace: &WorkspaceIndex,
+        ignore_patterns: &[&str],
+    ) -> Self {
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut reader = crate::parser::ModuleReader::quiet();
+        let mut importers: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+        let mut tests: HashSet<PathBuf> = HashSet::new();
+        for file in crate::file_finder::source_files_below(repo_root, ignore_patterns) {
+            let importer = canonical(&file);
+            if crate::file_finder::is_test_source(&file, repo_root) {
+                tests.insert(importer.clone());
+            }
+            for specifier in cache.loaded_specifiers(&mut reader, &file).iter() {
+                let Some(target) = workspace.resolve_module_path(&file, specifier) else {
+                    continue;
+                };
+                let target = canonical(&target);
+                if target != importer {
+                    importers
+                        .entry(target)
+                        .or_default()
+                        .insert(importer.clone());
+                }
+            }
+        }
+        Self { importers, tests }
+    }
+
+    /// The files that only tests import.
+    fn only_tests_import(&self) -> HashSet<PathBuf> {
+        let mut only: HashSet<PathBuf> = HashSet::new();
+        loop {
+            let before = only.len();
+            for (file, by) in &self.importers {
+                if !self.tests.contains(file)
+                    && !only.contains(file)
+                    && by
+                        .iter()
+                        .all(|who| self.tests.contains(who) || only.contains(who))
+                {
+                    only.insert(file.clone());
+                }
+            }
+            if only.len() == before {
+                break;
+            }
+        }
+        only
+    }
+
+    /// This graph as it was before `added` joined it.
+    fn without(mut self, added: &Path) -> Self {
+        self.tests.remove(added);
+        self.importers.remove(added);
+        self.importers.retain(|_, by| {
+            by.remove(added);
+            !by.is_empty()
+        });
+        self
+    }
+}
+
 /// The canonical files below `repo_root` that only tests import.
 fn only_tests_import(
     cache: &Cache,
@@ -150,46 +222,27 @@ fn only_tests_import(
     workspace: &WorkspaceIndex,
     ignore_patterns: &[&str],
 ) -> HashSet<PathBuf> {
-    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut reader = crate::parser::ModuleReader::quiet();
-    let mut importers: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-    let mut tests: HashSet<PathBuf> = HashSet::new();
-    for file in crate::file_finder::source_files_below(repo_root, ignore_patterns) {
-        let importer = canonical(&file);
-        if crate::file_finder::is_test_source(&file, repo_root) {
-            tests.insert(importer.clone());
-        }
-        for specifier in cache.loaded_specifiers(&mut reader, &file).iter() {
-            let Some(target) = workspace.resolve_module_path(&file, specifier) else {
-                continue;
-            };
-            let target = canonical(&target);
-            if target != importer {
-                importers
-                    .entry(target)
-                    .or_default()
-                    .insert(importer.clone());
-            }
-        }
-    }
-    let mut only: HashSet<PathBuf> = HashSet::new();
-    loop {
-        let before = only.len();
-        for (file, by) in &importers {
-            if !tests.contains(file)
-                && !only.contains(file)
-                && by
-                    .iter()
-                    .all(|who| tests.contains(who) || only.contains(who))
-            {
-                only.insert(file.clone());
-            }
-        }
-        if only.len() == before {
-            break;
-        }
-    }
-    only
+    Graph::read(cache, repo_root, workspace, ignore_patterns).only_tests_import()
+}
+
+/// Whether the file `added`, which is on disk now, changes which files only
+/// tests import: the set read with it, against the set read without it. An
+/// added test that imports files production code already imports, or other
+/// tests, moves none; one that is the only importer of a file moves it into
+/// the set (carrick#3114). The one reading of the set, so what the scan
+/// reads and what this says never differ.
+pub fn adding_moves_the_set(
+    cache: &Cache,
+    repo_root: &Path,
+    workspace: &WorkspaceIndex,
+    ignore_patterns: &[&str],
+    added: &Path,
+) -> bool {
+    let added = added.canonicalize().unwrap_or_else(|_| added.to_path_buf());
+    let with = Graph::read(cache, repo_root, workspace, ignore_patterns);
+    let after = with.only_tests_import();
+    let before = with.without(&added).only_tests_import();
+    after != before
 }
 
 #[cfg(test)]

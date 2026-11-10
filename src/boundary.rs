@@ -577,6 +577,8 @@ fn unknown_call_paths(data: &CloudRepoData) -> Counted {
     let reasons = data
         .calls
         .iter()
+        // A procedure call states its key, not a path (carrick#3809).
+        .filter(|call| call.procedure.is_none())
         .filter_map(|call| Some((call, call.key.as_http()?)))
         .filter(|(_, (_, path))| carrick_match::is_unknown_call_path(path))
         .map(|(call, (method, path))| format!("{method} {path} ({})", call.file_path.display()))
@@ -699,6 +701,11 @@ fn untyped_operations(
             .collect(),
     };
     operations.iter().filter_map(move |operation| {
+        // A procedure call's types come from its router, not from an expected
+        // type at the call site (carrick#3809).
+        if role == ManifestRole::Consumer && operation.procedure.is_some() {
+            return None;
+        }
         let location = operation.file_path.to_string_lossy();
         let (file, line) = match location.rsplit_once(':') {
             Some((file, line)) => (file, line.parse::<u32>().ok()),
@@ -1411,6 +1418,65 @@ mod tests {
                 .any(|line| line.contains("own route")),
             "{:?}",
             boundary.lines("app")
+        );
+    }
+
+    /// carrick#3809: a tRPC procedure call states its key, not a path, and its
+    /// types come from the router, so it is neither an unread call path nor a
+    /// call with no expected type. Only the plain HTTP call is counted.
+    #[test]
+    fn a_procedure_call_is_not_an_unknown_path_or_an_untyped_call() {
+        use crate::analyzer::ApiEndpointDetails;
+        use crate::operation::OperationKey;
+
+        let call = |path: &str, site: &str, procedure| ApiEndpointDetails {
+            procedure,
+            view_module: false,
+            owner: None,
+            key: OperationKey::http("GET", path.to_string()),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: std::path::PathBuf::from(site),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: None,
+            schema_binding: None,
+            undeclared_selection: None,
+            handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
+            inference: None,
+        };
+        let procedure = carrick_match::ProcedureKey {
+            path: "orders.list".to_string(),
+            router: carrick_match::RouterId::default(),
+        };
+        let data = CloudRepoData {
+            calls: vec![
+                call("/:base/:rest", "src/http.ts:3", None),
+                call("/:base/:rest", "src/trpc.ts:8", Some(procedure)),
+            ],
+            ..serde_json::from_value(serde_json::json!({
+                "repo_name": "acme/app", "endpoints": [], "calls": [], "mounts": [],
+                "apps": {}, "imported_handlers": [], "function_definitions": {},
+                "last_updated": "2026-01-01T00:00:00Z", "commit_hash": "abc1234"
+            }))
+            .expect("the blob reads")
+        };
+
+        let boundary =
+            ServiceBoundary::collect(&data, &ProcessingStats::default(), &HashMap::new(), "/repo");
+
+        assert_eq!(boundary.unknown_call_paths.total, 1, "{boundary:?}");
+        assert_eq!(
+            boundary.calls_without_expected_type.total, 1,
+            "{boundary:?}"
         );
     }
 
