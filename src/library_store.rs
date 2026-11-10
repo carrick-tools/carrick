@@ -1471,6 +1471,10 @@ pub struct LibraryAnswer {
     /// The reason the store gave each `pending` package (an empty string when
     /// it sent none), for the run log only.
     pub pending_reasons: BTreeMap<String, String>,
+    /// The failure reason the store gave each `build_failed` package
+    /// (`failed_reason`, carrick#3739), when it sent one. An older store
+    /// sends none.
+    pub failed_reasons: BTreeMap<String, String>,
     /// Entries answered, for the log.
     pub answered: usize,
     /// Entries skipped, for the log.
@@ -1524,6 +1528,15 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
                 let reason = entry.get("reason").and_then(|reason| reason.as_str());
                 if let (Some(package), Some("build_failed")) = (package, reason) {
                     answer.build_failed.insert(package.to_string());
+                    if let Some(cause) = entry
+                        .get("failed_reason")
+                        .and_then(Value::as_str)
+                        .filter(|cause| !cause.is_empty())
+                    {
+                        answer
+                            .failed_reasons
+                            .insert(package.to_string(), cause.to_string());
+                    }
                 }
                 debug!(
                     package = package.unwrap_or("?"),
@@ -1817,6 +1830,9 @@ pub struct Settled {
     /// The last reason the store gave each package in `pending`, for the run
     /// log only.
     pub pending_reasons: BTreeMap<String, String>,
+    /// The failure reason the store gave each package in `build_failed`, when
+    /// it gave one (carrick#3739): why a site resting on the package is unread.
+    pub failed_reasons: BTreeMap<String, String>,
     /// Whether the store was asked at all.
     pub asked: bool,
     /// Why the first ask went unanswered (carrick#3249). `None` for an answer,
@@ -1937,6 +1953,7 @@ where
     let mut building = first.building;
     let mut build_failed = first.build_failed;
     let mut pending_reasons = first.pending_reasons;
+    let mut failed_reasons = first.failed_reasons;
     let mut polls = 0usize;
     while !building.is_empty() {
         let next = tokio::time::Instant::now() + POLL_INTERVAL;
@@ -1955,6 +1972,7 @@ where
         exports.extend(second.exports);
         pending.extend(second.pending.difference(&second.building).cloned());
         build_failed.extend(second.build_failed);
+        failed_reasons.extend(second.failed_reasons);
         pending_reasons.extend(second.pending_reasons);
         building = second.building;
     }
@@ -1981,6 +1999,7 @@ where
         build_failed,
         unanswered,
         pending_reasons,
+        failed_reasons,
         asked: true,
         failure: None,
     }
@@ -4284,6 +4303,28 @@ mod tests {
             Some("lister_unavailable"),
             "the last pending reason is kept"
         );
+    }
+
+    /// carrick#3739: the store's `failed_reason` on a build-failed package is
+    /// kept by name; one with none (an older store) and an empty one are not.
+    #[tokio::test(start_paused = true)]
+    async fn a_build_failed_package_keeps_the_stores_failure_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let body = r#"{"library_claims":[
+            {"package":"lib","version":"1.0.0","status":"skipped","reason":"build_failed","failed_reason":"lister_out_of_memory"},
+            {"package":"other","version":"1.0.0","status":"skipped","reason":"build_failed"}]}"#;
+        let settled = FakeStore::new(vec![body.to_string()]).run(&asked).await;
+        assert_eq!(settled.build_failed, specifiers(&["lib", "other"]));
+        assert_eq!(
+            settled.failed_reasons,
+            [("lib".to_string(), "lister_out_of_memory".to_string())].into()
+        );
+        let empty = parse_answer(
+            r#"{"library_claims":[{"package":"x","version":"1","status":"skipped","reason":"build_failed","failed_reason":""}]}"#,
+        );
+        assert!(empty.failed_reasons.is_empty());
+        assert!(empty.build_failed.contains("x"));
     }
 
     /// carrick#3684: a failed first ask ends the scan without every package
