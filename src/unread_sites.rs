@@ -558,6 +558,7 @@ mod tests {
             span_end: 99,
             new: false,
             scope: None,
+            procedure: None,
         };
         let decided = Decided {
             stops: vec![DecidedStop {
