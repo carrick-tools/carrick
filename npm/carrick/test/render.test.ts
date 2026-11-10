@@ -307,7 +307,7 @@ test("a deleted file says so and names the problem it leaves", () => {
 test("a file with nothing to report prints nothing", () => {
   for (const name of ["check-silent.json", "check-clean.json"]) {
     const result = fixture(name);
-    result.boundary = { unemitted_literal_sites: [`${result.file}:7`] };
+    result.boundary = {};
     assert.equal(renderPostToolUse(result), null, name);
   }
 });
@@ -339,7 +339,6 @@ test("the boundary keeps the CLI's wording", () => {
   assert.ok(
     lines.includes("  1 call site(s) that named a client member and did not resolve to it (usersClient.get)"),
   );
-  assert.ok(lines.includes("  4 route-literal call site(s) left unclassified"));
   assert.ok(lines.includes("  6 row(s) the model alone states (11 joined a deterministic row)"));
   assert.ok(
     lines.includes("  1 model endpoint(s) dropped in modules a routing convention claims"),
@@ -405,12 +404,18 @@ test("the session line ends with each service's boundary lines, verbatim", () =>
 });
 
 test("a local index dispatches nothing, so the header drops the analyzer count", () => {
-  const lines = boundaryLines(
-    { commit_hash: "abc1234def", files_attempted: 0, unemitted_literal_candidates: 3 },
-    "webapp",
-  );
-  assert.equal(lines[0], "webapp at abc1234");
-  assert.equal(lines[1], "  3 route-literal call site(s) left unclassified");
+  const lines = boundaryLines({ commit_hash: "abc1234def", files_attempted: 0 }, "webapp");
+  assert.deepEqual(lines, ["webapp at abc1234"]);
+});
+
+test("an old blob that still carries the removed literal count reads without a line for it", () => {
+  const old = {
+    commit_hash: "abc1234def",
+    files_attempted: 0,
+    unemitted_literal_candidates: 3,
+    unemitted_literal_sites: ["src/a.ts:7"],
+  } as unknown as Parameters<typeof boundaryLines>[0];
+  assert.deepEqual(boundaryLines(old, "webapp"), ["webapp at abc1234"]);
 });
 
 test("a boundary with a degraded type stage says which stage", () => {

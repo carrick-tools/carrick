@@ -147,20 +147,6 @@ pub struct ServiceBoundary {
     /// absent as 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_not_parsed: Option<Counted>,
-    /// Offered HTTP candidates carrying a route-shaped literal (a readable
-    /// verb is not required) that no layer produced a row for and no mount
-    /// answers. A bare `x.verb("/lit", arg)` states no producer/consumer role,
-    /// so the scanner counts the gap rather than guessing at it (the
-    /// 2026-09-05 ruling; widened beyond verb calls in carrick#2382, so the
-    /// number rises at that release without any row being lost).
-    pub unemitted_literal_candidates: usize,
-    /// Where those sites are, `file:line`, up to [`MAX_REASONS`] of them. The
-    /// count above stays a count and keeps its type — the cloud's MCP server
-    /// reads it as a number — and this says which sites it counted, so the
-    /// line reconciles against the file instead of hanging in the air
-    /// (carrick#997 item 7).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unemitted_literal_sites: Vec<String>,
     /// Candidates in files no model was asked about, with no deterministic row
     /// at their span: what a paid scan would classify and this one did not.
     /// Zero on any scan that ran the model. `None` on a blob from a scanner
@@ -348,12 +334,6 @@ impl ServiceBoundary {
             .iter()
             .map(|reason| reason.replace(&prefix, ""))
             .collect();
-        let mut sites: Vec<String> = stats
-            .unemitted_literal_sites
-            .iter()
-            .map(|site| site.replace(&prefix, ""))
-            .collect();
-        sites.truncate(MAX_REASONS);
         let dropped_unanchored = stats
             .model_endpoints_dropped_unanchored_sites
             .iter()
@@ -373,8 +353,6 @@ impl ServiceBoundary {
             files_lost: Counted::new(stats.files_analysis_failed, lost),
             final_losses: Some(final_losses(data, repo_path)),
             files_not_parsed: Some(files_not_parsed(data, &prefix)),
-            unemitted_literal_candidates: stats.unemitted_literal_candidates,
-            unemitted_literal_sites: sites,
             candidates_awaiting_model: Some(stats.candidates_awaiting_model),
             type_extraction_status: data.type_extraction_status.clone(),
             consumers_not_resolved: unfollowed_members(data),
@@ -485,16 +463,6 @@ impl ServiceBoundary {
             &self.calls_without_expected_type,
             "call(s) with no resolved expected type",
         );
-        if self.unemitted_literal_candidates > 0 {
-            out.push(format!(
-                "  {} route-literal call site(s) left unclassified{}",
-                self.unemitted_literal_candidates,
-                first_site(
-                    &self.unemitted_literal_sites,
-                    self.unemitted_literal_candidates
-                )
-            ));
-        }
         if self.model_only_rows > 0 {
             out.push(format!(
                 "  {} row(s) the model alone states ({} joined a deterministic row)",
@@ -560,16 +528,6 @@ impl ServiceBoundary {
             )),
             _ => None,
         }
-    }
-}
-
-/// ` (e.g. src/a.ts:4)` — one of the sites a count counted, so the number can
-/// be reconciled against the file. Empty when the scan recorded none.
-fn first_site(sites: &[String], total: usize) -> String {
-    match sites.first() {
-        None => String::new(),
-        Some(first) if total > 1 => format!(" (e.g. {first})"),
-        Some(first) => format!(" ({first})"),
     }
 }
 
@@ -1484,24 +1442,18 @@ mod tests {
         assert!(stated.iter().any(|line| line.contains("bare checkout")));
     }
 
-    /// A count of something nobody can point at is a number to argue with. The
-    /// line names one of the sites it counted (carrick#997 item 7).
+    /// `unread_sites` is the one answer for HTTP sites the fact layer did not
+    /// read; the route-literal count was a second reader of that question and
+    /// is gone from the blob and from the printed lines.
     #[test]
-    fn the_unclassified_line_names_a_site() {
-        let boundary = ServiceBoundary {
-            commit_hash: "0123456".to_string(),
-            unemitted_literal_candidates: 2,
-            unemitted_literal_sites: vec![
-                "apps/gateway/main.ts:11".to_string(),
-                "apps/gateway/main.ts:40".to_string(),
-            ],
-            ..Default::default()
-        };
-        let lines = boundary.lines("gateway");
+    fn a_boundary_carries_no_literal_count() {
+        let value = serde_json::to_value(ServiceBoundary::default()).unwrap();
+        for field in ["unemitted_literal_candidates", "unemitted_literal_sites"] {
+            assert!(value.get(field).is_none(), "{field} is still written");
+        }
+        let lines = ServiceBoundary::default().lines("gateway");
         assert!(
-            lines.iter().any(|line| line
-                .contains("2 route-literal call site(s) left unclassified")
-                && line.contains("e.g. apps/gateway/main.ts:11")),
+            !lines.iter().any(|line| line.contains("route-literal")),
             "{lines:?}"
         );
     }

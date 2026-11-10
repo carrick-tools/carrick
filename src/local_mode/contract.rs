@@ -1688,24 +1688,19 @@ mod hosted_wire_tests {
     }
 
     /// The three fields carrick#997 adds to the boundary are additive and
-    /// sparse, and nothing that was a number stopped being one: the cloud's
-    /// MCP server reads `unemitted_literal_candidates` as an integer.
+    /// sparse.
     #[test]
     fn the_boundary_additions_are_sparse_and_change_no_existing_type() {
         let empty = serde_json::to_value(ServiceBoundary::default()).unwrap();
         for field in [
-            "unemitted_literal_sites",
             "candidates_awaiting_model",
             "type_extraction_status",
             "model_endpoints_dropped_unanchored",
         ] {
             assert!(empty.get(field).is_none(), "{field} is written when set");
         }
-        assert!(empty["unemitted_literal_candidates"].is_number());
 
         let stated = ServiceBoundary {
-            unemitted_literal_candidates: 1,
-            unemitted_literal_sites: vec!["src/a.ts:4".to_string()],
             candidates_awaiting_model: Some(8),
             type_extraction_status: Some("sidecar unavailable".to_string()),
             model_endpoints_dropped_unanchored: Some(crate::boundary::Counted::from_reasons(vec![
@@ -1714,7 +1709,6 @@ mod hosted_wire_tests {
             ..Default::default()
         };
         let value = serde_json::to_value(&stated).unwrap();
-        assert!(value["unemitted_literal_candidates"].is_number());
         // The wire spelling the cloud and the npm mirror read.
         assert_eq!(value["model_endpoints_dropped_unanchored"]["total"], 1);
         assert_eq!(

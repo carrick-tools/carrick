@@ -351,7 +351,6 @@ fn the_boundary_block_states_counts_totals_and_the_commit() {
         files_model_dispatched: 12,
         files_analysis_failed: 1,
         errors: vec!["Failed to analyze src/dead.ts: gateway timeout".to_string()],
-        unemitted_literal_candidates: 4,
         model_only_rows: 7,
         model_rows_joined: 2,
         model_contradictions_discarded: 1,
@@ -368,7 +367,6 @@ fn the_boundary_block_states_counts_totals_and_the_commit() {
         json["files_lost"]["reasons"][0],
         "Failed to analyze src/dead.ts: gateway timeout"
     );
-    assert_eq!(json["unemitted_literal_candidates"], 4);
     assert_eq!(json["model_only_rows"], 7);
     assert_eq!(json["model_rows_joined"], 2);
     assert_eq!(json["model_contradictions_discarded"], 1);

@@ -68,15 +68,6 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
   push(boundary.unknown_call_paths, "indexed call(s) whose path no producer may claim");
   push(boundary.routes_without_response_type, "route(s) with no resolved response type");
   push(boundary.calls_without_expected_type, "call(s) with no resolved expected type");
-  if ((boundary.unemitted_literal_candidates ?? 0) > 0) {
-    const sites = boundary.unemitted_literal_sites ?? [];
-    const where = sites.length
-      ? ` (${(boundary.unemitted_literal_candidates ?? 0) > 1 ? "e.g. " : ""}${sites[0]})`
-      : "";
-    out.push(
-      `  ${boundary.unemitted_literal_candidates} route-literal call site(s) left unclassified${where}`,
-    );
-  }
   if ((boundary.model_only_rows ?? 0) > 0) {
     out.push(
       `  ${boundary.model_only_rows} row(s) the model alone states (${boundary.model_rows_joined ?? 0} joined a deterministic row)`,
