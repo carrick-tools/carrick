@@ -297,7 +297,13 @@ fn files_not_parsed(data: &CloudRepoData, prefix: &str) -> Counted {
         crate::scan_health::unread_sources_for(data.service_name.as_deref())
             .into_iter()
             .filter(|(_, reason)| *reason == crate::findings::FileNotReadReason::DoesNotParse)
-            .map(|(path, reason)| format!("{}: {}", path.replace(prefix, ""), reason.code()))
+            .map(|(path, reason)| {
+                format!(
+                    "{}: {}",
+                    path.replace(prefix, "").trim_start_matches("./"),
+                    reason.code()
+                )
+            })
             .collect(),
     )
 }
