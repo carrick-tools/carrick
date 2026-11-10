@@ -2774,7 +2774,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
             &results.cross_repo_matches,
-            &analyzer.pair_directions(),
+            &analyzer.pair_directions_with_sources(),
         );
         // Each consumer's final pair outcomes, for a pull request run to
         // settle the pairs its change cannot reach (carrick#3104).

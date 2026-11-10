@@ -884,6 +884,36 @@ fn pairing_key_path(path: &str) -> String {
 /// consumer call-site identity `(file, line)`.
 type VerdictKey = (String, String, (String, u32));
 
+/// The consumer row an outcome's verdict was reached at, if the graph holds
+/// one. The edge is the producer rows plus that one consumer call. The key is
+/// the stored (unstripped) location, matching how the data calls are keyed;
+/// `apply_pair_outcomes` reads a zero line as line 1, so this does too. It
+/// names the protocol and, for an exact-key protocol, the consumer service and
+/// the operation, so a row on the same line of another protocol, topic or repo
+/// is never the one read (carrick#1626).
+fn consumer_row_of<'a>(
+    outcome: &PairCheckOutcome,
+    rows: &HashMap<ConsumerRowKey, ConsumerRow<'a>>,
+) -> Option<ConsumerRow<'a>> {
+    let key: ConsumerRowKey = match exact_key_protocol(&outcome.pseudo_method) {
+        Some(protocol) => (
+            protocol,
+            outcome.consumer_service.clone(),
+            carrick_match::route_identity(&outcome.identity),
+            outcome.consumer_file.clone(),
+            outcome.consumer_line.max(1),
+        ),
+        None => (
+            crate::operation::Protocol::Http,
+            String::new(),
+            String::new(),
+            outcome.consumer_file.clone(),
+            outcome.consumer_line.max(1),
+        ),
+    };
+    rows.get(&key).copied()
+}
+
 /// The key an OUTCOME is filed under.
 fn verdict_key_of_outcome(outcome: &PairCheckOutcome) -> VerdictKey {
     (
@@ -968,6 +998,10 @@ pub struct PairDirectionOutcome {
 pub struct EdgeDirections {
     pub request: Option<PairDirectionOutcome>,
     pub response: Option<PairDirectionOutcome>,
+    /// Which layer the rows behind this edge's pairing come from, the same
+    /// fold its `type_mismatch` finding carries (plan B1, cloud#1421). `None`
+    /// when unstated, and on directions built without an analyzer.
+    pub edge_source: Option<crate::findings::EdgeSource>,
 }
 
 impl EdgeDirections {
@@ -1007,6 +1041,10 @@ impl EdgeDirections {
 #[derive(Debug, Default)]
 pub struct PairDirections {
     by_key: HashMap<(VerdictKey, crate::cloud_storage::ManifestTypeKind), PairDirectionOutcome>,
+    /// Each edge's [`crate::findings::EdgeSource`] fold, filled by
+    /// [`Analyzer::pair_directions_with_sources`], which holds the rows it
+    /// folds over. Empty from [`Self::from_outcomes`].
+    edge_sources: HashMap<VerdictKey, Option<crate::findings::EdgeSource>>,
 }
 
 impl PairDirections {
@@ -1083,7 +1121,24 @@ impl PairDirections {
             entry.notes.sort();
             entry.notes.dedup();
         }
-        Self { by_key }
+        Self {
+            by_key,
+            edge_sources: HashMap::new(),
+        }
+    }
+
+    /// Set one edge's source, as [`Analyzer::pair_directions_with_sources`]
+    /// would. For tests that build directions without an analyzer.
+    #[cfg(test)]
+    pub(crate) fn with_edge_source(
+        mut self,
+        edge: &CrossRepoMatch,
+        source: Option<crate::findings::EdgeSource>,
+    ) -> Self {
+        if let Some(key) = verdict_key_of_edge(edge) {
+            self.edge_sources.insert(key, source);
+        }
+        self
     }
 
     /// Both directions for one edge. Empty when no outcome was filed for it —
@@ -1098,7 +1153,11 @@ impl PairDirections {
                 .by_key
                 .get(&(key.clone(), ManifestTypeKind::Request))
                 .cloned(),
-            response: self.by_key.get(&(key, ManifestTypeKind::Response)).cloned(),
+            response: self
+                .by_key
+                .get(&(key.clone(), ManifestTypeKind::Response))
+                .cloned(),
+            edge_source: self.edge_sources.get(&key).copied().flatten(),
         }
     }
 }
@@ -2095,6 +2154,45 @@ impl Analyzer {
             Some(outcomes) => PairDirections::from_outcomes(outcomes),
             None => PairDirections::default(),
         }
+    }
+
+    /// [`Self::pair_directions`] with each edge's source folded in, for the
+    /// blob's stored verdict sites (plan B1, cloud#1421). Separate because the
+    /// fold reads the producer rows per edge, and only the blob write needs
+    /// it.
+    ///
+    /// The edge's source is folded over every outcome filed on it with
+    /// [`crate::findings::EdgeSource::combine`]: a candidate anywhere makes it
+    /// a candidate, an unstated one leaves it unstated, else a fact. Each
+    /// distinct input to [`Self::edge_source_of`] is folded once, since many
+    /// sites share a route and a consumer source.
+    pub fn pair_directions_with_sources(&self) -> PairDirections {
+        let mut directions = self.pair_directions();
+        let Some(outcomes) = self.pair_outcomes.as_ref() else {
+            return directions;
+        };
+        let consumer_rows = self.consumer_rows();
+        let mut memo: HashMap<String, Option<crate::findings::EdgeSource>> = HashMap::new();
+        for outcome in outcomes {
+            let row = consumer_row_of(outcome, &consumer_rows);
+            let input = format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:?}",
+                outcome.pseudo_method,
+                outcome.identity,
+                outcome.producer_service,
+                outcome.consumer_service,
+                row.map(|row| (row.source, row.name_scope)),
+            );
+            let source = *memo
+                .entry(input)
+                .or_insert_with(|| self.edge_source_of(outcome, row));
+            directions
+                .edge_sources
+                .entry(verdict_key_of_outcome(outcome))
+                .and_modify(|held| *held = crate::findings::EdgeSource::combine(*held, source))
+                .or_insert(source);
+        }
+        directions
     }
 
     /// Every type-check outcome of this analysis as one call site's answer,
@@ -3873,30 +3971,8 @@ impl Analyzer {
                 let location = format!("{}:{}", outcome.consumer_file, outcome.consumer_line);
                 let call_sites = vec![strip_ci_workspace_prefix(&location).to_string()];
                 // The edge is the producer rows plus the one consumer call
-                // this verdict was reached at. The consumer key is the stored
-                // (unstripped) location, matching how the data calls are keyed;
-                // `apply_pair_outcomes` reads a zero line as line 1, so this
-                // does too. It names the protocol and, for an exact-key
-                // protocol, the consumer service and the operation, so a row
-                // on the same line of another protocol, topic or repo is never
-                // the one read (carrick#1626).
-                let consumer_key: ConsumerRowKey = match exact_key_protocol(&method) {
-                    Some(protocol) => (
-                        protocol,
-                        outcome.consumer_service.clone(),
-                        carrick_match::route_identity(&outcome.identity),
-                        outcome.consumer_file.clone(),
-                        outcome.consumer_line.max(1),
-                    ),
-                    None => (
-                        crate::operation::Protocol::Http,
-                        String::new(),
-                        String::new(),
-                        outcome.consumer_file.clone(),
-                        outcome.consumer_line.max(1),
-                    ),
-                };
-                let consumer_row = consumer_rows.get(&consumer_key).copied();
+                // this verdict was reached at (see `consumer_row_of`).
+                let consumer_row = consumer_row_of(outcome, &consumer_rows);
                 // The consumer as a side of a name-scope pairing: the
                 // producer rows this verdict rests on are the ones it pairs
                 // with (carrick#1663), as the cloud folds a pair. A consumer
@@ -3911,26 +3987,7 @@ impl Analyzer {
                     &outcome.producer_service,
                     consumer,
                 );
-                let edge_source = match consumer_row {
-                    Some(row) => {
-                        let mut sources = self.producer_resolution_sources_for(
-                            &method,
-                            &path,
-                            &outcome.producer_service,
-                            consumer,
-                        );
-                        sources.push(row.source);
-                        crate::findings::EdgeSource::fold(sources)
-                    }
-                    // The verdict was reached at a consumer call this graph
-                    // holds no row for (a peer whose calls did not merge). A
-                    // pairing with a side the scan cannot see is not a fact,
-                    // so it is a candidate, as a model row would make it
-                    // (carrick#1735). Not the fold's silence: that is a row
-                    // the scan holds which states no source, and stays
-                    // unstated.
-                    None => Some(crate::findings::EdgeSource::Candidate),
-                };
+                let edge_source = self.edge_source_of(outcome, consumer_row);
                 let detail = outcome
                     .diagnostic
                     .clone()
@@ -4096,6 +4153,41 @@ impl Analyzer {
             })
             .map(|endpoint| endpoint.resolution_source)
             .collect()
+    }
+
+    /// Which layer the rows behind one outcome's pairing come from: the
+    /// producer rows it pairs with and its consumer call, folded by
+    /// [`crate::findings::EdgeSource::fold`]. The one fold both the
+    /// `type_mismatch` finding and the stored verdict site read (plan B1,
+    /// cloud#1421), so the blob never states a source the finding does not.
+    fn edge_source_of(
+        &self,
+        outcome: &PairCheckOutcome,
+        consumer_row: Option<ConsumerRow<'_>>,
+    ) -> Option<crate::findings::EdgeSource> {
+        match consumer_row {
+            Some(row) => {
+                let consumer = carrick_match::ScopedRow {
+                    service: &outcome.consumer_service,
+                    name_scope: row.name_scope,
+                };
+                let mut sources = self.producer_resolution_sources_for(
+                    &outcome.pseudo_method,
+                    &outcome.identity,
+                    &outcome.producer_service,
+                    consumer,
+                );
+                sources.push(row.source);
+                crate::findings::EdgeSource::fold(sources)
+            }
+            // The verdict was reached at a consumer call this graph holds no
+            // row for (a peer whose calls did not merge). A pairing with a
+            // side the scan cannot see is not a fact, so it is a candidate,
+            // as a model row would make it (carrick#1735). Not the fold's
+            // silence: that is a row the scan holds which states no source,
+            // and stays unstated.
+            None => Some(crate::findings::EdgeSource::Candidate),
+        }
     }
 
     /// Consumer call rows by call-site identity (`file`, `line`) — the same key
@@ -6376,6 +6468,78 @@ mod tests {
                     "{pseudo_method} {identity}: producer {producer_source:?} + consumer \
                      {consumer_source:?}"
                 );
+            }
+        }
+    }
+
+    /// Plan B1 (cloud#1421): the edge source each stored verdict site carries
+    /// is the fold the site's `type_mismatch` finding carries, computed by
+    /// the one function, and it is filed for a site whose check agreed too
+    /// (no finding there, but the site is still stored).
+    #[test]
+    fn the_stored_site_source_is_the_findings_fold() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::{LibraryClaim, Model};
+        use crate::findings::EdgeSource;
+
+        let topic = || OperationKey::pubsub("orders.created");
+        // (producer source, consumer source, consumer row held) -> expected
+        let cases = [
+            (
+                Some(LibraryClaim),
+                Some(LibraryClaim),
+                true,
+                Some(EdgeSource::Fact),
+            ),
+            (
+                Some(Model),
+                Some(LibraryClaim),
+                true,
+                Some(EdgeSource::Candidate),
+            ),
+            (None, None, true, None),
+            (
+                Some(LibraryClaim),
+                Some(LibraryClaim),
+                false,
+                Some(EdgeSource::Candidate),
+            ),
+        ];
+        for bucket in [VerdictBucket::Incompatible, VerdictBucket::Compatible] {
+            for (producer_source, consumer_source, held, expected) in cases {
+                let filed = outcome(
+                    "PUBSUB",
+                    "orders.created",
+                    "web/src/client.ts:9",
+                    bucket,
+                    Some("Type 'A' is not assignable to type 'B'"),
+                );
+                let mut analyzer = analyzer_with_outcomes(vec![filed.clone()]);
+                analyzer.endpoints.push(protocol_row(
+                    topic(),
+                    "orders-svc/src/server.ts:5",
+                    "producer-svc",
+                    producer_source,
+                ));
+                if held {
+                    analyzer.calls.push(protocol_row(
+                        topic(),
+                        "web/src/client.ts:9",
+                        "consumer-svc",
+                        consumer_source,
+                    ));
+                }
+                let stored = analyzer
+                    .pair_directions_with_sources()
+                    .edge_sources
+                    .get(&verdict_key_of_outcome(&filed))
+                    .copied()
+                    .flatten();
+                let case =
+                    format!("{bucket:?}: {producer_source:?} + {consumer_source:?}, held {held}");
+                assert_eq!(stored, expected, "{case}");
+                if bucket == VerdictBucket::Incompatible {
+                    assert_eq!(type_mismatch_sources(&analyzer), vec![stored], "{case}");
+                }
             }
         }
     }

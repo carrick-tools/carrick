@@ -467,6 +467,22 @@ pub struct CompatVerdictSite {
     /// This site's RESPONSE direction. See [`CompatVerdict::response`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<DirectionVerdict>,
+    /// Which layer the rows behind this site's pairing come from (plan B1,
+    /// cloud#1421): `fact` when the producer rows and this call are all
+    /// stated by the source, `candidate` when any is the model's or the scan
+    /// holds no row for the call. The same fold the site's `type_mismatch`
+    /// finding carries as `edge_source`, so a reader of the blob never
+    /// re-derives it from the routes' and calls' `resolution_source`.
+    ///
+    /// Absent when unstated (a row recorded no source), and on a blob written
+    /// before the field: readers take absence as "not stated", never
+    /// "candidate", as they do on the finding. Per site, not per pair: two
+    /// sites on one pair can rest on different rows.
+    ///
+    /// Whether the type side was reached is already per direction
+    /// (`resolved`), so no `verdict_state` is stored beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_source: Option<crate::findings::EdgeSource>,
 }
 
 /// A consumer call that reaches a producer endpoint through a published npm
@@ -1915,6 +1931,8 @@ fn merge_site(sites: &mut Vec<CompatVerdictSite>, incoming: CompatVerdictSite) {
     {
         merge_direction(&mut existing.request, &incoming.request);
         merge_direction(&mut existing.response, &incoming.response);
+        existing.edge_source =
+            crate::findings::EdgeSource::combine(existing.edge_source, incoming.edge_source);
         return;
     }
     sites.push(incoming);
@@ -2000,6 +2018,7 @@ pub fn attach_compat_verdicts(
                 consumer_location: format!("{file}:{line}"),
                 request: dirs.request.as_ref().map(direction_verdict),
                 response: dirs.response.as_ref().map(direction_verdict),
+                edge_source: dirs.edge_source,
             };
             let row = CompatVerdict {
                 producer_repo: m.producer_repo.clone(),
@@ -3954,6 +3973,7 @@ mod tests {
                 consumer_location: "src/a.ts:1".to_string(),
                 request: None,
                 response: Some(compatible_direction(false)),
+                edge_source: None,
             }],
             scanner_version: "0.3.93".to_string(),
         }]);
@@ -4195,6 +4215,58 @@ mod tests {
              the worst site's"
         );
         assert!(fine.reason.is_none());
+    }
+
+    /// Plan B1 (cloud#1421): each stored site carries the scanner's
+    /// `edge_source` fold, it survives the blob round trip, a site whose
+    /// source is unstated writes no key, and a site from a blob written
+    /// before the field reads as unstated.
+    #[test]
+    fn a_stored_site_carries_its_edge_source() {
+        use crate::findings::EdgeSource;
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let stated = edge_at(
+            "producer",
+            "http|POST|/x",
+            "consumer",
+            "http|POST|/x",
+            "src/a.ts:3",
+        );
+        let unstated = edge_at(
+            "producer",
+            "http|POST|/x",
+            "consumer",
+            "http|POST|/x",
+            "src/b.ts:9",
+        );
+        let dirs = directions(&[
+            incompatible_outcome(&stated, ManifestTypeKind::Request, "request mismatch"),
+            compatible_outcome(&unstated, ManifestTypeKind::Request),
+        ])
+        .with_edge_source(&stated, Some(EdgeSource::Fact))
+        .with_edge_source(&unstated, None);
+        attach_compat_verdicts(&mut payloads, &[stated, unstated], &dirs);
+
+        let raw = serde_json::to_value(&payloads[0]).unwrap();
+        let sites = raw["compat_verdicts"][0]["sites"].as_array().unwrap();
+        assert_eq!(sites[0]["consumer_location"], "src/a.ts:3");
+        assert_eq!(sites[0]["edge_source"], "fact");
+        assert!(
+            !sites[1].as_object().unwrap().contains_key("edge_source"),
+            "an unstated source writes no key: {}",
+            sites[1]
+        );
+
+        let back: CloudRepoData = serde_json::from_value(raw).unwrap();
+        let row = &back.compat_verdicts.unwrap()[0];
+        assert_eq!(row.sites[0].edge_source, Some(EdgeSource::Fact));
+        assert_eq!(row.sites[1].edge_source, None);
+
+        let old: CompatVerdictSite = serde_json::from_str(
+            r#"{"consumer_location":"src/a.ts:3","request":{"verdict":"compatible","resolved":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.edge_source, None);
     }
 
     /// THE PIN: the pair-level directions are the worst-wins fold of the sites
