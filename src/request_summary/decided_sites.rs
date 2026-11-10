@@ -904,11 +904,47 @@ pub struct DecidedLead {
     pub reason: Stop,
 }
 
+/// A discovered call this pass stopped at with a reason and listed as no
+/// lead (carrick#3688 U3): a labelled call it could not place, and a walk up
+/// the callers that reached a function it had already passed. Read only by
+/// [`crate::unread_sites`]; never a possible call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecidedStop {
+    pub file: String,
+    pub line: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// The callee as written, where the stop is at a discovered call.
+    pub callee: Option<String>,
+    /// Functions the walk entered from this call.
+    pub depth: u32,
+    pub end: LabelledEnd,
+    pub reason: Stop,
+}
+
+impl DecidedStop {
+    /// Discovery's site whose labelled call `end` this pass could not place.
+    fn unplaced(site: &DiscoverySite, end: &LabelledEnd) -> Self {
+        DecidedStop {
+            file: site.file.clone(),
+            line: site.line,
+            span_start: site.span_start,
+            span_end: site.span_end,
+            callee: Some(site.callee.clone()),
+            depth: site.chain.len() as u32,
+            end: end.clone(),
+            reason: Stop::Unplaced,
+        }
+    }
+}
+
 /// What [`decided_sites`] finds.
 #[derive(Debug, Default)]
 pub struct Decided {
     pub sites: Vec<DecidedSite>,
     pub leads: Vec<DecidedLead>,
+    /// The calls this pass stopped at and listed as no lead ([`DecidedStop`]).
+    pub stops: Vec<DecidedStop>,
     /// Discovery sites whose labelled call this pass could not place in the
     /// summaries' inputs, by `file:line`.
     pub unplaced: Vec<String>,
@@ -2274,6 +2310,27 @@ impl<'a> Walk<'a, '_> {
         }
     }
 
+    /// A call the walk stopped at for `why` and lists as no lead
+    /// ([`DecidedStop`]); a sibling's call is that sibling's.
+    fn stopped(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Stop) {
+        if !self.calls.is_own(placed.file) {
+            return;
+        }
+        let stop = DecidedStop {
+            file: relative(self.root, placed.file),
+            line: placed.call.site.line,
+            span_start: placed.call.site.span_start,
+            span_end: placed.call.site.span_end,
+            callee: Some(placed.call.callee_text.clone()),
+            depth: u32::from(placed.depth),
+            end: end.clone(),
+            reason: why,
+        };
+        if !self.out.stops.contains(&stop) {
+            self.out.stops.push(stop);
+        }
+    }
+
     /// Drops the sites two walks disagreed on ([`Walk::withdrawn`]).
     fn drop_withdrawn(&mut self) {
         let withdrawn = &self.withdrawn;
@@ -2365,6 +2422,7 @@ impl<'a> Walk<'a, '_> {
         }
         let here = (placed.file.to_path_buf(), key.to_string());
         if path.contains(&here) {
+            self.stopped(&placed, end, Stop::Recursion);
             return;
         }
         path.push(here);
@@ -3025,6 +3083,7 @@ fn decide(
         walk.label = Some(label);
         let Some(last) = calls.at_span(&root.join(&end.file), end.span_start, end.span_end) else {
             unplaced.push(format!("{}:{}", site.file, site.line));
+            walk.out.stops.push(DecidedStop::unplaced(site, end));
             continue;
         };
         // A call above the labelled call, when that call is the site.
@@ -3081,6 +3140,7 @@ fn decide(
                 walk.site(&chain, end, Vec::new(), BTreeSet::new());
             } else {
                 unplaced.push(format!("{}:{}", site.file, site.line));
+                walk.out.stops.push(DecidedStop::unplaced(site, end));
             }
             continue;
         };

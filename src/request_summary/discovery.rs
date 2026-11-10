@@ -225,6 +225,10 @@ pub struct Discovery {
     /// The calls whose walk found no site and passed a call it could not
     /// follow on the way (`no_site` all the same): not followed to the end.
     pub missed_inside: Vec<(String, u32, u32)>,
+    /// The line and the callee as written of each `missed_inside` call, by
+    /// file and SWC span: what an unread site states of it
+    /// ([`crate::unread_sites`], carrick#3688 U3).
+    pub missed_at: BTreeMap<(String, u32, u32), (u32, String)>,
     pub counts: BTreeMap<String, usize>,
     /// For each call recorded with no end (a stopped site or `missed_inside`),
     /// by file and SWC span: the store keys of the packages the walk passed a
@@ -2703,6 +2707,9 @@ impl<'a> Walker<'a> {
                             *discovery.counts.entry("no_site".to_string()).or_default() += 1;
                             let at = (self.rel(file), call.site.span_start, call.site.span_end);
                             if missed {
+                                discovery
+                                    .missed_at
+                                    .insert(at.clone(), (call.site.line, call.callee_text.clone()));
                                 discovery.missed_inside.push(at);
                             } else {
                                 discovery.finished.push(at);
@@ -2784,6 +2791,9 @@ impl<'a> Walker<'a> {
                 if !discovery.sites.iter().any(|site| {
                     site.file == at.0 && site.span_start == at.1 && site.span_end == at.2
                 }) {
+                    discovery
+                        .missed_at
+                        .insert(at.clone(), (call.site.line, call.callee_text.clone()));
                     discovery.missed_inside.push(at);
                 }
             }

@@ -7000,6 +7000,7 @@ async fn site_rows_of(
         decided,
         records,
         labels: site_labels,
+        unread,
         handlers,
     } = site_records_of(inputs, root, claims, context);
     let answers = crate::site_questions::ask_service(
@@ -7024,6 +7025,14 @@ async fn site_rows_of(
     rows.rows.retain(|row| {
         !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
     });
+    // The calls the walks stopped at, but none in a mock or test tree: such
+    // a call is no call of the service (carrick#3688 U3).
+    rows.unread = unread
+        .into_iter()
+        .filter(|site| {
+            !protocol_producer_provenance(&root.join(&site.file), repo_path, service).is_mock()
+        })
+        .collect();
     // With the receiver trace on, the routes it serves at a full path
     // (carrick#2474 R3 S1), written into the mount graph by
     // [`apply_traced_routes`].
@@ -7260,6 +7269,9 @@ struct SiteRecordsOf {
     decided: crate::request_summary::decided_sites::Decided,
     records: Vec<crate::request_summary::site_record::SiteRecord>,
     labels: Vec<crate::request_summary::decided_sites::SiteLabel>,
+    /// The calls the walks considered and stopped at, besides the possible
+    /// calls ([`crate::unread_sites::from_scan`], carrick#3688 U3).
+    unread: Vec<crate::unread_sites::UnreadSite>,
     /// With the receiver trace on: the handler records (carrick#2474 R4b)
     /// and how long building them took.
     handlers: Option<(
@@ -7438,6 +7450,7 @@ fn site_records_of(
     SiteRecordsOf {
         discovered: discovery.sites.len(),
         reached_label,
+        unread: crate::unread_sites::from_scan(&discovery, &decided),
         decided,
         records,
         labels,
@@ -8511,9 +8524,15 @@ fn append_deterministic_protocol_operations(
             crate::site_rows::RowSide::Endpoint => to_producer(key, file, line),
         },
     );
-    // A service the site pass never read writes neither key.
+    // A service the site pass never read writes none of the keys.
     if extractions.site.enabled {
-        crate::possible_calls::attach(cloud_data, site.leads.clone());
+        crate::unread_sites::attach(cloud_data, site.unread.clone(), &site.leads);
+        debug!(
+            unread_sites = cloud_data.unread_sites_total.unwrap_or_default(),
+            unread_on_row_line = site.unread_on_row_line,
+            unread_by_reason = ?cloud_data.unread_sites_by_reason,
+            "site questions: unread sites"
+        );
         debug!(
             routes = extractions.site.routes.len(),
             route_kept_reader = site.route_kept_reader,
@@ -10430,6 +10449,9 @@ fn build_cloud_data_from_mount_graph(
         dispatch_tables: None,
         possible_calls: None,
         possible_calls_omitted: None,
+        unread_sites: None,
+        unread_sites_total: None,
+        unread_sites_by_reason: None,
         call_through: None,
         route_boundaries: None,
         memory_peaks: None,
@@ -16348,6 +16370,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -17370,6 +17395,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -17597,6 +17625,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -17658,6 +17689,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -17766,6 +17800,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -18583,6 +18620,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -18649,6 +18689,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -18728,6 +18771,9 @@ unfollowed_member_calls_total: 0,
                 dispatch_tables: None,
                 possible_calls: None,
                 possible_calls_omitted: None,
+                unread_sites: None,
+                unread_sites_total: None,
+                unread_sites_by_reason: None,
                 call_through: None,
                 route_boundaries: None,
                 memory_peaks: None,
@@ -18816,6 +18862,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -19051,6 +19100,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -19286,6 +19338,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -19431,6 +19486,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -19559,6 +19617,9 @@ unfollowed_member_calls_total: 0,
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -32520,6 +32581,9 @@ io.on("bare:in", (event) => {});
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
