@@ -60,7 +60,7 @@ export interface UndeclaredSubstitution {
  */
 const ACCESSIBLE = 0;
 
-interface InternalTypeChecker extends ts.TypeChecker {
+export interface InternalTypeChecker extends ts.TypeChecker {
   // Internal APIs: isSymbolAccessible is not in the public TypeChecker
   // surface, and the public typeToTypeNode overload has no tracker
   // parameter at all -- the tracker must ride the 5th slot (correction 4).
