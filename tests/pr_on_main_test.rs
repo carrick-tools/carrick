@@ -3291,52 +3291,26 @@ async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
     let _serial = SERIAL.lock().await;
     let main = main_snapshot().await;
     {
+        seed_env();
         let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = EnvVar::set("HOME", home.to_str().unwrap());
+        carrick::logging::init(false, carrick::logging::LogSink::Run);
         let src =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr-seeds/rpc-shelf");
         let repo = unlinked(tmp.path()).join("rpc-shelf");
         copy_dir(&src, &repo);
         git(&repo, &["init", "-q"]);
         commit(&repo, "init");
-        let storage = tmp.path().join("storage");
-        let home = tmp.path().join("home");
-        std::fs::create_dir_all(&storage).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
-            .arg(".")
-            .current_dir(&repo)
-            .env("CARRICK_LOCAL_STORAGE_DIR", &storage)
-            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
-            .env("HOME", &home)
-            .env("CARRICK_MOCK_ALL", "1")
-            .env(
-                "CARRICK_MOCK_FIXTURE_DIR",
-                format!("{}/", repo.join("__llm__").display()),
-            )
-            .env(
-                "CARRICK_SIDECAR_DIR",
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
-            )
-            .env("CARRICK_PROGRESS", "1")
-            .output()
-            .unwrap();
-        for line in String::from_utf8_lossy(&out.stderr).lines() {
-            if line.contains("carrick-fallbacks")
-                || line.contains("Sidecar")
-                || line.contains("sidecar")
-            {
-                eprintln!("DIAGBIN {}", &line[..line.len().min(300)]);
-            }
-        }
-        for f in std::fs::read_dir(&storage).unwrap().flatten() {
-            let text = std::fs::read_to_string(f.path()).unwrap_or_default();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                eprintln!(
-                    "DIAGBIN blob {:?} endpoints={}",
-                    f.file_name(),
-                    v["endpoints"].as_array().map_or(0, Vec::len)
-                );
-            }
+        let store = Store::default();
+        scan_seed_repo(&store, &repo).await;
+        for row in store.repos.lock().unwrap().iter() {
+            eprintln!(
+                "DIAGVAR {:?} endpoints={}",
+                row.service_name,
+                row.endpoints.len()
+            );
         }
         for entry in std::fs::read_dir(home.join(".carrick/logs/runs"))
             .into_iter()
@@ -3347,9 +3321,11 @@ async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
             for line in text.lines() {
                 let l = line.to_lowercase();
                 if l.contains("position rows")
-                    || l.contains("procedure")
                     || l.contains("untraced")
                     || l.contains("walk")
+                    || l.contains("sidecar")
+                    || l.contains("procedure")
+                    || l.contains("claims")
                 {
                     eprintln!("DIAGBINLOG {}", &line[..line.len().min(300)]);
                 }
