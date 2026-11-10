@@ -258,8 +258,7 @@ impl<'a> Resolver<'a> {
             .files
             .get(path)?
             .module_bindings
-            .get(&(line, symbol.clone()))
-            .filter(|binding| !binding.scoped_entry())?;
+            .get(&(line, symbol.clone()))?;
         let declared = super::super::site_record::declaration_path(row.decl_file()?);
         Some(((path, line, symbol), binding, declared))
     }

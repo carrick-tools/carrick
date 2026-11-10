@@ -111,6 +111,10 @@ compiler's literal type does not answer before the table does.
 | `pair` (two module blocks, one line) | one entry, unplaceable; the same two blocks in a body are a shadow and have none |
 | `item` (loop heads), `err` (`catch`), `same` (declared twice), `n` (a nested parameter's default) | no entry |
 
-No reader reads an entry of these classes yet: every probe above still reads
-as before (`outside_service`). The steps that open each reader replace that
-answer.
+The text reader reads an entry of these classes as its initialiser's text:
+`inIf` `order.created`, `inTry` `https://example.test/try`, `inCase`
+`case.a`, `bare`, `inLoop` `loop.body`, `atModule` `module.block`,
+`inCallback` `cb.top`, `deeper` `cb.block`, `inHandler` `handler.top`, and
+`moved` as `a` and `b`. `nestedMoved` reads `reassigned` (its write is never
+placed). `same`, `item` and `err` read `outside_service`. The value readers
+and the procedures walk still refuse every one of them.
