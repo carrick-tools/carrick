@@ -14,6 +14,8 @@ unread site with the reason `unanswered_package`.
     package: `unanswered_package`.
   - `src/outer.ts` calls `announce` from `pending.ts`: `missed_inside`, and
     `also` holds `unanswered_package`.
+  - `src/failed.ts` also states `cause`, the store's `failed_reason` for the
+    build-failed package (carrick#3739); `src/pending.ts` states none.
   - `src/stated.ts` states its path: no unread site.
   - `by_reason` counts and `boundary` holds the pending and failed counts,
     with no `library_ask_failed`.

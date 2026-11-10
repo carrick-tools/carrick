@@ -236,6 +236,13 @@ pub struct Discovery {
     /// not final until the store answers it (carrick#2813): the fact layer
     /// lists the call for the reader when the key is still pending.
     pub unanswered_at: BTreeMap<(String, u32, u32), BTreeSet<String>>,
+    /// The same keys for a call the walk could not follow because its own
+    /// declaration sits in a package the scan ended without an answer for
+    /// ([`Stop::UnansweredPackage`] on the call itself). Kept apart from
+    /// [`Self::unanswered_at`], which the fact layer reads to list walks that
+    /// are not final; a direct call is listed already. Read only for the
+    /// cause an unread site states (carrick#3739).
+    pub unanswered_direct: BTreeMap<(String, u32, u32), BTreeSet<String>>,
     /// Each call of the service's own files and the functions of the
     /// repository the walk entered from it, sorted by file and span: the
     /// definition a call names, each implementation of an interface member
@@ -2716,6 +2723,12 @@ impl<'a> Walker<'a> {
                     };
                     match own {
                         Some(reason) => {
+                            if reason == Stop::UnansweredPackage {
+                                discovery.unanswered_direct.insert(
+                                    (self.rel(file), call.site.span_start, call.site.span_end),
+                                    self.unanswered_keys(file, call).into_iter().collect(),
+                                );
+                            }
                             *discovery
                                 .counts
                                 .entry(format!("unfollowed/{}", reason.as_str()))
