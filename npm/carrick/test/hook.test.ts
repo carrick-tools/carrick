@@ -1115,3 +1115,62 @@ test("on the lsp channel nothing is queued and nothing is printed; with no sessi
   assert.equal(none.stdout, "");
   assert.equal(fs.existsSync(path.join(workspace.root, ".carrick", "rechecks")), false);
 });
+
+// ---------------------------------------------------------------------------
+// The edit-time lead (carrick#3249): a function the edit added that looks like
+// an indexed one gets one line naming it, once per function per session.
+
+const LEAD_LINE =
+  "Carrick: `slugify` looks like `toSlug` at src/text/slug.ts:4 (called from src/routes/users.ts:10, src/views/page.ts:22, +2 more): reuse or extend it if it does the same job.";
+
+test("an answered edit whose new function has a lead prints the lead line once per session", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions-lead.json") });
+  const edit = (session: string) =>
+    runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: session }, env });
+
+  const first = contextOf((await edit("sess-lead")).stdout);
+  assert.ok(first.split("\n\n").includes(LEAD_LINE), first);
+  // A second save in the same session: the lead is not repeated.
+  const second = contextOf((await edit("sess-lead")).stdout);
+  assert.equal(second.includes("looks like"), false, second);
+  // Another session is told again.
+  assert.ok(contextOf((await edit("sess-lead-2")).stdout).includes(LEAD_LINE));
+});
+
+test("an answer without a lead prints the same bytes as before", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const plain = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-nolead" },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions.json") }),
+  });
+  assert.equal(contextOf(plain.stdout).includes("looks like"), false);
+  const led = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-withlead" },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions-lead.json") }),
+  });
+  assert.equal(contextOf(led.stdout).replace(LEAD_LINE, "").trim(), contextOf(plain.stdout).trim());
+});
+
+test("a queued edit with a lead prints the lead alone, and names another repo", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const run = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-lead-q" },
+    env: deferredEnv(home, {
+      CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred-lead.json"),
+      CARRICK_FAKE_FULL_DELAY_MS: "100",
+    }),
+  });
+  // The lead is a finding, so it speaks; the queued file itself says nothing.
+  const lines = contextOf(run.stdout).split("\n\n");
+  assert.deepEqual(lines, [
+    "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.",
+  ]);
+  await waitForAnswers(home, "sess-lead-q", 1);
+});

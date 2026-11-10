@@ -27,6 +27,11 @@ export type SessionRecord = {
    */
   told: string[];
   /**
+   * `lead::repo::file::name` for every new function whose lead line this
+   * session has been shown (carrick#3249): each function is told of once.
+   */
+  led: string[];
+  /**
    * Absolute paths the Read hook has already asked about (carrick#2069): it
    * asks once per file per session, whatever the answer was.
    */
@@ -101,6 +106,7 @@ function stamps(raw: unknown): Record<string, number> {
 export function readSession(sessionId: string, home?: string): SessionRecord {
   const empty: SessionRecord = {
     told: [],
+    led: [],
     read: [],
     written: {},
     edited: {},
@@ -126,6 +132,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       told: Array.isArray(record.told)
         ? record.told.filter((entry): entry is string => typeof entry === "string")
         : [],
+      led: Array.isArray(record.led) ? record.led.filter((entry): entry is string => typeof entry === "string") : [],
       read: Array.isArray(record.read)
         ? record.read.filter((entry): entry is string => typeof entry === "string")
         : [],
@@ -284,6 +291,20 @@ export function markTold(sessionId: string, keys: string[], home?: string): void
   const told = new Set(current.told);
   for (const key of keys) told.add(key);
   current.told = [...told];
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** Whether this session has already been shown the lead line under `key`. */
+export function wasLed(sessionId: string, key: string, home?: string): boolean {
+  return readSession(sessionId, home).led.includes(key);
+}
+
+/** Remember that this session has been shown the lead lines under `keys`. */
+export function markLed(sessionId: string, keys: string[], home?: string): void {
+  if (keys.length === 0) return;
+  const current = readSession(sessionId, home);
+  current.led = [...new Set([...current.led, ...keys])];
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

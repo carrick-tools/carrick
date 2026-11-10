@@ -1,0 +1,36 @@
+{
+  "schema": "carrick.check/0",
+  "file": "src/routes/users.ts",
+  "service": "user-service",
+  "repo": "/workspace/user-service",
+  "index_commit": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+  "changed_since_index": 1,
+  "stale": true,
+  "items": [],
+  "boundary": null,
+  "recheck": {
+    "ran": "none",
+    "elapsed_ms": 0,
+    "stale_since": "2026-09-06T21:14:03Z",
+    "reason": "this edit needs a re-scan, which this call was asked not to start",
+    "deferred": true,
+    "new_functions": [
+      {
+        "name": "slugify",
+        "line": 12,
+        "lead": {
+          "name": "toSlug",
+          "repo": "shared-lib",
+          "file": "src/text/slug.ts",
+          "line": 4,
+          "end_line": 9,
+          "score": 0.83,
+          "basis": "tokens",
+          "callers": [],
+          "callers_total": 0,
+          "also": []
+        }
+      }
+    ]
+  }
+}

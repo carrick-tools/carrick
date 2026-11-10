@@ -12,6 +12,9 @@ Carrick ran `carrick check --changed` for this session's change: 1 contract prob
 Carrick re-checked user-service/src/routes/users.ts after this edit: 1 contract problem.
 - user-service/src/routes/users.ts:18:3 call GET /api/users/:id [fact, imported_member] type_mismatch: the response no longer carries `email`, which this call reads. Read off the client member this call goes through. Producers: user-service src/routes/users.ts:42
 
+### check-deferred-lead.json :: renderPostToolUse
+(silent)
+
 ### check-deferred.json :: renderPostToolUse
 (silent)
 
@@ -23,6 +26,9 @@ Carrick: user-service/src/routes/users.ts is gone from disk and the index still 
 - user-service/src/routes/users.ts:42:3 route GET /api/users/:id [fact, file_based_route] producer_removed (no type verdict): the file is gone from disk and one consumer still calls this route. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18
 
 ### check-mismatch.json :: renderPostToolUse
+(silent)
+
+### check-new-functions-lead.json :: renderPostToolUse
 (silent)
 
 ### check-new-functions.json :: renderPostToolUse
