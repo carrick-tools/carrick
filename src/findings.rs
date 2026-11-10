@@ -6,7 +6,7 @@
 //! JSON and never re-parses prose.
 
 use crate::operation::EndpointProvenance;
-use serde::{Serialize, Serializer, ser::SerializeMap};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 
 /// Wire cap on `call_sites` entries per finding. Applied when serializing
 /// only — the in-memory finding keeps the full set so the terminal report
@@ -76,7 +76,7 @@ pub enum Severity {
 /// Absent on the wire when every row is held but one states no source (see
 /// [`EdgeSource::fold`]), which readers take as "not stated", never
 /// "candidate"; the cloud's PR check enforces it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeSource {
     Fact,
@@ -116,6 +116,19 @@ impl EdgeSource {
             }
         }
         (any_row && all_stated).then_some(EdgeSource::Fact)
+    }
+
+    /// Two folds of one edge into one, by [`EdgeSource::fold`]'s rule:
+    /// `Candidate` wins, then unstated, else `Fact`. For an edge several
+    /// outcomes (or several matches on one call site) were filed on.
+    pub fn combine(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(EdgeSource::Candidate), _) | (_, Some(EdgeSource::Candidate)) => {
+                Some(EdgeSource::Candidate)
+            }
+            (Some(EdgeSource::Fact), Some(EdgeSource::Fact)) => Some(EdgeSource::Fact),
+            _ => None,
+        }
     }
 }
 
@@ -225,9 +238,9 @@ fn serialize_removal<M: SerializeMap>(map: &mut M, removal: &Removal) -> Result<
 /// Whether a finding is a break, and how sure the scanner is (the one break
 /// answer; plan R2). Every surface that decides "does this fail / post / count"
 /// reads this instead of folding `edge_source`, `verdict_state` and `on_main`
-/// itself. A pure function of the finding; it is not on the wire yet, so the
-/// PR comment, MCP and dashboard still carry their own copies until they read
-/// it.
+/// itself. A pure function of the finding, written on the wire as `break` and
+/// `break_reason` (see [`BreakStatus::wire_label`]); the PR comment, MCP and
+/// dashboard still carry their own copies until they read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BreakStatus {
     /// Proven and introduced by the change: `fact` edge (or an SDK-mediated
@@ -244,6 +257,30 @@ pub enum BreakStatus {
     OnMain,
     /// Not a break at all (a gap, an advisory, a dependency conflict).
     NotABreak,
+}
+
+impl BreakStatus {
+    /// The `break` value on the wire: `certain`, `possible`, `candidate`,
+    /// `on_main` or `none`. Flat strings, not a derived enum, so the payload
+    /// carries one value and its reason beside it (`break_reason`).
+    pub fn wire_label(&self) -> &'static str {
+        match self {
+            BreakStatus::Certain => "certain",
+            BreakStatus::Possible { .. } => "possible",
+            BreakStatus::Candidate { .. } => "candidate",
+            BreakStatus::OnMain => "on_main",
+            BreakStatus::NotABreak => "none",
+        }
+    }
+
+    /// Why a `possible` or `candidate` status is not `certain`; `None` for
+    /// every other status. Written as `break_reason`, omitted when `None`.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            BreakStatus::Possible { reason } | BreakStatus::Candidate { reason } => Some(reason),
+            BreakStatus::Certain | BreakStatus::OnMain | BreakStatus::NotABreak => None,
+        }
+    }
 }
 
 impl OnMainUnknown {
@@ -966,6 +1003,14 @@ impl Serialize for Finding {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("kind", self.kind())?;
         map.serialize_entry("severity", &self.severity())?;
+        // The one break answer (plan R2, B1), written on every kind so a
+        // reader never folds `edge_source`, `verdict_state` and `on_main`
+        // itself. Computed, not stored, like `severity`.
+        let status = self.break_status();
+        map.serialize_entry("break", status.wire_label())?;
+        if let Some(reason) = status.reason() {
+            map.serialize_entry("break_reason", reason)?;
+        }
         match self {
             Finding::TypeMismatch {
                 method,
@@ -2539,5 +2584,74 @@ mod tests {
             Some("it is not UTF-8 text")
         );
         assert_eq!(FileNotReadReason::OperationsMissing.phrase(), None);
+    }
+
+    /// The break answer rides on the wire (plan B1): every finding writes
+    /// `break`, and `break_reason` only when the status carries one.
+    #[test]
+    fn every_finding_carries_its_break_on_the_wire() {
+        let cases: Vec<(Finding, &str, Option<&str>)> = vec![
+            (
+                mismatch(
+                    Some(EdgeSource::Fact),
+                    Some(VerdictState::Resolved),
+                    Some(false),
+                ),
+                "certain",
+                None,
+            ),
+            (
+                {
+                    let mut f = mismatch(Some(EdgeSource::Fact), None, None);
+                    f.set_on_main_unknown(OnMainUnknown::MainIndexStale);
+                    f
+                },
+                "possible",
+                Some("main_index_stale"),
+            ),
+            (
+                mismatch(
+                    Some(EdgeSource::Fact),
+                    Some(VerdictState::Unresolved),
+                    Some(false),
+                ),
+                "candidate",
+                Some("type_side_unresolved"),
+            ),
+            (
+                mismatch(Some(EdgeSource::Fact), None, Some(true)),
+                "on_main",
+                None,
+            ),
+            (
+                Finding::env_var_call("GET", "/x", "API", vec![]),
+                "none",
+                None,
+            ),
+            (
+                Finding::orphaned_endpoint("CLIENT->SERVER", "evt", None).with_removal(
+                    removal(
+                        Some(EdgeSource::Fact),
+                        Some(VerdictState::NotChecked),
+                        Some(false),
+                        None,
+                    ),
+                    vec![],
+                ),
+                "certain",
+                None,
+            ),
+        ];
+        for (finding, want, reason) in cases {
+            let v = serde_json::to_value(&finding).unwrap();
+            assert_eq!(v["break"], json!(want), "got: {v}");
+            match reason {
+                Some(reason) => assert_eq!(v["break_reason"], json!(reason), "got: {v}"),
+                None => assert!(
+                    !v.as_object().unwrap().contains_key("break_reason"),
+                    "got: {v}"
+                ),
+            }
+        }
     }
 }
