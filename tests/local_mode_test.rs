@@ -5293,6 +5293,91 @@ fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
     );
 }
 
+/// A new test file that declares nothing program-wide and gives no source its
+/// first importer is read by no service, so the probe answers from the index
+/// and starts nothing. One that would make a source file test-only (it is that
+/// file's first importer), declares a global, or is a script is read, so it is
+/// deferred.
+#[test]
+#[serial]
+fn a_new_test_file_starts_no_re_scan() {
+    let workspace = shop_with_tests();
+    let root = workspace.path();
+    index(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    let probe = |file: &str| -> serde_json::Value {
+        let text = run_with_env(
+            root,
+            &[
+                "check",
+                file,
+                "--workspace",
+                ".",
+                "--recheck",
+                "--no-rescan",
+                "--json",
+            ],
+            &[AMPLE[0], ("TMPDIR", tmpdir)],
+        );
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
+    };
+    let add = |name: &str, text: &str| -> String {
+        let relative = format!("shop/inventory/src/__tests__/{name}");
+        std::fs::write(root.join(&relative), text).expect("write the new test");
+        relative
+    };
+    let before = recheck_temp_dirs(temp.path());
+
+    // (1) it imports the client, which `inventory.ts` (production) imports.
+    let kept = add(
+        "second.test.ts",
+        "import { CatalogClient } from \"../client.js\";\n\nexport const again = new CatalogClient(\"http://catalog.test\");\n",
+    );
+    let kept = probe(&kept);
+    assert_eq!(
+        kept["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{kept:#}"
+    );
+    assert!(kept["recheck"].get("deferred").is_none(), "{kept:#}");
+    assert_eq!(recheck_temp_dirs(temp.path()), before, "nothing was staged");
+
+    // (2) it is the first importer of `inventory.ts`, which would turn
+    // test-only.
+    let orphan = add(
+        "third.test.ts",
+        "import { countActive } from \"../inventory.js\";\nexport const c = countActive;\n",
+    );
+    let orphan = probe(&orphan);
+    assert_eq!(
+        orphan["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{orphan:#}"
+    );
+
+    // (3) it declares a global.
+    let global = add(
+        "fourth.test.ts",
+        "declare global { var flagged: boolean }\nexport {};\n",
+    );
+    let global = probe(&global);
+    assert_eq!(
+        global["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{global:#}"
+    );
+
+    // (4) it is a script: no import, no export.
+    let script = add("fifth.test.ts", "var shared = 1;\n");
+    let script = probe(&script);
+    assert_eq!(
+        script["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{script:#}"
+    );
+}
+
 /// A test edit no service reads, beside a source edit the scan reads the same
 /// (a comment), starts no re-scan in `check --changed`, and the answer is the
 /// forced re-scan's. The test file is no changed file of its own (the scan

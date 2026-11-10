@@ -229,8 +229,10 @@ impl CouldBe {
     }
 }
 
-/// Says whether an edited test source still loads what it loaded, and
-/// declares nothing program-wide ([`test_edit_keeps_imports`]).
+/// Says whether a changed test source moves nothing a scan reads: an edited
+/// one still loads what it loaded and declares nothing program-wide
+/// ([`test_edit_keeps_imports`]); an added one declares nothing program-wide
+/// and moves no file's test-only status ([`added_test_moves_nothing`]).
 type KeepsImports<'a> = &'a mut dyn FnMut(&ChangedPath) -> bool;
 
 impl ServiceInputs {
@@ -248,8 +250,9 @@ impl ServiceInputs {
     ///
     /// Under a root or a directory read whole, only a file some pass reads
     /// counts ([`read_by_input_rule`]), and a test source counts unless it was
-    /// edited and still loads what it loaded. An exact closure file, and an
-    /// add or delete beside one, always count.
+    /// edited and still loads what it loaded, or was added and moves nothing
+    /// ([`added_test_moves_nothing`]). An exact closure file, and an add or
+    /// delete beside one, always count.
     fn reads(&self, change: &ChangedPath, keeps_imports: KeepsImports) -> bool {
         let path = change.path.as_str();
         if self.files.contains(path)
@@ -276,7 +279,7 @@ impl ServiceInputs {
         let is_test =
             |base: &&str| crate::file_finder::is_test_source(Path::new(path), Path::new(base));
         if bases.iter().all(is_test) {
-            return !(change.status == 'M' && keeps_imports(change));
+            return !(matches!(change.status, 'M' | 'A') && keeps_imports(change));
         }
         true
     }
@@ -350,6 +353,61 @@ fn test_edit_keeps_imports(
         }
         _ => false,
     }
+}
+
+/// Whether the test source added at `path` (top-relative, on disk now) moves
+/// nothing a scan of `service` reads (carrick#3114). The test files a scan
+/// leaves unread still decide two things: which files only tests import,
+/// which the receiver trace reads, and what the type program loads from them.
+/// So an added test is skippable only when both hold:
+///
+/// - it parses as a module and declares nothing program-wide, so the program
+///   gains no augmentation or script;
+/// - the files only tests import are the same with it as without it
+///   ([`crate::test_only_files::adding_moves_the_set`]), so no source file
+///   gains its first importer (it would turn test-only and lose its rows).
+///
+/// A relative import the resolver cannot place says no: a file this service
+/// has not got yet may be what it names. A copy that cannot be read says no.
+fn added_test_moves_nothing(
+    reads: &ClosureReads,
+    cache: &crate::test_only_files::Cache,
+    repo_path: &str,
+    top: &Path,
+    service: &Config,
+    path: &str,
+) -> bool {
+    let file = top.join(path);
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return false;
+    };
+    let shape = reads
+        .reader
+        .borrow_mut()
+        .module_shape_of_text(&file, "added", text);
+    let Some(shape) = shape else {
+        return false;
+    };
+    if !shape.is_module || shape.augments_types {
+        return false;
+    }
+    let root = Path::new(repo_path);
+    let workspace = crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
+        root,
+        service.alias_scope(root).as_ref(),
+    );
+    let unplaced = reads.loaded_specifiers(&file).iter().any(|specifier| {
+        (specifier.starts_with("./") || specifier.starts_with("../"))
+            && workspace.resolve_module_path(&file, specifier).is_none()
+    });
+    !unplaced
+        && !crate::test_only_files::adding_moves_the_set(
+            cache,
+            root,
+            &workspace,
+            &crate::engine::service_ignore_patterns(service),
+            &file,
+        )
 }
 
 /// Whether `path` is a `.gitignore`, wherever it sits.
@@ -599,8 +657,9 @@ fn is_package_input(path: &str) -> bool {
 /// service reads ([`gitignore_moves`]); a `.gitignore` is judged by it alone,
 /// not as a repo input or a path under a root (carrick#3113).
 /// `keeps_imports` says whether an edited test source still loads what it
-/// loaded ([`test_edit_keeps_imports`]); it is asked only of a modified test
-/// source the service reads by a root or a directory (carrick#3114).
+/// loaded ([`test_edit_keeps_imports`]) or an added one moves nothing
+/// ([`added_test_moves_nothing`]); it is asked only of a modified or added
+/// test source the service reads by a root or a directory (carrick#3114).
 /// `dependencies` says whether the service loads a package the other repo
 /// input changes moved, when they are a dependency-only move
 /// ([`crate::dependency_move`], carrick#3115); it is asked only when such a
@@ -1095,7 +1154,9 @@ struct Walks<'r> {
     /// Listed once, and only when a `.gitignore` changed (carrick#3113).
     untracked: std::cell::OnceCell<Option<Vec<String>>>,
     stops: HashMap<PathBuf, bool>,
-    keeps_imports_of: HashMap<(String, String), bool>,
+    keeps_imports_of: HashMap<(String, String, String), bool>,
+    /// What an added test's imports say, shared by the services of a repo.
+    test_only: crate::test_only_files::Cache,
     /// What the package inputs alone moved since each commit
     /// ([`Against::Packages`]).
     package_moves: HashMap<String, Option<std::sync::Arc<DependencyMove>>>,
@@ -1114,6 +1175,7 @@ impl<'r> Walks<'r> {
             untracked: std::cell::OnceCell::new(),
             stops: HashMap::new(),
             keeps_imports_of: HashMap::new(),
+            test_only: Default::default(),
             package_moves: HashMap::new(),
             reads: ClosureReads::default(),
             closure_took: std::time::Duration::ZERO,
@@ -1131,6 +1193,7 @@ impl<'r> Walks<'r> {
             untracked,
             stops,
             keeps_imports_of,
+            test_only,
             package_moves,
             reads,
             closure_took,
@@ -1185,9 +1248,26 @@ impl<'r> Walks<'r> {
             let (Some(commit), Some(top)) = (commit, top) else {
                 return false;
             };
+            // An edit is read the same whichever service asks; an added test
+            // is placed by the aliases of the service that asks.
+            let asker = if change.status == 'A' {
+                service.directory.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
             *keeps_imports_of
-                .entry((commit.to_string(), change.path.clone()))
+                .entry((commit.to_string(), change.path.clone(), asker))
                 .or_insert_with(|| {
+                    if change.status == 'A' {
+                        return added_test_moves_nothing(
+                            reads,
+                            test_only,
+                            repo_path,
+                            top,
+                            service,
+                            &change.path,
+                        );
+                    }
                     test_edit_keeps_imports(
                         reads,
                         &change.path,
@@ -3649,7 +3729,7 @@ mod tests {
     }
     // --- carrick#3114: files no pass reads, and test edits that keep their imports ---
 
-    const DOC_FILES: [(&str, &str); 9] = [
+    const DOC_FILES: [(&str, &str); 10] = [
         ("apps/api/README.md", "api\n"),
         ("apps/api/docs/flow.svg", "<svg/>\n"),
         ("packages/shared/CHANGELOG.md", "# changes\n"),
@@ -3665,6 +3745,8 @@ mod tests {
         ("apps/api/Dockerfile", "FROM node\n"),
         ("apps/api/src/data.json", "{ \"a\": 1 }\n"),
         ("apps/api/src/fixtures/seed.ts", "export const seed = 1;\n"),
+        // A source file nothing imports.
+        ("apps/api/src/orphan.ts", "export const orphan = 1;\n"),
     ];
 
     /// The stored index sits at A, which holds the files above; `server.ts`
@@ -3745,12 +3827,70 @@ mod tests {
                 "apps/api/src/__tests__/server.test.ts",
                 "import { server } from \"../server\";\nimport \"../types\";\ntest(\"a\", () => server);\n",
             ),
-            ("apps/api/src/__tests__/b.test.ts", "export const b = 1;\n"),
+            // An added module that loads nothing is no change now
+            // (`an_added_test_that_changes_no_test_only_file_is_no_change`);
+            // an added script still is.
+            ("apps/api/src/__tests__/b.test.ts", "var b = 1;\n"),
             (
                 "apps/api/test/setup.ts",
                 "declare global { var flag: boolean; var other: number }\nexport {};\n",
             ),
             ("apps/api/test/globals.ts", "var shared = 2;\n"),
+        ] {
+            assert_eq!(
+                after_edit(false, |repo| write_file(repo, path, text)),
+                API_ONLY,
+                "{path}"
+            );
+        }
+    }
+
+    /// An added test that declares nothing program-wide and gives no source
+    /// file its first importer is no change to any service (carrick#3114): it
+    /// imports a file production code already imports, or a package.
+    #[test]
+    fn an_added_test_that_changes_no_test_only_file_is_no_change() {
+        for (path, text) in [
+            (
+                "apps/api/src/__tests__/types.test.ts",
+                "import type { Order } from \"../types\";\nexport const o: Order | null = null;\n",
+            ),
+            (
+                "apps/api/src/__tests__/runner.test.ts",
+                "import { it } from \"vitest\";\nimport { server } from \"../server\";\nit(\"x\", () => server);\n",
+            ),
+        ] {
+            assert_eq!(
+                after_edit(false, |repo| write_file(repo, path, text)),
+                [None, None, None],
+                "{path}"
+            );
+        }
+    }
+
+    /// The same new test analyses the service when it is the first importer of
+    /// a source file (that file would turn test-only and lose its rows), when
+    /// it declares something program-wide, when it is a script, or when an
+    /// import names a file that is not there.
+    #[test]
+    fn an_added_test_that_moves_what_a_scan_reads_analyses_the_service() {
+        for (path, text) in [
+            (
+                "apps/api/src/__tests__/orphan.test.ts",
+                "import { orphan } from \"../orphan\";\nexport const o = orphan;\n",
+            ),
+            (
+                "apps/api/src/__tests__/globals.test.ts",
+                "declare global { var flag2: boolean }\nexport {};\n",
+            ),
+            (
+                "apps/api/src/__tests__/script.test.ts",
+                "var shared2 = 1;\n",
+            ),
+            (
+                "apps/api/src/__tests__/missing.test.ts",
+                "import { gone } from \"../gone\";\nexport const g = gone;\n",
+            ),
         ] {
             assert_eq!(
                 after_edit(false, |repo| write_file(repo, path, text)),
