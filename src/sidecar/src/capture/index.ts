@@ -76,6 +76,12 @@ export { installedPackageDirectory } from './installed-package-directory.js';
 export { isDeclarationFileName, packageNameOf } from './specifiers.js';
 export { toPosix } from './installed-package.js';
 export { constituentsOf } from './result-label.js';
+export {
+  canonicalStringQuotes,
+  matchesMidElision,
+  midTextElision,
+  normalizeLocatorText,
+} from './locator-text.js';
 export { moduleExport } from './anchors.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
