@@ -541,6 +541,7 @@ mod tests {
             receiver: None,
             reached: None,
             bound: Vec::new(),
+            also: Vec::new(),
         };
         let discovery = Discovery {
             sites: vec![site],
