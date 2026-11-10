@@ -958,11 +958,11 @@ mod tests {
         assert_eq!(pr[1], orphan_row());
         assert_eq!(
             serde_json::to_string(&bystander).unwrap(),
-            r#"{"kind":"missing_endpoint","severity":"gap","method":"POST","path":"/x","service":null,"call_sites":["src/a.ts:1"]}"#
+            r#"{"kind":"missing_endpoint","severity":"gap","break":"none","method":"POST","path":"/x","service":null,"call_sites":["src/a.ts:1"]}"#
         );
         assert_eq!(
             serde_json::to_string(&orphan_row()).unwrap(),
-            r#"{"kind":"orphaned_endpoint","severity":"gap","method":"SERVER->CLIENT","path":"order:shipped","service":"storefront","provenance":"route"}"#
+            r#"{"kind":"orphaned_endpoint","severity":"gap","break":"none","method":"SERVER->CLIENT","path":"order:shipped","service":"storefront","provenance":"route"}"#
         );
     }
 }

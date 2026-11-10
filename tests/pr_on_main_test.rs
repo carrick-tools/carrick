@@ -314,8 +314,8 @@ fn type_mismatch(findings: &[serde_json::Value]) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no type_mismatch in {findings:#?}"))
 }
 
-/// The findings with every `on_main_unknown` checked to be `reason` and then
-/// removed, so two runs that could not compare for different reasons can be
+/// The findings with every `on_main_unknown` (and the `break_reason` that
+/// repeats it) checked to be `reason` and then removed, so two runs that could not compare for different reasons can be
 /// compared byte for byte.
 fn reasons_as(findings: &[serde_json::Value], reason: &str) -> Vec<serde_json::Value> {
     findings
@@ -326,6 +326,12 @@ fn reasons_as(findings: &[serde_json::Value], reason: &str) -> Vec<serde_json::V
                 && let Some(said) = object.remove("on_main_unknown")
             {
                 assert_eq!(said, serde_json::json!(reason), "{finding:#}");
+                // The break answer repeats why main could not be compared.
+                assert_eq!(
+                    object.remove("break_reason"),
+                    Some(serde_json::json!(reason)),
+                    "{finding:#}"
+                );
             }
             finding
         })

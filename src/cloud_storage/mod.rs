@@ -4217,11 +4217,6 @@ mod tests {
         assert!(fine.reason.is_none());
     }
 
-    /// THE PIN: the pair-level directions are the worst-wins fold of the sites
-    /// the row lists. A reader that ignores `sites` reads exactly what it read
-    /// before the field existed, and a reader that reads them can recover how
-    /// the fold got its answer. Asserted over sites that disagree on BOTH
-    /// directions in opposite senses, so neither half can pass by accident.
     /// Plan B1 (cloud#1421): each stored site carries the scanner's
     /// `edge_source` fold, it survives the blob round trip, a site whose
     /// source is unstated writes no key, and a site from a blob written
@@ -4274,6 +4269,11 @@ mod tests {
         assert_eq!(old.edge_source, None);
     }
 
+    /// THE PIN: the pair-level directions are the worst-wins fold of the sites
+    /// the row lists. A reader that ignores `sites` reads exactly what it read
+    /// before the field existed, and a reader that reads them can recover how
+    /// the fold got its answer. Asserted over sites that disagree on BOTH
+    /// directions in opposite senses, so neither half can pass by accident.
     #[test]
     fn the_pair_row_is_the_fold_of_its_sites() {
         let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];

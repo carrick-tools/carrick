@@ -1128,8 +1128,7 @@ impl PairDirections {
     }
 
     /// Set one edge's source, as [`Analyzer::pair_directions_with_sources`]
-    /// would. For
-    /// tests that build directions without an analyzer.
+    /// would. For tests that build directions without an analyzer.
     #[cfg(test)]
     pub(crate) fn with_edge_source(
         mut self,
@@ -4156,13 +4155,6 @@ impl Analyzer {
             .collect()
     }
 
-    /// Consumer call rows by call-site identity (`file`, `line`) — the same key
-    /// `apply_pair_outcomes` joins a verdict to its consumer with, so a
-    /// finding's edge source is folded over the very rows that made the pair —
-    /// under their protocol and, for socket, GraphQL and pub/sub rows, their
-    /// service and operation ([`ConsumerRowKey`], carrick#1626). HTTP rows
-    /// come from the mount graph's data calls; the others are the index's own
-    /// call rows, with the scope their names state.
     /// Which layer the rows behind one outcome's pairing come from: the
     /// producer rows it pairs with and its consumer call, folded by
     /// [`crate::findings::EdgeSource::fold`]. The one fold both the
@@ -4198,6 +4190,13 @@ impl Analyzer {
         }
     }
 
+    /// Consumer call rows by call-site identity (`file`, `line`) — the same key
+    /// `apply_pair_outcomes` joins a verdict to its consumer with, so a
+    /// finding's edge source is folded over the very rows that made the pair —
+    /// under their protocol and, for socket, GraphQL and pub/sub rows, their
+    /// service and operation ([`ConsumerRowKey`], carrick#1626). HTTP rows
+    /// come from the mount graph's data calls; the others are the index's own
+    /// call rows, with the scope their names state.
     fn consumer_rows(&self) -> HashMap<ConsumerRowKey, ConsumerRow<'_>> {
         let mut rows = HashMap::new();
         if let Some(mount_graph) = self.mount_graph.as_ref() {

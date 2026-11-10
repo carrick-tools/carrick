@@ -1898,6 +1898,8 @@ mod tests {
             json!({
                 "kind": "type_mismatch",
                 "severity": "risk",
+                "break": "possible",
+                "break_reason": "not_compared_with_main",
                 "method": "GET",
                 "path": "/api/users",
                 "service": null,
@@ -1913,6 +1915,8 @@ mod tests {
             json!({
                 "kind": "method_mismatch",
                 "severity": "risk",
+                "break": "possible",
+                "break_reason": "not_compared_with_main",
                 "method": "GET",
                 "path": "/api/orders",
                 "service": null,
@@ -1925,6 +1929,7 @@ mod tests {
             json!({
                 "kind": "missing_endpoint",
                 "severity": "gap",
+                "break": "none",
                 "method": "DELETE",
                 "path": "/api/sessions",
                 "service": null,
@@ -1936,6 +1941,7 @@ mod tests {
             json!({
                 "kind": "orphaned_endpoint",
                 "severity": "gap",
+                "break": "none",
                 "method": "GET",
                 "path": "/legacy/ping",
                 "service": "billing",
@@ -1947,6 +1953,7 @@ mod tests {
             json!({
                 "kind": "env_var_call",
                 "severity": "advisory",
+                "break": "none",
                 "method": "GET",
                 "path": "/orders",
                 "env_var": "ORDER_SERVICE_URL",
@@ -1958,6 +1965,7 @@ mod tests {
             json!({
                 "kind": "dependency_conflict",
                 "severity": "gap",
+                "break": "none",
                 "package_name": "zod",
                 "tier": "major",
                 "versions": [{ "repo": "billing", "version": "4.0.0", "source": "package.json" }],
@@ -1973,6 +1981,7 @@ mod tests {
             json!({
                 "kind": "shared_external_contract",
                 "severity": "advisory",
+                "break": "none",
                 "method": "POST",
                 "path": "/v2/widgets",
                 "repos": ["repo-alpha", "repo-beta"],
@@ -2001,10 +2010,10 @@ mod tests {
     #[test]
     fn a_dependency_conflict_writes_its_pr_fields_only_when_set() {
         let bytes = |finding: &Finding| serde_json::to_string(finding).unwrap();
-        const BARE: &str = r#"{"kind":"dependency_conflict","severity":"gap","package_name":"zod","tier":"major","versions":[{"repo":"api","version":"4.0.0","source":"services/api/package.json"}]}"#;
+        const BARE: &str = r#"{"kind":"dependency_conflict","severity":"gap","break":"none","package_name":"zod","tier":"major","versions":[{"repo":"api","version":"4.0.0","source":"services/api/package.json"}]}"#;
         assert_eq!(bytes(&zod_conflict("")), BARE);
 
-        const WRITTEN: &str = r#"{"kind":"dependency_conflict","severity":"gap","package_name":"zod","tier":"major","versions":[{"repo":"api","version":"4.0.0","source":"services/api/package.json","spec":"^4.0.0"}]"#;
+        const WRITTEN: &str = r#"{"kind":"dependency_conflict","severity":"gap","break":"none","package_name":"zod","tier":"major","versions":[{"repo":"api","version":"4.0.0","source":"services/api/package.json","spec":"^4.0.0"}]"#;
         let mut marked = zod_conflict("^4.0.0");
         assert_eq!(bytes(&marked), format!("{WRITTEN}}}"));
 
