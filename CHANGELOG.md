@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.3.152](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.151...carrick-v0.3.152) (2026-11-09)
+
+
+### Features
+
+* a class field holds its initialiser and every value written to it (S4c) ([#3637](https://github.com/carrick-tools/carrick/issues/3637)) ([feb15f6](https://github.com/carrick-tools/carrick/commit/feb15f640d72093ae664d9557c24ee86e54f45b8))
+* **guards:** a binding written as `new URL(req.url, base)` reads in a dispatch guard (S7b-2) ([#3651](https://github.com/carrick-tools/carrick/issues/3651)) ([bdd7761](https://github.com/carrick-tools/carrick/commit/bdd776129d0ce6994514607d72356cf8388caf59))
+* **guards:** a compared binding reads every value written to it (S7b-1) ([#3635](https://github.com/carrick-tools/carrick/issues/3635)) ([207fade](https://github.com/carrick-tools/carrick/commit/207fade13a8222c832c2ee0555c868a4bd684443))
+* **guards:** a compared constant reads through the text reader (S7c) ([#3652](https://github.com/carrick-tools/carrick/issues/3652)) ([e279832](https://github.com/carrick-tools/carrick/commit/e279832f4499a9570e2253d2dd5d70f6095a38be)), closes [#3504](https://github.com/carrick-tools/carrick/issues/3504)
+* **local:** the probe names the indexed function a new one looks like ([#3716](https://github.com/carrick-tools/carrick/issues/3716)) ([08badb6](https://github.com/carrick-tools/carrick/commit/08badb63c4724194a88e94d9ada128f7b6950561))
+* **npm:** a Bash read of a TS file gets the post-read callers line ([#3698](https://github.com/carrick-tools/carrick/issues/3698)) ([166b1b2](https://github.com/carrick-tools/carrick/commit/166b1b2087146604e3a2768eb6ebb5c63885280a))
+* **npm:** a Bash write of a TS file goes through the post-edit flow ([#3700](https://github.com/carrick-tools/carrick/issues/3700)) ([7307850](https://github.com/carrick-tools/carrick/commit/7307850e9fa51d90d7613f9a46b0be187ab956fd))
+* **npm:** a grep for an indexed function names the sites it did not print ([#3701](https://github.com/carrick-tools/carrick/issues/3701)) ([1315a61](https://github.com/carrick-tools/carrick/commit/1315a611c2f93ae7ce94e2660ba976ef49c72825))
+* **npm:** late check --changed answers speak only with a problem (hook audit T3) ([#3686](https://github.com/carrick-tools/carrick/issues/3686)) ([da917f5](https://github.com/carrick-tools/carrick/commit/da917f57f13b6f98830248be045972f414e364bc))
+* **npm:** Stop speaks only with a finding or a named clean result, once per set ([#3685](https://github.com/carrick-tools/carrick/issues/3685)) ([67b8f78](https://github.com/carrick-tools/carrick/commit/67b8f784d054e1f442f70a2b724faa1a36f2b2a1))
+* **resolver:** an alias of an object entry is that entry's value (S4b-2) ([#3649](https://github.com/carrick-tools/carrick/issues/3649)) ([fd30eda](https://github.com/carrick-tools/carrick/commit/fd30edad84d098afac550a82dcd473298d7a5a19))
+* **resolve:** read a key of a factory call or a cached module binding ([#3670](https://github.com/carrick-tools/carrick/issues/3670)) ([#3710](https://github.com/carrick-tools/carrick/issues/3710)) ([352add0](https://github.com/carrick-tools/carrick/commit/352add0ba628719a32c006240bc827e1d6ca0072))
+* **sidecar:** list an instance receiver's procedure properties ([#3696](https://github.com/carrick-tools/carrick/issues/3696)) ([#3705](https://github.com/carrick-tools/carrick/issues/3705)) ([650503e](https://github.com/carrick-tools/carrick/commit/650503edb4957e2b858dd84ac05d1ab278650238))
+
+
+### Bug Fixes
+
+* a removal in a file this scan could not read is named, not listed ([#3660](https://github.com/carrick-tools/carrick/issues/3660)) ([25df360](https://github.com/carrick-tools/carrick/commit/25df36057f737a4bb0298dac676a21f3ca1b59ea))
+* **graphql:** a service's GraphQL walk leaves its nested services' directories out ([#3668](https://github.com/carrick-tools/carrick/issues/3668)) ([1e7b2d3](https://github.com/carrick-tools/carrick/commit/1e7b2d3ce66964a9766b796569ad80364cf8c365))
+* **npm:** hooks no longer say run carrick init when this carrick is newer than the files ([#3661](https://github.com/carrick-tools/carrick/issues/3661)) ([767b1e0](https://github.com/carrick-tools/carrick/commit/767b1e0b30ab5a71a3e0a119846213b9005047db))
+* **orchestrator:** a late-summary row states its base ([#3666](https://github.com/carrick-tools/carrick/issues/3666)) ([c2d57d8](https://github.com/carrick-tools/carrick/commit/c2d57d8aae9f233fc16e1cfb7f6972938106f98d))
+* **pr-delta:** name the files whose operation changes the delta cannot list ([#3233](https://github.com/carrick-tools/carrick/issues/3233)) ([#3617](https://github.com/carrick-tools/carrick/issues/3617)) ([080b85c](https://github.com/carrick-tools/carrick/commit/080b85c99ff88db1ea5e4a26e254114e1980e349))
+* **request-summary:** a caller-placed row keeps its route when its URL reads a value off a construction or a base built by a call ([#3669](https://github.com/carrick-tools/carrick/issues/3669)) ([423fd37](https://github.com/carrick-tools/carrick/commit/423fd3723f65639fdae74ffac1105cd1c6a736a8))
+* **request-summary:** a class field initialiser that is not a function is a body the readers read ([#3667](https://github.com/carrick-tools/carrick/issues/3667)) ([b626b78](https://github.com/carrick-tools/carrick/commit/b626b78b223e305a56b0dbecec8c9e4b5c9dade4))
+* **resolve:** a && b lowers to its right side ([#3665](https://github.com/carrick-tools/carrick/issues/3665)) ([6470d05](https://github.com/carrick-tools/carrick/commit/6470d0592e233e04b3890fd7e7c34e31c57aabe0))
+* **resolve:** a declaration that reads itself is a hole, not a RefCell panic ([#3671](https://github.com/carrick-tools/carrick/issues/3671)) ([37e9dac](https://github.com/carrick-tools/carrick/commit/37e9dacf46dc3d8b1135e041b13e49097fc140d6))
+* **scanner:** a route path held in a binding with a literal default is served there ([#3191](https://github.com/carrick-tools/carrick/issues/3191)) ([#3607](https://github.com/carrick-tools/carrick/issues/3607)) ([cdca45b](https://github.com/carrick-tools/carrick/commit/cdca45b8f0c29a4944ca07757b83a6ac6e6b2c12))
+
 ## [0.3.151](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.150...carrick-v0.3.151) (2026-11-09)
 
 
