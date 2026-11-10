@@ -259,8 +259,6 @@ impl<'a> Resolver<'a> {
             .get(path)?
             .module_bindings
             .get(&(line, symbol.clone()))
-            // A block-scoped or nested local is in the table, and no text
-            // read opens it yet (carrick#3794): it reads as no entry.
             .filter(|binding| !binding.scoped_entry())?;
         let declared = super::super::site_record::declaration_path(row.decl_file()?);
         Some(((path, line, symbol), binding, declared))
@@ -826,46 +824,64 @@ mod tests {
         resolver.text_values(&path, &text)
     }
 
-    /// carrick#3794 T1: the binding table holds an entry for every block or
-    /// nested local, and the text reader reads none of them yet: each name
-    /// answers as it did before the entry existed. Step T2 replaces this pin
-    /// with the answers.
+    /// What the argument of the one call of `callee` in `blocks.ts` reads as.
+    fn blocks_read(resolver: &Resolver<'_>, on: &Walked, callee: &str) -> Vec<TextValue> {
+        let path = on.path("services/web/src/blocks.ts");
+        let found: Vec<ValueAt> = super::super::row_calls::every_call(&on.inputs.files)
+            .into_iter()
+            .filter(|(file, call, _)| *file == path && call.callee == callee)
+            .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}: {found:?}");
+        resolver.text_values(&path, &found[0])
+    }
+
+    /// The texts of a read, or the failure when it holds a hole.
+    fn texts_of(got: &[TextValue]) -> Result<Vec<&str>, String> {
+        got.iter()
+            .map(|value| match value {
+                TextValue::Text { text, .. } => Ok(text.as_str()),
+                hole => Err(format!("{hole:?}")),
+            })
+            .collect()
+    }
+
+    /// carrick#3794 T2: a local declared in a block, at module scope or in a
+    /// function written inside a body reads as its initialiser's text, a
+    /// `let` written again in a block as every value it holds.
     #[test]
-    fn no_reader_reads_a_block_or_nested_entry_yet() {
+    fn a_block_or_nested_local_reads_as_its_initialiser_text() {
         let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
             return;
         };
         let resolver = Resolver::new(&on.inputs, &[]);
-        let path = on.path("services/web/src/blocks.ts");
-        let argument = |callee: &str| -> ValueAt {
-            let found: Vec<ValueAt> = super::super::row_calls::every_call(&on.inputs.files)
-                .into_iter()
-                .filter(|(file, call, _)| *file == path && call.callee == callee)
-                .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
-                .collect();
-            assert_eq!(found.len(), 1, "{callee}: {found:?}");
-            found[0].clone()
-        };
-        for callee in [
-            "p_if",
-            "p_try",
-            "p_case",
-            "p_bare",
-            "p_loop_body",
-            "p_module_block",
-            "p_callback",
-            "p_callback_block",
-            "p_handler",
-            "p_moved",
-            "p_nested_moved",
-            "p_shadow",
-            "p_shadow_outer",
-            "p_pair_a",
-            "p_pair_b",
-            "p_loop",
-            "p_catch",
+        for (callee, want) in [
+            ("p_if", vec!["order.created"]),
+            ("p_try", vec!["https://example.test/try"]),
+            ("p_case", vec!["case.a"]),
+            ("p_bare", vec!["bare"]),
+            ("p_loop_body", vec!["loop.body"]),
+            ("p_module_block", vec!["module.block"]),
+            ("p_callback", vec!["cb.top"]),
+            ("p_callback_block", vec!["cb.block"]),
+            ("p_handler", vec!["handler.top"]),
+            ("p_moved", vec!["a", "b"]),
         ] {
-            let got = resolver.text_values(&path, &argument(callee));
+            let got = blocks_read(&resolver, &on, callee);
+            assert_eq!(texts_of(&got), Ok(want), "{callee}: {got:?}");
+        }
+    }
+
+    /// A declaration the table refuses, or whose write is never placed, still
+    /// reads as before: F4 gives the refusals a true word.
+    #[test]
+    fn a_name_the_table_refuses_still_reads_as_today() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        for callee in ["p_shadow", "p_shadow_outer", "p_loop", "p_catch"] {
+            let got = blocks_read(&resolver, &on, callee);
             assert!(
                 matches!(
                     got.as_slice(),
@@ -877,6 +893,18 @@ mod tests {
                 "{callee}: {got:?}"
             );
         }
+        // A nested `let` written again: its write is never placed.
+        let got = blocks_read(&resolver, &on, "p_nested_moved");
+        assert!(
+            matches!(
+                got.as_slice(),
+                [TextValue::Hole {
+                    reason: guards::HoleReason::Reassigned,
+                    ..
+                }]
+            ),
+            "{got:?}"
+        );
     }
 
     /// A choice reads every branch, never collapsed: a branch the code does
