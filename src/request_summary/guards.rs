@@ -450,15 +450,16 @@ pub(super) struct GuardIr {
     pub(super) literal_at: Option<Site>,
 }
 
+/// A parameter as [`Subject::parameter`] states it: how many functions out,
+/// its position and the keys read down from it.
+pub(super) type ParamAt = (u8, usize, Vec<String>);
+
 impl GuardIr {
     /// The parameter the guard tests and the test, where it is one the send
     /// side decides at a caller that fills the parameter with text
     /// (carrick#3679, the ruling R3): an equality with text, or a prefix of
-    /// text. How many functions out the parameter is, its position and the
-    /// keys read down from it, as [`Subject::parameter`] states them.
-    pub(super) fn parameter_test(
-        &self,
-    ) -> Option<((u8, usize, Vec<String>), super::alternatives::WayTest)> {
+    /// text.
+    pub(super) fn parameter_test(&self) -> Option<(ParamAt, super::alternatives::WayTest)> {
         use super::alternatives::WayTest;
         let GuardLiteral::Text(text) = &self.literal else {
             return None;

@@ -6462,15 +6462,14 @@ impl Reader<'_> {
             self.walk(stmt, scope, ir);
             for (key, state) in before {
                 let placed = written.get_mut(&key).expect("a written local");
-                match self.written_ways(
-                    stmt,
-                    &key,
-                    state,
-                    &mut Vec::new(),
+                let mut flow = alternatives::WriteFlow {
+                    local: &key,
                     scope,
-                    &ir.guards,
-                    placed,
-                ) {
+                    guards: &ir.guards,
+                    path: Vec::new(),
+                    placed: &mut *placed,
+                };
+                match self.written_ways(stmt, state, &mut flow) {
                     Some(state) => {
                         let state = state.of_local(&key, placed);
                         scope.alts.insert(key, state);

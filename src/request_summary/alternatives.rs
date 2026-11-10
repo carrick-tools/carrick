@@ -849,18 +849,28 @@ impl Reader<'_> {
     }
 }
 
-/// The guards of the `if` tests a statement sits under, each with the branch
-/// taken.
-type Path = Vec<(Option<WayGuard>, bool)>;
+/// What [`Reader::written_ways`] reads one local's writes with.
+pub(super) struct WriteFlow<'f, 's> {
+    /// The local written more than once.
+    pub(super) local: &'f BindingKey,
+    pub(super) scope: &'f Scope<'s>,
+    /// The guards the walk of the body read ([`super::FnIr::guards`]).
+    pub(super) guards: &'f [super::guards::GuardIr],
+    /// The guards of the `if` tests the statement sits under, each with the
+    /// branch taken.
+    pub(super) path: Vec<(Option<WayGuard>, bool)>,
+    /// Where each write read so far starts, for the write census
+    /// ([`Alternation::census_checked`]).
+    pub(super) placed: &'f mut BTreeSet<u32>,
+}
 
 impl Reader<'_> {
-    /// What the local `local`, written more than once, may hold after `stmt`
-    /// runs, given what it may hold before it (`state`) under the tests of
-    /// `path` (carrick#3679, the ruling R3): one way per write. A write
-    /// replaces every way it is reached on; an `if` keeps each branch's
-    /// ways, under its test where a caller decides the test ([`WayGuard`])
-    /// and unguarded where it is any other test. `placed` collects where each
-    /// write read starts, for the write census ([`Alternation::census_checked`]).
+    /// What the local `flow.local`, written more than once, may hold after
+    /// `stmt` runs, given what it may hold before it (`state`) under the
+    /// tests of `flow.path` (carrick#3679, the ruling R3): one way per
+    /// write. A write replaces every way it is reached on; an `if` keeps
+    /// each branch's ways, under its test where a caller decides the test
+    /// ([`WayGuard`]) and unguarded where it is any other test.
     ///
     /// `None` where a write is in any other statement or expression (a loop,
     /// a `try`, a `switch`, a write inside a call or a nested function), or
@@ -869,13 +879,10 @@ impl Reader<'_> {
     pub(super) fn written_ways(
         &self,
         stmt: &Stmt,
-        local: &BindingKey,
         state: Alternatives,
-        path: &mut Path,
-        scope: &Scope<'_>,
-        guards: &[super::guards::GuardIr],
-        placed: &mut BTreeSet<u32>,
+        flow: &mut WriteFlow<'_, '_>,
     ) -> Option<Alternatives> {
+        let local = flow.local;
         if !writes_local(stmt, local) {
             return Some(state);
         }
@@ -893,9 +900,9 @@ impl Reader<'_> {
                 {
                     return None;
                 }
-                placed.insert(assign.span.lo.0);
-                let mut written = self.reading_of(&assign.right, scope)?;
-                for (guard, holds) in path.iter() {
+                flow.placed.insert(assign.span.lo.0);
+                let mut written = self.reading_of(&assign.right, flow.scope)?;
+                for (guard, holds) in &flow.path {
                     written = written.under(guard.as_ref(), *holds);
                 }
                 (!written.readings.is_empty()).then_some(written)
@@ -903,20 +910,20 @@ impl Reader<'_> {
             Stmt::Block(block) => {
                 let mut state = state;
                 for inner in &block.stmts {
-                    state = self.written_ways(inner, local, state, path, scope, guards, placed)?;
+                    state = self.written_ways(inner, state, flow)?;
                 }
                 Some(state)
             }
             Stmt::If(branching) => {
-                let guard = self.way_guard(&branching.test, scope, guards);
+                let guard = self.way_guard(&branching.test, flow.scope, flow.guards);
                 let mut taken = |stmt: Option<&Stmt>, holds: bool| {
                     let state = state.under(guard.as_ref(), holds);
                     let Some(stmt) = stmt else {
                         return Some(state);
                     };
-                    path.push((guard.clone(), holds));
-                    let out = self.written_ways(stmt, local, state, path, scope, guards, placed);
-                    path.pop();
+                    flow.path.push((guard.clone(), holds));
+                    let out = self.written_ways(stmt, state, flow);
+                    flow.path.pop();
                     out
                 };
                 let consequent = taken(Some(&branching.cons), true)?;
