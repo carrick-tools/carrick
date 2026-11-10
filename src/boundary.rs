@@ -115,9 +115,8 @@ pub struct ServiceBoundary {
     /// nothing was sent because this machine is not signed in, or the store
     /// could not be reached. Every row a library package states is then
     /// missing from this blob, which is not the store's answer that a package
-    /// labels nothing. Set only on a read-only ask (the no-model local scan);
-    /// absent otherwise, so a signed-in blob and every blob the Action writes
-    /// are unchanged.
+    /// labels nothing. Set on every scan whose ask failed, whatever its mode
+    /// (carrick#3792); absent when the ask was answered or not made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_ask_failed: Option<crate::library_store::AskFailure>,
     /// The commit this service's rows were read at. Already on the blob;
