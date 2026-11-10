@@ -1,0 +1,10 @@
+{
+  "name": "unread-sites-unready",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/http": "^1.0.0",
+    "@fixture/pending": "^1.0.0",
+    "@fixture/failed": "^1.0.0"
+  }
+}

@@ -145,9 +145,11 @@ impl SiblingRegistry {
     ///
     /// A call through an import the compiler did not resolve is followed on
     /// the call graph instead (carrick#2557), into any service, named by no
-    /// row. Rows that may hold one read every analysed service's walk, as
-    /// every analysis did before the gate, and through those walks' rows the
-    /// carried services they reach.
+    /// row. Rows that may hold one read every other declared service's walk,
+    /// analysed or carried (a carried one filled with the rows the last pass
+    /// kept, or walked): a changed-only scan then reads the same services a
+    /// full scan reads, and its walks stop where a full scan's stop
+    /// (carrick#3688 U3).
     pub(super) fn walks_read_by(
         &self,
         service: usize,
@@ -160,13 +162,7 @@ impl SiblingRegistry {
                  every service's walk",
                 label_of(&self.services[service])
             );
-            reads.extend(
-                self.analysed_at
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, at)| *index != service && at.is_some())
-                    .map(|(index, _)| index),
-            );
+            reads.extend((0..self.services.len()).filter(|index| *index != service));
         }
         reads
     }

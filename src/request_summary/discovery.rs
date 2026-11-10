@@ -77,7 +77,8 @@ use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_st
 use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
-    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, FLAG_RUNS_HANDED, Kind, Row,
+    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, FLAG_RUNS_HANDED, FLAG_TOO_MANY,
+    Kind, Row,
 };
 use crate::services::type_sidecar::{
     ClaimOn, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm, SemanticsResult,
@@ -102,7 +103,7 @@ const OF_IMPLEMENTATIONS: Plural = Plural {
 };
 
 /// The hop a walk records where it enters a function through a value.
-use super::decided_sites::{BoundCall, HopMaker, VALUE_HOP};
+use super::decided_sites::{BoundCall, CALLBACK_HOP, HopMaker, VALUE_HOP};
 use super::stop::Stop;
 
 /// One discovered site, or one walk that entered code and stopped.
@@ -225,6 +226,10 @@ pub struct Discovery {
     /// The calls whose walk found no site and passed a call it could not
     /// follow on the way (`no_site` all the same): not followed to the end.
     pub missed_inside: Vec<(String, u32, u32)>,
+    /// The line and the callee as written of each `missed_inside` call, by
+    /// file and SWC span: what an unread site states of it
+    /// ([`crate::unread_sites`], carrick#3688 U3).
+    pub missed_at: BTreeMap<(String, u32, u32), (u32, String)>,
     pub counts: BTreeMap<String, usize>,
     /// For each call recorded with no end (a stopped site or `missed_inside`),
     /// by file and SWC span: the store keys of the packages the walk passed a
@@ -301,6 +306,9 @@ pub struct Labels<'a> {
     /// when only the exports are known ([`Labels::of`]), where no package
     /// can be told unanswered.
     answered: Option<HashSet<&'a str>>,
+    /// The packages the scan ended without an answer for ([`crate::library_store::Settled::unanswered`]),
+    /// for the settled pass; `None` leaves [`Self::answered`] to decide.
+    unready: Option<HashSet<&'a str>>,
     /// The packages with an export of a network role.
     networked: HashSet<&'a str>,
     /// The exports the store labelled with no network role.
@@ -323,6 +331,7 @@ impl<'a> Labels<'a> {
             declarations: None,
             implementations: None,
             answered: None,
+            unready: None,
             networked: exports
                 .iter()
                 .filter(|export| export.role != LibraryRole::None)
@@ -373,10 +382,27 @@ impl<'a> Labels<'a> {
         if !is_language_key(key) && self.networked.contains(key) {
             return Some(Stop::PackageUnmatched);
         }
+        if let Some(unready) = &self.unready {
+            // One language key is one whole default-library file: never unready.
+            return (!is_language_key(key) && unready.contains(key))
+                .then_some(Stop::UnansweredPackage);
+        }
         self.answered
             .as_ref()
             .is_some_and(unanswered)
             .then_some(Stop::UnansweredPackage)
+    }
+
+    /// These labels for the settled pass, with the packages the scan ended
+    /// without an answer for: a call into one is not followed, for
+    /// [`Stop::UnansweredPackage`]. For labels built by [`Self::of`] or
+    /// [`Self::traced`], which know no answered set.
+    pub fn ended_without(self, unready: &'a BTreeSet<String>) -> Self {
+        debug_assert!(self.answered.is_none());
+        Labels {
+            unready: Some(unready.iter().map(String::as_str).collect()),
+            ..self
+        }
     }
 
     /// These labels, following a call through an interface member into the
@@ -1467,6 +1493,20 @@ impl<'a> Walker<'a> {
     }
 
     fn hop(&self, file: &Path, key: &str) -> ChainHop {
+        // A function written inside another is entered as a value is, at
+        // the line its node starts on (carrick#2448 T3c): what decided
+        // sites places a `<value>` hop by.
+        if self.values.function(file, key).is_none()
+            && let Some((_, written)) = self.written_inside(file, key)
+            && let Some(site) = &written.site
+        {
+            return ChainHop {
+                function: VALUE_HOP.to_string(),
+                file: self.rel(file),
+                line: site.line,
+                made: None,
+            };
+        }
         let line = self
             .inputs_for(file)
             .files
@@ -1928,41 +1968,45 @@ impl<'a> Walker<'a> {
                 }
                 // A member the class inherits is declared in its base's
                 // package, so `packages` is the base's. The class the
-                // receiver holds is declared elsewhere: in the package the
-                // receiver itself is declared in, or in the module the file
-                // imports the receiver's type from (carrick#3390). Read only
-                // where that export's claims state this member as an op.
-                let mut holders: Vec<(String, &str)> = Vec::new();
-                if !in_repo(receiver) {
-                    for package in store_keys(receiver, self.labels.exports) {
-                        holders.extend(
-                            [receiver.symbol(), root]
-                                .into_iter()
-                                .flatten()
-                                .map(|name| (package.clone(), name)),
-                        );
+                // receiver holds is declared elsewhere, and the compiler
+                // engine writes it at the receiver as `receiver_type` rows
+                // (one per class of an intersection or union; an alias is
+                // already resolved). Read only where that export's claims
+                // state this member as an op (carrick#3390). A class the
+                // store does not label states nothing; two that both claim
+                // the member state nothing, and are counted.
+                let held = positions
+                    .receiver_declarations(file, ir.swc_start(*lo), ir.swc_start(*hi))
+                    .unwrap_or_default();
+                if held.iter().any(|row| row.flags() & FLAG_TOO_MANY != 0) {
+                    continue;
+                }
+                let mut claiming: Vec<(String, &str)> = Vec::new();
+                for row in held {
+                    let Some(name) = row.symbol() else {
+                        continue;
+                    };
+                    for package in store_keys(row, self.labels.exports) {
+                        let stated = self
+                            .labels
+                            .get(&package, name)
+                            .is_some_and(|claims| claims_member(claims, symbol));
+                        if stated && !claiming.contains(&(package.clone(), name)) {
+                            claiming.push((package, name));
+                        }
                     }
                 }
-                if let Some(root) = root {
-                    let mut imported: Vec<_> = ir
-                        .bindings
-                        .values()
-                        .filter(|binding| !binding.namespace && binding.export == root)
-                        .map(|binding| binding.specifier.as_str())
-                        .collect();
-                    imported.sort_unstable();
-                    imported.dedup();
-                    for specifier in imported {
-                        holders
-                            .extend(specifier_keys(specifier).into_iter().map(|key| (key, root)));
+                match claiming.as_slice() {
+                    [] => {}
+                    [(package, name)] => {
+                        if let Some(claims) = self.labels.get(package, name) {
+                            return Some((
+                                end(package, name, Some(symbol), claims),
+                                ReachedBy::Name,
+                            ));
+                        }
                     }
-                }
-                for (package, name) in holders {
-                    if let Some(claims) = self.labels.get(&package, name)
-                        && claims_member(claims, symbol)
-                    {
-                        return Some((end(&package, name, Some(symbol), claims), ReachedBy::Name));
-                    }
+                    _ => self.ambiguous.set(self.ambiguous.get() + 1),
                 }
             }
         }
@@ -2492,7 +2536,7 @@ impl<'a> Walker<'a> {
                 && let Some(callback) = body.nested.get(*nested)
             {
                 let written = ChainHop {
-                    function: "<callback>".to_string(),
+                    function: CALLBACK_HOP.to_string(),
                     file: self.rel(file),
                     line: callback
                         .site
@@ -2517,8 +2561,9 @@ impl<'a> Walker<'a> {
             return known.clone();
         }
         // A definition the extractor keys whose body this pass did not read
-        // (an object's method, a function written inside another): what it
-        // calls is not known, so the walk stops there and says so.
+        // (no keyed body and no function written where the key's node
+        // starts): what it calls is not known, so the walk stops there and
+        // says so.
         let Some((file, ir)) = self.function(&id.0, &id.1) else {
             return Outcome::stopped(Stop::NoBody);
         };
@@ -2703,6 +2748,9 @@ impl<'a> Walker<'a> {
                             *discovery.counts.entry("no_site".to_string()).or_default() += 1;
                             let at = (self.rel(file), call.site.span_start, call.site.span_end);
                             if missed {
+                                discovery
+                                    .missed_at
+                                    .insert(at.clone(), (call.site.line, call.callee_text.clone()));
                                 discovery.missed_inside.push(at);
                             } else {
                                 discovery.finished.push(at);
@@ -2784,6 +2832,9 @@ impl<'a> Walker<'a> {
                 if !discovery.sites.iter().any(|site| {
                     site.file == at.0 && site.span_start == at.1 && site.span_end == at.2
                 }) {
+                    discovery
+                        .missed_at
+                        .insert(at.clone(), (call.site.line, call.callee_text.clone()));
                     discovery.missed_inside.push(at);
                 }
             }
@@ -2793,9 +2844,26 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// The definition `key` of `file`, the file as `inputs` keys it.
+    /// The definition `key` of `file`, the file as `inputs` keys it: its
+    /// keyed body, else the function written inside another body that the
+    /// key names ([`Self::written_inside`]).
     fn function(&self, file: &Path, key: &str) -> Option<(&'a Path, &'a FnIr)> {
-        self.values.function(file, key)
+        self.values
+            .function(file, key)
+            .or_else(|| self.written_inside(file, key))
+    }
+
+    /// The function the extractor keys as `key` of `file` when it is written
+    /// inside another body, which keys no body of its own (carrick#2448
+    /// T3c): `const request = async (o) => …` in a factory, a function
+    /// declared in a function, an object's method written there. Found by
+    /// where the key's function node starts, never by its name.
+    fn written_inside(&self, file: &Path, key: &str) -> Option<(&'a Path, &'a FnIr)> {
+        let (path, ir) = self.inputs_for(file).files.get_key_value(file)?;
+        let (Some(start), _) = *ir.definitions.get(key)? else {
+            return None;
+        };
+        Some((path.as_path(), self.values.written_function(file, start)?))
     }
 
     /// The labelled call `invoke` is when the name or member read at
@@ -3805,6 +3873,139 @@ mod tests {
         assert_eq!(end.line, 38, "{end:?}");
     }
 
+    /// carrick#2448 T3c: a function the extractor keys that is written
+    /// inside another (`const request = async (options) => …` inside
+    /// `createClient`) has no keyed body; the walk enters the function
+    /// written there, under a `<value>` hop at its line, and reaches the send
+    /// at `client.ts:38` rather than stopping `no_body`. The send keeps its
+    /// own site. The answer key is `tests/fixtures/generated-client/README.md`.
+    #[test]
+    fn a_call_into_a_function_written_inside_another_enters_it() {
+        let Some(on) = walked("generated-client", "", "", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        for (file, line) in [
+            ("r3/sdk.ts", 11),
+            ("r3/sdk.ts", 18),
+            ("r3/sdk.ts", 25),
+            ("r3/client/client.ts", 43),
+        ] {
+            let [site] = at(file, line)[..] else {
+                panic!(
+                    "a site at {file}:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            assert_eq!(site.stop, None, "{file}:{line}: {site:?}");
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("lib:lib.dom.d.ts", "fetch"),
+                "{file}:{line}"
+            );
+            assert!(end.file.ends_with("r3/client/client.ts"), "{end:?}");
+            assert_eq!(end.line, 38, "{file}:{line}: {end:?}");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert_eq!(
+                hops.last(),
+                Some(&(VALUE_HOP, 31)),
+                "{file}:{line}: the walk enters `request` as a value"
+            );
+        }
+        // The send keeps its own site, with no chain.
+        let [send] = at("r3/client/client.ts", 38)[..] else {
+            panic!("one site at the send: {:?}", discovery.sites);
+        };
+        assert!(send.chain.is_empty(), "{send:?}");
+    }
+
+    /// carrick#2448 T3c, the other forms: a function declared inside a
+    /// factory, and a method of an object literal the factory holds, each
+    /// sending through `fetch`. A call through what the factory returns
+    /// enters the inner function as a value and reaches the send.
+    #[test]
+    fn a_function_declared_or_held_inside_a_factory_is_entered() {
+        let client = "export const make = (base: string) => {\n\
+            \x20 async function send(path: string) {\n\
+            \x20   return fetch(base + path);\n\
+            \x20 }\n\
+            \x20 const api = {\n\
+            \x20   async load(path: string) {\n\
+            \x20     return fetch(base + path);\n\
+            \x20   },\n\
+            \x20 };\n\
+            \x20 const list = () => send('/a');\n\
+            \x20 const read = () => api.load('/b');\n\
+            \x20 return { list, read };\n\
+            };\n";
+        let use_ = "import { make } from './inner';\n\
+            const c = make('http://localhost');\n\
+            export const a = () => c.list();\n\
+            export const b = () => c.read();\n";
+        let Some(on) = walked(
+            "generated-client",
+            "",
+            "",
+            &[("src/t3c/inner.ts", client), ("src/t3c/use.ts", use_)],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/generated-client/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        for (line, send, entered) in [(10, 3, 2), (11, 7, 6)] {
+            let at: Vec<&DiscoverySite> = discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("t3c/inner.ts") && site.line == line)
+                .collect();
+            let [site] = at[..] else {
+                panic!(
+                    "a site at t3c/inner.ts:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            assert_eq!(site.stop, None, "t3c/inner.ts:{line}: {site:?}");
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(end.export, "fetch", "t3c/inner.ts:{line}");
+            assert_eq!(end.line, send, "t3c/inner.ts:{line}: {end:?}");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert_eq!(
+                hops.last(),
+                Some(&(VALUE_HOP, entered)),
+                "t3c/inner.ts:{line}: {hops:?}"
+            );
+        }
+    }
+
     /// carrick#2448 T1, soundness rule 2.3.3 across modules: the object a
     /// module binding holds is read at a key only where no importer hands it
     /// on. A module that passes `client` to a call may have it changed, so
@@ -4124,6 +4325,167 @@ mod tests {
                 .unanswered_at
                 .contains_key(&span("client.ts", "transmit(path, body)")),
             "a direct call records no passed package"
+        );
+    }
+
+    /// What a pass over `discovery-pending-package` reads, as one string per
+    /// field the settled pass could move.
+    fn pending_package_record(discovery: &Discovery) -> Vec<String> {
+        vec![
+            format!("{:?}", discovery.sites),
+            format!("{:?}", discovery.unfollowed),
+            format!("{:?}", discovery.finished),
+            format!("{:?}", discovery.missed_inside),
+            format!("{:?}", discovery.unanswered_at),
+            format!("{:?}", discovery.entered),
+            format!("{:?}", discovery.counts),
+        ]
+    }
+
+    /// carrick#3684: the settled pass reads the packages the scan ended
+    /// without (`Labels::ended_without`), as the first pass reads the ones
+    /// the answer does not hold. The answer key is
+    /// `tests/fixtures/discovery-pending-package/README.md`.
+    #[test]
+    fn the_settled_pass_reads_a_package_the_scan_ended_without() {
+        let Some(on) = walked(
+            "discovery-pending-package",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-pending-package");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        let unready: BTreeSet<String> = ["fixture-pending".to_string()].into();
+        let plain = discover(&on.inputs, &Labels::of(&answer.exports), &on.repo);
+        let settled = discover(
+            &on.inputs,
+            &Labels::of(&answer.exports).ended_without(&unready),
+            &on.repo,
+        );
+        let span = |file: &str, needle: &str| -> (String, u32, u32) {
+            let text =
+                std::fs::read_to_string(fixture.join("repo/services/web/src").join(file)).unwrap();
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (
+                format!("services/web/src/{file}"),
+                lo,
+                lo + needle.len() as u32,
+            )
+        };
+        let pending: BTreeSet<String> = ["fixture-pending".to_string()].into();
+        for (file, needle) in [
+            ("events.ts", "send(\"/events\", body)"),
+            ("inject.ts", "doSend(\"/notify\", body)"),
+        ] {
+            let at = span(file, needle);
+            assert!(settled.missed_inside.contains(&at), "{file} missed_inside");
+            assert_eq!(settled.unanswered_at.get(&at), Some(&pending), "{file}");
+            assert!(
+                !plain.missed_inside.contains(&at),
+                "{file} on the plain pass"
+            );
+        }
+        let direct = span("client.ts", "transmit(path, body)");
+        assert!(
+            settled.unfollowed.iter().any(|site| (
+                site.file.clone(),
+                site.span_start,
+                site.span_end
+            ) == direct
+                && site.stop == Some(Stop::UnansweredPackage)),
+            "{:?}",
+            settled.unfollowed
+        );
+        assert!(
+            settled
+                .finished
+                .contains(&span("answered.ts", "render(body)"))
+        );
+        assert!(
+            settled
+                .sites
+                .iter()
+                .any(|site| site.file == "services/web/src/global.ts" && site.end.is_some())
+        );
+        let with_end = |discovery: &Discovery| -> Vec<String> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.end.is_some())
+                .map(|site| format!("{site:?}"))
+                .collect()
+        };
+        assert_eq!(with_end(&settled), with_end(&plain));
+        assert_eq!(
+            format!("{:?}", settled.entered),
+            format!("{:?}", plain.entered)
+        );
+    }
+
+    /// carrick#3684: with nothing unready the settled pass is the plain one.
+    #[test]
+    fn with_nothing_unready_the_settled_pass_is_unchanged() {
+        let Some(on) = walked(
+            "discovery-pending-package",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-pending-package");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        let none = BTreeSet::new();
+        assert_eq!(
+            pending_package_record(&discover(
+                &on.inputs,
+                &Labels::of(&answer.exports),
+                &on.repo
+            )),
+            pending_package_record(&discover(
+                &on.inputs,
+                &Labels::of(&answer.exports).ended_without(&none),
+                &on.repo
+            )),
+        );
+    }
+
+    /// carrick#3684: a default-library key is one whole file, so it is never
+    /// unready in the settled pass, whatever the set holds.
+    #[test]
+    fn a_language_key_is_never_unready() {
+        let Some(on) = walked("discovery", "services/web", "web", &[], true) else {
+            return;
+        };
+        let keys: BTreeSet<String> = on
+            .inputs
+            .positions
+            .as_ref()
+            .map(|positions| {
+                positions
+                    .call_rows()
+                    .flat_map(|row| store_keys(row, &[]))
+                    .filter(|key| is_language_key(key))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(!keys.is_empty(), "the fixture's rows name a language key");
+        let plain = discover(&on.inputs, &Labels::of(&[]), &on.repo);
+        let settled = discover(&on.inputs, &Labels::of(&[]).ended_without(&keys), &on.repo);
+        assert_eq!(
+            pending_package_record(&plain),
+            pending_package_record(&settled)
         );
     }
 
@@ -5227,7 +5589,7 @@ export function listen(): void {
     #[test]
     fn a_row_without_the_publication_bits_reads_and_names_nothing() {
         let text = concat!(
-            r#"{"v":5,"typescript":"5.9.3","service":"api","files":1}"#,
+            r#"{"v":6,"typescript":"5.9.3","service":"api","files":1}"#,
             "\n",
             r#"{"f":"src/a.ts","h":"00","r":[["call",0,7,"greet","node_modules/p/index.d.ts",1,"p","string",0],["call",9,16,"make","node_modules/p/index.d.ts",3,"p","App",96]]}"#,
             "\n"
@@ -5287,12 +5649,14 @@ export function listen(): void {
         );
     }
 
-    /// carrick#2431: a walk that reaches a definition whose body this pass
-    /// did not read stops there and says so; an optional call is a call. A
-    /// constant object's member is a function of the module, read like any
-    /// other, so the walk follows it (carrick#3356).
+    /// carrick#2431: an optional call is a call. A function declared inside
+    /// another (`loadInner`) keys no body of its own, and the walk enters
+    /// the function written there as a value (carrick#2448 T3c), where it
+    /// stopped `no_body` before. A constant object's member is a function of
+    /// the module, read like any other, so the walk follows it
+    /// (carrick#3356).
     #[test]
-    fn an_unread_body_is_a_stop_and_an_optional_call_is_a_site() {
+    fn a_function_declared_inside_another_is_entered_and_an_optional_call_is_a_site() {
         let edit = [
             (
                 "src/table.ts",
@@ -5312,7 +5676,7 @@ export function listen(): void {
             records_in(&discovery, "services/web/src/table.ts"),
             texts(&[
                 "3 fetch -> lib.dom fetch -",
-                "5 loadInner stop no_body",
+                "5 loadInner -> lib.dom fetch -",
                 "10 fetch -> lib.dom fetch -",
                 "15 table.load -> lib.dom fetch -",
             ])

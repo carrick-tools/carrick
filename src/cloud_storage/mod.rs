@@ -892,16 +892,37 @@ pub struct CloudRepoData {
     /// whose path, event name or method the code does not state. Labelled
     /// leads for the agent, never rows; nothing in matching, the type check,
     /// the findings or the PR result reads them. At most
-    /// [`crate::possible_calls::MAX_PER_SERVICE`] per service.
+    /// [`crate::possible_calls::MAX_PER_SERVICE`] per service. The projection
+    /// of [`Self::unread_sites`]'s listed rows (carrick#3688 U3) until that
+    /// field's readers are deployed.
     ///
-    /// Written only when `CARRICK_SITE_QUESTIONS=1`. Additive and optional:
-    /// `None` is "this scan did not write the field" (the switch was off, or
-    /// the blob predates it), never "no possible calls".
+    /// Written wherever the site pass reads the service, on both scan
+    /// branches. Additive and optional: `None` is "this scan did not write
+    /// the field" (the site pass did not read the service, or the blob
+    /// predates it), never "no possible calls".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possible_calls: Option<Vec<crate::possible_calls::PossibleCall>>,
     /// How many possible calls were left out past the cap. Absent when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possible_calls_omitted: Option<u32>,
+    /// Every call site the fact layer considered and did not state as a row,
+    /// each with the one reason it stopped (carrick#3688 U3,
+    /// [`crate::unread_sites`]): the possible calls, and the calls whose walk
+    /// stopped with no labelled library call. At most
+    /// [`crate::unread_sites::MAX_PER_SERVICE`] per service, labelled rows
+    /// first. Never a row, never an input to matching, findings or the PR
+    /// result. Written wherever the site pass reads the service. Additive
+    /// and optional: `None` is "this scanner did not state it", never "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites: Option<Vec<crate::unread_sites::UnreadSite>>,
+    /// The exact count of unread sites, past the cap too. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_total: Option<u32>,
+    /// The exact count of unread sites per reason, past the cap too. Absent
+    /// when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_by_reason:
+        Option<std::collections::BTreeMap<crate::request_summary::Stop, u32>>,
     /// What the call-through pass reads of this service from another one
     /// (carrick#2378): its model rows at calls through its own code, its
     /// definitions that hand back a request's parsed body, and its calls
@@ -1194,6 +1215,9 @@ impl CloudRepoData {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,
@@ -2891,6 +2915,9 @@ mod tests {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            unread_sites: None,
+            unread_sites_total: None,
+            unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
             memory_peaks: None,

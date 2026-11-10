@@ -1,0 +1,101 @@
+{
+  "possible_calls": [
+    {
+      "file_path": "src/possible-call.ts",
+      "kind": "http",
+      "labelled_end": {
+        "export": "http",
+        "member": "post",
+        "package": "@fixture/http"
+      },
+      "line_number": 4,
+      "role": "consumer",
+      "span_end": 122,
+      "span_start": 101,
+      "trace_depth": 0,
+      "unread": {
+        "reason": "name_never_bound",
+        "slot": "path"
+      }
+    }
+  ],
+  "unread_sites": [
+    {
+      "depth": 0,
+      "file": "src/possible-call.ts",
+      "kind": "http",
+      "labelled_end": {
+        "export": "http",
+        "member": "post",
+        "package": "@fixture/http"
+      },
+      "line": 4,
+      "reason": "name_never_bound",
+      "role": "consumer",
+      "slot": "path",
+      "span_end": 122,
+      "span_start": 101
+    },
+    {
+      "callee": "deliver",
+      "depth": 1,
+      "file": "src/declared.ts",
+      "line": 4,
+      "reason": "interface_member",
+      "slot": "callee",
+      "span_end": 150,
+      "span_start": 126,
+      "stop_at": "src/declared.ts:1"
+    },
+    {
+      "callee": "pong",
+      "depth": 2,
+      "file": "src/recursion.ts",
+      "line": 2,
+      "reason": "recursion",
+      "slot": "callee",
+      "span_end": 64,
+      "span_start": 53,
+      "stop_at": "src/recursion.ts:1"
+    },
+    {
+      "callee": "ping",
+      "depth": 2,
+      "file": "src/recursion.ts",
+      "line": 6,
+      "reason": "recursion",
+      "slot": "callee",
+      "span_end": 124,
+      "span_start": 117,
+      "stop_at": "src/recursion.ts:5"
+    },
+    {
+      "callee": "ping",
+      "depth": 2,
+      "file": "src/recursion.ts",
+      "line": 10,
+      "reason": "recursion",
+      "slot": "callee",
+      "span_end": 171,
+      "span_start": 164,
+      "stop_at": "src/recursion.ts:5"
+    },
+    {
+      "callee": "handlers[type]",
+      "depth": 0,
+      "file": "src/value-callee.ts",
+      "line": 6,
+      "reason": "value_callee",
+      "slot": "callee",
+      "span_end": 189,
+      "span_start": 169
+    }
+  ],
+  "unread_sites_by_reason": {
+    "interface_member": 1,
+    "name_never_bound": 1,
+    "recursion": 3,
+    "value_callee": 1
+  },
+  "unread_sites_total": 6
+}
