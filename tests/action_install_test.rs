@@ -1887,6 +1887,7 @@ impl StubManager {
              echo call >> \"$STUB_COUNTER\"\n\
              if [ -n \"$STUB_SLEEP\" ]; then exec sleep \"$STUB_SLEEP\"; fi\n\
              i=1; while [ \"$i\" -le \"${STUB_LINES:-0}\" ]; do echo \"line $i\"; i=$((i+1)); done\n\
+             if [ -n \"$STUB_ERROR\" ]; then printf '%s\\n' \"$STUB_ERROR\"; fi\n\
              for d in $STUB_MKDIRS; do mkdir -p \"$d\"; done\n\
              exit 1\n",
         )
@@ -2008,6 +2009,38 @@ fn a_failed_install_prints_the_head_of_its_log() {
         run.text()
     );
     assert!(!run.text().contains("lines omitted"), "{}", run.text());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failed_npm_install_warns_with_npms_first_error_line() {
+    let stub = StubManager::new("npm");
+    let root = stub.root.to_str().expect("utf-8").to_string();
+    let error = format!("npm error code EUSAGE {root}/package-lock.json is out of sync");
+    let run = stub.run("npm", true, &[("STUB_ERROR", error.as_str())]);
+    assert_eq!(stub.calls(), 2, "strict, then one retry: {}", run.text());
+    let warning = run
+        .err
+        .lines()
+        .find(|l| l.starts_with("::warning::"))
+        .unwrap_or_else(|| panic!("a warning: {}", run.text()));
+    assert!(
+        warning
+            .contains("failed (exit 1): npm error code EUSAGE ./package-lock.json is out of sync;"),
+        "the first npm error line, path made relative: {warning}"
+    );
+    assert!(
+        !warning.contains(&root),
+        "no absolute root in the warning: {warning}"
+    );
+
+    let silent = StubManager::new("npm");
+    let run = silent.run("npm", false, &[]);
+    assert!(
+        run.err.contains("failed (exit 1); the scan will refuse"),
+        "no npm line, no suffix: {}",
+        run.text()
+    );
 }
 
 #[test]
