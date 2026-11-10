@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::findings::{BreakStatus, EdgeSource, VerdictState, mismatch_break_status};
+
 use super::checkout::Tree;
 use super::join::{JoinedOperation, Role};
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex, Source};
@@ -1061,9 +1063,11 @@ pub(super) fn judge(
         // reached or needs none: the rule the cloud enforces on (cloud#599).
         // A verdict drawn from an edge with no finding behind it states no
         // source, so it is reported and does not fail the run.
-        let fact = finding.is_some_and(|finding| {
-            finding.edge_source.as_deref() == Some("fact")
-                && finding.verdict_state.as_deref() != Some("unresolved")
+        let fact_inputs = finding.map(|finding| {
+            (
+                finding.edge_source.as_deref() == Some("fact"),
+                finding.verdict_state.as_deref() == Some("unresolved"),
+            )
         });
         // Not this work's when the index already held the same row of this
         // file with a mismatch: it was there before the change began.
@@ -1087,6 +1091,31 @@ pub(super) fn judge(
             }
         };
         let moved_here = matches!(outside, Some(OutsideBefore::Agreed));
+        let already_here = already && in_change;
+        // The one break answer, with this run's own "before" as main's side:
+        // the index held the mismatch (on main), or held the pair agreeing
+        // (this change broke it), or said nothing about it (not placed). The
+        // check never enforces a source the join did not state, so anything
+        // but a `fact` edge is passed as a candidate.
+        let certain = fact_inputs.is_some_and(|(is_fact, unresolved)| {
+            let on_main = if already_here {
+                Some(true)
+            } else if in_change || moved_here {
+                Some(false)
+            } else {
+                None
+            };
+            mismatch_break_status(
+                Some(if is_fact {
+                    EdgeSource::Fact
+                } else {
+                    EdgeSource::Candidate
+                }),
+                unresolved.then_some(VerdictState::Unresolved),
+                on_main,
+                None,
+            ) == BreakStatus::Certain
+        });
         // Outside the change a sibling's mismatch at another line says
         // nothing about this row; `outside_before` decided on the line.
         let already = already && in_change;
@@ -1129,8 +1158,8 @@ pub(super) fn judge(
             not_judged_before: matches!(outside, Some(OutsideBefore::NotJudged)),
             moved_outside: moved_here,
             after: verdict.result.clone().unwrap_or_default(),
-            other_build: fact && !already && !same_build && (in_change || moved_here),
-            fails: fact && !already && same_build && (in_change || moved_here),
+            other_build: certain && !same_build,
+            fails: certain && same_build,
         });
         // Only a pair the index held compatible moved; one with no earlier
         // verdict is listed and counted apart, as "not judged before".
