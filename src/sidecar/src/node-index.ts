@@ -103,7 +103,12 @@ function buildIndex(sourceFile: SourceFile): FileIndex {
 
 /** The ts-morph node for an indexed one. */
 export function wrap<T extends Node = Node>(sourceFile: SourceFile, entry: IndexedNode): T {
-  return internals(sourceFile)._getNodeFromCompilerNode(entry.node) as T;
+  return wrapCompilerNode<T>(sourceFile, entry.node);
+}
+
+/** The ts-morph node for one of the file's compiler nodes. */
+export function wrapCompilerNode<T extends Node = Node>(sourceFile: SourceFile, node: ts.Node): T {
+  return internals(sourceFile)._getNodeFromCompilerNode(node) as T;
 }
 
 /** Every descendant, in `getDescendants()` order. */

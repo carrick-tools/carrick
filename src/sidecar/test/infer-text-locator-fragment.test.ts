@@ -30,7 +30,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { SidecarClient } from './helpers.js';
-import { canonicalStringQuotes } from '../src/type-inferrer.js';
+import { canonicalStringQuotes } from '../src/capture/site-node.js';
 
 const SOURCE_TS = `type Row = { id: string; label: string };
 type Hits = { hits: string[] };
