@@ -11447,7 +11447,11 @@ fn discover_with_positions(
     // `per_file_calls`: resolved by the call graph's own walk (carrick#1568).
     let mut wanted_from: Vec<(PathBuf, PathBuf)> = Vec::new();
 
+    // Names the file a step is stuck on once it passes the threshold; silent
+    // on a normal scan (carrick#3766).
+    let slow_step = crate::slow_step::Watch::discovery();
     for file_path in &files {
+        slow_step.file(std::path::Path::new(repo_path), file_path, "parse");
         let parsed = match positions.as_mut() {
             Some(index) => crate::parser::read_source(file_path).and_then(|text| {
                 index.bind(file_path, &text);
@@ -11463,6 +11467,7 @@ fn discover_with_positions(
             None => parse_file(file_path, &cm, &handler),
         };
         if let Some(module) = parsed {
+            slow_step.step("imports");
             // Extract import symbols
             let file_imports = sample_file_imports(&mut all_import_facts, &module);
 
@@ -11472,6 +11477,7 @@ fn discover_with_positions(
             let (call_imports, computed_requires) =
                 crate::call_graph::call_resolution_imports(&module, file_imports);
 
+            slow_step.step("definitions");
             // Extract function definitions with type annotations and source text
             let mut func_extractor =
                 FunctionDefinitionExtractor::new(file_path.clone(), cm.clone());
@@ -11483,12 +11489,14 @@ fn discover_with_positions(
                 .keys()
                 .cloned()
                 .collect();
+            slow_step.step("request summary");
             let mut request_ir =
                 crate::request_summary::extract_file_ir(&module, &cm, &definition_keys);
             // Which functions the module offers, keyed as the extractor keys
             // them, for where a guard's chain ends (carrick#2386).
             request_ir.place_definitions(&func_extractor.function_definitions);
 
+            slow_step.step("module scope");
             let canonical = file_path
                 .canonicalize()
                 .unwrap_or_else(|_| file_path.clone());
@@ -11514,6 +11522,7 @@ fn discover_with_positions(
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
         }
     }
+    drop(slow_step);
     if let Some(index) = &positions {
         debug!(
             "Position rows bound to discovery's reads: {:?}",
