@@ -1203,6 +1203,18 @@ impl FileNotReadReason {
             FileNotReadReason::OperationsMissing => "operations_missing",
         }
     }
+
+    /// The reason in words, for a line that says why a file was not read;
+    /// `None` when the reason is never shown. These are the PR check's own
+    /// phrases (carrick-cloud `lambdas/_shared/render_pr_comment.ts`,
+    /// `UNREAD_REASON_PHRASE`): keep them equal.
+    pub fn phrase(self) -> Option<&'static str> {
+        match self {
+            FileNotReadReason::DoesNotParse => Some("it does not parse"),
+            FileNotReadReason::NotUtf8Text => Some("it is not UTF-8 text"),
+            FileNotReadReason::OperationsMissing => None,
+        }
+    }
 }
 
 /// One file of [`PrDelta::files_not_read`]. A file both unread and holding
@@ -2514,5 +2526,18 @@ mod tests {
             Finding::env_var_call("GET", "/x", "API", vec![]).break_status(),
             BreakStatus::NotABreak
         );
+    }
+
+    #[test]
+    fn an_unread_reason_has_the_pr_checks_words() {
+        assert_eq!(
+            FileNotReadReason::DoesNotParse.phrase(),
+            Some("it does not parse")
+        );
+        assert_eq!(
+            FileNotReadReason::NotUtf8Text.phrase(),
+            Some("it is not UTF-8 text")
+        );
+        assert_eq!(FileNotReadReason::OperationsMissing.phrase(), None);
     }
 }
