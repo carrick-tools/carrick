@@ -21,6 +21,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SIDECAR_PATH } from '../helpers.js';
+import { writeDeepPrintProject } from '../deep-print-fixture.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // dist/test/lister/ -> the sidecar root.
@@ -96,7 +97,13 @@ interface Run {
  * `list_library_surface`, progress frames skipped; then `shutdown`, so an
  * exit hook can run.
  */
-async function runLister(entry: string, dir: string, nodeArgs: string[] = [], extraEnv: Record<string, string> = {}): Promise<Run> {
+async function runLister(
+  entry: string,
+  dir: string,
+  nodeArgs: string[] = [],
+  extraEnv: Record<string, string> = {},
+  packages: string[] = ['fixture-queue', 'node:events', 'lib:lib.es5.d.ts']
+): Promise<Run> {
   const env: Record<string, string> = { ...extraEnv };
   for (const key of ['PATH', 'LANG', 'TZ']) if (process.env[key]) env[key] = process.env[key]!;
   const child = spawn(process.execPath, [...nodeArgs, entry], { cwd: dir, env, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -128,7 +135,7 @@ async function runLister(entry: string, dir: string, nodeArgs: string[] = [], ex
       request_id: 'list',
       action: 'list_library_surface',
       from_dir: dir,
-      packages: ['fixture-queue', 'node:events', 'lib:lib.es5.d.ts'],
+      packages,
       max_entries: 1_000_000,
     });
     child.stdin.write(`${JSON.stringify({ request_id: 'bye', action: 'shutdown' })}\n`);
@@ -229,6 +236,16 @@ describe('the surface lister artifact (carrick#1660)', () => {
     const language = run.listed.surfaces[2];
     assert.strictEqual(language.reason, undefined);
     assert.ok(language.exports.some(e => e.export === 'parseInt'));
+  });
+
+  it('lists a print that doubles at every level as not printed, at the builder heap (carrick#3744)', async () => {
+    const deepDir = temp('carrick-lister-deep-');
+    writeDeepPrintProject(deepDir);
+    const run = await runLister(entry, deepDir, ['--max-old-space-size=1630'], {}, ['fixture-deep-print']);
+    assert.strictEqual(run.listed.status, 'success', run.stderr);
+    const flat = run.listed.surfaces[0].exports.find(e => e.export === 'flat')!;
+    const call = (flat.receivers.find(r => r.receiver === 'export') as unknown as { call: Array<{ returns: string }> }).call;
+    assert.strictEqual(call[0].returns, '<not printed: too large>');
   });
 
   it('lists exactly what the unbundled sidecar lists', async () => {

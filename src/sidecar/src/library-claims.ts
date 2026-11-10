@@ -74,6 +74,7 @@ import type {
   SurfaceTypeExport,
 } from './types.js';
 import { memberDeclaration } from './declaration-attribution.js';
+import type { InternalTypeChecker } from './capture/index.js';
 
 /** The methods a `verb` claim may name, and a method key may accept. */
 const HTTP_METHODS: ReadonlySet<string> = new Set([
@@ -5694,11 +5695,33 @@ class DeclarationReader {
     const known = this.printedTexts.get(type);
     if (known !== undefined) return known;
     surfaceReadCounts.typePrints += 1;
-    const node = this.checker.typeToTypeNode(type, undefined, PRINT_FLAGS);
-    const text = node === undefined ? this.checker.typeToString(type) : printTypeNode(this.orderUnions(node));
-    const listed = truncate(this.scrubbed(text));
+    const listed = this.printedWithinBudget(type);
     this.printedTexts.set(type, listed);
     return listed;
+  }
+
+  /**
+   * The print of `type`, or `NOT_PRINTED` when building it reaches more than
+   * `PRINT_SYMBOL_BUDGET` symbol references. The compiler reports each one to
+   * the tracker, so counting there stops the print wherever it is.
+   */
+  private printedWithinBudget(type: ts.Type): string {
+    const stop = {};
+    let references = 0;
+    const tracker = {
+      trackSymbol: () => {
+        if (++references > PRINT_SYMBOL_BUDGET) throw stop;
+        return false;
+      },
+    };
+    try {
+      const node = (this.checker as InternalTypeChecker).typeToTypeNode(type, undefined, PRINT_FLAGS, undefined, tracker);
+      const text = node === undefined ? this.checker.typeToString(type) : printTypeNode(this.orderUnions(node));
+      return truncate(this.scrubbed(text));
+    } catch (err) {
+      if (err === stop) return NOT_PRINTED;
+      throw err;
+    }
   }
 
   /** `text` with the service root written as `<root>`. */
@@ -6258,6 +6281,16 @@ const PRINT_FLAGS =
   ts.NodeBuilderFlags.UseAliasDefinedOutsideCurrentScope |
   ts.NodeBuilderFlags.IgnoreErrors |
   ts.NodeBuilderFlags.NoTruncation;
+
+/**
+ * A deferred conditional with no alias, whose branches reach more such
+ * conditionals, doubles its print at every level and runs the lister out of
+ * heap. A print that reaches more symbol references than this stops and lists
+ * as `NOT_PRINTED`. Counted, never timed, so the same print stops at the same
+ * point on every run; no finished print in the packages measured came near it.
+ */
+const PRINT_SYMBOL_BUDGET = 100_000;
+const NOT_PRINTED = '<not printed: too large>';
 
 const TYPE_PRINTER = ts.createPrinter({ removeComments: true });
 
