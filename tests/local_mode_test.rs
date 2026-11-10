@@ -1172,7 +1172,7 @@ fn a_comment_only_edit_is_answered_without_a_re_scan() {
     assert_eq!(
         answered["recheck"]["reason"],
         serde_json::json!(
-            "the edit changed nothing the scan reads (comments or layout); verdicts are the index's"
+            "the edit changed nothing the scan reads (comments or layout), or no service reads the file; verdicts are the index's"
         ),
         "{answered:#}"
     );
