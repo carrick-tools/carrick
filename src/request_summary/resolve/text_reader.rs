@@ -437,6 +437,18 @@ impl<'a> Resolver<'a> {
         Some(((path, line, symbol), binding, declared))
     }
 
+    /// Why `row`'s declaration has no binding table entry: a parameter of a
+    /// file of the run, which only the callers entry point reads
+    /// ([`Self::texts_through_callers`]), or a declaration outside the run
+    /// (carrick#3795).
+    fn unread_declaration(&self, row: &Row) -> guards::HoleReason {
+        if self.declared_param(row).is_some() {
+            guards::HoleReason::ParameterUnread
+        } else {
+            guards::HoleReason::OutsideService
+        }
+    }
+
     /// A name read at `lo..hi` of `file`: the one literal the compiler types
     /// it as, else the value of the declaration its row names.
     fn text_of_name(&self, file: &Path, lo: u32, hi: u32) -> Vec<TextValue> {
@@ -460,7 +472,7 @@ impl<'a> Resolver<'a> {
             return self.param_texts(at, param, &[]);
         }
         let Some((at, binding, declared)) = self.declared_entry(row) else {
-            return hole(OutsideService);
+            return hole(self.unread_declaration(row));
         };
         // A `let` the module writes again (`=`, `??=`, `||=`) holds its
         // initialiser and every value written (carrick#3504 S2b-4, D6): a
@@ -631,7 +643,7 @@ impl<'a> Resolver<'a> {
             return out;
         }
         let Some((at, binding, declared)) = self.declared_entry(row) else {
-            return hole(OutsideService);
+            return hole(self.unread_declaration(row));
         };
         let Some(ValueAt::Entries(entries)) = &binding.text else {
             return hole(UnreadExpression);
@@ -1421,11 +1433,11 @@ mod tests {
         let (path, one) = probe_arg(&on, "p_one");
         assert_eq!(
             resolver.text_values(&path, &one),
-            [TextValue::hole(guards::HoleReason::OutsideService)]
+            [TextValue::hole(guards::HoleReason::ParameterUnread)]
         );
         assert_eq!(
             resolver.one_text(&path, &one),
-            Err(guards::HoleReason::OutsideService)
+            Err(guards::HoleReason::ParameterUnread)
         );
         let (path, defaulted) = probe_arg(&on, "p_defaulted");
         let got = resolver.text_values(&path, &defaulted);
@@ -1438,6 +1450,25 @@ mod tests {
                 ("fallback".to_string(), Vec::new())
             ],
             "{got:?}"
+        );
+    }
+
+    /// carrick#3795: a value of a file in no service of the run still stops
+    /// as `outside_service`; only a parameter of the run is `parameter_unread`.
+    #[test]
+    fn a_file_outside_the_run_stops_as_outside_service() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let expr = Expr::Invalid(swc_ecma_ast::Invalid {
+            span: swc_common::DUMMY_SP,
+        });
+        assert_eq!(
+            resolver
+                .text_read(&on.repo, "services/nowhere/src/none.ts", &expr)
+                .map_err(|stop| stop.as_str()),
+            Err("outside_service")
         );
     }
 

@@ -124,11 +124,13 @@ pub enum Stop {
     ProcedureRouterAmbiguous,
     /// A procedure call's key path holds a member the code does not name.
     ProcedurePathUnread,
+    /// A parameter whose callers fill it, read by a reader that does not read through callers.
+    ParameterUnread,
 }
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 50] = [
+    pub const ALL: [Stop; 51] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -179,6 +181,7 @@ impl Stop {
         Stop::ProcedureRouterOutsideRepo,
         Stop::ProcedureRouterAmbiguous,
         Stop::ProcedurePathUnread,
+        Stop::ParameterUnread,
     ];
 
     /// The word as it is written on the wire.
@@ -234,6 +237,7 @@ impl Stop {
             Stop::ProcedureRouterOutsideRepo => "procedure_router_outside_repo",
             Stop::ProcedureRouterAmbiguous => "procedure_router_ambiguous",
             Stop::ProcedurePathUnread => "procedure_path_unread",
+            Stop::ParameterUnread => "parameter_unread",
         }
     }
 
@@ -268,6 +272,7 @@ impl From<HoleReason> for Stop {
             HoleReason::UnresolvedName => Stop::UnresolvedName,
             HoleReason::UntypedReceiver => Stop::UntypedReceiver,
             HoleReason::SeveralPaths => Stop::SeveralPaths,
+            HoleReason::ParameterUnread => Stop::ParameterUnread,
         }
     }
 }
@@ -356,6 +361,7 @@ mod tests {
             (H::UnresolvedName, "unresolved_name"),
             (H::UntypedReceiver, "untyped_receiver"),
             (H::SeveralPaths, "several_paths"),
+            (H::ParameterUnread, "parameter_unread"),
         ] {
             assert_eq!(serde_json::to_value(reason).unwrap(), word);
             assert_eq!(Stop::from(reason).as_str(), word);
