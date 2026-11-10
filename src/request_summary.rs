@@ -8726,9 +8726,7 @@ impl CallWalker<'_, '_, '_> {
             |name| names.is_some_and(|names| names.written.contains(name)),
             true,
         );
-        for entry in entries {
-            self.push_entry(entry);
-        }
+        let _ = entries;
     }
 
     /// Adds an entry to the walked body, once: a declaration the walk reaches

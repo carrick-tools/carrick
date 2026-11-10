@@ -435,7 +435,7 @@ impl<'a> Resolver<'a> {
             .get(&(line, symbol.clone()))
             // A block-scoped or nested local is in the table, and no text
             // read opens it yet (carrick#3794): it reads as no entry.
-            .filter(|binding| !binding.scoped_entry())?;
+            ?;
         let declared = super::super::site_record::declaration_path(row.decl_file()?);
         Some(((path, line, symbol), binding, declared))
     }
