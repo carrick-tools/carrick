@@ -1551,8 +1551,8 @@ pub fn fold_rows(
     // the sites the call reaches is a fact and together they state one
     // operation (carrick#2704): the call makes that request, and the
     // reader's other key is a wrong reading of it, not a second request.
-    // No row there, a candidate, or several operations, and a disagreeing
-    // caller's row stands.
+    // No row there, a candidate, an old-path row, or several operations, and
+    // a disagreeing caller's row stands.
     let at = |row: &ApiEndpointDetails, file: &str, line: u32| {
         place(root, row).is_some_and(|(f, l)| f == file && l == line)
     };
@@ -1577,9 +1577,12 @@ pub fn fold_rows(
         let procedures: Vec<Option<carrick_match::ProcedureKey>> =
             stated.iter().map(|row| row.procedure.clone()).collect();
         // A second call on the caller's line may be the reader row's own.
+        // An old-path row reads the site's spelling, not its request
+        // (carrick#3822): a caller's row that disagrees with it stands for
+        // `call_through::settle` to restate.
         let one_fact = !stated.is_empty()
             && !throughs.iter().any(|through| through.other_call)
-            && stated.iter().all(|row| is_fact(row))
+            && stated.iter().all(|row| is_fact(row) && !is_old_path(row))
             && keys.iter().all(|key| *key == keys[0])
             && procedures
                 .iter()
