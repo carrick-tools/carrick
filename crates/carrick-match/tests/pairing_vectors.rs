@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use carrick_match::{
     Call, MatchEvidence, MatchRelationship, MatchVerdict, NameScope, PairOutcome, Pairing,
-    PairingPool, Producer, canonical_path, pair_winners, route_identity,
+    PairingPool, ProcedureKey, Producer, RouterId, canonical_path, pair_winners, route_identity,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -24,7 +24,7 @@ const VECTORS: &[u8] = include_bytes!("fixtures/pairing.vectors.json");
 /// (`lambdas/mcp-server/src/utils/__tests__/fixtures/pairing.vectors.json`)
 /// is byte-identical, so a change is a contract change: change the vectors
 /// on both sides and re-pin both values together.
-const PINNED_SHA256: &str = "02c72f03cdc00bd538b6b3ee1f9d768d7b766698574032d32c7a6c7ad1b41868";
+const PINNED_SHA256: &str = "07c1bc20d1274486c2183853a76fa3869d75eaf5ecad598eb37451a581638e5c";
 
 /// The cases that pin today's answer for a named product gap (the file's
 /// `expected_red` marker). The change that closes a gap removes its marker
@@ -62,6 +62,20 @@ fn name_scope(value: &Value) -> Option<NameScope> {
     })
 }
 
+/// The vector file's `procedure` object, read strictly.
+fn procedure(value: &Value) -> Option<ProcedureKey> {
+    let raw = value.get("procedure")?;
+    let router = &raw["router"];
+    Some(ProcedureKey {
+        path: required(raw, "path"),
+        router: RouterId {
+            repo: required(router, "repo"),
+            file: required(router, "file"),
+            binding: required(router, "binding"),
+        },
+    })
+}
+
 fn producer(value: &Value) -> Producer {
     Producer {
         service: required(value, "service"),
@@ -77,6 +91,7 @@ fn producer(value: &Value) -> Producer {
             Some(other) => panic!("unknown evidence {other}"),
         },
         name_scope: name_scope(value),
+        procedure: procedure(value),
     }
 }
 
@@ -90,6 +105,7 @@ fn call(value: &Value) -> Call {
         direction: text(value, "direction"),
         dispatch: text(value, "dispatch"),
         name_scope: name_scope(value),
+        procedure: procedure(value),
     }
 }
 
@@ -101,6 +117,7 @@ fn outcome_name(outcome: PairOutcome) -> &'static str {
         PairOutcome::UnknownCallPath => "unknown_call_path",
         PairOutcome::NoLiteralAgreement => "no_literal_agreement",
         PairOutcome::NoRoute => "no_route",
+        PairOutcome::ProcedureUnserved => "procedure_unserved",
     }
 }
 

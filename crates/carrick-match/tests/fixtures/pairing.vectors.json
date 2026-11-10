@@ -8,6 +8,7 @@
     "HTTP, in order: (1) a call path with no literal segment is unknown_call_path and pairs with nothing; (2) the pool is every HTTP producer, in every service including the caller's own, whose method serves the call's (method_matches: case-insensitive, producer ALL serves every method, consumer ALL only producer ALL); (3) producers whose path routes the call (match_agreement is defined) are ranked by agreement and only the maximal ones are kept, ties kept; nothing routes -> no_route; (4) each kept producer answers match_verdict_with_dispatch; (5) dispatch_outcome over those answers decides: matched -> winners are the matched producers; route_case_unknown -> winners are the dispatching producers whose case the call does not state (one edge to the route, case unknown); no_case_answers -> no winner; otherwise (best agreement 0: a bare catch-all or a param-only route) -> no_literal_agreement, no winner.",
     "Every winner carries same_service (producer service == call service), relationship (producer_consumer for route-definition evidence, shared_external_contract for call-site evidence) and, for HTTP, call_param_over_route_literal (the call has a placeholder where this route states a literal: carrick#2004; the edge stands, the type check does not compare). These are facts, not filters: what a surface draws for them is its documented policy.",
     "routed lists every maximal-agreement producer with its verdict, for reasons and near-miss text. It is empty for non-HTTP calls, unknown_call_path and no_route.",
+    "A call carrying procedure (a tRPC-style procedure call: path and router repo, file and binding) pairs first, before any protocol rule: its winners are every producer whose procedure equals the call's, in input order, each matched with no agreement and no routed rows. The call's path and method are not read. Nothing equal gives procedure_unserved: no winner, never a missing endpoint. A call without procedure pairs as the rules above say.",
     "A case carrying expected_red pins today's answer for a product gap the case names: the answer is right for this function's rule and wrong for the product. Its expect is checked like any other; the marker says what turns the product green and must be removed by the change that does."
   ],
   "cases": [
@@ -1353,6 +1354,479 @@
             "relationship": "producer_consumer"
           }
         ],
+        "routed": []
+      }
+    },
+    {
+      "id": "procedure-call-pairs-the-producer-with-its-router-and-key-path",
+      "source": "T3-M: a client call names a procedure; two routers hold the same key path",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          },
+          {
+            "service": "admin",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/admin/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/admin.ts",
+                "binding": "adminRouter"
+              }
+            }
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "QUERY",
+          "path": "",
+          "procedure": {
+            "path": "shelf.list",
+            "router": {
+              "repo": "shelf-repo",
+              "file": "src/router.ts",
+              "binding": "appRouter"
+            }
+          }
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "same_service": false,
+            "relationship": "producer_consumer"
+          }
+        ],
+        "routed": []
+      }
+    },
+    {
+      "id": "procedure-decides-over-the-call-path",
+      "source": "T3-M: the call's path would route producer 1; the procedure decides",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          },
+          {
+            "service": "admin",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/admin/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/admin.ts",
+                "binding": "adminRouter"
+              }
+            }
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/admin/rpc/shelf.list",
+          "procedure": {
+            "path": "shelf.list",
+            "router": {
+              "repo": "shelf-repo",
+              "file": "src/router.ts",
+              "binding": "appRouter"
+            }
+          }
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "same_service": false,
+            "relationship": "producer_consumer"
+          }
+        ],
+        "routed": []
+      }
+    },
+    {
+      "id": "procedure-no-equal-producer-is-unserved-not-missing",
+      "source": "T3-M: nothing serves the procedure; a reading gap, never a missing endpoint",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          },
+          {
+            "service": "admin",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/admin/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/admin.ts",
+                "binding": "adminRouter"
+              }
+            }
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "QUERY",
+          "path": "",
+          "procedure": {
+            "path": "shelf.gone",
+            "router": {
+              "repo": "shelf-repo",
+              "file": "src/router.ts",
+              "binding": "appRouter"
+            }
+          }
+        }
+      },
+      "expect": {
+        "outcome": "procedure_unserved",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "procedure-same-service-pair",
+      "source": "T3-M: client and server in one service",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          },
+          {
+            "service": "admin",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/admin/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/admin.ts",
+                "binding": "adminRouter"
+              }
+            }
+          }
+        ],
+        "call": {
+          "service": "api",
+          "protocol": "http",
+          "method": "QUERY",
+          "path": "",
+          "procedure": {
+            "path": "shelf.list",
+            "router": {
+              "repo": "shelf-repo",
+              "file": "src/router.ts",
+              "binding": "appRouter"
+            }
+          }
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "same_service": true,
+            "relationship": "producer_consumer"
+          }
+        ],
+        "routed": []
+      }
+    },
+    {
+      "id": "plain-http-call-without-procedure-still-pairs-by-path",
+      "source": "T3-M: a call with no procedure pairs as before",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          },
+          {
+            "service": "admin",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/admin/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/admin.ts",
+                "binding": "adminRouter"
+              }
+            }
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/rpc/shelf.list"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 3,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 3
+          }
+        ]
+      }
+    },
+    {
+      "id": "procedure-one-router-served-at-two-mounts-both-win",
+      "source": "T3-M: the same procedure at two mounts",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/v2/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "QUERY",
+          "path": "",
+          "procedure": {
+            "path": "shelf.list",
+            "router": {
+              "repo": "shelf-repo",
+              "file": "src/router.ts",
+              "binding": "appRouter"
+            }
+          }
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "same_service": false,
+            "relationship": "producer_consumer"
+          },
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "same_service": false,
+            "relationship": "producer_consumer"
+          }
+        ],
+        "routed": []
+      }
+    },
+    {
+      "id": "procedure-different-repo-is-unserved",
+      "source": "T3-M: equal file, binding and path in another repo",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          },
+          {
+            "service": "admin",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/admin/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/admin.ts",
+                "binding": "adminRouter"
+              }
+            }
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "QUERY",
+          "path": "",
+          "procedure": {
+            "path": "shelf.list",
+            "router": {
+              "repo": "other-repo",
+              "file": "src/router.ts",
+              "binding": "appRouter"
+            }
+          }
+        }
+      },
+      "expect": {
+        "outcome": "procedure_unserved",
+        "winners": [],
+        "routed": []
+      }
+    },
+    {
+      "id": "empty-path-call-without-procedure-is-unknown-call-path",
+      "source": "T3-M: what a reader on main sees of a procedure call",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/router.ts",
+                "binding": "appRouter"
+              }
+            }
+          },
+          {
+            "service": "admin",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/admin/rpc/shelf.list",
+            "procedure": {
+              "path": "shelf.list",
+              "router": {
+                "repo": "shelf-repo",
+                "file": "src/admin.ts",
+                "binding": "adminRouter"
+              }
+            }
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "QUERY",
+          "path": ""
+        }
+      },
+      "expect": {
+        "outcome": "unknown_call_path",
+        "winners": [],
         "routed": []
       }
     }

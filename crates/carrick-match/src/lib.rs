@@ -56,7 +56,8 @@
 //! carrick#3496). It folds the primitives above, `names_pair` included, and
 //! the `wasm` feature exports it as the class `PairingPool` (JSON in, JSON
 //! out) beside [`canonical_path`], so a surface pairs through it rather than
-//! re-composing the primitives. Its rule is the vector file
+//! re-composing the primitives. A call that names a procedure
+//! ([`ProcedureKey`]) pairs first, by exact key. Its rule is the vector file
 //! `tests/fixtures/pairing.vectors.json`, run natively and over wasm.
 
 mod name_scope;
@@ -64,7 +65,8 @@ mod pairing;
 
 pub use name_scope::{GLOBAL_SCOPE, NameScope, SERVICE_SCOPE, ScopedRow, names_pair};
 pub use pairing::{
-    Call, PairOutcome, Pairing, PairingPool, Producer, Routed, Winner, canonical_path, pair_winners,
+    Call, PairOutcome, Pairing, PairingPool, ProcedureKey, Producer, Routed, RouterId, Winner,
+    canonical_path, pair_winners,
 };
 
 /// The kind of source evidence backing one side of a match: a route
