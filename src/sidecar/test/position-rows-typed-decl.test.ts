@@ -103,6 +103,6 @@ describe('position_rows: a call through a value typed as a function (carrick#244
 
   it('bumps the format version', () => {
     assert.strictEqual(version, POSITION_ROWS_VERSION);
-    assert.strictEqual(POSITION_ROWS_VERSION, 5);
+    assert.strictEqual(POSITION_ROWS_VERSION, 6);
   });
 });
