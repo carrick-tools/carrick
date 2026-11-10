@@ -98,6 +98,7 @@ pub(super) fn settle(
             scope_files: resolved.scope_files,
         });
         traced[index].push(TracedRoute {
+            procedures: Vec::new(),
             file: resolved.file,
             line: resolved.line,
             method: resolved.method,

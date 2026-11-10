@@ -300,6 +300,16 @@ pub struct ApiEndpointDetails {
     /// index, and read by matching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<crate::dispatch::Dispatch>,
+    /// The procedure this row is, when it is a procedure of an RPC router
+    /// (tRPC and similar): its key path and the router that declares it
+    /// (the router is named by
+    /// [`crate::request_summary::decided_sites::router_holder`]). It is the
+    /// row's IDENTITY where present: the base, the mount and the method are
+    /// transport. `None` on every row that is not a procedure, which is
+    /// nearly every row. Same pattern as `dispatch`: `default`, skipped when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure: Option<carrick_match::ProcedureKey>,
     /// On a GraphQL CALL entry: which schema identity the document it was
     /// parsed from is bound to (carrick#1134). `served` when a schema a
     /// service in this repository serves holds the document's fields, so an
@@ -4836,6 +4846,7 @@ mod tests {
 
     fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key,
@@ -5480,6 +5491,7 @@ mod tests {
         let mut call = op_details_in_repo(OperationKey::http("GET", key), file, "repo");
         call.repo_name = None;
         let row = crate::mount_graph::DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: key.to_string(),
             canonical_path: key.to_string(),
@@ -5765,6 +5777,7 @@ mod tests {
             "https://undeclared.test/v1/orders",
         ] {
             analyzer.calls.push(ApiEndpointDetails {
+                procedure: None,
                 view_module: false,
                 owner: None,
                 key: OperationKey::http("GET", route),
@@ -5811,6 +5824,7 @@ mod tests {
     /// A call-site fixture for the host tests below.
     fn host_test_call(method: &str, url: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http(method, url),
@@ -5837,6 +5851,7 @@ mod tests {
 
     fn host_test_route(method: &str, path: &str) -> crate::mount_graph::ResolvedEndpoint {
         crate::mount_graph::ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: method.to_string(),
             path: path.to_string(),
@@ -5928,6 +5943,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/orders"),
@@ -5953,6 +5969,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
@@ -6025,6 +6042,7 @@ mod tests {
         for (consumer_source, producer_source, expected) in cases {
             let mut analyzer = Analyzer::new(Config::default());
             analyzer.calls.push(ApiEndpointDetails {
+                procedure: None,
                 view_module: false,
                 owner: None,
                 key: OperationKey::http("GET", "/api/orders"),
@@ -6050,6 +6068,7 @@ mod tests {
 
             let mut mount_graph = MountGraph::new();
             mount_graph.endpoints.push(ResolvedEndpoint {
+                procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
                 path: "/api/orders".to_string(),
@@ -6068,6 +6087,7 @@ mod tests {
                 address: None,
             });
             mount_graph.data_calls.push(DataFetchingCall {
+                procedure: None,
                 method: "GET".to_string(),
                 target_url: "/api/orders".to_string(),
                 canonical_path: "/api/orders".to_string(),
@@ -6143,6 +6163,7 @@ mod tests {
             });
             for location in held {
                 mount_graph.data_calls.push(DataFetchingCall {
+                    procedure: None,
                     method: "GET".to_string(),
                     target_url: "/api/orders".to_string(),
                     canonical_path: "/api/orders".to_string(),
@@ -6188,6 +6209,7 @@ mod tests {
         resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
     ) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key,
@@ -6343,6 +6365,7 @@ mod tests {
         // The HTTP request on the same line is a fact, and so is its route.
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
@@ -6361,6 +6384,7 @@ mod tests {
             address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "/api/orders".to_string(),
             canonical_path: "/api/orders".to_string(),
@@ -6428,6 +6452,7 @@ mod tests {
         ));
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
@@ -6448,6 +6473,7 @@ mod tests {
         // The one call row the scan holds in that file is on another line,
         // and there is no pub/sub call row at all.
         mount_graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "/api/orders".to_string(),
             canonical_path: "/api/orders".to_string(),
@@ -6786,6 +6812,7 @@ mod tests {
 
         let mut analyzer = Analyzer::new(Config::default());
         analyzer.calls.push(ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/orders"),
@@ -6821,6 +6848,7 @@ mod tests {
             ),
         ] {
             mount_graph.endpoints.push(ResolvedEndpoint {
+                procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
                 path: "/api/orders".to_string(),
@@ -6840,6 +6868,7 @@ mod tests {
             });
         }
         mount_graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: "/api/orders".to_string(),
             canonical_path: "/api/orders".to_string(),
@@ -6883,6 +6912,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         for (path, is_view_module) in [("/dashboard", true), ("/api/orders", false)] {
             mount_graph.endpoints.push(ResolvedEndpoint {
+                procedure: None,
                 view_module: is_view_module,
                 method: "GET".to_string(),
                 path: path.to_string(),
@@ -6947,6 +6977,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
         let mut call = |value: Option<&str>, line: u32| {
             analyzer.calls.push(ApiEndpointDetails {
+                procedure: None,
                 view_module: false,
                 owner: None,
                 key: OperationKey::http("POST", ROUTE),
@@ -6977,6 +7008,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         for value in CASES {
             mount_graph.endpoints.push(ResolvedEndpoint {
+                procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
                 path: ROUTE.to_string(),
@@ -7037,6 +7069,7 @@ mod tests {
 
         let mut analyzer = Analyzer::new(Config::default());
         analyzer.calls.push(ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http("POST", ROUTE),
@@ -7063,6 +7096,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         for (value, line) in [("search-by-intent", 400), ("list-external-calls", 412)] {
             mount_graph.endpoints.push(ResolvedEndpoint {
+                procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
                 path: ROUTE.to_string(),
@@ -7082,6 +7116,7 @@ mod tests {
             });
         }
         mount_graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: ROUTE.to_string(),
             canonical_path: ROUTE.to_string(),
@@ -7169,6 +7204,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/missing"),
@@ -7194,6 +7230,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
@@ -7235,6 +7272,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/missing"),
@@ -7262,6 +7300,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
@@ -7305,6 +7344,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/widgets"),
@@ -7331,6 +7371,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         // The matched producer: an MSW-style handler under a mock tree.
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
@@ -7350,6 +7391,7 @@ mod tests {
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/api/widgets".to_string(),
@@ -7368,6 +7410,7 @@ mod tests {
             address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: "/api/widgets".to_string(),
             canonical_path: "/api/widgets".to_string(),
@@ -7468,6 +7511,7 @@ mod tests {
         // reclassified to call-site evidence at scan time.
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
@@ -7487,6 +7531,7 @@ mod tests {
         });
         // repo-beta: the identical call to the same external endpoint.
         mount_graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "https://api.vendor.example/v2/widgets".to_string(),
             canonical_path: "/v2/widgets".to_string(),
@@ -7557,6 +7602,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
@@ -7575,6 +7621,7 @@ mod tests {
             address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "/v2/widgets".to_string(),
             canonical_path: "/v2/widgets".to_string(),
@@ -7628,6 +7675,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
@@ -7646,6 +7694,7 @@ mod tests {
             address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "/v2/widgets".to_string(),
             canonical_path: "/v2/widgets".to_string(),
@@ -7690,6 +7739,7 @@ mod tests {
     /// Producer endpoint in the mount graph, repo-tagged `"api"`.
     fn resolved(method: &str, full_path: &str) -> crate::mount_graph::ResolvedEndpoint {
         crate::mount_graph::ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: method.to_string(),
             path: full_path.to_string(),
@@ -9328,6 +9378,7 @@ mod tests {
         repo: &str,
     ) -> crate::mount_graph::DataFetchingCall {
         crate::mount_graph::DataFetchingCall {
+            procedure: None,
             method: method.to_string(),
             target_url: canonical_path.to_string(),
             canonical_path: canonical_path.to_string(),

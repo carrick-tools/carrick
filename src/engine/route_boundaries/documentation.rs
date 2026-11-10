@@ -270,6 +270,7 @@ mod tests {
 
     fn row(location: &str, handler: &str, source: Option<ResolutionSource>) -> ResolvedEndpoint {
         ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/users".to_string(),

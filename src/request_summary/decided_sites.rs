@@ -64,13 +64,15 @@ pub mod boundaries;
 mod composed;
 mod instances;
 mod procedures;
+mod router_holder;
 pub use boundaries::RouteBoundaries;
 pub use composed::Composed;
 pub use instances::{
     InstanceAt, InstanceEnd, InstanceHole, MakerCall, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
     origin_side,
 };
-pub use procedures::{Procedure, ProcedureLabels};
+pub use procedures::{Procedure, ProcedureAt, ProcedureLabels};
+pub use router_holder::router_holder;
 
 /// The hop discovery records where a walk enters a function through a value
 /// the call runs (carrick#2432, [`super::discovery`]).

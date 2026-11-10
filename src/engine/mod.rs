@@ -7746,6 +7746,23 @@ fn write_traced_routes(
         return write;
     }
     let applied = &mut write.applied;
+    let repo = crate::utils::get_repository_name(repo_path);
+    // The procedure a traced route is at one full path (the router is named
+    // by `router_holder`), where the route is a procedure's.
+    let procedure_at = |route: &crate::site_rows::TracedRoute, full_path: &str| {
+        route
+            .procedures
+            .iter()
+            .find(|at| at.full_path == full_path)
+            .map(|at| carrick_match::ProcedureKey {
+                path: at.key_path.clone(),
+                router: carrick_match::RouterId {
+                    repo: repo.clone(),
+                    file: at.router_file.clone(),
+                    binding: at.router_binding.clone(),
+                },
+            })
+    };
     let repo_root = normalize_protocol_file(Path::new(repo_path));
     let place = |location: &str| row_place(location, &repo_root);
     // The graph names its files as the walk did (repo-relative, or under
@@ -7871,6 +7888,7 @@ fn write_traced_routes(
                 let own = route.path.clone();
                 let row = &mut mount_graph.endpoints[index];
                 row.address = route.addresses.get(&full_path).cloned();
+                row.procedure = procedure_at(route, &full_path);
                 row.full_path = full_path;
                 row.resolution_source = Some(ResolutionSource::LibraryClaim);
                 if corrects {
@@ -7950,6 +7968,21 @@ fn write_traced_routes(
                             .and_then(|traced| route.addresses.get(traced))
                     })
                     .cloned();
+                row.procedure = routes
+                    .iter()
+                    .filter(|route| route.method.eq_ignore_ascii_case(&row.method))
+                    .find_map(|route| {
+                        route
+                            .procedures
+                            .iter()
+                            .find(|at| {
+                                MountGraph::paths_equal_modulo_param_names(
+                                    &at.full_path,
+                                    &row.full_path,
+                                )
+                            })
+                            .and_then(|at| procedure_at(route, &at.full_path))
+                    });
                 applied.relabelled += 1;
                 write.relabelled.push(index);
             }
@@ -7991,6 +8024,7 @@ fn write_traced_routes(
                         resolution_source: Some(ResolutionSource::LibraryClaim),
                         handler_span: None,
                         address: route.addresses.get(full_path).cloned(),
+                        procedure: procedure_at(route, full_path),
                         ..template.clone()
                     },
                     // With no binding symbol there is no owner to write: the
@@ -8024,6 +8058,7 @@ fn write_traced_routes(
                         dispatch: None,
                         handler_span: None,
                         address: route.addresses.get(full_path).cloned(),
+                        procedure: procedure_at(route, full_path),
                     },
                 };
                 written.push(row);
@@ -8275,6 +8310,7 @@ fn append_deterministic_protocol_operations(
     // Same "{file}:{line}" convention the mount-graph conversions use. A
     // call's row; a producer's is `to_producer` below.
     let to_call = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+        procedure: None,
         owner: None,
         key,
         params: vec![],
@@ -16917,6 +16953,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             |pkg: &str| format!("{home}/.cache/runtime/npm/registry.npmjs.org/{pkg}/dist/types");
 
         let op = |file: &str| ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/orders".to_string()),
@@ -16963,6 +17000,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/orders".to_string(),
@@ -16981,6 +17019,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             address: None,
         });
         graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: "http://api/search".to_string(),
             canonical_path: "/search".to_string(),
@@ -17362,6 +17401,7 @@ unfollowed_member_calls_total: 0,
     fn test_ast_stripping_removes_nodes() {
         // Create test CloudRepoData with AST nodes
         let endpoint = ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: Some(OwnerType::App("test_app".to_string())),
             key: OperationKey::http("GET", "/test"),
@@ -17530,6 +17570,7 @@ unfollowed_member_calls_total: 0,
 
         // Create test data with TypeReferences that would cause SourceMap issues
         let endpoint = ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: Some(OwnerType::App("test_app".to_string())),
             key: OperationKey::http("GET", "/test"),
@@ -17721,6 +17762,7 @@ unfollowed_member_calls_total: 0,
         let mk_call = |target: &str, file: &str| {
             let target = target.to_string();
             crate::mount_graph::DataFetchingCall {
+                procedure: None,
                 method: "GET".to_string(),
                 canonical_path: normalizer.consumer_call_path_read(&target),
                 target_url: target,
@@ -17798,6 +17840,7 @@ unfollowed_member_calls_total: 0,
     fn a_row_restated_at_a_helper_s_caller_has_no_response_entry() {
         let config = Config::default();
         let call = |method: &str, path: &str, line: u32| crate::mount_graph::DataFetchingCall {
+            procedure: None,
             method: method.to_string(),
             canonical_path: path.to_string(),
             target_url: path.to_string(),
@@ -17947,6 +17990,7 @@ unfollowed_member_calls_total: 0,
     fn a_call_to_the_service_s_own_route_has_its_type_entries() {
         let config = Config::default();
         let call = |path: &str, line: u32, own_route: bool| crate::mount_graph::DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             canonical_path: path.to_string(),
             target_url: path.to_string(),
@@ -18011,6 +18055,7 @@ unfollowed_member_calls_total: 0,
     fn test_duplicate_producer_keys_each_get_their_own_manifest_entry() {
         let config = Config::default();
         let mk_endpoint = |file: &str| crate::mount_graph::ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/api/orders/:id".to_string(),
@@ -18090,6 +18135,7 @@ unfollowed_member_calls_total: 0,
         let config = Config::default();
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![crate::mount_graph::ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
@@ -18108,6 +18154,7 @@ unfollowed_member_calls_total: 0,
             address: None,
         }];
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "/v2/widgets".to_string(),
             canonical_path: "/v2/widgets".to_string(),
@@ -19172,6 +19219,7 @@ unfollowed_member_calls_total: 0,
         let mut graph = crate::mount_graph::MountGraph::new();
         graph.data_calls = vec![
             crate::mount_graph::DataFetchingCall {
+                procedure: None,
                 method: "POST".to_string(),
                 target_url: "https://api.vendor.test/v1/charges".to_string(),
                 canonical_path: "/v1/charges".to_string(),
@@ -19193,6 +19241,7 @@ unfollowed_member_calls_total: 0,
                 static_asset: None,
             },
             crate::mount_graph::DataFetchingCall {
+                procedure: None,
                 method: "GET".to_string(),
                 target_url: "${process.env.BILLING_API}/invoices".to_string(),
                 canonical_path: "${process.env.BILLING_API}/invoices".to_string(),
@@ -25756,6 +25805,7 @@ unfollowed_member_calls_total: 0,
     /// #307 (class 2) helper: an LLM HTTP data call at a given file/target.
     fn transport_call(target: &str, file_location: &str) -> crate::mount_graph::DataFetchingCall {
         crate::mount_graph::DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: target.to_string(),
             canonical_path: target.to_string(),
@@ -25819,6 +25869,7 @@ unfollowed_member_calls_total: 0,
     fn fold_reads_raw_target_not_stripped_canonical() {
         let mut mount_graph = MountGraph::new();
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "`${SUPPORT_GQL_URL}/graphql`".to_string(),
             canonical_path: "/graphql".to_string(),
@@ -27583,6 +27634,7 @@ unfollowed_member_calls_total: 0,
             },
         );
         let route = |line: u32, path: &str, source| crate::mount_graph::ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: path.to_string(),
@@ -27681,6 +27733,7 @@ unfollowed_member_calls_total: 0,
         source: crate::agents::file_analyzer_agent::ResolutionSource,
     ) -> crate::mount_graph::ResolvedEndpoint {
         crate::mount_graph::ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: method.to_string(),
             path: path.to_string(),
@@ -27709,6 +27762,7 @@ unfollowed_member_calls_total: 0,
         full_paths: &[&str],
     ) -> crate::site_rows::TracedRoute {
         crate::site_rows::TracedRoute {
+            procedures: Vec::new(),
             file: file.to_string(),
             line,
             method: method.to_string(),
@@ -30934,6 +30988,7 @@ io.on("bare:in", (event) => {});
         // in calls (consumer), keyed identically so they match cross-repo.
         let mut cloud_data = repo_with_bundle("metrics-monorepo", None, "");
         let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+            procedure: None,
             view_module: false,
             owner: None,
             key,
@@ -31717,6 +31772,7 @@ io.on("bare:in", (event) => {});
         repo.endpoints = paths
             .iter()
             .map(|path| ApiEndpointDetails {
+                procedure: None,
                 view_module: false,
                 owner: None,
                 key: OperationKey::http("GET", path.to_string()),

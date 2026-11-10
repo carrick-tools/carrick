@@ -11693,6 +11693,7 @@ impl FileOrchestrator {
                 };
 
                 graph.endpoints.push(ResolvedEndpoint {
+                    procedure: None,
                     method,
                     path: endpoint.path.clone(),
                     full_path: endpoint.path.clone(), // Will be resolved later
@@ -11780,6 +11781,7 @@ impl FileOrchestrator {
                 }
                 collected.push((
                     DataFetchingCall {
+                        procedure: None,
                         method,
                         target_url: data_call.target.clone(),
                         canonical_path,
@@ -18960,6 +18962,7 @@ export { routes };
         source: ResolutionSource,
     ) -> ResolvedEndpoint {
         ResolvedEndpoint {
+            procedure: None,
             method: method.to_string(),
             path: path.to_string(),
             full_path: path.to_string(),

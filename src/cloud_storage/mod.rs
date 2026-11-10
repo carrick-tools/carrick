@@ -1405,6 +1405,7 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
         // operation's identity, so it travels onto the index row: without
         // it, nine operations behind one route are one row on the wire.
         dispatch: endpoint.dispatch.clone(),
+        procedure: endpoint.procedure.clone(),
         schema_binding: None,
         undeclared_selection: None,
         handler_span: endpoint.handler_span,
@@ -1437,6 +1438,7 @@ pub fn call_details(call: &crate::mount_graph::DataFetchingCall) -> ApiEndpointD
         // The value this call sends for the field its target dispatches
         // on (carrick#831): the consumer half of the same identity.
         dispatch: call.dispatch.clone(),
+        procedure: call.procedure.clone(),
         schema_binding: None,
         undeclared_selection: None,
         // A call has no handler.
@@ -2243,6 +2245,7 @@ mod tests {
                 )
             };
             data.endpoints = vec![ApiEndpointDetails {
+                procedure: None,
                 owner: None,
                 key: OperationKey::http("POST", "/orders".to_string()),
                 params: vec![],
@@ -2490,6 +2493,7 @@ mod tests {
 
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
@@ -2527,6 +2531,7 @@ mod tests {
 
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
             full_path: "/api/widgets".to_string(),
@@ -2546,6 +2551,7 @@ mod tests {
         });
         // A route whose module also renders a view (carrick#704).
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             method: "GET".to_string(),
             path: "/admin".to_string(),
             full_path: "/admin".to_string(),
@@ -2564,6 +2570,7 @@ mod tests {
             address: None,
         });
         graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "${process.env.GATEWAY_URL}/v1/quote".to_string(),
             canonical_path: "/v1/quote".to_string(),
@@ -2621,6 +2628,7 @@ mod tests {
         };
         let mut graph = MountGraph::new();
         let route = |dispatch: Option<Dispatch>| ResolvedEndpoint {
+            procedure: None,
             method: "POST".to_string(),
             path: "/types/check-or-upload".to_string(),
             full_path: "/types/check-or-upload".to_string(),
@@ -2641,6 +2649,7 @@ mod tests {
         graph.endpoints.push(route(Some(case("search-by-intent"))));
         graph.endpoints.push(route(None));
         graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "${API}/types/check-or-upload".to_string(),
             canonical_path: "/types/check-or-upload".to_string(),
@@ -2748,6 +2757,7 @@ mod tests {
 
         let mut graph = MountGraph::new();
         let row = |path: &str, file: &str, view_module: bool| ResolvedEndpoint {
+            procedure: None,
             method: "GET".to_string(),
             path: path.to_string(),
             full_path: path.to_string(),
@@ -2774,6 +2784,7 @@ mod tests {
             false,
         ));
         graph.data_calls.push(DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: "/internal/audit".to_string(),
             canonical_path: "/internal/audit".to_string(),
@@ -3381,6 +3392,7 @@ mod tests {
         use crate::graphql::SchemaBinding;
         use crate::operation::{GraphqlOperationKind, OperationKey};
         let row = |key: OperationKey, binding: Option<SchemaBinding>| ApiEndpointDetails {
+            procedure: None,
             owner: None,
             key,
             params: vec![],

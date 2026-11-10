@@ -795,6 +795,7 @@ mod tests {
         }]);
         let mut graph = MountGraph::new();
         graph.data_calls = vec![DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "/v1/payments".to_string(),
             canonical_path: "/v1/payments".to_string(),
@@ -941,6 +942,7 @@ mod tests {
         sdk.sdk_surface = Some(surface);
         let mut graph = MountGraph::new();
         graph.data_calls = vec![DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: "/v1/vaults".to_string(),
             canonical_path: "/v1/vaults".to_string(),
@@ -1005,6 +1007,7 @@ mod tests {
         }]);
         let mut graph = MountGraph::new();
         graph.data_calls = vec![DataFetchingCall {
+            procedure: None,
             method: "POST".to_string(),
             target_url: "/v1/payments".to_string(),
             canonical_path: "/v1/payments".to_string(),

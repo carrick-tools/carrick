@@ -246,6 +246,10 @@ pub struct TracedRoute {
     /// path of its own, so a row at its line states some other reading and
     /// stays (carrick#2474 R6c).
     pub corrects: bool,
+    /// For a procedure's route: each full path with its key path and router
+    /// ([`crate::request_summary::decided_sites::router_holder`]). Empty for
+    /// every other route.
+    pub procedures: Vec<crate::request_summary::decided_sites::ProcedureAt>,
 }
 
 /// The route sites the receiver trace serves at a full path, and the rest
@@ -398,6 +402,7 @@ fn procedure_route(
             .and_then(|handler| handler.name.clone()),
         owner: procedure.owner.clone(),
         corrects: false,
+        procedures: procedure.at.clone(),
     })
 }
 
@@ -536,6 +541,7 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
             full_paths.sort();
             full_paths.dedup();
             TracedRoute {
+                procedures: Vec::new(),
                 file: site.file.clone(),
                 line: site.line,
                 method: method.to_uppercase(),
@@ -1198,6 +1204,7 @@ pub fn fold(
             };
             let host = host.or_else(|| read.and_then(|call| call.host.clone()));
             graph.data_calls.push(DataFetchingCall {
+                procedure: None,
                 method: method.to_string(),
                 target_url: path.to_string(),
                 canonical_path: path.to_string(),

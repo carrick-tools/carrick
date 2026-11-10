@@ -115,6 +115,16 @@ pub struct ResolvedEndpoint {
     /// matching reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<crate::address::Address>,
+    /// The procedure this row is, when it is a procedure of an RPC router
+    /// (tRPC and similar): its key path and the router that declares it
+    /// (the router is named by
+    /// [`crate::request_summary::decided_sites::router_holder`]). It is the
+    /// row's IDENTITY where present: the base, the mount and the method are
+    /// transport. `None` on every row that is not a procedure, which is
+    /// nearly every row. Same pattern as `dispatch`: `default`, skipped when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure: Option<carrick_match::ProcedureKey>,
 }
 
 /// A 1-based, inclusive line range in an endpoint row's own file: the span of
@@ -343,6 +353,16 @@ pub struct DataFetchingCall {
     /// cannot say which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<crate::dispatch::Dispatch>,
+    /// The procedure this row is, when it is a procedure of an RPC router
+    /// (tRPC and similar): its key path and the router that declares it
+    /// (the router is named by
+    /// [`crate::request_summary::decided_sites::router_holder`]). It is the
+    /// row's IDENTITY where present: the base, the mount and the method are
+    /// transport. `None` on every row that is not a procedure, which is
+    /// nearly every row. Same pattern as `dispatch`: `default`, skipped when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure: Option<carrick_match::ProcedureKey>,
     /// The library-semantics claim ids the row was read through
     /// (carrick#1564), carried from the per-file row. Empty on every row not
     /// read through a library client. Retention only: nothing in matching
@@ -567,6 +587,7 @@ impl MountGraph {
                     path: Some(endpoint.full_path.clone()),
                     dispatch: crate::dispatch::Dispatch::key_of(endpoint.dispatch.as_ref()),
                     evidence: endpoint.evidence,
+                    procedure: endpoint.procedure.clone(),
                     ..Default::default()
                 })
                 .collect(),
@@ -748,6 +769,7 @@ mod tests {
             ("/orders/list", "c"),
         ] {
             graph.endpoints.push(ResolvedEndpoint {
+                procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
                 path: path.to_string(),
@@ -783,6 +805,7 @@ mod tests {
     #[test]
     fn a_row_written_before_addresses_reads_as_not_recorded() {
         let row = ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/orders".to_string(),
@@ -832,6 +855,7 @@ mod tests {
     #[test]
     fn retained_fields_are_absent_when_empty() {
         let call = DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: "/api/orders".to_string(),
             canonical_path: "/api/orders".to_string(),
@@ -932,6 +956,7 @@ mod tests {
     #[test]
     fn own_route_is_written_only_when_true_and_reads_false_when_absent() {
         let call = |path: &str, line: u32, own_route: bool| DataFetchingCall {
+            procedure: None,
             method: "GET".to_string(),
             target_url: path.to_string(),
             canonical_path: path.to_string(),
@@ -1057,6 +1082,7 @@ mod tests {
 
         // Add an endpoint
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/users/:id".to_string(),
@@ -1339,6 +1365,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "POST".to_string(),
             path: "/orders".to_string(),
@@ -1390,6 +1417,7 @@ mod tests {
         // method a client sends.
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "ALL".to_string(),
             path: "/rpc".to_string(),
@@ -1426,6 +1454,7 @@ mod tests {
         // endpoint; keeping `${this.apiUrl}` on the key made the join impossible.
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/api/v1/widgets/:id".to_string(),
@@ -1464,6 +1493,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/users/:userId/orders/:orderId".to_string(),
@@ -1504,6 +1534,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/users".to_string(),
@@ -1539,6 +1570,7 @@ mod tests {
         let mut graph = MountGraph::new();
         for full_path in ["/api/**", "/api/v1/chat/new"] {
             graph.endpoints.push(ResolvedEndpoint {
+                procedure: None,
                 view_module: false,
                 method: "GET".to_string(),
                 path: full_path.to_string(),
@@ -1624,6 +1656,7 @@ mod tests {
     ) -> crate::cloud_storage::CloudRepoData {
         let mut mg = MountGraph::new();
         mg.endpoints.push(ResolvedEndpoint {
+            procedure: None,
             view_module: false,
             method: "GET".to_string(),
             path: "/health".to_string(),
@@ -1742,6 +1775,7 @@ mod tests {
             .unwrap()
             .data_calls
             .push(DataFetchingCall {
+                procedure: None,
                 method: "GET".to_string(),
                 target_url: "/api/orders".to_string(),
                 canonical_path: "/api/orders".to_string(),
@@ -1766,5 +1800,26 @@ mod tests {
         assert_eq!(merged.data_calls.len(), 1);
         assert_eq!(merged.data_calls[0].repo_name.as_deref(), Some("platform"));
         assert_eq!(merged.data_calls[0].service_name.as_deref(), Some("web"));
+    }
+
+    /// A blob row written before `procedure` existed reads as no procedure,
+    /// and a row with none writes no field; one with it round-trips as
+    /// written.
+    #[test]
+    fn a_row_without_a_procedure_reads_as_none_and_one_with_it_round_trips() {
+        let old = r#"{"method":"GET","path":"/a","full_path":"/a","handler":null,"owner":"app","file_location":"src/a.ts:1","middleware_chain":[]}"#;
+        let row: ResolvedEndpoint = serde_json::from_str(old).unwrap();
+        assert_eq!(row.procedure, None);
+        assert!(!serde_json::to_string(&row).unwrap().contains("procedure"));
+        let stated = r#"{"method":"GET","path":"/a","full_path":"/rpc/shelf.list","handler":null,"owner":"app","file_location":"src/a.ts:1","middleware_chain":[],"procedure":{"path":"shelf.list","router":{"repo":"api","file":"src/router.ts","binding":"appRouter"}}}"#;
+        let row: ResolvedEndpoint = serde_json::from_str(stated).unwrap();
+        let procedure = row.procedure.clone().unwrap();
+        assert_eq!(procedure.path, "shelf.list");
+        assert_eq!(procedure.router.binding, "appRouter");
+        let again: serde_json::Value = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            again["procedure"],
+            serde_json::from_str::<serde_json::Value>(stated).unwrap()["procedure"]
+        );
     }
 }

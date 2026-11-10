@@ -253,9 +253,24 @@ pub struct Procedure {
     /// The binding of the innermost router that collects it, where one
     /// holds it.
     pub owner: Option<String>,
+    /// Sorted: each full path with the key path it is served under and the
+    /// router that declares it, where the router is named.
+    pub at: Vec<ProcedureAt>,
     /// `unread_key`, `walk_stopped`, `unread_mount`, `mount_hole`: one per adapter and key
     /// path that reached the site and named no path.
     pub unread: BTreeMap<String, usize>,
+}
+
+/// A procedure at one full path: the key path it is served under and the
+/// router that declares it, as [`super::router_holder`] names it. The repo
+/// is the engine's to add.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProcedureAt {
+    pub full_path: String,
+    pub key_path: String,
+    /// Repo-relative, `/`-separated.
+    pub router_file: String,
+    pub router_binding: String,
 }
 
 /// One parsed module, with the source map its spans are in.
@@ -277,6 +292,9 @@ struct Above {
     /// The innermost router's join, once one is reached.
     join: Option<String>,
     owner: Option<String>,
+    /// The file and line of the property of the first key under the router,
+    /// once one is read.
+    first_key: Option<(String, u32)>,
     /// The binding whose initialiser the value is.
     bound: Option<String>,
     /// The value is read through a binding that may be set again: a
@@ -306,6 +324,7 @@ type Leaf = (
     (String, u32, u32),
     Result<String, &'static str>,
     Option<String>,
+    Option<(String, u32)>,
 );
 
 /// What the walk down one adapter's collection reached.
@@ -370,6 +389,7 @@ impl Pass<'_, '_> {
                 path: Some(String::new()),
                 join: None,
                 owner: None,
+                first_key: None,
                 bound: None,
                 stopped: false,
             };
@@ -387,11 +407,17 @@ impl Pass<'_, '_> {
                 continue;
             }
             let mounts = self.mounts_of(&mut modules, &file, end, adapter, &out.sites);
-            for (leaf, path, owner) in reached.leaves {
+            for (leaf, path, owner, first_key) in reached.leaves {
                 let procedure = served.entry(leaf).or_default();
                 if procedure.owner.is_none() {
                     procedure.owner = owner;
                 }
+                let router = first_key.and_then(|(router_file, line)| {
+                    let parsed = self.parsed(&mut modules, &self.root.join(&router_file))?;
+                    let binding =
+                        super::router_holder::holder_in(&parsed.cm, &parsed.module, line)?;
+                    Some((router_file, binding))
+                });
                 for mount in &mounts {
                     match (mount, &path) {
                         (Ok(mount), Ok(path)) => {
@@ -399,6 +425,14 @@ impl Pass<'_, '_> {
                                 .full_paths
                                 .push(crate::utils::join_prefix_and_path(mount, path));
                             procedure.key_paths.push(path.clone());
+                            if let Some((router_file, router_binding)) = &router {
+                                procedure.at.push(ProcedureAt {
+                                    full_path: crate::utils::join_prefix_and_path(mount, path),
+                                    key_path: path.clone(),
+                                    router_file: router_file.clone(),
+                                    router_binding: router_binding.clone(),
+                                });
+                            }
                         }
                         (Err(reason), _) | (Ok(_), Err(reason)) => {
                             *procedure.unread.entry(reason.to_string()).or_default() += 1
@@ -421,6 +455,8 @@ impl Pass<'_, '_> {
             procedure.full_paths.dedup();
             procedure.key_paths.sort();
             procedure.key_paths.dedup();
+            procedure.at.sort();
+            procedure.at.dedup();
             site.procedure = Some(procedure);
         }
     }
@@ -606,7 +642,9 @@ impl Pass<'_, '_> {
                             .and(above.path.clone())
                             .ok_or("unread_key")
                     };
-                    reached.leaves.push((leaf, path, above.owner.clone()));
+                    reached
+                        .leaves
+                        .push((leaf, path, above.owner.clone(), above.first_key.clone()));
                 } else if let Some(label) = self
                     .collects_of(file, span)
                     .or_else(|| self.collects_through_alias(modules, file, span))
@@ -617,6 +655,7 @@ impl Pass<'_, '_> {
                             path: above.path.clone(),
                             join: Some(label.join.clone()),
                             owner: above.bound.clone().or(above.owner.clone()),
+                            first_key: above.first_key.clone(),
                             bound: None,
                             stopped: above.stopped,
                         };
@@ -725,8 +764,21 @@ impl Pass<'_, '_> {
                         }),
                         _ => None,
                     };
+                    // The first key read under a router is the property the
+                    // router is named from (`router_holder`).
+                    let first_key =
+                        match (&above.path, &above.join, &path, above.first_key.is_none()) {
+                            (Some(before), Some(_), Some(_), true) if before.is_empty() => {
+                                let line = self
+                                    .parsed(modules, file)
+                                    .map(|parsed| parsed.line(prop.span()));
+                                line.map(|line| (relative(self.root, file), line))
+                            }
+                            _ => above.first_key.clone(),
+                        };
                     let below = Above {
                         path,
+                        first_key,
                         bound: None,
                         ..above.clone()
                     };
