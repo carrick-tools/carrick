@@ -2083,17 +2083,20 @@ mod tests {
     /// reading, not the rows, so a site that states no row is counted too.
     #[test]
     fn the_name_census_counts_each_name_outcome() {
-        let sites = sites_of(&[(
-            "src/names.ts",
-            "import { bus } from \"@fixture/bus\";\n\
-            const KIND = \"orders.kind\";\n\
-            export function literal() { bus.publish(\"orders.literal\", {}); }\n\
-            export function linked() { bus.publish(KIND, {}); }\n\
-            export function relay(topic: string) { bus.publish(topic, {}); }\n\
-            export function caller() { relay(\"orders.filled\"); }\n\
-            export function spread(...args: any[]) { bus.publish(...args, {}); }\n\
-            export function unread() { bus.publish(compute(), {}); }\n",
-        )]);
+        let sites = sites_of(&[
+            ("src/topics.ts", "export const KIND = \"orders.kind\";\n"),
+            (
+                "src/names.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                import { KIND } from \"./topics\";\n\
+                export function literal() { bus.publish(\"orders.literal\", {}); }\n\
+                export function linked() { bus.publish(KIND, {}); }\n\
+                export function relay(topic: string) { bus.publish(topic, {}); }\n\
+                export function caller() { relay(\"orders.filled\"); }\n\
+                export function spread(...args: any[]) { bus.publish(...args, {}); }\n\
+                export function unread() { bus.publish(compute(), {}); }\n",
+            ),
+        ]);
         let asked = std::cell::RefCell::new(Vec::new());
         let names = read(&sites, &[bus()], verifier(&asked, all)).names;
         assert_eq!(
