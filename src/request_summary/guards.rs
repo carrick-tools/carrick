@@ -439,6 +439,28 @@ pub(super) struct GuardIr {
     pub(super) literal_at: Option<Site>,
 }
 
+impl GuardIr {
+    /// The parameter the guard tests and the test, where it is one the send
+    /// side decides at a caller that fills the parameter with text
+    /// (carrick#3679, the ruling R3): an equality with text, or a prefix of
+    /// text. How many functions out the parameter is, its position and the
+    /// keys read down from it, as [`Subject::parameter`] states them.
+    pub(super) fn parameter_test(
+        &self,
+    ) -> Option<((u8, usize, Vec<String>), super::alternatives::WayTest)> {
+        use super::alternatives::WayTest;
+        let GuardLiteral::Text(text) = &self.literal else {
+            return None;
+        };
+        let test = match self.position {
+            GuardPosition::Equality => WayTest::Equals(text.clone()),
+            GuardPosition::StartsWith => WayTest::StartsWith(text.clone()),
+            GuardPosition::Case | GuardPosition::TableKey => return None,
+        };
+        Some((self.subject.parameter()?, test))
+    }
+}
+
 /// A call an `if`, a ternary or a `&&` tests: the branch its result guards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Tested {
@@ -1330,6 +1352,39 @@ fn constant_of(pieces: &[TextPiece], scope: &Scope<'_>) -> Option<Constant> {
     })
 }
 
+/// The text a regular expression literal requires its subject to start
+/// with, when the pattern is `^` and literal characters only (`/^http/`,
+/// `/^\/items\//`): such a test is a `startsWith` of that text. `None` for
+/// any other pattern, and for a flag that changes what `^` or a character
+/// matches (`i`, `m`, `s`, `v`) or where matching starts (`y`).
+fn anchored_prefix(expr: &Expr) -> Option<String> {
+    let Expr::Lit(Lit::Regex(regex)) = unwrap_expression(expr) else {
+        return None;
+    };
+    if regex
+        .flags
+        .chars()
+        .any(|flag| !matches!(flag, 'g' | 'u' | 'd'))
+    {
+        return None;
+    }
+    let mut chars = regex.exp.strip_prefix('^')?.chars();
+    let mut prefix = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next()? {
+                escaped if escaped.is_ascii_punctuation() => prefix.push(escaped),
+                _ => return None,
+            },
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
+                return None;
+            }
+            other => prefix.push(other),
+        }
+    }
+    (!prefix.is_empty()).then_some(prefix)
+}
+
 /// The text of `pieces` when every piece is literal.
 fn literal_text(pieces: &[Piece]) -> Option<String> {
     pieces
@@ -1680,6 +1735,9 @@ impl CallWalker<'_, '_, '_> {
     }
 
     /// `pathname.startsWith("/items/")`.
+    ///
+    /// An anchored literal pattern is the same test (carrick#3679):
+    /// `pathname.match(/^\/items\//)` and `/^\/items\//.test(pathname)`.
     pub(super) fn read_starts_with(&mut self, call: &CallExpr) {
         let Callee::Expr(callee) = &call.callee else {
             return;
@@ -1687,23 +1745,33 @@ impl CallWalker<'_, '_, '_> {
         let Expr::Member(member) = unwrap_expression(callee) else {
             return;
         };
-        if member_prop(member).as_deref() != Some("startsWith") {
-            return;
-        }
         let Some(first) = call.args.first().filter(|arg| arg.spread.is_none()) else {
             return;
         };
-        if let Some(literal) = self.guard_literal(&first.expr) {
-            self.record_guard(
-                literal,
-                GuardPosition::StartsWith,
-                &member.obj,
-                call.span,
-                false,
-                None,
-                None,
-            );
-        }
+        let (literal, subject) = match member_prop(member).as_deref() {
+            Some("startsWith") => match self.guard_literal(&first.expr) {
+                Some(literal) => (literal, &*member.obj),
+                None => return,
+            },
+            Some("match") => match anchored_prefix(&first.expr) {
+                Some(prefix) => (GuardLiteral::Text(prefix), &*member.obj),
+                None => return,
+            },
+            Some("test") => match anchored_prefix(&member.obj) {
+                Some(prefix) => (GuardLiteral::Text(prefix), &*first.expr),
+                None => return,
+            },
+            _ => return,
+        };
+        self.record_guard(
+            literal,
+            GuardPosition::StartsWith,
+            subject,
+            call.span,
+            false,
+            None,
+            None,
+        );
     }
 
     /// `case "/health":`, compared with the discriminant. An empty case
