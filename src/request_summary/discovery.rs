@@ -4194,6 +4194,136 @@ mod tests {
         );
     }
 
+    /// Discovery of `tests/fixtures/spread-absent-key`, its sites at
+    /// `file:line` by their stops, and every site and unfollowed call for a
+    /// failure message.
+    fn spread_absent_key() -> Option<(Discovery, String)> {
+        let on = walked("spread-absent-key", "", "", &[], true)?;
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/spread-absent-key/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let all = format!("{:?} {:?}", discovery.sites, discovery.unfollowed);
+        Some((discovery, all))
+    }
+
+    /// The stops of the sites discovery keeps at `file:line`.
+    fn stops_at(discovery: &Discovery, file: &str, line: u32) -> Vec<Option<Stop>> {
+        discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with(file) && site.line == line)
+            .map(|site| site.stop)
+            .collect()
+    }
+
+    /// Ruling R-SP (carrick#2448, #3504): a key read through object spreads
+    /// is absent where every spread source resolves to an object that does
+    /// not write it. The hooks call the SDK with
+    /// `{ ...options, signal, throwOnError }`, `options` the hook's own
+    /// parameter whose callers never write `client`, so
+    /// `options?.client ?? client` holds the module client alone and the
+    /// calls reach the client's `fetch` with no `several_values` stop. The
+    /// answer key is `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_no_spread_source_writes_is_absent() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for (file, line) in [
+            ("src/sdk.ts", 7),
+            ("src/sdk.ts", 14),
+            ("src/sdk.ts", 22),
+            ("hooks/queries.ts", 8),
+            ("hooks/queries.ts", 15),
+            ("hooks/queries.ts", 22),
+        ] {
+            let stops = stops_at(&discovery, file, line);
+            assert!(
+                !stops.is_empty() && stops.iter().all(Option::is_none),
+                "{file}:{line} reaches the client with no stop: {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP, must-stay: a spread source the resolver does not read
+    /// (`...JSON.parse(raw)`) may write the key, so it stays unread and the
+    /// receiver keeps two values. The answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_an_unread_spread_source_may_write_keeps_several_values() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for line in [8, 15] {
+            let stops = stops_at(&discovery, "unread/stored.ts", line);
+            assert!(
+                !stops.is_empty() && stops.iter().all(|stop| *stop == Some(Stop::SeveralValues)),
+                "unread/stored.ts:{line} keeps several values: {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP, must-stay: the sources are parameters of callbacks a
+    /// library runs (`key[0]`, `fnOptions`). Nothing in the repository passes
+    /// them, so they cannot be resolved here and `client` stays unread; the
+    /// receiver keeps two values. Reading what a library passes to a callback
+    /// is a store question, filed under the V1 shape hold. The answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_a_library_callback_parameter_spread_keeps_several_values() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for line in [17, 21] {
+            let stops = stops_at(&discovery, "src/callbacks.ts", line);
+            assert!(
+                !stops.is_empty() && stops.iter().all(|stop| *stop == Some(Stop::SeveralValues)),
+                "callbacks.ts:{line} keeps several values: {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP: a named-binding spread source that writes the key
+    /// (`call({ ...base, signal })`, `const base = { run: send }` local to the caller) is read, so the
+    /// key reads that value: `options.run(...)` enters `send` and stops
+    /// nowhere. Before the rule the key was unread and the call stopped. The
+    /// answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_a_spread_source_writes_is_read() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        let stops = stops_at(&discovery, "writes/same.ts", 7);
+        assert!(
+            !stops.is_empty() && stops.iter().all(Option::is_none),
+            "writes/same.ts:7 enters `send` with no stop: {stops:?}\n{all}"
+        );
+    }
+
+    /// Ruling R-SP, must-stay: a spread source that writes another client
+    /// (`{ ...base, signal }`, `base = { client: offline }`) carries what it
+    /// writes, so the receiver holds both clients and keeps two values. The
+    /// answer key is `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_a_spread_source_writes_another_client_keeps_several_values() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for line in [16, 23] {
+            let stops = stops_at(&discovery, "writes/offline.ts", line);
+            assert!(
+                !stops.is_empty() && stops.iter().all(|stop| *stop == Some(Stop::SeveralValues)),
+                "writes/offline.ts:{line} keeps several values: {stops:?}\n{all}"
+            );
+        }
+    }
+
     /// carrick#2448 T2: the method a maker call binds. `get` and `post` of
     /// the client are `makeMethodFn('GET')` and `makeMethodFn('POST')`; the
     /// arrow they return reads `method` from its factory, so the site's method
