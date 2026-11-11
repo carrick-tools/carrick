@@ -1708,6 +1708,22 @@ pub struct CheckV2Result {
     /// abnormally (every pair is then unverifiable) (carrick#2209).
     #[serde(default)]
     pub compiler_end: Option<CompilerEnd>,
+    /// Wall time of each phase of a check that ran to its end. For the log
+    /// only: no verdict reads it. Absent on every early return
+    /// (carrick#1047).
+    #[serde(default)]
+    pub phase_ms: Option<CheckPhaseMs>,
+}
+
+/// Where a check's time went, in milliseconds (mirrors `CheckPhaseMs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckPhaseMs {
+    pub assemble: u64,
+    pub probes: u64,
+    pub install: u64,
+    pub tsc: u64,
+    pub probe_program: u64,
+    pub classify: u64,
 }
 
 /// How the check's compiler process ended (mirrors `CompilerEnd`).
