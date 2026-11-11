@@ -1,0 +1,1 @@
+{ "name": "@fixture/runner", "version": "1.0.0", "type": "module", "main": "src/runner.ts" }
