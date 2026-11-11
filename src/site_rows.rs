@@ -282,6 +282,14 @@ pub struct TracedRoutes {
     /// reader row there guesses at a value the code never states, so it is
     /// no route and the site stays a possible call ([`GuessedRoute`]).
     pub guessed: Vec<GuessedRoute>,
+    /// Whether the procedure walk stopped anywhere in the service: with no
+    /// procedure to count it on (`procedure_walk_stopped`), or at an adapter
+    /// or key path that reached a procedure and named no path (the
+    /// `procedure_<reason>` counts of its unread). A procedure no adapter
+    /// serves (`procedure_unserved`) was read whole, so it is no stop. A
+    /// removal of a procedure row in such a service is not proven: the
+    /// row may still be there, unread (carrick#3778 R5).
+    pub procedure_stopped: bool,
 }
 
 /// A route site whose own path the code writes in no whole way (the
@@ -312,6 +320,7 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
     // Where the procedure walk stopped with no procedure to count it on:
     // counted apart from a procedure nothing serves.
     if decided.procedure_stops > 0 {
+        out.procedure_stopped = true;
         *out.untraced
             .entry("procedure_walk_stopped".to_string())
             .or_default() += decided.procedure_stops;
@@ -351,6 +360,7 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
         if let Some(procedure) = &site.procedure {
             // Each adapter and key path that reached it and named no path,
             // and a procedure nothing serves.
+            out.procedure_stopped |= !procedure.unread.is_empty();
             for (reason, count) in &procedure.unread {
                 *out.untraced
                     .entry(format!("procedure_{reason}"))
@@ -366,7 +376,13 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
             }
             match procedure_route(site, procedure, record) {
                 Ok(route) => out.routes.push(route),
-                Err(reason) => *out.untraced.entry(reason).or_default() += 1,
+                // A procedure that reached a path and whose method the label
+                // does not state is a procedure row the walk could not
+                // write: a stop, so a removal of it is not proven (R5).
+                Err(reason) => {
+                    out.procedure_stopped = true;
+                    *out.untraced.entry(reason).or_default() += 1;
+                }
             }
             continue;
         }

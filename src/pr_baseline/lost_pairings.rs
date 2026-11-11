@@ -68,6 +68,11 @@ pub struct RemovedOperation {
     /// Whether the diff anchor listed this removal (`pr_delta_anchor::run`).
     pub placed: bool,
     pub source: Option<ResolutionSource>,
+    /// Whether this run's reading of the row's service stopped where the row
+    /// may still be (a procedure row in a service whose procedure walk
+    /// stopped, carrick#3778 R5): the removal is not proven, so the row it
+    /// gives is a candidate whatever the sources say.
+    pub in_doubt: bool,
 }
 
 /// A socket or pub/sub call row main has and this run lacks, keyed
@@ -82,6 +87,20 @@ pub struct RemovedSend {
     pub place: String,
     pub placed: bool,
     pub source: Option<ResolutionSource>,
+}
+
+/// The consumer key of a procedure call (carrick#3778): its canonical HTTP
+/// key, which states no path (`http|GET|`), with the procedure it calls.
+/// Without the procedure every query call of a file shares one key, so a
+/// call nothing ever served would join the row of a removed procedure called
+/// in the same file. Both sides spell it here: this run's unpaired call from
+/// the call's procedure, main's pairing from its producer's, which pairing
+/// made equal to the call's.
+pub fn procedure_consumer_key(key: &str, procedure: &carrick_match::ProcedureKey) -> String {
+    format!(
+        "{key}{}",
+        crate::mount_graph::procedure_suffix(Some(procedure))
+    )
 }
 
 /// A consumer call this run holds that no producer answers.
@@ -164,6 +183,9 @@ fn is_message_protocol(protocol: Protocol) -> bool {
 struct Group {
     /// The removals behind it, as `(placed, source)`.
     removals: Vec<(bool, Option<ResolutionSource>)>,
+    /// Whether any removal behind it is in doubt
+    /// ([`RemovedOperation::in_doubt`]).
+    in_doubt: bool,
     removed: RemovedSide,
     removed_service: String,
     /// Surviving side.
@@ -187,14 +209,21 @@ impl Group {
             Decision::OnMain(value) => (Some(value), None),
             Decision::Unknown(reason) => (None, Some(reason)),
         };
-        Removal {
-            removed: self.removed.clone(),
-            edge_source: EdgeSource::fold(
+        // A removal in doubt makes the row a candidate: `break_status`
+        // answers `removal_not_proven` for it.
+        let edge_source = if self.in_doubt {
+            Some(EdgeSource::Candidate)
+        } else {
+            EdgeSource::fold(
                 self.surviving_sources
                     .iter()
                     .copied()
                     .chain(self.removals.iter().map(|(_, source)| *source)),
-            ),
+            )
+        };
+        Removal {
+            removed: self.removed.clone(),
+            edge_source,
             verdict_state: Some(VerdictState::NotChecked),
             on_main,
             on_main_unknown,
@@ -253,6 +282,7 @@ pub fn mark_lost_pairings(
                     ))
                     .or_insert_with(|| Group {
                         removals: operations.iter().map(|op| (op.placed, op.source)).collect(),
+                        in_doubt: operations.iter().any(|op| op.in_doubt),
                         removed: RemovedSide {
                             method: first.method.clone(),
                             path: first.path.clone(),
@@ -300,6 +330,7 @@ pub fn mark_lost_pairings(
                             .iter()
                             .map(|send| (send.placed, send.source))
                             .collect(),
+                        in_doubt: false,
                         removed: RemovedSide {
                             method: first.method.clone(),
                             path: first.path.clone(),
@@ -449,6 +480,7 @@ mod tests {
             place: "app/orders.ts:9".into(),
             placed,
             source: Some(ResolutionSource::RequestSpec),
+            in_doubt: false,
         }
     }
 
@@ -608,6 +640,30 @@ mod tests {
             on_main(&pr[0]),
             (None, Some(OnMainUnknown::RemovalUnplaced))
         );
+    }
+
+    /// A removal in doubt (a procedure row of a service whose walk stopped,
+    /// carrick#3778 R5) gives a candidate row: the break is not proven,
+    /// whatever its sources and its placement say.
+    #[test]
+    fn a_removed_procedure_in_a_service_whose_walk_stopped_is_a_candidate() {
+        let (mut main, run) = http_break(true);
+        main.operations[0].in_doubt = true;
+        let mut pr = vec![unmarked_missing()];
+        mark_lost_pairings(&mut pr, &main, &run, MainCopy::Current, None);
+        let v = serde_json::to_value(&pr[0]).unwrap();
+        assert_eq!(v["edge_source"], json!("candidate"));
+        assert_eq!(
+            pr[0].break_status(),
+            crate::findings::BreakStatus::Candidate {
+                reason: "removal_not_proven"
+            }
+        );
+
+        let (main, run) = http_break(true);
+        let mut pr = vec![unmarked_missing()];
+        mark_lost_pairings(&mut pr, &main, &run, MainCopy::Current, None);
+        assert_eq!(pr[0].break_status(), crate::findings::BreakStatus::Certain);
     }
 
     /// One removal behind the row that is not placed is enough for doubt.

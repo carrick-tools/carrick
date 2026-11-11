@@ -2143,6 +2143,15 @@ impl Analyzer {
         self.mount_graph = Some(mount_graph);
     }
 
+    /// Every route row the HTTP matcher pairs calls with (its pool's rows),
+    /// across every service. Empty before the mount graph is built.
+    pub fn resolved_endpoints(&self) -> &[crate::mount_graph::ResolvedEndpoint] {
+        self.mount_graph
+            .as_ref()
+            .map(|graph| graph.get_resolved_endpoints())
+            .unwrap_or_default()
+    }
+
     /// Store the structured v2 check outcomes for this run. Not calling this
     /// leaves compat unevaluated: every edge keeps `type_compatible: None`.
     /// Every checked pair's outcome per direction, for a reader that must say
@@ -2782,20 +2791,31 @@ impl Analyzer {
             let Some((method, target)) = call.key.as_http() else {
                 continue;
             };
+            // Rendered, not joined: `call_site` feeds the missing-endpoint,
+            // wrong-verb, shared-contract and env-var rows, and a procedure
+            // call's unpaired entry. Blobs uploaded before paths were
+            // relativized at the source carry the runner checkout, so strip
+            // it here. The compat-verdict join keys below
+            // (`consumer_location`, `consumer_repo_by_call`) deliberately keep
+            // the stored text: their other side is the manifest's
+            // `consumer_file`, which is not stripped, and stripping one side
+            // would break the join.
+            let call_site =
+                strip_ci_workspace_prefix(&call.file_path.display().to_string()).to_string();
             // A procedure call pairs by its procedure alone (carrick-match's
             // procedure arm), before any reading of its empty target: a
             // matched procedure is an edge, and one no row serves is no
-            // missing endpoint.
+            // missing endpoint. It is an unpaired call, keyed by its
+            // procedure (carrick#3778), so a pairing main had that this PR
+            // removed marks it as a break.
             if let Some(procedure) = &call.procedure {
+                let service = consumer_repo_by_call.get(&(
+                    method.to_uppercase(),
+                    target.to_string(),
+                    call.file_path.display().to_string(),
+                ));
                 let pairing = pool.pair(&carrick_match::Call {
-                    service: consumer_repo_by_call
-                        .get(&(
-                            method.to_uppercase(),
-                            target.to_string(),
-                            call.file_path.display().to_string(),
-                        ))
-                        .cloned()
-                        .unwrap_or_default(),
+                    service: service.cloned().unwrap_or_default(),
                     protocol: "http".to_string(),
                     method: Some(method.to_string()),
                     path: Some(target.to_string()),
@@ -2821,18 +2841,27 @@ impl Analyzer {
                         cross_repo_matches.push(edge);
                     }
                 }
+                if pairing.winners.is_empty()
+                    && let Some(service) = service
+                {
+                    unpaired_calls.push(crate::pr_baseline::UnpairedCall {
+                        service: service.clone(),
+                        key: crate::pr_baseline::procedure_consumer_key(
+                            &OperationKey::http(method, target).canonical(),
+                            procedure,
+                        ),
+                        file: location_file(&call_site),
+                        method: method.to_string(),
+                        path: target.to_string(),
+                        sites: vec![call_site],
+                        source: consumer_source_by_call
+                            .get(&consumer_identity(&call.file_path.display().to_string()))
+                            .copied()
+                            .flatten(),
+                    });
+                }
                 continue;
             }
-            // Rendered, not joined: `call_site` feeds the missing-endpoint,
-            // wrong-verb, shared-contract and env-var rows. Blobs uploaded
-            // before paths were relativized at the source carry the runner
-            // checkout, so strip it here. The compat-verdict join keys below
-            // (`consumer_location`, `consumer_repo_by_call`) deliberately keep
-            // the stored text: their other side is the manifest's
-            // `consumer_file`, which is not stripped, and stripping one side
-            // would break the join.
-            let call_site =
-                strip_ci_workspace_prefix(&call.file_path.display().to_string()).to_string();
 
             // Env-var base URLs (framework-agnostic; smarter detection avoids
             // false positives on path parameters) look up by their canonical

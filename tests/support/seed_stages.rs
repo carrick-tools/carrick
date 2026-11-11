@@ -89,6 +89,15 @@ fn names_parts(want_method: &str, want_path: &str, method: &Value, path: &Value)
             .is_some_and(|p| carrick_match::paths_match(want_path, p))
 }
 
+/// Whether a delta endpoint is of the service a manifest row names: the
+/// row's `service`, or no service when it names none (a single-service
+/// repo's rows). The PR-accuracy instrument keys a delta row by its service
+/// the same way (`service or '-'`), so a row of a multi-service repo names
+/// the service its operation is in.
+fn of_service(row_service: &Value, endpoint: &Value) -> bool {
+    row_service.as_str() == endpoint["service"].as_str()
+}
+
 fn call_sites(finding: &Value) -> Vec<&str> {
     array(&finding["call_sites"])
         .iter()
@@ -182,7 +191,7 @@ fn risk_row(label: &str, site: Option<&str>, payload: &Value) -> Option<(usize, 
     }
 }
 
-fn delta_row(kind: &str, label: &str, payload: &Value) -> Option<(usize, String)> {
+fn delta_row(kind: &str, label: &str, service: &Value, payload: &Value) -> Option<(usize, String)> {
     let side = if kind == "delta_new" {
         "new_endpoints"
     } else {
@@ -190,14 +199,14 @@ fn delta_row(kind: &str, label: &str, payload: &Value) -> Option<(usize, String)
     };
     let hit = array(&payload["delta"][side])
         .iter()
-        .any(|e| names(label, &e["method"], &e["path"]));
+        .any(|e| names(label, &e["method"], &e["path"]) && of_service(service, e));
     (!hit).then(|| (3, format!("{kind} {label}: no delta.{side} row")))
 }
 
-fn still_called_row(label: &str, payload: &Value) -> Option<(usize, String)> {
+fn still_called_row(label: &str, service: &Value, payload: &Value) -> Option<(usize, String)> {
     let removed = array(&payload["delta"]["removed_endpoints"])
         .iter()
-        .any(|e| names(label, &e["method"], &e["path"]));
+        .any(|e| names(label, &e["method"], &e["path"]) && of_service(service, e));
     if !removed {
         return Some((0, format!("{label}: no removed row")));
     }
@@ -222,8 +231,10 @@ pub fn wrong_scanner_stages(entry: &Value, payload: &Value) -> Vec<(usize, Strin
         let site = row["site"].as_str();
         let found = match row["kind"].as_str().unwrap_or_default() {
             "risk_introduced" | "risk_could_not_compare" => risk_row(label, site, payload),
-            kind @ ("delta_new" | "delta_removed") => delta_row(kind, label, payload),
-            "removed_still_called" => still_called_row(label, payload),
+            kind @ ("delta_new" | "delta_removed") => {
+                delta_row(kind, label, &row["service"], payload)
+            }
+            "removed_still_called" => still_called_row(label, &row["service"], payload),
             _ => None,
         };
         wrong.extend(found);
@@ -250,13 +261,16 @@ pub fn wrong_scanner_stages(entry: &Value, payload: &Value) -> Vec<(usize, Strin
 
 /// Rows the payload carries that the correct check does not (closed world).
 fn false_rows(rows: &[Value], payload: &Value) -> Vec<(usize, String)> {
-    let expected = |kind: &str, m: &Value, p: &Value| {
-        rows.iter()
-            .any(|r| r["kind"] == kind && names(r["label"].as_str().unwrap_or(" "), m, p))
+    let expected = |kind: &str, e: &Value| {
+        rows.iter().any(|r| {
+            r["kind"] == kind
+                && names(r["label"].as_str().unwrap_or(" "), &e["method"], &e["path"])
+                && of_service(&r["service"], e)
+        })
     };
     let mut false_rows = Vec::new();
     for e in array(&payload["delta"]["new_endpoints"]) {
-        if !expected("delta_new", &e["method"], &e["path"]) {
+        if !expected("delta_new", e) {
             false_rows.push((3, format!("unexpected new endpoint {e}")));
         }
     }
@@ -265,7 +279,13 @@ fn false_rows(rows: &[Value], payload: &Value) -> Vec<(usize, String)> {
         .filter(|f| f["kind"] == "missing_endpoint")
         .collect();
     for e in array(&payload["delta"]["removed_endpoints"]) {
-        if !expected("delta_removed", &e["method"], &e["path"]) {
+        // The PR check posts a removed row, and the call still made of it,
+        // only when the row is a fact (the renderer's `isFactRow`): a
+        // candidate or unstated row is no row of the check.
+        if e["edge_source"] != "fact" {
+            continue;
+        }
+        if !expected("delta_removed", e) {
             false_rows.push((3, format!("unexpected removed endpoint {e}")));
         }
         let (m, p) = (&e["method"], &e["path"]);
@@ -277,7 +297,7 @@ fn false_rows(rows: &[Value], payload: &Value) -> Vec<(usize, String)> {
                 &f["path"],
             )
         });
-        if still_called && !expected("removed_still_called", m, p) {
+        if still_called && !expected("removed_still_called", e) {
             false_rows.push((3, format!("unexpected still-called row {e}")));
         }
     }

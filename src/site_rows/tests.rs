@@ -2142,6 +2142,33 @@ fn every_route_the_trace_does_not_serve_is_counted_by_why() {
     );
 }
 
+/// A procedure site served at a path whose method the label does not state
+/// writes no row; that is a stop, so a removal of the procedure is a
+/// candidate, not a fact (carrick#3778 R5).
+#[test]
+fn a_procedure_site_with_an_unreadable_method_is_a_stop() {
+    let mut site = traced_site("src/proc.ts", 100, &[("top", Some("/api/rpc/shelf.get"))]);
+    site.procedure = Some(crate::request_summary::decided_sites::Procedure {
+        full_paths: vec!["/api/rpc/shelf.get".to_string()],
+        key_paths: vec!["/shelf.get".to_string()],
+        ..Default::default()
+    });
+    let decided = Decided {
+        sites: vec![site.clone()],
+        ..Decided::default()
+    };
+    let routes = traced(&decided, &[route_record(&site, None)]);
+    assert!(routes.routes.is_empty());
+    assert_eq!(
+        routes.untraced,
+        BTreeMap::from([("method_unstated".to_string(), 1)])
+    );
+    assert!(routes.procedure_stopped);
+    let served = traced(&decided, &[route_record(&site, Some("get"))]);
+    assert_eq!(served.routes.len(), 1);
+    assert!(!served.procedure_stopped);
+}
+
 /// A socket lead flips its side as a pub/sub lead does: a producer lead on a
 /// call row's line is that row's site (carrick#3498).
 #[test]
