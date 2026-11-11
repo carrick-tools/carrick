@@ -1,0 +1,66 @@
+{
+  "boundary": {
+    "bare_checkout": false,
+    "calls_without_expected_type": {
+      "total": 0
+    },
+    "candidates_awaiting_model": 0,
+    "commit_hash": "abc1234def",
+    "consumers_not_resolved": {
+      "total": 0
+    },
+    "files_attempted": 3,
+    "files_lost": {
+      "reasons": [
+        "src/a.ts: parse error"
+      ],
+      "total": 1
+    },
+    "files_not_parsed": {
+      "total": 0
+    },
+    "final_losses": {
+      "total": 0
+    },
+    "model_contradictions_discarded": 0,
+    "model_endpoints_discarded_in_claimed_modules": 0,
+    "model_endpoints_dropped_unanchored": {
+      "total": 0
+    },
+    "model_only_rows": 0,
+    "model_rows_joined": 0,
+    "routes_without_body": {
+      "reasons": [
+        "GET /health"
+      ],
+      "total": 1
+    },
+    "routes_without_response_type": {
+      "total": 0
+    },
+    "sdk_unresolved": {
+      "reasons": [
+        "@acme/sdk ×2: no surface"
+      ],
+      "total": 2
+    },
+    "unknown_call_paths": {
+      "total": 0
+    },
+    "unread_sites": {
+      "reasons": [
+        "src/value-callee.ts:4: the function called is a value in this code, and Carrick found no function behind it",
+        "src/recursion.ts:9: the calls loop back to a function already passed"
+      ],
+      "total": 5
+    }
+  },
+  "lines": [
+    "svc at abc1234: 3 file(s) sent to the analyzer",
+    "  1 file(s) the analyzer never answered for (src/a.ts: parse error)",
+    "  2 SDK call(s) that produced no edge (e.g. @acme/sdk ×2: no surface)",
+    "  1 route(s) that send no response body (not counted above) (GET /health)",
+    "  5 call site(s) Carrick could not read (e.g. src/value-callee.ts:4: the function called is a value in this code, and Carrick found no function behind it)"
+  ],
+  "service": "svc"
+}

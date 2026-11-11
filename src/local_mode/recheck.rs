@@ -98,6 +98,9 @@ impl Ran {
 pub struct Fresh {
     /// The rows the working tree states, in the shape the index holds them.
     pub items: Vec<IndexedItem>,
+    /// The calls of the file the re-scan considered and did not state as a
+    /// row, at the lines the working tree has (carrick#3688 U4).
+    pub unread: Vec<super::read_model::IndexedUnread>,
     /// Functions the re-extracted file declares that the blobs the index holds
     /// do not (carrick#1330), in line order.
     pub new_functions: Vec<super::contract::NewFunction>,
@@ -1075,6 +1078,14 @@ fn inside(
         .and_then(|rebuilt| rebuilt.files.get(relative))
         .cloned()
         .unwrap_or_default();
+    let unread = rejoined
+        .index
+        .repos
+        .iter()
+        .find(|rebuilt| rebuilt.name == name)
+        .and_then(|rebuilt| rebuilt.unread.get(relative))
+        .cloned()
+        .unwrap_or_default();
     let (moved, no_route) = judge_edit(workspace, before, &rejoined, tree, relative, plan);
     state_no_route(&mut items, &no_route);
     // No rows where the index held some is an answer, not a failure: the edit
@@ -1087,6 +1098,7 @@ fn inside(
     };
     Ok(Fresh {
         items,
+        unread,
         // Filled in by `run`, from the parse that did not wait on this.
         new_functions: Vec::new(),
         ran,

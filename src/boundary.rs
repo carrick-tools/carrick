@@ -265,6 +265,15 @@ pub struct ServiceBoundary {
     /// printed by [`Self::lines`].
     #[serde(default, skip_serializing_if = "unprepared_not_stated")]
     pub unprepared: Option<Vec<crate::preflight::UnpreparedRow>>,
+    /// Call sites the fact layer considered and did not state as a row
+    /// (`unread_sites` on the blob, carrick#3688 U4). `total` is the exact
+    /// count, `reasons` the first [`MAX_REASONS`] sites, each as the line a
+    /// reader prints: `file:line: <phrase>`, the phrase from
+    /// `npm/carrick/src/unread-reasons.json` (the CLI resolves it, so the npm
+    /// port reads text and holds no table). `None` on a blob from a scanner
+    /// that did not write the field: absent is not the same as counting none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites: Option<Counted>,
 }
 
 fn unprepared_not_stated(rows: &Option<Vec<crate::preflight::UnpreparedRow>>) -> bool {
@@ -382,6 +391,7 @@ impl ServiceBoundary {
             library_packages_pending: library_counts.map(|(pending, _)| pending),
             library_packages_failed: library_counts.map(|(_, failed)| failed),
             unprepared: crate::preflight::recorded_for(data.service_name.as_deref()),
+            unread_sites: unread_sites(data),
         }
     }
 
@@ -462,6 +472,9 @@ impl ServiceBoundary {
             &self.calls_without_expected_type,
             "call(s) with no resolved expected type",
         );
+        if let Some(unread) = &self.unread_sites {
+            push(unread, "call site(s) Carrick could not read");
+        }
         if self.model_only_rows > 0 {
             out.push(format!(
                 "  {} row(s) the model alone states ({} joined a deterministic row)",
@@ -547,6 +560,29 @@ fn short_hash(commit: &str) -> &str {
     } else {
         &commit[..end]
     }
+}
+
+/// The unread sites the blob carries, as a count: the exact total the scan
+/// kept and the first [`MAX_REASONS`] rows as `file:line: <phrase>`. `None`
+/// when the blob has no `unread_sites` key.
+fn unread_sites(data: &CloudRepoData) -> Option<Counted> {
+    let rows = data.unread_sites.as_ref()?;
+    let total = data
+        .unread_sites_total
+        .map_or(rows.len(), |total| total as usize);
+    let reasons = rows
+        .iter()
+        .take(MAX_REASONS)
+        .map(|site| {
+            format!(
+                "{}:{}: {}",
+                site.file,
+                site.line,
+                crate::unread_sites::phrase_of(site)
+            )
+        })
+        .collect();
+    Some(Counted::new(total, reasons))
 }
 
 /// Client members the join could not follow, one entry per member name. The
@@ -1839,6 +1875,91 @@ mod tests {
             serde_json::json!([{"kind":"dependencies","install_root":".","lockfile":"package-lock.json"}])
         );
         assert_eq!(stated.lines("svc"), read.lines("svc"));
+    }
+
+    /// The boundary of a blob that carries unread sites, read through
+    /// `collect` as a scan does, and the lines both ports print for it. The
+    /// JSON this writes is `boundary.expected.json`: the npm port renders the
+    /// same boundary and must say the same lines
+    /// (`npm/carrick/test/render.test.ts`). Set `CARRICK_WRITE_FIXTURES=1` to
+    /// rewrite it; otherwise the committed file must equal what this reads.
+    #[test]
+    fn an_unread_site_count_is_a_boundary_line() {
+        let row = |file: &str, line: u32, reason: &str| {
+            serde_json::json!({
+                "file": file, "line": line, "span_start": line * 10,
+                "span_end": line * 10 + 5, "reason": reason,
+                "slot": "callee", "depth": 0
+            })
+        };
+        let blob = serde_json::json!({
+            "repo_name": "acme/app", "endpoints": [], "calls": [], "mounts": [],
+            "apps": {}, "imported_handlers": [], "function_definitions": {},
+            "config_json": null, "package_json": null, "packages": null,
+            "last_updated": "2026-01-01T00:00:00Z", "commit_hash": "abc1234def",
+            "unread_sites": [
+                row("src/value-callee.ts", 4, "value_callee"),
+                row("src/recursion.ts", 9, "recursion"),
+            ],
+            "unread_sites_total": 5,
+        });
+        let data: CloudRepoData = serde_json::from_value(blob).expect("the blob reads");
+        let stats = ProcessingStats {
+            files_model_dispatched: 3,
+            ..ProcessingStats::default()
+        };
+        let mut boundary = ServiceBoundary::collect(&data, &stats, &HashMap::new(), "/repo");
+        // The other counts both ports print, so one fixture holds every line
+        // they share.
+        boundary.files_lost = Counted::new(1, vec!["src/a.ts: parse error".to_string()]);
+        boundary.sdk_unresolved = Counted::new(2, vec!["@acme/sdk ×2: no surface".to_string()]);
+        boundary.routes_without_body = Some(Counted::new(1, vec!["GET /health".to_string()]));
+
+        let lines = boundary.lines("svc");
+        assert_eq!(
+            boundary.unread_sites.as_ref().map(|count| count.total),
+            Some(5),
+            "the exact total, not the rows listed"
+        );
+        let unread = lines
+            .iter()
+            .find(|line| line.contains("could not read"))
+            .expect("an unread line");
+        assert_eq!(
+            unread,
+            "  5 call site(s) Carrick could not read (e.g. src/value-callee.ts:4: the function called is a value in this code, and Carrick found no function behind it)"
+        );
+
+        let expected = serde_json::json!({
+            "service": "svc",
+            "boundary": boundary,
+            "lines": lines,
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/unread-sites/boundary.expected.json");
+        let text = format!("{}\n", serde_json::to_string_pretty(&expected).unwrap());
+        if std::env::var_os("CARRICK_WRITE_FIXTURES").is_some() {
+            std::fs::write(&path, &text).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            text,
+            "{} is stale: rerun with CARRICK_WRITE_FIXTURES=1",
+            path.display()
+        );
+
+        // A blob with no key states nothing, and says nothing.
+        let mut old = data.clone();
+        old.unread_sites = None;
+        old.unread_sites_total = None;
+        let none = ServiceBoundary::collect(&old, &stats, &HashMap::new(), "/repo");
+        assert!(none.unread_sites.is_none());
+        assert!(
+            !none
+                .lines("svc")
+                .iter()
+                .any(|l| l.contains("could not read"))
+        );
     }
 
     /// The wire shape the cloud reader expects, byte for byte.
