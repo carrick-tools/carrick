@@ -2709,9 +2709,12 @@ fn every_protocol_keeps_a_reach_pair_seed() {
         .iter()
         .filter(|s| !seed_stages::is_retired(s))
         .collect();
+    // `dependency` seeds score the comment's Dependencies section: no
+    // operation, so no type-reach decision to compare.
     let protocols: std::collections::BTreeSet<&str> = live
         .iter()
         .map(|s| s["protocol"].as_str().unwrap())
+        .filter(|p| *p != "dependency")
         .collect();
     let sampled: std::collections::BTreeSet<&str> = REACH_SAMPLE.iter().map(|(p, _)| *p).collect();
     assert_eq!(protocols, sampled, "a protocol has no reach-pair seed");
@@ -3765,7 +3768,13 @@ async fn seed_copied_helper() {
 async fn seed_dependency_added() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("dependency-added").await;
-    let finding = findings_of(&payload)
+    let findings = findings_of(&payload);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the conflict and nothing else: {payload:#}"
+    );
+    let finding = findings
         .into_iter()
         .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == "@example/gql-client")
         .unwrap_or_else(|| panic!("no dependency_conflict on @example/gql-client in {payload:#}"));
@@ -3782,7 +3791,13 @@ async fn seed_dependency_added() {
 async fn seed_dependency_major_bump() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("dependency-major-bump").await;
-    let finding = findings_of(&payload)
+    let findings = findings_of(&payload);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the conflict and nothing else: {payload:#}"
+    );
+    let finding = findings
         .into_iter()
         .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == "zod")
         .unwrap_or_else(|| panic!("no dependency_conflict on zod in {payload:#}"));
@@ -3805,13 +3820,7 @@ async fn seed_dependency_major_bump() {
 async fn seed_dependency_unchanged() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("dependency-unchanged").await;
-    assert!(
-        findings_of(&payload)
-            .iter()
-            .filter(|f| f["kind"] == "dependency_conflict")
-            .all(|f| f["on_main"] != false && f.get("changed_by_pr").is_none()),
-        "{payload:#}"
-    );
+    assert!(findings_of(&payload).is_empty(), "{payload:#}");
     assert_eq!(
         payload["checked"]["dependencies"]["changed"], 0,
         "{payload:#}"
