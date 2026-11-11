@@ -11016,6 +11016,33 @@ fn run_capture_for_service(
         .service_name
         .clone()
         .unwrap_or_else(|| cloud_data.repo_name.clone());
+    // Every alias the check phase will import from this service's surface. The
+    // manifest is already on `cloud_data` by the time capture runs.
+    let manifest_aliases: Vec<String> = cloud_data
+        .type_manifest
+        .as_ref()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.type_alias.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let anchors = type_compat_v2::derive_capture_anchors(
+        &explicit,
+        &infer,
+        &inline_aliases,
+        &type_resolution.inferred_types,
+        &manifest_aliases,
+        &capture_root,
+    );
+    // A service with anchors is captured in a process of its own: start it
+    // now, so its start is not what the capture waits for. The call locators
+    // below do not change the aliases or anchors, so deciding here decides
+    // what the capture below does; a service with none starts nothing.
+    if !anchors.is_empty() {
+        sidecar.start_spare();
+    }
     let mut calls = type_compat_v2::consumer_call_locators(&infer);
     // The calls the retype abstains for before any rewrite are decided here,
     // in the program this analysis built, before the capture restarts the
@@ -11036,26 +11063,6 @@ fn run_capture_for_service(
             tsconfig: config.tsconfig.clone(),
             calls,
         },
-    );
-    // Every alias the check phase will import from this service's surface. The
-    // manifest is already on `cloud_data` by the time capture runs.
-    let manifest_aliases: Vec<String> = cloud_data
-        .type_manifest
-        .as_ref()
-        .map(|entries| {
-            entries
-                .iter()
-                .map(|entry| entry.type_alias.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    let anchors = type_compat_v2::derive_capture_anchors(
-        &explicit,
-        &infer,
-        &inline_aliases,
-        &type_resolution.inferred_types,
-        &manifest_aliases,
-        &capture_root,
     );
     if anchors.is_empty() {
         return None;

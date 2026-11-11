@@ -2868,6 +2868,33 @@ struct SidecarProcess {
     evidence: DeathEvidence,
 }
 
+/// A process started ahead of the capture that will replace the current one,
+/// already sent its `init` (which builds no program). It is held by the
+/// sidecar it was started for, taken by the capture's restart, and killed and
+/// reaped on every other path: when the sidecar is dropped, or when a restart
+/// finds it unusable.
+struct SpareProcess {
+    child: SpareChild,
+    stdin: ChildStdin,
+    responses: Receiver<String>,
+    evidence: DeathEvidence,
+    /// The scope its `init` was sent with.
+    scope: (PathBuf, Option<String>),
+}
+
+/// The spare's child, killed and reaped when this is dropped. Tracked in
+/// [`LIVE_SIDECARS`] while it waits, so a signal ends it too.
+struct SpareChild(Arc<Mutex<Child>>);
+
+impl Drop for SpareChild {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.0.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// What one sidecar process leaves behind to say whether it died of memory
 /// (carrick#2208): whether its stderr carried V8's heap-exhaustion line, and
 /// the cgroup's OOM-kill count when it was started.
@@ -3108,6 +3135,9 @@ pub struct TypeSidecar {
     /// that reads the init'd project for one service checks this before
     /// re-initialising, because a re-init drops the built program.
     scope: Mutex<Option<(PathBuf, Option<String>)>>,
+    /// A process started ahead for the capture's restart: see
+    /// [`Self::start_spare`].
+    spare: Mutex<Option<SpareProcess>>,
     /// The scanned repo's root, sent with every `init` and `capture_v2`: a
     /// service with no tsconfig of its own is typed under the nearest one
     /// above it, searched up to this root and no further (carrick#1776).
@@ -3317,6 +3347,7 @@ impl TypeSidecar {
             request_counter: Mutex::new(0),
             check_v2_sent: AtomicUsize::new(0),
             scope: Mutex::new(None),
+            spare: Mutex::new(None),
             scan_root: Mutex::new(None),
             operation_timeout: OPERATION_TIMEOUT,
             last_progress: Mutex::new(None),
@@ -3519,6 +3550,18 @@ impl TypeSidecar {
             .map(|root| root.to_string_lossy().into_owned())
     }
 
+    /// The `init` request for a scope: one recipe for the process in hand
+    /// and for a spare started ahead of it.
+    fn init_request(&self, repo_root: String, tsconfig_path: Option<String>) -> SidecarRequest {
+        SidecarRequest::Init {
+            request_id: self.next_request_id(),
+            repo_root,
+            tsconfig_path,
+            scan_root: self.scan_root_arg(),
+            workspace_source: self.workspace_source,
+        }
+    }
+
     /// Start initialization of the TypeScript project.
     ///
     /// This sends the init request and returns immediately. The sidecar
@@ -3542,13 +3585,7 @@ impl TypeSidecar {
         *self.scope.lock().unwrap() = Some((repo_root.to_path_buf(), tsconfig.clone()));
 
         // Send init request
-        let request = SidecarRequest::Init {
-            request_id: self.next_request_id(),
-            repo_root: repo_root_str,
-            tsconfig_path: tsconfig,
-            scan_root: self.scan_root_arg(),
-            workspace_source: self.workspace_source,
-        };
+        let request = self.init_request(repo_root_str, tsconfig);
 
         if let Err(e) = self.send_request(&request) {
             let mut state = self.state.lock().unwrap();
@@ -3746,9 +3783,136 @@ impl TypeSidecar {
     /// in its budget is abandoned ([`Self::abandon`]), because a fresh one
     /// would be asked the same question.
     pub fn restart(&self, why: &str) -> Result<(), SidecarError> {
+        self.restart_with(why, false)
+    }
+
+    /// [`Self::restart`] for a capture's first process: the process
+    /// [`Self::start_spare`] started ahead takes the old one's place when it
+    /// is there, alive and scoped as the sidecar is now, and a fresh one is
+    /// started when it is not. The old process is stopped first either way,
+    /// so its memory is free before the capture builds (carrick#1916).
+    /// One debug line says which it was.
+    pub fn restart_for_capture(&self, why: &str) -> Result<(), SidecarError> {
+        self.restart_with(why, true)
+    }
+
+    /// Start the process the next [`Self::restart_for_capture`] will install,
+    /// sent its `init` now so its start is not on the capture's wait. The
+    /// init builds no program. Nothing happens for a sidecar that has no
+    /// scope yet or already holds a spare, and a spare that cannot be started
+    /// is only logged: the capture then starts a process as it always did.
+    pub fn start_spare(&self) {
+        let Some((root, tsconfig)) = self.scope.lock().unwrap().clone() else {
+            return;
+        };
+        let mut held = self.spare.lock().unwrap();
+        if held.is_some() {
+            return;
+        }
+        let process = match SidecarProcess::spawn(&self.sidecar_path, self.heap_cap_mb) {
+            Ok(process) => process,
+            Err(e) => {
+                debug!("[type_sidecar] The capture's process was not started ahead: {e}");
+                return;
+            }
+        };
+        let child = Arc::new(Mutex::new(process.child));
+        track(&child);
+        let mut spare = SpareProcess {
+            child: SpareChild(child),
+            stdin: process.stdin,
+            responses: process.responses,
+            evidence: process.evidence,
+            scope: (root.clone(), tsconfig.clone()),
+        };
+        let request = self.init_request(root.to_string_lossy().into_owned(), tsconfig);
+        let sent = serde_json::to_string(&request)
+            .map_err(|e| e.to_string())
+            .and_then(|json| {
+                writeln!(spare.stdin, "{json}")
+                    .and_then(|()| spare.stdin.flush())
+                    .map_err(|e| e.to_string())
+            });
+        match sent {
+            Ok(()) => *held = Some(spare),
+            Err(e) => debug!("[type_sidecar] The capture's process was not started ahead: {e}"),
+        }
+    }
+
+    /// The spare, when it can take the place of the process this sidecar
+    /// holds; otherwise why not. A spare that is not usable is dropped here,
+    /// which kills and reaps it.
+    fn take_spare(&self) -> Result<SpareProcess, &'static str> {
+        let spare = self
+            .spare
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("none was started")?;
+        if self.scope.lock().unwrap().as_ref() != Some(&spare.scope) {
+            return Err("the sidecar was scoped elsewhere since");
+        }
+        let alive = matches!(spare.child.0.lock().unwrap().try_wait(), Ok(None));
+        if !alive {
+            return Err("it had exited");
+        }
+        Ok(spare)
+    }
+
+    fn restart_with(&self, why: &str, take_spare: bool) -> Result<(), SidecarError> {
         let started = Instant::now();
         debug!("[type_sidecar] Starting a fresh sidecar: {why}");
         self.kill();
+
+        if take_spare {
+            match self.take_spare() {
+                Ok(spare) => {
+                    debug!("[type_sidecar] capture process: spare used");
+                    let SpareProcess {
+                        child,
+                        stdin,
+                        responses,
+                        evidence,
+                        ..
+                    } = spare;
+                    // The spare's child goes in behind the handle the sidecar
+                    // already tracks; the stopped one ends up in `child`,
+                    // which reaps it as it goes out of scope.
+                    std::mem::swap(
+                        &mut *self.child.lock().unwrap(),
+                        &mut *child.0.lock().unwrap(),
+                    );
+                    *self.stdin.lock().unwrap() = stdin;
+                    *self.responses.lock().unwrap() = responses;
+                    *self.evidence.lock().unwrap() = evidence;
+                    self.death_noted.store(false, Ordering::SeqCst);
+                    // Its init was sent when it was started.
+                    *self.state.lock().unwrap() = SidecarState::Initializing;
+                    return match self.wait_ready(ready_budget()) {
+                        Ok(()) => {
+                            debug!(
+                                "[type_sidecar] Fresh sidecar ready in {:?}",
+                                started.elapsed()
+                            );
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let reason = format!(
+                                "no fresh sidecar could be started ({why}): it was not ready: {e}"
+                            );
+                            warn!(
+                                "The type sidecar was not replaced ({why}): it was not ready: {e}"
+                            );
+                            *self.state.lock().unwrap() = SidecarState::Failed(reason.clone());
+                            Err(SidecarError::NotReady(reason))
+                        }
+                    };
+                }
+                Err(reason) => debug!(
+                    "[type_sidecar] capture process: spare missing ({reason}), started fresh"
+                ),
+            }
+        }
 
         let failed = |detail: String| {
             warn!("The type sidecar was not replaced ({why}): {detail}");
