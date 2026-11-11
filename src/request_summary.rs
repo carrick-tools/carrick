@@ -1339,10 +1339,11 @@ struct FnIr {
     /// anew, of one of its makers, each handed its own arguments
     /// (carrick#1689).
     returned: Option<Returned>,
-    /// What each `return` hands back, an arrow's expression body included,
-    /// as far as it is a request's parsed body or another call's value
-    /// ([`BodyReturn`], carrick#1601). Empty when the body returns nothing.
-    body_returns: Vec<BodyReturn>,
+    /// What the function returns when that is one call's value read one way
+    /// ([`crate::return_flow::return_shapes`], carrick#1601, carrick#3823):
+    /// the one reader of whether it hands back its request's parsed body.
+    /// `None` for anything else, or nothing returned.
+    return_shape: Option<crate::return_flow::ReturnShape>,
     /// Each parameter by position, as a body sent through it is read
     /// (carrick#1782): where its name is written, whether its declaration
     /// states a type, and whether the body assigns it again. `None` for a
@@ -1415,80 +1416,6 @@ impl FnIr {
             .map(|call| (call, false))
             .chain(self.constructions.iter().map(|call| (call, true)))
             .chain(self.optional_calls.iter().map(|call| (call, false)))
-    }
-}
-
-/// What one `return` hands back, read for whether a call of the function is
-/// worth its request's parsed body (carrick#1601). Calls are named by their
-/// span start in the discovery source map ([`Site`]'s `lo`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyReturn {
-    /// The body the response of the call at this span parses into, unchanged
-    /// (`(await res.json()) as T` with `res` that call's value, or
-    /// `(await fetch(url)).json()`).
-    Parsed(u32),
-    /// The value of the call at this span, unchanged.
-    Value(u32),
-    /// Anything else: a value the function computes from the body, a
-    /// literal, a binding this pass cannot follow.
-    Other,
-}
-
-/// What a local binding holds, for [`BodyReturn`]: a call's value or the
-/// body that call's response parses into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodySource {
-    Response(u32),
-    Parsed(u32),
-}
-
-/// What `expr` hands back as a [`BodyReturn`], reading bindings through
-/// `bodies`. Types, parentheses and `await` change nothing it holds.
-fn body_return(expr: &Expr, bodies: &HashMap<BindingKey, BodySource>) -> BodyReturn {
-    let parsed = |response: &Expr| match unwrap_value(response) {
-        Expr::Call(call) => Some(call.span.lo.0),
-        Expr::Ident(ident) => match bodies.get(&ident_key(ident)) {
-            Some(BodySource::Response(at)) => Some(*at),
-            _ => None,
-        },
-        _ => None,
-    };
-    match unwrap_value(expr) {
-        Expr::Call(call) => match parse_call_object(call) {
-            Some(response) => parsed(response).map_or(BodyReturn::Other, BodyReturn::Parsed),
-            None => BodyReturn::Value(call.span.lo.0),
-        },
-        Expr::Ident(ident) => match bodies.get(&ident_key(ident)) {
-            Some(BodySource::Parsed(at)) => BodyReturn::Parsed(*at),
-            Some(BodySource::Response(at)) => BodyReturn::Value(*at),
-            None => BodyReturn::Other,
-        },
-        _ => BodyReturn::Other,
-    }
-}
-
-/// What a binding initialised with `init` holds, for [`body_return`].
-fn body_source(init: &Expr, bodies: &HashMap<BindingKey, BodySource>) -> Option<BodySource> {
-    match body_return(init, bodies) {
-        BodyReturn::Parsed(at) => Some(BodySource::Parsed(at)),
-        BodyReturn::Value(at) => Some(BodySource::Response(at)),
-        BodyReturn::Other => None,
-    }
-}
-
-/// The response a `<response>.json()` call parses: the Fetch body read the
-/// platform's `fetch` answers with. No arguments, no optional chain.
-fn parse_call_object(call: &CallExpr) -> Option<&Expr> {
-    let Callee::Expr(callee) = &call.callee else {
-        return None;
-    };
-    match &**callee {
-        Expr::Member(member)
-            if call.args.is_empty() && member_prop(member).as_deref() == Some("json") =>
-        {
-            Some(&member.obj)
-        }
-        _ => None,
     }
 }
 
@@ -2071,6 +1998,10 @@ pub fn extract_file_ir(
         source_map,
         builder_depth: std::cell::Cell::new(0),
         returned_objects: crate::return_flow::returned_objects(module),
+        return_shapes: crate::return_flow::return_shapes(module)
+            .into_iter()
+            .filter_map(|(node, shape)| Some(((node.lo.0, node.hi.0), shape?)))
+            .collect(),
         recording_depth: std::cell::Cell::new(0),
         arg_pieces: std::cell::RefCell::new(HashMap::new()),
     };
@@ -4967,9 +4898,6 @@ struct Scope<'a> {
     /// [`Reader::let_makers`]). Read only where they are returned: no call
     /// is read through one, for any role.
     let_makers: HashMap<BindingKey, Vec<ClientRef>>,
-    /// Locals set once to a call's value or to the body its response parses
-    /// into ([`body_source`], carrick#1601).
-    bodies: HashMap<BindingKey, BodySource>,
     /// Parameters, the enclosing function's included, that hold the
     /// platform's `fetch` unless a caller hands another (`fetchImpl =
     /// fetch`, `{ fetchImpl = fetch } = {}`), and that the body never
@@ -5020,7 +4948,6 @@ impl<'a> Scope<'a> {
             texts: HashMap::new(),
             local_receivers: HashMap::new(),
             let_makers: HashMap::new(),
-            bodies: HashMap::new(),
             fetches: HashSet::new(),
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
@@ -5209,6 +5136,10 @@ struct Reader<'a> {
     /// The object literals some function of the module returns, by span
     /// ([`crate::return_flow::returned_objects`], carrick#3470).
     returned_objects: HashSet<(u32, u32)>,
+    /// What each function of the module returns, by the span `(lo, hi)` of
+    /// its node, where that is one call's value read one way
+    /// ([`crate::return_flow::return_shapes`], carrick#3823).
+    return_shapes: HashMap<(u32, u32), crate::return_flow::ReturnShape>,
     /// While above 0, [`Reader::eval`] keeps the pieces it reads each
     /// expression as in [`Self::arg_pieces`] ([`Reader::recording`]).
     recording_depth: std::cell::Cell<usize>,
@@ -5390,6 +5321,12 @@ impl Reader<'_> {
             Expr::New(new) => Some(self.text(new.span)),
             _ => None,
         }
+    }
+
+    /// What the function whose node is `span` returns
+    /// ([`Reader::return_shapes`]).
+    fn return_shape(&self, span: Span) -> Option<crate::return_flow::ReturnShape> {
+        self.return_shapes.get(&(span.lo.0, span.hi.0)).copied()
     }
 
     fn site(&self, span: Span) -> Site {
@@ -6058,7 +5995,6 @@ impl Reader<'_> {
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, function),
             let_makers: HashMap::new(),
-            bodies: HashMap::new(),
             fetches,
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
@@ -6092,6 +6028,7 @@ impl Reader<'_> {
             ),
             type_params: type_param_names(function.type_params.as_deref()),
             site: Some(self.site(function.span)),
+            return_shape: self.return_shape(function.span),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
             param_names: values.names,
@@ -6129,7 +6066,6 @@ impl Reader<'_> {
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, arrow),
             let_makers: HashMap::new(),
-            bodies: HashMap::new(),
             fetches,
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
@@ -6154,6 +6090,7 @@ impl Reader<'_> {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
             site: Some(self.site(arrow.span)),
+            return_shape: self.return_shape(arrow.span),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
             param_names: values.names,
@@ -6168,7 +6105,6 @@ impl Reader<'_> {
             ArrowFunctionBody::Expr(expr) => {
                 let returned = self.returned_instances(expr, &scope);
                 ir.returns.push((expr.span().lo.0, returned));
-                ir.body_returns.push(body_return(expr, &scope.bodies));
                 ir.returned_values
                     .extend(self.value_of(expr, &scope, &guards::Bound::default()));
                 ir.returns_tests.push(guards::is_test(expr));
@@ -6409,15 +6345,6 @@ impl Reader<'_> {
                                 scope.alts.remove(&key);
                             }
                         }
-                        // What a call or its parsed response leaves in it,
-                        // for what a `return` of it hands back (carrick#1601).
-                        match (!unsettled)
-                            .then(|| body_source(init, &scope.bodies))
-                            .flatten()
-                        {
-                            Some(source) => scope.bodies.insert(key.clone(), source),
-                            None => scope.bodies.remove(&key),
-                        };
                         scope.local_receivers.remove(&key);
                         if let Some(client) = client
                             && declared.name_count(&name) == 1
@@ -8277,11 +8204,6 @@ impl Visit for CallWalker<'_, '_, '_> {
             self.ir.returned_values.extend(values);
         }
         self.ir.returns.push((ret.span.lo.0, returned));
-        self.ir
-            .body_returns
-            .push(ret.arg.as_deref().map_or(BodyReturn::Other, |arg| {
-                body_return(arg, &self.scope.bodies)
-            }));
         // A predicate's guard is read where it is returned (carrick#2386).
         self.ir
             .returns_tests
@@ -9193,10 +9115,12 @@ struct Summary {
     complete: bool,
     /// Parameters the function invokes.
     invokes: BTreeSet<usize>,
-    /// The function sends one request and every `return` hands back that
-    /// request's parsed body unchanged, here or through a call to a function
-    /// that does the same (carrick#1601). A call of it is worth the body,
-    /// so a row stated at that call can be typed by the call's value.
+    /// The function sends one request and what it returns
+    /// ([`crate::return_flow::return_shapes`], the reader model rows use
+    /// too, carrick#3823) is that request's parsed body unchanged, here or
+    /// through a call to a function that does the same (carrick#1601). A
+    /// call of it is worth the body, so a row stated at that call can be
+    /// typed by the call's value.
     passes_body: bool,
     /// The function hands out a function that may send (carrick#2281): its
     /// body writes one it does not call whose own summary is incomplete or
@@ -10006,10 +9930,6 @@ fn declared_client(
 pub struct RequestSummaryIndex {
     rows: HashMap<PathBuf, BTreeMap<u32, Vec<SummaryRow>>>,
     silent: HashMap<PathBuf, BTreeSet<u32>>,
-    /// Every function that hands back its one request's parsed body
-    /// ([`Summary::passes_body`]), by its file's canonical path and the name
-    /// the file declares it under.
-    passes_body: HashSet<(PathBuf, String)>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
     /// The callers among them whose request is closed and does not render
@@ -10103,16 +10023,6 @@ struct DeclaredRows {
 }
 
 impl RequestSummaryIndex {
-    /// Whether a call of `function`, declared at top level in the file whose
-    /// canonical path is `file`, is worth its one request's parsed body
-    /// (carrick#1601): the function sends one request and every `return`
-    /// hands back that request's body unchanged. False for a function this
-    /// pass did not read.
-    pub fn passes_body(&self, file: &Path, function: &str) -> bool {
-        self.passes_body
-            .contains(&(file.to_path_buf(), function.to_string()))
-    }
-
     /// Rows read through library semantics (carrick#1564).
     pub fn library_row_count(&self) -> usize {
         self.rows
@@ -10445,11 +10355,9 @@ impl Composer<'_> {
             lifted.extend(lift_outer(&written));
         }
         summary.passes_body = summary.effects.len() == 1
-            && !ir.body_returns.is_empty()
             && ir
-                .body_returns
-                .iter()
-                .all(|returned| self.hands_back_body(file, ir, *returned));
+                .return_shape
+                .is_some_and(|shape| self.hands_back_body(file, ir, shape));
         summary
             .effects
             .extend(lifted.into_iter().map(|effect| ir.settle_forward(effect)));
@@ -10478,24 +10386,27 @@ fn lift_outer(summary: &Summary) -> Vec<Effect> {
 }
 
 impl Composer<'_> {
-    /// Whether one `return` of `ir` hands back its request's parsed body
-    /// unchanged (carrick#1601): the response a request this body makes
-    /// answers with, parsed, or what a call of a function that does the
-    /// same returns.
-    fn hands_back_body(&mut self, file: &Path, ir: &FnIr, returned: BodyReturn) -> bool {
-        let (BodyReturn::Parsed(at) | BodyReturn::Value(at)) = returned else {
+    /// Whether what `ir` returns ([`FnIr::return_shape`]) is its request's
+    /// parsed body unchanged (carrick#1601): the response a request this
+    /// body makes answers with, parsed, or what a call of a function that
+    /// does the same returns. One member of a value is not the body.
+    fn hands_back_body(
+        &mut self,
+        file: &Path,
+        ir: &FnIr,
+        shape: crate::return_flow::ReturnShape,
+    ) -> bool {
+        use crate::return_flow::ShapeKind;
+        let Some(call) = ir.calls.iter().find(|call| {
+            call.site.lo == shape.base.lo.0
+                && call.site.hi == shape.base.hi.0
+                && call.invokes_param.is_none()
+        }) else {
             return false;
         };
-        let Some(call) = ir
-            .calls
-            .iter()
-            .find(|call| call.site.lo == at && call.invokes_param.is_none())
-        else {
-            return false;
-        };
-        match (returned, self.callee(file, call)) {
-            (BodyReturn::Parsed(_), None) => self.request_of(file, call).is_some(),
-            (BodyReturn::Value(_), Some((_, callee))) => callee.passes_body,
+        match (shape.kind, self.callee(file, call)) {
+            (ShapeKind::Parsed, None) => self.request_of(file, call).is_some(),
+            (ShapeKind::Value, Some((_, callee))) => callee.passes_body,
             _ => false,
         }
     }
@@ -10552,26 +10463,6 @@ pub fn summarize(
                     .entry(path.to_path_buf())
                     .or_default()
                     .insert(call.site.span_start);
-            }
-        }
-    }
-    // Every function, not only the ones a resolved call site composed: a
-    // caller the model states is read against its callee by the module graph
-    // (carrick#1801), whether or not the call graph resolved that call.
-    for path in &paths {
-        let mut canonical = None;
-        for (key, ir) in &files[*path].functions {
-            if !ir.constructor
-                && composer
-                    .summary(path, key)
-                    .is_some_and(|summary| summary.passes_body)
-            {
-                let file = canonical
-                    .get_or_insert_with(|| {
-                        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-                    })
-                    .clone();
-                index.passes_body.insert((file, key.clone()));
             }
         }
     }

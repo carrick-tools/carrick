@@ -20788,9 +20788,11 @@ unfollowed_member_calls_total: 0,
     /// back its parsed body unchanged is worth that body, so a row stated
     /// there is not marked: a generic transport helper (`send<T>`), the body
     /// held in a local first, the response parsed where it is awaited, an
-    /// arrow, and a function that returns such a helper's call (`viaSend`). A
-    /// helper that hands back the raw response, returns early with something
-    /// else, makes two requests, returns a call of a helper that hands back
+    /// arrow, a function that returns such a helper's call (`viaSend`), and
+    /// one that returns early with no body (`early`: `return null` hands back
+    /// nothing, carrick#3823). A helper that hands back the raw response,
+    /// returns early with something else (`other`), makes two requests,
+    /// returns a call of a helper that hands back
     /// the raw response (`viaRaw`), or parses a response its request did not
     /// answer with (`stored`) is marked.
     #[test]
@@ -20820,6 +20822,11 @@ unfollowed_member_calls_total: 0,
                  \x20 if (!res.ok) return null;\n\
                  \x20 return res.json();\n\
                  }\n\
+                 export async function other(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 if (!res.ok) return { failed: res.status };\n\
+                 \x20 return res.json();\n\
+                 }\n\
                  export async function twice(url: string) {\n\
                  \x20 await fetch(`${url}/audit`, { method: \"POST\" });\n\
                  \x20 const res = await fetch(url, { method: \"GET\" });\n\
@@ -20839,7 +20846,7 @@ unfollowed_member_calls_total: 0,
             ),
             (
                 "src/client.ts",
-                "import { send, held, inline, arrow, raw, early, twice, viaSend, viaRaw, stored } from \"./send\";\n\
+                "import { send, held, inline, arrow, raw, early, other, twice, viaSend, viaRaw, stored } from \"./send\";\n\
                  const BASE = process.env.API_BASE;\n\
                  export function readWidget(id: string) {\n\
                  \x20 return send<{ id: string }>(`${BASE}/widgets/${id}`, { method: \"GET\" });\n\
@@ -20854,6 +20861,7 @@ unfollowed_member_calls_total: 0,
                  \x20 viaSend(`${BASE}/via-send`);\n\
                  \x20 viaRaw(`${BASE}/via-raw`);\n\
                  \x20 stored(`${BASE}/stored`);\n\
+                 \x20 other(`${BASE}/other`);\n\
                  }\n",
             ),
         ]);
@@ -20879,55 +20887,255 @@ unfollowed_member_calls_total: 0,
                 (8, "inline".to_string(), false),
                 (9, "arrow".to_string(), false),
                 (10, "raw".to_string(), true),
-                (11, "early".to_string(), true),
+                (11, "early".to_string(), false),
                 (12, "audit".to_string(), true),
                 (12, "twice".to_string(), true),
                 (13, "via-send".to_string(), false),
                 (14, "via-raw".to_string(), true),
                 (15, "stored".to_string(), true),
+                (16, "other".to_string(), true),
             ]
         );
     }
 
-    /// carrick#1801: the summaries answer whether a function hands back its
-    /// parsed body for every function they read, by the file's canonical path
-    /// (the temp dir is reached through a link on macOS), including one no
-    /// call in the service reaches: a caller only the model states is read
-    /// against its callee by the module graph, not the call graph.
+    /// carrick#1601: a row stated at a call of a function that hands back
+    /// its parsed body (the body held in a local, an arrow) is not marked;
+    /// one stated at a call of a function that hands back the raw response or
+    /// a value mapped from the body is.
     #[test]
-    fn the_summaries_say_which_functions_hand_back_their_parsed_body() {
-        let (dir, discovery) = discover_sources(&[(
-            "src/send.ts",
-            "export async function held(url: string) {\n\
-             \x20 const res = await fetch(url, { method: \"GET\" });\n\
-             \x20 const data = (await res.json()) as { id: string };\n\
-             \x20 return data;\n\
-             }\n\
-             export const arrow = async (url: string) => (await fetch(url, { method: \"GET\" })).json();\n\
-             export async function raw(url: string) {\n\
-             \x20 return fetch(url, { method: \"GET\" });\n\
-             }\n\
-             export async function mapped(url: string) {\n\
-             \x20 const res = await fetch(url, { method: \"GET\" });\n\
-             \x20 const data = (await res.json()) as { id: string };\n\
-             \x20 return { id: data.id };\n\
-             }\n",
-        )]);
-        let summaries = summaries_of(&discovery);
-        let file = dir.path().join("src/send.ts").canonicalize().unwrap();
-        let passes: Vec<(&str, bool)> = ["held", "arrow", "raw", "mapped", "missing"]
+    fn a_call_of_a_function_that_maps_or_hands_back_the_raw_response_is_marked() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/send.ts",
+                "export async function held(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 const data = (await res.json()) as { id: string };\n\
+                 \x20 return data;\n\
+                 }\n\
+                 export const arrow = async (url: string) => (await fetch(url, { method: \"GET\" })).json();\n\
+                 export async function raw(url: string) {\n\
+                 \x20 return fetch(url, { method: \"GET\" });\n\
+                 }\n\
+                 export async function mapped(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 const data = (await res.json()) as { id: string };\n\
+                 \x20 return { id: data.id };\n\
+                 }\n",
+            ),
+            (
+                "src/client.ts",
+                "import { held, arrow, raw, mapped } from \"./send\";\n\
+                 const BASE = process.env.API_BASE;\n\
+                 export function readAll() {\n\
+                 \x20 held(`${BASE}/held`);\n\
+                 \x20 arrow(`${BASE}/arrow`);\n\
+                 \x20 raw(`${BASE}/raw`);\n\
+                 \x20 mapped(`${BASE}/mapped`);\n\
+                 }\n",
+            ),
+        ]);
+        let mut marks: Vec<(String, bool)> = summary_rows_of(&dir, &discovery, "src/client.ts")
             .into_iter()
-            .map(|name| (name, summaries.passes_body(&file, name)))
+            .map(|row| {
+                let last = row.target.rsplit('/').next().unwrap_or_default();
+                (last.to_string(), row.at_caller)
+            })
+            .collect();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec![
+                ("arrow".to_string(), false),
+                ("held".to_string(), false),
+                ("mapped".to_string(), true),
+                ("raw".to_string(), true),
+            ]
+        );
+    }
+
+    /// The `send<T>` wrappers of the carrick#3823 fixture, each a private
+    /// method of its own client class that a `get` method calls with the path
+    /// `/widgets-<name>/${id}` (or as `call` reads it), as `(name, call,
+    /// send)`.
+    fn class_wrapper_sources(wrappers: &[(&str, &str, &str)]) -> String {
+        let mut source = String::from("interface Widget { id: string; name: string }\n");
+        for (name, call, send) in wrappers {
+            source.push_str(&format!(
+                "export class Client_{name} {{\n\
+                 \x20 private readonly base: string;\n\
+                 \x20 constructor(settings: {{ url: string }}) {{ this.base = settings.url; }}\n\
+                 \x20 async getWidget(id: string, name: string): Promise<Widget> {{\n\
+                 \x20   return await {call};\n\
+                 \x20 }}\n\
+                 \x20 {send}\n\
+                 }}\n"
+            ));
+        }
+        source
+    }
+
+    /// The summary rows `class_wrapper_sources` states, by the `/widgets-*`
+    /// segment of their target.
+    fn class_wrapper_rows(
+        wrappers: &[(&str, &str, &str)],
+    ) -> Vec<(String, crate::request_summary::SummaryRow)> {
+        let (dir, discovery) =
+            discover_sources(&[("src/clients.ts", &class_wrapper_sources(wrappers))]);
+        let mut rows: Vec<(String, crate::request_summary::SummaryRow)> =
+            summary_rows_of(&dir, &discovery, "src/clients.ts")
+                .into_iter()
+                .filter_map(|row| {
+                    let segment = row
+                        .target
+                        .split('/')
+                        .find(|segment| segment.starts_with("widgets-"))?
+                        .to_string();
+                    Some((segment, row))
+                })
+                .collect();
+        rows.sort_by(|a, b| (a.0.as_str(), a.1.line).cmp(&(b.0.as_str(), b.1.line)));
+        rows
+    }
+
+    const GET_WIDGET: &str = "fetch(`${this.base}${path}`, { method: \"GET\" })";
+
+    /// carrick#3823: a wrapper whose response local is declared in a nested
+    /// block (D) or assigned once after its declaration (C) hands back its
+    /// one request's parsed body, as one whose local is declared at the top
+    /// does, so its caller's row is not marked and keeps its response type.
+    /// Two returns of the same parse (TWO) are one.
+    #[test]
+    fn a_wrapper_whose_response_local_is_scoped_or_assigned_later_hands_back_its_body() {
+        let call = |name: &str| format!("this.send<Widget>(`/widgets-{name}/${{id}}`)");
+        let c = format!(
+            "private async send<T>(path: string): Promise<T> {{\n\
+             \x20   for (let attempt = 0; attempt < 3; attempt++) {{\n\
+             \x20     let res: Response;\n\
+             \x20     try {{ res = await {GET_WIDGET}; }} catch {{ continue; }}\n\
+             \x20     if (res.ok) {{ return (await res.json()) as T; }}\n\
+             \x20   }}\n\
+             \x20   throw new Error(\"no answer\");\n\
+             \x20 }}"
+        );
+        let d = format!(
+            "private async send<T>(path: string): Promise<T> {{\n\
+             \x20   try {{ const res = await {GET_WIDGET}; return (await res.json()) as T; }} catch (error) {{ throw error; }}\n\
+             \x20 }}"
+        );
+        let two = format!(
+            "private async send<T>(path: string): Promise<T> {{\n\
+             \x20   const res = await {GET_WIDGET};\n\
+             \x20   if (res.status === 200) {{ return (await res.json()) as T; }}\n\
+             \x20   return (await res.json()) as T;\n\
+             \x20 }}"
+        );
+        let (call_c, call_d, call_two) = (call("c"), call("d"), call("two"));
+        let rows = class_wrapper_rows(&[
+            ("c", &call_c, &c),
+            ("d", &call_d, &d),
+            ("two", &call_two, &two),
+        ]);
+        let marks: Vec<(&str, bool)> = rows
+            .iter()
+            .filter(|(_, row)| !row.own_site)
+            .map(|(segment, row)| (segment.as_str(), row.at_caller))
             .collect();
         assert_eq!(
-            passes,
+            marks,
             vec![
-                ("held", true),
-                ("arrow", true),
-                ("raw", false),
-                ("mapped", false),
-                ("missing", false),
-            ]
+                ("widgets-c", false),
+                ("widgets-d", false),
+                ("widgets-two", false)
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    /// carrick#1601 / carrick#3823: a wrapper that hands back something other
+    /// than its request's parsed body leaves its caller's row marked: a
+    /// second return of a value read off a caught parse (E, until
+    /// carrick#3842), the body wrapped in an object (G), the raw response
+    /// (RAW).
+    #[test]
+    fn a_wrapper_that_does_not_hand_back_its_parsed_body_leaves_its_caller_marked() {
+        let call = |name: &str| format!("this.send<Widget>(`/widgets-{name}/${{id}}`)");
+        let e = format!(
+            "private async send<T>(path: string): Promise<T> {{\n\
+             \x20   const res = await {GET_WIDGET};\n\
+             \x20   if (res.ok) {{ return (await res.json()) as T; }}\n\
+             \x20   const failure = await res.json().catch(() => null);\n\
+             \x20   if (res.status === 409 && failure) {{ return failure as T; }}\n\
+             \x20   throw new Error(`status ${{res.status}}`);\n\
+             \x20 }}"
+        );
+        let g = format!(
+            "private async send<T>(path: string): Promise<{{ data: T; status: number }}> {{\n\
+             \x20   const res = await {GET_WIDGET};\n\
+             \x20   return {{ data: (await res.json()) as T, status: res.status }};\n\
+             \x20 }}"
+        );
+        let raw = format!(
+            "private async send<T>(path: string): Promise<T> {{\n\
+             \x20   return {GET_WIDGET} as unknown as T;\n\
+             \x20 }}"
+        );
+        let call_g = "(await this.send<Widget>(`/widgets-g/${id}`)).data".to_string();
+        let (call_e, call_raw) = (call("e"), call("raw"));
+        let rows = class_wrapper_rows(&[
+            ("e", &call_e, &e),
+            ("g", &call_g, &g),
+            ("raw", &call_raw, &raw),
+        ]);
+        let marks: Vec<(&str, bool)> = rows
+            .iter()
+            .filter(|(_, row)| !row.own_site)
+            .map(|(segment, row)| (segment.as_str(), row.at_caller))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                ("widgets-e", true),
+                ("widgets-g", true),
+                ("widgets-raw", true)
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    /// carrick#1782: a wrapper whose body is built from its parameter under
+    /// a condition (F, until carrick#3843) or from an options bag (BAG)
+    /// states its caller's body as built, whatever it returns.
+    #[test]
+    fn a_wrapper_that_builds_its_body_states_its_caller_s_body_as_built() {
+        let call = |name: &str| {
+            format!("this.send<Widget>(\"POST\", `/widgets-{name}/${{id}}`, {{ name }})")
+        };
+        let f = "private async send<T>(method: string, path: string, body?: object): Promise<T> {\n\
+                 \x20   const res = await fetch(`${this.base}${path}`, { method, body: body ? JSON.stringify(body) : null });\n\
+                 \x20   return (await res.json()) as T;\n\
+                 \x20 }";
+        let bag = "private async send<T>(method: string, path: string, opts: { json?: unknown; form?: FormData } = {}): Promise<T> {\n\
+                   \x20   let body: BodyInit | undefined;\n\
+                   \x20   if (opts.form) { body = opts.form; } else if (opts.json !== undefined) { body = JSON.stringify(opts.json); }\n\
+                   \x20   const res = await fetch(`${this.base}${path}`, { method, body });\n\
+                   \x20   return (await res.json()) as T;\n\
+                   \x20 }";
+        let call_bag =
+            "this.send<Widget>(\"POST\", `/widgets-bag/${id}`, { json: { name } })".to_string();
+        let call_f = call("f");
+        let rows = class_wrapper_rows(&[("f", &call_f, f), ("bag", &call_bag, bag)]);
+        let bodies: Vec<(&str, Option<crate::forwarded_body::CallBody>)> = rows
+            .iter()
+            .filter(|(_, row)| !row.own_site)
+            .map(|(segment, row)| (segment.as_str(), row.call_body.clone()))
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                ("widgets-bag", Some(crate::forwarded_body::CallBody::Built)),
+                ("widgets-f", Some(crate::forwarded_body::CallBody::Built)),
+            ],
+            "{rows:#?}"
         );
     }
 
