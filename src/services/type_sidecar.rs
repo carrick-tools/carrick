@@ -3247,7 +3247,29 @@ impl SidecarRecipe {
         self.spawn_ready(repo_root, tsconfig_path, true)
     }
 
+    /// [`Self::spawn_scoped`] without the wait: the process gets ready while
+    /// the caller works, and [`TypeSidecar::wait_ready`] is owed before its
+    /// first request.
+    pub fn start_scoped(
+        &self,
+        repo_root: &Path,
+        tsconfig_path: Option<&str>,
+    ) -> Result<TypeSidecar, SidecarError> {
+        self.spawn_initialising(repo_root, tsconfig_path, false)
+    }
+
     fn spawn_ready(
+        &self,
+        repo_root: &Path,
+        tsconfig_path: Option<&str>,
+        position_rows: bool,
+    ) -> Result<TypeSidecar, SidecarError> {
+        let sidecar = self.spawn_initialising(repo_root, tsconfig_path, position_rows)?;
+        sidecar.wait_ready(ready_budget())?;
+        Ok(sidecar)
+    }
+
+    fn spawn_initialising(
         &self,
         repo_root: &Path,
         tsconfig_path: Option<&str>,
@@ -3264,7 +3286,6 @@ impl SidecarRecipe {
             sidecar.set_scan_root(scan_root);
         }
         sidecar.start_init(repo_root, tsconfig_path);
-        sidecar.wait_ready(ready_budget())?;
         Ok(sidecar)
     }
 }
