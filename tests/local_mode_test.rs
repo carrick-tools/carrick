@@ -3930,6 +3930,40 @@ fn check_changed_names_the_untouched_calls_a_deleted_route_leaves_with_no_route(
     assert_eq!(code, Some(1), "{text}");
 }
 
+/// carrick#3411: an agent adds one new file with no route, call or event in
+/// one package; socket emits in an untouched file of another package are not
+/// named as left with no route.
+#[test]
+#[serial]
+fn check_changed_does_not_name_untouched_socket_emits_for_an_unrelated_new_file() {
+    let workspace = workspace(
+        "xrepo-corpus-1",
+        &["orders-monorepo", "payments-svc", "web-frontend"],
+    );
+    let root = workspace.path();
+    index(root);
+    // The known positive: the emit and its listener are paired in the index.
+    let socket = touch(root, "payments-svc/realtime/server.ts");
+    assert!(socket.contains("payment:settled"), "{socket}");
+
+    std::fs::write(
+        root.join("orders-monorepo/packages/orders-pkg/src/slug.ts"),
+        "export function slug(name: string): string {\n  return name.toLowerCase().replace(/ /g, \"-\");\n}\n",
+    )
+    .expect("add an unrelated file");
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        !text.contains("payment:settled") && !text.contains("realtime"),
+        "the untouched emits are not named:\n{text}"
+    );
+    assert!(
+        text.contains(": 0 incompatible, 0 reach no route"),
+        "and nothing is left with no route:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
 /// Marks the workspace's index as written by an older scanner, as an upgrade
 /// leaves it: same rows, another version.
 fn as_written_by_an_older_scanner(root: &Path) {
