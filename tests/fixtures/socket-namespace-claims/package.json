@@ -1,0 +1,11 @@
+{
+  "name": "socket-namespace-claims",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "workspaces": ["services/*"],
+  "dependencies": {
+    "@fixture/rt-client": "^4.8.0",
+    "@fixture/rt-server": "^4.8.0"
+  }
+}
