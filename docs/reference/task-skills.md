@@ -195,47 +195,41 @@ excluded repo is invisible to the derivation, so the flag would otherwise reach
 the carrick#991 rule that attaches an unmatched value to the one repo with no
 GitHub identity.
 
-## The reuse nudge (carrick#1330)
+## What the hooks deliver
 
-`carrick-reuse` is the one skill with a moment that can be detected rather than
-remembered, so it is the one a hook points at. Measured before it was built:
-prose alone reached the index in none of five runs, and a hook pack in five of
-five. A reuse check that waits to be remembered does not run.
+The end-of-task hooks report what the agent's edits came to and never ask the
+agent to start something new once the task is done.
 
-Three parts, in the order they fire:
-
-| Part | Governed code | What it does |
+| Hook | Governed code | What it does |
 |---|---|---|
-| `carrick check <file> --recheck` | `src/local_mode/recheck.rs` | answers with `recheck.new_functions`, the functions the edited file declares that the index does not hold (`docs/local-mode-output.md`), from a parse of that file that does not wait on the re-scan, so a re-scan that misses its budget still records them (carrick#2849) |
-| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/reuse.ts` | records those names for the session under `~/.carrick/sessions/<session_id>.json`, outside every repository, and prints not one byte about them |
-| `carrick hook stop` (Claude Code) or `carrick hook user-prompt` (Codex) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/user-prompt.ts`, `drain` in `npm/carrick/src/hook/reuse.ts` | names the accumulated set once and points at this skill |
+| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/edit-flow.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/lead.ts` | re-checks the edited files, prints what needs acting on, queues a background re-check for an edit that needs a re-scan, and names the indexed function a new function looks like (`recheck.new_functions[].lead`, carrick#3249) |
+| `carrick hook stop` (Claude Code) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/stop-wait.ts` | delivers the background re-checks that finished, waits for the ones still running (`--wait-s`), and says which are still running after the wait |
+| `carrick hook user-prompt` (Codex) | `npm/carrick/src/hook/user-prompt.ts`, `npm/carrick/src/hook/late.ts` | delivers the background re-checks that finished, with the next prompt |
 
-Why the nudge is not on the edit: most edits add no function, and every nudge
-costs a model turn. Why it is not left to the agent: see the measurement above.
+The per-session store (`npm/carrick/src/hook/reuse.ts`, under
+`~/.carrick/sessions/<session_id>.json`, outside every repository) remembers
+which files' uses lines and which new functions' lead lines were shown, which
+files the Read hook asked about, and the last edit per workspace.
 
-**The channel is the feature.** A Stop hook's
-`hookSpecificOutput.additionalContext` is delivered to the model and the
-conversation continues, which is the one Stop channel that is both model-visible
-and non-blocking. `systemMessage` is shown to the user and never reaches the
-model — a Stop hook of ours fired in 21 sessions through that field and changed
-nothing — and `decision: "block"` reaches the model by refusing to let the turn
-end, which is a block. The hook emits `hookSpecificOutput` and nothing else.
+**No reuse nudge (carrick#3436).** Until carrick#3436 the Stop hook named the
+functions a task added and asked for one `find_similar` call (carrick#1330).
+Across 68 graded runs no code edit followed that call, and summaries repeated
+that a new function "isn't in the index yet". Reuse is decided before the code
+is written (rule 1 of the AGENTS.md section, the `carrick-reuse` skill), so the
+line and the per-session list of new functions were removed from both hosts.
+`carrick check --recheck` still answers with `recheck.new_functions`. The
+post-edit hook prints one line for a new function that has a `lead`
+(carrick#3249), once per function per session, as the edit lands. Nothing about
+new functions is said at the end of the task.
 
-**It fires once per set.** The names a nudge has spoken are marked in the same
-file, before the line is written, so the next stop of the same session says
-nothing about them. A function added after a nudge is pending on its own.
-
-**The line is short and says where it came from.** It reads "Carrick: this task
-added N new functions (a, b and N-2 more). Check them for existing copies with
-one find_similar call, then tell the user in one line what Carrick found." Names
-only, at most two, no paths; one and two functions read "(a)" and "(a and b)".
-Test, spec and story files are never recorded (`isCheckedSource`), and a
-function is keyed by its path relative to the nearest checkout top, so an edit
-inside a nested worktree matches the index row (carrick#2936). It fires even
-when the index is older than the branch point. The two limits on the answer (the
-index is the default branch at the commit it states; the match is on what a
-function is described as doing, not on its source) are in the `carrick-reuse`
-skill, where the answer is read.
+**The channel.** A Stop hook's `hookSpecificOutput.additionalContext` reaches
+the model and the conversation continues, so it is the one Stop channel that is
+both model-visible and non-blocking. `systemMessage` is shown to the user and
+never reaches the model (a Stop hook of ours fired in 21 sessions through that
+field and changed nothing). `decision: "block"` reaches the model by refusing to
+let the turn end, which is a block. The hook emits `hookSpecificOutput` and
+nothing else, and only when a re-check answer needs acting on or is still
+running.
 
 **No check line at Stop.** The Stop hook does not ask for `carrick check
 --changed`: a 1-3 minute check at every turn end is the user's cost, so the
@@ -248,31 +242,30 @@ answer is delivered by the next hook that speaks (`npm/carrick/src/hook/late.ts`
 `carrick uninstall` deletes the session records; `carrick doctor` reports a missing
 Stop entry with the other two, because both read `expectedCarrickHooks`.
 
-The same three parts run on Codex through a different event and a different
-payload reader; that is the section below.
+The same hooks run on Codex through a different event and a different payload
+reader; that is the section below.
 
 ### Codex (carrick#1335)
 
-One implementation, two delivery channels. The recording half, the per-session
-store, the line itself and the once-per-set marking are the same code on both
-hosts; what differs is the event that carries it and the payload the recorder
-reads.
+One implementation, two delivery channels. The re-check, the background queue
+and the per-session store are the same code on both hosts. What differs is the
+event that delivers a finished re-check and the payload the post-edit hook
+reads. Each surviving path of an apply_patch is re-checked exactly as a Claude
+Code edit is.
 
 **The event.** Codex accepts `additionalContext` only on `PreToolUse`,
 `PostToolUse`, `SessionStart`, `UserPromptSubmit` and `SubagentStart`, and warns
 "this event cannot emit additionalContext" for every other one
 (`codex-rs/hooks/src/engine/discovery.rs`). Its `Stop` event is therefore not
-available to a nudge that must not block, so the nudge is delivered by
-`UserPromptSubmit`: `carrick hook user-prompt` drains the same pending set and
-prints the same `hookSpecificOutput` object with `hookEventName:
-"UserPromptSubmit"` on it. The ruling of 2026-09-20 took this over a blocking
-`Stop` hook.
+available to a line that must not block, so finished re-checks are delivered by
+`UserPromptSubmit`. `carrick hook user-prompt` prints them in the same
+`hookSpecificOutput` object with `hookEventName: "UserPromptSubmit"`. The ruling
+of 2026-09-20 took this over a blocking `Stop` hook. It names no function a task
+added, as the Claude Code Stop hook does not (carrick#3436).
 
-**The limit that follows.** The line arrives with the NEXT prompt, not at the
-end of the task that earned it — and a one-shot run with no following prompt
-(`codex exec "…"`, a session closed on the nudging task) never sees it at all.
-The marking is what makes a late delivery safe: the set is spoken once, whenever
-the next prompt comes, and never again.
+**The limit that follows.** An answer arrives with the NEXT prompt, not at the
+end of the task that earned it, and a one-shot run with no following prompt
+(`codex exec "…"`) never sees it. Each answer is delivered once.
 
 **The payload.** Codex has no `Edit`/`Write`/`MultiEdit` with a `file_path`. It
 edits through `apply_patch`, whose `tool_input` is `{ "command": "<patch text>"
@@ -281,7 +274,7 @@ several files. `npm/carrick/src/hook/apply-patch.ts` reads the four header lines
 out of it: `Add File` and `Update File` are re-checked, `Delete File` is dropped
 because the path is gone once the patch applies, and `Move to` replaces the
 `Update File` above it because the destination is the file that now exists. Each
-surviving path is re-checked and recorded exactly as a Claude Code edit is.
+surviving path is re-checked exactly as a Claude Code edit is.
 
 **The file.** `carrick init` writes `.codex/hooks.json` — Codex's project config
 layer (`ConfigLayerSource::Project`), which nests its groups under a `hooks` key
