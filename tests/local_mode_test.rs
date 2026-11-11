@@ -5897,12 +5897,18 @@ fn check_each_answers_a_missed_services_other_files_at_once() {
 /// verdict, so it can only have come from the kept file. The folder still
 /// holds that one key afterwards, which also shows the capture's stubs are
 /// byte-stable across a re-scan.
+///
+/// The join judges here with its settle off (`CARRICK_JOIN_SETTLE=off`): in
+/// a one-repo workspace the join otherwise takes every pair's outcome from the
+/// scan's stored record and judges none (carrick#3884), so it keeps no answer.
+/// The kept answers still serve every pair the join judges.
 #[test]
 #[serial]
 fn a_type_neutral_edit_reuses_the_indexs_type_check_answer() {
     let workspace = shop();
     let root = workspace.path();
-    index(root);
+    let judging_join = [("CARRICK_JOIN_SETTLE", "off")];
+    run_with_env(root, &["refresh", "--workspace", "."], &judging_join);
 
     let kept = |root: &Path| -> Vec<PathBuf> {
         let mut found = Vec::new();
@@ -5934,7 +5940,7 @@ fn a_type_neutral_edit_reuses_the_indexs_type_check_answer() {
     .expect("plant the answer");
 
     statement_in(&root.join(SHOP_ROUTE), "moves no type");
-    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    let answer = recheck_json(root, SHOP_ROUTE, &[AMPLE[0], judging_join[0]]);
     assert_eq!(
         answer["recheck"]["ran"],
         serde_json::json!("extraction+types")

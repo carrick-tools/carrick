@@ -498,11 +498,11 @@ fn http_consumer_edit_prints_the_childs_verdict() {
 }
 
 /// Each of web's response pairs against api by its consumer site
-/// (`file:line`), with the bucket the scan child logged for it: the child's
-/// own `Pair verdict:` lines, not the join's (which carry `source=main`).
+/// (`file:line`), with the bucket the scan child logged for it. Only a scan
+/// logs `Pair verdict:` lines: the join holds no local consumers, so it logs
+/// none.
 fn child_buckets(log: &str) -> std::collections::BTreeMap<String, String> {
     log.lines()
-        .filter(|line| !line.contains("source=main"))
         .filter_map(|line| {
             let (_, verdict) = line.split_once("Pair verdict: ")?;
             let (_, site) = verdict.split_once(" response (")?;
@@ -556,6 +556,18 @@ fn refresh_indexes_the_retype_and_check_changed_counts_what_it_moved() {
     args.push("--json");
     let index = command(root, &args, &[]).output().expect("check files");
     let index: Value = serde_json::from_slice(&index.stdout).expect("JSON");
+    // Every pair the refresh child judged is a checked row; none reads "not
+    // judged", as each did before the join read the stored outcomes.
+    assert_eq!(
+        index["type_checked"],
+        serde_json::json!(before.len()),
+        "{index:#}"
+    );
+    assert_eq!(
+        index["not_type_checked"],
+        serde_json::json!([]),
+        "{index:#}"
+    );
     let listed: Vec<String> = index["problems"]
         .as_array()
         .into_iter()
@@ -723,8 +735,16 @@ fn graphql_pair_prints_the_same_with_the_join_settle_off() {
         );
     };
     let (on, off) = settle_on_off(graphql_workspace, schema_edit, &[]);
-    eprintln!("graphql judged: {:#?}", non_http_verdicts(&on));
-    eprintln!("graphql printed:\n{}", on.text);
+    // With no model the producer's types are unknown, so the pairs are judged
+    // unverifiable: this proves the settle moves nothing, not that a GraphQL
+    // break would print.
+    assert!(
+        non_http_verdicts(&on)
+            .iter()
+            .any(|line| line.starts_with("Pair verdict: GRAPHQL ")),
+        "the child judges the GraphQL pairs:\n{}",
+        on.log
+    );
     assert_settle_moves_nothing(&on, &off);
 }
 
@@ -753,7 +773,8 @@ fn pubsub_pair_prints_the_same_with_the_join_settle_off() {
         payload_edit,
         &[("CARRICK_MOCK_FIXTURE_DIR", cassettes.as_str())],
     );
-    eprintln!("pubsub judged: {:#?}", non_http_verdicts(&on));
-    eprintln!("pubsub printed:\n{}", on.text);
+    // With no model this fixture yields no judged pair (the call is "not
+    // type-checked"), so pub/sub stays unmeasured here (carrick#3887): this
+    // only proves the settle moves nothing.
     assert_settle_moves_nothing(&on, &off);
 }
