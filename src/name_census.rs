@@ -179,6 +179,45 @@ pub fn parity(root: &Path, library: &[LibraryRow], site: &[SiteRow]) -> Tally<Pa
     out
 }
 
+/// The resolver's pieces read of each labelled call's name slot, beside the
+/// site path's own (carrick#3504 B10-2a2, the dry run that sizes B10-2b):
+/// one count per call of `same` or `differs` (the pieces read spells the
+/// name at the labelled call's own function as the site path does, or not),
+/// and among them how many would fall back to the site path's walk, by the
+/// word of the part that would, and how many hold a chain the cap ended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DryRunNames {
+    pub same: usize,
+    pub differs: usize,
+    pub fallback: BTreeMap<&'static str, usize>,
+    pub capped: usize,
+}
+
+impl DryRunNames {
+    pub fn note(&mut self, same: bool, fallback: Option<&'static str>, capped: bool) {
+        if same {
+            self.same += 1;
+        } else {
+            self.differs += 1;
+        }
+        if let Some(word) = fallback {
+            *self.fallback.entry(word).or_default() += 1;
+        }
+        if capped {
+            self.capped += 1;
+        }
+    }
+
+    /// The fallbacks by word, as the log prints them.
+    pub fn fallback_line(&self) -> String {
+        self.fallback
+            .iter()
+            .map(|(word, count)| format!("{word}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// The one debug line per service.
 pub fn log(
     root: &Path,
@@ -190,5 +229,14 @@ pub fn log(
         site = %site.names.line(),
         parity = %parity(root, &library.rows, &site.rows).line(),
         "message names: library-reader sites by name outcome, site-path message sites by name source, library-reader rows by what the site path states at the same place"
+    );
+    let dry_run = &site.dry_run_names;
+    tracing::debug!(
+        same = dry_run.same,
+        differs = dry_run.differs,
+        fallback = dry_run.fallback.values().sum::<usize>(),
+        fallback_by_word = %dry_run.fallback_line(),
+        capped = dry_run.capped,
+        "site-path names (dry run): labelled calls whose name slot the resolver's pieces read spells as the site path does, or not; of them, those that would fall back to the site path's walk, by word, and those a cap ended"
     );
 }

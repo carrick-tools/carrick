@@ -141,3 +141,23 @@ summaries read it as. `base.ts` declares the imported base.
 module-level code writes, no function of the file. Its parameter `id` is
 keyed by the definition `itemsApi.replace` (position 0, no keys, not
 colliding), as the caller index keys the function (carrick#2793).
+
+## A name read as pieces through callers (`pieces.ts`, carrick#3504 B10-2a2)
+
+`Resolver::pieces_through_callers` reads a probe's argument as parts, one
+value per caller chain. A part is a literal or a hole, with where it was read
+and the calls of the parameters it was passed through (innermost first).
+
+| Probe | Values |
+|---|---|
+| `p_url` (in `user(id)`) | `/users/` then `42`, passed through `user("42")`; `/users/` then an `unread_expression` hole at `req.params.id`, passed through `user(req.params.id)` |
+| `p_env` | one hole, `unread_expression`, at the `??` choice, then `/items` |
+| `p_base` | `https://api.example.test` at the `API_BASE` read, then `/things` |
+| `p_typed` (in `typed(kind: "jobs.run")`) | `jobs.run`, passed through `typed("jobs.run")`; read whole, `jobs.run` through no call |
+| `p_wide` (in `wide(name)`) | `w01` to `w17`, each passed through its own call: seventeen values, no cap |
+| `p_local` | `/orders/` then a `name_never_bound` hole at the initialiser's `id`: the summaries read `url` as its initialiser |
+| `p_target` (`const t = process.env.API_URL + id`) | one part at the read of `t`: the summaries read `t` by its name |
+| `p_renamed` (`const u = opts.url`) | one part at the read of `u`: the summaries read `u` by its name |
+
+Read at the labelled call's own function, each `p_local`, `p_target` and
+`p_renamed` value spells what the summaries read at the call's argument.

@@ -228,6 +228,9 @@ pub struct SiteRows {
     /// How the site path came by the name of each message site it decided
     /// (carrick#3504 B10-0). Log-only: no row reads it.
     pub names: crate::name_census::SiteNames,
+    /// The resolver's pieces read of each labelled call's name slot beside
+    /// the site path's own (carrick#3504 B10-2a2). Log-only: no row reads it.
+    pub dry_run_names: crate::name_census::DryRunNames,
 }
 
 /// A route the receiver trace serves at a full path it composed from the
@@ -925,6 +928,7 @@ pub fn of(
         traced: TracedRoutes::default(),
         boundaries: Default::default(),
         names: site_names(decided, records),
+        dry_run_names: decided.dry_run_names.clone(),
     };
     for record in records {
         if record.bucket == Bucket::Lead {
