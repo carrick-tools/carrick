@@ -30,7 +30,7 @@ import { moduleFormatResolutionHost } from './module-format.js';
 import { ExternalImports, registerExternalImports } from './origin.js';
 import { pinProgramRoots } from './program-files.js';
 import { defaultLibraryOptions } from './default-library.js';
-import { walkFirst, walkFirstVariant, type WalkFirstRecord } from './walk-first-probe.js';
+import { walkFirst, walkFirstVariant, type WalkFirstRecord } from './position-rows.js';
 
 /**
  * Options for ProjectLoader construction
