@@ -19,7 +19,7 @@ import {
   undeclaredNamesIn,
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
-import { nodeByLocatorText, nodesNearLine } from './site-node.js';
+import { firstExactLocatorMatch } from './site-node.js';
 import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
@@ -1598,21 +1598,16 @@ function tightestCoveringNode(
 }
 
 /**
- * The node a locator's text names: the locator the inferrer runs
- * (`nodeByLocatorText`, carrick#3500), over the nodes near the line that a
- * value type can be read at.
+ * The node a locator's text names: the first exact match on or after the line
+ * among the nodes a value type can be read at (`firstExactLocatorMatch`,
+ * carrick#3500).
  */
 function nodeByExpressionText(
   sourceFile: ts.SourceFile,
   text: string,
   fromLine?: number
 ): ts.Node | undefined {
-  return nodeByLocatorText(
-    sourceFile,
-    nodesNearLine(sourceFile, fromLine).filter(isPreferredTarget),
-    text,
-    fromLine
-  );
+  return firstExactLocatorMatch(sourceFile, text, fromLine, isPreferredTarget);
 }
 
 function firstExpressionOnLine(

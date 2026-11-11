@@ -2,14 +2,15 @@
  * Where a site is, and whether its type is framework machinery: one answer for
  * the inferrer and the capture (carrick#3500).
  *
- * Both read a scanner site the same way: they find the node a locator's text
- * names near its line, then refuse to publish a type that is HTTP transport
- * machinery. Each used to keep its own copy, and the copies disagreed (string
- * quotes in the locator, which shapes of machinery were refused), so a wrong
- * node or a transport type could be published by one path and refused by the
- * other. The module lives inside `capture/` because that bundle may import
- * only itself and `typescript`; the inferrer reaches it through
- * `capture/index.js` and hands it compiler nodes.
+ * Both find the node a locator's text names near its line, then refuse to
+ * publish a type that is HTTP transport machinery. Each used to keep its own
+ * copy, and the copies disagreed (string quotes in the locator, which shapes
+ * of machinery were refused), so a wrong node or a transport type could be
+ * published by one path and refused by the other. They share the text rule
+ * here: the inferrer runs `nodeByLocatorText`, the capture an exact match
+ * alone (`firstExactLocatorMatch`). The module lives inside `capture/`
+ * because that bundle may import only itself and `typescript`; the inferrer
+ * reaches it through `capture/index.js` and hands it compiler nodes.
  */
 
 import ts from 'typescript';
@@ -279,21 +280,30 @@ export function canonicalStringQuotes(text: string): string {
   return out;
 }
 
-function isBareStringText(text: string): boolean {
-  const members = text.split('|').map((member) => member.trim());
-  return (
-    members.includes('string') &&
-    members.every((member) => member === 'string' || member === 'null' || member === 'undefined')
-  );
+/**
+ * Runs of whitespace collapse to one space, and a member chain broken before
+ * its dot (`client\n  .list(…)`) reads the same as `client.list(…)`: a space
+ * around `.` / `?.` means nothing (carrick#1162). Not trimmed.
+ */
+function collapseLocatorWhitespace(text: string): string {
+  return text.replace(/\s+/g, ' ').replace(/\s*(\?\.|\.)\s*/g, '$1');
 }
 
+/**
+ * The text the capture's exact match compares: whitespace collapsed
+ * (`collapseLocatorWhitespace`), trimmed, and every plain string literal in
+ * double quotes (carrick#2056). Unlike `normalizeLocatorText` it keeps
+ * trailing commas and the space after an opening bracket, so a payload written
+ * over several lines is not matched by a compact print of it (see
+ * `firstExactLocatorMatch`).
+ */
+export function exactLocatorText(text: string): string {
+  return canonicalStringQuotes(collapseLocatorWhitespace(text).trim());
+}
 
 /**
- * Normalize whitespace for text comparison:
- * collapse runs of whitespace into single spaces, trim.
- *
- * A member chain broken before its dot (`client\n  .list(…)`) reads the same
- * as `client.list(…)`; a space around `.` / `?.` means nothing (carrick#1162).
+ * Normalize whitespace for text comparison, the inferrer's rule:
+ * `collapseLocatorWhitespace`, then trim.
  *
  * Also strips trailing commas before `}` `)` `]`: multi-line source
  * literals carry them but the LLM's single-line locator print does not,
@@ -311,9 +321,7 @@ function isBareStringText(text: string): boolean {
  * A string literal reads the same in any quotes (carrick#2056).
  */
 export function normalizeLocatorText(text: string): string {
-  const collapsed = text
-    .replace(/\s+/g, ' ')
-    .replace(/\s*(\?\.|\.)\s*/g, '$1')
+  const collapsed = collapseLocatorWhitespace(text)
     .replace(/\s*,?\s*([}\)\]])/g, '$1')
     .replace(/([\(\[{])\s+/g, '$1')
     .trim();
@@ -321,42 +329,47 @@ export function normalizeLocatorText(text: string): string {
 }
 
 /** The default number of lines either side of a locator's line it may match. */
-export const LOCATOR_SEARCH_RADIUS = 5;
+const LOCATOR_SEARCH_RADIUS = 5;
 
 function startLine(sourceFile: ts.SourceFile, node: ts.Node): number {
   return sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
 }
 
 /**
- * Every node of `sourceFile` (tokens included, syntax lists left out) that
- * starts within `radius` lines of `line`, or every node when no line is
- * given, in pre-order. The candidates a caller hands `nodeByLocatorText` when
- * it keeps no index of its own.
+ * The capture's locator: the first node in pre-order that `accept`s, whose
+ * text equals the locator's (`exactLocatorText`), and that ends on or after
+ * `fromLine` (a chain broken before its dot starts a line above the line the
+ * analyzer reports for the call), anywhere in the file.
+ *
+ * Exact only, with no line window: the capture publishes the type of the node
+ * it binds, and each of `nodeByLocatorText`'s further tiers moved published
+ * answers when the capture ran them (carrick#3500): a body read stated at a
+ * handler's opening line bound the whole handler, and a compact print of a
+ * multi-line payload bound the payload where the call on its line was asked.
+ * A text with no exact match leaves the caller its line fallback.
  */
-export function nodesNearLine(
+export function firstExactLocatorMatch(
   sourceFile: ts.SourceFile,
-  line?: number,
-  radius: number = LOCATOR_SEARCH_RADIUS
-): ts.Node[] {
-  const first = line === undefined ? undefined : line - radius;
-  const last = line === undefined ? undefined : line + radius;
-  const lineAt = (pos: number): number => sourceFile.getLineAndCharacterOfPosition(pos).line + 1;
-  const found: ts.Node[] = [];
+  expressionText: string,
+  fromLine: number | undefined,
+  accept: (node: ts.Node) => boolean
+): ts.Node | undefined {
+  const wanted = exactLocatorText(expressionText);
+  if (!wanted) return undefined;
+  let best: ts.Node | undefined;
   const visit = (node: ts.Node): void => {
-    for (const child of node.getChildren(sourceFile)) {
-      // A subtree that ends before the window, or starts after it, holds
-      // nothing that starts inside it.
-      if (first !== undefined && lineAt(child.getEnd()) < first) continue;
-      if (last !== undefined && lineAt(child.getStart(sourceFile)) > last) continue;
-      if (child.kind !== ts.SyntaxKind.SyntaxList) {
-        const at = lineAt(child.getStart(sourceFile));
-        if (first === undefined || (at >= first && at <= last!)) found.push(child);
+    if (best) return;
+    if (accept(node) && exactLocatorText(node.getText(sourceFile)) === wanted) {
+      const endLine = sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
+      if (fromLine === undefined || endLine >= fromLine) {
+        best = node;
+        return;
       }
-      visit(child);
     }
+    node.forEachChild(visit);
   };
   visit(sourceFile);
-  return found;
+  return best;
 }
 
 /**
@@ -366,8 +379,8 @@ export function nodesNearLine(
  * locator that elides members, then a node containing the text (preferring
  * the nodes the text opens), then a node the text contains. Among several,
  * the smallest node wins, then the one nearest the line. The caller chooses
- * the candidates (every node, or only calls, or only nodes it can read a
- * value type at).
+ * the candidates (every node, or only calls). The inferrer's locator; the
+ * capture runs `firstExactLocatorMatch`.
  */
 export function nodeByLocatorText<T extends ts.Node>(
   sourceFile: ts.SourceFile,
