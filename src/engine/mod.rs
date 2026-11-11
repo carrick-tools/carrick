@@ -5756,7 +5756,7 @@ async fn analyze_current_repo_incremental(
                 &semantics_root,
             );
             let file_orchestrator = file_orchestrator.with_result_index(results.clone());
-            protocol_extractions.site = site_rows_of(
+            let (site_rows, site_payloads) = site_rows_of(
                 &request_inputs,
                 repo_path,
                 service,
@@ -5772,21 +5772,8 @@ async fn analyze_current_repo_incremental(
                 },
             )
             .await;
+            protocol_extractions.site = site_rows;
             yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
-            let site_payloads = site_payloads_of(
-                &request_inputs,
-                repo_path,
-                &claims,
-                SiteContext {
-                    placements: Some(&placements),
-                    caller_stops: &caller_stops,
-                    library: library_ask.as_ref().map(|ask| &ask.sites),
-                    declarations: declarations.as_ref(),
-                    implementations: Some(&implementations),
-                    siblings: &sibling_inputs,
-                    unready: unready.as_ref(),
-                },
-            );
             let withdrawn = withdraw_model_routes_at_definitions(
                 &mut mount_graph,
                 &merged_results,
@@ -7004,13 +6991,21 @@ fn server_claims_of(
 /// answers read into rows and possible calls ([`crate::site_rows`]). With no
 /// compiler rows discovery finds nothing. A row in a mock or test tree of the
 /// service states nothing.
+///
+/// The site records are built once, here, and also give the payload
+/// placements the type capture reads (phase 3 step 1,
+/// [`crate::site_payloads`]): a second [`site_records_of`] with the same
+/// inputs cost about 2 s on a large service.
 async fn site_rows_of(
     inputs: &crate::request_summary::RequestSummaryInputs,
     repo_path: &str,
     service: &Config,
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
-) -> crate::site_rows::SiteRows {
+) -> (
+    crate::site_rows::SiteRows,
+    crate::site_payloads::SitePayloads,
+) {
     let root = Path::new(repo_path);
     let SiteRecordsOf {
         discovered,
@@ -7112,25 +7107,15 @@ async fn site_rows_of(
         leads_by_reason = ?leads_by_reason,
         "site questions: rows"
     );
-    rows
-}
-
-/// Where the service's decided sites place their payloads (phase 3 step 1,
-/// [`crate::site_payloads`]), from the same records the site questions read;
-/// with no compiler rows discovery finds no site and nothing moves.
-fn site_payloads_of(
-    inputs: &crate::request_summary::RequestSummaryInputs,
-    repo_path: &str,
-    claims: &[crate::library_claims::ExportClaims],
-    context: SiteContext<'_>,
-) -> crate::site_payloads::SitePayloads {
-    let records = site_records_of(inputs, Path::new(repo_path), claims, context).records;
+    // Where the decided sites place their payloads, from the same records
+    // the site questions read; with no compiler rows discovery finds no
+    // site and nothing moves.
     let payloads = crate::site_payloads::SitePayloads::of(&records);
     debug!(
         records = records.len(),
         "site payloads: records whose slots the type capture may read"
     );
-    payloads
+    (rows, payloads)
 }
 
 /// What the site pass reads from the rest of the scan (carrick#2524): where
@@ -7404,6 +7389,13 @@ fn result_index_of(
     index
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`site_records_of`] ran on this thread: a service's
+    /// site records are built once ([`site_rows_of`]).
+    static SITE_RECORD_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The site labels the settled `claims` give, of every role the store was
 /// asked for (carrick#2436), every call discovery finds that reaches one,
 /// where each one's name is decided, and each decided site's record. Files
@@ -7414,6 +7406,8 @@ fn site_records_of(
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> SiteRecordsOf {
+    #[cfg(test)]
+    SITE_RECORD_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let discovery = discovery_of(inputs, root, claims, context);
     let reached_label = discovery
         .sites
@@ -13874,7 +13868,7 @@ async fn analyze_current_repo(
         sidecar,
         &service_root,
     );
-    protocol_extractions.site = site_rows_of(
+    let (site_rows, site_payloads) = site_rows_of(
         &request_inputs,
         repo_path,
         service,
@@ -13890,21 +13884,8 @@ async fn analyze_current_repo(
         },
     )
     .await;
+    protocol_extractions.site = site_rows;
     yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
-    let site_payloads = site_payloads_of(
-        &request_inputs,
-        repo_path,
-        &claims,
-        SiteContext {
-            placements: Some(&placements),
-            caller_stops: &caller_stops,
-            library: library_ask.as_ref().map(|ask| &ask.sites),
-            declarations: declarations.as_ref(),
-            implementations: Some(&implementations),
-            siblings: &sibling_inputs,
-            unready: unready.as_ref(),
-        },
-    );
     let withdrawn = withdraw_model_routes_at_definitions(
         &mut analysis_result.mount_graph,
         &analysis_result.file_results,
@@ -26962,6 +26943,88 @@ unfollowed_member_calls_total: 0,
             "the HTTP call is a site"
         );
         assert_eq!(records, 1, "the site has its record");
+    }
+
+    /// A service's site records are built once for its rows and its payload
+    /// placements together. Two builds of the same inputs cost about 2 s on
+    /// a large service.
+    #[tokio::test]
+    async fn a_service_s_site_records_are_built_once() {
+        let inputs = crate::request_summary::RequestSummaryInputs::default();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_string_lossy().into_owned();
+        super::SITE_RECORD_BUILDS.with(|builds| builds.set(0));
+        let _ = super::site_rows_of(
+            &inputs,
+            &repo,
+            &Config::default(),
+            &[],
+            super::SiteContext::default(),
+        )
+        .await;
+        assert_eq!(super::SITE_RECORD_BUILDS.with(|builds| builds.get()), 1);
+    }
+
+    /// The payload placements the one build hands on are the placements a
+    /// build of their own reads, and the rows are as before.
+    #[tokio::test]
+    async fn the_shared_site_records_give_the_payloads_a_separate_build_gives() {
+        let edit = [
+            (
+                "node_modules/fixture-http/package.json",
+                r#"{ "name": "fixture-http", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/fixture-http/index.d.ts",
+                "export interface HttpStatic {\n  get(url: string): Promise<unknown>;\n}\ndeclare const http: HttpStatic;\nexport default http;\n",
+            ),
+            (
+                "src/orders-api.ts",
+                "import http from \"fixture-http\";\n\nexport function listOrders(): Promise<unknown> {\n  return http.get(\"/orders\");\n}\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let asked = crate::library_store::Asked::naming_for(
+            &["fixture-http"],
+            &crate::library_store::NETWORK_ROLES,
+        );
+        let settled = crate::library_store::ask_until_settled(
+            &asked,
+            |_| async {},
+            |request| async move { Ok(http_store(&request)) },
+            None,
+        )
+        .await;
+        let repo = on.repo.to_string_lossy().into_owned();
+        super::SITE_RECORD_BUILDS.with(|builds| builds.set(0));
+        let (rows, payloads) = super::site_rows_of(
+            &on.inputs,
+            &repo,
+            &Config::default(),
+            &settled.exports,
+            super::SiteContext::default(),
+        )
+        .await;
+        assert_eq!(super::SITE_RECORD_BUILDS.with(|builds| builds.get()), 1);
+        let separate = crate::site_payloads::SitePayloads::of(
+            &super::site_records_of(
+                &on.inputs,
+                &on.repo,
+                &settled.exports,
+                super::SiteContext::default(),
+            )
+            .records,
+        );
+        assert_eq!(format!("{payloads:?}"), format!("{separate:?}"));
+        assert!(!rows.rows.is_empty(), "the call is a site row");
     }
 
     /// carrick#2504: the file a service calls `fetch(url, init)` in.
