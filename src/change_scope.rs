@@ -2248,18 +2248,30 @@ pub fn join_fields_changed(payload: &CloudRepoData, stored: &CloudRepoData) -> b
 /// Its boundary is the stored one with this run's SDK join folded in: the
 /// rest of it states the run that analysed the service, which this run did
 /// not repeat.
+///
+/// A run that writes to a local folder (`writes_locally`) also writes it when
+/// the stored record of its pair outcomes is another build's, so the
+/// workspace join can take this build's outcomes for its pairs
+/// (carrick#3884): the join reads a record only of its own build. A run that
+/// writes the hosted index does not, so a CI scan writes what it did before.
 pub fn refreshed_carried(
     mut payload: CloudRepoData,
     stored: &CloudRepoData,
     sdk_unresolved: &[crate::cloud_storage::SdkUnresolved],
     head: &str,
     dirty: bool,
+    writes_locally: bool,
 ) -> Option<CloudRepoData> {
     payload.boundary = stored.boundary.clone().map(|mut boundary| {
         boundary.fold_sdk_unresolved(sdk_unresolved);
         boundary
     });
-    if !join_fields_changed(&payload, stored) {
+    let this_build = crate::cloud_storage::ScannerBuild::current();
+    let record_of_another_build = stored.pair_outcomes.as_ref().is_some_and(|record| {
+        record.scanner_build.as_ref().map(|build| &build.commit)
+            != this_build.as_ref().map(|build| &build.commit)
+    });
+    if !join_fields_changed(&payload, stored) && !(writes_locally && record_of_another_build) {
         return None;
     }
     stamp_carried(&mut payload, head, dirty);
@@ -3567,9 +3579,51 @@ mod tests {
             }))
             .unwrap(),
         ]);
-        let written = refreshed_carried(payload, &stored, &[], "1234567fff", false).unwrap();
+        let written = refreshed_carried(payload, &stored, &[], "1234567fff", false, false).unwrap();
         assert_eq!(written.package_json, stored.package_json);
         assert_eq!(written.package_json_hash, stored.package_json_hash);
+    }
+
+    /// carrick#3884 R11: a carried consumer whose stored outcomes another
+    /// build wrote is written, stamped as this run's, when the run writes a
+    /// local folder, even though its join fields did not move. A run that
+    /// writes the hosted index leaves it as stored.
+    #[test]
+    fn a_local_run_rewrites_a_carried_record_of_another_build() {
+        let mut stored = stored("abcdef1234");
+        let record = |build: Option<crate::cloud_storage::ScannerBuild>| {
+            crate::cloud_storage::StoredPairOutcomes {
+                version: crate::cloud_storage::PAIR_OUTCOMES_VERSION,
+                commit: "abcdef1234".to_string(),
+                scanner_build: build,
+                outcomes: Vec::new(),
+            }
+        };
+        stored.pair_outcomes = Some(record(Some(crate::cloud_storage::ScannerBuild {
+            commit: "another".to_string(),
+            dirty: false,
+        })));
+        let payload = stored.clone();
+
+        let written = refreshed_carried(payload.clone(), &stored, &[], "1234567fff", true, true)
+            .expect("a local run writes it");
+        assert_eq!(written.commit_hash, "1234567fff");
+        assert_eq!(written.dirty, Some(true));
+        assert!(
+            refreshed_carried(payload.clone(), &stored, &[], "1234567fff", true, false).is_none(),
+            "a run that writes the hosted index does not"
+        );
+
+        stored.pair_outcomes = Some(record(crate::cloud_storage::ScannerBuild::current()));
+        assert!(
+            refreshed_carried(stored.clone(), &stored, &[], "1234567fff", true, true).is_none(),
+            "a record of this build is left as stored"
+        );
+        stored.pair_outcomes = None;
+        assert!(
+            refreshed_carried(stored.clone(), &stored, &[], "1234567fff", true, true).is_none(),
+            "no record, nothing to refresh"
+        );
     }
 
     /// The stored index sits at A, where a root `.gitignore` exists.

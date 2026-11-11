@@ -1,25 +1,21 @@
-//! Does the child scan's retype reach anything `carrick check --changed`
-//! prints? ($0, no model, no cloud.)
+//! Does the child scan's retype reach what `carrick check --changed` prints?
+//! ($0, no model, no cloud.)
 //!
 //! `check --changed` re-scans the changed repo in a child process, which
 //! judges the pairs and retypes the consumer calls the judge left to the
-//! consumer, then joins the workspace in a second process. The question is
-//! whether any printed line, the exit code or the stored index depends on the
-//! child's retype. Each case runs the same edit twice on two identical
-//! workspaces, once as shipped and once with the test-only switch
-//! (`CARRICK_TEST_SKIP_RETYPE`) that makes the retype return before it sends a
-//! call, and compares everything the check leaves.
+//! consumer, then joins the workspace in a second process. Since carrick#3884
+//! the join takes each pair's outcome the child stored on its consumer's blob
+//! instead of judging the pair again, so the retype's verdict is what prints.
 //!
-//! The HTTP case is built so the retype decides the pair: the consumer's
-//! client returns `any`, so the judge has no consumer type and leaves the
-//! pair to the consumer's reads. The GraphQL and socket cases use a corpus
-//! whose pairs the judge reads directly. The retype is HTTP-only
-//! (`retype_consumer_calls`), so those two are the control that nothing else
-//! moves.
+//! The HTTP cases run the same edit twice on two identical workspaces, once
+//! as shipped and once with the test-only switch (`CARRICK_TEST_SKIP_RETYPE`)
+//! that makes the retype return before it sends a call, and compare what the
+//! check leaves. The consumer's client returns `any`, so the judge has no
+//! consumer type and leaves the pair to the consumer's reads.
 //!
-//! This records today's behaviour. If a later change makes the join read the
-//! child's outcomes, the HTTP cases are the ones that must move, and they
-//! should be rewritten to say which printed line now depends on the retype.
+//! The socket, GraphQL and pub/sub cases run with the join's settle on and
+//! `off` (`CARRICK_JOIN_SETTLE`): the judge decides those pairs and the
+//! retype is HTTP-only, so nothing they print may move.
 
 /// The switch in `retype_consumer_calls` (`src/engine/type_compat_v2.rs`).
 const SKIP_RETYPE_FOR_TEST_ENV: &str = "CARRICK_TEST_SKIP_RETYPE";
@@ -154,9 +150,18 @@ struct Observed {
     /// The child scan's own log lines about its retype.
     retype_ran: bool,
     retype_decided: Vec<String>,
+    /// The child's `scope: <service> carried and written` lines: a carried
+    /// consumer whose pair outcomes moved is written where the join reads it.
+    carried_written: Vec<String>,
+    /// The whole log of the check's processes, for the cases that read more.
+    log: String,
 }
 
-fn command(root: &Path, args: &[&str], skip_retype: bool) -> Command {
+/// The join's settle switch (`src/engine/mod.rs`, carrick#3884): `off` judges
+/// every pair in the join as before.
+const JOIN_SETTLE_ENV: &str = "CARRICK_JOIN_SETTLE";
+
+fn command(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
     let mut command = Command::new(carrick());
     command
         .args(args)
@@ -166,14 +171,13 @@ fn command(root: &Path, args: &[&str], skip_retype: bool) -> Command {
         .env_remove("CARRICK_TOKEN")
         .env_remove("CARRICK_CHECK_RESCAN")
         .env_remove(SKIP_RETYPE_FOR_TEST_ENV)
+        .env_remove(JOIN_SETTLE_ENV)
         // Each run logs under its own home, so a run's log lines are its own.
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_CHECK_BUDGET_MS", "600000");
-    if skip_retype {
-        command.env(SKIP_RETYPE_FOR_TEST_ENV, "1");
-    }
+    command.envs(env.iter().copied());
     command
 }
 
@@ -239,8 +243,13 @@ fn without_root(text: &str, root: &Path) -> String {
 
 /// Index the workspace as shipped, apply the edit, and run `check --changed`
 /// twice (as text and as JSON), with or without the retype.
-fn observe(root: &Path, edit_it: impl Fn(&Path), skip_retype: bool) -> Observed {
-    let indexed = command(root, &["refresh"], false)
+fn observe(
+    root: &Path,
+    edit_it: impl Fn(&Path),
+    refresh_env: &[(&str, &str)],
+    check_env: &[(&str, &str)],
+) -> Observed {
+    let indexed = command(root, &["refresh"], refresh_env)
         .output()
         .expect("spawn refresh");
     assert!(
@@ -252,10 +261,10 @@ fn observe(root: &Path, edit_it: impl Fn(&Path), skip_retype: bool) -> Observed 
     let _ = std::fs::remove_dir_all(root.join("home/.carrick/logs"));
     edit_it(&root.join("mono"));
 
-    let text = command(root, &["check", "--changed"], skip_retype)
+    let text = command(root, &["check", "--changed"], check_env)
         .output()
         .expect("spawn check --changed");
-    let json = command(root, &["check", "--changed", "--json"], skip_retype)
+    let json = command(root, &["check", "--changed", "--json"], check_env)
         .output()
         .expect("spawn check --changed --json");
 
@@ -289,6 +298,12 @@ fn observe(root: &Path, edit_it: impl Fn(&Path), skip_retype: bool) -> Observed 
             .filter(|line| line.contains("Pair verdict:") && line.contains("gate=retype:"))
             .map(|line| line[line.find("Pair verdict:").unwrap_or(0)..].to_string())
             .collect(),
+        carried_written: log
+            .lines()
+            .filter(|line| line.contains("carried and written at this commit"))
+            .map(|line| line[line.find("scope: ").unwrap_or(0)..].to_string())
+            .collect(),
+        log,
     }
 }
 
@@ -296,10 +311,31 @@ fn observe(root: &Path, edit_it: impl Fn(&Path), skip_retype: bool) -> Observed 
 /// retype off, and return both.
 fn both(make: fn() -> tempfile::TempDir, edit_it: impl Fn(&Path) + Copy) -> (Observed, Observed) {
     let shipped_root = make();
-    let shipped = observe(shipped_root.path(), edit_it, false);
+    let shipped = observe(shipped_root.path(), edit_it, &[], &[]);
     let skipped_root = make();
-    let skipped = observe(skipped_root.path(), edit_it, true);
+    let skipped = observe(
+        skipped_root.path(),
+        edit_it,
+        &[],
+        &[(SKIP_RETYPE_FOR_TEST_ENV, "1")],
+    );
     (shipped, skipped)
+}
+
+/// Run the same edit on two identical workspaces, with the join's settle on
+/// (as shipped) and `off`, every command of each, and return both.
+fn settle_on_off(
+    make: fn() -> tempfile::TempDir,
+    edit_it: impl Fn(&Path) + Copy,
+    env: &[(&str, &str)],
+) -> (Observed, Observed) {
+    let on_root = make();
+    let on = observe(on_root.path(), edit_it, env, env);
+    let off_root = make();
+    let mut off_env = env.to_vec();
+    off_env.push((JOIN_SETTLE_ENV, "off"));
+    let off = observe(off_root.path(), edit_it, &off_env, &off_env);
+    (on, off)
 }
 
 fn assert_unread(shipped: &Observed, skipped: &Observed) {
@@ -310,12 +346,27 @@ fn assert_unread(shipped: &Observed, skipped: &Observed) {
     assert_eq!(shipped.stored, skipped.stored, "the stored verdicts");
 }
 
+/// The join's `join settle: S of N pairs taken ...` lines (carrick#3884).
+fn join_settled_counts(log: &str) -> Vec<(usize, usize)> {
+    log.lines()
+        .filter_map(|line| {
+            let rest = &line[line.find("join settle: ")? + "join settle: ".len()..];
+            let mut words = rest.split_whitespace();
+            let settled = words.next()?.parse().ok()?;
+            let total = words.nth(1)?.parse().ok()?;
+            Some((settled, total))
+        })
+        .collect()
+}
+
 /// The producer's response loses a field the consumer reads. The child's
-/// retype decides this pair as a break (the positive control: it ran and it
-/// found one); the check prints the same either way.
+/// retype decides this pair as a break, and the join takes the child's
+/// stored outcome instead of judging the pair again (carrick#3884), so the
+/// check prints the break and fails. With the retype off, the child leaves
+/// the pair to the consumer and the check cannot say.
 #[test]
 #[serial]
-fn http_producer_edit_retype_is_unread_by_check_changed() {
+fn http_producer_edit_retype_is_read_by_check_changed() {
     if !sidecar_built() {
         eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
         return;
@@ -337,14 +388,68 @@ fn http_producer_edit_retype_is_unread_by_check_changed() {
         shipped.retype_decided
     );
     assert!(!skipped.retype_ran, "the switch turns the retype off");
-    assert!(skipped.retype_decided.is_empty());
-    assert_unread(&shipped, &skipped);
+    assert!(
+        !skipped
+            .retype_decided
+            .iter()
+            .any(|line| line.contains("gate=retype:")),
+        "{:#?}",
+        skipped.retype_decided
+    );
+    // Step 0 (carrick#3884): the child writes the consumer whose outcome the
+    // retype moved, so its record is on the blob the join reads.
+    assert!(
+        shipped
+            .carried_written
+            .iter()
+            .any(|line| line.starts_with("scope: web ")),
+        "the child writes web's blob with the retype's outcome: {:#?}",
+        shipped.carried_written
+    );
+    // The stored hash survives the write and the read-back: the join settles.
+    let counts = join_settled_counts(&shipped.log);
+    assert!(
+        counts.iter().any(|(settled, _)| *settled >= 1),
+        "the join takes at least one stored outcome: {counts:?}\n{}",
+        shipped
+            .log
+            .lines()
+            .filter(|line| line.contains("join settle"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    assert!(
+        shipped.text.lines().any(|line| {
+            line.starts_with("mono/apps/web/src/inventory.ts:7 ")
+                && line.contains("  incompatible  ")
+                && line.contains("'activeCount' does not exist")
+        }),
+        "the check prints the consumer's break the edit made:\n{}",
+        shipped.text
+    );
+    assert_eq!(shipped.text_exit, Some(1), "and fails:\n{}", shipped.text);
+    assert_eq!(shipped.json_exit, Some(1), "the JSON run fails too");
+    assert_ne!(
+        shipped.text, skipped.text,
+        "the printed check reads the retype"
+    );
+    assert_ne!(
+        shipped.json, skipped.json,
+        "the printed JSON reads the retype"
+    );
+    assert_ne!(
+        shipped.text_exit, skipped.text_exit,
+        "the exit reads the retype"
+    );
+    assert_eq!(shipped.stored, skipped.stored, "the index is not written");
 }
 
-/// The consumer reads a field the producer never had. Same answer.
+/// The consumer reads a field the producer never had. The check prints the
+/// child's verdict for the edited call (carrick#3884).
 #[test]
 #[serial]
-fn http_consumer_edit_retype_is_unread_by_check_changed() {
+fn http_consumer_edit_prints_the_childs_verdict() {
     if !sidecar_built() {
         eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
         return;
@@ -364,7 +469,137 @@ fn http_consumer_edit_retype_is_unread_by_check_changed() {
         "and decides at least one pair"
     );
     assert!(!skipped.retype_ran, "the switch turns the retype off");
-    assert_unread(&shipped, &skipped);
+    // The edited call's pair, as the check's child decided it.
+    let site = "apps/web/src/inventory.ts:7";
+    let buckets = child_buckets(&shipped.log);
+    let bucket = buckets
+        .get(site)
+        .unwrap_or_else(|| panic!("the child logs {site}: {buckets:#?}"));
+    let printed = shipped
+        .text
+        .lines()
+        .find(|line| line.starts_with(&format!("mono/{site} ")))
+        .unwrap_or_default();
+    if bucket == "incompatible" {
+        assert!(
+            printed.contains("  incompatible  "),
+            "the check prints the child's break:\n{}",
+            shipped.text
+        );
+        assert_eq!(shipped.text_exit, Some(1), "and fails:\n{}", shipped.text);
+    } else {
+        assert!(
+            !printed.contains("  incompatible  "),
+            "the check prints no break the child did not decide ({bucket}):\n{}",
+            shipped.text
+        );
+    }
+    assert_eq!(shipped.stored, skipped.stored, "the index is not written");
+}
+
+/// Each of web's response pairs against api by its consumer site
+/// (`file:line`), with the bucket the scan child logged for it: the child's
+/// own `Pair verdict:` lines, not the join's (which carry `source=main`).
+fn child_buckets(log: &str) -> std::collections::BTreeMap<String, String> {
+    log.lines()
+        .filter(|line| !line.contains("source=main"))
+        .filter_map(|line| {
+            let (_, verdict) = line.split_once("Pair verdict: ")?;
+            let (_, site) = verdict.split_once(" response (")?;
+            let (site, rest) = site.split_once(" in web against api): ")?;
+            Some((
+                site.to_string(),
+                rest.split_whitespace().next()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn read_logs(root: &Path) -> String {
+    let mut log = String::new();
+    for path in files_under(&root.join("home/.carrick/logs"), "log") {
+        log.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+    }
+    let _ = std::fs::remove_dir_all(root.join("home/.carrick/logs"));
+    log
+}
+
+/// carrick#3884: `refresh` reads the retype too. With no edit, the index's
+/// rows for web's calls hold the refresh child's buckets, so a retype-decided
+/// break is in the index (today it is "not judged"). Then on the producer
+/// edit, a consumer row outside the change that the refresh child held
+/// compatible and the check child decides incompatible is counted as moved.
+#[test]
+#[serial]
+fn refresh_indexes_the_retype_and_check_changed_counts_what_it_moved() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let dir = http_workspace();
+    let root = dir.path();
+    let indexed = command(root, &["refresh"], &[]).output().expect("refresh");
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let before = child_buckets(&read_logs(root));
+    assert!(!before.is_empty(), "the refresh child judges web's pairs");
+
+    let files = [
+        "mono/apps/web/src/inventory.ts",
+        "mono/apps/web/src/client.ts",
+    ];
+    let mut args = vec!["check"];
+    args.extend(files);
+    args.push("--json");
+    let index = command(root, &args, &[]).output().expect("check files");
+    let index: Value = serde_json::from_slice(&index.stdout).expect("JSON");
+    let listed: Vec<String> = index["problems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|problem| problem["kind"] == "incompatible")
+        .map(|problem| {
+            let file = problem["file"].as_str().unwrap_or_default();
+            format!("{}:{}", file.trim_start_matches("mono/"), problem["line"])
+        })
+        .collect();
+    let mut expected: Vec<String> = before
+        .iter()
+        .filter(|(_, bucket)| *bucket == "incompatible")
+        .map(|(site, _)| site.clone())
+        .collect();
+    expected.sort();
+    let mut listed_sorted = listed.clone();
+    listed_sorted.sort();
+    assert_eq!(
+        listed_sorted, expected,
+        "the index lists exactly the refresh child's breaks: {before:#?}\n{index:#}"
+    );
+    let _ = read_logs(root);
+
+    let route = root.join("mono/apps/api/app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "activeCount: number", "active: number");
+    edit(&route, "activeCount: 3", "active: 3");
+    let changed = command(root, &["check", "--changed", "--json"], &[])
+        .output()
+        .expect("check --changed");
+    let changed: Value = serde_json::from_slice(&changed.stdout).expect("JSON");
+    let after = child_buckets(&read_logs(root));
+    let moved = before
+        .iter()
+        .filter(|(site, bucket)| {
+            *bucket == "compatible" && after.get(*site).map(String::as_str) == Some("incompatible")
+        })
+        .count();
+    assert!(moved >= 1, "the edit moves a row: {before:#?} {after:#?}");
+    assert_eq!(
+        changed["outside_moved"],
+        serde_json::json!(moved),
+        "{before:#?} {after:#?}\n{changed:#}"
+    );
 }
 
 /// A socket payload the judge reads itself. The retype is HTTP-only, so it
@@ -394,4 +629,131 @@ fn socket_pair_check_changed_is_the_same_without_the_retype() {
     );
     assert_eq!(shipped.text_exit, Some(1), "and fails the run");
     assert_unread(&shipped, &skipped);
+}
+
+/// A GraphQL pair across two services of one repo, from the cross-repo
+/// corpus: `gateway` serves `subscription orderUpdated`, `web` reads it.
+fn graphql_workspace() -> tempfile::TempDir {
+    workspace(|repo| {
+        let corpus = fixtures().join("xrepo-corpus-1");
+        copy_tree(
+            &corpus.join("orders-monorepo/packages/gateway"),
+            &repo.join("apps/gateway"),
+        );
+        copy_tree(&corpus.join("web-frontend"), &repo.join("apps/web"));
+        for service in ["gateway", "web"] {
+            for stale in ["carrick.json", "expected.json"] {
+                let _ = std::fs::remove_file(repo.join("apps").join(service).join(stale));
+            }
+        }
+        std::fs::write(
+            repo.join("carrick.json"),
+            "{ \"services\": [ { \"name\": \"gateway\", \"directory\": \"apps/gateway\" }, \
+             { \"name\": \"web\", \"directory\": \"apps/web\" } ] }\n",
+        )
+        .expect("write carrick.json");
+    })
+}
+
+/// The pub/sub wrapper fixture: `dispatch` publishes, `relay` subscribes.
+fn pubsub_workspace() -> tempfile::TempDir {
+    workspace(|repo| copy_tree(&fixtures().join("pubsub-wrapper-monorepo"), repo))
+}
+
+/// The child's and the join's `Pair verdict:` lines for operations that are
+/// not HTTP: what the case actually judged.
+fn non_http_verdicts(observed: &Observed) -> Vec<String> {
+    observed
+        .log
+        .lines()
+        .filter_map(|line| Some(&line[line.find("Pair verdict: ")?..]))
+        .filter(|line| {
+            !line.starts_with("Pair verdict: GET ") && !line.starts_with("Pair verdict: POST ")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn assert_settle_moves_nothing(on: &Observed, off: &Observed) {
+    assert_eq!(on.text, off.text, "the printed check");
+    assert_eq!(on.text_exit, off.text_exit, "the exit code");
+    assert_eq!(on.json, off.json, "the printed JSON");
+    assert_eq!(on.json_exit, off.json_exit, "the JSON exit code");
+}
+
+/// carrick#3884 must not move a socket pair: the judge decides it, so the
+/// join's settle prints exactly what the join's own judge printed.
+#[test]
+#[serial]
+fn socket_pair_prints_the_same_with_the_join_settle_off() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let payload_edit = |repo: &Path| {
+        edit(
+            &repo.join("apps/payments/src/types/index.ts"),
+            "  amountCents: number;\n  status:",
+            "  amountCents: string;\n  status:",
+        );
+    };
+    let (on, off) = settle_on_off(socket_workspace, payload_edit, &[]);
+    assert!(
+        on.text
+            .contains("incompatible  route SERVER->CLIENT payment:settled"),
+        "the check prints the socket break:\n{}",
+        on.text
+    );
+    assert_settle_moves_nothing(&on, &off);
+}
+
+/// The same for a GraphQL pair.
+#[test]
+#[serial]
+fn graphql_pair_prints_the_same_with_the_join_settle_off() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let schema_edit = |repo: &Path| {
+        edit(
+            &repo.join("apps/gateway/src/orders.resolver.ts"),
+            "  note?: string;",
+            "  note?: number;",
+        );
+    };
+    let (on, off) = settle_on_off(graphql_workspace, schema_edit, &[]);
+    eprintln!("graphql judged: {:#?}", non_http_verdicts(&on));
+    eprintln!("graphql printed:\n{}", on.text);
+    assert_settle_moves_nothing(&on, &off);
+}
+
+/// The same for a pub/sub pair.
+#[test]
+#[serial]
+fn pubsub_pair_prints_the_same_with_the_join_settle_off() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let payload_edit = |repo: &Path| {
+        edit(
+            &repo.join("services/dispatch/src/dispatch.ts"),
+            "{ approved: boolean; reviewer: string }",
+            "{ approved: string; reviewer: string }",
+        );
+    };
+    // The fixture's recorded extraction answers, read by file name.
+    let cassettes = format!(
+        "{}/",
+        fixtures().join("pubsub-wrapper-monorepo/__llm__").display()
+    );
+    let (on, off) = settle_on_off(
+        pubsub_workspace,
+        payload_edit,
+        &[("CARRICK_MOCK_FIXTURE_DIR", cassettes.as_str())],
+    );
+    eprintln!("pubsub judged: {:#?}", non_http_verdicts(&on));
+    eprintln!("pubsub printed:\n{}", on.text);
+    assert_settle_moves_nothing(&on, &off);
 }
