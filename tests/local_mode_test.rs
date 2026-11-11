@@ -204,6 +204,17 @@ fn index(workspace: &Path) -> String {
 /// needs: its budget is the one thing that decides which half of the feature
 /// runs, and a wall-clock assertion would be a flake on a loaded machine.
 fn run_with_env(workspace: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
+    let (stdout, code) = run_with_env_code(workspace, args, env);
+    assert_eq!(code, Some(0), "carrick {args:?} exited {code:?}:\n{stdout}");
+    stdout
+}
+
+/// [`run_with_env`], handing back the exit code rather than asserting it.
+fn run_with_env_code(
+    workspace: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (String, Option<i32>) {
     let mut command = Command::new(carrick());
     command
         .args(args)
@@ -217,13 +228,32 @@ fn run_with_env(workspace: &Path, args: &[&str], env: &[(&str, &str)]) -> String
     let output = command
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
-    assert!(
-        output.status.success(),
-        "carrick {args:?} exited {:?}:\n{}",
+    if !output.status.success() {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    (
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
         output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// `check <file> --recheck --json`, with the exit code checked against the
+/// answer: a re-check that ran out of time, now (`deadline`) or on an earlier
+/// edit against this index (`known_miss`), is not a check of the edit and
+/// exits 2 (carrick#3860); every other answer exits 0.
+fn recheck_json(root: &Path, file: &str, env: &[(&str, &str)]) -> serde_json::Value {
+    let args = ["check", file, "--workspace", ".", "--recheck", "--json"];
+    let (text, code) = run_with_env_code(root, &args, env);
+    let answer: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"));
+    let ran_out = answer["recheck"]["deadline"] == serde_json::json!(true)
+        || answer["recheck"]["known_miss"] == serde_json::json!(true);
+    assert_eq!(
+        code,
+        Some(if ran_out { 2 } else { 0 }),
+        "the exit code does not match the answer:\n{answer:#}"
     );
-    String::from_utf8(output.stdout).expect("stdout was not UTF-8")
+    answer
 }
 
 fn touch(workspace: &Path, file: &str) -> String {
@@ -874,12 +904,7 @@ fn a_re_check_names_the_functions_the_index_does_not_hold() {
     // (carrick#2849): the names come from a parse of the file, which does not
     // wait on the re-scan. On a large monorepo the re-scan never fits the
     // budget, and the reuse nudge would otherwise never hear of a function.
-    let degraded: serde_json::Value = serde_json::from_str(&run_with_env(
-        root,
-        &["check", route, "--workspace", ".", "--recheck", "--json"],
-        &[("CARRICK_RECHECK_BUDGET_MS", "1")],
-    ))
-    .expect("check --recheck --json was not JSON");
+    let degraded = recheck_json(root, route, &[("CARRICK_RECHECK_BUDGET_MS", "1")]);
     assert_eq!(
         degraded["recheck"]["ran"],
         serde_json::json!("none"),
@@ -916,17 +941,21 @@ fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
     let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
     let before = recheck_temp_dirs(temp.path());
     let started = Instant::now();
-    let degraded: serde_json::Value = serde_json::from_str(&run_with_env(
+    let degraded = recheck_json(
         root,
-        &["check", route, "--workspace", ".", "--recheck", "--json"],
+        route,
         &[("CARRICK_RECHECK_BUDGET_MS", "1"), ("TMPDIR", tmpdir)],
-    ))
-    .expect("check --recheck --json was not JSON");
+    );
 
     assert_eq!(
         degraded["recheck"]["ran"],
         serde_json::json!("none"),
         "no half of the re-check ran:\n{degraded:#}"
+    );
+    assert_eq!(
+        degraded["recheck"]["deadline"],
+        serde_json::json!(true),
+        "and it says time ran out, so the exit is not a clean one:\n{degraded:#}"
     );
     assert!(
         degraded["recheck"]["stale_since"].as_str().is_some(),
@@ -963,6 +992,50 @@ fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
     );
 }
 
+/// carrick#3860: a re-check stopped at its budget answers from the index, and
+/// that is never a clean result. Before any row the terminal says the file was
+/// not checked and names the index commit it answered from, and the command
+/// exits 2, as a check that covered nothing does. The edit breaks the
+/// consumer's type, and the indexed `compatible` verdict below the line is
+/// from before it.
+#[test]
+#[serial]
+fn a_re_check_stopped_at_its_budget_is_never_a_clean_result() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+
+    index(root);
+    edit(&route_file, "activeCount: number", "activeCount: string");
+    edit(&route_file, "activeCount: 3", "activeCount: \"3\"");
+
+    let (text, code) = run_with_env_code(
+        root,
+        &["check", route, "--workspace", ".", "--recheck"],
+        &[("CARRICK_RECHECK_BUDGET_MS", "1")],
+    );
+    assert_eq!(code, Some(2), "a deadline fallback is not a check:\n{text}");
+    let header = text.lines().next().expect("a header line");
+    let commit = header
+        .rsplit_once("indexed at ")
+        .map(|(_, at)| at.trim_end_matches(')'))
+        .unwrap_or_else(|| panic!("no index commit in the header:\n{text}"));
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("re-check: not checked, "))
+        .unwrap_or_else(|| panic!("the answer does not say it was not checked:\n{text}"));
+    assert!(
+        line.contains(&format!("from the index at {commit}")),
+        "it names the index it answered from:\n{text}"
+    );
+    let said = text.find(line).expect("the line");
+    let verdict = text
+        .find("    verdict   ")
+        .unwrap_or_else(|| panic!("no indexed verdict row:\n{text}"));
+    assert!(said < verdict, "it says so before any verdict:\n{text}");
+}
+
 /// A re-check that missed its budget is not started again against the same
 /// index: the next one answers at once with the parse and the indexed
 /// verdicts, and says why. A new index tries again. On a large monorepo the
@@ -976,14 +1049,7 @@ fn a_re_check_that_missed_its_budget_is_not_started_again_until_the_index_moves(
     let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
     let route_file = root.join(route);
     let ample = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
-    let ask = |env: &[(&str, &str)]| -> serde_json::Value {
-        serde_json::from_str(&run_with_env(
-            root,
-            &["check", route, "--workspace", ".", "--recheck", "--json"],
-            env,
-        ))
-        .expect("check --recheck --json was not JSON")
-    };
+    let ask = |env: &[(&str, &str)]| -> serde_json::Value { recheck_json(root, route, env) };
     let named = |answer: &serde_json::Value| -> Vec<String> {
         answer["recheck"]["new_functions"]
             .as_array()
@@ -4978,16 +5044,6 @@ const AMPLE: [(&str, &str); 1] = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
 
 fn shop() -> tempfile::TempDir {
     workspace(SHOP, &["shop"])
-}
-
-/// `check <file> --recheck --json`, parsed.
-fn recheck_json(root: &Path, file: &str, env: &[(&str, &str)]) -> serde_json::Value {
-    let text = run_with_env(
-        root,
-        &["check", file, "--workspace", ".", "--recheck", "--json"],
-        env,
-    );
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"))
 }
 
 fn reread(answer: &serde_json::Value) -> Vec<String> {

@@ -637,6 +637,13 @@ pub struct Recheck {
     /// its budget (`known_miss`, `reason`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
+    /// True on a `none` whose re-check started and ran past its budget, so the
+    /// rows are the indexed ones because time ran out (carrick#3860). Such an
+    /// answer, and a `known_miss`, is never a clean result: `check <file>
+    /// --recheck` exits 2 on it, as a check that covered nothing does.
+    /// Absent on every other answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deadline: bool,
     /// Which services this re-check read, and which it judged against their
     /// newest known copy (`docs/local-mode-output.md`, "`recheck`"). Absent on
     /// a `none` that had no service to name.
@@ -767,9 +774,41 @@ pub struct LeadRef {
 }
 
 impl Recheck {
+    /// Whether this answer is a re-check that was warranted and did not
+    /// finish inside its budget: it ran past it (`deadline`), or an earlier
+    /// one of the same service did against this index (`known_miss`). The
+    /// rows are the indexed ones, from before the edit, so the answer is not
+    /// a check of the edit (carrick#3860).
+    pub fn not_checked(&self) -> bool {
+        self.ran == "none" && (self.deadline || self.known_miss)
+    }
+
     /// The line a terminal and a hook both print for this block. Keyed on
     /// `ran`, which is the field that says whose rows these are.
-    pub fn line(&self) -> String {
+    pub fn line(&self, index_commit: &str) -> String {
+        if self.not_checked() {
+            // The reason goes last, as its own sentence: a known miss's reason
+            // is two sentences already, and the clause that names the index
+            // must not be appended to the second.
+            let reason = self
+                .reason
+                .as_deref()
+                .unwrap_or("the re-check ran past its budget")
+                .trim_end_matches('.');
+            let mut chars = reason.chars();
+            let reason: String = match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            };
+            return format!(
+                "re-check: not checked, so these verdicts do not include your edits and are from the index at {}{}. {reason}.",
+                short_commit(index_commit),
+                match self.stale_since.as_deref() {
+                    Some(since) => format!(" (computed {since})"),
+                    None => String::new(),
+                }
+            );
+        }
         match self.ran.as_str() {
             // The reason is what tells the two `none`s apart: a re-check that
             // was warranted and did not finish, and one that had nothing to do
@@ -839,6 +878,18 @@ impl CheckOutput {
             self.service,
             short_commit(&self.index_commit)
         ));
+        // A re-check that ran out of time says so before any row: the rows
+        // below are from before the edit, and a reader who stops at a
+        // `compatible` verdict must not take it for a check of the edit
+        // (carrick#3860).
+        let not_checked = self
+            .recheck
+            .as_ref()
+            .filter(|recheck| recheck.not_checked());
+        if let Some(recheck) = not_checked {
+            out.push_str(&recheck.line(&self.index_commit));
+            out.push('\n');
+        }
         if self.deleted {
             out.push_str("this file is no longer on disk; the rows below are what the index still holds for it.\n");
         }
@@ -921,8 +972,10 @@ impl CheckOutput {
             }
         ));
         if let Some(recheck) = &self.recheck {
-            out.push_str(&recheck.line());
-            out.push('\n');
+            if not_checked.is_none() {
+                out.push_str(&recheck.line(&self.index_commit));
+                out.push('\n');
+            }
             if let Some(line) = recheck.new_functions_line(&self.index_commit) {
                 out.push_str(&line);
                 out.push('\n');
@@ -1500,6 +1553,7 @@ mod tests {
             new_functions: Vec::new(),
             known_miss: false,
             deferred: false,
+            deadline: false,
             scope: None,
             moved: Vec::new(),
         });
@@ -1523,12 +1577,72 @@ mod tests {
             new_functions: Vec::new(),
             known_miss: false,
             deferred: false,
+            deadline: false,
             scope: None,
             moved: Vec::new(),
         });
         let text = degraded.render();
         assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");
         assert!(text.contains("unresolved since your edit"), "{text}");
+    }
+
+    /// carrick#3860: a re-check stopped at its budget says, before any row,
+    /// that the file was not checked and which index answered, once.
+    #[test]
+    fn a_re_check_stopped_at_its_budget_says_not_checked_before_the_rows() {
+        let mut stopped = output();
+        stopped.recheck = Some(Recheck {
+            ran: "none".to_string(),
+            elapsed_ms: 6_400,
+            stale_since: Some("2026-09-13T22:26:26Z".to_string()),
+            reason: Some("the re-scan ran past the budget".to_string()),
+            new_functions: Vec::new(),
+            known_miss: false,
+            deferred: false,
+            deadline: true,
+            scope: None,
+            moved: Vec::new(),
+        });
+        let text = stopped.render();
+        let line = format!(
+            "re-check: not checked, so these verdicts do not include your edits and are from the index at {} \
+             (computed 2026-09-13T22:26:26Z). The re-scan ran past the budget.\n",
+            short_commit(&stopped.index_commit)
+        );
+        let said = text.find(&line).unwrap_or_else(|| panic!("{text}"));
+        let item = text.find("src/api.ts:44").expect("item");
+        assert!(said < item, "the line comes before the rows:\n{text}");
+        assert_eq!(text.matches("re-check:").count(), 1, "{text}");
+    }
+
+    /// A known miss is the same fallback, remembered: the same line, with
+    /// its own two-sentence reason last and whole.
+    #[test]
+    fn a_known_miss_says_not_checked_with_its_reason_whole() {
+        let recheck = Recheck {
+            ran: "none".to_string(),
+            elapsed_ms: 3,
+            stale_since: Some("2026-09-13T22:26:26Z".to_string()),
+            reason: Some(
+                "re-reading catalog (12 indexed files) took longer than 10 s against this \
+                 index, so edits in catalog are not re-checked until `carrick refresh`. Run \
+                 `carrick check --changed` before you finish."
+                    .to_string(),
+            ),
+            new_functions: Vec::new(),
+            known_miss: true,
+            deferred: false,
+            deadline: false,
+            scope: None,
+            moved: Vec::new(),
+        };
+        assert_eq!(
+            recheck.line("1a2b3c4d5e6f"),
+            "re-check: not checked, so these verdicts do not include your edits and are from the index at \
+             1a2b3c4 (computed 2026-09-13T22:26:26Z). Re-reading catalog (12 indexed files) \
+             took longer than 10 s against this index, so edits in catalog are not re-checked \
+             until `carrick refresh`. Run `carrick check --changed` before you finish."
+        );
     }
 
     /// carrick#1374: a re-check that had nothing to do is a `none` too, and
@@ -1545,6 +1659,7 @@ mod tests {
             new_functions: Vec::new(),
             known_miss: false,
             deferred: false,
+            deadline: false,
             scope: None,
             moved: Vec::new(),
         });
