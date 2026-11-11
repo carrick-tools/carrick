@@ -349,6 +349,13 @@
   "kind": "call",
   "source": "platform built-in"
  },
+ "n-version-key": {
+  "carries": "name",
+  "expect": "/v1/p/n-version-key|/v2/p/n-version-key",
+  "feature": "destructured options key with a default (const { k = 'x' } = options || {})",
+  "kind": "call",
+  "source": "test262 (destructuring-binding defaults)"
+ },
  "pl-class": {
   "carries": "payload",
   "expect": "/p/pl-class",

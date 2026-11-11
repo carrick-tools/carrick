@@ -318,6 +318,13 @@ pub enum Piece {
     /// (`url` for `{ url }`, `options.url`). Filled in at each call site from
     /// the object the caller writes at that position.
     ParamKey(usize, String, String),
+    /// [`Piece::ParamKey`] with what it holds where the caller's object
+    /// leaves the key out (carrick#3608): the key's default, or the value a
+    /// caller wrote under it before spreading its own options (`{ version:
+    /// 'v2', ...options }`). Built only by the caller walk
+    /// (`decided_sites::filled_with`), which fills it at the next call up;
+    /// left open it reads as the parameter it names.
+    ParamKeyOr(usize, String, String, Vec<Piece>),
     /// A value the source names and this pass does not read, kept as written
     /// (`process.env.API_URL`, `config.apiEndpoint`), with where it comes
     /// from as the receive side reads it (carrick#2406): an environment
@@ -374,14 +381,16 @@ impl Piece {
     fn is_parameter(&self) -> bool {
         matches!(
             self,
-            Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..)
+            Piece::Param(..) | Piece::ParamKey(..) | Piece::ParamKeyOr(..) | Piece::Outer(..)
         )
     }
 
     /// The text a parameter is read by where it is written.
     fn parameter_name(&self) -> Option<&str> {
         match self {
-            Piece::Param(_, name) | Piece::ParamKey(_, _, name) => Some(name),
+            Piece::Param(_, name)
+            | Piece::ParamKey(_, _, name)
+            | Piece::ParamKeyOr(_, _, name, _) => Some(name),
             Piece::Outer(_, inner) => inner.parameter_name(),
             _ => None,
         }
@@ -391,7 +400,9 @@ impl Piece {
     /// function out (carrick#1949).
     fn enclosed(&self) -> Piece {
         match self {
-            Piece::Param(..) | Piece::ParamKey(..) => Piece::Outer(1, Box::new(self.clone())),
+            Piece::Param(..) | Piece::ParamKey(..) | Piece::ParamKeyOr(..) => {
+                Piece::Outer(1, Box::new(self.clone()))
+            }
             Piece::Outer(depth, inner) => Piece::Outer(depth.saturating_add(1), inner.clone()),
             other => other.clone(),
         }
@@ -430,10 +441,14 @@ fn end_of(pieces: &[Piece]) -> Root {
         [Piece::Lit(text)] => Root::Literal(text.clone()),
         [Piece::Opaque { end, .. }] => end.clone(),
         [Piece::Param(index, name)] => Root::Param(*index, name.clone()),
-        [Piece::ParamKey(index, ..)] => Root::Param(*index, String::new()),
+        [Piece::ParamKey(index, ..) | Piece::ParamKeyOr(index, ..)] => {
+            Root::Param(*index, String::new())
+        }
         [Piece::Outer(depth, inner)] => match &**inner {
             Piece::Param(index, name) => Root::Outer(*depth, *index, name.clone()),
-            Piece::ParamKey(index, ..) => Root::Outer(*depth, *index, String::new()),
+            Piece::ParamKey(index, ..) | Piece::ParamKeyOr(index, ..) => {
+                Root::Outer(*depth, *index, String::new())
+            }
             _ => Root::Hole(HoleReason::UnreadExpression),
         },
         _ => Root::Hole(HoleReason::UnreadExpression),
@@ -1134,6 +1149,13 @@ impl CallIr {
         }
     }
 
+    /// Whether the call leaves position `index` out: it writes fewer
+    /// arguments, and no spread may fill it. The callee's default is what
+    /// it holds there (carrick#3504 S2b-2).
+    fn omits(&self, index: usize) -> bool {
+        self.args.len() <= index && self.spread_from.is_none()
+    }
+
     /// What each argument the function this call runs receives may hold,
     /// by position, as [`CallIr::arg_values`] states a call's own, shifted
     /// as [`Self::passed_arg`] shifts them.
@@ -1417,6 +1439,12 @@ struct FnIr {
     /// ([`resolve::param_bindings`] keys the file's parameter table from
     /// these, carrick#3504 B10-1a).
     param_names: Vec<resolve::ParamName>,
+    /// Each key of a parameter with a default whose text the function's own
+    /// scope reads (`{ version = 'v1' }`, `const { method = 'POST' } =
+    /// options || {}`), by position and key: what a request the function
+    /// sends reads where a caller's object leaves the key out
+    /// ([`Effect::key_defaults`], carrick#3608).
+    key_defaults: BTreeMap<(usize, String), Vec<Piece>>,
     /// Each function written as a parameter's default, read with this
     /// function's own captures (carrick#2813). A value that is one reaches it
     /// here, by where it starts. Discovery's value walk enters it; no site
@@ -5008,6 +5036,18 @@ struct Scope<'a> {
     /// nested pattern: each may hold something other than what the caller
     /// wrote under that key.
     keyed: HashMap<BindingKey, (usize, String)>,
+    /// Each binding that holds one key of an object parameter or, where the
+    /// caller's object leaves it out, the key's default (`{ version = 'v1' }`,
+    /// `const { version = 'v1' } = options || {}`, carrick#3608), with the
+    /// parameter's position and the key: read as that key by the values a
+    /// request is composed of, and the default by the caller walk from
+    /// [`FnIr::param_default_texts`]. Kept apart from `keyed`, whose
+    /// readers (the guards) compare what the caller wrote under the key.
+    defaulted: HashMap<BindingKey, (usize, String)>,
+    /// The default each of [`Self::defaulted`] is given, as written, by the
+    /// parameter's position and the key: what a request reads where the
+    /// caller's object leaves the key out ([`FnIr::key_defaults`]).
+    key_defaults: HashMap<(usize, String), Expr>,
     /// Each parameter, or key of an object parameter, the function gives a
     /// default (`prefix = '/api'`, `{ prefix = '/api' } = {}`): the
     /// parameter's position, the key (`None`: the parameter itself) and the
@@ -5091,6 +5131,8 @@ impl<'a> Scope<'a> {
         Self {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaulted: HashMap::new(),
+            key_defaults: HashMap::new(),
             defaults: HashMap::new(),
             rest_of: HashMap::new(),
             key_objects: HashSet::new(),
@@ -5185,6 +5227,15 @@ impl<'a> Scope<'a> {
                 for (binding, key) in keyed_names(object) {
                     if settled(&binding) {
                         self.keyed.insert(binding, (index, key));
+                    }
+                }
+                // `{ version = 'v1' }`: the caller's key, or the default
+                // (`ParamValues::default_texts` holds its text).
+                for (binding, key, default) in defaulted_names(object) {
+                    if settled(&binding) {
+                        self.key_defaults
+                            .insert((index, key.clone()), default.clone());
+                        self.defaulted.insert(binding, (index, key));
                     }
                 }
                 for prop in &object.props {
@@ -6175,6 +6226,8 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaulted: HashMap::new(),
+            key_defaults: HashMap::new(),
             defaults: HashMap::new(),
             rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
@@ -6229,6 +6282,7 @@ impl Reader<'_> {
             Some(body) => self.body(&body.stmts, &mut scope, &mut ir),
             None => ir.bodyless = true,
         }
+        ir.key_defaults = self.key_defaults(&scope);
         ir.settle_returned(function.is_async, function.is_generator);
         self.keep_returns(function.span.lo.0, &ir);
         ir
@@ -6242,6 +6296,24 @@ impl Reader<'_> {
                 .borrow_mut()
                 .insert(start, ir.returned_values.clone());
         }
+    }
+
+    /// The text each default of [`Scope::key_defaults`] states, where it is
+    /// text alone (carrick#3608).
+    fn key_defaults(&self, scope: &Scope<'_>) -> BTreeMap<(usize, String), Vec<Piece>> {
+        scope
+            .key_defaults
+            .iter()
+            .filter_map(|(at, default)| match self.eval(default, scope) {
+                Value::Str(pieces)
+                    if !pieces.is_empty()
+                        && pieces.iter().all(|piece| matches!(piece, Piece::Lit(_))) =>
+                {
+                    Some((at.clone(), pieces))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn arrow(
@@ -6258,6 +6330,8 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaulted: HashMap::new(),
+            key_defaults: HashMap::new(),
             defaults: HashMap::new(),
             rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
@@ -6312,6 +6386,7 @@ impl Reader<'_> {
                 self.walk_returned(expr, &scope, &mut ir);
             }
         }
+        ir.key_defaults = self.key_defaults(&scope);
         ir.settle_returned(arrow.is_async, arrow.is_generator);
         self.keep_returns(arrow.span.lo.0, &ir);
         ir
@@ -6470,17 +6545,35 @@ impl Reader<'_> {
                     {
                         scope.rest_of.insert(rest, (0, index, taken));
                     }
+                    // `const { version = 'v1' } = options || {}`: a key with
+                    // a default holds the caller's key or, where the caller's
+                    // object leaves it out, the default, whose text the
+                    // function keeps for the caller walk (carrick#3608).
                     if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
-                        && let Expr::Ident(source) =
-                            crate::graphql_document_sites::unwrap_expression(init)
+                        && let Some(source) = param_or_empty(init)
                         && scope.key_objects.contains(&ident_key(source))
                         && let Some(index) = scope.param_index(source)
                     {
+                        let settled = |binding: &BindingKey| {
+                            !reassigned.names.contains(&binding.0)
+                                && declared.binding_count(binding) == 1
+                        };
                         for (binding, key) in keyed_names(object) {
-                            if !reassigned.names.contains(&binding.0)
-                                && declared.binding_count(&binding) == 1
-                            {
+                            if settled(&binding) {
                                 scope.keyed.insert(binding, (index, key));
+                            }
+                        }
+                        for (binding, key, default) in defaulted_names(object) {
+                            if settled(&binding) {
+                                ir.param_default_texts.push((
+                                    index,
+                                    vec![key.clone()],
+                                    resolve::text_of(default, &|lo| lo),
+                                ));
+                                scope
+                                    .key_defaults
+                                    .insert((index, key.clone()), default.clone());
+                                scope.defaulted.insert(binding, (index, key));
                             }
                         }
                     }
@@ -6753,8 +6846,11 @@ impl Reader<'_> {
                     return Value::Str(vec![Piece::Param(index, name.to_string())]);
                 }
                 let key = ident_key(ident);
-                // One key of an object parameter (carrick#1950).
-                if let Some((index, param_key)) = scope.keyed.get(&key) {
+                // One key of an object parameter (carrick#1950), or its
+                // default (carrick#3608).
+                if let Some((index, param_key)) =
+                    scope.keyed.get(&key).or_else(|| scope.defaulted.get(&key))
+                {
                     return Value::Str(vec![Piece::ParamKey(
                         *index,
                         param_key.clone(),
@@ -7940,6 +8036,35 @@ fn keyed_names(object: &ObjectPat) -> Vec<(BindingKey, String)> {
         .collect()
 }
 
+/// The bindings an object pattern introduces that hold one key of the object
+/// it unpacks or, where the object leaves the key out, a default
+/// (carrick#3608): `{ version = 'v1' }` and `{ version: v = 'v1' }`, each
+/// with its key and the default as written. [`keyed_names`] gives the keys
+/// with no default.
+fn defaulted_names(object: &ObjectPat) -> Vec<(BindingKey, String, &Expr)> {
+    object
+        .props
+        .iter()
+        .filter_map(|prop| match prop {
+            ObjectPatProp::Assign(assign) => Some((
+                ident_key(&assign.key.id),
+                assign.key.id.sym.to_string(),
+                assign.value.as_deref()?,
+            )),
+            ObjectPatProp::KeyValue(kv) => match &*kv.value {
+                Pat::Assign(assign) => match &*assign.left {
+                    Pat::Ident(binding) => {
+                        Some((ident_key(&binding.id), prop_name(&kv.key)?, &*assign.right))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            ObjectPatProp::Rest(_) => None,
+        })
+        .collect()
+}
+
 /// The bindings `const <pattern> = init` binds to one key of a module object
 /// literal, each with the key's value expression (carrick#3489 W2): `init`
 /// names a module `const` object literal that nothing writes through, and the
@@ -8852,7 +8977,7 @@ impl CallWalker<'_, '_, '_> {
                 );
             }
         }
-        for (key, (index, param_key)) in &self.scope.keyed {
+        for (key, (index, param_key)) in self.scope.keyed.iter().chain(&self.scope.defaulted) {
             values.insert(
                 key.clone(),
                 Value::Str(vec![
@@ -9067,14 +9192,88 @@ struct Effect {
     base_scope: Option<PathBuf>,
     /// The library-semantics claim ids the request was read through.
     semantics: BTreeSet<String>,
+    /// What each key of the function's own parameter the URL or the method
+    /// reads holds where the caller's object leaves it out (carrick#3608):
+    /// the key's default ([`FnIr::key_defaults`]), or, once a caller hands
+    /// its own options on, the key it wrote before spreading them.
+    key_defaults: BTreeMap<(usize, String), Vec<Piece>>,
+}
+
+/// What a caller's argument holds under one key of the callee's parameter
+/// ([`Effect::read_key`], carrick#3608).
+enum KeyRead<'v> {
+    /// The value the caller's object writes under the key.
+    Written(&'v Value),
+    /// The callee's fallback: the caller omits the argument, or writes a
+    /// closed object without the key.
+    Fallback(Vec<Piece>),
+    /// A closed object without the key, and no fallback.
+    Missing,
+    /// The caller's own parameter at this position holds it (its options,
+    /// passed on whole or spread), with what it holds where that leaves
+    /// the key out.
+    Passed(usize, Option<Vec<Piece>>),
+    /// Anything else.
+    Unread,
 }
 
 impl Effect {
+    /// What `args` (with `omitted` true for a position a call leaves out)
+    /// hold under key `key` of the parameter at `index` ([`KeyRead`]).
+    fn read_key<'v>(
+        &self,
+        args: &'v [Value],
+        omitted: &dyn Fn(usize) -> bool,
+        index: usize,
+        key: &str,
+    ) -> KeyRead<'v> {
+        let fallback = self.key_defaults.get(&(index, key.to_string())).cloned();
+        match args.get(index) {
+            Some(Value::Obj(object)) => match object.fields.get(key) {
+                Some(value) => KeyRead::Written(value),
+                None if object.unsettled.contains(key) || object.functions.contains(key) => {
+                    KeyRead::Unread
+                }
+                None => match &object.under_param {
+                    Some((position, before)) => match before.get(key) {
+                        Some(Value::Str(pieces)) => {
+                            KeyRead::Passed(*position, Some(pieces.clone()))
+                        }
+                        Some(_) => KeyRead::Unread,
+                        None if fallback.is_some() => KeyRead::Passed(*position, fallback),
+                        None => KeyRead::Unread,
+                    },
+                    None if !object.open && object.under_rest.is_none() => match fallback {
+                        Some(fallback) => KeyRead::Fallback(fallback),
+                        None => KeyRead::Missing,
+                    },
+                    None => KeyRead::Unread,
+                },
+            },
+            Some(Value::Str(pieces)) => match pieces.as_slice() {
+                [Piece::Param(outer, _)] => KeyRead::Passed(*outer, fallback),
+                _ => KeyRead::Unread,
+            },
+            None if omitted(index) => match fallback {
+                Some(fallback) => KeyRead::Fallback(fallback),
+                None => KeyRead::Unread,
+            },
+            _ => KeyRead::Unread,
+        }
+    }
+
     /// The requests a shape sends: one, or one per way a conditional in its
     /// URL or method can go (carrick#2050, carrick#2051), or one that states
     /// no row where the source does not say which goes out
     /// ([`Alternation::Nothing`]).
-    fn from_shape(shape: &RequestShape, file: &Path, call: Site) -> Vec<Self> {
+    ///
+    /// `key_defaults` are the sending function's ([`FnIr::key_defaults`]).
+    fn from_shape(
+        shape: &RequestShape,
+        file: &Path,
+        call: Site,
+        key_defaults: &BTreeMap<(usize, String), Vec<Piece>>,
+    ) -> Vec<Self> {
         let (body, body_param) = match &shape.body {
             BodyValue::Fields(obj) => (string_fields(obj), None),
             BodyValue::Param(index) => (BTreeMap::new(), Some((*index, None))),
@@ -9114,6 +9313,7 @@ impl Effect {
                     base: shape.base.clone(),
                     base_scope: shape.base_scope.clone(),
                     semantics: shape.semantics.clone(),
+                    key_defaults: key_defaults.clone(),
                 };
                 effect.settle_keys();
                 effect.settle_outer();
@@ -9250,6 +9450,8 @@ impl Effect {
             base: lift(&self.base),
             base_scope: self.base_scope.clone(),
             semantics: self.semantics.clone(),
+            // The closure's own defaults are no key of the enclosing one.
+            key_defaults: BTreeMap::new(),
         }
     }
 
@@ -9274,6 +9476,17 @@ impl Effect {
     /// reads as a spread of the parameter at each position puts them in
     /// place.
     fn instantiate(&self, args: &[Value], spread_args: &[SpreadArg]) -> Effect {
+        self.instantiate_omitting(args, spread_args, &|_| false)
+    }
+
+    /// [`Self::instantiate`], where `omitted` is true for a position the
+    /// call leaves out ([`CallIr::omits`]), which holds its default.
+    fn instantiate_omitting(
+        &self,
+        args: &[Value],
+        spread_args: &[SpreadArg],
+        omitted: &dyn Fn(usize) -> bool,
+    ) -> Effect {
         // What the caller wrote where the callee reads `name`, at `position`
         // of the URL. An opaque value standing for a path segment is a path
         // parameter, and keeps the name the callee gives it. Leading the URL
@@ -9338,20 +9551,19 @@ impl Effect {
                         // spread or a computed key may hold it, or nothing
                         // does) and one holding anything but text say
                         // nothing. A caller that passes its own parameter on
-                        // leaves the key to its own caller.
-                        Piece::ParamKey(index, key, name) => match args.get(*index) {
-                            Some(Value::Obj(object)) => match object.fields.get(key) {
-                                Some(Value::Str(arg)) => written(arg, position, name),
-                                _ => vec![Piece::Unknown],
-                            },
-                            Some(Value::Str(arg)) => match arg.as_slice() {
-                                [Piece::Param(outer, _)] => {
-                                    vec![Piece::ParamKey(*outer, key.clone(), name.clone())]
+                        // leaves the key to its own caller. A key the object
+                        // leaves out that the callee gives a default is that
+                        // default (carrick#3608).
+                        Piece::ParamKey(index, key, name) => {
+                            match self.read_key(args, omitted, *index, key) {
+                                KeyRead::Written(Value::Str(arg)) => written(arg, position, name),
+                                KeyRead::Fallback(fallback) => fallback,
+                                KeyRead::Passed(outer, _) => {
+                                    vec![Piece::ParamKey(outer, key.clone(), name.clone())]
                                 }
                                 _ => vec![Piece::Unknown],
-                            },
-                            _ => vec![Piece::Unknown],
-                        },
+                            }
+                        }
                         other => vec![other.clone()],
                     }),
             )
@@ -9361,23 +9573,43 @@ impl Effect {
                 Some(Value::Str(pieces)) => method_of(pieces),
                 _ => MethodValue::Unknown,
             },
-            MethodValue::ParamKey(index, key) => match args.get(*index) {
-                Some(Value::Obj(obj)) => match obj.fields.get(key) {
-                    Some(Value::Str(pieces)) => method_of(pieces),
-                    Some(_) => MethodValue::Unknown,
-                    // Options stating no method and no body: the GET every
-                    // fetch-shaped client defaults to.
-                    None if obj.fields.contains_key("body") || obj.open => MethodValue::Unknown,
-                    None => MethodValue::Lit("GET".to_string()),
+            MethodValue::ParamKey(index, key) => match self.read_key(args, omitted, *index, key) {
+                KeyRead::Written(Value::Str(pieces)) => method_of(pieces),
+                KeyRead::Written(_) | KeyRead::Unread => MethodValue::Unknown,
+                // The callee's own default (carrick#3608).
+                KeyRead::Fallback(fallback) => method_of(&fallback),
+                // Options stating no method and no body: the GET every
+                // fetch-shaped client defaults to.
+                KeyRead::Missing => match args.get(*index) {
+                    Some(Value::Obj(obj)) if obj.fields.contains_key("body") => {
+                        MethodValue::Unknown
+                    }
+                    _ => MethodValue::Lit("GET".to_string()),
                 },
-                Some(Value::Str(pieces)) => match pieces.as_slice() {
-                    [Piece::Param(outer, _)] => MethodValue::ParamKey(*outer, key.clone()),
-                    _ => MethodValue::Unknown,
-                },
-                _ => MethodValue::Unknown,
+                KeyRead::Passed(outer, _) => MethodValue::ParamKey(outer, key.clone()),
             },
             other => other.clone(),
         };
+        // What each key the caller's own parameter now holds falls back to.
+        let mut key_defaults: BTreeMap<(usize, String), Vec<Piece>> = BTreeMap::new();
+        let read_keys = self
+            .url
+            .iter()
+            .chain(&self.base)
+            .filter_map(|piece| match piece {
+                Piece::ParamKey(index, key, _) => Some((*index, key.as_str())),
+                _ => None,
+            })
+            .chain(match &self.method {
+                MethodValue::ParamKey(index, key) => Some((*index, key.as_str())),
+                _ => None,
+            });
+        for (index, key) in read_keys {
+            if let KeyRead::Passed(outer, Some(fallback)) = self.read_key(args, omitted, index, key)
+            {
+                key_defaults.insert((outer, key.to_string()), fallback);
+            }
+        }
         let fill_keys = |keys: &BTreeMap<String, Vec<Piece>>| -> BTreeMap<String, Vec<Piece>> {
             keys.iter()
                 .map(|(key, pieces)| (key.clone(), fill(pieces)))
@@ -9445,6 +9677,7 @@ impl Effect {
             base: fill(&self.base),
             base_scope: self.base_scope.clone(),
             semantics: self.semantics.clone(),
+            key_defaults,
         };
         // A key of the caller's own parameter may have arrived in what it
         // wrote (`get(`${options.base}/users`)`), and so may an enclosing
@@ -9459,7 +9692,8 @@ impl Effect {
     /// is stated, and it is the request line everything further up reaches.
     fn at_call(&self, call: &CallIr, file: &Path) -> Effect {
         let site = call.site;
-        let mut instantiated = self.instantiate(&call.args, &call.spread_args);
+        let mut instantiated =
+            self.instantiate_omitting(&call.args, &call.spread_args, &|index| call.omits(index));
         if self.has_params() && !instantiated.has_params() {
             instantiated.site = RequestSite {
                 file: file.to_path_buf(),
@@ -10711,7 +10945,7 @@ impl Composer<'_> {
                 None => {
                     if let Some(request) = self.request_of(file, call) {
                         summary.effects.extend(
-                            Effect::from_shape(&request, file, call.site)
+                            Effect::from_shape(&request, file, call.site, &ir.key_defaults)
                                 .into_iter()
                                 .map(|effect| ir.settle_forward(effect)),
                         );
@@ -10984,7 +11218,10 @@ fn emit(
                     if call.jsx && !effect.has_params() {
                         continue;
                     }
-                    let instantiated = effect.instantiate(&call.args, &call.spread_args);
+                    let instantiated =
+                        effect.instantiate_omitting(&call.args, &call.spread_args, &|index| {
+                            call.omits(index)
+                        });
                     // What this call writes for a method that is a parameter
                     // (carrick#2049).
                     if matches!(effect.method, MethodValue::Param(_)) {
@@ -11131,7 +11368,9 @@ fn emit(
                         || (request.kind != RequestKind::Verb
                             && (!request.url_inline || request.fans_out_inline()))
                     {
-                        for effect in Effect::from_shape(&request, file, call.site) {
+                        for effect in
+                            Effect::from_shape(&request, file, call.site, &ir.key_defaults)
+                        {
                             let site = effect.site.clone();
                             let declared = matches!(effect.method, MethodValue::Param(_))
                                 && !request.declared_methods.is_empty();
@@ -11338,6 +11577,7 @@ fn base_reads_the_same_in(effect: &Effect, file: &Path) -> bool {
             Piece::Opaque { .. }
             | Piece::Param(..)
             | Piece::ParamKey(..)
+            | Piece::ParamKeyOr(..)
             | Piece::Outer(..)
             | Piece::Query
             | Piece::Unknown => false,
@@ -11617,7 +11857,7 @@ fn render_target(url: &[Piece]) -> Option<String> {
             end: Root::Hole(HoleReason::SeveralPaths),
             ..
         } => true,
-        Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..) => {
+        Piece::Param(..) | Piece::ParamKey(..) | Piece::ParamKeyOr(..) | Piece::Outer(..) => {
             !is_whole_segment(url, position)
         }
         // Text after a query that may be empty would continue the path.
@@ -11647,7 +11887,8 @@ fn render_target(url: &[Piece]) -> Option<String> {
             }
             Piece::Opaque { text: name, .. }
             | Piece::Param(_, name)
-            | Piece::ParamKey(_, _, name) => {
+            | Piece::ParamKey(_, _, name)
+            | Piece::ParamKeyOr(_, _, name, _) => {
                 if !is_whole_segment(path, position) {
                     return None;
                 }
@@ -11837,6 +12078,7 @@ mod tests {
             base: Vec::new(),
             base_scope: None,
             semantics: BTreeSet::new(),
+            key_defaults: BTreeMap::new(),
         }
     }
 
@@ -12228,7 +12470,7 @@ mod tests {
     }
 
     /// The file IR `source` reads as.
-    fn file_ir_of(source: &str) -> FileIr {
+    pub(super) fn file_ir_of(source: &str) -> FileIr {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("input.ts");
         std::fs::write(&path, source).expect("write file");

@@ -249,6 +249,11 @@
   "source": "platform built-in",
   "status": "covered"
  },
+ "n-version-key": {
+  "feature": "destructured options key with a default (const { k = 'x' } = options || {})",
+  "source": "test262 (destructuring-binding defaults)",
+  "status": "covered"
+ },
  "pl-class": {
   "feature": "class instance payload",
   "source": "test262 (class)",
