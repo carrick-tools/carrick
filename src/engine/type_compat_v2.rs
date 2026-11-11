@@ -2317,6 +2317,14 @@ struct PreJudgeMs {
     stubs: u64,
 }
 
+/// What a timed judge reports besides the answer: the time before it, and
+/// how many pairs a timing sample re-judges (`None`: no sample).
+#[derive(Debug, Clone, Copy, Default)]
+struct JudgeTiming {
+    before: PreJudgeMs,
+    sample: Option<usize>,
+}
+
 /// The `v2 check timing` log line. Agent- and log-facing only: it carries
 /// counts and times, no paths.
 fn judge_timing_line(
@@ -2377,8 +2385,7 @@ fn judge_timed(
     build_key: &str,
     stubs: &[CheckStubInput],
     specs: &[CheckPairSpec],
-    before: PreJudgeMs,
-    sample: Option<usize>,
+    timing: JudgeTiming,
     emit: impl Fn(&str),
     check: impl Fn(&[CheckPairSpec]) -> Result<CheckV2Result, SidecarError>,
 ) -> Result<CheckV2Result, SidecarError> {
@@ -2391,6 +2398,7 @@ fn judge_timed(
         ran_ms.set(Some(run.elapsed().as_millis() as u64));
         answer
     });
+    let JudgeTiming { before, sample } = timing;
     if result.is_ok() {
         // Time outside the compiler engine's own run: the key over every
         // stub's files, and writing the kept answer. A reused kept answer
@@ -2543,8 +2551,7 @@ pub(crate) fn run_check(
                 &sidecar.build_key(),
                 &stubs,
                 &specs,
-                before,
-                sample,
+                JudgeTiming { before, sample },
                 |line| info!("{line}"),
                 |s| sidecar.check_v2(&stubs, s),
             )
@@ -10306,8 +10313,10 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 "b",
                 &stubs,
                 &specs,
-                PreJudgeMs::default(),
-                sample,
+                JudgeTiming {
+                    before: PreJudgeMs::default(),
+                    sample,
+                },
                 |l| lines.borrow_mut().push(l.to_string()),
                 |s| {
                     seen.borrow_mut()
@@ -10365,8 +10374,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             "b",
             &stubs,
             &specs,
-            PreJudgeMs::default(),
-            None,
+            JudgeTiming::default(),
             |l| lines.borrow_mut().push(l.to_string()),
             |_| panic!("a kept answer must not be judged again"),
         );
