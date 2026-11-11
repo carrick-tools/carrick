@@ -1099,11 +1099,8 @@ fn path_op_of<'e>(
                 } => join.clone(),
                 _ => return None,
             };
-            (held == type_name
-                && specifier_keys(module)
-                    .iter()
-                    .any(|key| *key == export.package))
-            .then_some((export, join))
+            (held == type_name && specifier_keys(module).contains(&export.package))
+                .then_some((export, join))
         }
         _ => None,
     })
