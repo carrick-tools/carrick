@@ -30,6 +30,7 @@ import { moduleFormatResolutionHost } from './module-format.js';
 import { ExternalImports, registerExternalImports } from './origin.js';
 import { pinProgramRoots } from './program-files.js';
 import { defaultLibraryOptions } from './default-library.js';
+import { walkFirst, walkFirstVariant, type WalkFirstRecord } from './walk-first-probe.js';
 
 /**
  * Options for ProjectLoader construction
@@ -219,6 +220,8 @@ export class ProjectLoader {
   private readonly repoRoot: string;
   private readonly tsconfigPath: string | undefined;
   private readonly scanRoot: string | undefined;
+  /** PROTOTYPE (one-engine step 0): the probe walk, once it ran. */
+  walkFirstRecord: WalkFirstRecord | undefined = undefined;
   /** `ProjectLoaderOptions.workspaceSource`. */
   private readonly workspaceSource: boolean;
   private readonly tsconfigSnapshot: TsconfigSnapshot | undefined;
@@ -567,6 +570,15 @@ export class ProjectLoader {
         `Project built in ${buildTimeMs}ms ` +
           `(${this.project.getSourceFiles().length} source files)`
       );
+      // PROTOTYPE (one-engine step 0): an analysis process walks first.
+      const variant = walkFirstVariant();
+      if (variant !== undefined && !this.workspaceSource && this.walkFirstRecord === undefined) {
+        this.walkFirstRecord = walkFirst(this, this.project, variant);
+        this.log(
+          `walk_first_probe: ${variant} walked ${this.walkFirstRecord.files} file(s), ` +
+            `${this.walkFirstRecord.rows} row(s), in ${this.walkFirstRecord.ms}ms`
+        );
+      }
     }
     return this.project;
   }

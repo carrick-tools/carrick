@@ -127,6 +127,8 @@ export interface PositionRowsOptions {
   service: string;
   /** Called after each file is walked or skipped. */
   onFile?: () => void;
+  /** PROTOTYPE (one-engine step 0): keep each program instead of releasing it. */
+  keepPrograms?: boolean;
 }
 
 const COMPARE_OPERATORS = new Set<ts.SyntaxKind>([
@@ -267,7 +269,7 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
       untaken.set(key, { indexes: missed, declarations });
     }
     // One owner's program at a time.
-    loader.releaseProjectFor(key);
+    if (!options.keepPrograms) loader.releaseProjectFor(key);
   }
 
   for (const [key, { indexes, declarations }] of untaken) {
