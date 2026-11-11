@@ -7,6 +7,8 @@
  * classifying by diagnostic code + file + line (never by line position alone):
  *
  *   poison (stub-file diagnostic)         -> unverifiable   [highest precedence]
+ *   a side reads another service's        -> unverifiable (foreign:<side>,
+ *   declaration (or could not rule it out)    carrick#1047)
  *   surface import error (probe lines 1-2)-> unverifiable
  *   IsAny gate fired (TS2344)             -> gate_caught_baked_any
  *   IsUnknown/IsNever gate fired (TS2344) -> unverifiable
@@ -41,7 +43,7 @@ import {
   type Side,
 } from './check-probe.js';
 import { scrubDiagnostic, scrubPaths, type ScrubContext } from './check-scrub.js';
-import type { PairDeepFindings } from './check-deep.js';
+import type { PairDeepFindings, PairForeignFindings } from './check-deep.js';
 import { onlyDeclaredOpenMembers } from './deep-walk.js';
 import type { DispatchUnion } from './check-union.js';
 import {
@@ -147,6 +149,11 @@ export interface ClassifyInput {
    * JSON body that is a string.
    */
   rawTextSide?: Side;
+  /**
+   * What each side reads of another service's declarations (carrick#1047
+   * J1-1). Absent when neither side can reach one.
+   */
+  foreign?: PairForeignFindings;
 }
 
 /** Classify one pair into exactly one bucket, honouring the precedence order. */
@@ -192,6 +199,31 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
         ...notAFact(`the ${side} stub does not typecheck`, side),
       };
     }
+  }
+
+  // 1b. A side whose type reads a declaration only another service declares
+  //     (carrick#1047 J1-1): a global merged in from a stub loaded beside it.
+  //     Each service compiles alone, so neither compiles that type, and the
+  //     verdict would hang on which other pairs this run probed. A walk that
+  //     could not rule it out fails closed. The producer is named first, as
+  //     poison names it.
+  for (const side of ['producer', 'consumer'] as const) {
+    const found = input.foreign?.[side];
+    if (!found) continue;
+    const service = plan.spec[side].service_name;
+    const reason =
+      found === 'unwalked'
+        ? foreignUnwalkedReason(side)
+        : 'exhaustedAt' in found
+          ? `the ${side} type is too deep or wide to verify at ${found.exhaustedAt === '<root>' ? 'its root' : `'${found.exhaustedAt}'`}`
+          : foreignHitReason(side, found.service);
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: `foreign:${side}`,
+      diagnostic: foreignDiagnostic(service, typeof found !== 'string' && 'service' in found ? found.service : undefined),
+      ...notAFact(reason, side),
+    };
   }
 
   // 2. Surface import error (missing/renamed export): probe import lines.
@@ -607,4 +639,20 @@ function factness(input: ClassifyInput, strict = false): {
     };
   }
   return { resolved: true };
+}
+
+/** carrick#1047 J1-1: a side's type reads a declaration `other` declares. */
+export function foreignHitReason(side: Side, other: string): string {
+  return `the ${side} type uses declarations from '${other}'`;
+}
+
+/** carrick#1047 J1-1: no program could be built to rule that out. */
+export function foreignUnwalkedReason(side: Side): string {
+  return `the ${side} type may use declarations from another service`;
+}
+
+function foreignDiagnostic(service: string, other: string | undefined): string {
+  return other === undefined
+    ? `the type for '${service}' may use declarations from another service that '${service}' never compiles with; compatibility cannot be verified.`
+    : `the type for '${service}' uses declarations from '${other}', which '${service}' never compiles with; compatibility cannot be verified.`;
 }

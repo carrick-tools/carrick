@@ -121,6 +121,59 @@ export function findUncarriedPositions(
     .map((finding) => finding.path);
 }
 
+/** What {@link findForeignDeclarationPositions} found on one type. */
+export interface ForeignWalk {
+  /** The first position, in walk order, whose type or member another service
+   * declares, and that service. `path` is `''` at the root. */
+  hit?: { service: string; path: string };
+  /** Where the walk ran out of budget before it found one (`<root>` at the
+   * root): nothing is ruled out. */
+  exhaustedAt?: string;
+}
+
+/**
+ * The first position of `root` that reads a declaration another service
+ * declares (carrick#1047 J1-1): its type's symbols, or a member symbol of an
+ * object type there (a mapped type such as `Partial<T>` keeps the original
+ * member declarations). `foreignOf` names the other service for one symbol,
+ * or nothing.
+ *
+ * The same walk and budget as every other deep finding, plus the root, which
+ * the walk leaves to its callers: a type that is itself a merged interface is
+ * the commonest hit. Unlike `findUncarriedPositions`, a walk that runs out of
+ * budget before a hit says so, so the caller can fail closed.
+ */
+export function findForeignDeclarationPositions(
+  root: ts.Type,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  location: ts.Node,
+  foreignOf: (symbol: ts.Symbol) => string | undefined
+): ForeignWalk {
+  const declaredElsewhere = (t: ts.Type): string | undefined => {
+    const members = t.flags & ts.TypeFlags.Object ? t.getProperties() : [];
+    for (const symbol of [t.aliasSymbol, t.getSymbol(), ...members]) {
+      const service = symbol && foreignOf(symbol);
+      if (service !== undefined) return service;
+    }
+    return undefined;
+  };
+  const atRoot = declaredElsewhere(root);
+  if (atRoot !== undefined) return { hit: { service: atRoot, path: '' } };
+  // The walk's head is its first flagged position, so the first service named
+  // here belongs to it.
+  let first: string | undefined;
+  const [head] = walkTopTypes(root, program, checker, location, (t) => {
+    const service = declaredElsewhere(t);
+    if (service === undefined) return undefined;
+    first ??= service;
+    return 'unknown';
+  });
+  if (head === undefined) return {};
+  if (head.kind === 'budget_exhausted' || first === undefined) return { exhaustedAt: head.path };
+  return { hit: { service: first, path: head.path } };
+}
+
 /** TypeScript's unresolved-reference placeholder: `TypeFlags.Any` with the
  * internal `intrinsicName === 'error'` (stable since TS 1.x; see `anchors.ts`). */
 export function isErrorPlaceholder(t: ts.Type): boolean {
