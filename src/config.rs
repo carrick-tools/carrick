@@ -123,6 +123,9 @@ const GENERATED_SOURCE: &str = "generated";
 /// Declared operations REPLACE the inferred ones for the handler they name:
 /// two sources for one set would leave a reader guessing which is current, and
 /// the repo's own statement is the one that wins.
+///
+/// A block Carrick Cloud generated carries `"source": "generated"` and its
+/// rows are candidates; see `docs/reference/generated-operations.md`.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct DeclaredOperations {
     /// The service (`serviceName`) whose handler this is.
