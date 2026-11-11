@@ -20,6 +20,8 @@
 //!   the verdict is a routing fact);
 //! - break family (`removed_still_called`): found, paired, finding;
 //! - delta family (`delta_new`, `delta_removed`): finding;
+//! - dependency family (`dependency`, a major conflict the PR introduces):
+//!   finding;
 //! - the check: finding only; the payload holds a raiser iff the correct
 //!   title is not clean.
 //!
@@ -39,12 +41,14 @@ pub const STAGES: [&str; 5] = ["found", "paired", "judged", "finding", "shown"];
 const SHOWN: usize = 4;
 
 /// The kinds of change a seed makes (the table's second key).
-pub const CHANGES: [&str; 6] = [
+pub const CHANGES: [&str; 8] = [
     "shape_break",
     "verb_change",
     "removed_while_used",
     "sender_renamed",
     "delta_only",
+    "added",
+    "major_bump",
     "quiet",
 ];
 
@@ -194,6 +198,35 @@ fn delta_row(kind: &str, label: &str, payload: &Value) -> Option<(usize, String)
     (!hit).then(|| (3, format!("{kind} {label}: no delta.{side} row")))
 }
 
+/// The conflict a `dependency` row names: `dependency_conflict` on its
+/// package, `tier: major`, `on_main: false`, with a `changed_by_pr` entry that
+/// adds the package (`from` null) for verb `adds` or moves it for `moves`.
+fn introduces_conflict(row: &Value, f: &Value) -> bool {
+    let adds = row["verb"] == "adds";
+    f["kind"] == "dependency_conflict"
+        && f["package_name"] == row["package"]
+        && f["tier"] == "major"
+        && f["on_main"] == false
+        && array(&f["changed_by_pr"])
+            .iter()
+            .any(|c| c["to"].is_string() && c["from"].is_null() == adds)
+}
+
+fn dependency_row(row: &Value, payload: &Value) -> Option<(usize, String)> {
+    let hit = array(&payload["findings"])
+        .iter()
+        .any(|f| introduces_conflict(row, f));
+    (!hit).then(|| {
+        (
+            3,
+            format!(
+                "dependency {} {}: no introduced major conflict",
+                row["verb"], row["package"]
+            ),
+        )
+    })
+}
+
 fn still_called_row(label: &str, payload: &Value) -> Option<(usize, String)> {
     let removed = array(&payload["delta"]["removed_endpoints"])
         .iter()
@@ -224,6 +257,7 @@ pub fn wrong_scanner_stages(entry: &Value, payload: &Value) -> Vec<(usize, Strin
             "risk_introduced" | "risk_could_not_compare" => risk_row(label, site, payload),
             kind @ ("delta_new" | "delta_removed") => delta_row(kind, label, payload),
             "removed_still_called" => still_called_row(label, payload),
+            "dependency" => dependency_row(row, payload),
             _ => None,
         };
         wrong.extend(found);
@@ -308,6 +342,22 @@ fn false_rows(rows: &[Value], payload: &Value) -> Vec<(usize, String)> {
                     "unexpected risk row {} {} at {site:?}",
                     f["method"], f["path"]
                 ),
+            ));
+        }
+    }
+    for f in array(&payload["findings"]) {
+        let introduced = f["kind"] == "dependency_conflict"
+            && f["tier"] == "major"
+            && f["on_main"] == false
+            && !array(&f["changed_by_pr"]).is_empty();
+        if introduced
+            && !rows
+                .iter()
+                .any(|r| r["kind"] == "dependency" && introduces_conflict(r, f))
+        {
+            false_rows.push((
+                3,
+                format!("unexpected dependency conflict {}", f["package_name"]),
             ));
         }
     }

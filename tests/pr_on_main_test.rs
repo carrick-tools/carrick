@@ -2709,9 +2709,12 @@ fn every_protocol_keeps_a_reach_pair_seed() {
         .iter()
         .filter(|s| !seed_stages::is_retired(s))
         .collect();
+    // `dependency` seeds score the comment's Dependencies section: no
+    // operation, so no type-reach decision to compare.
     let protocols: std::collections::BTreeSet<&str> = live
         .iter()
         .map(|s| s["protocol"].as_str().unwrap())
+        .filter(|p| *p != "dependency")
         .collect();
     let sampled: std::collections::BTreeSet<&str> = REACH_SAMPLE.iter().map(|(p, _)| *p).collect();
     assert_eq!(protocols, sampled, "a protocol has no reach-pair seed");
@@ -3759,18 +3762,42 @@ async fn seed_copied_helper() {
     assert!(findings_of(&payload).is_empty(), "{payload:#}");
 }
 
+/// A package added at a major another service is not on is a conflict the
+/// PR introduces, with no `from`.
 #[tokio::test]
-async fn seed_major_bump() {
+async fn seed_dependency_added() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "package.json",
-            &[("\"zod\": \"^3.22.0\"", "\"zod\": \"^4.0.0\"")],
-        )
-    })
-    .await;
-    let finding = findings_of(&payload)
+    let payload = manifest_seed_payload("dependency-added").await;
+    let findings = findings_of(&payload);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the conflict and nothing else: {payload:#}"
+    );
+    let finding = findings
+        .into_iter()
+        .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == "@example/gql-client")
+        .unwrap_or_else(|| panic!("no dependency_conflict on @example/gql-client in {payload:#}"));
+    assert_eq!(finding["tier"], "major", "{finding:#}");
+    assert_eq!(
+        finding["changed_by_pr"],
+        serde_json::json!([{ "service": "orders-api", "from": null, "to": "^2.0.0" }]),
+        "{finding:#}"
+    );
+    assert_marks(&finding, Some(false), None, None);
+}
+
+#[tokio::test]
+async fn seed_dependency_major_bump() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("dependency-major-bump").await;
+    let findings = findings_of(&payload);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the conflict and nothing else: {payload:#}"
+    );
+    let finding = findings
         .into_iter()
         .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == "zod")
         .unwrap_or_else(|| panic!("no dependency_conflict on zod in {payload:#}"));
@@ -3783,6 +3810,19 @@ async fn seed_major_bump() {
     assert_marks(&finding, Some(false), None, None);
     assert_eq!(
         payload["checked"]["dependencies"]["changed"], 1,
+        "{payload:#}"
+    );
+}
+
+/// A `package.json` edit that leaves every dependency alone: no conflict is
+/// the PR's, and none changed.
+#[tokio::test]
+async fn seed_dependency_unchanged() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("dependency-unchanged").await;
+    assert!(findings_of(&payload).is_empty(), "{payload:#}");
+    assert_eq!(
+        payload["checked"]["dependencies"]["changed"], 0,
         "{payload:#}"
     );
 }
