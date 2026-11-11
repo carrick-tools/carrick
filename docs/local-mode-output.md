@@ -291,8 +291,7 @@ a function that was renamed appears as new and one rewritten under its old name
 does not. The synthetic `<module>` definition (this file's own top-level call
 sites, carrick#965) is never listed: nobody wrote it.
 
-No hook reads it: the end-of-task reuse nudge that named these functions
-(carrick#1330) was removed in carrick#3436.
+The post-edit hook reads only each function's `lead`. The end-of-task reuse nudge that named these functions (carrick#1330) was removed in carrick#3436.
 
 The items in one answer are all fresh or all indexed, never a mixture, and this
 block is the only thing that says which. `stale` and `changed_since_index` keep

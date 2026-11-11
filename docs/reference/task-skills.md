@@ -195,37 +195,39 @@ GitHub identity.
 
 ## What the hooks deliver
 
-The end-of-task hooks report what the agent's edits came to; they never ask the
+The end-of-task hooks report what the agent's edits came to and never ask the
 agent to start something new once the task is done.
 
 | Hook | Governed code | What it does |
 |---|---|---|
-| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/apply-patch.ts` | re-checks the edited files, prints what needs acting on, and queues a background re-check for an edit that needs a re-scan |
+| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/edit-flow.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/lead.ts` | re-checks the edited files, prints what needs acting on, queues a background re-check for an edit that needs a re-scan, and names the indexed function a new function looks like (`recheck.new_functions[].lead`, carrick#3249) |
 | `carrick hook stop` (Claude Code) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/stop-wait.ts` | delivers the background re-checks that finished, waits for the ones still running (`--wait-s`), and says which are still running after the wait |
 | `carrick hook user-prompt` (Codex) | `npm/carrick/src/hook/user-prompt.ts`, `npm/carrick/src/hook/late.ts` | delivers the background re-checks that finished, with the next prompt |
 
 The per-session store (`npm/carrick/src/hook/reuse.ts`, under
 `~/.carrick/sessions/<session_id>.json`, outside every repository) remembers
-which files' uses lines were shown, which files the Read hook asked about, and
-the last edit per workspace.
+which files' uses lines and which new functions' lead lines were shown, which
+files the Read hook asked about, and the last edit per workspace.
 
-**No reuse nudge (carrick#3436).** Until carrick#3436 the Stop hook also named
-the functions a task added and asked for one `find_similar` call (carrick#1330).
+**No reuse nudge (carrick#3436).** Until carrick#3436 the Stop hook named the
+functions a task added and asked for one `find_similar` call (carrick#1330).
 Across 68 graded runs no code edit followed that call, and summaries repeated
 that a new function "isn't in the index yet". Reuse is decided before the code
 is written (rule 1 of the AGENTS.md section, the `carrick-reuse` skill), so the
-line was removed from both hosts, along with the per-session list of new
-functions it read. `carrick check --recheck` still answers with
-`recheck.new_functions` (`docs/local-mode-output.md`); no hook reads it.
+line and the per-session list of new functions were removed from both hosts.
+`carrick check --recheck` still answers with `recheck.new_functions`. The
+post-edit hook prints one line for a new function that has a `lead`
+(carrick#3249), once per function per session, as the edit lands. Nothing about
+new functions is said at the end of the task.
 
-**The channel.** A Stop hook's `hookSpecificOutput.additionalContext` is
-delivered to the model and the conversation continues, which is the one Stop
-channel that is both model-visible and non-blocking. `systemMessage` is shown to
-the user and never reaches the model — a Stop hook of ours fired in 21 sessions
-through that field and changed nothing — and `decision: "block"` reaches the
-model by refusing to let the turn end, which is a block. The hook emits
-`hookSpecificOutput` and nothing else, and only when a re-check answer needs
-acting on or is still running.
+**The channel.** A Stop hook's `hookSpecificOutput.additionalContext` reaches
+the model and the conversation continues, so it is the one Stop channel that is
+both model-visible and non-blocking. `systemMessage` is shown to the user and
+never reaches the model (a Stop hook of ours fired in 21 sessions through that
+field and changed nothing). `decision: "block"` reaches the model by refusing to
+let the turn end, which is a block. The hook emits `hookSpecificOutput` and
+nothing else, and only when a re-check answer needs acting on or is still
+running.
 
 **No check line at Stop.** The Stop hook does not ask for `carrick check
 --changed`: a 1-3 minute check at every turn end is the user's cost, so the
@@ -244,23 +246,24 @@ reader; that is the section below.
 ### Codex (carrick#1335)
 
 One implementation, two delivery channels. The re-check, the background queue
-and the per-session store are the same code on both hosts; what differs is the
+and the per-session store are the same code on both hosts. What differs is the
 event that delivers a finished re-check and the payload the post-edit hook
-reads.
+reads. Each surviving path of an apply_patch is re-checked exactly as a Claude
+Code edit is.
 
 **The event.** Codex accepts `additionalContext` only on `PreToolUse`,
 `PostToolUse`, `SessionStart`, `UserPromptSubmit` and `SubagentStart`, and warns
 "this event cannot emit additionalContext" for every other one
 (`codex-rs/hooks/src/engine/discovery.rs`). Its `Stop` event is therefore not
 available to a line that must not block, so finished re-checks are delivered by
-`UserPromptSubmit`: `carrick hook user-prompt` prints them in the same
-`hookSpecificOutput` object with `hookEventName: "UserPromptSubmit"` on it. The
-ruling of 2026-09-20 took this over a blocking `Stop` hook. It names no function
-a task added, as the Claude Code Stop hook does not (carrick#3436).
+`UserPromptSubmit`. `carrick hook user-prompt` prints them in the same
+`hookSpecificOutput` object with `hookEventName: "UserPromptSubmit"`. The ruling
+of 2026-09-20 took this over a blocking `Stop` hook. It names no function a task
+added, as the Claude Code Stop hook does not (carrick#3436).
 
 **The limit that follows.** An answer arrives with the NEXT prompt, not at the
-end of the task that earned it — and a one-shot run with no following prompt
-(`codex exec "…"`) never sees it at all. Each answer is delivered once.
+end of the task that earned it, and a one-shot run with no following prompt
+(`codex exec "…"`) never sees it. Each answer is delivered once.
 
 **The payload.** Codex has no `Edit`/`Write`/`MultiEdit` with a `file_path`. It
 edits through `apply_patch`, whose `tool_input` is `{ "command": "<patch text>"
