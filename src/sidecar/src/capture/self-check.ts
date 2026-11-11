@@ -100,8 +100,19 @@ interface FileFailures {
   unfoundNames: Set<string>;
 }
 
-/** The records of each surface, in `args.surfaces` order. */
-export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[][] {
+/** What one stub's self-check answers. */
+export interface SelfCheckResult {
+  /** The records of each surface, in `args.surfaces` order. */
+  records: CaptureAliasRecord[][];
+  /**
+   * Hash of the stub's global-scope files, `null` when it has none. The judge
+   * loads a stub that has some in every run, and a pair's side hash covers it
+   * (carrick#1047).
+   */
+  globalsHash: string | null;
+}
+
+export function selfCheckStub(args: SelfCheckArgs): SelfCheckResult {
   const typesDir = path.join(args.stubDir, 'types');
   const treeFiles: string[] = [];
   const walk = (dir: string) => {
@@ -132,8 +143,8 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[][] {
     // reach comes back as a `Cannot find name` diagnostic that
     // `repairedNameFailures` folds back into the same dangling specifier.
     const repaired = repairDanglingImports(first.internalFailuresByFile, args.guard.narrow(typesDir));
-    if (repaired.size === 0) return first.records;
-    return runSelfCheck(args, treeFiles, repaired).records;
+    if (repaired.size === 0) return first;
+    return runSelfCheck(args, treeFiles, repaired);
   } finally {
     // unlinkSync, not rmSync: the link target is a directory and rmSync
     // refuses symlinks-to-directories with EISDIR.
@@ -142,9 +153,7 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[][] {
 }
 
 /** One self-check pass: its records, and what each file could not resolve. */
-interface SelfCheckPass {
-  /** Per surface, in `args.surfaces` order. */
-  records: CaptureAliasRecord[][];
+interface SelfCheckPass extends SelfCheckResult {
   /**
    * Absolute file -> internal specifiers that failed in it, for the repair
    * pass. The surface files are excluded: their failures are the pasted text
@@ -344,7 +353,7 @@ function runSelfCheck(
     if (repaired?.has(file)) continue;
     internalFailuresByFile.set(file, failures.internal);
   }
-  return { records, internalFailuresByFile };
+  return { records, globalsHash: globalsHashOf(judgeInputs.globals), internalFailuresByFile };
 }
 
 /**
@@ -722,6 +731,12 @@ function stubJudgeInputs(
     resolution,
     bareCheckout: args.bareCheckout,
   };
+}
+
+/** The hash `carrick-manifest.json` records; `null` for a stub with no global-scope file. */
+export function globalsHashOf(globals: Array<[string, string]>): string | null {
+  if (globals.length === 0) return null;
+  return createHash('sha256').update('carrick-globals/1\n').update(JSON.stringify(globals)).digest('hex');
 }
 
 function stubRelative(stubDir: string, abs: string): string {

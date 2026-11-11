@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 /// The record's own format and the `spec_hash` preimage's. Bump it when
 /// either changes: a record of another version settles nothing.
-pub const PAIR_OUTCOMES_VERSION: u32 = 2;
+pub const PAIR_OUTCOMES_VERSION: u32 = 3;
 
 /// The largest serialised record a main scan stores. Over it the consumer
 /// stores none, and a pull request scan judges each of its pairs.

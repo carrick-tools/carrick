@@ -41,6 +41,7 @@ import { scrubPaths, type ScrubContext } from './check-scrub.js';
 import {
   assembleWorkspace,
   writeProbes,
+  writeContextProbes,
   type AssembledWorkspace,
 } from './check-workspace.js';
 import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
@@ -495,6 +496,11 @@ export async function runCheck(
 
   const { preGated, probing } = preGate(plans, aliasRecords);
   writeProbes(ws, probing);
+  // A stub with global-scope files reaches every pair the run judges, so it is
+  // loaded whether or not a probe imports it: a verdict then depends on the
+  // pair's own sides and on every stub's global files, never on which other
+  // pairs this run holds (carrick#1047). The side hashes cover the same files.
+  writeContextProbes(ws, stubsWithGlobals(opts.stubs));
 
   const errors: string[] = [];
   const degraded: DegradedService[] = [];
@@ -707,6 +713,24 @@ export async function runCheck(
   };
 }
 
+/** A stub's `carrick-manifest.json`; throws when it is absent or unparseable. */
+function readStubManifest(stub: CheckStubInput): { aliases?: CaptureAliasRecord[]; globals_hash?: string | null } {
+  return JSON.parse(fs.readFileSync(path.join(stub.stub_dir, 'carrick-manifest.json'), 'utf8'));
+}
+
+/** The services whose stub records global-scope files (`globals_hash`, carrick#1047). */
+function stubsWithGlobals(stubs: CheckStubInput[]): string[] {
+  const names: string[] = [];
+  for (const stub of stubs) {
+    try {
+      if (typeof readStubManifest(stub).globals_hash === 'string') names.push(stub.service_name);
+    } catch {
+      // No manifest: nothing recorded, nothing to load.
+    }
+  }
+  return names;
+}
+
 /**
  * Per-service alias records from each stub's carrick-manifest.json. Absent
  * or unparseable manifests (e.g. hand-authored stubs in tests) contribute
@@ -718,9 +742,7 @@ function readStubAliasRecords(
   const byService = new Map<string, Map<string, CaptureAliasRecord>>();
   for (const stub of stubs) {
     try {
-      const manifest = JSON.parse(
-        fs.readFileSync(path.join(stub.stub_dir, 'carrick-manifest.json'), 'utf8')
-      ) as { aliases?: CaptureAliasRecord[] };
+      const manifest = readStubManifest(stub);
       const byAlias = new Map<string, CaptureAliasRecord>();
       for (const record of manifest.aliases ?? []) {
         if (record?.alias) byAlias.set(record.alias, record);

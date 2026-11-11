@@ -49,7 +49,7 @@ import { installedResolutionEdges, RESOLUTION_FILE } from './resolution-edges.js
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
 import { substituteMachinePathImports } from './machine-paths.js';
 import { installedPackageSpecifier, typesPackageOf, withInstalledPackages } from './installed-package.js';
-import { selfCheckStub, type SelfCheckArgs } from './self-check.js';
+import { selfCheckStub, type SelfCheckArgs, type SelfCheckResult } from './self-check.js';
 import { backfillRerun, sharingHost, type BackfillPlan } from './backfill.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
@@ -548,13 +548,22 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   });
   let aliases: CaptureAliasRecord[];
   let secondAliases: CaptureAliasRecord[] | undefined;
+  let globalsHash: string | null;
+  let secondGlobalsHash: string | null = null;
   if (!second) {
-    [aliases] = selfCheckStub(checkArgs(stub, hostFor(stub.installs)));
+    const checked = selfCheckStub(checkArgs(stub, hostFor(stub.installs)));
+    aliases = checked.records[0];
+    globalsHash = checked.globalsHash;
   } else {
-    ({ first: aliases, second: secondAliases } = selfCheckBoth(stub, second, checkArgs, hostFor));
+    ({ first: aliases, second: secondAliases, firstGlobalsHash: globalsHash, secondGlobalsHash } = selfCheckBoth(
+      stub,
+      second,
+      checkArgs,
+      hostFor
+    ));
   }
 
-  const result = finishStub(stub, aliases, {
+  const result = finishStub(stub, aliases, globalsHash, {
     packageName,
     bareCheckout,
     unresolvedDependencies,
@@ -568,7 +577,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     ...result,
     backfill: {
       backfilled: backfill.plan.backfilled,
-      result: finishStub(second, secondAliases, {
+      result: finishStub(second, secondAliases, secondGlobalsHash, {
         packageName,
         bareCheckout,
         unresolvedDependencies,
@@ -947,15 +956,20 @@ function selfCheckBoth(
   second: WrittenStub,
   checkArgs: (written: WrittenStub, compilerHost: SelfCheckArgs['compilerHost']) => SelfCheckArgs,
   hostFor: (installs: Record<string, string>) => SelfCheckArgs['compilerHost']
-): { first: CaptureAliasRecord[]; second: CaptureAliasRecord[] | undefined } {
+): {
+  first: CaptureAliasRecord[];
+  second: CaptureAliasRecord[] | undefined;
+  firstGlobalsHash: string | null;
+  secondGlobalsHash: string | null;
+} {
   const typesOf = (written: WrittenStub) => path.join(written.stubDir, 'types');
   if (sameTreeBesideSurface(first, second)) {
     const joint = path.join(typesOf(first), JOINT_SURFACE);
     first.guard.writeFile(joint, fs.readFileSync(second.surfaceAbsPath, 'utf8'));
-    let records: CaptureAliasRecord[][];
+    let checked: SelfCheckResult;
     try {
       const installs = { ...second.installs, ...first.installs };
-      records = selfCheckStub({
+      checked = selfCheckStub({
         ...checkArgs(first, hostFor(installs)),
         surfaces: [
           { surfaceAbsPath: first.surfaceAbsPath, resolved: first.resolved },
@@ -967,7 +981,8 @@ function selfCheckBoth(
       // The first stub is checked alone, as it would be with no backfill.
       console.error(`[sidecar] backfill self-check failed, first stub checked alone: ${err instanceof Error ? err.message : String(err)}`);
       if (fs.existsSync(joint)) first.guard.unlink(joint);
-      return { first: selfCheckStub(checkArgs(first, hostFor(first.installs)))[0], second: undefined };
+      const alone = selfCheckStub(checkArgs(first, hostFor(first.installs)));
+      return { first: alone.records[0], second: undefined, firstGlobalsHash: alone.globalsHash, secondGlobalsHash: null };
     } finally {
       if (fs.existsSync(joint)) first.guard.unlink(joint);
     }
@@ -977,7 +992,13 @@ function selfCheckBoth(
       const dest = path.join(typesOf(second), rel);
       if (fs.readFileSync(dest, 'utf8') !== text) second.guard.writeFile(dest, text);
     }
-    return { first: records[0], second: records[1] };
+    // One tree beside the surface: the second stub holds the first's global files.
+    return {
+      first: checked.records[0],
+      second: checked.records[1],
+      firstGlobalsHash: checked.globalsHash,
+      secondGlobalsHash: checked.globalsHash,
+    };
   }
 
   const inStubs = (file: string) => {
@@ -989,14 +1010,22 @@ function selfCheckBoth(
     const host = hostFor(installs);
     return (options) => sharingHost(host?.(options) ?? ts.createCompilerHost(options), inStubs, parsedOnce);
   };
-  const [firstRecords] = selfCheckStub(checkArgs(first, sharing(first.installs)));
+  const firstChecked = selfCheckStub(checkArgs(first, sharing(first.installs)));
   let secondRecords: CaptureAliasRecord[] | undefined;
+  let secondGlobalsHash: string | null = null;
   try {
-    [secondRecords] = selfCheckStub(checkArgs(second, sharing(second.installs)));
+    const secondChecked = selfCheckStub(checkArgs(second, sharing(second.installs)));
+    secondRecords = secondChecked.records[0];
+    secondGlobalsHash = secondChecked.globalsHash;
   } catch (err) {
     console.error(`[sidecar] backfill self-check failed: ${err instanceof Error ? err.message : String(err)}`);
   }
-  return { first: firstRecords, second: secondRecords };
+  return {
+    first: firstChecked.records[0],
+    second: secondRecords,
+    firstGlobalsHash: firstChecked.globalsHash,
+    secondGlobalsHash,
+  };
 }
 
 /** Whether two stubs hold the same files, byte for byte, beside `surface.d.ts`. */
@@ -1017,6 +1046,7 @@ function sameTreeBesideSurface(first: WrittenStub, second: WrittenStub): boolean
 function finishStub(
   written: WrittenStub,
   aliases: CaptureAliasRecord[],
+  globalsHash: string | null,
   args: { packageName: string; bareCheckout: boolean; unresolvedDependencies: string[]; errors: string[] }
 ): CaptureStubResult {
   const fidelity = computeFidelity(aliases);
@@ -1029,6 +1059,7 @@ function finishStub(
         bare_checkout: args.bareCheckout,
         aliases,
         fidelity,
+        globals_hash: globalsHash,
       },
       null,
       2

@@ -12983,6 +12983,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     /// [`settle_repos`] with each stub's capture records carrying `hashes`
     /// (alias -> surface hash) and `package` as its `package.json`.
     fn hashed_repos(hashes: &[(&str, &str)], package: &str) -> Vec<CloudRepoData> {
+        hashed_repos_beside(hashes, package, None)
+    }
+
+    /// [`hashed_repos`] with a third stub, `aux`, that has no pair, whose
+    /// manifest is `aux_manifest` (carrick#1047).
+    fn hashed_repos_beside(
+        hashes: &[(&str, &str)],
+        package: &str,
+        aux_manifest: Option<serde_json::Value>,
+    ) -> Vec<CloudRepoData> {
         let manifest = serde_json::json!({
             "aliases": hashes.iter().map(|(alias, hash)| serde_json::json!({
                 "alias": alias,
@@ -12993,7 +13003,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 "self_check": "ok",
                 "top_type_at_self_check": false,
                 "surface_hash": hash,
-            })).collect::<Vec<_>>()
+            })).collect::<Vec<_>>(),
+            "globals_hash": null,
         })
         .to_string();
         let mut repos = settle_repos();
@@ -13004,7 +13015,71 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             stub.files
                 .insert("package.json".to_string(), package.to_string());
         }
+        if let Some(aux) = aux_manifest {
+            let mut blob = repo("mono", Some("aux"), Vec::new(), Some(fake_artifact()));
+            let stub = blob.capture_stub.as_mut().unwrap();
+            stub.files
+                .insert("carrick-manifest.json".to_string(), aux.to_string());
+            stub.files
+                .insert("package.json".to_string(), package.to_string());
+            repos.push(blob);
+        }
         repos
+    }
+
+    /// carrick#1047: the side hashes of the P-to-C8 pair, beside a third stub
+    /// whose manifest is `aux_manifest`.
+    fn sides_beside(aux_manifest: serde_json::Value) -> (Option<String>, Option<String>) {
+        let repos = hashed_repos_beside(
+            &[("P", "p1"), ("C8", "c8"), ("C9", "c9")],
+            "{}",
+            Some(aux_manifest),
+        );
+        let pairs = build_check_pairs(&repos);
+        let pair = pairs
+            .iter()
+            .find(|pair| pair.consumer_alias == "C8")
+            .unwrap();
+        (
+            pair.producer_surface_hash.clone(),
+            pair.consumer_surface_hash.clone(),
+        )
+    }
+
+    /// carrick#1047: a sibling stub's global-scope files reach every alias the
+    /// judge loads beside it, so they are in both side hashes of every pair.
+    #[test]
+    fn a_sibling_stubs_global_files_are_in_every_side_hash() {
+        let with = |hash: serde_json::Value| {
+            sides_beside(serde_json::json!({ "aliases": [], "globals_hash": hash }))
+        };
+        let one = with(serde_json::json!("g1"));
+        assert!(one.0.is_some() && one.1.is_some(), "{one:?}");
+        assert_eq!(
+            one,
+            with(serde_json::json!("g1")),
+            "same files, same hashes"
+        );
+        let two = with(serde_json::json!("g2"));
+        assert_ne!(one.0, two.0, "the producer side moved with the sibling");
+        assert_ne!(one.1, two.1, "the consumer side moved with the sibling");
+        let none = with(serde_json::Value::Null);
+        assert!(
+            none.0.is_some() && none.1.is_some(),
+            "no global file is a recorded state"
+        );
+        assert_ne!(
+            none.0, one.0,
+            "a sibling gaining global files moved the key"
+        );
+    }
+
+    /// carrick#1047: a stub captured before the field existed cannot be shown
+    /// to have been judged with the same global files, so no side settles.
+    #[test]
+    fn a_stub_that_records_no_globals_hash_leaves_every_side_unhashed() {
+        let sides = sides_beside(serde_json::json!({ "aliases": [] }));
+        assert_eq!(sides, (None, None));
     }
 
     /// carrick#3135: a pair with a reached side settles when the judge would

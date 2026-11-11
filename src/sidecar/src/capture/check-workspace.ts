@@ -304,6 +304,19 @@ export function writeProbes(ws: AssembledWorkspace, plans: ProbePlan[]): void {
   }
 }
 
+/**
+ * Load each named service's stub in the judge's program, beside the probes
+ * that import it. A diagnostic in one of these files belongs to no pair.
+ */
+export function writeContextProbes(ws: AssembledWorkspace, services: string[]): void {
+  services.forEach((service, i) => {
+    ws.guard.writeFile(
+      path.join(ws.probesDir, 'probes', `context-${i}.ts`),
+      `import type * as _ from '${ws.packageOf(service)}';\n`
+    );
+  });
+}
+
 const NPMRC = [
   // Every stub gets its own node_modules: two versions of one dep coexist and
   // tsc resolves each stub's ref to its own copy (the isolation guarantee).

@@ -271,10 +271,18 @@ fn same_judge_input(pair: &BuiltPair, stored: &StoredPairOutcome) -> bool {
 /// stub installs (`computeDedupeOverrides`). A side whose alias has no
 /// recorded hash, or whose service id names two stubs, gets `None` and never
 /// settles that way.
+///
+/// The workspace part also holds each stub's `globals_hash`, the hash of its
+/// global-scope files (carrick#1047). The judge loads every stub that has
+/// such files in every run, so a sibling's augmentation reaches every alias
+/// judged beside it. A stub whose manifest does not record the field (captured
+/// before it existed) leaves every side `None`: the judge cannot be shown to
+/// have read the same files.
 pub(crate) fn stamp_surface_hashes(pairs: &mut [BuiltPair], all_repo_data: &[CloudRepoData]) {
     let mut records: HashMap<&str, Option<HashMap<String, Option<String>>>> = HashMap::new();
     let mut workspace = Sha256::new();
     workspace.update(format!("carrick-workspace/{PAIR_OUTCOMES_VERSION}\n").as_bytes());
+    let mut globals_recorded = true;
     let mut stubs: Vec<(&str, &crate::cloud_storage::CaptureStubArtifact)> = all_repo_data
         .iter()
         .filter_map(|repo| {
@@ -287,17 +295,19 @@ pub(crate) fn stamp_surface_hashes(pairs: &mut [BuiltPair], all_repo_data: &[Clo
         .collect();
     stubs.sort_by(|a, b| a.0.cmp(b.0));
     for (id, stub) in &stubs {
-        let parsed = stub
+        let manifest = stub
             .files
             .get(CAPTURE_MANIFEST_FILE)
-            .and_then(|text| serde_json::from_str::<StubManifest>(text).ok())
-            .map(|manifest| {
-                manifest
-                    .aliases
-                    .into_iter()
-                    .map(|record| (record.alias, record.surface_hash))
-                    .collect()
-            });
+            .and_then(|text| serde_json::from_str::<StubManifest>(text).ok());
+        let globals = manifest.as_ref().and_then(|m| m.globals_hash.clone());
+        globals_recorded &= globals.is_some();
+        let parsed = manifest.map(|manifest| {
+            manifest
+                .aliases
+                .into_iter()
+                .map(|record| (record.alias, record.surface_hash))
+                .collect()
+        });
         // A service id that names two stubs: which one the judge reads is
         // not known, so neither side hashes.
         records
@@ -309,12 +319,17 @@ pub(crate) fn stamp_surface_hashes(pairs: &mut [BuiltPair], all_repo_data: &[Clo
                 id,
                 stub.files.get("package.json"),
                 stub.files.get(RESOLUTION_FILE),
+                // `null` is the marker of a stub with no global-scope file.
+                globals.flatten(),
             ))
             .unwrap_or_default(),
         );
     }
     let workspace = format!("{:x}", workspace.finalize());
     let side = |service: &str, alias: &str| -> Option<String> {
+        if !globals_recorded {
+            return None;
+        }
         let aliases = records.get(service)?.as_ref()?;
         let own = aliases.get(alias)?.as_ref()?;
         let unwidened = super::type_compat_v2::unwidened_alias(alias);
@@ -343,4 +358,14 @@ const RESOLUTION_FILE: &str = "carrick-resolution.json";
 struct StubManifest {
     #[serde(default)]
     aliases: Vec<crate::services::type_sidecar::CaptureAliasRecord>,
+    /// Absent: captured before the field existed. `null`: no global-scope
+    /// file. A string: the hash of those files.
+    #[serde(default, deserialize_with = "recorded")]
+    globals_hash: Option<Option<String>>,
+}
+
+/// A field that is present, `null` included, reads `Some(..)`; one that is
+/// absent reads `None` through `serde(default)`.
+fn recorded<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    <Option<String> as serde::Deserialize>::deserialize(d).map(Some)
 }
