@@ -45,11 +45,9 @@ const behind = row({
   behind: 93,
 });
 
-test("the hosted line names the commit the MCP answers come from and its age", () => {
-  assert.equal(
-    hostedLine(record([row()]), NOW),
-    "Carrick's MCP tools answer from the hosted index: api at bbbbbbb (scanned 2 h ago).",
-  );
+test("a copy at the hosted commit is fresh and has no hosted line", () => {
+  assert.equal(hostedLine(record([row()]), NOW), null);
+  assert.equal(hostedLine(record([row()], NOW - 3 * DAY), NOW), null);
 });
 
 test("an older copy on this machine is stated apart, with its own age", () => {
@@ -60,10 +58,9 @@ test("an older copy on this machine is stated apart, with its own age", () => {
   );
 });
 
-test("a record from an old check says when it was taken", () => {
-  assert.match(hostedLine(record([row()], NOW - 3 * DAY), NOW) ?? "", / Last checked 3 days ago\.$/);
+test("a record from an old check, with an older copy, says when it was taken", () => {
+  assert.match(hostedLine(record([behind], NOW - 3 * DAY), NOW) ?? "", / Last checked 3 days ago\.$/);
 });
-
 test("the held line names how far behind HEAD is and the move", () => {
   assert.equal(
     heldLine(record([behind], NOW, "kept")),
@@ -134,7 +131,8 @@ test("the session start opens with the hosted index, then says once a day that t
   );
   assert.match(lines[1] ?? "", /^This checkout is 93 commits behind the hosted index of api \(bbbbbbb\)/);
   // The machine's own scan keeps its date, said to be this machine's.
-  assert.match(lines[2] ?? "", /^Carrick indexed 3 service\(s\) in \S+ on this machine at 2026-09-06T21:14:03Z/);
+  // A healthy index adds nothing beside them.
+  assert.equal(lines.length, 3, first.stdout);
 
   const second = await runHook("session-start.ts", { cwd: workspace.root, env });
   assert.match(second.stdout, /^Carrick's MCP tools answer from the hosted index/);
@@ -147,13 +145,12 @@ test("the session start opens with the hosted index, then says once a day that t
   assert.match(daily.stdout, /commits behind/, "a day later it is said again");
 });
 
-test("with no record the session start is what it was", async (t) => {
+test("with no record a healthy session start prints nothing", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const run = await runHook("session-start.ts", {
     cwd: workspace.root,
     env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json") }),
   });
-  assert.match(run.stdout, /^Carrick indexed 3 service\(s\) in \S+ at 2026-09-06T21:14:03Z/);
-  assert.doesNotMatch(run.stdout, /hosted index/);
+  assert.equal(run.stdout, "");
 });
