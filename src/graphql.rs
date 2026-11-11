@@ -843,9 +843,13 @@ pub struct ServedSchemaSources {
 /// when that service shows it serves a schema (carrick#1189). A client app
 /// often commits a copy of a third-party API's schema in its own tree for
 /// codegen, and location alone would make it that API's server. The evidence
-/// is known only once the service's rows are built, so each walked file is
-/// served until [`Self::settle_walked_schemas`] has heard from a service that
-/// walks it.
+/// is known only once the service's rows are built, and a file is served when
+/// ANY service that walks it shows the evidence. So a document is decided
+/// against a walked file only once every service that walks it has been heard
+/// ([`Self::settle_walked_schemas`]); until then its rows are kept, bound
+/// `Served` provisionally, and decided with every service settled
+/// ([`Self::settle_held`]). The order the services are scanned in does not
+/// change a verdict (carrick#3663).
 #[derive(Debug, Default)]
 pub struct SchemaCatalogue {
     schemas: Vec<KnownSchema>,
@@ -856,9 +860,15 @@ pub struct SchemaCatalogue {
     canonical_root: PathBuf,
     /// Repository-relative files some service names in `graphqlSchemas`.
     declared: BTreeSet<PathBuf>,
-    /// Walked, undeclared file -> whether a service that walks it serves a
-    /// schema. Absent until such a service is settled.
-    walked_verdicts: std::sync::Mutex<BTreeMap<PathBuf, bool>>,
+    /// Walked file -> how many services' walks read it, from their walk roots
+    /// at build.
+    walkers: BTreeMap<PathBuf, usize>,
+    /// Walked, undeclared file -> the votes of the services that walk it and
+    /// have been settled. Absent until such a service is settled.
+    walked_verdicts: std::sync::Mutex<BTreeMap<PathBuf, WalkedVotes>>,
+    /// Service -> the consumer rows whose document waits on a walked file's
+    /// vote, decided by [`Self::settle_held`].
+    held: std::sync::Mutex<BTreeMap<String, Vec<HeldRow>>>,
     /// Service -> what its walk read that it does not serve, for the report.
     unserved: std::sync::Mutex<BTreeMap<String, BTreeMap<PathBuf, usize>>>,
     tally: std::sync::Mutex<BTreeMap<String, AttributionSummary>>,
@@ -1053,6 +1063,40 @@ pub enum DocumentIdentity {
 #[derive(Debug, Clone, Default)]
 pub struct ConsumerAttribution {
     documents: HashMap<(PathBuf, u32), DocumentIdentity>,
+    /// Documents whose identity waits on a walked file's vote: held `Served`
+    /// in `documents` and decided by [`SchemaCatalogue::settle_held`].
+    held: HashMap<(PathBuf, u32), HeldDocument>,
+}
+
+/// The settled services' votes on one walked file.
+#[derive(Debug, Clone, Default)]
+struct WalkedVotes {
+    /// Whether any of them serves a schema.
+    serves: bool,
+    /// The services heard.
+    heard: BTreeSet<String>,
+}
+
+/// What a held document's identity is decided from once every service is
+/// settled: the same inputs [`SchemaCatalogue::attribute`] decides from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldDocument {
+    /// Whether the service's own producers hold the document's basis.
+    own_covers: bool,
+    /// The schema files that hold the whole basis.
+    covering: Vec<PathBuf>,
+    /// The document file's transport, read when the document was attributed.
+    transport: TransportOrigin,
+}
+
+/// One consumer row of a held document, as the scan's call rows locate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldRow {
+    document: HeldDocument,
+    key: OperationKey,
+    /// The row's file, as the service's scan named it.
+    file: PathBuf,
+    line: u32,
 }
 
 /// What [`ConsumerAttribution::apply`] removed from a service's consumers.
@@ -1113,9 +1157,15 @@ impl SchemaCatalogue {
     pub fn build(repo_root: &Path, services: &[ServedSchemaSources]) -> Self {
         let mut served: BTreeSet<PathBuf> = BTreeSet::new();
         let mut declared: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut walkers: BTreeMap<PathBuf, usize> = BTreeMap::new();
         for service in services {
-            for path in graphql_files_under(&service.roots) {
-                served.insert(repo_relative(repo_root, &path));
+            let walked: BTreeSet<PathBuf> = graphql_files_under(&service.roots)
+                .iter()
+                .map(|path| repo_relative(repo_root, path))
+                .collect();
+            for file in walked {
+                *walkers.entry(file.clone()).or_default() += 1;
+                served.insert(file);
             }
             for path in &service.declared {
                 declared.insert(repo_relative(repo_root, path));
@@ -1197,7 +1247,9 @@ impl SchemaCatalogue {
                 .canonicalize()
                 .unwrap_or_else(|_| repo_root.to_path_buf()),
             declared,
+            walkers,
             walked_verdicts: Default::default(),
+            held: Default::default(),
             unserved: Default::default(),
             tally: Default::default(),
             served_schemas,
@@ -1388,10 +1440,11 @@ impl SchemaCatalogue {
     /// `serves_schema` is the service's evidence: it names a schema in
     /// `graphqlSchemas`, serves HTTP routes, or has a resolver or backing type
     /// joined to one of its fields. Without it, every producer the walk read is
-    /// removed, and each file it came from counts as external for every
-    /// service settled after this one, unless another service that walks the
-    /// same file serves a schema. A file some service declares keeps its
-    /// origin. Returns how many producers were removed.
+    /// removed. Each file the walk read records the service's vote: the file
+    /// is external once every service that walks it has voted and none serves
+    /// a schema ([`Self::attribute`] holds a document against it until then).
+    /// A file some service declares keeps its origin. Returns how many
+    /// producers were removed.
     pub fn settle_walked_schemas(
         &self,
         service: &str,
@@ -1410,8 +1463,9 @@ impl SchemaCatalogue {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             for file in &files {
-                let verdict = verdicts.entry(file.clone()).or_insert(serves_schema);
-                *verdict |= serves_schema;
+                let votes = verdicts.entry(file.clone()).or_default();
+                votes.serves |= serves_schema;
+                votes.heard.insert(service.to_string());
             }
         }
         let mut removed: BTreeMap<PathBuf, usize> = BTreeMap::new();
@@ -1454,7 +1508,56 @@ impl SchemaCatalogue {
             .walked_verdicts
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        verdicts.get(&schema.file).copied().unwrap_or(true)
+        verdicts.get(&schema.file).is_none_or(|votes| votes.serves)
+    }
+
+    /// Whether `schema` is a walked, undeclared file some service that walks
+    /// it has not voted on yet, so whether it is served is not known. A file
+    /// whose walkers were miscounted errs toward waiting: the wait ends with
+    /// every service settled ([`Self::settle_held`]).
+    fn awaits_walker(&self, schema: &KnownSchema) -> bool {
+        if schema.origin != SchemaOrigin::Served || self.declared.contains(&schema.file) {
+            return false;
+        }
+        let walkers = self.walkers.get(&schema.file).copied().unwrap_or(0);
+        let verdicts = self
+            .walked_verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let heard = verdicts
+            .get(&schema.file)
+            .map_or(0, |votes| votes.heard.len());
+        heard < walkers
+    }
+
+    /// A document's identity from what holds its basis: the service's own
+    /// producers (`own_covers`) and the schema files that hold all of it, read
+    /// with the votes heard so far. `transport` is asked only when a served
+    /// and an external schema both hold it.
+    fn identity_from(
+        &self,
+        own_covers: bool,
+        covering: &[&KnownSchema],
+        transport: impl FnOnce() -> TransportOrigin,
+    ) -> DocumentIdentity {
+        let served = own_covers || covering.iter().any(|s| self.is_served(s));
+        let external: Vec<PathBuf> = covering
+            .iter()
+            .filter(|s| !self.is_served(s))
+            .map(|s| s.file.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        match (served, external.is_empty()) {
+            (true, true) => DocumentIdentity::Served,
+            (false, false) => DocumentIdentity::External(external),
+            (false, true) => DocumentIdentity::Unresolved,
+            (true, false) => match transport() {
+                TransportOrigin::Internal => DocumentIdentity::Served,
+                TransportOrigin::External => DocumentIdentity::External(external),
+                TransportOrigin::Unknown => DocumentIdentity::Unresolved,
+            },
+        }
     }
 
     /// Attribute each of `extraction`'s documents to a schema identity.
@@ -1495,6 +1598,7 @@ impl SchemaCatalogue {
                 .insert(op.key.canonical());
         }
         let mut documents = HashMap::new();
+        let mut held = HashMap::new();
         for (document, fields) in fields_by_document {
             let basis: Vec<&String> = fields
                 .iter()
@@ -1506,33 +1610,132 @@ impl SchemaCatalogue {
                 DocumentIdentity::NoLocalSchema
             } else {
                 let covers = |keys: &HashSet<String>| basis.iter().all(|key| keys.contains(*key));
-                let served = covers(&own)
-                    || self
-                        .schemas
-                        .iter()
-                        .any(|s| self.is_served(s) && covers(&s.root_keys));
-                let external: Vec<PathBuf> = self
+                let own_covers = covers(&own);
+                let covering: Vec<&KnownSchema> = self
                     .schemas
                     .iter()
-                    .filter(|s| !self.is_served(s) && covers(&s.root_keys))
-                    .map(|s| s.file.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
+                    .filter(|s| covers(&s.root_keys))
                     .collect();
-                match (served, external.is_empty()) {
-                    (true, true) => DocumentIdentity::Served,
-                    (false, false) => DocumentIdentity::External(external),
-                    (false, true) => DocumentIdentity::Unresolved,
-                    (true, false) => match transport(&document.0) {
-                        TransportOrigin::Internal => DocumentIdentity::Served,
-                        TransportOrigin::External => DocumentIdentity::External(external),
-                        TransportOrigin::Unknown => DocumentIdentity::Unresolved,
-                    },
+                if covering.iter().any(|s| self.awaits_walker(s)) {
+                    held.insert(
+                        document.clone(),
+                        HeldDocument {
+                            own_covers,
+                            covering: covering.iter().map(|s| s.file.clone()).collect(),
+                            transport: transport(&document.0),
+                        },
+                    );
+                    DocumentIdentity::Served
+                } else {
+                    self.identity_from(own_covers, &covering, || transport(&document.0))
                 }
             };
             documents.insert(document, identity);
         }
-        ConsumerAttribution { documents }
+        ConsumerAttribution { documents, held }
+    }
+
+    /// Decide the documents `service`'s attribution held, now that every
+    /// service is settled ([`Self::attribute`]): each identity is read from
+    /// the votes heard, as it would have been had every service that walks
+    /// its files voted first. A held document that is not served has its
+    /// rows removed from `calls`, when given, and counted in the service's
+    /// record, so the report reads the same whatever order the services were
+    /// scanned in. Pass `None` for a service whose rows are not written this
+    /// run. Returns how many held rows were found not served.
+    pub fn settle_held(
+        &self,
+        service: &str,
+        mut calls: Option<&mut Vec<crate::analyzer::ApiEndpointDetails>>,
+    ) -> usize {
+        let rows = self
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(service)
+            .unwrap_or_default();
+        let mut decided = AttributionSummary::default();
+        for row in rows {
+            let covering: Vec<&KnownSchema> = self
+                .schemas
+                .iter()
+                .filter(|s| row.document.covering.contains(&s.file))
+                .collect();
+            match self.identity_from(row.document.own_covers, &covering, || {
+                row.document.transport
+            }) {
+                DocumentIdentity::External(files) => {
+                    *decided.external.entry(files).or_default() += 1;
+                }
+                DocumentIdentity::Unresolved => decided.unresolved += 1,
+                DocumentIdentity::Served | DocumentIdentity::NoLocalSchema => continue,
+            }
+            if let Some(calls) = calls.as_deref_mut()
+                && let Some(at) = calls.iter().position(|call| self.is_row_of(call, &row))
+            {
+                calls.remove(at);
+            }
+        }
+        let count = decided.external.values().sum::<usize>() + decided.unresolved;
+        if count > 0 {
+            let mut tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+            let summary = tally.entry(service.to_string()).or_default();
+            for (files, n) in decided.external {
+                *summary.external.entry(files).or_default() += n;
+            }
+            summary.unresolved += decided.unresolved;
+        }
+        count
+    }
+
+    /// Whether `call` is the consumer row `row` names: a document row at the
+    /// same file, line and key, still bound `Served` as it was held.
+    fn is_row_of(&self, call: &crate::analyzer::ApiEndpointDetails, row: &HeldRow) -> bool {
+        if call.key != row.key
+            || call.schema_binding != Some(SchemaBinding::Served)
+            || call.resolution_source
+                != Some(crate::agents::file_analyzer_agent::ResolutionSource::GraphqlDocument)
+        {
+            return false;
+        }
+        let location = call.file_path.to_string_lossy();
+        let Some((file, line)) = location.rsplit_once(':') else {
+            return false;
+        };
+        line.parse::<u32>() == Ok(row.line)
+            && self.scanned_relative(Path::new(file)) == self.scanned_relative(&row.file)
+    }
+
+    /// Keep the rows of the documents `attribution` held among `service`'s
+    /// consumers (`extraction`, once applied), for [`Self::settle_held`],
+    /// replacing what an earlier attribution of the same service held.
+    pub fn hold(
+        &self,
+        service: &str,
+        attribution: &ConsumerAttribution,
+        extraction: &GraphqlExtraction,
+    ) {
+        let rows: Vec<HeldRow> = extraction
+            .consumers
+            .iter()
+            .filter_map(|op| {
+                let document = attribution
+                    .held
+                    .get(&(op.file_path.clone(), op.document_line))?;
+                Some(HeldRow {
+                    document: document.clone(),
+                    key: op.key.clone(),
+                    file: op.file_path.clone(),
+                    line: op.line,
+                })
+            })
+            .collect();
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if rows.is_empty() {
+            held.remove(service);
+        } else {
+            held.insert(service.to_string(), rows);
+        }
     }
 
     /// Record what `service`'s attribution removed, replacing an earlier
@@ -3917,6 +4120,128 @@ export const typeDefs = gql`
         assert_eq!(second.producers.len(), 1);
         let schema = &catalogue.schemas[0];
         assert!(catalogue.is_served(schema));
+    }
+
+    /// carrick#3663: a document's identity is what it would be had every
+    /// service that walks a schema file covering it voted first. Each service
+    /// is settled, then attributes its own documents, in every order; the
+    /// verdict and the report read the same in all of them.
+    #[test]
+    fn a_documents_identity_waits_for_every_walker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        };
+        write("shared/schema.graphql", "type Query { accounts: [String] }");
+        write("a/src/index.ts", "export const a = 1;\n");
+        write("b/src/index.ts", "export const b = 1;\n");
+        write("c/src/accounts.gql", "query Accounts { accounts }");
+        // (name, walk roots, serves a schema)
+        type Service = (&'static str, Vec<PathBuf>, bool);
+        let roots = |dirs: &[&str]| dirs.iter().map(|d| root.join(d)).collect::<Vec<_>>();
+        // Every order of `services`, each settling then attributing; the
+        // report once every service is settled.
+        let outcomes = |services: Vec<Service>| -> BTreeSet<Vec<String>> {
+            let mut orders: Vec<Vec<usize>> = vec![vec![]];
+            for _ in 0..services.len() {
+                orders = orders
+                    .into_iter()
+                    .flat_map(|order| {
+                        (0..services.len())
+                            .filter(|i| !order.contains(i))
+                            .map(|i| {
+                                let mut next = order.clone();
+                                next.push(i);
+                                next
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+            }
+            orders
+                .iter()
+                .map(|order| {
+                    let catalogue = SchemaCatalogue::build(
+                        root,
+                        &services
+                            .iter()
+                            .map(|(_, dirs, _)| ServedSchemaSources {
+                                roots: whole(dirs.clone()),
+                                declared: vec![],
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    for &i in order {
+                        let (name, dirs, serves) = &services[i];
+                        let mut extraction = scan_repo(dirs, &[], &[]);
+                        catalogue.settle_walked_schemas(name, &mut extraction, *serves);
+                        let attribution =
+                            catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+                        let summary = attribution.apply(&mut extraction);
+                        catalogue.hold(name, &attribution, &extraction);
+                        catalogue.record(name, summary);
+                    }
+                    for (name, _, _) in &services {
+                        catalogue.settle_held(name, None);
+                    }
+                    catalogue.notices()
+                })
+                .collect()
+        };
+        let external_line = "Service 'c': 1 GraphQL document operation(s) are written against \
+                             'shared/schema.graphql', which no service in this repository \
+                             serves, so they are read as calls to an external API and not \
+                             indexed. If a service here serves that schema, name the file in \
+                             its `graphqlSchemas`.";
+        let unserved_line = |service: &str| {
+            format!(
+                "Service '{service}': 1 GraphQL schema field(s) in 'shared/schema.graphql' are \
+                 not indexed as operations it serves. The file sits in its directory, but the \
+                 service serves no HTTP route and no resolver was found for its fields, so it \
+                 is read as another API's schema. If this service serves it, name the file in \
+                 its `graphqlSchemas`."
+            )
+        };
+
+        // Two services include the schema, one serving and one not; a third
+        // service's document is served whichever votes first.
+        let both = outcomes(vec![
+            ("a", roots(&["a", "shared"]), true),
+            ("b", roots(&["b", "shared"]), false),
+            ("c", roots(&["c"]), false),
+        ]);
+        assert_eq!(
+            both,
+            BTreeSet::from([vec![unserved_line("b")]]),
+            "every order reads the document as served"
+        );
+
+        // A lone walker that serves nothing: the document is another API's
+        // whether it attributes before or after the walker votes.
+        let lone = outcomes(vec![
+            ("b", roots(&["b", "shared"]), false),
+            ("c", roots(&["c"]), false),
+        ]);
+        assert_eq!(
+            lone,
+            BTreeSet::from([vec![unserved_line("b"), external_line.to_string()]]),
+            "every order reads the document as external"
+        );
+
+        // The document's own service walks the schema and serves nothing; a
+        // second walker serves it.
+        let own = outcomes(vec![
+            ("a", roots(&["a", "shared"]), true),
+            ("c", roots(&["c", "shared"]), false),
+        ]);
+        assert_eq!(
+            own,
+            BTreeSet::from([vec![unserved_line("c")]]),
+            "every order reads the document as served"
+        );
     }
 
     /// The engine builds the catalogue from the repository path as given, and
