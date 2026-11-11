@@ -207,6 +207,7 @@ jobs:
               # Last: it flips carrick-match's features, which would make every
               # target above Dirty if it ran first.
               cargo test -p carrick-match --verbose || rc=$?
+              cargo test -p carrick-match --test split_once_parity -- --nocapture --test-threads 1 || rc=$?
               ;;
             *)
               echo "::error::unknown runner $RUNNER"

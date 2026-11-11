@@ -265,7 +265,12 @@ impl PairingPool {
         }
         let route_segments = producers
             .iter()
-            .map(|producer| producer.path.as_deref().map(owned_segments))
+            .map(|producer| {
+                producer
+                    .path
+                    .as_deref()
+                    .map(|path| owned_segments(path.trim_end_matches('/')))
+            })
             .collect();
         PairingPool {
             producers,
